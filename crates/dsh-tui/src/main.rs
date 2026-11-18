@@ -11,6 +11,7 @@
 //! - `--continue` / `-c`：恢复当前工作区最近一次持久化的历史会话
 //! - `--resume <id>`：按会话 ID 恢复历史会话
 //! - `--no-persist`：禁用 SQLite 会话落盘（仅当前进程内存模式）
+//! - `--no-instructions`：禁用自动发现与注入 `AGENTS.md` / `CLAUDE.md`
 //! - `--theme <preset>`：指定预设主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`）
 //!
 //! 配置文件目录（全局 `~/.dsh-rs/` + 项目 `<workspace>/.dsh-rs/`，支持 `DSH_RS_HOME` 覆盖）：
@@ -28,7 +29,8 @@ use std::path::PathBuf;
 
 use cordis::{Context, Service};
 use dsh_agent_spine::{
-    AgentSpineConfig, AgentSpinePlugin, load_dsh_config, resolve_default_session_db_path,
+    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, load_dsh_config,
+    resolve_default_session_db_path,
 };
 use dsh_llm_mock::MockPlugin;
 use dsh_llm_retry::{LlmRetryPlugin, RetryConfig};
@@ -52,6 +54,7 @@ struct CliArgs {
     inline: bool,
     approve: bool,
     no_persist: bool,
+    no_instructions: bool,
     resume_session: Option<ResumeTarget>,
     theme: Option<ThemePreset>,
 }
@@ -92,6 +95,7 @@ fn parse_cli_args() -> CliArgs {
             "--inline" => out.inline = true,
             "--approve" => out.approve = true,
             "--no-persist" => out.no_persist = true,
+            "--no-instructions" => out.no_instructions = true,
             "--continue" | "-c" => out.resume_session = Some(ResumeTarget::LatestInWorkspace),
             "--resume" | "-r" => {
                 if let Some(val) = args.next() {
@@ -131,6 +135,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.no_persist {
         spine_cfg.session_db_path = None;
     }
+    if cli.no_instructions
+        && let AgentToolsMode::Coding {
+            ref mut instructions,
+            ..
+        } = spine_cfg.tools_mode
+    {
+        instructions.enabled = false;
+    }
 
     if let Some(preset) = cli.preset {
         spine_cfg = spine_cfg.with_coding_preset(preset);
@@ -155,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
     tui_cfg.theme_preset = cli.theme;
     tui_cfg.resume_session = cli.resume_session;
+    tui_cfg.restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
     if cli.inline {
         tui_cfg.screen_mode = ScreenMode::Inline;
     }

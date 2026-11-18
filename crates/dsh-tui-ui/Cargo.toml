@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 crossterm = { workspace = true }
+dirs = { workspace = true }
 dsh-llm-types = { workspace = true }
 dsh-trajectory-core = { workspace = true }
 futures = { workspace = true }

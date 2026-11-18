@@ -87,6 +87,7 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     if let AgentToolsMode::Coding {
         ref mut mcp,
         ref mut skills,
+        ref mut instructions,
         ..
     } = cfg.tools_mode
     {
@@ -99,6 +100,7 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
         mcp.servers.insert("fff".into(), fff);
 
         skills.agents_home = Some(ws.join("isolated-agents"));
+        instructions.include_default_global = false;
     }
 
     struct ScriptedAdapter {

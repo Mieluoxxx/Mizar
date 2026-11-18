@@ -17,6 +17,7 @@ coding = [
     "dep:dsh-codemode",
     "dep:dsh-mcp",
     "dep:dsh-skills",
+    "dep:dsh-instructions",
 ]
 sqlite = ["dep:dsh-session-sqlite"]
 trajectory = ["dep:dsh-trajectory"]
@@ -33,6 +34,7 @@ dsh-mcp = { workspace = true, optional = true }
 dsh-session = { workspace = true }
 dsh-session-sqlite = { workspace = true, optional = true }
 dsh-skills = { workspace = true, optional = true }
+dsh-instructions = { workspace = true, optional = true }
 dsh-system-prompt = { workspace = true }
 dsh-tool-fs = { workspace = true, optional = true }
 dsh-tool-search = { workspace = true, optional = true }

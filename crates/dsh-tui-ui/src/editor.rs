@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::mentions::{MentionCaret, mention_at_caret};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputLayout {
     pub lines: Vec<String>,
@@ -207,15 +209,26 @@ impl TextInput {
         }
     }
 
-    /// 在当前词内替换为补全内容（例如 `/` 命令或 `@` 文件路径补全）。
-    pub fn replace_byte_range(&mut self, start: usize, end: usize, replacement: &str) {
+    /// 在当前词内替换为补全内容，并把光标定位到 `replacement` 内指定字节偏移处。
+    pub fn replace_byte_range_with_cursor(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &str,
+        cursor_offset: usize,
+    ) {
         if start > end || end > self.text.len() {
             return;
         }
         self.push_undo();
         self.history_idx = None;
         self.text.replace_range(start..end, replacement);
-        self.cursor = start + replacement.len();
+        self.cursor = start + cursor_offset.min(replacement.len());
+    }
+
+    /// 在当前词内替换为补全内容（例如 `/` 命令或 `@` 文件路径补全）。
+    pub fn replace_byte_range(&mut self, start: usize, end: usize, replacement: &str) {
+        self.replace_byte_range_with_cursor(start, end, replacement, replacement.len());
     }
 
     fn paste_span_containing(&self, byte_idx: usize) -> Option<(usize, usize)> {
@@ -508,20 +521,12 @@ impl TextInput {
         Some((0, token.to_string()))
     }
 
+    pub fn active_mention_caret(&self) -> Option<MentionCaret> {
+        mention_at_caret(&self.text, self.cursor)
+    }
+
     pub fn active_mention_trigger(&self) -> Option<(usize, String)> {
-        let prefix = &self.text[..self.cursor];
-        let at_pos = prefix.rfind('@')?;
-        if at_pos > 0 {
-            let prev = prefix[..at_pos].chars().next_back()?;
-            if !prev.is_whitespace() && !matches!(prev, '(' | '[' | '"' | '\'') {
-                return None;
-            }
-        }
-        let token = &prefix[at_pos + 1..];
-        if token.contains(char::is_whitespace) {
-            return None;
-        }
-        Some((at_pos, token.to_string()))
+        self.active_mention_caret().map(|m| (m.start, m.query))
     }
 
     /// 按终端显示列宽对输入文本折行，并计算物理光标位置 `(row, col)`。

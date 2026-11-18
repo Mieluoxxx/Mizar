@@ -57,7 +57,8 @@ impl LlmAdapter for MockAdapter {
                         .find_map(|m| match m {
                             Message::User { content }
                                 if !content.trim_start().starts_with("<system-reminder>")
-                                    && !content.trim_start().starts_with("<skill_content") =>
+                                    && !content.trim_start().starts_with("<skill_content")
+                                    && !content.trim_start().starts_with("<attached-") =>
                             {
                                 Some(content.clone())
                             }

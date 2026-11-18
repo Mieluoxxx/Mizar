@@ -52,11 +52,13 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     if let AgentToolsMode::Coding {
         ref mut mcp,
         ref mut skills,
+        ref mut instructions,
         ..
     } = spine_cfg.tools_mode
     {
         mcp.load_config_files = false;
         skills.include_default_roots = false;
+        instructions.include_default_global = false;
     }
     app_ctx.plugin(AgentSpinePlugin, spine_cfg);
     app_ctx.plugin(MockPlugin, ());
@@ -149,11 +151,13 @@ async fn boot_mock_ctx(ws: PathBuf) -> Context {
     if let AgentToolsMode::Coding {
         ref mut mcp,
         ref mut skills,
+        ref mut instructions,
         ..
     } = spine_cfg.tools_mode
     {
         mcp.load_config_files = false;
         skills.include_default_roots = false;
+        instructions.include_default_global = false;
     }
     app_ctx.plugin(AgentSpinePlugin, spine_cfg);
     app_ctx.plugin(MockPlugin, ());
@@ -187,12 +191,12 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
         "prompt after cleanup:\n{built_without}"
     );
 
-    // 2. 验证 [[Done]] 胶囊、CJK 相邻粗体 **证据与影响：**源码中、词级 Diff 与原始 Session 不被污染
+    // 2. 验证 [[Done]] 胶囊、CJK 相邻粗体 **证据与影响：**源码中、词级 Diff、思考与正文空行隔离及去重
     let session = app_ctx.sessions().unwrap().create(None);
     let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
     state.items.push(ChatItem::Assistant {
-        reasoning: String::new(),
-        text: "[[Done]] **证据与影响：**源码中 `[[Done]]` 已被美化，而历史仍保持原始文本。".into(),
+        reasoning: "Let me write Chinese content.".into(),
+        text: "**Investigate** [[Investigate]] 我先梳理各个 crate 的依赖与职责、agent 主循环与工具调度机制，并确认 **`cargo fmt --all` 单独提交**。\n\n[[Done]] **证据与影响：**源码中 `[[Done]]` 已被美化，而历史仍保持原始文本。".into(),
     });
     state.items.push(ChatItem::ToolCall {
         id: "edit-1".into(),
@@ -206,7 +210,6 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
         ToolExtraMeta {
             full_content: "已更新 1 处".into(),
             diff_raw: Some("-let old_val = 1;\n+let new_val = 2;\n".into()),
-            local_expanded: None,
         },
     );
 
@@ -215,10 +218,83 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
     terminal.draw(|f| render(f, &mut state)).unwrap();
 
     let screen = buffer_text(terminal.backend());
+    assert!(!screen.contains("[▸ 展开]") && !screen.contains("[▾ 收起]"), "button should be removed:\n{screen}");
     assert!(screen.contains("Done"), "screen:\n{screen}");
     assert!(screen.contains("证据与影响：源码中"), "screen:\n{screen}");
+    assert!(screen.contains("cargo fmt --all 单独提交"), "screen:\n{screen}");
+    assert!(!screen.contains("**cargo"), "raw asterisks leaked:\n{screen}");
+    assert_eq!(
+        screen.matches("Investigate").count(),
+        1,
+        "duplicate Investigate leaked:\n{screen}"
+    );
+    let lines: Vec<&str> = screen.lines().collect();
+    let think_idx = lines
+        .iter()
+        .position(|l| l.contains("Let me write Chinese content."))
+        .expect("thinking line");
+    assert!(
+        lines.get(think_idx + 1).is_some_and(|l| l.trim().is_empty()),
+        "expected blank line between thinking and response:\n{screen}"
+    );
+    assert!(
+        lines.get(think_idx + 2).is_some_and(|l| l.contains("Investigate")),
+        "expected standalone mode pill after blank line:\n{screen}"
+    );
+    assert!(
+        lines
+            .get(think_idx + 3)
+            .is_some_and(|l| l.starts_with("我先梳理")),
+        "expected prose at col 0:\n{screen}"
+    );
     assert!(screen.contains("old_val"), "screen:\n{screen}");
     assert!(screen.contains("new_val"), "screen:\n{screen}");
+
+    // 验证全靠 Ctrl+O 统一展开与折叠（思考块与多行工具输出同步）
+    state.items.push(ChatItem::ToolCall {
+        id: "bash-1".into(),
+        name: "bash".into(),
+        args_summary: "ls".into(),
+        status: dsh_tui::ToolState::Done,
+        output_preview: "line1\nline2\nline3\nline4\nline5\nline6".into(),
+    });
+    state.tool_extras.insert(
+        "bash-1".into(),
+        ToolExtraMeta {
+            full_content: "line1\nline2\nline3\nline4\nline5\nline6\nline7".into(),
+            diff_raw: None,
+        },
+    );
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let collapsed_screen = buffer_text(terminal.backend());
+    assert!(
+        collapsed_screen.contains("按 Ctrl+O 展开"),
+        "expected Ctrl+O expand hint:\n{collapsed_screen}"
+    );
+    assert!(!collapsed_screen.contains("点击或按"), "unexpected click hint:\n{collapsed_screen}");
+    assert!(!collapsed_screen.contains("line7"));
+
+    let items_before = state.items.len();
+    state.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(state.verbose_expanded);
+    assert!(state.show_thinking);
+    assert_eq!(state.items.len(), items_before);
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let expanded_screen = buffer_text(terminal.backend());
+    assert!(expanded_screen.contains("line7"), "expected expanded output:\n{expanded_screen}");
+    assert!(expanded_screen.contains("Let me write Chinese content."));
+    assert!(!expanded_screen.contains("[▾ 收起]"));
+
+    state.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(!state.verbose_expanded);
+    assert!(!state.show_thinking);
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let folded_screen = buffer_text(terminal.backend());
+    assert!(
+        folded_screen.contains("思考过程已折叠") && folded_screen.contains("按 Ctrl+O 展开"),
+        "expected thinking folded with Ctrl+O hint:\n{folded_screen}"
+    );
+    assert!(!folded_screen.contains("line7"));
     assert!(session.log().is_empty());
 
     app_ctx.fiber().dispose().await;
@@ -613,4 +689,196 @@ async fn resumes_session_with_compaction_and_trace_entries_cleanly() {
     assert!(screen.contains("已恢复历史会话"), "screen:\n{screen}");
 
     app_ctx.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_instructions() {
+    let ws = crate_root();
+    let app_ctx = boot_mock_ctx(ws.clone()).await;
+    let store = app_ctx.sessions().unwrap();
+    let session = store.create(None);
+    session.append(SessionEvent::User {
+        text: "测试问题".into(),
+    });
+    session.append(SessionEvent::ContextNotice {
+        source: "agent-instructions".into(),
+        text: "<system-reminder>\nInstructions from: AGENTS.md\n\nSECRET_RAW_BODY_DO_NOT_DUMP\n\nInstructions from: CLAUDE.md\n\nMORE_RAW\n</system-reminder>".into(),
+    });
+    session.append(SessionEvent::ContextNotice {
+        source: "skill-catalog".into(),
+        text: "<system-reminder>\n<available_skills>\n- `foo`: raw\n</available_skills>\n</system-reminder>".into(),
+    });
+    session.append(SessionEvent::assistant_text("测试回答"));
+
+    let empty = store.create(None);
+    let mut state = AppState::new(ws, &empty.id, Vec::new(), None, None, None);
+    state.restore_session_view(project_resume_view(&session));
+    state.side_panel.open = true;
+    state.side_panel_data.instructions = vec![dsh_tui::side_panel::InstructionSummaryRow {
+        path: "AGENTS.md".into(),
+        scope: "workspace".into(),
+        bytes: 42,
+        truncated: false,
+        omitted: false,
+    }];
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let screen = buffer_text(terminal.backend());
+    assert!(screen.contains("已加载指令：AGENTS.md, CLAUDE.md"), "screen:\n{screen}");
+    assert!(!screen.contains("SECRET_RAW_BODY_DO_NOT_DUMP"), "screen:\n{screen}");
+    assert!(screen.contains("已加载可用技能目录"), "screen:\n{screen}");
+    assert!(screen.contains("指令文件 (1)"), "screen:\n{screen}");
+
+    state.input.insert_str("/instructions");
+    let act = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(act, AppAction::ShowInstructions);
+
+    // 验证新键位：Ctrl+L 呼出模型选择器，Tab 循环思考等级，运行中 Enter 排队、Ctrl+Enter 立即发送、Esc 暂停
+    let providers = vec![dsh_llm::ProviderInfo {
+        id: "mock".into(),
+        name: "Mock".into(),
+        protocol: "mock".into(),
+        models: vec![dsh_llm::ModelInfo {
+            id: "mock-v1".into(),
+            name: "Mock V1".into(),
+            context_window: Some(32_768),
+            max_tokens: Some(4096),
+            reasoning_efforts: vec![
+                dsh_llm::ReasoningEffort::Off,
+                dsh_llm::ReasoningEffort::Low,
+                dsh_llm::ReasoningEffort::High,
+            ],
+        }],
+    }];
+    state.providers = providers;
+    state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(state.overlay.is_modal());
+    state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!state.overlay.is_open());
+
+    state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.reasoning_effort, Some(dsh_llm::ReasoningEffort::Low));
+    state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.reasoning_effort, Some(dsh_llm::ReasoningEffort::High));
+
+    state.is_busy = true;
+    state.input.insert_str("follow up");
+    assert_eq!(
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        AppAction::None
+    );
+    assert_eq!(state.queued_prompts, vec!["follow up".to_string()]);
+    state.input.insert_str("steer now");
+    assert_eq!(
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+        AppAction::SteerPrompt("steer now".into())
+    );
+    assert_eq!(
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        AppAction::CancelRun
+    );
+
+    app_ctx.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn expands_at_mentions_via_pre_step_and_folds_on_resume() {
+    let ws = std::env::temp_dir().join(format!(
+        "dsh_tui_headless_mentions_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("src/demo.rs"), "line 1\nline 2\nline 3\nline 4\n").unwrap();
+    std::fs::write(ws.join("sub/inside.txt"), "SECRET_NESTED\n").unwrap();
+
+    let app_ctx = boot_mock_ctx(ws.clone()).await;
+    let store = app_ctx.sessions().unwrap();
+    let session = store.create(None);
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let hook_handle =
+        dsh_tui::mentions::register_mention_hook(&app_ctx, ws.clone(), false, tx.clone())
+            .unwrap();
+
+    let prompt = "请查看 @src/demo.rs#L2-3、@sub 与 @does_not_exist.rs";
+    let _reply = app_ctx
+        .agent_loop()
+        .unwrap()
+        .run_with_options(
+            Arc::clone(&session),
+            prompt,
+            CancellationToken::new(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    // 1. User 事件保持干净原始文本；file-mentions ContextNotice 按预期附加片段
+    let (user_texts, mention_notices) = session.with_visible_entries(|entries| {
+        let mut users = Vec::new();
+        let mut notices = Vec::new();
+        for e in entries {
+            match &e.event {
+                SessionEvent::User { text } => users.push(text.clone()),
+                SessionEvent::ContextNotice { source, text } if source == "file-mentions" => {
+                    notices.push(text.clone());
+                }
+                _ => {}
+            }
+        }
+        (users, notices)
+    });
+    assert_eq!(user_texts, vec![prompt.to_string()]);
+    assert_eq!(mention_notices.len(), 1);
+    let body = &mention_notices[0];
+    assert!(
+        body.contains("<attached-file path=\"src/demo.rs\" lines=\"2-3\">\nline 2\nline 3\n</attached-file>"),
+        "body:\n{body}"
+    );
+    assert!(!body.contains("line 1"), "body:\n{body}");
+    assert!(!body.contains("line 4"), "body:\n{body}");
+    assert!(
+        body.contains("<attached-directory path=\"sub\">\ninside.txt\n</attached-directory>"),
+        "body:\n{body}"
+    );
+
+    // 2. UI 收到 Flash 与 Missing Warn Notice
+    let mut state = AppState::new(ws.clone(), &session.id, Vec::new(), None, None, None);
+    while let Ok(ev) = rx.try_recv() {
+        state.apply_ui_event(ev);
+    }
+    assert_eq!(state.active_flash(), Some("✓ 已附加 2 个 @ 引用"));
+    assert!(
+        state.items.iter().any(|item| matches!(
+            item,
+            ChatItem::Notice {
+                level: dsh_tui::NoticeLevel::Warn,
+                text
+            } if text.contains("does_not_exist.rs")
+        )),
+        "items: {:?}",
+        state.items
+    );
+
+    // 3. --resume 回放折叠 file-mentions，不把原始文件正文展开进聊天记录
+    let empty = store.create(None);
+    let mut resumed = AppState::new(ws.clone(), &empty.id, Vec::new(), None, None, None);
+    resumed.restore_session_view(project_resume_view(&session));
+    let backend = TestBackend::new(120, 26);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut resumed)).unwrap();
+    let screen = buffer_text(terminal.backend());
+    assert!(
+        screen.contains("已附加引用：src/demo.rs, sub"),
+        "screen:\n{screen}"
+    );
+    assert!(!screen.contains("line 2"), "screen:\n{screen}");
+
+    drop(hook_handle.dispose());
+    app_ctx.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&ws);
 }

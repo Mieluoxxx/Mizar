@@ -1,6 +1,6 @@
 # dsh-rs 插件与模块清单
 
-本文档介绍 `crates/` 下共 **27 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
+本文档介绍 `crates/` 下共 **28 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
 
 目前仓库为纯 Virtual Workspace，唯一的终端入口为 `crates/dsh-tui/src/main.rs`（`dsh-tui`），通过 `dsh-agent-spine` 按需装配 Agent 能力并由纯前端工作台 `dsh-tui-ui` 渲染界面。**纯模型/纯 UI 层**与**异步插件宿主层**已彻底解耦。
 
@@ -44,13 +44,13 @@ HTTP 传输实现收敛在 `dsh-llm-http`，其余协议与路由插件运行时
 | **`dsh-llm-messages`** | `MessagesPlugin` | `"llm-messages"` | **Anthropic Messages 协议适配器**：对接 `/v1/messages`，自动处理 `system` 抽取、连续 `tool_result` 合并、`thinking` 签名与前缀摘要校验 | `["llm"]` | `cordis`、`dsh-llm`、`dsh-llm-http` |
 | **`dsh-llm-mock`** | `MockPlugin` | `"llm-mock"` | **离线假模型适配器**：无需 API Key，按关键词规则模拟 `get_time` / `list_dir` 工具调用与逐字流式输出，用于演示与无网测试 | `["llm"]` | `cordis`、`dsh-llm` |
 | **`dsh-llm-retry`** | `LlmRetryPlugin` | `"llm-retry"` | **流式自动重试中间件**：拦截 `llm/stream` waterfall，在未发出可见内容前对 `RateLimit` / `Server` / `Timeout` / `Transport` 等瞬时故障按退避策略重试 | `["llm"]` | `cordis`、`dsh-llm` |
-| **`dsh-llm-router`** | `LlmRouter` | `"llmRouter"`（服务） | **多提供方声明式路由与热重载插件**：将多路由配置（`~/.dsh-rs/models.json`）映射到上述协议适配器，支持 `protocol` 选择、`api_key_env` 动态解析、`models` / `model_overrides` 目录、请求头扩展钩子与原子热更新 | `["llm"]` | `cordis`、`dsh-llm`、`dsh-llm-http`、`dsh-llm-completions`、`dsh-llm-responses`、`dsh-llm-messages`、`dsh-llm-mock` |
+| **`dsh-llm-router`** | `LlmRouter` | `"llmRouter"`（服务） | **多提供方声明式路由与热重载插件**：将多路由配置（`~/.dsh-rs/models.json`）映射到上述协议适配器，支持 `protocol` 选择、`api_key_env` 与 `$VAR` / `${VAR}` / `!command` 动态解析、`models` / `modelOverrides` 目录、请求头扩展钩子，并暴露 `apply_config` 原子热更新接口（**当前无内置文件监听**，需宿主在配置变更时主动调用） | `["llm"]` | `cordis`、`dsh-llm`、`dsh-llm-http`、`dsh-llm-completions`、`dsh-llm-responses`、`dsh-llm-messages`、`dsh-llm-mock` |
 
 ---
 
 ## 四、工具插件
 
-以下插件均向 `"tools"` 运行时注册可执行工具，运行时均注入 `"tools"` 服务。
+以下插件中，4.1–4.4 与 4.5 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.6 `dsh-instructions` 是例外**：它不注册任何工具、不声明 `inject`，纯以事件订阅方式向会话注入 `ContextNotice`。
 
 工具的可达性由 `dsh-tools` 的 **`ToolExposure`** 统一控制：
 
@@ -61,6 +61,8 @@ HTTP 传输实现收敛在 `dsh-llm-http`，其余协议与路由插件运行时
 | `Codemode` | ✗（需激活） | ✓ | ✓ | MCP 工具默认、`codemode` 内部依赖的工具 |
 | `Deferred` | ✗（需激活） | ✓ | ✗（靠 `tool_search` / `searchTools()` 发现） | MCP 工具可选项 |
 | `Hidden` | ✗ | ✗ | ✗ | 显式屏蔽（`exclude_tools`） |
+
+激活与排除的优先级依次为（`dsh-tools` 的 `is_default_active`）：**`include_tools` 通配白名单** > `global_active_overrides` > 工具的 `default_active`；任何情况下 `ToolExposure::Hidden` 与命中 `exclude_tools` 的工具都不可激活。显式激活过的工具会在下一次模型调用时重新参与声明，而 `Codemode` / `Deferred` 工具即使未激活也仍可被脚本或 `tool_search` 调用（`resolve_callable_infos`）。
 
 ### 4.1 最小只读套件（Legacy 模式）
 
@@ -80,19 +82,25 @@ HTTP 传输实现收敛在 `dsh-llm-http`，其余协议与路由插件运行时
 | Crate | 插件结构体 | 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`dsh-tool-search`** | `ToolSearchPlugin` | `"tool-search"` | `tool_search` | `["tools"]` | **BM25 工具发现**：对 `Codemode` / `Deferred` 暴露等级的工具建索引（名称权重 4.0、命名空间 2.0），命中后按会话（或全局）激活，使其出现在下一次模型调用的声明中。存在可搜索工具时自动激活，`default_limit` 默认 8 | `cordis`、`dsh-tools` |
-| **`dsh-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎**：把多个工具调用折叠成一次脚本执行，中间结果不进上下文。提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s）与内联预算（默认 6 000 字符）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`dsh-tool-search`、`dsh-tools` |
+| **`dsh-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎**：把多个工具调用折叠成一次脚本执行，中间结果不进上下文。提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s）与内联预算（默认 3 000 字符，`DEFAULT_CODEMODE_INLINE_BUDGET`）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`dsh-tool-search`、`dsh-tools` |
 
 ### 4.4 MCP 接入
 
 | Crate | 服务结构体 | 提供服务名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`dsh-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.dsh-rs/mcp.json` 与 `<workspace>/.dsh-rs/mcp.json` 加载配置，支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`）两种传输；按 Server 与逐工具两级配置暴露等级（默认 `Codemode`）；后台异步连接不阻塞启动；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`dsh-llm`、`dsh-system-prompt`、`dsh-tools` |
+| **`dsh-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.dsh-rs/mcp.json` 与 `<workspace>/.dsh-rs/mcp.json` 加载配置（项目级可用 `override` 仅改单个 Server 的暴露等级），支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`，`Accept: application/json, text/event-stream`）两种传输；按 Server 与逐工具两级配置暴露等级（`McpExposure` 默认 `Codemode`，支持通配符匹配），后台异步连接不阻塞启动；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`dsh-llm`、`dsh-system-prompt`、`dsh-tools` |
 
 ### 4.5 技能系统
 
 | Crate | 服务 / 插件结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`dsh-skills`** | `SkillRegistry` + `SkillsPlugin` | `"skills"` / `"skills-plugin"` | `skill` | `["tools", "skills"]` | **渐进式技能发现与按需加载**：扫描分层技能根（项目 `.agents/skills` → 自定义目录 → 用户 `~/.agents/skills` → 内置包），解析 `SKILL.md` frontmatter，按 rank 升序仲裁同名技能；通过合成消息注入技能目录并支持热失效——监听 `write` / `edit` 写入命中技能目录时自动刷新缓存，广播 `skills/change` | `cordis`、`dsh-agent-loop`、`dsh-llm`、`dsh-session`、`dsh-tools` |
+
+### 4.6 工作区指令系统
+
+| Crate | 服务结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`dsh-instructions`** | `AgentInstructions` | `"agentInstructions"` / `"agent-instructions"` | —（不注册工具） | 无（事件订阅 `tools/result` + `agent/pre-step`） | **多层级 `AGENTS.md` / `CLAUDE.md` 自动加载与热同步**：扫描 `~/.dsh-rs/`（`DSH_RS_HOME`）与 `~/.agents/`（`DSH_AGENTS_HOME`）、由 `.git` 项目根到工作区的祖先链，以及 `read`/`write`/`edit` 触达的子目录（`follow_subdirs`）；默认候选 `AGENTS.md` / `CLAUDE.md` 与 `.local.md` 变体。同组按去空白 SHA-256 摘要去重、不同内容并存；超预算时**优先淘汰最宽泛的祖先**以保住近目录指令，并在正文做 UTF-8 安全截断。默认 `max_bytes` 65 536、`max_source_bytes` 1 MiB（超出即跳过该文件）；通过 `agent/pre-step` 注入 `ContextNotice`，文件增删改时发增量提示，并在历史压缩后自动重建基线 | `cordis`、`dsh-agent-loop`、`dsh-session`、`dsh-tools` |
 
 ---
 
@@ -118,7 +126,7 @@ HTTP 传输实现收敛在 `dsh-llm-http`，其余协议与路由插件运行时
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`dsh-agent-spine`** | `AgentSpinePlugin` | `"agent-spine"` | **核心装配套件**：支持通过 Cargo features（`legacy` / `coding` / `sqlite` / `trajectory` / `router`）按需裁剪插件栈（`--no-default-features` 仅拉起最小微内核与核心服务）。同时提供 `load_dsh_config` 读取 `~/.dsh-rs/` 与 `<workspace>/.dsh-rs/` 下的 `settings.json` / `models.json` / `mcp.json` | 无（自身负责装配） | 按 Cargo features 选配后端 crate |
-| **`dsh-tui`** | 可执行文件 `dsh-tui` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `dsh-tui-ui`。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测） | `dsh-tui-ui`、`dsh-agent-spine` 及宿主桥接 crate |
+| **`dsh-tui`** | 可执行文件 `dsh-tui` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `dsh-tui-ui`。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测） | `dsh-tui-ui`、`dsh-agent-spine` 及宿主桥接 crate |
 
 ---
 
@@ -137,10 +145,11 @@ HTTP 传输实现收敛在 `dsh-llm-http`，其余协议与路由插件运行时
 │  dsh-session-sqlite  (sessionPersistence)                               │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 v
-┌─ 工具插件层（均 inject ["tools"]） ─────────────────────────────────────┐
+┌─ 工具插件层（除 dsh-instructions 外均 inject ["tools"]） ───────────────┐
 │  coding: dsh-tools-coding / dsh-tool-search / dsh-codemode              │
 │  legacy: dsh-tool-fs / dsh-tool-time                                    │
 │  extra : dsh-mcp / dsh-skills                                           │
+│  notice: dsh-instructions（不注册工具，仅注入 ContextNotice）           │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 v
 ┌─ 基础服务与模型层 ──────────────────────────────────────────────────────┐
@@ -153,3 +162,31 @@ HTTP 传输实现收敛在 `dsh-llm-http`，其余协议与路由插件运行时
 ```
 
 **编译隔离边界**：`dsh-tui-ui`、`dsh-llm-types`、`dsh-trajectory-core` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite`；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `dsh-tui-ui` 与薄宿主 `dsh-tui`。
+
+---
+
+## 九、配置字段速查
+
+全局 `~/.dsh-rs/` 与项目 `<workspace>/.dsh-rs/` 会按目录顺序叠加，后者覆盖前者（`exclude_tools` 与 `custom_dirs` 是追加而非覆盖）。目录可用 `DSH_RS_HOME` 改写。
+
+`settings.json`（`SettingsConfig`，camelCase，全部字段可选）：
+
+| 字段 | 类型 | 作用 |
+| :--- | :--- | :--- |
+| `defaultProvider` / `defaultModel` | string | 默认提供方与模型 |
+| `reasoningEffort`（别名 `defaultThinkingLevel`） | string | 思考强度 `off`..`max` |
+| `maxSteps` | number | 单轮工具步数上限，省略则不限 |
+| `persona` | string | 覆盖内置人设 |
+| `toolsPreset` | `all` / `minimal` / `read-only` | 编码工具预设，对应 `--minimal` / `--read-only` |
+| `tools` | string[] | 工具白名单（支持 `*` 通配） |
+| `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |
+| `restrictToWorkspace` | bool | 将文件工具限制在工作区内（**默认 `false`**） |
+| `sessionDb` | string | SQLite 落盘路径；等价环境变量 `DSH_RS_SESSION_DB`（`none` / `off` 关闭） |
+| `codemode` | object | `autoEnable` / `onlyMode` / `inlineBudget` / `timeoutMs` |
+| `toolSearch` | object | `autoEnable` / `defaultLimit` |
+| `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
+| `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` / `followSubdirs` |
+
+`models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/dsh-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，并额外支持每个 Server 的 `exposure` 与 `toolExposure`。
+
+> **注意**：`restrictToWorkspace` 默认关闭且 `TuiConfig::approval_mode` 默认为 `Auto`，即开箱状态下 `bash` / `write` / `edit` 可触达工作区外路径且无审批弹窗；需要沙箱感时请显式开启 `restrictToWorkspace` 并搭配 `--approve`。

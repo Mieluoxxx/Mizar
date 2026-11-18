@@ -13,6 +13,7 @@ cordis = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 dsh-agent-loop = { workspace = true }
 dsh-agent-spine = { workspace = true }
+dsh-instructions = { workspace = true }
 dsh-llm = { workspace = true }
 dsh-llm-mock = { workspace = true }
 dsh-llm-retry = { workspace = true }

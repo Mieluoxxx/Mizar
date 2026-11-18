@@ -402,6 +402,25 @@ pub fn render_pill_spans(raw_label: &str, theme: &Theme, cfg: &EmphasisConfig) -
     }
 }
 
+pub fn is_mode_pill(raw_label: &str) -> bool {
+    matches!(parse_pill(raw_label).tone, PillTone::Mode)
+}
+
+pub fn pill_matches_label(pill_raw: &str, label: &str) -> bool {
+    let stem = label
+        .trim()
+        .trim_end_matches([':', '：'])
+        .trim()
+        .to_ascii_lowercase();
+    if stem.is_empty() {
+        return false;
+    }
+    let pill = parse_pill(pill_raw);
+    stem == pill.key
+        || stem == pill.word.to_ascii_lowercase()
+        || stem == pill_raw.trim().to_ascii_lowercase()
+}
+
 /// 给已知标题或行首加粗标签补充图标（例如 `Finding:` -> ` Finding:`）。
 pub fn decorate_label_with_icon(label: &str, cfg: &EmphasisConfig) -> String {
     if !cfg.enabled || !cfg.icons || starts_with_pua_glyph(label).is_some() {
@@ -469,18 +488,18 @@ pub fn reply_guidance_prompt() -> String {
     format!(
         "These rules shape replies written to the user in this terminal. It colors pills, adds icons, and cannot change text size.\n\
          \n\
-         - **Label every reply.** Start the first substantive line with a bold label, even for a one-line update, and give each subject in a multi-part reply a short heading or a bullet with a bold lead label. Write the label as a plain word; the terminal adds its icon. Never type icon glyphs. Labels with an icon: {labels}. Prefer these; any other label shows without an icon.\n\
+         - **Open cleanly without duplicating labels.** Start a substantive reply either with one optional work-mode pill ({mode}) on its own header line before the body, or with a bold lead label—never repeat the same word as both a bold label and a pill (never `**Investigate** [[Investigate]]`), and never glue a mode pill onto the start of a multi-line paragraph. Write labels as plain words; the terminal adds icons. Never type icon glyphs. Labels with an icon: {labels}. Prefer these; any other label shows without an icon.\n\
          - **Shape follows information.** Use `├──` and `└──` (with `│  ` for nested levels) for what belongs to what, `→` for a sequence, `✓` or `✗` beside a checked item. Keep tree lines plain (never wrap `├──`, `└──`, or `│` in `**...**`), omit blank lines inside an active tree, and indent child rows directly under `│  ` (or use a Markdown table / nested list without mixing `├──` headings and flush `-` bullets).\n\
-         - **Bold the anchor terms.** Treat the components, choices, options, and statuses under discussion as key nodes, and bold them where they carry the point (1-3 bold spans per paragraph or bullet). Italicize sparingly for contrast.\n\
-         - **Pills are required, not optional.** A pill is `[[Word]]` beside the subject it describes; the terminal colors it and adds its icon from the word:\n\
+         - **Bold the anchor terms.** Treat the components, choices, and key verdicts under discussion as concise bold anchors (1-3 short bold spans per paragraph or bullet, never entire long sentences). Italicize sparingly for contrast.\n\
+         - **Use pills sparingly for true status slots.** A pill is `[[Word]]` on a status cell, checklist verdict, or concrete outcome—not required on every heading or paragraph. Never place pills inside mid-sentence prose or parenthetical clauses (`(...)` / `（...）`), and never attach misleading status pills like [[Skipped]] or [[Pending]] to findings you already inspected:\n\
            - **Red (wrong):** {err}\n\
            - **Yellow (attention):** {warn}\n\
            - **Green (settled):** {ok}\n\
            - **Solid red (consequences):** {danger}\n\
-           - **Cyan (kind of work):** open substantive replies with one of {mode}\n\
+           - **Cyan (kind of work):** {mode} (standalone header line only)\n\
            - **Blue (ownership):** {owner}\n\
-           - **Soft blue (context):** {ctx}, and any other short label.\n\
-         - **Every attention pill carries its action.** Follow every red/yellow/solid-red pill and [[Inferred]] with a bold action lead-in ending in a colon ({actions}).\n\
+           - **Soft blue (context):** {ctx}, and any other short status label.\n\
+         - **Every attention pill carries its action.** Follow a red/yellow/solid-red pill or [[Inferred]] with a bold action lead-in ending in a colon ({actions}).\n\
          - **Copyable text stays clean.** Keep pills out of paths, commands, code blocks, and exact identifiers.",
         labels = title_list(LABEL_ICONS),
         err = join_pills(ERROR_CORE),
@@ -550,5 +569,17 @@ mod tests {
         assert!(prompt.contains("[[Costs money]]"));
         assert!(prompt.contains("Finding"));
         assert!(prompt.contains("Check"));
+        assert!(!prompt.contains("Pills are required"));
+        assert!(prompt.contains("Use pills sparingly"));
+        assert!(prompt.contains("never `**Investigate** [[Investigate]]`"));
+    }
+
+    #[test]
+    fn detects_mode_pills_and_label_matches() {
+        assert!(is_mode_pill("Investigate"));
+        assert!(!is_mode_pill("Done"));
+        assert!(pill_matches_label("Investigate", "Investigate:"));
+        assert!(pill_matches_label("Completed", "Done"));
+        assert!(!pill_matches_label("Done", "Finding"));
     }
 }

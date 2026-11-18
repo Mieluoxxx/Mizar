@@ -3,7 +3,8 @@
 //! 统一承接 `/` 命令补全、`@` 文件模糊引用（接 `ignore` crate）、交互式 `/model`、`/effort`、
 //! `/theme` 选择器、`Ctrl+R` 历史模糊搜索、`?` 帮助面板，以及可选的 `tools/pre-execute` 审批弹窗。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -17,6 +18,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::editor::display_width;
+use crate::mentions::{
+    MentionCandidate, MentionCandidateKind, fuzzy_subsequence_score, is_path_like_query,
+};
 use crate::theme::{Theme, ThemePreset};
 
 #[derive(Debug, Clone)]
@@ -35,12 +39,12 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
         },
         SlashEntry {
             command: "model".into(),
-            description: "交互切换模型 / Provider".into(),
+            description: "交互切换模型 / Provider (Ctrl+L)".into(),
             takes_arg: true,
         },
         SlashEntry {
             command: "effort".into(),
-            description: "调整思考强度 (off..max)".into(),
+            description: "调整思考强度 (Tab 切换 / off..max)".into(),
             takes_arg: true,
         },
         SlashEntry {
@@ -84,6 +88,11 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
             takes_arg: false,
         },
         SlashEntry {
+            command: "instructions".into(),
+            description: "查看已加载的 AGENTS.md / CLAUDE.md 指令".into(),
+            takes_arg: false,
+        },
+        SlashEntry {
             command: "tree".into(),
             description: "查看会话时间线与分叉回溯树".into(),
             takes_arg: false,
@@ -110,7 +119,7 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
         },
         SlashEntry {
             command: "clear".into(),
-            description: "开启全新会话 (Ctrl+L)".into(),
+            description: "开启全新会话 (/new)".into(),
             takes_arg: false,
         },
         SlashEntry {
@@ -129,81 +138,298 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
     list
 }
 
-/// 缓存 2 秒的工作区文件索引（利用 `ignore` crate 自动遵守 `.gitignore`）。
+const WORKSPACE_INDEX_TTL: Duration = Duration::from_secs(5);
+const WORKSPACE_INDEX_MAX_ENTRIES: usize = 8_192;
+const WORKSPACE_COLD_WAIT: Duration = Duration::from_millis(60);
+const MENTION_RESULT_LIMIT: usize = 25;
+
 #[derive(Debug, Default)]
-pub struct WorkspaceFileCache {
-    files: Vec<String>,
+struct CachedWorkspaceState {
+    workspace: Option<PathBuf>,
+    entries: Vec<MentionCandidate>,
     refreshed_at: Option<Instant>,
+    scanning: bool,
+    generation: u64,
+}
+
+/// 工作区文件与目录索引缓存（利用 `ignore` crate 遵守 `.gitignore`，后台非阻塞刷新 + 路径直列模式）。
+#[derive(Debug, Clone)]
+pub struct WorkspaceFileCache {
+    shared: Arc<(Mutex<CachedWorkspaceState>, Condvar)>,
+    last_seen_gen: u64,
+}
+
+impl Default for WorkspaceFileCache {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new((Mutex::new(CachedWorkspaceState::default()), Condvar::new())),
+            last_seen_gen: 0,
+        }
+    }
 }
 
 impl WorkspaceFileCache {
-    pub fn files(&mut self, workspace: &Path) -> &[String] {
-        let stale = self
+    fn spawn_scan_if_needed(&self, workspace: &Path) -> bool {
+        let mut guard = self.shared.0.lock().unwrap();
+        let ws_changed = guard.workspace.as_deref() != Some(workspace);
+        if ws_changed {
+            guard.workspace = Some(workspace.to_path_buf());
+            guard.entries.clear();
+            guard.refreshed_at = None;
+            guard.scanning = false;
+        }
+        let stale = guard
             .refreshed_at
-            .is_none_or(|t| t.elapsed() > Duration::from_secs(2));
-        if stale {
-            let mut found = Vec::new();
-            let walker = WalkBuilder::new(workspace)
-                .hidden(false)
-                .max_depth(Some(8))
-                .build();
-            for entry in walker.flatten() {
-                if found.len() >= 256 {
+            .is_none_or(|t| t.elapsed() > WORKSPACE_INDEX_TTL);
+        let cold = guard.entries.is_empty() && guard.refreshed_at.is_none();
+        if stale && !guard.scanning {
+            guard.scanning = true;
+            let shared = Arc::clone(&self.shared);
+            let ws = workspace.to_path_buf();
+            std::thread::spawn(move || {
+                let scanned = scan_workspace_entries(&ws);
+                let mut g = shared.0.lock().unwrap();
+                if g.workspace.as_deref() == Some(ws.as_path()) {
+                    g.entries = scanned;
+                    g.refreshed_at = Some(Instant::now());
+                    g.generation = g.generation.wrapping_add(1);
+                }
+                g.scanning = false;
+                shared.1.notify_all();
+            });
+        }
+        if cold {
+            let deadline = Instant::now() + WORKSPACE_COLD_WAIT;
+            while guard.scanning && guard.entries.is_empty() {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
                     break;
                 }
-                if entry.file_type().is_some_and(|ft| ft.is_file())
-                    && let Ok(rel) = entry.path().strip_prefix(workspace)
-                {
-                    found.push(rel.to_string_lossy().replace('\\', "/"));
+                let (next_guard, res) = self.shared.1.wait_timeout(guard, rem).unwrap();
+                guard = next_guard;
+                if res.timed_out() {
+                    break;
                 }
             }
-            found.sort();
-            self.files = found;
-            self.refreshed_at = Some(Instant::now());
+            if guard.entries.is_empty() {
+                // 超大型仓库首次扫描未在 60ms 内结束时，先同步返回首层目录条目避免卡顿
+                guard.entries = list_shallow_workspace_entries(workspace);
+            }
         }
-        &self.files
+        cold
     }
 
-    pub fn match_query(&mut self, workspace: &Path, query: &str) -> Vec<String> {
-        let q = query.trim().to_ascii_lowercase();
-        let all = self.files(workspace);
-        if q.is_empty() {
-            return all.iter().take(12).cloned().collect();
+    /// 检查后台索引是否刚更新了新代次，供展开的 `@` 浮层无感刷新候选列表。
+    pub fn consume_generation_update(&mut self) -> bool {
+        let g = self.shared.0.lock().unwrap();
+        if g.generation != self.last_seen_gen {
+            self.last_seen_gen = g.generation;
+            true
+        } else {
+            false
         }
-        let mut scored: Vec<(i32, String)> = all
+    }
+
+    pub fn files(&mut self, workspace: &Path) -> Vec<String> {
+        self.spawn_scan_if_needed(workspace);
+        let g = self.shared.0.lock().unwrap();
+        self.last_seen_gen = g.generation;
+        g.entries
             .iter()
-            .filter_map(|path| fuzzy_score(path, &q).map(|s| (s, path.clone())))
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
-        scored.into_iter().take(12).map(|(_, p)| p).collect()
+            .filter(|e| e.kind == MentionCandidateKind::File)
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    pub fn match_query(&mut self, workspace: &Path, query: &str) -> Vec<MentionCandidate> {
+        if is_path_like_query(query) {
+            return list_path_candidates(workspace, query, MENTION_RESULT_LIMIT);
+        }
+        self.spawn_scan_if_needed(workspace);
+        let g = self.shared.0.lock().unwrap();
+        self.last_seen_gen = g.generation;
+        rank_mention_candidates(&g.entries, query, MENTION_RESULT_LIMIT)
     }
 }
 
-fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
-    let lower = candidate.to_ascii_lowercase();
-    if lower == query {
-        return Some(1000);
-    }
-    if lower.starts_with(query) {
-        return Some(800 - candidate.len() as i32);
-    }
-    if let Some(pos) = lower.find(query) {
-        return Some(500 - pos as i32 - candidate.len() as i32);
-    }
-    // 简单子序列模糊匹配（`@mep` -> `markdown_emphasis.rs`）
-    let mut q_chars = query.chars().peekable();
-    let mut hits = 0i32;
-    for ch in lower.chars() {
-        if q_chars.peek() == Some(&ch) {
-            q_chars.next();
-            hits += 10;
+fn scan_workspace_entries(workspace: &Path) -> Vec<MentionCandidate> {
+    let mut found = Vec::new();
+    let walker = WalkBuilder::new(workspace)
+        .hidden(false)
+        .max_depth(Some(8))
+        .build();
+    for entry in walker.flatten() {
+        if found.len() >= WORKSPACE_INDEX_MAX_ENTRIES {
+            break;
+        }
+        let Ok(rel) = entry.path().strip_prefix(workspace) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str.is_empty() {
+            continue;
+        }
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            found.push(MentionCandidate {
+                path: format!("{}/", rel_str.trim_end_matches('/')),
+                name,
+                kind: MentionCandidateKind::Directory,
+            });
+        } else if ft.is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            found.push(MentionCandidate {
+                path: rel_str,
+                name,
+                kind: MentionCandidateKind::File,
+            });
         }
     }
-    if q_chars.peek().is_none() {
-        Some(hits - candidate.len() as i32)
-    } else {
-        None
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+fn list_shallow_workspace_entries(workspace: &Path) -> Vec<MentionCandidate> {
+    let Ok(rd) = std::fs::read_dir(workspace) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" || name == ".DS_Store" {
+            continue;
+        }
+        let is_dir = entry.path().is_dir();
+        out.push(MentionCandidate {
+            path: if is_dir {
+                format!("{name}/")
+            } else {
+                name.clone()
+            },
+            name,
+            kind: if is_dir {
+                MentionCandidateKind::Directory
+            } else {
+                MentionCandidateKind::File
+            },
+        });
     }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+fn expand_home_dir_prefix(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(raw)
+}
+
+fn list_path_candidates(
+    workspace: &Path,
+    query: &str,
+    limit: usize,
+) -> Vec<MentionCandidate> {
+    let normalized = query.replace('\\', "/");
+    let raw_slash = query.rfind(['/', '\\']);
+    let slash = normalized.rfind('/');
+    let bare_dir =
+        slash.is_none() && matches!(normalized.as_str(), "." | ".." | "~");
+
+    let dir_part = if bare_dir {
+        format!("{normalized}/")
+    } else if let Some(pos) = slash {
+        normalized[..=pos].to_string()
+    } else {
+        String::new()
+    };
+
+    let display_dir = if bare_dir {
+        format!("{query}/")
+    } else if let Some(pos) = raw_slash {
+        query[..=pos].to_string()
+    } else {
+        String::new()
+    };
+
+    let display_sep = if display_dir.ends_with('\\') { '\\' } else { '/' };
+    let name_query = if bare_dir {
+        ""
+    } else if let Some(pos) = slash {
+        &normalized[pos + 1..]
+    } else {
+        normalized.as_str()
+    };
+
+    let expanded = expand_home_dir_prefix(&dir_part);
+    let target_dir = if expanded.is_absolute() {
+        expanded
+    } else if dir_part.is_empty() {
+        workspace.to_path_buf()
+    } else {
+        workspace.join(expanded)
+    };
+
+    let Ok(rd) = std::fs::read_dir(&target_dir) else {
+        return Vec::new();
+    };
+    let show_dot_hidden = name_query.starts_with('.');
+    let mut entries = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (name == ".git" || name == ".DS_Store") && !show_dot_hidden {
+            continue;
+        }
+        let is_dir = entry.path().is_dir();
+        let path = if is_dir {
+            format!("{display_dir}{name}{display_sep}")
+        } else {
+            format!("{display_dir}{name}")
+        };
+        entries.push(MentionCandidate {
+            path,
+            name,
+            kind: if is_dir {
+                MentionCandidateKind::Directory
+            } else {
+                MentionCandidateKind::File
+            },
+        });
+    }
+
+    rank_mention_candidates(&entries, name_query, limit)
+}
+
+fn rank_mention_candidates(
+    entries: &[MentionCandidate],
+    query: &str,
+    limit: usize,
+) -> Vec<MentionCandidate> {
+    let mut scored: Vec<(i32, MentionCandidate)> = entries
+        .iter()
+        .filter_map(|c| {
+            fuzzy_subsequence_score(query, &c.path, &c.name, c.kind).map(|s| (s, c.clone()))
+        })
+        .collect();
+    scored.sort_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa)
+            .then_with(|| {
+                let da = matches!(a.kind, MentionCandidateKind::Directory);
+                let db = matches!(b.kind, MentionCandidateKind::Directory);
+                db.cmp(&da)
+            })
+            .then_with(|| a.path.len().cmp(&b.path.len()))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    scored.into_iter().take(limit).map(|(_, c)| c).collect()
 }
 
 #[derive(Debug)]
@@ -255,8 +481,11 @@ pub enum OverlayKind {
     },
     FileMention {
         token_start: usize,
+        token_end: usize,
+        path_end: usize,
+        is_quoted: bool,
         query: String,
-        matches: Vec<String>,
+        matches: Vec<MentionCandidate>,
         selected: usize,
     },
     ModelPicker {
@@ -302,7 +531,10 @@ pub enum OverlayAction {
     },
     CompleteMention {
         token_start: usize,
-        path: String,
+        token_end: usize,
+        path_end: usize,
+        is_quoted: bool,
+        candidate: MentionCandidate,
     },
     SelectModel {
         provider: String,
@@ -479,6 +711,9 @@ impl OverlayState {
             }
             OverlayKind::FileMention {
                 token_start,
+                token_end,
+                path_end,
+                is_quoted,
                 matches,
                 selected,
                 ..
@@ -499,7 +734,10 @@ impl OverlayState {
                 {
                     Some(OverlayAction::CompleteMention {
                         token_start: *token_start,
-                        path: matches[*selected].clone(),
+                        token_end: *token_end,
+                        path_end: *path_end,
+                        is_quoted: *is_quoted,
+                        candidate: matches[*selected].clone(),
                     })
                 }
                 _ => None,
@@ -792,11 +1030,17 @@ impl OverlayState {
                             }
                             OverlayKind::FileMention {
                                 token_start,
+                                token_end,
+                                path_end,
+                                is_quoted,
                                 matches,
                                 ..
-                            } => matches.get(idx).map(|p| OverlayAction::CompleteMention {
+                            } => matches.get(idx).map(|c| OverlayAction::CompleteMention {
                                 token_start: *token_start,
-                                path: p.clone(),
+                                token_end: *token_end,
+                                path_end: *path_end,
+                                is_quoted: *is_quoted,
+                                candidate: c.clone(),
                             }),
                             OverlayKind::ModelPicker { items, query, .. } => {
                                 let filtered: Vec<&ModelPickerItem> = items
@@ -952,18 +1196,25 @@ pub fn render_overlay(
             selected,
             ..
         } => {
+            let max_w = full_area.width.clamp(28, 104);
+            let left_budget = (max_w as usize).saturating_sub(6).max(12);
             let rows: Vec<(String, String)> = matches
                 .iter()
-                .map(|p| (format!("@{p}"), String::new()))
+                .map(|c| {
+                    let display = clip_left_path(&format!("@{}", c.path), left_budget);
+                    (display, String::new())
+                })
                 .collect();
-            let title = format!(" 文件引用: @{query} (Tab/Enter 插入) ");
-            render_anchored_list(
+            let title = format!(" 文件/目录引用: @{query} (Tab/Enter 插入 · Esc 隐藏) ");
+            render_anchored_list_sized(
                 frame,
                 full_area,
                 input_area,
                 &title,
                 &rows,
                 *selected,
+                max_w,
+                10,
                 theme,
                 state,
             );
@@ -1133,12 +1384,58 @@ fn render_anchored_list(
     theme: &Theme,
     state: &mut OverlayState,
 ) {
-    let box_h = (rows.len().clamp(1, 8) + 2) as u16;
     let box_w = full_area.width.clamp(24, 72);
+    render_anchored_list_sized(
+        frame,
+        full_area,
+        anchor_area,
+        title,
+        rows,
+        selected,
+        box_w,
+        8,
+        theme,
+        state,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_anchored_list_sized(
+    frame: &mut Frame<'_>,
+    full_area: Rect,
+    anchor_area: Rect,
+    title: &str,
+    rows: &[(String, String)],
+    selected: usize,
+    box_w: u16,
+    max_rows: usize,
+    theme: &Theme,
+    state: &mut OverlayState,
+) {
+    let box_h = (rows.len().clamp(1, max_rows) + 2) as u16;
     let y = anchor_area.y.saturating_sub(box_h);
     let x = anchor_area.x.min(full_area.width.saturating_sub(box_w));
     let rect = Rect::new(x, y, box_w, box_h.min(anchor_area.y.max(3)));
     draw_list_box(frame, rect, title, rows, selected, theme, state);
+}
+
+fn clip_left_path(s: &str, max_cols: usize) -> String {
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    let mut kept = Vec::new();
+    let mut w = 1usize; // 预留前缀 '…'
+    for ch in s.chars().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max_cols {
+            break;
+        }
+        kept.push(ch);
+        w += cw;
+    }
+    kept.reverse();
+    let tail: String = kept.into_iter().collect();
+    format!("…{tail}")
 }
 
 fn render_centered_list(
@@ -1373,8 +1670,13 @@ fn render_help_modal(
     state.last_box = Some(rect);
 
     let items = [
-        ("Enter / Tab (运行中)", "空闲发送；运行中 Tab 排入 Follow-up 队列，Ctrl+Enter 立即插队"),
+        ("Enter (空闲 / 运行中)", "空闲直接发送；运行中自动加入 Follow-up 队列"),
+        ("Ctrl+Enter", "立即发送（运行中打断当前回合并立即插队发送）"),
         ("Shift+Enter / Ctrl+J", "插入换行；粘贴超长文本自动折叠为原子块"),
+        ("Tab", "循环切换思考等级（补全浮层内为补全选中项）"),
+        ("Ctrl+L", "打开交互式模型选择器（等同 /model）"),
+        ("Esc", "取消选区或浮层 -> 暂停当前生成 -> 清空输入"),
+        ("Ctrl+C", "复制选区 / 关闭弹窗 / 单击清空输入 / 中断或双击退出"),
         ("鼠标划词 / 双击 / 三击", "应用级分栏选区（自动拼接软换行），松手自动复制；F2 切换鼠标追踪"),
         ("Ctrl+B / Ctrl+O", "Ctrl+B 开关侧栏；Ctrl+O 展开/折叠思考与完整工具输出"),
         ("Ctrl+T / /trace", "打开全屏三泳道轨迹分析器（WaveBand + Timeline + Hotspots）"),
@@ -1383,7 +1685,6 @@ fn render_help_modal(
         ("/tree /skills /view", "会话分支树回溯 / 交互技能选择 / Fullscreen↔Inline 视图热切"),
         ("/model /effort /theme", "交互切换模型、思考深度与 Oklab 自适应主题"),
         ("/approval [auto|ask]", "开启或关闭工具调用交互式审批确认弹窗（支持拒绝附理由）"),
-        ("Esc / Ctrl+C", "优先取消选区或浮层 -> 中断生成 -> 清空输入 -> 双击退出"),
     ];
     let cap = inner.height as usize;
     let start = scroll.min(items.len().saturating_sub(cap));
@@ -1411,9 +1712,114 @@ mod tests {
 
     #[test]
     fn fuzzy_ranks_exact_and_prefix_and_subsequence_matches() {
-        assert!(fuzzy_score("crates/dsh-tui/src/app.rs", "app").is_some());
-        let s1 = fuzzy_score("app.rs", "app").unwrap();
-        let s2 = fuzzy_score("crates/dsh-tui/src/app.rs", "app").unwrap();
+        assert!(
+            fuzzy_subsequence_score(
+                "app",
+                "crates/dsh-tui/src/app.rs",
+                "app.rs",
+                MentionCandidateKind::File,
+            )
+            .is_some()
+        );
+        let s1 = fuzzy_subsequence_score("app", "app.rs", "app.rs", MentionCandidateKind::File)
+            .unwrap();
+        let s2 = fuzzy_subsequence_score(
+            "app",
+            "crates/dsh-tui/src/app.rs",
+            "app.rs",
+            MentionCandidateKind::File,
+        )
+        .unwrap();
         assert!(s1 > s2);
+    }
+
+    #[test]
+    fn workspace_file_cache_indexes_over_256_entries_and_lists_directories() {
+        let tmp = std::env::temp_dir().join(format!(
+            "dsh_tui_file_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("crates/sub")).unwrap();
+        for idx in 0..320 {
+            std::fs::write(tmp.join(format!("crates/file_{idx:03}.rs")), "").unwrap();
+        }
+        std::fs::write(tmp.join("crates/sub/target_deep.rs"), "").unwrap();
+
+        let mut cache = WorkspaceFileCache::default();
+        let matches = cache.match_query(&tmp, "target_deep");
+        assert!(
+            matches.iter().any(|c| c.path == "crates/sub/target_deep.rs"),
+            "expected deep file beyond 256 limit, got: {matches:?}"
+        );
+
+        let dir_matches = cache.match_query(&tmp, "crates/s");
+        assert!(
+            dir_matches
+                .iter()
+                .any(|c| c.path == "crates/sub/" && c.kind == MentionCandidateKind::Directory),
+            "expected directory candidate in path-like query, got: {dir_matches:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn file_mention_overlay_renders_directory_without_dir_badge() {
+        let mut state = OverlayState {
+            active: Some(OverlayKind::FileMention {
+                token_start: 0,
+                token_end: 8,
+                path_end: 8,
+                is_quoted: false,
+                query: "crates/".into(),
+                matches: vec![
+                    MentionCandidate {
+                        path: "crates/dsh-tui/".into(),
+                        name: "dsh-tui/".into(),
+                        kind: MentionCandidateKind::Directory,
+                    },
+                    MentionCandidate {
+                        path: "crates/Cargo.toml".into(),
+                        name: "Cargo.toml".into(),
+                        kind: MentionCandidateKind::File,
+                    },
+                ],
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::from_preset(ThemePreset::Auto, None);
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_overlay(
+                    frame,
+                    Rect::new(0, 0, 80, 20),
+                    Rect::new(0, 15, 80, 5),
+                    &mut state,
+                    &[],
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            for x in 0..buf.area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            lines.push(row);
+        }
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("@crates/dsh-tui/"), "rendered:\n{rendered}");
+        assert!(rendered.contains("@crates/Cargo.toml"), "rendered:\n{rendered}");
+        assert!(
+            !rendered.contains("  dir"),
+            "unexpected dir badge in rendered overlay:\n{rendered}"
+        );
     }
 }

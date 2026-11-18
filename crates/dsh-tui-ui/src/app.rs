@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use dsh_llm_types::{ContentBlock, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall};
+use dsh_llm_types::{ContentBlock, ModelInfo, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall};
 use dsh_trajectory_core::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::editor::{TextInput, char_width};
 use crate::emphasis::EmphasisConfig;
 use crate::markdown::RenderedLine;
+use crate::mentions::{FILE_MENTIONS_SOURCE, format_mention_replacement};
 use crate::overlay::{
     ApprovalDecision, OverlayAction, OverlayKind, OverlayState, SessionTreeEntry,
     WorkspaceFileCache,
@@ -93,7 +94,6 @@ pub enum ChatItem {
 pub struct ToolExtraMeta {
     pub full_content: String,
     pub diff_raw: Option<String>,
-    pub local_expanded: Option<bool>,
 }
 
 /// 单个消息条目的行级渲染缓存键。
@@ -211,6 +211,11 @@ pub enum UiEvent {
     },
     Usage(TokenUsage),
     Anomaly(String),
+    Flash(String),
+    Notice {
+        level: NoticeLevel,
+        text: String,
+    },
     UserSkillsUpdated(Vec<String>),
     Log(UiLogRecord),
     RunFinished(Result<String, String>),
@@ -242,6 +247,7 @@ pub enum AppAction {
     ShowTools,
     ShowMcp,
     ShowSkills,
+    ShowInstructions,
     OpenSkillPicker,
     OpenSessionTree,
     ForkSessionAtSeq(u64),
@@ -262,7 +268,6 @@ pub struct AppState {
     pub items: Vec<ChatItem>,
     pub tool_extras: HashMap<String, ToolExtraMeta>,
     pub item_cache: HashMap<usize, CachedItemLines>,
-    pub tool_hit_rects: Vec<(String, Rect)>,
 
     pub input: TextInput,
     pub queued_prompts: Vec<String>,
@@ -327,6 +332,7 @@ pub struct AppState {
     pub trajectory_scene: TrajectorySceneState,
     pub overlay: OverlayState,
     pub file_cache: WorkspaceFileCache,
+    dismissed_mention: Option<(usize, String)>,
 
     // 确认退出 / 终端状态记忆
     pub terminal_focused: bool,
@@ -353,7 +359,6 @@ impl AppState {
             items: Vec::new(),
             tool_extras: HashMap::new(),
             item_cache: HashMap::new(),
-            tool_hit_rects: Vec::new(),
             input: TextInput::new(),
             queued_prompts: Vec::new(),
             is_busy: false,
@@ -411,6 +416,7 @@ impl AppState {
             trajectory_scene: TrajectorySceneState::default(),
             overlay: OverlayState::default(),
             file_cache: WorkspaceFileCache::default(),
+            dismissed_mention: None,
             terminal_focused: true,
             last_ctrl_c_at: None,
             pending_exit_status: None,
@@ -462,7 +468,7 @@ impl AppState {
         }
     }
 
-    pub fn active_context_window(&self) -> u64 {
+    pub fn active_model_info(&self) -> Option<&ModelInfo> {
         let p = self.provider.as_deref();
         let m = self.model.as_deref();
         for prov in &self.providers {
@@ -470,14 +476,50 @@ impl AppState {
                 continue;
             }
             for model in &prov.models {
-                if (m.is_none() || m == Some(model.id.as_str()))
-                    && let Some(w) = model.context_window
-                {
-                    return w;
+                if m.is_none() || m == Some(model.id.as_str()) {
+                    return Some(model);
                 }
             }
         }
-        128_000
+        None
+    }
+
+    pub fn active_context_window(&self) -> u64 {
+        self.active_model_info()
+            .and_then(|model| model.context_window)
+            .unwrap_or(128_000)
+    }
+
+    pub fn available_efforts(&self) -> Vec<ReasoningEffort> {
+        if let Some(model) = self.active_model_info()
+            && !model.reasoning_efforts.is_empty()
+        {
+            return model.reasoning_efforts.clone();
+        }
+        crate::overlay::all_efforts().to_vec()
+    }
+
+    pub fn push_user_message(&mut self, text: &str) {
+        self.items.push(ChatItem::User {
+            text: text.to_string(),
+        });
+        self.streaming_assistant_open = false;
+        self.scroll_to_bottom();
+    }
+
+    pub fn open_model_selector(&mut self) -> AppAction {
+        if self.providers.iter().any(|p| !p.models.is_empty()) {
+            let current_hint = match (self.provider.as_deref(), self.model.as_deref()) {
+                (Some(p), Some(m)) => Some(format!("{p}/{m}")),
+                (_, Some(m)) => Some(m.to_string()),
+                _ => None,
+            };
+            self.overlay
+                .open_model_picker(&self.providers, current_hint.as_deref());
+            AppAction::None
+        } else {
+            AppAction::ShowOrSwitchModel(None)
+        }
     }
 
     pub fn refresh_context_breakdown(&mut self) {
@@ -672,7 +714,6 @@ impl AppState {
                     ToolExtraMeta {
                         full_content: String::new(),
                         diff_raw: None,
-                        local_expanded: None,
                     },
                 );
                 self.items.push(ChatItem::ToolCall {
@@ -724,7 +765,6 @@ impl AppState {
                     ToolExtraMeta {
                         full_content: content.clone(),
                         diff_raw,
-                        local_expanded: None,
                     },
                 );
                 let preview = summarize_tool_result(&name, &content, details.as_ref(), is_error);
@@ -775,6 +815,12 @@ impl AppState {
             UiEvent::Anomaly(summary) => {
                 self.anomalies.push(summary.clone());
                 self.push_notice(NoticeLevel::Warn, format!("轨迹告警：{summary}"));
+            }
+            UiEvent::Flash(msg) => {
+                self.set_flash(msg);
+            }
+            UiEvent::Notice { level, text } => {
+                self.push_notice(level, text);
             }
             UiEvent::UserSkillsUpdated(names) => {
                 self.user_skill_names = names;
@@ -832,6 +878,7 @@ impl AppState {
             return;
         }
         if let Some((start, query)) = self.input.active_slash_trigger() {
+            self.dismissed_mention = None;
             let selected = match &self.overlay.active {
                 Some(OverlayKind::SlashComplete { selected, .. }) => *selected,
                 _ => 0,
@@ -843,22 +890,42 @@ impl AppState {
             });
             return;
         }
-        if let Some((start, query)) = self.input.active_mention_trigger() {
-            let matches = self.file_cache.match_query(&self.workspace, &query);
-            let selected = match &self.overlay.active {
-                Some(OverlayKind::FileMention { selected, .. }) => {
-                    (*selected).min(matches.len().saturating_sub(1))
+        if let Some(caret) = self.input.active_mention_caret() {
+            if self
+                .dismissed_mention
+                .as_ref()
+                .is_some_and(|(s, q)| *s == caret.start && q == &caret.query)
+            {
+                if matches!(self.overlay.active, Some(OverlayKind::FileMention { .. })) {
+                    self.overlay.active = None;
                 }
+                return;
+            }
+            self.dismissed_mention = None;
+            let matches = self.file_cache.match_query(&self.workspace, &caret.query);
+            let selected = match &self.overlay.active {
+                Some(OverlayKind::FileMention {
+                    matches: prev_matches,
+                    selected: prev_sel,
+                    ..
+                }) => prev_matches
+                    .get(*prev_sel)
+                    .and_then(|prev| matches.iter().position(|m| m.path == prev.path))
+                    .unwrap_or((*prev_sel).min(matches.len().saturating_sub(1))),
                 _ => 0,
             };
             self.overlay.active = Some(OverlayKind::FileMention {
-                token_start: start,
-                query,
+                token_start: caret.start,
+                token_end: caret.end,
+                path_end: caret.path_end,
+                is_quoted: caret.is_quoted,
+                query: caret.query,
                 matches,
                 selected,
             });
             return;
         }
+        self.dismissed_mention = None;
         if matches!(
             self.overlay.active,
             Some(OverlayKind::SlashComplete { .. } | OverlayKind::FileMention { .. })
@@ -871,7 +938,12 @@ impl AppState {
         match action {
             OverlayAction::None => AppAction::None,
             OverlayAction::Close => {
-                self.overlay.active = None;
+                if let Some(OverlayKind::FileMention {
+                    token_start, query, ..
+                }) = self.overlay.active.take()
+                {
+                    self.dismissed_mention = Some((token_start, query));
+                }
                 AppAction::None
             }
             OverlayAction::CompleteSlash {
@@ -890,11 +962,28 @@ impl AppState {
                     AppAction::None
                 }
             }
-            OverlayAction::CompleteMention { token_start, path } => {
+            OverlayAction::CompleteMention {
+                token_start,
+                token_end,
+                path_end,
+                is_quoted,
+                candidate,
+            } => {
                 self.overlay.active = None;
-                let end = self.input.cursor_byte();
-                self.input
-                    .replace_byte_range(token_start, end, &format!("@{path} "));
+                self.dismissed_mention = None;
+                let len = self.input.text().len();
+                let safe_end = token_end.min(len);
+                let safe_path_end = path_end.min(safe_end);
+                let suffix = self.input.text()[safe_path_end..safe_end].to_string();
+                let (replacement, cursor_offset) =
+                    format_mention_replacement(&candidate, &suffix, is_quoted);
+                self.input.replace_byte_range_with_cursor(
+                    token_start,
+                    safe_end,
+                    &replacement,
+                    cursor_offset,
+                );
+                self.sync_input_completion_overlay();
                 AppAction::None
             }
             OverlayAction::SelectModel { provider, model } => {
@@ -969,16 +1058,47 @@ impl AppState {
         }
     }
 
-    pub fn set_effort(&mut self, effort: ReasoningEffort) {
+    fn apply_effort(&mut self, effort: ReasoningEffort, with_notice: bool) {
         let changed = self.reasoning_effort != Some(effort);
         self.reasoning_effort = Some(effort);
         if changed && matches!(effort, ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max) {
             self.effort_ignition_at = Some(Instant::now());
         }
-        self.push_notice(
-            NoticeLevel::Info,
-            format!("推理强度已切换为：{}", format!("{effort:?}").to_lowercase()),
-        );
+        let label = format!("{effort:?}").to_lowercase();
+        self.set_flash(format!("思考等级：{label}"));
+        if with_notice {
+            self.push_notice(NoticeLevel::Info, format!("推理强度已切换为：{label}"));
+        }
+    }
+
+    pub fn set_effort(&mut self, effort: ReasoningEffort) {
+        self.apply_effort(effort, true);
+    }
+
+    pub fn cycle_reasoning_effort(&mut self) -> ReasoningEffort {
+        let efforts = self.available_efforts();
+        let next = match self.reasoning_effort {
+            Some(cur) => {
+                if let Some(pos) = efforts.iter().position(|&e| e == cur) {
+                    efforts[(pos + 1) % efforts.len()]
+                } else {
+                    let order = crate::overlay::all_efforts();
+                    let cur_rank = order.iter().position(|&e| e == cur).unwrap_or(0);
+                    efforts
+                        .iter()
+                        .copied()
+                        .find(|e| order.iter().position(|o| o == e).unwrap_or(0) > cur_rank)
+                        .unwrap_or(efforts[0])
+                }
+            }
+            None => efforts
+                .iter()
+                .copied()
+                .find(|&e| e != ReasoningEffort::Off)
+                .unwrap_or(efforts[0]),
+        };
+        self.apply_effort(next, false);
+        next
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
@@ -1000,7 +1120,8 @@ impl AppState {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        // 2. Ctrl+C：若有活跃鼠标选区，优先复制选区并保持界面；否则走中断/清空/退出
+        // 2. Ctrl+C：若有活跃鼠标选区，优先复制选区并保持界面；模态弹窗则先关闭/拒绝；
+        // 非空输入优先由单次 Ctrl+C 清空（含补全浮层与运行中草稿）；否则走中断或双击退出
         if matches!(key.code, KeyCode::Char('c')) && ctrl {
             if self.selection.is_active()
                 && let Some(buf) = &self.last_buffer
@@ -1011,7 +1132,7 @@ impl AppState {
                 self.set_flash(format!("✓ 已复制 {chars} 字符"));
                 return AppAction::None;
             }
-            if self.overlay.is_open() {
+            if self.overlay.is_modal() {
                 if let Some(OverlayKind::Approval(_)) = self.overlay.active {
                     return self.apply_overlay_action(OverlayAction::ResolveApproval {
                         decision: ApprovalDecision::Deny,
@@ -1020,12 +1141,14 @@ impl AppState {
                 self.overlay.active = None;
                 return AppAction::None;
             }
-            if self.is_busy {
-                return AppAction::CancelRun;
-            }
             if !self.input.is_empty() {
                 self.input.clear();
+                self.sync_input_completion_overlay();
+                self.last_ctrl_c_at = None;
                 return AppAction::None;
+            }
+            if self.is_busy {
+                return AppAction::CancelRun;
             }
             let double_press = self
                 .last_ctrl_c_at
@@ -1062,11 +1185,12 @@ impl AppState {
                 return AppAction::OpenTrajectoryScene(self.trajectory_scene.mode);
             }
             KeyCode::Char('o') if ctrl => {
-                self.verbose_expanded = !self.verbose_expanded;
-                self.show_thinking = !self.show_thinking;
+                let next = !self.verbose_expanded;
+                self.verbose_expanded = next;
+                self.show_thinking = next;
                 self.item_cache.clear();
-                let state = if self.verbose_expanded { "展开" } else { "收起" };
-                self.push_notice(NoticeLevel::Info, format!("思考与工具详情已{state}"));
+                let state = if next { "展开" } else { "收起" };
+                self.set_flash(format!("思考与工具详情已{state}"));
                 return AppAction::None;
             }
             KeyCode::Char('b') if ctrl => {
@@ -1122,17 +1246,11 @@ impl AppState {
             }
             KeyCode::Char('k') if ctrl => {
                 self.input.delete_to_line_end();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::Char('l') if ctrl => {
-                if self.is_busy {
-                    self.push_notice(
-                        NoticeLevel::Warn,
-                        "当前正在生成，请先按 Esc 中断后再清屏",
-                    );
-                    return AppAction::None;
-                }
-                return AppAction::NewSession;
+                return self.open_model_selector();
             }
             KeyCode::Esc => {
                 if self.selection.is_active() {
@@ -1163,24 +1281,12 @@ impl AppState {
                 self.scroll_up(self.page_step());
                 return AppAction::None;
             }
-            KeyCode::Tab if self.is_busy && !self.input.is_empty() => {
-                // 运行中按 Tab 排入 Follow-up 队列，等当前回合结束自动发送
-                let queued = self.input.take();
-                let trimmed = queued.trim().to_string();
-                if !trimmed.is_empty() {
-                    self.queued_prompts.push(trimmed);
-                    self.set_flash(format!(
-                        "已排入队列 (共 {} 条待发)",
-                        self.queued_prompts.len()
-                    ));
-                }
+            KeyCode::Tab if !ctrl && !alt => {
+                self.cycle_reasoning_effort();
                 return AppAction::None;
             }
+            KeyCode::Enter if ctrl && !alt && !shift => return self.prepare_submit(true),
             KeyCode::Enter if shift || alt || ctrl => {
-                if (ctrl || alt) && self.is_busy && !self.input.is_empty() {
-                    let prompt = self.input.take();
-                    return AppAction::SteerPrompt(prompt);
-                }
                 self.input.insert_char('\n');
                 return AppAction::None;
             }
@@ -1188,7 +1294,7 @@ impl AppState {
                 self.input.insert_char('\n');
                 return AppAction::None;
             }
-            KeyCode::Enter => return self.prepare_submit(),
+            KeyCode::Enter => return self.prepare_submit(false),
             KeyCode::Backspace => {
                 self.input.backspace();
                 self.sync_input_completion_overlay();
@@ -1201,10 +1307,12 @@ impl AppState {
             }
             KeyCode::Left if alt || ctrl => {
                 self.input.move_word_left();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::Right if alt || ctrl => {
                 self.input.move_word_right();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::Left => {
@@ -1219,10 +1327,12 @@ impl AppState {
             }
             KeyCode::Up => {
                 self.input.move_up();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::Down => {
                 self.input.move_down();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::Home if ctrl => {
@@ -1236,10 +1346,12 @@ impl AppState {
             }
             KeyCode::Home => {
                 self.input.move_home();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::End => {
                 self.input.move_end();
+                self.sync_input_completion_overlay();
                 return AppAction::None;
             }
             KeyCode::Char(ch) if !ctrl && !alt => {
@@ -1358,15 +1470,7 @@ impl AppState {
                         && row < rect.y + rect.height
                     {
                         return match qa.clone() {
-                            LaunchpadQuickAction::ModelPicker => {
-                                if !self.providers.is_empty() {
-                                    self.overlay
-                                        .open_model_picker(&self.providers, self.model.as_deref());
-                                    AppAction::None
-                                } else {
-                                    AppAction::ShowOrSwitchModel(None)
-                                }
-                            }
+                            LaunchpadQuickAction::ModelPicker => self.open_model_selector(),
                             LaunchpadQuickAction::ThemePicker => {
                                 self.overlay.open_theme_picker(self.theme_preset);
                                 AppAction::None
@@ -1385,21 +1489,6 @@ impl AppState {
                                 }
                             }
                         };
-                    }
-                }
-                // 检查是否点中某个工具卡以局部展开/收起
-                for (tool_id, rect) in &self.tool_hit_rects {
-                    if col >= rect.x
-                        && col < rect.x + rect.width
-                        && row >= rect.y
-                        && row < rect.y + rect.height
-                    {
-                        if let Some(extra) = self.tool_extras.get_mut(tool_id) {
-                            let cur = extra.local_expanded.unwrap_or(self.verbose_expanded);
-                            extra.local_expanded = Some(!cur);
-                            self.item_cache.clear();
-                        }
-                        break;
                     }
                 }
             }
@@ -1507,6 +1596,7 @@ impl AppState {
         self.scroll_from_top = 0;
         self.auto_scroll = true;
         self.streaming_assistant_open = false;
+        self.dismissed_mention = None;
         self.refresh_context_breakdown();
         self.push_notice(
             NoticeLevel::Info,
@@ -1528,7 +1618,7 @@ impl AppState {
                 SessionReplayItem::ContextNotice { source, text } => {
                     self.items.push(ChatItem::Notice {
                         level: NoticeLevel::Info,
-                        text: format!("[{source}] {text}"),
+                        text: summarize_context_notice_for_replay(&source, &text),
                     });
                 }
                 SessionReplayItem::Compaction {
@@ -1570,7 +1660,6 @@ impl AppState {
                             ToolExtraMeta {
                                 full_content: String::new(),
                                 diff_raw: None,
-                                local_expanded: None,
                             },
                         );
                         self.items.push(ChatItem::ToolCall {
@@ -1621,13 +1710,14 @@ impl AppState {
         self.overlay.open_session_tree(entries);
     }
 
-    fn prepare_submit(&mut self) -> AppAction {
+    fn prepare_submit(&mut self, immediate: bool) -> AppAction {
         let raw = self.input.take();
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return AppAction::None;
         }
         self.overlay.active = None;
+        self.dismissed_mention = None;
         self.input.push_history(trimmed);
         self.scroll_to_bottom();
 
@@ -1642,18 +1732,20 @@ impl AppState {
         }
 
         if self.is_busy {
-            self.input.insert_str(trimmed);
-            self.push_notice(
-                NoticeLevel::Warn,
-                "上一轮仍在运行：按 Tab 排入待办队列，或 Ctrl+Enter 打断并插队",
-            );
+            let prompt = trimmed.to_string();
+            if immediate {
+                self.set_flash("⚡ 正在中断当前回合并立即发送…");
+                return AppAction::SteerPrompt(prompt);
+            }
+            self.queued_prompts.push(prompt);
+            self.set_flash(format!(
+                "已加入队列 (共 {} 条待发)",
+                self.queued_prompts.len()
+            ));
             return AppAction::None;
         }
 
-        self.items.push(ChatItem::User {
-            text: trimmed.to_string(),
-        });
-        self.streaming_assistant_open = false;
+        self.push_user_message(trimmed);
         AppAction::SubmitPrompt(trimmed.to_string())
     }
 
@@ -1677,6 +1769,7 @@ impl AppState {
                 Some("list") => AppAction::ShowSkills,
                 _ => AppAction::OpenSkillPicker,
             },
+            "instructions" => AppAction::ShowInstructions,
             "tree" => AppAction::OpenSessionTree,
             "view" => {
                 let next = match arg {
@@ -1786,11 +1879,7 @@ impl AppState {
                 AppAction::None
             }
             "model" => match arg {
-                None if !self.providers.is_empty() => {
-                    self.overlay
-                        .open_model_picker(&self.providers, self.model.as_deref());
-                    AppAction::None
-                }
+                None => self.open_model_selector(),
                 other => AppAction::ShowOrSwitchModel(other.map(ToString::to_string)),
             },
             "effort" => match arg {
@@ -1830,6 +1919,7 @@ fn is_builtin_slash_cmd(cmd: &str) -> bool {
             | "tools"
             | "mcp"
             | "skills"
+            | "instructions"
             | "clear"
             | "new"
             | "thinking"
@@ -1845,6 +1935,56 @@ fn is_builtin_slash_cmd(cmd: &str) -> bool {
             | "theme"
             | "approval"
     )
+}
+
+fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
+    if source == "skill-catalog" {
+        return "[skill-catalog] 已加载可用技能目录".to_string();
+    }
+    if source == FILE_MENTIONS_SOURCE {
+        let mut refs = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if (trimmed.starts_with("<attached-file ") || trimmed.starts_with("<attached-directory "))
+                && let Some(p_start) = trimmed.find("path=\"")
+            {
+                let after = &trimmed[p_start + 6..];
+                if let Some(p_end) = after.find('"') {
+                    let path = &after[..p_end];
+                    if !path.is_empty() && !refs.iter().any(|r| r == path) {
+                        refs.push(path.to_string());
+                    }
+                }
+            }
+        }
+        return if refs.is_empty() {
+            "[file-mentions] 已附加引用内容".to_string()
+        } else {
+            format!("[file-mentions] 已附加引用：{}", refs.join(", "))
+        };
+    }
+    if source == "agent-instructions" {
+        let mut paths = Vec::new();
+        for line in text.lines() {
+            let extracted = line
+                .strip_prefix("Instructions from: ")
+                .or_else(|| line.strip_prefix("Additional instructions from: "))
+                .or_else(|| line.strip_prefix("Updated instructions from: "))
+                .or_else(|| line.strip_prefix("Instructions removed: "));
+            if let Some(rest) = extracted {
+                let path_part = rest.split(" (").next().unwrap_or(rest).trim();
+                if !path_part.is_empty() && !paths.iter().any(|p| p == path_part) {
+                    paths.push(path_part.to_string());
+                }
+            }
+        }
+        return if paths.is_empty() {
+            format!("[{source}] {}", truncate_display(&text.replace('\n', " "), 96))
+        } else {
+            format!("[{source}] 已加载指令：{}", paths.join(", "))
+        };
+    }
+    format!("[{source}] {text}")
 }
 
 fn parse_effort(raw: &str) -> Option<ReasoningEffort> {
@@ -2156,5 +2296,262 @@ mod tests {
             AppAction::Quit
         );
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn keymap_supports_ctrl_l_model_picker_tab_effort_and_enter_queue_vs_ctrl_enter_steer() {
+        let providers = vec![ProviderInfo {
+            id: "magpie".into(),
+            name: "Magpie".into(),
+            protocol: "openai-completions".into(),
+            models: vec![
+                ModelInfo {
+                    id: "model-limited".into(),
+                    name: "Limited".into(),
+                    context_window: Some(64_000),
+                    max_tokens: None,
+                    reasoning_efforts: vec![
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                    ],
+                },
+                ModelInfo {
+                    id: "model-all".into(),
+                    name: "All".into(),
+                    context_window: Some(128_000),
+                    max_tokens: None,
+                    reasoning_efforts: Vec::new(),
+                },
+            ],
+        }];
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-12345678",
+            providers,
+            Some("magpie".into()),
+            Some("model-limited".into()),
+            None,
+        );
+
+        // 1. Tab 在当前模型声明了 reasoning_efforts 时按模型列表循环
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, Some(ReasoningEffort::Low));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, Some(ReasoningEffort::Medium));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, Some(ReasoningEffort::High));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, Some(ReasoningEffort::Low));
+
+        // 2. Ctrl+L 打开模型选择器，并用 Enter 切换到未声明支持列表的模型后，Tab 回退到全 7 档循环
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            AppAction::None
+        );
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::ModelPicker { .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.model.as_deref(), Some("model-all"));
+        assert!(!app.overlay.is_open());
+
+        // 从 Low 切换：Low -> Medium -> High -> XHigh -> Max -> Off -> Minimal
+        app.reasoning_effort = Some(ReasoningEffort::Max);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, Some(ReasoningEffort::Off));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, Some(ReasoningEffort::Minimal));
+
+        // 3. `/` 补全浮层打开时，Tab 仍用于补全而不切换思考等级
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::SlashComplete { .. })
+        ));
+        let before = app.reasoning_effort;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.reasoning_effort, before);
+        assert_eq!(app.input.text(), "/help ");
+        app.input.clear();
+
+        // 4. 空闲时 Enter 与 Ctrl+Enter 均立即发送，Shift+Enter 插入换行
+        app.input.insert_str("a");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.input.insert_str("b");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            AppAction::SubmitPrompt("a\nb".into())
+        );
+
+        // 5. 运行中 Enter 加入队列，Ctrl+Enter 立即打断插队，Esc 暂停
+        app.is_busy = true;
+        app.input.insert_str("queued one");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.queued_prompts, vec!["queued one".to_string()]);
+        assert!(app.input.is_empty());
+
+        app.input.insert_str("urgent steer");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            AppAction::SteerPrompt("urgent steer".into())
+        );
+        assert!(app.input.is_empty());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::CancelRun
+        );
+
+        // 6. 单个 Ctrl+C 清空输入（运行中不误中断，补全浮层打开时一并关闭，空会话时不误退出）
+        app.input.insert_str("draft while busy");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            AppAction::None
+        );
+        assert!(app.input.is_empty());
+        assert!(!app.should_quit);
+
+        app.is_busy = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::SlashComplete { .. })
+        ));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            AppAction::None
+        );
+        assert!(app.input.is_empty());
+        assert!(!app.overlay.is_open());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_thinking_and_tool_details_in_sync_without_polluting_items() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-12345678",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        assert!(app.show_thinking);
+        assert!(!app.verbose_expanded);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(app.verbose_expanded);
+        assert!(app.show_thinking);
+        assert!(app.items.is_empty());
+        assert_eq!(app.active_flash(), Some("思考与工具详情已展开"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!app.verbose_expanded);
+        assert!(!app.show_thinking);
+        assert!(app.items.is_empty());
+        assert_eq!(app.active_flash(), Some("思考与工具详情已收起"));
+    }
+
+    #[test]
+    fn mention_completion_supports_directory_drilldown_line_suffix_esc_dismiss_and_replay_fold() {
+        let ws = std::env::temp_dir().join(format!("dsh_app_mention_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("src/nested")).unwrap();
+        std::fs::write(ws.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(ws.join("src/nested/mod.rs"), "// nested\n").unwrap();
+
+        let mut app = AppState::new(ws.clone(), "sess-mention", Vec::new(), None, None, None);
+
+        // 1. 输入 `@sr` 并接受目录 `src/`：不追加尾随空格，并连续保持在目录下一跳补全
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let src_dir_idx = match &app.overlay.active {
+            Some(OverlayKind::FileMention { matches, .. }) => matches
+                .iter()
+                .position(|c| {
+                    c.path == "src/"
+                        && c.kind == crate::mentions::MentionCandidateKind::Directory
+                })
+                .expect("expected src/ directory candidate"),
+            _ => panic!("expected FileMention overlay"),
+        };
+        for _ in 0..src_dir_idx {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "@src/");
+        match &app.overlay.active {
+            Some(OverlayKind::FileMention { query, matches, .. }) => {
+                assert_eq!(query, "src/");
+                assert!(matches.iter().any(|c| c.path == "src/lib.rs"));
+            }
+            _ => panic!("expected continued FileMention after dir accept"),
+        }
+
+        // 2. Esc 仅局部关闭当前 `@src/` 弹窗，不清空输入也不触发停止
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert!(!app.overlay.is_open());
+        assert_eq!(app.input.text(), "@src/");
+
+        // 继续输入 `l` 改变 query 后应重新弹出，Tab 完成文件后带尾随空格
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::FileMention { .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "@src/lib.rs ");
+        assert!(!app.overlay.is_open());
+
+        // 3. 在 `#L10-20` 前编辑 path 并接受候选时，应保留行号后缀
+        app.input.clear();
+        for ch in "@nested#L10-20".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(!app.overlay.is_open());
+        // 左移 7 个字符回到 `nested` 与 `#` 之间
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        match &app.overlay.active {
+            Some(OverlayKind::FileMention { query, matches, .. }) => {
+                assert_eq!(query, "nested");
+                assert!(matches.iter().any(|c| c.path == "src/nested/mod.rs"));
+            }
+            _ => panic!("expected FileMention before #L10-20"),
+        }
+        let mod_idx = match &app.overlay.active {
+            Some(OverlayKind::FileMention { matches, .. }) => matches
+                .iter()
+                .position(|c| c.path == "src/nested/mod.rs")
+                .expect("mod.rs candidate"),
+            _ => unreachable!(),
+        };
+        for _ in 0..mod_idx {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "@src/nested/mod.rs#L10-20 ");
+
+        // 4. --resume 回放折叠 `file-mentions` 通知，不将原文灌入聊天流
+        let folded = summarize_context_notice_for_replay(
+            FILE_MENTIONS_SOURCE,
+            "<attached-file path=\"src/lib.rs\" lines=\"1-2\">\nSECRET_FILE_BODY\n</attached-file>\n<attached-directory path=\"src\">\na/\n</attached-directory>",
+        );
+        assert_eq!(folded, "[file-mentions] 已附加引用：src/lib.rs, src");
+        assert!(!folded.contains("SECRET_FILE_BODY"));
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

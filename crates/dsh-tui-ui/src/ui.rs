@@ -39,7 +39,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     }
 
     app.selection_geom.clear();
-    app.tool_hit_rects.clear();
     app.launchpad_hit_rects.clear();
     app.rail_geo = None;
     app.side_panel.divider_col = None;
@@ -137,6 +136,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     render_status_bar(frame, status_area, app);
 
     // 8. 渲染浮层栈（补全弹窗 / Model / Effort / Theme / 历史 / 审批 / 帮助）
+    if matches!(
+        app.overlay.active,
+        Some(crate::overlay::OverlayKind::FileMention { .. })
+    ) && app.file_cache.consume_generation_update()
+    {
+        app.sync_input_completion_overlay();
+    }
     render_overlay(
         frame,
         area,
@@ -251,22 +257,24 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     lines.push(Line::from(vec![
         Span::styled("  操作    ", Style::default().fg(theme.text_dim)),
         Span::styled("Enter", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 发送  ·  ", Style::default().fg(theme.text_muted)),
+        Span::styled(" 发送/排队  ·  ", Style::default().fg(theme.text_muted)),
+        Span::styled("Tab", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" 思考  ·  ", Style::default().fg(theme.text_muted)),
+        Span::styled("Ctrl+L", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" 模型  ·  ", Style::default().fg(theme.text_muted)),
         Span::styled("Ctrl+B", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 侧栏  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("Ctrl+T", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 轨迹透视", Style::default().fg(theme.text_muted)),
+        Span::styled(" 侧栏", Style::default().fg(theme.text_muted)),
     ]));
     lines.push(Line::from(vec![
         Span::styled("          ", Style::default().fg(theme.text_dim)),
+        Span::styled("Esc", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" 暂停  ·  ", Style::default().fg(theme.text_muted)),
         Span::styled("/", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(" 命令  ·  ", Style::default().fg(theme.text_muted)),
         Span::styled("@", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(" 文件  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("Ctrl+G", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 外部编辑器  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("F3", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 视图  ·  ", Style::default().fg(theme.text_muted)),
+        Span::styled("Ctrl+T", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" 轨迹  ·  ", Style::default().fg(theme.text_muted)),
         Span::styled("?", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(" 帮助", Style::default().fg(theme.text_muted)),
     ]));
@@ -335,32 +343,20 @@ pub fn build_item_lines_for_scrollback(
             status,
             output_preview,
             ..
-        } => {
-            let expanded = extra
-                .and_then(|e| e.local_expanded)
-                .unwrap_or(verbose_expanded);
-            build_tool_lines(
-                name,
-                args_summary,
-                *status,
-                output_preview,
-                extra,
-                expanded,
-                0,
-                w,
-                theme,
-            )
-        }
+        } => build_tool_lines(
+            name,
+            args_summary,
+            *status,
+            output_preview,
+            extra,
+            verbose_expanded,
+            0,
+            w,
+            theme,
+        ),
         ChatItem::Notice { level, text } => build_notice_lines(*level, text, w, theme, emphasis),
     };
     rendered.into_iter().map(|rl| rl.line).collect()
-}
-
-#[derive(Debug, Clone)]
-struct ToolLineRange {
-    id: String,
-    start_line: usize,
-    end_line: usize,
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
@@ -391,7 +387,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
 
     let mut all_lines: Vec<RenderedLine> = Vec::with_capacity((total_items - start_item) * 4);
     let mut turns: Vec<TimelineTurn> = Vec::with_capacity(user_turn_count);
-    let mut tool_ranges: Vec<ToolLineRange> = Vec::new();
 
     // 借用拆分：先收集各 item 的只读引用数据并按需更新 reveal 与 item_cache
     let theme = app.theme.clone();
@@ -502,10 +497,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 output_preview,
             } => {
                 let extra = app.tool_extras.get(id).cloned();
-                let expanded = extra
-                    .as_ref()
-                    .and_then(|e| e.local_expanded)
-                    .unwrap_or(verbose_expanded);
+                let expanded = verbose_expanded;
                 let extra_len = extra.as_ref().map_or(0, |e| {
                     e.full_content.len() + e.diff_raw.as_ref().map_or(0, String::len)
                 });
@@ -531,7 +523,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                     text_len: extra_len,
                     preview_len: args_summary.len() + output_preview.len() + name.len(),
                 };
-                let tool_id = id.clone();
                 let lines = get_or_build_cached(&mut app.item_cache, idx, key, || {
                     build_tool_lines(
                         name,
@@ -546,12 +537,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                     )
                 });
                 all_lines.extend(lines);
-                let end_line = all_lines.len().saturating_sub(1).max(start_line + 1);
-                tool_ranges.push(ToolLineRange {
-                    id: tool_id,
-                    start_line,
-                    end_line,
-                });
             }
             ChatItem::Notice { level, text } => {
                 let level_code = match level {
@@ -642,22 +627,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             col_end,
             rl.soft_wrapped,
         );
-    }
-
-    // 计算当前视口内的 ToolCall 点击矩形
-    let visible_start = scroll_top + sticky_rows;
-    let visible_end = scroll_top + view_h;
-    for tr in tool_ranges {
-        let vis_s = tr.start_line.max(visible_start);
-        let vis_e = tr.end_line.min(visible_end);
-        if vis_e > vis_s {
-            let y_top = content_area.y + (vis_s - scroll_top) as u16;
-            let height = (vis_e - vis_s) as u16;
-            app.tool_hit_rects.push((
-                tr.id,
-                Rect::new(content_area.x, y_top, content_area.width, height),
-            ));
-        }
     }
 
     // 2 列时间轴导轨绘制（使用同一份 timeline_snap 快照）
@@ -754,6 +723,7 @@ fn build_assistant_lines(
 ) -> Vec<RenderedLine> {
     let mut out = Vec::new();
 
+    let mut emitted_reasoning = false;
     if !full_reasoning.is_empty() {
         if show_thinking {
             if !vis_reasoning.is_empty() {
@@ -771,11 +741,12 @@ fn build_assistant_lines(
                         line: Line::from(spans),
                         soft_wrapped: rl.soft_wrapped,
                     });
+                    emitted_reasoning = true;
                 }
             }
         } else {
             let line_count = full_reasoning.lines().count().max(1);
-            let collapsed = format!("┆ 思考过程已折叠 ({line_count} 行，按 t 展开)");
+            let collapsed = format!("┆ 思考过程已折叠 ({line_count} 行，按 Ctrl+O 展开)");
             out.extend(wrap_styled_spans_rich(
                 vec![Span::styled(
                     collapsed,
@@ -787,10 +758,14 @@ fn build_assistant_lines(
                 None,
                 width,
             ));
+            emitted_reasoning = true;
         }
     }
 
     if !vis_text.is_empty() {
+        if emitted_reasoning {
+            out.push(RenderedLine::hard(Line::raw("")));
+        }
         let md_lines = render_markdown_rich(vis_text, width, theme, emphasis);
         out.extend(md_lines);
     } else if full_reasoning.is_empty() {
@@ -825,7 +800,7 @@ fn build_tool_lines(
     };
 
     let bg_card = theme.card_bg;
-    let mut header_spans = vec![
+    let header_spans = vec![
         Span::styled(
             format!("{glyph} "),
             Style::default()
@@ -845,21 +820,6 @@ fn build_tool_lines(
             Style::default().fg(theme.text_muted).bg(bg_card),
         ),
     ];
-
-    let has_more = extra.is_some_and(|e| {
-        !e.full_content.is_empty() && e.full_content != output_preview || e.diff_raw.is_some()
-    });
-    if has_more && width >= 36 {
-        let tag = if expanded {
-            "  [▾ 收起]"
-        } else {
-            "  [▸ 展开]"
-        };
-        header_spans.push(Span::styled(
-            tag,
-            Style::default().fg(theme.text_dim).bg(bg_card),
-        ));
-    }
 
     out.extend(wrap_styled_spans_rich(header_spans, None, None, width));
 
@@ -884,7 +844,7 @@ fn build_tool_lines(
         if !expanded && total > max_show {
             out.extend(wrap_styled_spans_rich(
                 vec![Span::styled(
-                    format!("  │ … 共 {total} 行 Diff（点击或按 Ctrl+O 展开）"),
+                    format!("  │ … 共 {total} 行 Diff（按 Ctrl+O 展开）"),
                     Style::default().fg(theme.text_dim),
                 )],
                 None,
@@ -926,7 +886,7 @@ fn build_tool_lines(
                 let hint = if expanded {
                     format!("  │ … 其余 {truncated} 行已省略（完整记录请查 Ctrl+T）")
                 } else {
-                    format!("  │ … 还有 {truncated} 行输出（点击或按 Ctrl+O 展开）")
+                    format!("  │ … 还有 {truncated} 行输出（按 Ctrl+O 展开）")
                 };
                 out.extend(wrap_styled_spans_rich(
                     vec![Span::styled(hint, Style::default().fg(theme.text_dim))],
@@ -1043,11 +1003,11 @@ fn render_input_box(
     }
 
     let title = if app.is_busy {
-        " 输入 (Tab 排队 · Ctrl/Alt+Enter 转向 · Ctrl+C 中断) "
+        " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) "
     } else if app.input.has_collapsed_pastes() {
-        " 输入 (Enter 发送 · 含折叠粘贴块，Ctrl+E 展开) "
+        " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) "
     } else {
-        " 输入 (Enter 发送 · / 命令 · @ 文件 · ? 帮助) "
+        " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) "
     };
 
     let block = Block::default()
@@ -1272,8 +1232,13 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else if avail >= 96 {
+        let toggle_hint = if app.verbose_expanded {
+            "Ctrl+O 收起"
+        } else {
+            "Ctrl+O 展开"
+        };
         spans.push(Span::styled(
-            " │ Ctrl+B 侧栏 · Ctrl+T 轨迹 · ? 帮助",
+            format!(" │ {toggle_hint} · Ctrl+B 侧栏 · Ctrl+T 轨迹 · ? 帮助"),
             Style::default().fg(theme.text_dim),
         ));
     }

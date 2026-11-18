@@ -7,12 +7,18 @@ pub mod config;
 
 use std::path::PathBuf;
 
+#[cfg(feature = "coding")]
+pub use dsh_instructions::{
+    AGENT_INSTRUCTIONS_SOURCE, AgentInstructions, InstructionScopeKind, InstructionScopeStatus,
+    InstructionsConfig, InstructionsContextExt, SessionInstructionsReport,
+};
 #[cfg(feature = "router")]
 pub use config::ResolvedLlmRouter;
 pub use config::{
-    CONFIG_DIR_NAME, CodemodeSettings, EnvLlmOverride, LoadedDshConfig, SettingsConfig,
-    SkillsSettings, ToolSearchSettings, load_dsh_config, load_dsh_config_with_global,
-    resolve_default_session_db_path, resolve_global_config_dir, resolve_project_config_dir,
+    CONFIG_DIR_NAME, CodemodeSettings, EnvLlmOverride, InstructionsSettings, LoadedDshConfig,
+    SettingsConfig, SkillsSettings, ToolSearchSettings, load_dsh_config,
+    load_dsh_config_with_global, resolve_default_session_db_path, resolve_global_config_dir,
+    resolve_project_config_dir,
 };
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin, Service};
@@ -58,6 +64,7 @@ pub enum AgentToolsMode {
         codemode: CodemodeConfig,
         mcp: McpPluginConfig,
         skills: SkillsConfig,
+        instructions: InstructionsConfig,
     },
 }
 
@@ -119,6 +126,7 @@ impl AgentSpineConfig {
                 codemode: CodemodeConfig::default(),
                 mcp: McpPluginConfig::new(&ws),
                 skills: SkillsConfig::new(&ws),
+                instructions: InstructionsConfig::new(&ws),
             },
             include_tools: None,
             exclude_tools: Vec::new(),
@@ -205,6 +213,7 @@ impl Plugin for AgentSpinePlugin {
                     codemode,
                     mcp,
                     skills,
+                    instructions,
                 } => {
                     ctx.try_plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())?;
                     ctx.try_plugin(CodingToolsPlugin, coding)?;
@@ -212,6 +221,7 @@ impl Plugin for AgentSpinePlugin {
                     ctx.try_plugin(CodemodePlugin, codemode)?;
                     ctx.try_plugin(McpManager::plugin(), mcp)?;
                     ctx.try_plugin(SkillsPlugin, skills)?;
+                    ctx.try_plugin(AgentInstructions::plugin(), instructions)?;
                 }
             }
 

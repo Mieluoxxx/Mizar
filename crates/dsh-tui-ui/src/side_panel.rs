@@ -97,9 +97,19 @@ pub struct FileTouchRow {
     pub op: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct InstructionSummaryRow {
+    pub path: String,
+    pub scope: String,
+    pub bytes: usize,
+    pub truncated: bool,
+    pub omitted: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SidePanelData {
     pub context: ContextBreakdownSnapshot,
+    pub instructions: Vec<InstructionSummaryRow>,
     pub files: Vec<FileTouchRow>,
     pub git_changes: Vec<FileTouchRow>,
     pub git_diff_stat: String,
@@ -281,7 +291,9 @@ pub fn render_side_panel(
     let inner_w = body_area.width as usize;
 
     let lines = match state.tab {
-        SidePanelTab::Context => build_context_lines(&data.context, inner_w, theme),
+        SidePanelTab::Context => {
+            build_context_lines(&data.context, &data.instructions, inner_w, theme)
+        }
         SidePanelTab::Files => build_files_lines(
             &data.files,
             &data.git_changes,
@@ -328,6 +340,7 @@ pub fn render_side_panel(
 
 fn build_context_lines(
     ctx: &ContextBreakdownSnapshot,
+    instructions: &[InstructionSummaryRow],
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -462,6 +475,32 @@ fn build_context_lines(
             Style::default().fg(theme.success),
         ),
     ]));
+    if !instructions.is_empty() {
+        out.push(Line::default());
+        out.push(Line::from(Span::styled(
+            format!("指令文件 ({})", instructions.len()),
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for row in instructions {
+            let (badge, col) = if row.omitted {
+                ("omitted", theme.error)
+            } else if row.truncated {
+                ("trunc", theme.warning)
+            } else {
+                (row.scope.as_str(), theme.success)
+            };
+            out.push(Line::from(vec![
+                Span::styled(format!("  [{badge}] "), Style::default().fg(col)),
+                Span::styled(row.path.clone(), Style::default().fg(theme.text)),
+                Span::styled(
+                    format!(" ({}B)", row.bytes),
+                    Style::default().fg(theme.text_dim),
+                ),
+            ]));
+        }
+    }
     out
 }
 

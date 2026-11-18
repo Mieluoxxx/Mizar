@@ -102,6 +102,18 @@ pub struct SkillsSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
+pub struct InstructionsSettings {
+    pub enabled: Option<bool>,
+    pub candidates: Option<Vec<String>>,
+    pub local_candidates: Option<Vec<String>>,
+    pub project_root_markers: Option<Vec<String>>,
+    pub max_bytes: Option<usize>,
+    pub max_source_bytes: Option<usize>,
+    pub follow_subdirs: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SettingsConfig {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
@@ -119,6 +131,7 @@ pub struct SettingsConfig {
     pub codemode: Option<CodemodeSettings>,
     pub tool_search: Option<ToolSearchSettings>,
     pub skills: Option<SkillsSettings>,
+    pub instructions: Option<InstructionsSettings>,
 }
 
 impl SettingsConfig {
@@ -194,6 +207,30 @@ impl SettingsConfig {
             }
             if sk.catalog_description_max_length.is_some() {
                 dst.catalog_description_max_length = sk.catalog_description_max_length;
+            }
+        }
+        if let Some(inst) = other.instructions {
+            let dst = self.instructions.get_or_insert_with(Default::default);
+            if inst.enabled.is_some() {
+                dst.enabled = inst.enabled;
+            }
+            if inst.candidates.is_some() {
+                dst.candidates = inst.candidates;
+            }
+            if inst.local_candidates.is_some() {
+                dst.local_candidates = inst.local_candidates;
+            }
+            if inst.project_root_markers.is_some() {
+                dst.project_root_markers = inst.project_root_markers;
+            }
+            if inst.max_bytes.is_some() {
+                dst.max_bytes = inst.max_bytes;
+            }
+            if inst.max_source_bytes.is_some() {
+                dst.max_source_bytes = inst.max_source_bytes;
+            }
+            if inst.follow_subdirs.is_some() {
+                dst.follow_subdirs = inst.follow_subdirs;
             }
         }
     }
@@ -322,9 +359,34 @@ impl LoadedDshConfig {
             codemode,
             mcp,
             skills,
+            instructions,
         } = &mut spine.tools_mode
         {
             mcp.global_config_dir = self.global_dir.clone();
+            instructions.dsh_home = self.global_dir.clone();
+            if let Some(inst) = &self.settings.instructions {
+                if let Some(v) = inst.enabled {
+                    instructions.enabled = v;
+                }
+                if let Some(cands) = &inst.candidates {
+                    instructions.candidates = cands.clone();
+                }
+                if let Some(local) = &inst.local_candidates {
+                    instructions.local_candidates = local.clone();
+                }
+                if let Some(markers) = &inst.project_root_markers {
+                    instructions.project_root_markers = markers.clone();
+                }
+                if let Some(v) = inst.max_bytes {
+                    instructions.max_bytes = v;
+                }
+                if let Some(v) = inst.max_source_bytes {
+                    instructions.max_source_bytes = v;
+                }
+                if let Some(v) = inst.follow_subdirs {
+                    instructions.follow_subdirs = v;
+                }
+            }
             if let Some(sk) = &self.settings.skills {
                 if let Some(v) = sk.enabled {
                     skills.enabled = v;
@@ -548,7 +610,11 @@ mod tests {
             proj.join(".dsh-rs/settings.json"),
             r#"{
                 "toolsPreset": "minimal",
-                "reasoningEffort": "medium"
+                "reasoningEffort": "medium",
+                "instructions": {
+                    "maxBytes": 32768,
+                    "followSubdirs": false
+                }
             }"#,
         )
         .unwrap();
@@ -595,9 +661,17 @@ mod tests {
         assert_eq!(spine.agent.max_steps, Some(40));
         assert_eq!(spine.exclude_tools, vec!["mcp__fff__multi_grep".to_string()]);
         match &spine.tools_mode {
-            AgentToolsMode::Coding { coding, mcp, .. } => {
+            AgentToolsMode::Coding {
+                coding,
+                mcp,
+                instructions,
+                ..
+            } => {
                 assert_eq!(coding.preset, CodingToolsPreset::MinimalCoding);
                 assert_eq!(mcp.global_config_dir.as_deref(), Some(global.as_path()));
+                assert_eq!(instructions.dsh_home.as_deref(), Some(global.as_path()));
+                assert_eq!(instructions.max_bytes, 32768);
+                assert!(!instructions.follow_subdirs);
             }
             _ => panic!("expected coding mode"),
         }

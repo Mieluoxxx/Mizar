@@ -446,7 +446,7 @@ impl Plugin for SkillsPlugin {
                                             collected.push(text.clone())
                                         }
                                         SessionEvent::ContextNotice { source, .. }
-                                            if source == SKILL_CATALOG_SOURCE => {}
+                                            if source != SKILL_INVOCATION_SOURCE => {}
                                         SessionEvent::ContextNotice { .. }
                                         | SessionEvent::Assistant { .. }
                                         | SessionEvent::ToolResult { .. }

@@ -51,6 +51,7 @@ dsh-tool-search = { path = "crates/dsh-tool-search" }
 dsh-tool-time = { path = "crates/dsh-tool-time" }
 dsh-mcp = { path = "crates/dsh-mcp" }
 dsh-skills = { path = "crates/dsh-skills" }
+dsh-instructions = { path = "crates/dsh-instructions" }
 dsh-system-prompt = { path = "crates/dsh-system-prompt" }
 dsh-agent-loop = { path = "crates/dsh-agent-loop" }
 dsh-agent-spine = { path = "crates/dsh-agent-spine" }

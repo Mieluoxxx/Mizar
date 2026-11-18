@@ -1,5 +1,6 @@
 //! 终端交互式 TUI 客户端宿主：桥接纯前端工作台 `dsh-tui-ui` 与 Cordis / AgentLoop / Trajectory 后端。
 
+pub mod mentions;
 pub mod runner;
 
 pub mod emphasis {

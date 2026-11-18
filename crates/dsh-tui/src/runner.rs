@@ -18,6 +18,7 @@ use dsh_agent_loop::{
     EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT, EVENT_AGENT_TOOL_UPDATE,
     EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE, RunOptions, TurnEndReason,
 };
+use dsh_instructions::AgentInstructions;
 use dsh_llm::{ContentBlock, LlmContextExt, ReasoningEffort};
 use dsh_mcp::{McpConnectionState, McpManager};
 use dsh_session::{
@@ -38,7 +39,7 @@ use dsh_tui_ui::app::{
 };
 use dsh_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use dsh_tui_ui::overlay::{ApprovalDecision, SessionTreeEntry, SkillPickerItem};
-use dsh_tui_ui::side_panel::{FileTouchRow, McpSummaryRow, ToolSummaryRow};
+use dsh_tui_ui::side_panel::{FileTouchRow, InstructionSummaryRow, McpSummaryRow, ToolSummaryRow};
 use dsh_tui_ui::terminal::{
     ProgramStatusState, ScreenMode, TerminalGuard, apply_terminal_modes, emit_program_status,
     resume_after_external_editor, set_mouse_capture_enabled, suspend_for_external_editor,
@@ -137,6 +138,7 @@ pub struct TuiConfig {
     pub theme_preset: Option<ThemePreset>,
     pub screen_mode: ScreenMode,
     pub resume_session: Option<ResumeTarget>,
+    pub restrict_to_workspace: bool,
     pub startup_notices: Vec<(NoticeLevel, String)>,
 }
 
@@ -152,6 +154,7 @@ impl TuiConfig {
             theme_preset: None,
             screen_mode: ScreenMode::Fullscreen,
             resume_session: None,
+            restrict_to_workspace: false,
             startup_notices: Vec::new(),
         }
     }
@@ -655,6 +658,12 @@ pub async fn run_tui_with_summary(
         always_allowed: app.always_allowed_tools.clone(),
     }));
     let pre_exec_handle = register_approval_hook(&ctx, ui_tx.clone(), Arc::clone(&approval_snap))?;
+    let mention_hook_handle = crate::mentions::register_mention_hook(
+        &ctx,
+        config.workspace.clone(),
+        config.restrict_to_workspace,
+        ui_tx.clone(),
+    )?;
 
     app.approval_mode = config.approval_mode;
     app.screen_mode = config.screen_mode;
@@ -790,6 +799,7 @@ pub async fn run_tui_with_summary(
     if let Some(cancel) = active_cancel.take() {
         cancel.cancel();
     }
+    drop(mention_hook_handle.dispose());
     drop(pre_exec_handle.dispose());
     if let Some(cleanup) = reply_guidance {
         match cleanup {
@@ -901,10 +911,12 @@ fn process_ui_event(
         app.apply_ui_event(event);
 
         if let Some(steer) = pending_steer.take() {
+            app.push_user_message(&steer);
             return AppAction::SubmitPrompt(steer);
         }
         if !was_aborted && is_ok && !app.queued_prompts.is_empty() {
             let next_prompt = app.queued_prompts.remove(0);
+            app.push_user_message(&next_prompt);
             return AppAction::SubmitPrompt(next_prompt);
         }
         if !was_aborted && !is_ok && !app.queued_prompts.is_empty() {
@@ -1075,6 +1087,7 @@ async fn handle_action(
                 *user_cancelled = false;
                 cancel.cancel();
             } else {
+                app.push_user_message(&prompt);
                 spawn_agent_run(
                     ctx,
                     config,
@@ -1223,6 +1236,43 @@ async fn handle_action(
                 app.push_notice(NoticeLevel::Warn, "skills 服务未启用");
             }
         }
+        AppAction::ShowInstructions => {
+            if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
+                let report = inst.probe_report(Some(&app.session_id));
+                if !report.enabled {
+                    app.push_notice(NoticeLevel::Info, "工作区指令加载已禁用（--no-instructions 或 settings.json）");
+                } else if report.scopes.is_empty() {
+                    app.push_notice(
+                        NoticeLevel::Info,
+                        "未发现 AGENTS.md / CLAUDE.md 指令文件（可在 ~/.dsh-rs/、~/.agents/ 或工作区/Git 祖先目录添加）",
+                    );
+                } else {
+                    let mut lines = vec![format!("已探测指令文件（共 {} 个）：", report.scopes.len())];
+                    for s in report.scopes {
+                        let status = if s.omitted {
+                            "已省略(超出预算)"
+                        } else if s.truncated {
+                            "已截断"
+                        } else {
+                            "已注入"
+                        };
+                        lines.push(format!(
+                            "  - {} [{} | {} | {} 字节]",
+                            s.display_path,
+                            s.scope_kind.as_str(),
+                            status,
+                            s.bytes
+                        ));
+                    }
+                    for w in report.warnings {
+                        lines.push(format!("  ! {w}"));
+                    }
+                    app.push_notice(NoticeLevel::Info, lines.join("\n"));
+                }
+            } else {
+                app.push_notice(NoticeLevel::Warn, "agentInstructions 服务未启用");
+            }
+        }
         AppAction::ExportTrajectory(custom_path) => {
             if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
                 if let Some(jsonl) = traj.export_jsonl(&app.session_id) {
@@ -1251,6 +1301,9 @@ async fn handle_action(
                 app.providers = llm.provider_infos();
             }
             match target {
+                None if app.providers.iter().any(|p| !p.models.is_empty()) => {
+                    let _ = app.open_model_selector();
+                }
                 None => {
                     let mut lines = vec![format!("当前模型：{}", app.active_model_label())];
                     if !app.providers.is_empty() {
@@ -1431,6 +1484,20 @@ async fn handle_action(
 async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
     app.refresh_context_breakdown();
     app.side_panel_data.files = app.touched_files.clone();
+    if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
+        let report = inst.probe_report(Some(&app.session_id));
+        app.side_panel_data.instructions = report
+            .scopes
+            .into_iter()
+            .map(|s| InstructionSummaryRow {
+                path: s.display_path,
+                scope: s.scope_kind.as_str().to_string(),
+                bytes: s.bytes,
+                truncated: s.truncated,
+                omitted: s.omitted,
+            })
+            .collect();
+    }
     let (git_changes, git_diff_stat) = collect_git_summary(&app.workspace).await;
     app.side_panel_data.git_changes = git_changes;
     app.side_panel_data.git_diff_stat = git_diff_stat;
@@ -1620,11 +1687,12 @@ fn resolve_model_switch(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use dsh_llm::{ModelInfo, ProviderInfo};
+    use dsh_tui_ui::app::{AppAction, AppState, ChatItem, UiEvent};
 
-    use super::{TuiExitSummary, format_resume_command, resolve_model_switch};
+    use super::{TuiExitSummary, format_resume_command, process_ui_event, resolve_model_switch};
 
     #[test]
     fn resolve_model_switch_handles_slashes_in_model_ids() {
@@ -1716,5 +1784,51 @@ mod tests {
             persisted: false,
         };
         assert_eq!(format_resume_command(&unpersisted, None, None, None), None);
+    }
+
+    #[test]
+    fn process_ui_event_records_user_items_for_steer_and_queued_prompts() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-queue",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.is_busy = true;
+        app.queued_prompts.push("queued follow-up".into());
+
+        let mut active_cancel = None;
+        let mut pending_steer = Some("urgent steer".into());
+        let mut user_cancelled = false;
+
+        let act1 = process_ui_event(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::RunFinished(Err("request aborted".into())),
+        );
+        assert_eq!(act1, AppAction::SubmitPrompt("urgent steer".into()));
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::User { text }) if text == "urgent steer"
+        ));
+        assert_eq!(app.queued_prompts, vec!["queued follow-up".to_string()]);
+
+        let act2 = process_ui_event(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::RunFinished(Ok("done".into())),
+        );
+        assert_eq!(act2, AppAction::SubmitPrompt("queued follow-up".into()));
+        assert!(app.queued_prompts.is_empty());
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::User { text }) if text == "queued follow-up"
+        ));
     }
 }

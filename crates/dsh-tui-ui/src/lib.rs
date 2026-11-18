@@ -6,6 +6,7 @@ pub mod app;
 pub mod editor;
 pub mod emphasis;
 pub mod markdown;
+pub mod mentions;
 pub mod overlay;
 pub mod reveal;
 pub mod selection;

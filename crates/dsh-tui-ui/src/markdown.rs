@@ -6,7 +6,8 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::editor::{char_width, display_width};
 use crate::emphasis::{
-    EmphasisConfig, decorate_action_lead_in, decorate_label_with_icon, render_pill_spans,
+    EmphasisConfig, decorate_action_lead_in, decorate_label_with_icon, is_mode_pill,
+    pill_matches_label, render_pill_spans,
 };
 use crate::theme::Theme;
 
@@ -171,10 +172,15 @@ pub fn render_markdown_rich(
         // 5. 标题
         if let Some((level, heading)) = parse_heading_level(trimmed) {
             tree_rails.clear();
+            let unwrapped = heading
+                .strip_prefix("**")
+                .and_then(|s| s.strip_suffix("**"))
+                .filter(|s| !s.is_empty() && !s.contains("**"))
+                .unwrap_or(heading);
             let decorated = if level == 2 {
-                decorate_label_with_icon(heading, emphasis)
+                decorate_label_with_icon(unwrapped, emphasis)
             } else {
-                heading.to_string()
+                unwrapped.to_string()
             };
             let style = Style::default()
                 .fg(if level <= 2 {
@@ -249,7 +255,7 @@ pub fn render_markdown_rich(
                     if let Some((num_prefix, ord_rest)) = parse_ordered_list(rest) {
                         let first = Span::styled(
                             format!("{num_prefix} "),
-                            Style::default().fg(theme.accent),
+                            Style::default().fg(theme.text_muted),
                         );
                         let cont = Span::raw(" ".repeat(display_width(&format!("{num_prefix} "))));
                         let spans = parse_inline_rich(ord_rest, base_style, theme, emphasis, true);
@@ -340,7 +346,7 @@ pub fn render_markdown_rich(
             };
             let first_str = format!("{pad}{num_prefix} ");
             let cont_str = " ".repeat(display_width(&first_str));
-            first_prefixes.push(Span::styled(first_str, Style::default().fg(theme.accent)));
+            first_prefixes.push(Span::styled(first_str, Style::default().fg(theme.text_muted)));
             cont_prefixes.push(Span::raw(cont_str));
             let spans = parse_inline_rich(rest, base_style, theme, emphasis, true);
             out.extend(wrap_styled_spans_with_prefixes(
@@ -387,12 +393,71 @@ pub fn render_markdown_rich(
             tree_rails.clear();
         }
 
-        let spans = parse_inline_rich(raw_line, base_style, theme, emphasis, true);
-        out.extend(wrap_styled_spans_rich(spans, None, None, width));
+        if let Some((pill_spans, rest_spans)) =
+            split_leading_mode_pill_paragraph(raw_line, base_style, theme, emphasis, width)
+        {
+            out.extend(wrap_styled_spans_rich(pill_spans, None, None, width));
+            if !rest_spans.is_empty() {
+                out.extend(wrap_styled_spans_rich(rest_spans, None, None, width));
+            }
+        } else {
+            let spans = parse_inline_rich(raw_line, base_style, theme, emphasis, true);
+            out.extend(wrap_styled_spans_rich(spans, None, None, width));
+        }
         idx += 1;
     }
 
     out
+}
+
+/// 若顶级段落以工作模式胶囊（如 `[[Investigate]]` 或去重后的 `**Investigate** [[Investigate]]`）开头
+/// 且后续正文超出单行宽度，将模式胶囊独立成标题行，避免长段中文/英文正文粘连在胶囊末尾。
+fn split_leading_mode_pill_paragraph(
+    raw_line: &str,
+    base: Style,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    width: usize,
+) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
+    let trimmed = raw_line.trim_start();
+    let mut scan_pos = raw_line.len() - trimmed.len();
+    if let Some((inner, strong_end)) = try_parse_strong(raw_line, scan_pos, "**")
+        .or_else(|| try_parse_strong(raw_line, scan_pos, "__"))
+    {
+        let after_ws = skip_ascii_spaces(raw_line, strong_end);
+        if let Some((pill_label, _)) = try_parse_pill(raw_line, after_ws)
+            && pill_matches_label(pill_label, &inner)
+        {
+            scan_pos = after_ws;
+        }
+    }
+    let (pill_label, pill_end) = try_parse_pill(raw_line, scan_pos)?;
+    if !is_mode_pill(pill_label) {
+        return None;
+    }
+    let tail = raw_line[pill_end..]
+        .trim_start()
+        .trim_start_matches([':', '：'])
+        .trim_start();
+    if tail.is_empty() {
+        return None;
+    }
+    let pill_spans = render_pill_spans(pill_label, theme, emphasis);
+    let rest_spans = parse_inline_rich(tail, base, theme, emphasis, true);
+    let rest_w = spans_display_width(&rest_spans);
+    let combined_w = spans_display_width(&pill_spans) + 1 + rest_w;
+    if combined_w <= width && rest_w <= 24 {
+        return None;
+    }
+    Some((pill_spans, rest_spans))
+}
+
+fn skip_ascii_spaces(s: &str, mut byte_idx: usize) -> usize {
+    let bytes = s.as_bytes();
+    while byte_idx < bytes.len() && bytes[byte_idx] == b' ' {
+        byte_idx += 1;
+    }
+    byte_idx
 }
 
 fn strip_unordered_bullet(trimmed: &str) -> Option<&str> {
@@ -702,7 +767,7 @@ fn render_bullet_item(
     }
     first_prefixes.push(Span::styled(
         format!("{pad}• "),
-        Style::default().fg(theme.accent),
+        Style::default().fg(theme.text_muted),
     ));
     cont_prefixes.push(Span::raw(format!("{pad}  ")));
 
@@ -1168,6 +1233,12 @@ fn is_unicode_punct(ch: char) -> bool {
                 | '》'
                 | '「'
                 | '」'
+                | '『'
+                | '』'
+                | '〔'
+                | '〕'
+                | '〈'
+                | '〉'
                 | '“'
                 | '”'
                 | '‘'
@@ -1175,36 +1246,119 @@ fn is_unicode_punct(ch: char) -> bool {
                 | '、'
                 | '…'
                 | '—'
+                | '–'
+                | '～'
+                | '·'
+                | '・'
+                | '°'
+                | '％'
+                | '￥'
         )
 }
 
-/// 匹配 `**...**` 或 `__...__`，包含针对 `**证据与影响：**源码中` 的 CJK 标点闭合修正。
+/// 匹配 `**...**` 或 `__...__`，跳过内部平衡反引号代码，并包含针对 `**证据与影响：**源码中` 的 CJK 标点闭合修正。
 fn try_parse_strong(line: &str, byte_idx: usize, delim: &str) -> Option<(String, usize)> {
     let rest = line.get(byte_idx..)?.strip_prefix(delim)?;
-    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with(delim) {
         return None;
     }
-    let mut search_from = 0usize;
-    while let Some(rel_end) = rest[search_from..].find(delim) {
-        let abs_end = search_from + rel_end;
-        let inner = &rest[..abs_end];
-        if inner.is_empty() || inner.contains('`') || inner.contains('\n') {
+    let delim_ch = delim.chars().next()?;
+    let mut pos = 0usize;
+    while pos < rest.len() {
+        let tail = &rest[pos..];
+        if tail.starts_with('\n') {
             return None;
         }
-        let prev_ch = inner.chars().next_back()?;
-        let after = &rest[abs_end + delim.len()..];
-        let next_ch = after.chars().next();
-
-        let valid_standard = !prev_ch.is_whitespace()
-            && (!is_unicode_punct(prev_ch)
-                || next_ch.is_none_or(|c| c.is_whitespace() || is_unicode_punct(c)));
-        let valid_cjk_adjacent = is_unicode_punct(prev_ch) && next_ch.is_some_and(is_cjk_char);
-
-        if valid_standard || valid_cjk_adjacent {
-            let next_byte = byte_idx + delim.len() + abs_end + delim.len();
-            return Some((inner.to_string(), next_byte));
+        if tail.starts_with('`') {
+            if let Some((_, next_rel)) = try_parse_inline_code(rest, pos) {
+                pos = next_rel;
+                continue;
+            }
+            pos += 1;
+            continue;
         }
-        search_from = abs_end + delim.len();
+        if tail.starts_with(delim) {
+            let abs_end = pos;
+            let inner = &rest[..abs_end];
+            if inner.is_empty() {
+                return None;
+            }
+            let prev_ch = inner.chars().next_back()?;
+            let after = &rest[abs_end + delim.len()..];
+            let next_ch = after.chars().next();
+            if next_ch == Some(delim_ch) && inner.starts_with(delim_ch) {
+                pos += 1;
+                continue;
+            }
+
+            let valid_standard = !prev_ch.is_whitespace()
+                && (!is_unicode_punct(prev_ch)
+                    || next_ch.is_none_or(|c| c.is_whitespace() || is_unicode_punct(c)));
+            let valid_cjk_adjacent =
+                is_unicode_punct(prev_ch) && next_ch.is_some_and(is_cjk_char);
+
+            if valid_standard || valid_cjk_adjacent {
+                let next_byte = byte_idx + delim.len() + abs_end + delim.len();
+                return Some((inner.to_string(), next_byte));
+            }
+            pos += delim.len();
+            continue;
+        }
+        let ch_len = tail.chars().next().map(char::len_utf8).unwrap_or(1);
+        pos += ch_len;
+    }
+    None
+}
+
+/// 匹配轻量行内斜体 `*...*`（排除 `**`、`crates/*/src` 与 `2 * 3` 等非强调星号）。
+fn try_parse_italic(line: &str, byte_idx: usize) -> Option<(String, usize)> {
+    let rest = line.get(byte_idx..)?.strip_prefix('*')?;
+    if rest.is_empty() || rest.starts_with('*') || rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    if byte_idx > 0
+        && line[..byte_idx]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let mut pos = 0usize;
+    while pos < rest.len() {
+        let tail = &rest[pos..];
+        if tail.starts_with('\n') {
+            return None;
+        }
+        if tail.starts_with('`') {
+            if let Some((_, next_rel)) = try_parse_inline_code(rest, pos) {
+                pos = next_rel;
+                continue;
+            }
+            pos += 1;
+            continue;
+        }
+        if tail.starts_with("**") {
+            pos += 2;
+            continue;
+        }
+        if tail.starts_with('*') {
+            let inner = &rest[..pos];
+            if inner.is_empty() {
+                return None;
+            }
+            let prev_ch = inner.chars().next_back()?;
+            let next_ch = rest[pos + 1..].chars().next();
+            if !prev_ch.is_whitespace()
+                && !next_ch.is_some_and(|c| c.is_ascii_alphanumeric())
+            {
+                return Some((inner.to_string(), byte_idx + 1 + pos + 1));
+            }
+            pos += 1;
+            continue;
+        }
+        let ch_len = tail.chars().next().map(char::len_utf8).unwrap_or(1);
+        pos += ch_len;
     }
     None
 }
@@ -1316,24 +1470,47 @@ pub fn parse_inline_rich(
             continue;
         }
 
-        // 4. 粗体（含 CJK 邻接修正、内部嵌套 `[[Pill]]` 解包、行首标签图标与行动引导词图标）
+        // 4. 粗体（含 CJK 邻接修正、同词胶囊去重、内部 `code`/`[[Pill]]`、行首标签与行动引导词图标）
         if let Some((inner, next_byte)) = try_parse_strong(line, byte_idx, "**")
             .or_else(|| try_parse_strong(line, byte_idx, "__"))
         {
             flush_buf(&mut buf, &mut spans);
-            let bold_color = if emphasis.enabled {
-                theme.link
-            } else {
-                base.fg.unwrap_or(theme.text)
-            };
-            let strong_style = base.fg(bold_color).add_modifier(Modifier::BOLD);
+            // 若紧跟同词 `[[Pill]]`（例如 `**Investigate** [[Investigate]]`），跳过冗余粗体避免双份图标/标签
+            if !inner.contains("[[") && !inner.contains('`') {
+                let after_ws = skip_ascii_spaces(line, next_byte);
+                if let Some((pill_label, _)) = try_parse_pill(line, after_ws)
+                    && pill_matches_label(pill_label, &inner)
+                {
+                    while i < chars.len() && chars[i].0 < after_ws {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+
+            let preserve_base_color = base.add_modifier.contains(Modifier::BOLD);
+            let strong_style = base.add_modifier(Modifier::BOLD);
             spans.extend(render_strong_inner_spans(
                 &inner,
                 strong_style,
+                preserve_base_color,
                 theme,
                 emphasis,
                 is_line_lead,
             ));
+            while i < chars.len() && chars[i].0 < next_byte {
+                i += 1;
+            }
+            is_line_lead = false;
+            continue;
+        }
+
+        // 4.5 行内斜体 `*...*`
+        if let Some((inner, next_byte)) = try_parse_italic(line, byte_idx) {
+            flush_buf(&mut buf, &mut spans);
+            let italic_style = base.add_modifier(Modifier::ITALIC);
+            let inner_spans = parse_inline_rich(&inner, italic_style, theme, emphasis, false);
+            spans.extend(inner_spans);
             while i < chars.len() && chars[i].0 < next_byte {
                 i += 1;
             }
@@ -1408,6 +1585,7 @@ fn push_strong_segment(
     out: &mut Vec<Span<'static>>,
     seg: &str,
     strong_style: Style,
+    preserve_base_color: bool,
     theme: &Theme,
     emphasis: &EmphasisConfig,
     lead: bool,
@@ -1427,20 +1605,34 @@ fn push_strong_segment(
     } else {
         decorate_action_lead_in(body, emphasis)
     };
-    out.push(Span::styled(decorated, strong_style));
+    let span_style = if !preserve_base_color && emphasis.enabled && decorated != body {
+        strong_style.fg(theme.accent)
+    } else {
+        strong_style
+    };
+    out.push(Span::styled(decorated, span_style));
 }
 
-/// 渲染粗体内部文本：支持模型习惯性把胶囊写成 `**[[Passed]]**`、树线前缀 `**├── ...**` 或混排 `**[[Done]] 说明**` 的场景。
+/// 渲染粗体内部文本：支持内联代码 `` `code` ``、嵌套胶囊 `**[[Passed]]**`、树线前缀 `**├── ...**` 或混排。
 fn render_strong_inner_spans(
     inner: &str,
     strong_style: Style,
+    preserve_base_color: bool,
     theme: &Theme,
     emphasis: &EmphasisConfig,
     is_line_lead: bool,
 ) -> Vec<Span<'static>> {
-    if !inner.contains("[[") {
+    if !inner.contains("[[") && !inner.contains('`') {
         let mut out = Vec::new();
-        push_strong_segment(&mut out, inner, strong_style, theme, emphasis, is_line_lead);
+        push_strong_segment(
+            &mut out,
+            inner,
+            strong_style,
+            preserve_base_color,
+            theme,
+            emphasis,
+            is_line_lead,
+        );
         if out.is_empty() {
             out.push(Span::styled(String::new(), strong_style));
         }
@@ -1449,24 +1641,53 @@ fn render_strong_inner_spans(
 
     let mut out = Vec::new();
     let mut pos = 0usize;
+    let mut text_start = 0usize;
     let mut lead = is_line_lead;
+    let flush_seg = |out: &mut Vec<Span<'static>>, seg: &str, lead_flag: &mut bool| {
+        if !seg.is_empty() {
+            push_strong_segment(
+                out,
+                seg,
+                strong_style,
+                preserve_base_color,
+                theme,
+                emphasis,
+                *lead_flag,
+            );
+            *lead_flag = false;
+        }
+    };
+
     while pos < inner.len() {
-        if let Some((pill_label, next_byte)) = try_parse_pill(inner, pos) {
-            out.extend(render_pill_spans(pill_label, theme, emphasis));
-            pos = next_byte;
+        if inner[pos..].starts_with('`')
+            && let Some((code, next_byte)) = try_parse_inline_code(inner, pos)
+        {
+            flush_seg(&mut out, &inner[text_start..pos], &mut lead);
+            let code_style = Style::default()
+                .fg(theme.code_fg)
+                .bg(theme.code_bg)
+                .add_modifier(Modifier::BOLD);
+            out.push(Span::styled(code.to_string(), code_style));
             lead = false;
+            pos = next_byte;
+            text_start = pos;
             continue;
         }
-        let next_bracket = inner[pos..]
-            .find("[[")
-            .map(|rel| pos + rel)
-            .filter(|&p| p > pos)
-            .unwrap_or(inner.len());
-        let seg = &inner[pos..next_bracket];
-        push_strong_segment(&mut out, seg, strong_style, theme, emphasis, lead);
-        pos = next_bracket;
-        lead = false;
+        if inner[pos..].starts_with("[[")
+            && let Some((pill_label, next_byte)) = try_parse_pill(inner, pos)
+        {
+            flush_seg(&mut out, &inner[text_start..pos], &mut lead);
+            out.extend(render_pill_spans(pill_label, theme, emphasis));
+            lead = false;
+            pos = next_byte;
+            text_start = pos;
+            continue;
+        }
+        let ch_len = inner[pos..].chars().next().map(char::len_utf8).unwrap_or(1);
+        pos += ch_len;
     }
+    flush_seg(&mut out, &inner[text_start..], &mut lead);
+
     if out.is_empty() {
         out.push(Span::styled(inner.to_string(), strong_style));
     }
@@ -1501,6 +1722,316 @@ pub fn wrap_styled_spans_rich(
     )
 }
 
+fn is_kinsoku_no_line_start(ch: char) -> bool {
+    matches!(
+        ch,
+        '。' | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '）'
+            | '】'
+            | '》'
+            | '」'
+            | '』'
+            | '”'
+            | '’'
+            | '…'
+            | '—'
+            | '–'
+            | '～'
+            | '·'
+            | '・'
+            | '％'
+            | '°'
+            | '.'
+            | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+    )
+}
+
+fn is_kinsoku_no_line_end(ch: char) -> bool {
+    matches!(
+        ch,
+        '（' | '【' | '《' | '「' | '『' | '“' | '‘' | '(' | '[' | '{'
+    )
+}
+
+enum RawToken {
+    Space {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    OpenPunct {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    ClosePunct {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    Atom {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+}
+
+enum WrapItem {
+    BreakSpace {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    Atom {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+}
+
+fn tokenize_spans_for_wrap(spans: Vec<Span<'static>>, avail_w: usize) -> Vec<RawToken> {
+    let mut raw = Vec::new();
+    let mut seen_non_space = false;
+    let mut idx = 0usize;
+
+    while idx < spans.len() {
+        // 1. 保持 Powerline 圆角胶囊（`\u{e0b6}` ... `\u{e0b4}`）跨 Span 原子不断开
+        if spans[idx].content.as_ref() == "\u{e0b6}"
+            && let Some(end_idx) = (idx + 1..spans.len().min(idx + 5))
+                .find(|&j| spans[j].content.as_ref() == "\u{e0b4}")
+        {
+            let mut pieces = Vec::with_capacity(end_idx - idx + 1);
+            let mut w = 0usize;
+            for sp in &spans[idx..=end_idx] {
+                w += display_width(&sp.content);
+                pieces.push((sp.content.to_string(), sp.style));
+            }
+            seen_non_space = true;
+            raw.push(RawToken::Atom { pieces, width: w });
+            idx = end_idx + 1;
+            continue;
+        }
+
+        let span = &spans[idx];
+        let style = span.style;
+        let text = span.content.as_ref();
+
+        // 2. 短行内代码 / 背景词块尽量保持原子性，避免 `6 000` 或 `ToolRuntime` 被拆散
+        if style.bg.is_some_and(|c| c != Color::Reset)
+            && !text.starts_with(' ')
+            && !text.contains('\t')
+        {
+            let w = display_width(text);
+            if w > 0 && w <= avail_w.min(28) {
+                seen_non_space = true;
+                raw.push(RawToken::Atom {
+                    pieces: vec![(text.to_string(), style)],
+                    width: w,
+                });
+                idx += 1;
+                continue;
+            }
+        }
+
+        let mut chars = text.char_indices().peekable();
+        while let Some(&(start_b, ch)) = chars.peek() {
+            if ch == ' ' {
+                let mut end_b = start_b + ch.len_utf8();
+                let mut w = char_width(ch);
+                chars.next();
+                while let Some(&(nb, nch)) = chars.peek() {
+                    if nch != ' ' {
+                        break;
+                    }
+                    end_b = nb + nch.len_utf8();
+                    w += char_width(nch);
+                    chars.next();
+                }
+                let piece = (text[start_b..end_b].to_string(), style);
+                if seen_non_space {
+                    raw.push(RawToken::Space {
+                        pieces: vec![piece],
+                        width: w,
+                    });
+                } else {
+                    raw.push(RawToken::Atom {
+                        pieces: vec![piece],
+                        width: w,
+                    });
+                }
+                continue;
+            }
+
+            seen_non_space = true;
+            if is_kinsoku_no_line_end(ch) {
+                chars.next();
+                raw.push(RawToken::OpenPunct {
+                    pieces: vec![(ch.to_string(), style)],
+                    width: char_width(ch),
+                });
+                continue;
+            }
+            if is_kinsoku_no_line_start(ch) {
+                chars.next();
+                raw.push(RawToken::ClosePunct {
+                    pieces: vec![(ch.to_string(), style)],
+                    width: char_width(ch),
+                });
+                continue;
+            }
+            if is_cjk_char(ch) || char_width(ch) >= 2 {
+                chars.next();
+                raw.push(RawToken::Atom {
+                    pieces: vec![(ch.to_string(), style)],
+                    width: char_width(ch),
+                });
+                continue;
+            }
+
+            // 连续 ASCII 单词/标识符/路径块：在非 ASCII 字符、全角标点处结束
+            let mut end_b = start_b + ch.len_utf8();
+            let mut w = char_width(ch);
+            chars.next();
+            while let Some(&(nb, nch)) = chars.peek() {
+                if nch == ' '
+                    || !nch.is_ascii()
+                    || is_cjk_char(nch)
+                    || char_width(nch) >= 2
+                {
+                    break;
+                }
+                end_b = nb + nch.len_utf8();
+                w += char_width(nch);
+                chars.next();
+            }
+            raw.push(RawToken::Atom {
+                pieces: vec![(text[start_b..end_b].to_string(), style)],
+                width: w,
+            });
+        }
+
+        idx += 1;
+    }
+
+    raw
+}
+
+fn merge_kinsoku_items(raw: Vec<RawToken>, avail_w: usize) -> Vec<WrapItem> {
+    let mut items: Vec<WrapItem> = Vec::with_capacity(raw.len());
+    let mut pending_open: Vec<(String, Style)> = Vec::new();
+    let mut pending_open_w = 0usize;
+
+    let flush_pending_open =
+        |open: &mut Vec<(String, Style)>, open_w: &mut usize, items: &mut Vec<WrapItem>| {
+            if !open.is_empty() {
+                items.push(WrapItem::Atom {
+                    pieces: std::mem::take(open),
+                    width: std::mem::take(open_w),
+                });
+            }
+        };
+
+    for tok in raw {
+        match tok {
+            RawToken::Space { pieces, width } => {
+                flush_pending_open(&mut pending_open, &mut pending_open_w, &mut items);
+                items.push(WrapItem::BreakSpace { pieces, width });
+            }
+            RawToken::OpenPunct { pieces, width } => {
+                pending_open.extend(pieces);
+                pending_open_w += width;
+            }
+            RawToken::ClosePunct { pieces, width } => {
+                if !pending_open.is_empty() {
+                    pending_open.extend(pieces);
+                    pending_open_w += width;
+                    flush_pending_open(&mut pending_open, &mut pending_open_w, &mut items);
+                } else if let Some(WrapItem::Atom {
+                    pieces: prev_p,
+                    width: prev_w,
+                }) = items.last_mut()
+                    && *prev_w + width <= avail_w
+                {
+                    prev_p.extend(pieces);
+                    *prev_w += width;
+                } else {
+                    items.push(WrapItem::Atom { pieces, width });
+                }
+            }
+            RawToken::Atom { mut pieces, width } => {
+                if !pending_open.is_empty() {
+                    let mut merged = std::mem::take(&mut pending_open);
+                    let merged_w = std::mem::take(&mut pending_open_w) + width;
+                    merged.append(&mut pieces);
+                    items.push(WrapItem::Atom {
+                        pieces: merged,
+                        width: merged_w,
+                    });
+                } else {
+                    items.push(WrapItem::Atom { pieces, width });
+                }
+            }
+        }
+    }
+
+    flush_pending_open(&mut pending_open, &mut pending_open_w, &mut items);
+    items
+}
+
+fn push_styled_piece(cur_spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = cur_spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(&text);
+    } else {
+        cur_spans.push(Span::styled(text, style));
+    }
+}
+
+fn is_preferred_atom_break(ch: char) -> bool {
+    matches!(
+        ch,
+        '/' | '\\' | '-' | '_' | '.' | ',' | ';' | ':' | ' ' | '(' | '&' | '?' | '='
+    )
+}
+
+fn split_pieces_at_separators(pieces: Vec<(String, Style)>) -> Vec<(Vec<(String, Style)>, usize)> {
+    let mut chunks: Vec<(Vec<(String, Style)>, usize)> = Vec::new();
+    let mut cur_pieces: Vec<(String, Style)> = Vec::new();
+    let mut cur_w = 0usize;
+
+    for (text, style) in pieces {
+        let mut buf = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            let cw = char_width(ch);
+            buf.push(ch);
+            cur_w += cw;
+            let next_same_sep = matches!(ch, ':' | '.') && chars.peek() == Some(&ch);
+            if is_preferred_atom_break(ch) && !next_same_sep {
+                cur_pieces.push((std::mem::take(&mut buf), style));
+                chunks.push((std::mem::take(&mut cur_pieces), std::mem::take(&mut cur_w)));
+            }
+        }
+        if !buf.is_empty() {
+            cur_pieces.push((buf, style));
+        }
+    }
+    if !cur_pieces.is_empty() {
+        chunks.push((cur_pieces, cur_w));
+    }
+    chunks
+}
+
 fn wrap_styled_spans_with_prefixes(
     spans: Vec<Span<'static>>,
     prefix_first: &[Span<'static>],
@@ -1508,10 +2039,22 @@ fn wrap_styled_spans_with_prefixes(
     max_width: usize,
 ) -> Vec<RenderedLine> {
     let width = max_width.max(2);
+    let cont_prefix_w: usize = prefix_cont
+        .iter()
+        .map(|p| display_width(&p.content))
+        .sum();
+    let avail_w = width.saturating_sub(cont_prefix_w).max(1);
+
+    let raw = tokenize_spans_for_wrap(spans, avail_w);
+    let items = merge_kinsoku_items(raw, avail_w);
+
     let mut lines: Vec<RenderedLine> = Vec::new();
     let mut cur_spans: Vec<Span<'static>> = Vec::new();
     let mut cur_col = 0usize;
     let mut is_first_visual_line = true;
+    let mut line_has_content = false;
+    let mut pending_space: Vec<(String, Style)> = Vec::new();
+    let mut pending_space_w = 0usize;
 
     let push_prefixes = |target: &mut Vec<Span<'static>>,
                          col: &mut usize,
@@ -1523,30 +2066,134 @@ fn wrap_styled_spans_with_prefixes(
         }
     };
 
+    let flush_line = |lines: &mut Vec<RenderedLine>,
+                      cur_spans: &mut Vec<Span<'static>>,
+                      cur_col: &mut usize,
+                      is_first: &mut bool,
+                      has_content: &mut bool| {
+        lines.push(RenderedLine {
+            line: Line::from(std::mem::take(cur_spans)),
+            soft_wrapped: !*is_first,
+        });
+        *is_first = false;
+        *cur_col = 0;
+        *has_content = false;
+        push_prefixes(cur_spans, cur_col, prefix_cont);
+    };
+
     push_prefixes(&mut cur_spans, &mut cur_col, prefix_first);
 
-    for span in spans {
-        let style = span.style;
-        let mut chunk = String::new();
-        for ch in span.content.chars() {
-            let cw = char_width(ch);
-            if cw > 0 && cur_col + cw > width && cur_col > 0 {
-                if !chunk.is_empty() {
-                    cur_spans.push(Span::styled(std::mem::take(&mut chunk), style));
-                }
-                lines.push(RenderedLine {
-                    line: Line::from(std::mem::take(&mut cur_spans)),
-                    soft_wrapped: !is_first_visual_line,
-                });
-                is_first_visual_line = false;
-                cur_col = 0;
-                push_prefixes(&mut cur_spans, &mut cur_col, prefix_cont);
+    for item in items {
+        match item {
+            WrapItem::BreakSpace { pieces, width: sw } => {
+                pending_space.extend(pieces);
+                pending_space_w += sw;
             }
-            chunk.push(ch);
-            cur_col += cw;
+            WrapItem::Atom { pieces, width: aw } => {
+                if cur_col + pending_space_w + aw <= width {
+                    for (t, st) in pending_space.drain(..) {
+                        push_styled_piece(&mut cur_spans, t, st);
+                    }
+                    cur_col += std::mem::take(&mut pending_space_w);
+                    for (t, st) in pieces {
+                        push_styled_piece(&mut cur_spans, t, st);
+                    }
+                    cur_col += aw;
+                    line_has_content = true;
+                } else if aw <= avail_w && (line_has_content || cur_col > 0) {
+                    pending_space.clear();
+                    pending_space_w = 0;
+                    flush_line(
+                        &mut lines,
+                        &mut cur_spans,
+                        &mut cur_col,
+                        &mut is_first_visual_line,
+                        &mut line_has_content,
+                    );
+                    for (t, st) in pieces {
+                        push_styled_piece(&mut cur_spans, t, st);
+                    }
+                    cur_col += aw;
+                    line_has_content = true;
+                } else {
+                    // 单个原子词块本身超过续行可用宽度：若当前行已有内容先整块换行，再按分隔符/字符安全切分
+                    if line_has_content {
+                        pending_space.clear();
+                        pending_space_w = 0;
+                        flush_line(
+                            &mut lines,
+                            &mut cur_spans,
+                            &mut cur_col,
+                            &mut is_first_visual_line,
+                            &mut line_has_content,
+                        );
+                    } else if cur_col + pending_space_w <= width {
+                        for (t, st) in pending_space.drain(..) {
+                            push_styled_piece(&mut cur_spans, t, st);
+                        }
+                        cur_col += std::mem::take(&mut pending_space_w);
+                    } else {
+                        pending_space.clear();
+                        pending_space_w = 0;
+                    }
+
+                    for (sub_pieces, sub_w) in split_pieces_at_separators(pieces) {
+                        if sub_w <= avail_w && cur_col + sub_w <= width {
+                            for (t, st) in sub_pieces {
+                                push_styled_piece(&mut cur_spans, t, st);
+                            }
+                            cur_col += sub_w;
+                            line_has_content = true;
+                            continue;
+                        }
+                        if sub_w <= avail_w && line_has_content {
+                            flush_line(
+                                &mut lines,
+                                &mut cur_spans,
+                                &mut cur_col,
+                                &mut is_first_visual_line,
+                                &mut line_has_content,
+                            );
+                            for (t, st) in sub_pieces {
+                                push_styled_piece(&mut cur_spans, t, st);
+                            }
+                            cur_col += sub_w;
+                            line_has_content = true;
+                            continue;
+                        }
+                        for (t, st) in sub_pieces {
+                            let mut chunk = String::new();
+                            for ch in t.chars() {
+                                let cw = char_width(ch);
+                                if cw > 0 && cur_col + cw > width && cur_col > 0 {
+                                    push_styled_piece(
+                                        &mut cur_spans,
+                                        std::mem::take(&mut chunk),
+                                        st,
+                                    );
+                                    flush_line(
+                                        &mut lines,
+                                        &mut cur_spans,
+                                        &mut cur_col,
+                                        &mut is_first_visual_line,
+                                        &mut line_has_content,
+                                    );
+                                }
+                                chunk.push(ch);
+                                cur_col += cw;
+                                line_has_content = true;
+                            }
+                            push_styled_piece(&mut cur_spans, chunk, st);
+                        }
+                    }
+                }
+            }
         }
-        if !chunk.is_empty() {
-            cur_spans.push(Span::styled(chunk, style));
+    }
+
+    if !pending_space.is_empty() && cur_col + pending_space_w <= width {
+        for (t, st) in pending_space {
+            push_styled_piece(&mut cur_spans, t, st);
         }
     }
 
@@ -2072,6 +2719,181 @@ mod tests {
         );
         for rl in &rendered {
             assert!(spans_display_width(&rl.line.spans) <= 30);
+        }
+    }
+
+    #[test]
+    fn deduplicates_bold_label_before_matching_mode_pill_and_splits_long_prose() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig {
+            enabled: true,
+            round_caps: true,
+            icons: true,
+            guidance: true,
+        };
+        let md = "**Investigate** [[Investigate]]：我先梳理各个 crate 的依赖与职责、agent 主循环与工具调度机制。";
+        let rendered = render_markdown_rich(md, 44, &theme, &cfg);
+        assert!(rendered.len() >= 2, "expected pill line + prose lines");
+
+        let line0: String = rendered[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            line0.matches("Investigate").count(),
+            1,
+            "duplicate Investigate leaked: {line0:?}"
+        );
+        assert!(line0.starts_with('\u{e0b6}') && line0.ends_with('\u{e0b4}'));
+
+        let line1: String = rendered[1]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            line1.starts_with("我先梳理"),
+            "prose should start flush at col 0 without colon/indent: {line1:?}"
+        );
+        assert!(!rendered[1].soft_wrapped);
+    }
+
+    #[test]
+    fn parses_bold_with_inline_code_and_preserves_heading_hierarchy() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig {
+            enabled: true,
+            round_caps: true,
+            icons: true,
+            guidance: true,
+        };
+        let md = "## **Medium - `grep` 硬依赖外部 `rg`**\n### **Sub**\n1. **`cargo fmt --all` 单独提交**，让 CI 变绿。\n2. 普通文本与 *斜体*。";
+        let rendered = render_markdown_rich(md, 96, &theme, &cfg);
+        let texts: Vec<String> = rendered
+            .iter()
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = texts.join("\n");
+        assert!(!joined.contains("**"), "raw asterisks leaked:\n{joined}");
+        assert!(joined.contains("cargo fmt --all 单独提交"));
+
+        // H3 内部粗体保持 warning 色，不被 link 覆盖
+        let h3_span = rendered[1]
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Sub"))
+            .expect("h3 span");
+        assert_eq!(h3_span.style.fg, Some(theme.warning));
+        assert!(h3_span.style.add_modifier.contains(Modifier::BOLD));
+
+        // 列表项内普通粗体用 crisp text+BOLD 而非全句变蓝，其中的内联代码保留 code_bg+BOLD
+        let item1_code = rendered[2]
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("cargo fmt --all"))
+            .expect("bold inline code span");
+        assert_eq!(item1_code.style.bg, Some(theme.code_bg));
+        assert!(item1_code.style.add_modifier.contains(Modifier::BOLD));
+
+        let item1_bold = rendered[2]
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("单独提交"))
+            .expect("bold prose span");
+        assert_eq!(item1_bold.style.fg, Some(theme.text));
+        assert!(item1_bold.style.add_modifier.contains(Modifier::BOLD));
+
+        let italic_span = rendered[3]
+            .line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("斜体"))
+            .expect("italic span");
+        assert!(italic_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn wraps_words_paths_and_cjk_kinsoku_without_splitting_tokens_or_orphaning_punct() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig {
+            enabled: true,
+            round_caps: true,
+            icons: true,
+            guidance: true,
+        };
+
+        // 1. 句末中文句号不能单独落到新行行首
+        let md_punct = "要么在启动探测阶段就提示缺依赖。";
+        // "要么在启动探测阶段就提示缺依赖" = 30 列，"." = 2 列，width=30 时必须把"赖。"一起推到下一行
+        let r_punct = render_markdown_rich(md_punct, 30, &theme, &cfg);
+        assert_eq!(r_punct.len(), 2);
+        let p_line1: String = r_punct[1].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(p_line1, "赖。");
+
+        // 2. 英文标识符与行内代码路径不能从中间腰斩
+        let md_tokens = "\
+建议先在高风险点 (`Session`、`ToolRuntime`、`McpTransport`) 替换。\n\
+- 仍引用已删除的 `crates/dsh-webserver` 与根 `src/main.rs`。\n\
+- 手写 `poll/read` 可改用树里已有的 `rustix` (`crossterm` 已引入)。\n\
+1. 单独提交，让 CI 变绿（[[Done]] 后可解锁合并门禁）。";
+        for w in [42usize, 46, 52, 60] {
+            let rendered = render_markdown_rich(md_tokens, w, &theme, &cfg);
+            let lines_str: Vec<String> = rendered
+                .iter()
+                .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            for l in &lines_str {
+                assert!(
+                    display_width(l) <= w,
+                    "exceeded width {w}: {l:?}"
+                );
+                let trimmed_l = l.trim_start();
+                assert!(
+                    !trimmed_l.starts_with('。')
+                        && !trimmed_l.starts_with('、')
+                        && !trimmed_l.starts_with('）'),
+                    "kinsoku violated at line start (w={w}): {l:?}\nall:\n{}",
+                    lines_str.join("\n")
+                );
+                assert!(
+                    !l.ends_with('（'),
+                    "kinsoku violated at line end (w={w}): {l:?}"
+                );
+            }
+            let joined = lines_str.join("\n");
+            assert!(
+                joined.contains("ToolRuntime"),
+                "ToolRuntime split across lines (w={w}):\n{joined}"
+            );
+            assert!(
+                joined.contains("src/main.rs"),
+                "src/main.rs split across lines (w={w}):\n{joined}"
+            );
+            assert!(
+                joined.contains("rustix"),
+                "rustix split across lines (w={w}):\n{joined}"
+            );
+            // 验证圆角胶囊左右帽永远在同一行
+            for l in &lines_str {
+                if l.contains('\u{e0b6}') || l.contains('\u{e0b4}') {
+                    assert!(
+                        l.contains('\u{e0b6}') && l.contains('\u{e0b4}'),
+                        "powerline pill split across lines: {l:?}"
+                    );
+                }
+            }
         }
     }
 }
