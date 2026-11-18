@@ -71,36 +71,55 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
     let _ = std::fs::remove_dir_all(&base);
     let repo = base.join("repo");
     let sub_cwd = repo.join("crates/app");
-    let user_dsh = base.join("user-dsh");
+    let user_agents = base.join("user-agents");
     let custom_dir = base.join("custom");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::create_dir_all(&sub_cwd).unwrap();
-    std::fs::create_dir_all(repo.join(".dsh-rs/skills/alpha-skill")).unwrap();
-    std::fs::create_dir_all(repo.join(".dsh-rs/skills/manual-only")).unwrap();
+    std::fs::create_dir_all(repo.join(".agents/skills/alpha-skill")).unwrap();
+    std::fs::create_dir_all(repo.join(".agents/skills/manual-only")).unwrap();
     std::fs::create_dir_all(repo.join(".agents/skills/shared-skill")).unwrap();
-    std::fs::create_dir_all(user_dsh.join("skills/.system/ignored-skill")).unwrap();
-    std::fs::create_dir_all(user_dsh.join("skills/alpha-skill")).unwrap();
+    // .dsh-rs/skills 不再作为默认读取路径
+    std::fs::create_dir_all(repo.join(".dsh-rs/skills/legacy-ignored")).unwrap();
+    std::fs::create_dir_all(user_agents.join("skills/.system/ignored-skill")).unwrap();
+    std::fs::create_dir_all(user_agents.join("skills/alpha-skill")).unwrap();
+    std::fs::create_dir_all(user_agents.join("skills/pack/skills/nested-skill")).unwrap();
     std::fs::create_dir_all(&custom_dir).unwrap();
 
-    // 同名 alpha-skill：project-dsh (rank 100) 覆盖 user-dsh (rank 400)
+    // 同名 alpha-skill：project-agents (rank 200) 覆盖 user-agents (rank 500)
     std::fs::write(
-        repo.join(".dsh-rs/skills/alpha-skill/SKILL.md"),
+        repo.join(".agents/skills/alpha-skill/SKILL.md"),
         "---\nname: alpha-skill\ndescription: Project alpha guide\n---\nPROJECT_BODY_V1",
     )
     .unwrap();
     std::fs::write(
-        user_dsh.join("skills/alpha-skill/SKILL.md"),
+        user_agents.join("skills/alpha-skill/SKILL.md"),
         "---\nname: alpha-skill\ndescription: User alpha guide\n---\nUSER_BODY",
     )
     .unwrap();
     std::fs::write(
-        user_dsh.join("skills/.system/ignored-skill/SKILL.md"),
+        user_agents.join("skills/.system/ignored-skill/SKILL.md"),
         "---\nname: ignored-skill\ndescription: Should be skipped\n---\nIGNORED",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".dsh-rs/skills/legacy-ignored/SKILL.md"),
+        "---\nname: legacy-ignored\ndescription: Legacy path skipped\n---\nLEGACY",
+    )
+    .unwrap();
+    // 技能包嵌套目录（如 ~/.agents/skills/pstack/skills/<name>/SKILL.md）与包内非根 README.md 处理
+    std::fs::write(
+        user_agents.join("skills/pack/README.md"),
+        "# Pack Readme without frontmatter",
+    )
+    .unwrap();
+    std::fs::write(
+        user_agents.join("skills/pack/skills/nested-skill/SKILL.md"),
+        "---\nname: nested-skill\ndescription: Nested pack helper\n---\nNESTED_BODY",
     )
     .unwrap();
     // disable-model-invocation: true 仅能通过 /manual-only 触发
     std::fs::write(
-        repo.join(".dsh-rs/skills/manual-only/SKILL.md"),
+        repo.join(".agents/skills/manual-only/SKILL.md"),
         "---\nname: manual-only\ndescription: Deploy release\ndisable-model-invocation: true\n---\nMANUAL_BODY",
     )
     .unwrap();
@@ -183,9 +202,8 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
         .unwrap();
 
     let mut skills_cfg = SkillsConfig::new(&sub_cwd);
-    skills_cfg.dsh_home = Some(user_dsh.clone());
+    skills_cfg.agents_home = Some(user_agents.clone());
     skills_cfg.custom_skill_dirs = vec![custom_dir.clone()];
-    skills_cfg.agents_home = Some(base.join("missing-agents"));
     ctx.plugin(SkillsPlugin, skills_cfg).await.unwrap();
     ctx.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
         .await
@@ -255,8 +273,10 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
         assert!(step1_text.contains("`alpha-skill`: Project alpha guide"));
         assert!(step1_text.contains("`shared-skill`: From project agents"));
         assert!(step1_text.contains("`runtime-skill`: Runtime helper"));
+        assert!(step1_text.contains("`nested-skill`: Nested pack helper"));
         assert!(!step1_text.contains("manual-only`: Deploy release"));
         assert!(!step1_text.contains("ignored-skill"));
+        assert!(!step1_text.contains("legacy-ignored"));
         assert!(!step1_text.contains("PROJECT_BODY_V1"));
         assert!(step1_text.contains("<skill_content name=\"manual-only\">"));
         assert!(step1_text.contains("MANUAL_BODY"));
@@ -301,7 +321,7 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
 
     // 验证文件修改后无需手动刷新即可拿到新正文并触发替换目录
     std::fs::write(
-        repo.join(".dsh-rs/skills/alpha-skill/SKILL.md"),
+        repo.join(".agents/skills/alpha-skill/SKILL.md"),
         "---\nname: alpha-skill\ndescription: Project alpha guide v2\n---\nPROJECT_BODY_V2",
     )
     .unwrap();

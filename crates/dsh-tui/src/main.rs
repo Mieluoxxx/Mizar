@@ -23,6 +23,7 @@
 //! - `PROTOCOL`：`completions`（默认）/ `responses` / `messages`
 //! - `BASE_URL`、`MODEL`、`WORKSPACE`、`DSH_RS_HOME`
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use cordis::{Context, Service};
@@ -34,7 +35,8 @@ use dsh_llm_retry::{LlmRetryPlugin, RetryConfig};
 use dsh_llm_router::LlmRouter;
 use dsh_tools_coding::CodingToolsPreset;
 use dsh_tui::{
-    ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig, run_tui,
+    ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
+    format_resume_command, run_tui_with_summary,
 };
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -114,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 进入终端界面前先静默，防止启动日志先刷到 stdout 再闪屏
     app.logger().set_silent();
 
+    let explicit_workspace = cli.workspace.clone();
     let workspace = cli
         .workspace
         .or_else(|| env_non_empty("WORKSPACE").map(PathBuf::from))
@@ -182,7 +185,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let run_res = run_tui(app.clone(), tui_cfg).await;
+    let run_res = run_tui_with_summary(app.clone(), tui_cfg).await;
     app.fiber().dispose().await;
-    run_res
+    match run_res {
+        Ok(summary) => {
+            if std::io::stdout().is_terminal()
+                && let Some(cmd) = format_resume_command(
+                    &summary,
+                    explicit_workspace.as_deref(),
+                    std::env::current_exe().ok().as_deref(),
+                    std::env::current_dir().ok().as_deref(),
+                )
+            {
+                println!("\n可使用以下命令恢复此会话：\n  {cmd}");
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }

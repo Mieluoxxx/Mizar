@@ -20,7 +20,10 @@ pub use app::{
     UiEvent,
 };
 pub use emphasis::EmphasisConfig;
-pub use runner::{ResumeTarget, TuiConfig, run_tui, subscribe_session_events, wait_for_services};
+pub use runner::{
+    ResumeTarget, TuiConfig, TuiExitSummary, format_resume_command, run_tui,
+    run_tui_with_summary, subscribe_session_events, wait_for_services,
+};
 pub use terminal::ScreenMode;
 pub use theme::{TerminalColors, Theme, ThemePreset};
 pub use ui::{build_item_lines_for_scrollback, render};

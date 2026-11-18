@@ -8,8 +8,7 @@ pub mod types;
 
 pub use filesystem::{
     CUSTOM_RANK, FilesystemSkillConfig, FilesystemSkillProvider, PROJECT_AGENTS_RANK,
-    PROJECT_DSH_RANK, USER_AGENTS_RANK, USER_DSH_RANK, find_project_root, resolve_agents_home,
-    resolve_dsh_home,
+    USER_AGENTS_RANK, find_project_root, is_potential_skill_path, resolve_agents_home,
 };
 pub use frontmatter::{ParsedSkillFile, parse_skill_markdown};
 pub use plugin::{

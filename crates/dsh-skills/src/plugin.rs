@@ -30,7 +30,6 @@ pub struct SkillsConfig {
     pub workspace: PathBuf,
     pub enabled: bool,
     pub include_default_roots: bool,
-    pub dsh_home: Option<PathBuf>,
     pub agents_home: Option<PathBuf>,
     pub custom_skill_dirs: Vec<PathBuf>,
     pub bundled_skill_dir: Option<PathBuf>,
@@ -43,7 +42,6 @@ impl SkillsConfig {
             workspace: workspace.into(),
             enabled: true,
             include_default_roots: true,
-            dsh_home: None,
             agents_home: None,
             custom_skill_dirs: Vec::new(),
             bundled_skill_dir: None,
@@ -297,7 +295,6 @@ impl Plugin for SkillsPlugin {
                 FilesystemSkillConfig {
                     provider_name: "filesystem".to_string(),
                     include_default_roots: config.include_default_roots,
-                    dsh_home: config.dsh_home.clone(),
                     agents_home: config.agents_home.clone(),
                     custom_skill_dirs: config.custom_skill_dirs.clone(),
                     bundled_skill_dir: config.bundled_skill_dir.clone(),

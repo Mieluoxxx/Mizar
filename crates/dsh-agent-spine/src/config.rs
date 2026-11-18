@@ -293,7 +293,6 @@ impl LoadedDshConfig {
         } = &mut spine.tools_mode
         {
             mcp.global_config_dir = self.global_dir.clone();
-            skills.dsh_home = self.global_dir.clone();
             if let Some(sk) = &self.settings.skills {
                 if let Some(v) = sk.enabled {
                     skills.enabled = v;

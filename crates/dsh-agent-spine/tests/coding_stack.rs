@@ -98,7 +98,6 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
             .insert("multi_grep".into(), McpExposure::Hidden);
         mcp.servers.insert("fff".into(), fff);
 
-        skills.dsh_home = Some(ws.join("isolated-home"));
         skills.agents_home = Some(ws.join("isolated-agents"));
     }
 

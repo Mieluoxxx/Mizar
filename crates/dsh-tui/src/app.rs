@@ -1664,9 +1664,9 @@ impl AppState {
         if let Some(cmd_line) = trimmed.strip_prefix('/') {
             let cmd_line = cmd_line.trim();
             let first = cmd_line.split_whitespace().next().unwrap_or("");
-            let is_skill_gesture = !is_builtin_slash_cmd(&first.to_ascii_lowercase())
-                && self.user_skill_names.iter().any(|s| s == first);
-            if !is_skill_gesture {
+            // 对齐 dsh-TUI / pi：仅拦截已注册内置命令；
+            // 技能手势（/<skill>）、绝对路径（/Users/...）以及未知 / 前缀一律作为普通消息发给模型。
+            if is_builtin_slash_cmd(&first.to_ascii_lowercase()) {
                 return self.handle_slash_command(cmd_line);
             }
         }
@@ -1847,13 +1847,7 @@ impl AppState {
             },
             "stats" => AppAction::ShowStats,
             "export" => AppAction::ExportTrajectory(arg.map(PathBuf::from)),
-            _ => {
-                self.push_notice(
-                    NoticeLevel::Warn,
-                    format!("未知命令 `/{cmd}`，输入 /help 查看可用命令"),
-                );
-                AppAction::None
-            }
+            _ => AppAction::None,
         }
     }
 }
@@ -2178,6 +2172,21 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::SubmitPrompt("/rust-review crates/dsh-skills".to_string())
+        );
+
+        // 绝对路径与未知斜杠前缀应直接作为普通消息发给模型，不被误判为未知命令
+        let abs_path_prompt =
+            "/Users/moguw/workspace/dsh-space/dsh-rs/docs/plugins.md 帮我更新一下文档";
+        app.input.insert_str(abs_path_prompt);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::SubmitPrompt(abs_path_prompt.to_string())
+        );
+
+        app.input.insert_str("/unknown-cmd hello");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::SubmitPrompt("/unknown-cmd hello".to_string())
         );
 
         app.input.insert_str("/exit");

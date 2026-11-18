@@ -37,10 +37,8 @@ pub fn is_skill_name(name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkillSource {
-    ProjectDsh,
     ProjectAgents,
     Custom,
-    UserDsh,
     UserAgents,
     Bundled,
     Runtime,
@@ -50,10 +48,8 @@ pub enum SkillSource {
 impl SkillSource {
     pub fn as_str(&self) -> &str {
         match self {
-            Self::ProjectDsh => "project-dsh",
             Self::ProjectAgents => "project-agents",
             Self::Custom => "custom",
-            Self::UserDsh => "user-dsh",
             Self::UserAgents => "user-agents",
             Self::Bundled => "bundled",
             Self::Runtime => "runtime",

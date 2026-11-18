@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -15,17 +16,15 @@ use crate::types::{
     SkillProviderObservation, SkillResourceBase, SkillSource, SkillSummary,
 };
 
-pub const PROJECT_DSH_RANK: u32 = 100;
 pub const PROJECT_AGENTS_RANK: u32 = 200;
 pub const CUSTOM_RANK: u32 = 300;
-pub const USER_DSH_RANK: u32 = 400;
 pub const USER_AGENTS_RANK: u32 = 500;
+const MAX_SKILL_SCAN_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct FilesystemSkillConfig {
     pub provider_name: String,
     pub include_default_roots: bool,
-    pub dsh_home: Option<PathBuf>,
     pub agents_home: Option<PathBuf>,
     pub custom_skill_dirs: Vec<PathBuf>,
     pub bundled_skill_dir: Option<PathBuf>,
@@ -36,7 +35,6 @@ impl Default for FilesystemSkillConfig {
         Self {
             provider_name: "filesystem".to_string(),
             include_default_roots: true,
-            dsh_home: None,
             agents_home: None,
             custom_skill_dirs: Vec::new(),
             bundled_skill_dir: None,
@@ -49,7 +47,6 @@ struct SkillRoot {
     path: PathBuf,
     source: SkillSource,
     rank: u32,
-    skip_system: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,19 +54,6 @@ struct LocalLocator {
     path: PathBuf,
     directory: PathBuf,
     source: SkillSource,
-}
-
-pub fn resolve_dsh_home(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = explicit {
-        return Some(dir.to_path_buf());
-    }
-    if let Ok(env) = std::env::var("DSH_RS_HOME") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".dsh-rs"))
 }
 
 pub fn resolve_agents_home(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -99,8 +83,12 @@ pub fn find_project_root(cwd: &Path) -> PathBuf {
     }
 }
 
-/// 判断目标路径是否可能命中任一潜在技能路径（`<root>/<name>.md` 或 `<root>/<name>/SKILL.md`）。
-pub fn is_potential_skill_path(root: &Path, target: &Path, skip_system: bool) -> bool {
+fn should_skip_entry_name(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules"
+}
+
+/// 判断目标路径是否可能命中任一潜在技能路径（根下 `<name>.md` 或任意非隐藏子目录 `<dir>/.../SKILL.md`）。
+pub fn is_potential_skill_path(root: &Path, target: &Path) -> bool {
     let Ok(rel) = target.strip_prefix(root) else {
         return false;
     };
@@ -111,16 +99,16 @@ pub fn is_potential_skill_path(root: &Path, target: &Path, skip_system: bool) ->
             _ => None,
         })
         .collect();
-    if comps.is_empty() || comps.len() > 2 {
+    if comps.is_empty() {
         return false;
     }
-    if skip_system && comps[0] == ".system" {
+    if comps.iter().any(|c| should_skip_entry_name(c)) {
         return false;
     }
     if comps.len() == 1 {
-        comps[0].ends_with(".md")
+        comps[0].ends_with(".md") && comps[0] != "SKILL.md"
     } else {
-        comps[1] == "SKILL.md"
+        comps.last().is_some_and(|last| last == "SKILL.md")
     }
 }
 
@@ -141,50 +129,61 @@ impl FilesystemSkillProvider {
 
     fn resolve_roots(&self, cwd: Option<&Path>) -> Vec<SkillRoot> {
         let mut roots = Vec::new();
+        let mut seen_paths = HashSet::new();
+
+        let user_agents_dir = self
+            .config
+            .include_default_roots
+            .then(|| resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills")))
+            .flatten();
+        let user_agents_key = user_agents_dir
+            .as_ref()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+
         let effective_cwd = cwd.or(self.default_cwd.as_deref());
         if self.config.include_default_roots
             && let Some(dir) = effective_cwd
         {
-            let abs = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            let project_root = find_project_root(&abs);
-            roots.push(SkillRoot {
-                path: project_root.join(".dsh-rs").join("skills"),
-                source: SkillSource::ProjectDsh,
-                rank: PROJECT_DSH_RANK,
-                skip_system: false,
-            });
-            roots.push(SkillRoot {
-                path: project_root.join(".agents").join("skills"),
-                source: SkillSource::ProjectAgents,
-                rank: PROJECT_AGENTS_RANK,
-                skip_system: false,
-            });
+            let abs_cwd = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            let project_root = find_project_root(&abs_cwd);
+            let mut candidates = Vec::new();
+            if abs_cwd != project_root {
+                candidates.push(abs_cwd.join(".agents").join("skills"));
+            }
+            candidates.push(project_root.join(".agents").join("skills"));
+            for path in candidates {
+                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if user_agents_key.as_ref() == Some(&key) {
+                    continue;
+                }
+                if seen_paths.insert(key) {
+                    roots.push(SkillRoot {
+                        path,
+                        source: SkillSource::ProjectAgents,
+                        rank: PROJECT_AGENTS_RANK,
+                    });
+                }
+            }
         }
 
         for dir in &self.config.custom_skill_dirs {
-            roots.push(SkillRoot {
-                path: dir.clone(),
-                source: SkillSource::Custom,
-                rank: CUSTOM_RANK,
-                skip_system: false,
-            });
-        }
-
-        if self.config.include_default_roots {
-            if let Some(dsh_home) = resolve_dsh_home(self.config.dsh_home.as_deref()) {
+            let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            if seen_paths.insert(key) {
                 roots.push(SkillRoot {
-                    path: dsh_home.join("skills"),
-                    source: SkillSource::UserDsh,
-                    rank: USER_DSH_RANK,
-                    skip_system: true,
+                    path: dir.clone(),
+                    source: SkillSource::Custom,
+                    rank: CUSTOM_RANK,
                 });
             }
-            if let Some(agents_home) = resolve_agents_home(self.config.agents_home.as_deref()) {
+        }
+
+        if let Some(path) = user_agents_dir {
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if seen_paths.insert(key) {
                 roots.push(SkillRoot {
-                    path: agents_home.join("skills"),
+                    path,
                     source: SkillSource::UserAgents,
                     rank: USER_AGENTS_RANK,
-                    skip_system: false,
                 });
             }
         }
@@ -198,12 +197,14 @@ impl FilesystemSkillProvider {
                 .map(PathBuf::from)
         });
         if let Some(bundled_dir) = bundled {
-            roots.push(SkillRoot {
-                path: bundled_dir,
-                source: SkillSource::Bundled,
-                rank: BUNDLED_SKILL_RANK,
-                skip_system: false,
-            });
+            let key = std::fs::canonicalize(&bundled_dir).unwrap_or_else(|_| bundled_dir.clone());
+            if seen_paths.insert(key) {
+                roots.push(SkillRoot {
+                    path: bundled_dir,
+                    source: SkillSource::Bundled,
+                    rank: BUNDLED_SKILL_RANK,
+                });
+            }
         }
 
         roots
@@ -213,7 +214,7 @@ impl FilesystemSkillProvider {
         let abs_target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
         self.resolve_roots(cwd).into_iter().any(|root| {
             let root_abs = std::fs::canonicalize(&root.path).unwrap_or(root.path);
-            is_potential_skill_path(&root_abs, &abs_target, root.skip_system)
+            is_potential_skill_path(&root_abs, &abs_target)
         })
     }
 }
@@ -228,6 +229,65 @@ fn hash_mtime(meta: &std::fs::Metadata, hasher: &mut DefaultHasher) {
     }
 }
 
+/// 扫描单个技能根目录，返回排序后的 `(skill_md_path, resource_base_dir)` 列表。
+/// 若某子目录直接包含 `SKILL.md`，加载后停止继续下钻；否则递归扫描下级目录以兼容技能包结构。
+fn scan_root_skill_files(root_path: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    if !root_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut visited_dirs = HashSet::new();
+    let mut stack = vec![(root_path.to_path_buf(), true, 0usize)];
+    let mut discovered = Vec::new();
+
+    while let Some((dir, is_root, depth)) = stack.pop() {
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !visited_dirs.insert(canonical_dir) {
+            continue;
+        }
+
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) if is_root => return Err(format!("read_dir {}: {err}", dir.display())),
+            Err(_) => continue,
+        };
+
+        let mut entries: Vec<(String, PathBuf)> = rd
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut next_subdirs = Vec::new();
+        for (name, entry_path) in entries {
+            if should_skip_entry_name(&name) {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&entry_path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                let skill_md = entry_path.join("SKILL.md");
+                if std::fs::metadata(&skill_md).is_ok_and(|m| m.is_file()) {
+                    discovered.push((skill_md, entry_path));
+                } else if depth < MAX_SKILL_SCAN_DEPTH {
+                    next_subdirs.push((entry_path, false, depth + 1));
+                }
+            } else if is_root && meta.is_file() && name.ends_with(".md") && name != "SKILL.md" {
+                discovered.push((entry_path, root_path.to_path_buf()));
+            }
+        }
+
+        // LIFO 栈逆序压入以保持字典序遍历
+        for item in next_subdirs.into_iter().rev() {
+            stack.push(item);
+        }
+    }
+
+    discovered.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(discovered)
+}
+
 fn compute_roots_fingerprint(roots: &[SkillRoot]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for root in roots {
@@ -238,31 +298,12 @@ fn compute_roots_fingerprint(roots: &[SkillRoot]) -> u64 {
         };
         true.hash(&mut hasher);
         hash_mtime(&root_meta, &mut hasher);
-        let Ok(rd) = std::fs::read_dir(&root.path) else {
+        let Ok(files) = scan_root_skill_files(&root.path) else {
             continue;
         };
-        let mut names: Vec<(String, PathBuf)> = rd
-            .flatten()
-            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
-            .collect();
-        names.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, path) in names {
-            if root.skip_system && name == ".system" {
-                continue;
-            }
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if meta.is_dir() {
-                let skill_file = path.join("SKILL.md");
-                if let Ok(sf_meta) = std::fs::metadata(&skill_file)
-                    && sf_meta.is_file()
-                {
-                    name.hash(&mut hasher);
-                    hash_mtime(&sf_meta, &mut hasher);
-                }
-            } else if meta.is_file() && name.ends_with(".md") {
-                name.hash(&mut hasher);
+        for (file_path, _) in files {
+            if let Ok(meta) = std::fs::metadata(&file_path) {
+                file_path.hash(&mut hasher);
                 hash_mtime(&meta, &mut hasher);
             }
         }
@@ -275,54 +316,17 @@ async fn discover_root(
     provider_name: &str,
     root: &SkillRoot,
 ) -> Result<Vec<SkillCandidate>, String> {
-    if !root.path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut rd = tokio::fs::read_dir(&root.path)
+    let root_path = root.path.clone();
+    let files = tokio::task::spawn_blocking(move || scan_root_skill_files(&root_path))
         .await
-        .map_err(|e| format!("read_dir {}: {e}", root.path.display()))?;
-
-    let mut entries = Vec::new();
-    while let Some(entry) = rd
-        .next_entry()
-        .await
-        .map_err(|e| format!("next_entry {}: {e}", root.path.display()))?
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if root.skip_system && name == ".system" {
-            continue;
-        }
-        entries.push((name, entry.path()));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+        .map_err(|err| format!("scan_root_skill_files join error: {err}"))??;
 
     let mut candidates = Vec::new();
-    for (name, entry_path) in entries {
-        let Ok(meta) = tokio::fs::metadata(&entry_path).await else {
-            continue;
-        };
-        let locator = if meta.is_dir() {
-            let skill_md = entry_path.join("SKILL.md");
-            if tokio::fs::metadata(&skill_md)
-                .await
-                .is_ok_and(|m| m.is_file())
-            {
-                LocalLocator {
-                    path: skill_md,
-                    directory: entry_path,
-                    source: root.source.clone(),
-                }
-            } else {
-                continue;
-            }
-        } else if meta.is_file() && name.ends_with(".md") {
-            LocalLocator {
-                path: entry_path,
-                directory: root.path.clone(),
-                source: root.source.clone(),
-            }
-        } else {
-            continue;
+    for (skill_path, resource_dir) in files {
+        let locator = LocalLocator {
+            path: skill_path,
+            directory: resource_dir,
+            source: root.source.clone(),
         };
 
         match read_and_parse_skill(&locator.path).await {

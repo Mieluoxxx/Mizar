@@ -415,6 +415,7 @@ pub fn decorate_label_with_icon(label: &str, cfg: &EmphasisConfig) -> String {
         .iter()
         .find(|(k, _)| *k == word)
         .map(|(_, ic)| *ic)
+        .or_else(|| PILL_ICONS.iter().find(|(k, _)| *k == word).map(|(_, ic)| *ic))
         .or_else(|| {
             if trimmed.ends_with(':') {
                 ACTION_ICONS

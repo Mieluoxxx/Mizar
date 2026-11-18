@@ -497,10 +497,15 @@ impl TextInput {
             return None;
         }
         let up_to_cursor = &self.text[..self.cursor];
-        if up_to_cursor.contains('\n') || up_to_cursor.contains(' ') {
+        if up_to_cursor.chars().any(char::is_whitespace) {
             return None;
         }
-        Some((0, up_to_cursor[1..].to_string()))
+        let token = &up_to_cursor[1..];
+        // 对齐 pi / dsh-TUI：包含 `/` 时代表输入文件系统路径（如 `/Users/...`），不弹出命令补全
+        if token.contains('/') {
+            return None;
+        }
+        Some((0, token.to_string()))
     }
 
     pub fn active_mention_trigger(&self) -> Option<(usize, String)> {
@@ -651,6 +656,10 @@ mod tests {
         let mut input = TextInput::new();
         input.insert_str("/mod");
         assert_eq!(input.active_slash_trigger(), Some((0, "mod".to_string())));
+
+        input.clear();
+        input.insert_str("/Users/moguw/docs/plugins.md");
+        assert_eq!(input.active_slash_trigger(), None);
 
         input.clear();
         input.insert_str("read @src/ap");

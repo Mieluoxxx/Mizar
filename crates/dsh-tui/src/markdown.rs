@@ -316,6 +316,53 @@ fn parse_col_align(cell: &str) -> ColAlign {
     }
 }
 
+fn spans_display_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| display_width(&s.content)).sum()
+}
+
+/// 按终端显示列宽裁剪 `Span` 列表，返回裁剪后的 spans 与真实显示宽度（供表格对齐与分栏 Diff 共用）。
+fn clip_spans_to_width(
+    spans: &[Span<'static>],
+    max_w: usize,
+    add_ellipsis: bool,
+) -> (Vec<Span<'static>>, usize) {
+    let total = spans_display_width(spans);
+    if total <= max_w {
+        return (spans.to_vec(), total);
+    }
+    let limit = if add_ellipsis && max_w >= 2 {
+        max_w.saturating_sub(1)
+    } else {
+        max_w
+    };
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    let mut last_style = Style::default();
+    'outer: for sp in spans {
+        last_style = sp.style;
+        let mut part = String::new();
+        for ch in sp.content.chars() {
+            let cw = char_width(ch);
+            if cw > 0 && used + cw > limit {
+                if !part.is_empty() {
+                    out.push(Span::styled(part, sp.style));
+                }
+                break 'outer;
+            }
+            part.push(ch);
+            used += cw;
+        }
+        if !part.is_empty() {
+            out.push(Span::styled(part, sp.style));
+        }
+    }
+    if add_ellipsis && max_w >= 2 {
+        out.push(Span::styled("…", last_style));
+        used += 1;
+    }
+    (out, used)
+}
+
 fn render_table_block(
     rows: &[&str],
     max_width: usize,
@@ -329,31 +376,50 @@ fn render_table_block(
         .map(|i| delim.get(i).map(|s| parse_col_align(s)).unwrap_or(ColAlign::Left))
         .collect();
 
-    let mut data_rows: Vec<Vec<String>> = Vec::with_capacity(rows.len() - 1);
-    data_rows.push(
+    // 先解析每一格的富文本 Span，再基于真实渲染宽度计算列宽与对齐填充，
+    // 防止剥除 `` ` `` / `**` 或展开 `[[Pill]]` 后破坏右侧 `│` 边框对齐。
+    let mut parsed_rows: Vec<Vec<Vec<Span<'static>>>> = Vec::with_capacity(rows.len() - 1);
+    let header_style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    parsed_rows.push(
         (0..cols)
-            .map(|i| header.get(i).copied().unwrap_or("").to_string())
+            .map(|i| {
+                parse_inline_rich(
+                    header.get(i).copied().unwrap_or(""),
+                    header_style,
+                    theme,
+                    emphasis,
+                    false,
+                )
+            })
             .collect(),
     );
+    let body_style = Style::default().fg(theme.text);
     for raw in &rows[2..] {
         let cells = split_table_row(raw);
-        data_rows.push(
+        parsed_rows.push(
             (0..cols)
-                .map(|i| cells.get(i).copied().unwrap_or("").to_string())
+                .map(|i| {
+                    parse_inline_rich(
+                        cells.get(i).copied().unwrap_or(""),
+                        body_style,
+                        theme,
+                        emphasis,
+                        false,
+                    )
+                })
                 .collect(),
         );
     }
 
-    // 计算每列自然显示宽度并在 max_width 预算内收缩
-    let mut col_widths = vec![3usize; cols];
-    for r in &data_rows {
-        for (c, cell) in r.iter().enumerate() {
-            col_widths[c] = col_widths[c].max(display_width(cell).min(40));
-        }
-    }
     // 边框消耗：cols + 1 个框线 + 每列左右各 1 空格
     let chrome = cols + 1 + cols * 2;
     let avail = max_width.saturating_sub(chrome).max(cols * 2);
+    let mut col_widths = vec![3usize; cols];
+    for r in &parsed_rows {
+        for (c, cell_spans) in r.iter().enumerate() {
+            col_widths[c] = col_widths[c].max(spans_display_width(cell_spans));
+        }
+    }
     let sum: usize = col_widths.iter().sum();
     if sum > avail {
         let scale = avail as f64 / sum as f64;
@@ -389,18 +455,12 @@ fn render_table_block(
     let mut out = Vec::new();
     out.push(make_border("┌", "┬", "┐"));
 
-    for (r_idx, row) in data_rows.iter().enumerate() {
+    for (r_idx, row_spans) in parsed_rows.iter().enumerate() {
         let is_header = r_idx == 0;
-        let cell_style = if is_header {
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text)
-        };
         let mut spans = vec![Span::styled("│", border_style)];
-        for (c_idx, cell) in row.iter().enumerate() {
+        for (c_idx, cell_spans) in row_spans.iter().enumerate() {
             let w = col_widths[c_idx];
-            let clipped = truncate_cell(cell, w);
-            let cw = display_width(&clipped);
+            let (clipped_spans, cw) = clip_spans_to_width(cell_spans, w, true);
             let pad = w.saturating_sub(cw);
             let (left_pad, right_pad) = match aligns[c_idx] {
                 ColAlign::Left => (0, pad),
@@ -408,7 +468,7 @@ fn render_table_block(
                 ColAlign::Center => (pad / 2, pad - pad / 2),
             };
             spans.push(Span::raw(format!(" {}", " ".repeat(left_pad))));
-            spans.extend(parse_inline_rich(&clipped, cell_style, theme, emphasis, false));
+            spans.extend(clipped_spans);
             spans.push(Span::raw(format!("{} ", " ".repeat(right_pad))));
             spans.push(Span::styled("│", border_style));
         }
@@ -765,24 +825,23 @@ pub fn parse_inline_rich(
             continue;
         }
 
-        // 4. 粗体（含 CJK 邻接修正、行首标签图标与行动引导词图标）
+        // 4. 粗体（含 CJK 邻接修正、内部嵌套 `[[Pill]]` 解包、行首标签图标与行动引导词图标）
         if let Some((inner, next_byte)) = try_parse_strong(line, byte_idx, "**")
             .or_else(|| try_parse_strong(line, byte_idx, "__"))
         {
             flush_buf(&mut buf, &mut spans);
-            let decorated = if is_line_lead {
-                decorate_label_with_icon(&inner, emphasis)
-            } else {
-                decorate_action_lead_in(&inner, emphasis)
-            };
             let bold_color = if emphasis.enabled {
                 theme.link
             } else {
                 base.fg.unwrap_or(theme.text)
             };
-            spans.push(Span::styled(
-                decorated,
-                base.fg(bold_color).add_modifier(Modifier::BOLD),
+            let strong_style = base.fg(bold_color).add_modifier(Modifier::BOLD);
+            spans.extend(render_strong_inner_spans(
+                &inner,
+                strong_style,
+                theme,
+                emphasis,
+                is_line_lead,
             ));
             while i < chars.len() && chars[i].0 < next_byte {
                 i += 1;
@@ -851,6 +910,54 @@ pub fn parse_inline_rich(
         spans.push(Span::styled(String::new(), base));
     }
     spans
+}
+
+/// 渲染粗体内部文本：支持模型习惯性把胶囊写成 `**[[Passed]]**` 或混排 `**[[Done]] 说明**` 的场景。
+fn render_strong_inner_spans(
+    inner: &str,
+    strong_style: Style,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    is_line_lead: bool,
+) -> Vec<Span<'static>> {
+    if !inner.contains("[[") {
+        let decorated = if is_line_lead {
+            decorate_label_with_icon(inner, emphasis)
+        } else {
+            decorate_action_lead_in(inner, emphasis)
+        };
+        return vec![Span::styled(decorated, strong_style)];
+    }
+
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut lead = is_line_lead;
+    while pos < inner.len() {
+        if let Some((pill_label, next_byte)) = try_parse_pill(inner, pos) {
+            out.extend(render_pill_spans(pill_label, theme, emphasis));
+            pos = next_byte;
+            lead = false;
+            continue;
+        }
+        let next_bracket = inner[pos..]
+            .find("[[")
+            .map(|rel| pos + rel)
+            .filter(|&p| p > pos)
+            .unwrap_or(inner.len());
+        let seg = &inner[pos..next_bracket];
+        let decorated = if lead {
+            decorate_label_with_icon(seg, emphasis)
+        } else {
+            decorate_action_lead_in(seg, emphasis)
+        };
+        out.push(Span::styled(decorated, strong_style));
+        pos = next_bracket;
+        lead = false;
+    }
+    if out.is_empty() {
+        out.push(Span::styled(inner.to_string(), strong_style));
+    }
+    out
 }
 
 /// 兼容旧签名的折行封装。
@@ -1133,26 +1240,8 @@ fn render_split_diff(lines: &[&str], max_width: usize, theme: &Theme) -> Vec<Ren
     let mut out = Vec::new();
     let mut i = 0usize;
 
-    let pad_spans_to = |mut spans: Vec<Span<'static>>, bg: Color, target_w: usize| -> Vec<Span<'static>> {
-        let mut used = 0usize;
-        let mut clipped = Vec::new();
-        for sp in spans.drain(..) {
-            if used >= target_w {
-                break;
-            }
-            let mut part = String::new();
-            for ch in sp.content.chars() {
-                let cw = char_width(ch);
-                if used + cw > target_w {
-                    break;
-                }
-                part.push(ch);
-                used += cw;
-            }
-            if !part.is_empty() {
-                clipped.push(Span::styled(part, sp.style));
-            }
-        }
+    let pad_spans_to = |spans: Vec<Span<'static>>, bg: Color, target_w: usize| -> Vec<Span<'static>> {
+        let (mut clipped, used) = clip_spans_to_width(&spans, target_w, false);
         if used < target_w {
             clipped.push(Span::styled(
                 " ".repeat(target_w - used),
@@ -1305,5 +1394,45 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(wide_str.contains('│'), "expected split diff: {wide_str}");
+    }
+
+    #[test]
+    fn table_borders_stay_aligned_with_code_bold_and_nested_pills() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig {
+            enabled: true,
+            round_caps: false,
+            icons: false,
+            guidance: true,
+        };
+        let md = "\
+| 检查 | 结果 |
+| --- | --- |
+| `cargo check --all-targets` | **[[Passed]]** 16.6s, 零错误 |
+| `cargo test --workspace` | **[[Passed]]** 全部绿，含 SSE 集成 |
+| `cargo clippy` | **[[Passed]]** 全仓仅 `1` 条警告 |
+| `unsafe` | **[[Keep]]** 仅 2 处真实块 |
+| panic/expect | 8 处，对一个含 `TUI` 的项目来说很低 |";
+
+        let rendered = render_markdown_rich(md, 96, &theme, &cfg);
+        assert!(rendered.len() >= 8);
+        let first_w = spans_display_width(&rendered[0].line.spans);
+        for (row_idx, rl) in rendered.iter().enumerate() {
+            let row_str: String = rl
+                .line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            let rw = spans_display_width(&rl.line.spans);
+            assert_eq!(
+                rw, first_w,
+                "table row {row_idx} width mismatch ({rw} != {first_w}): {row_str:?}"
+            );
+            assert!(
+                !row_str.contains("[[Passed]]") && !row_str.contains("[[Keep]]"),
+                "nested bold pill leaked raw brackets: {row_str:?}"
+            );
+        }
     }
 }

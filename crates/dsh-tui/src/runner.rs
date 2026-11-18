@@ -1,7 +1,7 @@
 //! 异步运行循环：将 Cordis / AgentLoop / Trajectory 事件接入终端界面。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -18,7 +18,10 @@ use dsh_agent_loop::{
 };
 use dsh_llm::{LlmContextExt, ReasoningEffort};
 use dsh_mcp::{McpConnectionState, McpManager};
-use dsh_session::{Session, SessionContextExt, SessionCreateOptions, SessionListQuery};
+use dsh_session::{
+    Session, SessionContextExt, SessionCreateOptions, SessionListQuery,
+    SessionPersistenceContextExt,
+};
 use dsh_skills::{EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillRegistry};
 use dsh_tools::{
     EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolExposure, ToolRuntime,
@@ -49,6 +52,73 @@ use crate::ui::{build_item_lines_for_scrollback, render};
 pub enum ResumeTarget {
     LatestInWorkspace,
     Id(String),
+}
+
+/// TUI 退出时返回给宿主进程的可恢复会话摘要。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiExitSummary {
+    pub session_id: String,
+    pub persisted: bool,
+}
+
+fn shell_quote_arg(raw: &str) -> String {
+    if !raw.is_empty()
+        && raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'_' | b'-' | b'.' | b'/' | b'~' | b':' | b'@')
+        })
+    {
+        return raw.to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+fn resolve_resume_executable(current_exe: Option<&Path>, cwd: Option<&Path>) -> String {
+    if let Some(exe) = current_exe {
+        let normalized = exe.to_string_lossy().replace('\\', "/");
+        let is_cargo_target =
+            normalized.contains("/target/debug/") || normalized.contains("/target/release/");
+        if is_cargo_target {
+            if let Some(cwd_path) = cwd
+                && let Ok(rel) = exe.strip_prefix(cwd_path)
+            {
+                let rel_str = rel.to_string_lossy();
+                let dot_rel = if rel_str.starts_with('.') {
+                    rel_str.into_owned()
+                } else {
+                    format!("./{rel_str}")
+                };
+                return shell_quote_arg(&dot_rel);
+            }
+            return shell_quote_arg(&exe.display().to_string());
+        }
+        if let Some(name) = exe.file_name().and_then(|s| s.to_str())
+            && !name.trim().is_empty()
+        {
+            return shell_quote_arg(name);
+        }
+    }
+    "dsh-tui".to_string()
+}
+
+/// 根据退出会话信息构造可直接复制执行的 `--resume` 恢复命令；未开启持久化或空会话 ID 时返回 `None`。
+pub fn format_resume_command(
+    summary: &TuiExitSummary,
+    explicit_workspace: Option<&Path>,
+    current_exe: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    if !summary.persisted || summary.session_id.trim().is_empty() {
+        return None;
+    }
+    let mut parts = vec![resolve_resume_executable(current_exe, cwd)];
+    if let Some(ws) = explicit_workspace {
+        parts.push("-C".to_string());
+        parts.push(shell_quote_arg(&ws.display().to_string()));
+    }
+    parts.push("--resume".to_string());
+    parts.push(shell_quote_arg(&summary.session_id));
+    Some(parts.join(" "))
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +334,14 @@ pub async fn wait_for_services(ctx: &Context) -> Result<(), Box<dyn std::error::
 
 /// 在已装配 `AgentSpinePlugin` 与模型适配器的 `Context` 上启动全屏 TUI。
 pub async fn run_tui(ctx: Context, config: TuiConfig) -> Result<(), Box<dyn std::error::Error>> {
+    run_tui_with_summary(ctx, config).await.map(|_| ())
+}
+
+/// 在已装配 `AgentSpinePlugin` 与模型适配器的 `Context` 上启动 TUI，并在恢复终端后返回当前会话摘要。
+pub async fn run_tui_with_summary(
+    ctx: Context,
+    config: TuiConfig,
+) -> Result<TuiExitSummary, Box<dyn std::error::Error>> {
     wait_for_services(&ctx).await?;
     let sessions = ctx.sessions()?;
     let mut resume_notice: Option<(NoticeLevel, String)> = None;
@@ -518,7 +596,10 @@ pub async fn run_tui(ctx: Context, config: TuiConfig) -> Result<(), Box<dyn std:
     for handle in handles {
         drop(handle.dispose());
     }
-    Ok(())
+    Ok(TuiExitSummary {
+        session_id: app.session.id.clone(),
+        persisted: ctx.session_persistence().is_some(),
+    })
 }
 
 #[derive(Default)]
@@ -886,7 +967,7 @@ async fn handle_action(
                 if list.is_empty() {
                     app.push_notice(
                         NoticeLevel::Info,
-                        "未发现任何技能（可在 ~/.dsh-rs/skills 或 <project>/.dsh-rs/skills 添加 <name>/SKILL.md）",
+                        "未发现任何技能（可在 ~/.agents/skills 或 <project>/.agents/skills 添加 <name>/SKILL.md）",
                     );
                 } else {
                     let mut lines = vec![format!("已发现技能（共 {} 个）：", list.len())];
@@ -1010,7 +1091,7 @@ async fn handle_action(
                 if items.is_empty() {
                     app.push_notice(
                         NoticeLevel::Info,
-                        "未发现可交互调用的技能（可在 ~/.dsh-rs/skills 或 <project>/.dsh-rs/skills 添加 <name>/SKILL.md）",
+                        "未发现可交互调用的技能（可在 ~/.agents/skills 或 <project>/.agents/skills 添加 <name>/SKILL.md）",
                     );
                 } else {
                     app.overlay.open_skill_picker(items);
@@ -1311,9 +1392,11 @@ fn resolve_model_switch(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use dsh_llm::{ModelInfo, ProviderInfo};
 
-    use super::resolve_model_switch;
+    use super::{TuiExitSummary, format_resume_command, resolve_model_switch};
 
     #[test]
     fn resolve_model_switch_handles_slashes_in_model_ids() {
@@ -1361,5 +1444,49 @@ mod tests {
                 "mayoru-completions/gemini-4-hydrogen".to_string(),
             )
         );
+    }
+
+    #[test]
+    fn format_resume_command_handles_cargo_target_installed_bin_and_unpersisted() {
+        let persisted = TuiExitSummary {
+            session_id: "sess-abc-123".to_string(),
+            persisted: true,
+        };
+        assert_eq!(
+            format_resume_command(
+                &persisted,
+                None,
+                Some(Path::new("/repo/target/debug/dsh-tui")),
+                Some(Path::new("/repo")),
+            ),
+            Some("./target/debug/dsh-tui --resume sess-abc-123".to_string())
+        );
+        assert_eq!(
+            format_resume_command(
+                &persisted,
+                Some(Path::new("/tmp/my workspace")),
+                Some(Path::new("/repo/target/release/dsh-tui")),
+                Some(Path::new("/other")),
+            ),
+            Some(
+                "/repo/target/release/dsh-tui -C '/tmp/my workspace' --resume sess-abc-123"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            format_resume_command(
+                &persisted,
+                None,
+                Some(Path::new("/usr/local/bin/dsh-tui")),
+                Some(Path::new("/repo")),
+            ),
+            Some("dsh-tui --resume sess-abc-123".to_string())
+        );
+
+        let unpersisted = TuiExitSummary {
+            session_id: "sess-mem".to_string(),
+            persisted: false,
+        };
+        assert_eq!(format_resume_command(&unpersisted, None, None, None), None);
     }
 }
