@@ -60,9 +60,13 @@ pub fn render_markdown_rich(
 ) -> Vec<RenderedLine> {
     let width = max_width.max(4);
     let base_style = Style::default().fg(theme.text);
+    let dim_style = Style::default().fg(theme.text_dim);
     let mut out = Vec::new();
     let lines: Vec<&str> = text.split('\n').collect();
     let mut idx = 0usize;
+    let mut tree_rails: Vec<bool> = Vec::new();
+    let mut key_align_end = 0usize;
+    let mut key_align_width: Option<usize> = None;
 
     while idx < lines.len() {
         let raw_line = lines[idx];
@@ -70,6 +74,7 @@ pub fn render_markdown_rich(
 
         // 1. 围栏代码块（``` 或 ~~~）
         if let Some(fence_ch) = fence_opener(trimmed) {
+            tree_rails.clear();
             let fence_len = trimmed.bytes().take_while(|&b| b == fence_ch as u8).count();
             let lang = trimmed[fence_len..].trim();
             let label = if lang.is_empty() {
@@ -78,7 +83,7 @@ pub fn render_markdown_rich(
                 format!("┌─ {lang}")
             };
             out.extend(wrap_styled_spans_rich(
-                vec![Span::styled(label, Style::default().fg(theme.text_dim))],
+                vec![Span::styled(label, dim_style)],
                 None,
                 None,
                 width,
@@ -94,7 +99,7 @@ pub fn render_markdown_rich(
                     idx += 1;
                     break;
                 }
-                let prefix = Span::styled("│ ", Style::default().fg(theme.text_dim));
+                let prefix = Span::styled("│ ", dim_style);
                 let highlighted = highlight_code_line(code_line, lang, theme);
                 out.extend(wrap_styled_spans_rich(
                     highlighted,
@@ -107,7 +112,7 @@ pub fn render_markdown_rich(
             if closed {
                 out.push(RenderedLine::hard(Line::from(Span::styled(
                     "└─",
-                    Style::default().fg(theme.text_dim),
+                    dim_style,
                 ))));
             }
             continue;
@@ -115,6 +120,7 @@ pub fn render_markdown_rich(
 
         // 2. GFM 表格（表头含 `|` 且下一行匹配分割线）
         if idx + 1 < lines.len() && is_table_pair(lines[idx], lines[idx + 1]) {
+            tree_rails.clear();
             let start = idx;
             idx += 2;
             while idx < lines.len() && lines[idx].trim().contains('|') && !lines[idx].trim().is_empty()
@@ -130,8 +136,22 @@ pub fn render_markdown_rich(
             continue;
         }
 
-        // 3. 空行
-        if raw_line.is_empty() {
+        // 3. 空行（若处于未闭合的树分支作用域中，按前瞻行决定是否续画竖脊）
+        if raw_line.trim().is_empty() {
+            if !tree_rails.is_empty()
+                && let Some(guide) = active_tree_blank_guide(&lines, idx + 1, &tree_rails)
+            {
+                if guide.is_empty() {
+                    out.push(RenderedLine::hard(Line::default()));
+                } else {
+                    out.push(RenderedLine::hard(Line::from(Span::styled(
+                        guide, dim_style,
+                    ))));
+                }
+                idx += 1;
+                continue;
+            }
+            tree_rails.clear();
             out.push(RenderedLine::hard(Line::default()));
             idx += 1;
             continue;
@@ -139,10 +159,10 @@ pub fn render_markdown_rich(
 
         // 4. 分割线
         if is_horizontal_rule(trimmed) {
+            tree_rails.clear();
             let rule = "─".repeat(width.min(48));
             out.push(RenderedLine::hard(Line::from(Span::styled(
-                rule,
-                Style::default().fg(theme.text_dim),
+                rule, dim_style,
             ))));
             idx += 1;
             continue;
@@ -150,6 +170,7 @@ pub fn render_markdown_rich(
 
         // 5. 标题
         if let Some((level, heading)) = parse_heading_level(trimmed) {
+            tree_rails.clear();
             let decorated = if level == 2 {
                 decorate_label_with_icon(heading, emphasis)
             } else {
@@ -168,21 +189,137 @@ pub fn render_markdown_rich(
             continue;
         }
 
-        // 6. 无序列表
-        if let Some(rest) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
+        // 5.5 树形行与带 `│` 前缀行（支持 `**├── ...**` 外层粗体剥离、状态栈维护及子列表归位）
+        if let Some(tree_line) = parse_tree_line(raw_line) {
+            match tree_line.kind {
+                TreeKind::Branch { depth, is_open } => {
+                    update_tree_rails(&mut tree_rails, depth, &tree_line.ancestor_rails, is_open);
+                    let rest = tree_line.rest.trim_end();
+                    let pref = Span::styled(tree_line.prefix.clone(), dim_style);
+                    let cont = Span::styled(tree_branch_cont_guide(&tree_rails, &tree_line.prefix), dim_style);
+                    let spans = if rest.is_empty() {
+                        vec![Span::raw("")]
+                    } else {
+                        parse_inline_rich(rest, base_style, theme, emphasis, false)
+                    };
+                    out.extend(wrap_styled_spans_with_prefixes(
+                        spans,
+                        &[pref],
+                        &[cont],
+                        width,
+                    ));
+                    idx += 1;
+                    continue;
+                }
+                TreeKind::RailLine => {
+                    let rail_span = Span::styled(tree_line.prefix.clone(), dim_style);
+                    let rest = tree_line.rest.trim_start();
+                    if let Some(bullet_rest) = strip_unordered_bullet(rest) {
+                        if idx >= key_align_end {
+                            let (end, align_w) = compute_key_desc_align_run(
+                                &lines,
+                                idx,
+                                &tree_rails,
+                                width,
+                                base_style,
+                                theme,
+                                emphasis,
+                            );
+                            key_align_end = end;
+                            key_align_width = align_w;
+                        }
+                        let target_w = if idx < key_align_end {
+                            key_align_width
+                        } else {
+                            None
+                        };
+                        out.extend(render_bullet_item(
+                            bullet_rest,
+                            Some(rail_span),
+                            "",
+                            target_w,
+                            width,
+                            base_style,
+                            theme,
+                            emphasis,
+                        ));
+                        idx += 1;
+                        continue;
+                    }
+                    if let Some((num_prefix, ord_rest)) = parse_ordered_list(rest) {
+                        let first = Span::styled(
+                            format!("{num_prefix} "),
+                            Style::default().fg(theme.accent),
+                        );
+                        let cont = Span::raw(" ".repeat(display_width(&format!("{num_prefix} "))));
+                        let spans = parse_inline_rich(ord_rest, base_style, theme, emphasis, true);
+                        out.extend(wrap_styled_spans_with_prefixes(
+                            spans,
+                            &[rail_span.clone(), first],
+                            &[rail_span, cont],
+                            width,
+                        ));
+                        idx += 1;
+                        continue;
+                    }
+                    let spans = if rest.is_empty() {
+                        vec![Span::raw("")]
+                    } else {
+                        parse_inline_rich(rest, base_style, theme, emphasis, true)
+                    };
+                    out.extend(wrap_styled_spans_with_prefixes(
+                        spans,
+                        std::slice::from_ref(&rail_span),
+                        std::slice::from_ref(&rail_span),
+                        width,
+                    ));
+                    idx += 1;
+                    continue;
+                }
+            }
+        }
+
+        // 6. 无序列表（若处于活跃树作用域内，自动补齐外层 `│  ` 竖脊并对齐所属层级；成组 `key — desc` 对齐）
+        if let Some(rest) = strip_unordered_bullet(trimmed) {
             let indent_cols = raw_line.len() - trimmed.len();
-            let pad = " ".repeat(indent_cols.min(8));
-            let first = Span::styled(format!("{pad}• "), Style::default().fg(theme.accent));
-            let cont = Span::raw(format!("{pad}  "));
-            let spans = parse_inline_rich(rest, base_style, theme, emphasis, true);
-            out.extend(wrap_styled_spans_rich(
-                spans,
-                Some(first),
-                Some(cont),
+            let rail_span = if !tree_rails.is_empty() {
+                Some(Span::styled(tree_child_guide(&tree_rails), dim_style))
+            } else {
+                None
+            };
+            let pad_cols = if !tree_rails.is_empty() {
+                if indent_cols >= 4 { 2 } else { 0 }
+            } else {
+                indent_cols.min(8)
+            };
+            let pad = " ".repeat(pad_cols);
+            if idx >= key_align_end {
+                let (end, align_w) = compute_key_desc_align_run(
+                    &lines,
+                    idx,
+                    &tree_rails,
+                    width,
+                    base_style,
+                    theme,
+                    emphasis,
+                );
+                key_align_end = end;
+                key_align_width = align_w;
+            }
+            let target_w = if idx < key_align_end {
+                key_align_width
+            } else {
+                None
+            };
+            out.extend(render_bullet_item(
+                rest,
+                rail_span,
+                &pad,
+                target_w,
                 width,
+                base_style,
+                theme,
+                emphasis,
             ));
             idx += 1;
             continue;
@@ -191,16 +328,25 @@ pub fn render_markdown_rich(
         // 7. 有序列表
         if let Some((num_prefix, rest)) = parse_ordered_list(trimmed) {
             let indent_cols = raw_line.len() - trimmed.len();
-            let pad = " ".repeat(indent_cols.min(8));
+            let mut first_prefixes = Vec::new();
+            let mut cont_prefixes = Vec::new();
+            let pad = if !tree_rails.is_empty() {
+                let g = Span::styled(tree_child_guide(&tree_rails), dim_style);
+                first_prefixes.push(g.clone());
+                cont_prefixes.push(g);
+                " ".repeat(if indent_cols >= 4 { 2 } else { 0 })
+            } else {
+                " ".repeat(indent_cols.min(8))
+            };
             let first_str = format!("{pad}{num_prefix} ");
             let cont_str = " ".repeat(display_width(&first_str));
-            let first = Span::styled(first_str, Style::default().fg(theme.accent));
-            let cont = Span::raw(cont_str);
+            first_prefixes.push(Span::styled(first_str, Style::default().fg(theme.accent)));
+            cont_prefixes.push(Span::raw(cont_str));
             let spans = parse_inline_rich(rest, base_style, theme, emphasis, true);
-            out.extend(wrap_styled_spans_rich(
+            out.extend(wrap_styled_spans_with_prefixes(
                 spans,
-                Some(first),
-                Some(cont),
+                &first_prefixes,
+                &cont_prefixes,
                 width,
             ));
             idx += 1;
@@ -209,7 +355,8 @@ pub fn render_markdown_rich(
 
         // 8. 引用行
         if let Some(quoted) = trimmed.strip_prefix("> ") {
-            let bar = Span::styled("▎ ", Style::default().fg(theme.text_dim));
+            tree_rails.clear();
+            let bar = Span::styled("▎ ", dim_style);
             let quote_style = Style::default().fg(theme.text_muted);
             let spans = parse_inline_rich(quoted, quote_style, theme, emphasis, false);
             out.extend(wrap_styled_spans_rich(
@@ -222,13 +369,357 @@ pub fn render_markdown_rich(
             continue;
         }
 
-        // 9. 普通段落（行首加粗标签可获图标装饰）
+        // 9. 普通段落（树作用域下缩进≥2格的纯文本视为无短横线树子行，否则退出树作用域）
+        if !tree_rails.is_empty() {
+            let indent_cols = raw_line.len() - trimmed.len();
+            if indent_cols >= 2 {
+                let guide = Span::styled(tree_child_guide(&tree_rails), dim_style);
+                let spans = parse_inline_rich(trimmed, base_style, theme, emphasis, true);
+                out.extend(wrap_styled_spans_with_prefixes(
+                    spans,
+                    std::slice::from_ref(&guide),
+                    std::slice::from_ref(&guide),
+                    width,
+                ));
+                idx += 1;
+                continue;
+            }
+            tree_rails.clear();
+        }
+
         let spans = parse_inline_rich(raw_line, base_style, theme, emphasis, true);
         out.extend(wrap_styled_spans_rich(spans, None, None, width));
         idx += 1;
     }
 
     out
+}
+
+fn strip_unordered_bullet(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeKind {
+    Branch { depth: usize, is_open: bool },
+    RailLine,
+}
+
+struct ParsedTreeLine {
+    prefix: String,
+    rest: String,
+    kind: TreeKind,
+    ancestor_rails: Vec<bool>,
+}
+
+fn is_box_border_continuation(ch: char) -> bool {
+    matches!(ch, '─' | '┼' | '┬' | '┴' | '┤' | '┐' | '┘' | '═')
+}
+
+fn match_tree_branch_token(s: &str) -> Option<(usize, bool)> {
+    for (tok, is_open) in [
+        ("├──", true),
+        ("└──", false),
+        ("├─", true),
+        ("└─", false),
+    ] {
+        if let Some(after) = s.strip_prefix(tok) {
+            if after.chars().next().is_some_and(is_box_border_continuation) {
+                return None;
+            }
+            return Some((tok.len(), is_open));
+        }
+    }
+    None
+}
+
+/// 解析行首树线前缀（支持 `├──` / `└──` / `├─` / `└─` 及嵌套 `│  `）。
+fn split_tree_prefix_raw(s: &str) -> Option<(usize, Vec<bool>, TreeKind, usize)> {
+    let mut pos = 0usize;
+    let mut ancestor_rails: Vec<bool> = Vec::new();
+
+    loop {
+        let sp_start = pos;
+        while pos < s.len() && s.as_bytes()[pos] == b' ' {
+            pos += 1;
+        }
+        let spaces = pos - sp_start;
+        let push_closed_gap = |rails: &mut Vec<bool>, sp: usize| {
+            let count = if rails.is_empty() && sp >= 2 {
+                (sp + 1) / 3
+            } else if !rails.is_empty() && sp >= 5 {
+                (sp - 2) / 3
+            } else {
+                0
+            };
+            rails.extend(std::iter::repeat_n(false, count));
+        };
+
+        if let Some(after_bar) = s[pos..].strip_prefix('│') {
+            push_closed_gap(&mut ancestor_rails, spaces);
+            ancestor_rails.push(true);
+            pos += '│'.len_utf8();
+            let trailing_start = pos;
+            while pos < s.len() && s.as_bytes()[pos] == b' ' {
+                pos += 1;
+            }
+            let after_spaces = pos - trailing_start;
+            let rest_preview = after_bar.trim_start_matches(' ');
+            if !rest_preview.starts_with('│')
+                && match_tree_branch_token(rest_preview).is_none()
+            {
+                return Some((pos, ancestor_rails, TreeKind::RailLine, pos));
+            }
+            // 若紧跟的是另一层 `│` 或 `├──`/`└──`，把多出的空白组折算为闭合层
+            push_closed_gap(&mut ancestor_rails, after_spaces);
+            continue;
+        }
+
+        if let Some((tok_len, is_open)) = match_tree_branch_token(&s[pos..]) {
+            push_closed_gap(&mut ancestor_rails, spaces);
+            pos += tok_len;
+            while pos < s.len() && s.as_bytes()[pos] == b' ' {
+                pos += 1;
+            }
+            let depth = ancestor_rails.len();
+            return Some((
+                pos,
+                ancestor_rails,
+                TreeKind::Branch { depth, is_open },
+                pos,
+            ));
+        }
+
+        return None;
+    }
+}
+
+/// 识别树形行（兼容模型习惯性把整行写成 `**├── ...**` 或 `**│  ├── ...**` 的情况）。
+fn parse_tree_line(raw_line: &str) -> Option<ParsedTreeLine> {
+    if let Some((pref_end, rails, kind, rest_start)) = split_tree_prefix_raw(raw_line) {
+        return Some(ParsedTreeLine {
+            prefix: raw_line[..pref_end].to_string(),
+            rest: raw_line[rest_start..].to_string(),
+            kind,
+            ancestor_rails: rails,
+        });
+    }
+
+    let leading_ws = raw_line.len() - raw_line.trim_start_matches(' ').len();
+    let after_ws = &raw_line[leading_ws..];
+    for delim in ["**", "__"] {
+        if after_ws.starts_with(delim)
+            && let Some((inner, close_end)) = try_parse_strong(after_ws, 0, delim)
+            && let Some((pref_end, rails, kind, rest_start)) = split_tree_prefix_raw(&inner)
+        {
+            let prefix = format!("{}{}", &raw_line[..leading_ws], &inner[..pref_end]);
+            let inner_rest = &inner[rest_start..];
+            let after_strong = &after_ws[close_end..];
+            let rest = if inner_rest.is_empty() {
+                after_strong.trim_start().to_string()
+            } else {
+                format!("{delim}{inner_rest}{delim}{after_strong}")
+            };
+            return Some(ParsedTreeLine {
+                prefix,
+                rest,
+                kind,
+                ancestor_rails: rails,
+            });
+        }
+    }
+
+    None
+}
+
+fn update_tree_rails(
+    tree_rails: &mut Vec<bool>,
+    depth: usize,
+    ancestor_rails: &[bool],
+    is_open: bool,
+) {
+    let mut next = Vec::with_capacity(depth + 1);
+    for d in 0..depth {
+        let open = ancestor_rails.get(d).copied() == Some(true)
+            || tree_rails.get(d).copied().unwrap_or(false);
+        next.push(open);
+    }
+    next.push(is_open);
+    *tree_rails = next;
+}
+
+fn tree_child_guide(rails: &[bool]) -> String {
+    let mut s = String::with_capacity(rails.len() * 3);
+    for &open in rails {
+        s.push_str(if open { "│  " } else { "   " });
+    }
+    s
+}
+
+fn tree_branch_cont_guide(rails: &[bool], prefix: &str) -> String {
+    let outer_count = rails.len().saturating_sub(1);
+    let mut s = tree_child_guide(&rails[..outer_count]);
+    let used = display_width(&s);
+    let target = display_width(prefix);
+    if target > used {
+        s.push_str(&" ".repeat(target - used));
+    }
+    s
+}
+
+fn active_tree_blank_guide(lines: &[&str], scan_from: usize, tree_rails: &[bool]) -> Option<String> {
+    let mut j = scan_from;
+    while j < lines.len() && lines[j].trim().is_empty() {
+        j += 1;
+    }
+    let next = lines.get(j)?;
+    let next_trimmed = next.trim_start();
+    if fence_opener(next_trimmed).is_some()
+        || (j + 1 < lines.len() && is_table_pair(next, lines[j + 1]))
+        || is_horizontal_rule(next_trimmed)
+        || parse_heading_level(next_trimmed).is_some()
+        || next_trimmed.starts_with("> ")
+    {
+        return None;
+    }
+    if let Some(next_tree) = parse_tree_line(next) {
+        let limit = match next_tree.kind {
+            TreeKind::Branch { depth, .. } => (depth + 1).min(tree_rails.len()),
+            TreeKind::RailLine => tree_rails.len(),
+        };
+        let guide = tree_child_guide(&tree_rails[..limit]);
+        return Some(guide.trim_end().to_string());
+    }
+    let has_open_rail = tree_rails.iter().any(|&o| o);
+    if has_open_rail
+        && (strip_unordered_bullet(next_trimmed).is_some()
+            || parse_ordered_list(next_trimmed).is_some()
+            || next.len() - next_trimmed.len() >= 2)
+    {
+        return Some(tree_child_guide(tree_rails).trim_end().to_string());
+    }
+    None
+}
+
+fn compute_key_desc_align_run(
+    lines: &[&str],
+    start: usize,
+    tree_rails: &[bool],
+    max_width: usize,
+    base_style: Style,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+) -> (usize, Option<usize>) {
+    let Some(first_raw) = lines.get(start) else {
+        return (start, None);
+    };
+    let first_tree = parse_tree_line(first_raw);
+    let first_is_rail = first_tree
+        .as_ref()
+        .is_some_and(|t| matches!(t.kind, TreeKind::RailLine));
+    let first_indent = first_raw.len() - first_raw.trim_start().len();
+    let first_rail_prefix = first_tree.as_ref().map(|t| t.prefix.as_str()).unwrap_or("");
+
+    let mut end = start;
+    let mut widths: Vec<usize> = Vec::new();
+    while end < lines.len() {
+        let line = lines[end];
+        if line.trim().is_empty() {
+            break;
+        }
+        let tree_opt = parse_tree_line(line);
+        let rest_opt = match (&tree_opt, first_is_rail) {
+            (Some(t), true) if matches!(t.kind, TreeKind::RailLine) && t.prefix == first_rail_prefix => {
+                strip_unordered_bullet(t.rest.trim_start())
+            }
+            (None, false) => {
+                let tr = line.trim_start();
+                if line.len() - tr.len() == first_indent {
+                    strip_unordered_bullet(tr)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some(rest) = rest_opt else {
+            break;
+        };
+        let Some((key_raw, tail_raw)) = rest.split_once(" — ") else {
+            widths.clear();
+            break;
+        };
+        if tail_raw.trim().is_empty() {
+            widths.clear();
+            break;
+        }
+        let key_spans = parse_inline_rich(key_raw, base_style, theme, emphasis, true);
+        let kw = spans_display_width(&key_spans);
+        if kw == 0 || kw > 24 {
+            widths.clear();
+            break;
+        }
+        widths.push(kw);
+        end += 1;
+    }
+
+    if widths.len() < 2 {
+        return (start + 1, None);
+    }
+    let min_w = widths.iter().copied().min().unwrap_or(0);
+    let max_w = widths.iter().copied().max().unwrap_or(0);
+    let guide_w = if first_is_rail {
+        display_width(first_rail_prefix)
+    } else if !tree_rails.is_empty() {
+        tree_rails.len() * 3
+    } else {
+        first_indent.min(8)
+    };
+    if max_w - min_w > 20 || guide_w + 2 + max_w + 6 > max_width {
+        return (end, None);
+    }
+    (end, Some(max_w))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_bullet_item(
+    rest: &str,
+    rail_span: Option<Span<'static>>,
+    pad: &str,
+    align_key_width: Option<usize>,
+    width: usize,
+    base_style: Style,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+) -> Vec<RenderedLine> {
+    let mut first_prefixes = Vec::new();
+    let mut cont_prefixes = Vec::new();
+    if let Some(rail) = rail_span {
+        first_prefixes.push(rail.clone());
+        cont_prefixes.push(rail);
+    }
+    first_prefixes.push(Span::styled(
+        format!("{pad}• "),
+        Style::default().fg(theme.accent),
+    ));
+    cont_prefixes.push(Span::raw(format!("{pad}  ")));
+
+    let spans = if let Some(target_w) = align_key_width
+        && let Some((key_raw, tail_raw)) = rest.split_once(" — ")
+    {
+        let mut combined = parse_inline_rich(key_raw, base_style, theme, emphasis, true);
+        let kw = spans_display_width(&combined);
+        let gap = target_w.saturating_sub(kw) + 1;
+        combined.push(Span::styled(format!("{}— ", " ".repeat(gap)), base_style));
+        combined.extend(parse_inline_rich(tail_raw, base_style, theme, emphasis, false));
+        combined
+    } else {
+        parse_inline_rich(rest, base_style, theme, emphasis, true)
+    };
+
+    wrap_styled_spans_with_prefixes(spans, &first_prefixes, &cont_prefixes, width)
 }
 
 fn fence_opener(trimmed: &str) -> Option<char> {
@@ -870,17 +1361,18 @@ pub fn parse_inline_rich(
             continue;
         }
 
-        // 6. 树线连接符 ├── / └── 降暗（必须位于字符索引）
+        // 6. 树线连接符 ├── / └── / ├─ / └─ 降暗（排除表格框线续接符，必须位于字符索引）
         if emphasis.enabled
-            && (line[byte_idx..].starts_with("├──") || line[byte_idx..].starts_with("└──"))
+            && let Some((tok_len, _)) = match_tree_branch_token(&line[byte_idx..])
         {
             flush_buf(&mut buf, &mut spans);
-            let connector = &line[byte_idx..byte_idx + "├──".len()];
+            let connector = &line[byte_idx..byte_idx + tok_len];
+            let char_count = connector.chars().count();
             spans.push(Span::styled(
                 connector.to_string(),
                 Style::default().fg(theme.text_dim),
             ));
-            i += 3;
+            i += char_count;
             continue;
         }
 
@@ -912,7 +1404,33 @@ pub fn parse_inline_rich(
     spans
 }
 
-/// 渲染粗体内部文本：支持模型习惯性把胶囊写成 `**[[Passed]]**` 或混排 `**[[Done]] 说明**` 的场景。
+fn push_strong_segment(
+    out: &mut Vec<Span<'static>>,
+    seg: &str,
+    strong_style: Style,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    lead: bool,
+) {
+    let dim_style = Style::default().fg(theme.text_dim);
+    let body = if lead && let Some((pref_end, _, _, rest_start)) = split_tree_prefix_raw(seg) {
+        out.push(Span::styled(seg[..pref_end].to_string(), dim_style));
+        &seg[rest_start..]
+    } else {
+        seg
+    };
+    if body.is_empty() {
+        return;
+    }
+    let decorated = if lead {
+        decorate_label_with_icon(body, emphasis)
+    } else {
+        decorate_action_lead_in(body, emphasis)
+    };
+    out.push(Span::styled(decorated, strong_style));
+}
+
+/// 渲染粗体内部文本：支持模型习惯性把胶囊写成 `**[[Passed]]**`、树线前缀 `**├── ...**` 或混排 `**[[Done]] 说明**` 的场景。
 fn render_strong_inner_spans(
     inner: &str,
     strong_style: Style,
@@ -921,12 +1439,12 @@ fn render_strong_inner_spans(
     is_line_lead: bool,
 ) -> Vec<Span<'static>> {
     if !inner.contains("[[") {
-        let decorated = if is_line_lead {
-            decorate_label_with_icon(inner, emphasis)
-        } else {
-            decorate_action_lead_in(inner, emphasis)
-        };
-        return vec![Span::styled(decorated, strong_style)];
+        let mut out = Vec::new();
+        push_strong_segment(&mut out, inner, strong_style, theme, emphasis, is_line_lead);
+        if out.is_empty() {
+            out.push(Span::styled(String::new(), strong_style));
+        }
+        return out;
     }
 
     let mut out = Vec::new();
@@ -945,12 +1463,7 @@ fn render_strong_inner_spans(
             .filter(|&p| p > pos)
             .unwrap_or(inner.len());
         let seg = &inner[pos..next_bracket];
-        let decorated = if lead {
-            decorate_label_with_icon(seg, emphasis)
-        } else {
-            decorate_action_lead_in(seg, emphasis)
-        };
-        out.push(Span::styled(decorated, strong_style));
+        push_strong_segment(&mut out, seg, strong_style, theme, emphasis, lead);
         pos = next_bracket;
         lead = false;
     }
@@ -980,23 +1493,37 @@ pub fn wrap_styled_spans_rich(
     prefix_cont: Option<Span<'static>>,
     max_width: usize,
 ) -> Vec<RenderedLine> {
+    wrap_styled_spans_with_prefixes(
+        spans,
+        prefix_first.as_slice(),
+        prefix_cont.as_slice(),
+        max_width,
+    )
+}
+
+fn wrap_styled_spans_with_prefixes(
+    spans: Vec<Span<'static>>,
+    prefix_first: &[Span<'static>],
+    prefix_cont: &[Span<'static>],
+    max_width: usize,
+) -> Vec<RenderedLine> {
     let width = max_width.max(2);
     let mut lines: Vec<RenderedLine> = Vec::new();
     let mut cur_spans: Vec<Span<'static>> = Vec::new();
     let mut cur_col = 0usize;
     let mut is_first_visual_line = true;
 
-    let push_prefix = |target: &mut Vec<Span<'static>>,
-                       col: &mut usize,
-                       pref: Option<&Span<'static>>| {
-        if let Some(p) = pref {
+    let push_prefixes = |target: &mut Vec<Span<'static>>,
+                         col: &mut usize,
+                         prefs: &[Span<'static>]| {
+        for p in prefs {
             let pw: usize = p.content.chars().map(char_width).sum();
             *col += pw;
             target.push(p.clone());
         }
     };
 
-    push_prefix(&mut cur_spans, &mut cur_col, prefix_first.as_ref());
+    push_prefixes(&mut cur_spans, &mut cur_col, prefix_first);
 
     for span in spans {
         let style = span.style;
@@ -1013,7 +1540,7 @@ pub fn wrap_styled_spans_rich(
                 });
                 is_first_visual_line = false;
                 cur_col = 0;
-                push_prefix(&mut cur_spans, &mut cur_col, prefix_cont.as_ref());
+                push_prefixes(&mut cur_spans, &mut cur_col, prefix_cont);
             }
             chunk.push(ch);
             cur_col += cw;
@@ -1433,6 +1960,118 @@ mod tests {
                 !row_str.contains("[[Passed]]") && !row_str.contains("[[Keep]]"),
                 "nested bold pill leaked raw brackets: {row_str:?}"
             );
+        }
+    }
+
+    #[test]
+    fn repairs_bold_tree_prefixes_indent_and_vertical_rails() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig {
+            enabled: true,
+            round_caps: false,
+            icons: false,
+            guidance: true,
+        };
+        let md = "\
+### Toolkit
+
+**├── 核心工具 (直接可用)**
+- **read** — 读文件
+- **tool_search** — 检索工具
+
+**├── 延迟加载工具 (需先搜索激活)**
+
+**│  ├── FFF 文件查找器**
+- **find_files** — 模糊文件名搜索
+- **grep** — 内容搜索
+
+**│  └── 外挂 MCP 命名空间**
+- **codegraph** — 代码图谱
+- **magpie-image** — 文生图
+
+**└── 说明**
+- 外部工具默认不挂载上下文
+- 想让我用某个具体能力可以直接说
+
+普通总结段落应回到第0列。";
+
+        let rendered = render_markdown_rich(md, 96, &theme, &cfg);
+        let texts: Vec<String> = rendered
+            .iter()
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = texts.join("\n");
+
+        // 1. 树线前缀降暗且不带 BOLD，而正文保持 BOLD
+        let core_line = &rendered
+            .iter()
+            .find(|r| r.line.spans.iter().any(|s| s.content.contains("核心工具")))
+            .expect("core branch")
+            .line;
+        assert_eq!(core_line.spans[0].content, "├── ");
+        assert_eq!(core_line.spans[0].style.fg, Some(theme.text_dim));
+        assert!(!core_line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(core_line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+
+        // 2. 子列表保留外层竖脊并缩进对齐，同时成组 key — desc 对齐 `—`
+        let read_row = texts.iter().find(|l| l.contains("read")).unwrap();
+        let ts_row = texts.iter().find(|l| l.contains("tool_search")).unwrap();
+        assert!(read_row.starts_with("│  • read"), "read row: {read_row:?}");
+        assert_eq!(
+            read_row.find('—'),
+            ts_row.find('—'),
+            "em-dash should align:\n{read_row}\n{ts_row}"
+        );
+
+        let ff_row = texts.iter().find(|l| l.contains("find_files")).unwrap();
+        assert!(ff_row.starts_with("│  │  • find_files"), "ff row: {ff_row:?}");
+
+        let cg_row = texts.iter().find(|l| l.contains("codegraph")).unwrap();
+        assert!(cg_row.starts_with("│     • codegraph"), "cg row: {cg_row:?}");
+
+        let note_row = texts.iter().find(|l| l.contains("外部工具")).unwrap();
+        assert!(note_row.starts_with("   • 外部工具"), "note row: {note_row:?}");
+
+        // 3. 树分支之间的空行保持竖脊不断裂
+        assert!(
+            texts.iter().any(|l| l == "│") && texts.iter().any(|l| l == "│  │"),
+            "missing vertical rail continuity across blanks:\n{joined}"
+        );
+
+        // 4. 关闭树之后空行后的普通段落回到第 0 列
+        let summary_row = texts.iter().find(|l| l.contains("普通总结段落")).unwrap();
+        assert!(
+            summary_row.starts_with("普通总结段落"),
+            "summary leaked tree indent: {summary_row:?}"
+        );
+    }
+
+    #[test]
+    fn tree_bullet_soft_wrap_preserves_outer_rail_within_width() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig::default();
+        let md = "**├── 分支**\n- **codemode** — QuickJS 沙箱执行多个工具调用中间结果不进上下文";
+        let rendered = render_markdown_rich(md, 30, &theme, &cfg);
+        assert!(rendered.len() >= 3);
+        assert!(rendered[2].soft_wrapped);
+        let cont_str: String = rendered[2]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            cont_str.starts_with("│    "),
+            "soft wrap lost outer rail: {cont_str:?}"
+        );
+        for rl in &rendered {
+            assert!(spans_display_width(&rl.line.spans) <= 30);
         }
     }
 }

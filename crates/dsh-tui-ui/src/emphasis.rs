@@ -470,7 +470,7 @@ pub fn reply_guidance_prompt() -> String {
         "These rules shape replies written to the user in this terminal. It colors pills, adds icons, and cannot change text size.\n\
          \n\
          - **Label every reply.** Start the first substantive line with a bold label, even for a one-line update, and give each subject in a multi-part reply a short heading or a bullet with a bold lead label. Write the label as a plain word; the terminal adds its icon. Never type icon glyphs. Labels with an icon: {labels}. Prefer these; any other label shows without an icon.\n\
-         - **Shape follows information.** Use `├──` and `└──` for what belongs to what, `→` for a sequence, `✓` or `✗` beside a checked item. Write tree rows as indented lines directly under their parent with no list dash, one line per row.\n\
+         - **Shape follows information.** Use `├──` and `└──` (with `│  ` for nested levels) for what belongs to what, `→` for a sequence, `✓` or `✗` beside a checked item. Keep tree lines plain (never wrap `├──`, `└──`, or `│` in `**...**`), omit blank lines inside an active tree, and indent child rows directly under `│  ` (or use a Markdown table / nested list without mixing `├──` headings and flush `-` bullets).\n\
          - **Bold the anchor terms.** Treat the components, choices, options, and statuses under discussion as key nodes, and bold them where they carry the point (1-3 bold spans per paragraph or bullet). Italicize sparingly for contrast.\n\
          - **Pills are required, not optional.** A pill is `[[Word]]` beside the subject it describes; the terminal colors it and adds its icon from the word:\n\
            - **Red (wrong):** {err}\n\
