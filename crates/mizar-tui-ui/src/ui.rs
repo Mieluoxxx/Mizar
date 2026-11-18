@@ -10,9 +10,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{
-    AppState, ApprovalMode, ChatItem, ItemRenderKey, LaunchpadQuickAction, NoticeLevel,
-    ToolExtraMeta, ToolState, abbreviate_home_path, clean_bash_output_lines, count_diff_stats,
-    format_diff_stat, format_expanded_tool_args, format_tokens, is_path_arg_tool,
+    AppState, ApprovalMode, BashInputMode, ChatItem, ItemRenderKey, LaunchpadQuickAction,
+    NoticeLevel, ToolExtraMeta, ToolState, abbreviate_home_path, clean_bash_output_lines,
+    count_diff_stats, format_diff_stat, format_expanded_tool_args, format_tokens, is_path_arg_tool,
     is_read_only_compact_tool, short_id, truncate_display,
 };
 use crate::editor::{char_width, display_width};
@@ -1659,8 +1659,14 @@ fn render_input_box(
     }
     let theme = &app.theme;
 
+    let bash_mode = app.bash_mode();
     let effort_col = effort_color(theme, app.reasoning_effort);
-    let mut base_border_color = if app.is_busy {
+    let mut base_border_color = if let Some(mode) = bash_mode {
+        match mode {
+            BashInputMode::Context => theme.success,
+            BashInputMode::NoContext => theme.text_muted,
+        }
+    } else if app.is_busy || app.is_bash_running {
         theme.border_busy
     } else if app.reasoning_effort.is_some() {
         effort_col
@@ -1670,7 +1676,9 @@ fn render_input_box(
 
     // High/XHigh/Max 推理强度切换点火扫描波（1.2s 内沿边框做 OKLab 色彩脉冲）
     let mut ignition_progress: Option<f64> = None;
-    if let Some(started) = app.effort_ignition_at {
+    if bash_mode.is_none()
+        && let Some(started) = app.effort_ignition_at
+    {
         let elapsed_ms = started.elapsed().as_millis();
         if elapsed_ms < IGNITION_DURATION_MS {
             let p = elapsed_ms as f64 / IGNITION_DURATION_MS as f64;
@@ -1687,18 +1695,39 @@ fn render_input_box(
         }
     }
 
-    let title = if app.is_busy {
-        " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) "
-    } else if app.input.has_collapsed_pastes() {
-        " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) "
-    } else {
-        " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) "
+    let (title, title_style) = match bash_mode {
+        Some(BashInputMode::Context) => (
+            " Bash (! · 载入上下文 · Enter 执行 · Esc 退出) ",
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Some(BashInputMode::NoContext) => (
+            " Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出) ",
+            Style::default().fg(theme.text_muted),
+        ),
+        None if app.is_busy => (
+            " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) ",
+            Style::default().fg(theme.text_muted),
+        ),
+        None if app.is_bash_running => (
+            " 输入 (Bash 命令执行中 · Esc 取消) ",
+            Style::default().fg(theme.text_muted),
+        ),
+        None if app.input.has_collapsed_pastes() => (
+            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) ",
+            Style::default().fg(theme.text_muted),
+        ),
+        None => (
+            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) ",
+            Style::default().fg(theme.text_muted),
+        ),
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(base_border_color))
-        .title(Span::styled(title, Style::default().fg(theme.text_muted)));
+        .title(Span::styled(title, title_style));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1819,13 +1848,20 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
 
     let theme = app.theme.clone();
     let is_busy = app.is_busy;
+    let is_bash = app.is_bash_running;
     let spinner = BRAILLE_SPINNER[app.spinner_tick % BRAILLE_SPINNER.len()];
     let status_text = if is_busy {
         format!("{spinner} 运行中")
+    } else if is_bash {
+        format!("{spinner} Bash")
     } else {
         "● 就绪".to_string()
     };
-    let status_color = if is_busy { theme.warning } else { theme.success };
+    let status_color = if is_busy || is_bash {
+        theme.warning
+    } else {
+        theme.success
+    };
 
     let model_label = app.active_model_label();
     let effort_str = format_effort_label(app.reasoning_effort);
@@ -2101,6 +2137,7 @@ mod tests {
             diff_raw: None,
             full_args: format!(r#"{{"command":"{long_cmd}"}}"#),
             inline_meta: Some("25 lines".into()),
+            ..Default::default()
         };
         let preview = "output line 24\noutput line 25";
 
@@ -2213,6 +2250,7 @@ mod tests {
             diff_raw: Some(diff),
             full_args: r#"{"path":"src/ui.rs"}"#.into(),
             inline_meta: Some("+6 -6".into()),
+            ..Default::default()
         };
 
         let collapsed = build_tool_lines(
@@ -2409,5 +2447,140 @@ mod tests {
             c2_line.contains("(Ctrl+O 展开)"),
             "c2 should refresh with expand hint when sibling c1 becomes expandable:\n{frame3}"
         );
+    }
+
+    #[test]
+    fn bash_mode_input_box_visuals_and_antigravity_cards() {
+        use crate::app::{LocalBashOutput, UiEvent};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-bash-render",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        let draw_with_border = |app: &mut AppState| -> (String, Color) {
+            let backend = TestBackend::new(110, 32);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(f, app)).unwrap();
+            let buf = terminal.backend().buffer();
+            let area = buf.area;
+            let mut out = String::new();
+            let mut input_top_border_fg = Color::Reset;
+            for y in 0..area.height {
+                let mut line = String::new();
+                let mut x = 0u16;
+                while x < area.width {
+                    let cell = &buf[(x, y)];
+                    let sym = cell.symbol();
+                    line.push_str(sym);
+                    if sym == "┌" && y > 10 {
+                        input_top_border_fg = cell.fg;
+                    }
+                    x += display_width(sym).max(1) as u16;
+                }
+                out.push_str(line.trim_end());
+                out.push('\n');
+            }
+            (out, input_top_border_fg)
+        };
+
+        // 1. 输入框 `!` 与 `!!` 视觉区分
+        app.input.set_text_end("! echo hi");
+        let (ctx_screen, ctx_border_fg) = draw_with_border(&mut app);
+        assert!(
+            ctx_screen.contains("Bash (! · 载入上下文 · Enter 执行 · Esc 退出)"),
+            "{ctx_screen}"
+        );
+        assert_eq!(ctx_border_fg, app.theme.success);
+
+        app.input.set_text_end("!! echo hi");
+        let (local_screen, local_border_fg) = draw_with_border(&mut app);
+        assert!(
+            local_screen.contains("Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出)"),
+            "{local_screen}"
+        );
+        assert_eq!(local_border_fg, app.theme.text_muted);
+        assert_ne!(ctx_border_fg, local_border_fg);
+        app.input.clear();
+
+        // 2. 运行态 + 完成(!) + 失败(!!) + 取消(!!) 卡片渲染
+        app.start_local_bash("b-run", "sleep 2", false);
+        let (running_screen, _) = draw_with_border(&mut app);
+        assert!(
+            running_screen.contains("bash(sleep 2) · 已入上下文"),
+            "{running_screen}"
+        );
+        assert!(running_screen.contains("Bash"), "{running_screen}");
+
+        app.apply_ui_event(UiEvent::LocalBashFinished {
+            call_id: "b-run".into(),
+            command: "sleep 2".into(),
+            exclude_from_context: false,
+            output: Ok(LocalBashOutput {
+                display: "line 1\nline 2\nline 3\nline 4".into(),
+                session_output: "line 1\nline 2\nline 3\nline 4".into(),
+                exit_code: Some(0),
+                cancelled: false,
+                timed_out: false,
+            }),
+        });
+        app.start_local_bash("b-err", "false_cmd", true);
+        app.apply_ui_event(UiEvent::LocalBashFinished {
+            call_id: "b-err".into(),
+            command: "false_cmd".into(),
+            exclude_from_context: true,
+            output: Ok(LocalBashOutput {
+                display: "boom detail\n\nCommand exited with code 2".into(),
+                session_output: "boom detail".into(),
+                exit_code: Some(2),
+                cancelled: false,
+                timed_out: false,
+            }),
+        });
+        app.start_local_bash("b-cancel", "tail -f foo", true);
+        app.apply_ui_event(UiEvent::LocalBashFinished {
+            call_id: "b-cancel".into(),
+            command: "tail -f foo".into(),
+            exclude_from_context: true,
+            output: Ok(LocalBashOutput {
+                display: "(no output)\n\nCommand aborted".into(),
+                session_output: String::new(),
+                exit_code: Some(-1),
+                cancelled: true,
+                timed_out: false,
+            }),
+        });
+
+        let (cards_screen, _) = draw_with_border(&mut app);
+        assert!(
+            cards_screen.contains("● bash(sleep 2) · 已入上下文"),
+            "{cards_screen}"
+        );
+        assert!(
+            cards_screen.contains("✗ bash(false_cmd) · 仅本地 · 退出码 2"),
+            "{cards_screen}"
+        );
+        assert!(
+            cards_screen.contains("⊘ bash(tail -f foo) · 仅本地 · 已取消"),
+            "{cards_screen}"
+        );
+        assert!(cards_screen.contains("boom detail"), "{cards_screen}");
+        assert!(cards_screen.contains("line 3"), "{cards_screen}");
+        assert!(cards_screen.contains("line 4"), "{cards_screen}");
+        assert!(!cards_screen.contains("line 1"), "{cards_screen}");
+        assert!(cards_screen.contains("(Ctrl+O 展开)"), "{cards_screen}");
+
+        // 3. Ctrl+O 展开恢复完整命令与输出
+        app.verbose_expanded = true;
+        app.item_cache.clear();
+        let (expanded_screen, _) = draw_with_border(&mut app);
+        assert!(expanded_screen.contains("line 1"), "{expanded_screen}");
+        assert!(expanded_screen.contains("line 4"), "{expanded_screen}");
     }
 }

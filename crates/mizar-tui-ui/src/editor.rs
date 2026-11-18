@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::app::BashInputMode;
 use crate::mentions::{MentionCaret, mention_at_caret};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,9 +505,13 @@ impl TextInput {
         self.cursor = self.text.len();
     }
 
+    pub fn bash_mode(&self) -> Option<BashInputMode> {
+        BashInputMode::from_input(&self.text)
+    }
+
     /// 检测光标当前是否处于 `/` 命令首行前缀或 `@` 文件引用片段中，返回 `(token_start_byte, query)`。
     pub fn active_slash_trigger(&self) -> Option<(usize, String)> {
-        if !self.text.starts_with('/') {
+        if self.bash_mode().is_some() || !self.text.starts_with('/') {
             return None;
         }
         let up_to_cursor = &self.text[..self.cursor];

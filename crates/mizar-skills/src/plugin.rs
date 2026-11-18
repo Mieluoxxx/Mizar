@@ -451,6 +451,7 @@ impl Plugin for SkillsPlugin {
                                         | SessionEvent::Assistant { .. }
                                         | SessionEvent::ToolResult { .. }
                                         | SessionEvent::Compaction { .. }
+                                        | SessionEvent::BashExecution { .. }
                                         | SessionEvent::Trace { .. } => break,
                                     }
                                 }

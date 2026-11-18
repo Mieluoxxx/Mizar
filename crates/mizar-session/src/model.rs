@@ -125,6 +125,17 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_before: Option<u64>,
     },
+    /// 本地执行的 Shell 命令（`!` 载入上下文 / `!!` 仅本地审计不载入上下文）。
+    BashExecution {
+        command: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(default)]
+        exclude_from_context: bool,
+    },
     /// 内部审计 / 轨迹边界事件（`EntryVisibility::LogOnly`）。
     Trace {
         detail: SessionTraceEvent,
@@ -149,6 +160,16 @@ impl SessionEvent {
     pub fn visibility(&self) -> EntryVisibility {
         match self {
             Self::Trace { .. } => EntryVisibility::LogOnly,
+            Self::BashExecution {
+                exclude_from_context,
+                ..
+            } => {
+                if *exclude_from_context {
+                    EntryVisibility::LogOnly
+                } else {
+                    EntryVisibility::Surface
+                }
+            }
             Self::User { .. }
             | Self::ContextNotice { .. }
             | Self::Assistant { .. }
@@ -168,6 +189,7 @@ impl SessionEvent {
             Self::Assistant { .. } => "assistant",
             Self::ToolResult { .. } => "tool-result",
             Self::Compaction { .. } => "compaction",
+            Self::BashExecution { .. } => "bash-execution",
             Self::Trace { detail } => detail.kind_name(),
         }
     }

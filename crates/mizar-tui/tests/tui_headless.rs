@@ -1133,3 +1133,343 @@ fn renders_wide_markdown_table_with_intact_short_col_wrapping_and_right_borders(
         "narrow render failed:\n{screen_narrow}"
     );
 }
+
+#[tokio::test]
+async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() {
+    use cordis::{BoxFuture, Next};
+    use mizar_llm::{
+        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, Message,
+        ModelInfo, ProviderInfo, StreamChunk,
+    };
+    use mizar_tools::{EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution};
+    use mizar_tools_coding::bash::execute_bash_process;
+    use mizar_tui::app::LocalBashOutput;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SpyLlm {
+        seen_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl LlmAdapter for SpyLlm {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "spy".into(),
+                name: "Spy".into(),
+                protocol: "mock".into(),
+                models: vec![ModelInfo {
+                    id: "spy-1".into(),
+                    name: "Spy 1".into(),
+                    context_window: Some(32_768),
+                    max_tokens: Some(4096),
+                    reasoning_efforts: Vec::new(),
+                }],
+            })
+        }
+
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            self.seen_messages.lock().unwrap().push(options.messages);
+            let chunks = vec![
+                Ok(StreamChunk::text("模型已收到结果")),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }),
+            ];
+            Box::pin(futures::stream::iter(chunks))
+        }
+    }
+
+    let tmp_root = std::env::temp_dir().join(format!("mizar_tui_bash_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_root);
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let db_path = tmp_root.join("sessions.sqlite");
+
+    let seen_messages = Arc::new(Mutex::new(Vec::new()));
+    let pre_exec_hits = Arc::new(AtomicUsize::new(0));
+
+    let boot_ctx = |root: PathBuf, db: PathBuf| async move {
+        let ctx = Context::new();
+        ctx.logger().set_silent();
+        let mut spine_cfg = AgentSpineConfig::coding(root).with_session_db(db);
+        if let AgentToolsMode::Coding {
+            ref mut mcp,
+            ref mut skills,
+            ref mut instructions,
+            ..
+        } = spine_cfg.tools_mode
+        {
+            mcp.load_config_files = false;
+            skills.include_default_roots = false;
+            instructions.include_default_global = false;
+        }
+        ctx.plugin(AgentSpinePlugin, spine_cfg);
+        ctx.plugin(MockPlugin, ());
+        wait_for_services(&ctx).await.unwrap();
+        ctx
+    };
+
+    let ctx = boot_ctx(tmp_root.clone(), db_path.clone()).await;
+    let _spy_handle = ctx
+        .llm()
+        .unwrap()
+        .register_adapter(
+            "spy",
+            Arc::new(SpyLlm {
+                seen_messages: Arc::clone(&seen_messages),
+            }),
+        )
+        .unwrap();
+
+    // 注册拦截器以验证 `!` / `!!` 本地命令不触发 `tools/pre-execute` 弹窗审批
+    let hits_clone = Arc::clone(&pre_exec_hits);
+    let _pre_hook = ctx
+        .on_waterfall(
+            EVENT_TOOLS_PRE_EXECUTE,
+            move |_exec: ToolExecution,
+                  _next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+                let hits_inner = Arc::clone(&hits_clone);
+                Box::pin(async move {
+                    hits_inner.fetch_add(1, Ordering::Relaxed);
+                    PreExecuteDecision::deny("should not run")
+                })
+            },
+        )
+        .unwrap();
+
+    let session = ctx.sessions().unwrap().create(Some("e2e-bash-sess".into()));
+    let mut state = AppState::new(
+        tmp_root.clone(),
+        &session.id,
+        Vec::new(),
+        Some("spy".into()),
+        Some("spy-1".into()),
+        None,
+    );
+
+    // 1. 输入框 `! echo CTX_VISIBLE_E2E` -> 提交得到 RunLocalBash，不触发 AgentLoop
+    state.input.set_text_end("! echo CTX_VISIBLE_E2E");
+    let act1 = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        act1,
+        AppAction::RunLocalBash {
+            command: "echo CTX_VISIBLE_E2E".into(),
+            exclude_from_context: false,
+        }
+    );
+    state.start_local_bash("local-1", "echo CTX_VISIBLE_E2E", false);
+    let res1 = execute_bash_process(
+        "echo CTX_VISIBLE_E2E",
+        &tmp_root,
+        None,
+        CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let out1 = res1.session_output();
+    session.append(SessionEvent::BashExecution {
+        command: "echo CTX_VISIBLE_E2E".into(),
+        output: out1.clone(),
+        exit_code: res1.exit_code,
+        cancelled: res1.cancelled,
+        exclude_from_context: false,
+    });
+    state.apply_ui_event(UiEvent::LocalBashFinished {
+        call_id: "local-1".into(),
+        command: "echo CTX_VISIBLE_E2E".into(),
+        exclude_from_context: false,
+        output: Ok(LocalBashOutput {
+            display: res1.display,
+            session_output: out1,
+            exit_code: res1.exit_code,
+            cancelled: res1.cancelled,
+            timed_out: res1.timed_out,
+        }),
+    });
+    // 执行完 ! 后不应自动触发模型回复
+    assert!(!state.is_busy);
+    assert!(seen_messages.lock().unwrap().is_empty());
+
+    // 2. 输入框 `!! echo LOCAL_HIDDEN_E2E` -> 仅本地执行，不进入上下文
+    state.input.set_text_end("!! echo LOCAL_HIDDEN_E2E");
+    let act2 = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        act2,
+        AppAction::RunLocalBash {
+            command: "echo LOCAL_HIDDEN_E2E".into(),
+            exclude_from_context: true,
+        }
+    );
+    state.start_local_bash("local-2", "echo LOCAL_HIDDEN_E2E", true);
+    let res2 = execute_bash_process(
+        "echo LOCAL_HIDDEN_E2E",
+        &tmp_root,
+        None,
+        CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let out2 = res2.session_output();
+    session.append(SessionEvent::BashExecution {
+        command: "echo LOCAL_HIDDEN_E2E".into(),
+        output: out2.clone(),
+        exit_code: res2.exit_code,
+        cancelled: res2.cancelled,
+        exclude_from_context: true,
+    });
+    state.apply_ui_event(UiEvent::LocalBashFinished {
+        call_id: "local-2".into(),
+        command: "echo LOCAL_HIDDEN_E2E".into(),
+        exclude_from_context: true,
+        output: Ok(LocalBashOutput {
+            display: res2.display,
+            session_output: out2,
+            exit_code: res2.exit_code,
+            cancelled: res2.cancelled,
+            timed_out: res2.timed_out,
+        }),
+    });
+
+    // 3. 大输出截断落盘到 temp_dir().join("mizar") 与 CancellationToken 中断测试
+    let big_res = execute_bash_process(
+        "seq 1 2500",
+        &tmp_root,
+        None,
+        CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(big_res.truncated);
+    let full_path = PathBuf::from(big_res.full_output_path.as_ref().expect("temp log path"));
+    assert!(full_path.starts_with(std::env::temp_dir().join("mizar")));
+    assert!(full_path.exists());
+    let _ = std::fs::remove_file(&full_path);
+
+    let cancel = CancellationToken::new();
+    let cancel_trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        cancel_trigger.cancel();
+    });
+    let cancelled_res = execute_bash_process("sleep 10", &tmp_root, None, cancel, |_| {})
+        .await
+        .unwrap();
+    assert!(cancelled_res.cancelled);
+
+    assert_eq!(pre_exec_hits.load(Ordering::Relaxed), 0);
+
+    // 4. 随后向模型提问：SpyLlm 必须能看见 ! 命令与输出，绝不可见 !! 命令与输出
+    let reply = ctx
+        .agent_loop()
+        .unwrap()
+        .run_with_options(
+            Arc::clone(&session),
+            "分析上面命令的输出",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("spy".into()),
+                model: Some("spy-1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "模型已收到结果");
+
+    {
+        let recorded = seen_messages.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let serialized = format!("{:?}", recorded[0]);
+        assert!(serialized.contains("echo CTX_VISIBLE_E2E"), "{serialized}");
+        assert!(serialized.contains("CTX_VISIBLE_E2E"), "{serialized}");
+        assert!(
+            !serialized.contains("LOCAL_HIDDEN_E2E"),
+            "!! output leaked to LLM:\n{serialized}"
+        );
+    }
+
+    // 5. 关闭当前宿主并从 SQLite 重建宿主验证 --resume 与 /tree 回放
+    session.flush_async().await.unwrap();
+    ctx.fiber().dispose().await;
+
+    let ctx2 = Context::new();
+    ctx2.logger().set_silent();
+    let mut spine_cfg2 = AgentSpineConfig::coding(tmp_root.clone()).with_session_db(db_path);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = spine_cfg2.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx2.plugin(AgentSpinePlugin, spine_cfg2);
+    wait_for_services(&ctx2).await.unwrap();
+
+    let reloaded = ctx2
+        .sessions()
+        .unwrap()
+        .get("e2e-bash-sess")
+        .expect("reloaded session from sqlite");
+
+    // /tree 包含 ! 与 !! 且保留归属标识
+    let tree = project_session_tree(&reloaded);
+    assert!(
+        tree.iter().any(|e| e.kind_tag.contains("BASH!")
+            && !e.kind_tag.contains("!!")
+            && e.summary.contains("echo CTX_VISIBLE_E2E")),
+        "tree missing ! entry: {tree:?}"
+    );
+    assert!(
+        tree.iter()
+            .any(|e| e.kind_tag == "BASH!!" && e.summary.contains("!! echo LOCAL_HIDDEN_E2E")),
+        "tree missing !! entry: {tree:?}"
+    );
+
+    // --resume 回放还原两张极简 bash 卡片且上下文统计排除 !!
+    let view = project_resume_view(&reloaded);
+    let mut resumed_state =
+        AppState::new(tmp_root.clone(), &reloaded.id, Vec::new(), None, None, None);
+    resumed_state.restore_session_view(view);
+
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut resumed_state)).unwrap();
+    let screen = buffer_text(terminal.backend());
+    assert!(
+        screen.contains("● bash(echo CTX_VISIBLE_E2E) · 已入上下文"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("● bash(echo LOCAL_HIDDEN_E2E) · 仅本地"),
+        "{screen}"
+    );
+    assert!(screen.contains("CTX_VISIBLE_E2E"), "{screen}");
+    assert!(screen.contains("LOCAL_HIDDEN_E2E"), "{screen}");
+
+    // 验证仅有 ! 计入 tool_tokens（若去掉 ! 卡片仅留 !! 则 tool_tokens 为 0）
+    assert!(resumed_state.side_panel_data.context.tool_tokens > 0);
+    let mut only_local_state = AppState::new(tmp_root.clone(), "s2", Vec::new(), None, None, None);
+    only_local_state.restore_session_view(mizar_tui::SessionViewData {
+        session_id: "s2".into(),
+        session_title: None,
+        items: vec![mizar_tui::SessionReplayItem::BashExecution {
+            command: "echo SECRET_ONLY".into(),
+            output: "SECRET_ONLY_BODY\n".repeat(20),
+            exit_code: Some(0),
+            cancelled: false,
+            exclude_from_context: true,
+        }],
+        finish_notice: "ok".into(),
+    });
+    assert_eq!(only_local_state.side_panel_data.context.tool_tokens, 0);
+
+    ctx2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&tmp_root);
+}

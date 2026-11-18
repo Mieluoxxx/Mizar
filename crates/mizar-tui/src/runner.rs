@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -30,12 +31,14 @@ use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_tools::{
     EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolExposure, ToolRuntime,
 };
+use mizar_tools_coding::bash::execute_bash_process;
 use mizar_trajectory::{
     EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime,
 };
 use mizar_tui_ui::app::{
-    AppAction, AppState, ApprovalMode, NoticeLevel, SessionReplayItem, SessionViewData,
-    UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason, short_id, truncate_display,
+    AppAction, AppState, ApprovalMode, LocalBashOutput, NoticeLevel, SessionReplayItem,
+    SessionViewData, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason, short_id,
+    truncate_display,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{ApprovalDecision, SessionTreeEntry, SkillPickerItem};
@@ -220,11 +223,11 @@ pub fn to_ui_log_record(record: &LogRecord) -> UiLogRecord {
     }
 }
 
-/// 将持久化会话日志投影为纯 UI 可重放的 `SessionViewData`。
+/// 将持久化会话日志投影为纯 UI 可重放的 `SessionViewData`（含 `!` 与 `!!` 本地命令记录）。
 pub fn project_session_view(session: &Session, finish_notice: impl Into<String>) -> SessionViewData {
     let header = session.header();
     let items = session
-        .log()
+        .all_entries()
         .into_iter()
         .filter_map(|entry| match entry.event {
             SessionEvent::User { text } => Some(SessionReplayItem::User { text }),
@@ -251,6 +254,19 @@ pub fn project_session_view(session: &Session, finish_notice: impl Into<String>)
                 tool_call_id,
                 content,
                 is_error,
+            }),
+            SessionEvent::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                exclude_from_context,
+            } => Some(SessionReplayItem::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                exclude_from_context,
             }),
             SessionEvent::Trace { .. } => None,
         })
@@ -289,10 +305,10 @@ pub fn project_fork_view(session: &Session, from_seq: u64) -> SessionViewData {
     project_session_view(session, finish_notice)
 }
 
-/// 将持久化会话日志投影为 `/tree` 覆盖层条目列表。
+/// 将持久化会话日志投影为 `/tree` 覆盖层条目列表（保留 `!` 与 `!!` 归属标识）。
 pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
     session
-        .log()
+        .all_entries()
         .into_iter()
         .filter_map(|entry| match entry.event {
             SessionEvent::User { text } => Some(SessionTreeEntry {
@@ -361,6 +377,39 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
                 depth: 0,
                 can_fork: false,
             }),
+            SessionEvent::BashExecution {
+                command,
+                exit_code,
+                cancelled,
+                exclude_from_context,
+                ..
+            } => {
+                let kind_tag = if exclude_from_context {
+                    "BASH!!"
+                } else {
+                    "BASH! "
+                };
+                let prefix = if exclude_from_context { "!!" } else { "!" };
+                let status_hint = if cancelled {
+                    "[取消] "
+                } else if let Some(code) = exit_code
+                    && code != 0
+                {
+                    "[失败] "
+                } else {
+                    ""
+                };
+                Some(SessionTreeEntry {
+                    seq: entry.seq,
+                    kind_tag: kind_tag.to_string(),
+                    summary: format!(
+                        "{prefix} {status_hint}{}",
+                        truncate_display(&command.replace('\n', " "), 60)
+                    ),
+                    depth: 0,
+                    can_fork: true,
+                })
+            }
             SessionEvent::Trace { .. } => None,
         })
         .collect()
@@ -691,7 +740,7 @@ pub async fn run_tui_with_summary(
     let mut user_cancelled = false;
 
     while !app.should_quit {
-        if app.screen_mode == ScreenMode::Inline && !app.is_busy {
+        if app.screen_mode == ScreenMode::Inline && !app.is_busy && !app.is_bash_running {
             flush_inline_scrollback(&mut terminal, &mut app);
         }
         write_begin_sync();
@@ -759,8 +808,8 @@ pub async fn run_tui_with_summary(
                 app.reveal.tick();
                 AppAction::None
             }
-            _ = spinner_tick.tick(), if app.is_busy || (!app.terminal_focused && (app.reveal.has_pending() || app.effort_ignition_at.is_some())) => {
-                if app.is_busy {
+            _ = spinner_tick.tick(), if app.is_busy || app.is_bash_running || (!app.terminal_focused && (app.reveal.has_pending() || app.effort_ignition_at.is_some())) => {
+                if app.is_busy || app.is_bash_running {
                     app.spinner_tick = app.spinner_tick.wrapping_add(1);
                 }
                 if !app.terminal_focused {
@@ -902,6 +951,13 @@ fn process_ui_event(
     user_cancelled: &mut bool,
     event: UiEvent,
 ) -> AppAction {
+    if matches!(event, UiEvent::LocalBashFinished { .. }) {
+        *active_cancel = None;
+        *user_cancelled = false;
+        app.apply_ui_event(event);
+        return AppAction::None;
+    }
+
     if let UiEvent::RunFinished(ref res) = event {
         let was_aborted =
             *user_cancelled || res.as_ref().is_err_and(|e| e.contains("request aborted"));
@@ -965,6 +1021,76 @@ fn spawn_agent_run(
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(UiEvent::RunFinished(res));
+    });
+}
+
+static LOCAL_BASH_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn spawn_local_bash_run(
+    app: &mut AppState,
+    active_session: &Arc<Session>,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    active_cancel: &mut Option<CancellationToken>,
+    command: String,
+    exclude_from_context: bool,
+) {
+    if app.is_bash_running {
+        app.set_flash("已有 Bash 命令正在运行，请先按 Esc 取消");
+        return;
+    }
+    if app.is_busy {
+        app.set_flash("模型正在生成中，请等待回合结束或按 Esc 取消后再运行 Bash 命令");
+        return;
+    }
+
+    let seq = LOCAL_BASH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let call_id = format!("local-bash-{seq}");
+    let cancel = CancellationToken::new();
+    *active_cancel = Some(cancel.clone());
+    app.start_local_bash(&call_id, &command, exclude_from_context);
+
+    let session = Arc::clone(active_session);
+    let cwd = app.workspace.clone();
+    let tx = ui_tx.clone();
+    let update_cid = call_id.clone();
+    let update_tx = tx.clone();
+
+    tokio::spawn(async move {
+        let res = execute_bash_process(&command, &cwd, None, cancel, move |preview| {
+            let _ = update_tx.send(UiEvent::ToolUpdate {
+                call_id: update_cid.clone(),
+                name: "bash".to_string(),
+                preview: preview.to_string(),
+            });
+        })
+        .await;
+
+        let (session_out, exit_code, cancelled) = match &res {
+            Ok(out) => (out.session_output(), out.exit_code, out.cancelled),
+            Err(err) => (err.clone(), Some(1), false),
+        };
+        session.append(SessionEvent::BashExecution {
+            command: command.clone(),
+            output: session_out.clone(),
+            exit_code,
+            cancelled,
+            exclude_from_context,
+        });
+
+        let payload = res.map(|out| LocalBashOutput {
+            display: out.display,
+            session_output: session_out,
+            exit_code: out.exit_code,
+            cancelled: out.cancelled,
+            timed_out: out.timed_out,
+        });
+
+        let _ = tx.send(UiEvent::LocalBashFinished {
+            call_id,
+            command,
+            exclude_from_context,
+            output: payload,
+        });
     });
 }
 
@@ -1057,6 +1183,9 @@ async fn handle_action(
         AppAction::NewSession => {
             *pending_steer = None;
             *user_cancelled = false;
+            if let Some(cancel) = active_cancel.take() {
+                cancel.cancel();
+            }
             if let Ok(sessions) = ctx.sessions() {
                 let next = sessions.create(None);
                 let title = next.header().title;
@@ -1094,6 +1223,19 @@ async fn handle_action(
                     prompt,
                 );
             }
+        }
+        AppAction::RunLocalBash {
+            command,
+            exclude_from_context,
+        } => {
+            spawn_local_bash_run(
+                app,
+                active_session,
+                ui_tx,
+                active_cancel,
+                command,
+                exclude_from_context,
+            );
         }
         AppAction::ShowStats => {
             if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
@@ -1826,5 +1968,105 @@ mod tests {
             app.items.last(),
             Some(ChatItem::User { text }) if text == "queued follow-up"
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_local_bash_run_executes_persists_and_supports_cancel() {
+        use cordis::Service;
+        use mizar_session::{SessionContextExt, SessionStore};
+
+        let ctx = cordis::Context::new();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let session = ctx.sessions().unwrap().create(Some("runner-bash".into()));
+
+        let mut app = AppState::new(
+            std::env::temp_dir(),
+            &session.id,
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut active_cancel = None;
+        let mut pending_steer = None;
+        let mut user_cancelled = false;
+
+        super::spawn_local_bash_run(
+            &mut app,
+            &session,
+            &tx,
+            &mut active_cancel,
+            "echo RUNNER_LOCAL_OK".into(),
+            false,
+        );
+        assert!(app.is_bash_running);
+        assert!(active_cancel.is_some());
+
+        while let Some(ev) = rx.recv().await {
+            let is_done = matches!(ev, UiEvent::LocalBashFinished { .. });
+            let act = process_ui_event(
+                &mut app,
+                &mut active_cancel,
+                &mut pending_steer,
+                &mut user_cancelled,
+                ev,
+            );
+            assert_eq!(act, AppAction::None);
+            if is_done {
+                break;
+            }
+        }
+        assert!(!app.is_bash_running);
+        assert!(active_cancel.is_none());
+        assert_eq!(session.log().len(), 1);
+        assert!(matches!(
+            &session.log()[0].event,
+            mizar_session::SessionEvent::BashExecution {
+                command,
+                output,
+                exit_code: Some(0),
+                cancelled: false,
+                exclude_from_context: false,
+            } if command == "echo RUNNER_LOCAL_OK" && output.contains("RUNNER_LOCAL_OK")
+        ));
+
+        // 测试 Esc 取消（active_cancel.cancel()）
+        super::spawn_local_bash_run(
+            &mut app,
+            &session,
+            &tx,
+            &mut active_cancel,
+            "sleep 10".into(),
+            true,
+        );
+        assert!(app.is_bash_running);
+        active_cancel.as_ref().unwrap().cancel();
+        while let Some(ev) = rx.recv().await {
+            let is_done = matches!(ev, UiEvent::LocalBashFinished { .. });
+            process_ui_event(
+                &mut app,
+                &mut active_cancel,
+                &mut pending_steer,
+                &mut user_cancelled,
+                ev,
+            );
+            if is_done {
+                break;
+            }
+        }
+        assert!(!app.is_bash_running);
+        assert!(active_cancel.is_none());
+        assert_eq!(session.all_entries().len(), 2);
+        assert!(matches!(
+            &session.all_entries()[1].event,
+            mizar_session::SessionEvent::BashExecution {
+                cancelled: true,
+                exclude_from_context: true,
+                ..
+            }
+        ));
+
+        ctx.fiber().dispose().await;
     }
 }

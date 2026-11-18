@@ -126,6 +126,34 @@ fn entry_to_trace_event(
             is_error: *is_error,
             blocked: blocked_ids.remove(tool_call_id),
         },
+        SessionEvent::BashExecution {
+            command,
+            output,
+            exit_code,
+            cancelled,
+            exclude_from_context,
+        } => {
+            let source = if *exclude_from_context {
+                "bash-local"
+            } else {
+                "bash-context"
+            };
+            let mut text = format!("! {command}\n");
+            if *cancelled {
+                text.push_str("[cancelled]\n");
+            } else if let Some(code) = exit_code
+                && *code != 0
+            {
+                text.push_str(&format!("[exit code: {code}]\n"));
+            }
+            if !output.is_empty() {
+                text.push_str(output);
+            }
+            TraceEventKind::ContextNotice {
+                source: source.to_string(),
+                text,
+            }
+        }
         SessionEvent::Trace { detail } => match detail {
             SessionTraceEvent::TurnStart { turn } => TraceEventKind::TurnStart { turn: *turn },
             SessionTraceEvent::TurnEnd { turn, reason } => TraceEventKind::TurnEnd {

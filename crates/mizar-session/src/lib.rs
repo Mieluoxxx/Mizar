@@ -129,7 +129,9 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
             SessionEvent::ToolResult { tool_call_id, .. } => {
                 pending.retain(|(id, _)| id != tool_call_id);
             }
-            SessionEvent::ContextNotice { .. } | SessionEvent::Trace { .. } => {}
+            SessionEvent::ContextNotice { .. }
+            | SessionEvent::BashExecution { .. }
+            | SessionEvent::Trace { .. } => {}
         }
     }
 
@@ -213,6 +215,17 @@ impl Session {
             match &entry.event {
                 SessionEvent::User { text } if inner.header.title.is_none() => {
                     if let Some(title) = derive_session_title(text) {
+                        inner.header.title = Some(title.clone());
+                        title_patch = Some(SessionHeaderPatch {
+                            title: Some(title),
+                            updated_at_ms: Some(ts),
+                            compacted_up_to_seq: None,
+                        });
+                    }
+                }
+                SessionEvent::BashExecution { command, .. } if inner.header.title.is_none() => {
+                    let cmd_title = format!("! {command}");
+                    if let Some(title) = derive_session_title(&cmd_title) {
                         inner.header.title = Some(title.clone());
                         title_patch = Some(SessionHeaderPatch {
                             title: Some(title),
@@ -407,6 +420,35 @@ impl Session {
                     messages.push(Message::User {
                         content: format!("[历史对话摘要]\n{summary}"),
                     });
+                }
+                SessionEvent::BashExecution {
+                    command,
+                    output,
+                    exit_code,
+                    cancelled,
+                    exclude_from_context,
+                } => {
+                    if !*exclude_from_context {
+                        let mut content = format!("Ran `{command}`\n");
+                        if !output.is_empty() {
+                            content.push_str("```\n");
+                            content.push_str(output);
+                            if !output.ends_with('\n') {
+                                content.push('\n');
+                            }
+                            content.push_str("```");
+                        } else {
+                            content.push_str("(no output)");
+                        }
+                        if *cancelled {
+                            content.push_str("\n\n(command cancelled)");
+                        } else if let Some(code) = exit_code
+                            && *code != 0
+                        {
+                            content.push_str(&format!("\n\nCommand exited with code {code}"));
+                        }
+                        messages.push(Message::User { content });
+                    }
                 }
                 SessionEvent::Trace { .. } => {}
             }

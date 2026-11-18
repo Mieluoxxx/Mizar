@@ -18,9 +18,9 @@ pub mod trajectory_scene;
 pub mod ui;
 
 pub use app::{
-    AppAction, AppState, ApprovalMode, ChatItem, LaunchpadQuickAction, NoticeLevel,
-    SessionReplayItem, SessionViewData, ToolState, UiAgentStatus, UiEvent, UiLogLevel,
-    UiLogRecord, UiTurnEndReason,
+    AppAction, AppState, ApprovalMode, BashInputMode, ChatItem, LaunchpadQuickAction,
+    LocalBashOutput, NoticeLevel, SessionReplayItem, SessionViewData, ToolState, UiAgentStatus,
+    UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason,
 };
 pub use emphasis::EmphasisConfig;
 pub use terminal::ScreenMode;

@@ -96,6 +96,57 @@ pub struct ToolExtraMeta {
     pub diff_raw: Option<String>,
     pub full_args: String,
     pub inline_meta: Option<String>,
+    /// 为 `true` 时（如 `!!` 本地命令），不计入模型上下文估算。
+    pub exclude_from_context: bool,
+}
+
+/// 输入前缀识别得到的 Bash 交互模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashInputMode {
+    /// `!` 开头：执行结果载入后续对话上下文。
+    Context,
+    /// `!!` 开头：执行结果仅本地展示与审计，不载入上下文。
+    NoContext,
+}
+
+impl BashInputMode {
+    pub fn from_input(input: &str) -> Option<Self> {
+        let trimmed = input.trim_start();
+        if trimmed.starts_with("!!") {
+            Some(Self::NoContext)
+        } else if trimmed.starts_with('!') {
+            Some(Self::Context)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_context(self) -> bool {
+        matches!(self, Self::Context)
+    }
+
+    pub fn exclude_from_context(self) -> bool {
+        matches!(self, Self::NoContext)
+    }
+
+    /// 剥离 `!` / `!!` 前缀并裁剪两端空白，返回待执行命令。
+    pub fn extract_command(self, input: &str) -> &str {
+        let trimmed = input.trim();
+        match self {
+            Self::NoContext => trimmed.strip_prefix("!!").unwrap_or("").trim(),
+            Self::Context => trimmed.strip_prefix('!').unwrap_or("").trim(),
+        }
+    }
+}
+
+/// 本地 Bash 命令异步执行完成后的 UI 投影负载。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBashOutput {
+    pub display: String,
+    pub session_output: String,
+    pub exit_code: Option<i32>,
+    pub cancelled: bool,
+    pub timed_out: bool,
 }
 
 /// 单个消息条目的行级渲染缓存键。
@@ -169,6 +220,13 @@ pub enum SessionReplayItem {
         content: String,
         is_error: bool,
     },
+    BashExecution {
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+        cancelled: bool,
+        exclude_from_context: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +279,12 @@ pub enum UiEvent {
     UserSkillsUpdated(Vec<String>),
     Log(UiLogRecord),
     RunFinished(Result<String, String>),
+    LocalBashFinished {
+        call_id: String,
+        command: String,
+        exclude_from_context: bool,
+        output: Result<LocalBashOutput, String>,
+    },
     ApprovalRequested {
         tool_name: String,
         args_preview: String,
@@ -243,6 +307,10 @@ pub enum AppAction {
     None,
     SubmitPrompt(String),
     SteerPrompt(String),
+    RunLocalBash {
+        command: String,
+        exclude_from_context: bool,
+    },
     CancelRun,
     NewSession,
     ShowStats,
@@ -274,6 +342,7 @@ pub struct AppState {
     pub input: TextInput,
     pub queued_prompts: Vec<String>,
     pub is_busy: bool,
+    pub is_bash_running: bool,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub providers: Vec<ProviderInfo>,
@@ -364,6 +433,7 @@ impl AppState {
             input: TextInput::new(),
             queued_prompts: Vec::new(),
             is_busy: false,
+            is_bash_running: false,
             provider,
             model,
             providers,
@@ -501,12 +571,96 @@ impl AppState {
         crate::overlay::all_efforts().to_vec()
     }
 
+    pub fn bash_mode(&self) -> Option<BashInputMode> {
+        BashInputMode::from_input(self.input.text())
+    }
+
     pub fn push_user_message(&mut self, text: &str) {
         self.items.push(ChatItem::User {
             text: text.to_string(),
         });
         self.streaming_assistant_open = false;
         self.scroll_to_bottom();
+    }
+
+    /// 在对话流插入一张处于运行态的本地 `!` / `!!` Bash 卡片。
+    pub fn start_local_bash(
+        &mut self,
+        call_id: impl Into<String>,
+        command: &str,
+        exclude_from_context: bool,
+    ) {
+        let call_id = call_id.into();
+        self.is_bash_running = true;
+        self.streaming_assistant_open = false;
+        self.reveal.snap_all();
+        let args_json = serde_json::json!({ "command": command }).to_string();
+        let args_summary = summarize_tool_args(&args_json);
+        let inline_meta = bash_scope_label(exclude_from_context).to_string();
+        self.tool_extras.insert(
+            call_id.clone(),
+            ToolExtraMeta {
+                full_content: String::new(),
+                diff_raw: None,
+                full_args: args_json,
+                inline_meta: Some(inline_meta),
+                exclude_from_context,
+            },
+        );
+        self.items.push(ChatItem::ToolCall {
+            id: call_id,
+            name: "bash".to_string(),
+            args_summary,
+            status: ToolState::Running,
+            output_preview: String::new(),
+        });
+        self.item_cache.clear();
+        self.scroll_to_bottom();
+    }
+
+    fn apply_local_bash_completion(
+        &mut self,
+        call_id: String,
+        command: &str,
+        exclude_from_context: bool,
+        display: String,
+        status: ToolState,
+        inline_meta: String,
+    ) {
+        let failed = !matches!(status, ToolState::Done);
+        let preview = summarize_tool_result("bash", &display, None, failed);
+        if let Some(ChatItem::ToolCall {
+            status: st,
+            output_preview,
+            ..
+        }) = self.items.iter_mut().rev().find(|item| match item {
+            ChatItem::ToolCall { id, .. } => id == &call_id,
+            _ => false,
+        }) {
+            *st = status;
+            *output_preview = preview;
+        } else {
+            let args_json = serde_json::json!({ "command": command }).to_string();
+            let args_summary = summarize_tool_args(&args_json);
+            self.tool_extras
+                .entry(call_id.clone())
+                .or_insert_with(|| ToolExtraMeta {
+                    full_args: args_json,
+                    exclude_from_context,
+                    ..Default::default()
+                });
+            self.items.push(ChatItem::ToolCall {
+                id: call_id.clone(),
+                name: "bash".to_string(),
+                args_summary,
+                status,
+                output_preview: preview,
+            });
+        }
+        let ext = self.tool_extras.entry(call_id).or_default();
+        ext.full_content = display;
+        ext.inline_meta = Some(inline_meta);
+        ext.exclude_from_context = exclude_from_context;
     }
 
     pub fn open_model_selector(&mut self) -> AppAction {
@@ -542,9 +696,11 @@ impl AppState {
                     output_preview,
                     ..
                 } => {
-                    let body_len = self
-                        .tool_extras
-                        .get(id)
+                    let extra = self.tool_extras.get(id);
+                    if extra.is_some_and(|e| e.exclude_from_context) {
+                        continue;
+                    }
+                    let body_len = extra
                         .map(|e| e.full_content.len())
                         .unwrap_or(output_preview.len());
                     tool_chars += args_summary.len() + body_len;
@@ -718,6 +874,7 @@ impl AppState {
                         diff_raw: None,
                         full_args: call.arguments,
                         inline_meta: None,
+                        exclude_from_context: false,
                     },
                 );
                 self.items.push(ChatItem::ToolCall {
@@ -731,6 +888,9 @@ impl AppState {
             UiEvent::ToolUpdate {
                 call_id, preview, ..
             } => {
+                if let Some(ext) = self.tool_extras.get_mut(&call_id) {
+                    ext.full_content = preview.clone();
+                }
                 if let Some(ChatItem::ToolCall { output_preview, .. }) =
                     self.items.iter_mut().rev().find(|item| match item {
                         ChatItem::ToolCall { id, .. } => id == &call_id,
@@ -855,6 +1015,49 @@ impl AppState {
                 }
                 self.refresh_context_breakdown();
             }
+            UiEvent::LocalBashFinished {
+                call_id,
+                command,
+                exclude_from_context,
+                output,
+            } => {
+                self.is_bash_running = false;
+                match output {
+                    Ok(out) => {
+                        let status = if out.cancelled {
+                            ToolState::Blocked
+                        } else if out.exit_code.unwrap_or(0) != 0 {
+                            ToolState::Error
+                        } else {
+                            ToolState::Done
+                        };
+                        let inline_meta =
+                            bash_inline_meta(exclude_from_context, out.exit_code, out.cancelled);
+                        self.apply_local_bash_completion(
+                            call_id,
+                            &command,
+                            exclude_from_context,
+                            out.display,
+                            status,
+                            inline_meta,
+                        );
+                    }
+                    Err(err) => {
+                        let inline_meta =
+                            format!("{} · 失败", bash_scope_label(exclude_from_context));
+                        self.apply_local_bash_completion(
+                            call_id,
+                            &command,
+                            exclude_from_context,
+                            err,
+                            ToolState::Error,
+                            inline_meta,
+                        );
+                    }
+                }
+                self.item_cache.clear();
+                self.refresh_context_breakdown();
+            }
             UiEvent::ApprovalRequested {
                 tool_name,
                 args_preview,
@@ -882,7 +1085,10 @@ impl AppState {
         if self.overlay.is_modal() {
             return;
         }
-        if let Some((start, query)) = self.input.active_slash_trigger() {
+        // Bash 模式下禁止触发 `/` 斜杠命令补全
+        if self.bash_mode().is_none()
+            && let Some((start, query)) = self.input.active_slash_trigger()
+        {
             self.dismissed_mention = None;
             let selected = match &self.overlay.active {
                 Some(OverlayKind::SlashComplete { selected, .. }) => *selected,
@@ -1152,7 +1358,7 @@ impl AppState {
                 self.last_ctrl_c_at = None;
                 return AppAction::None;
             }
-            if self.is_busy {
+            if self.is_busy || self.is_bash_running {
                 return AppAction::CancelRun;
             }
             let double_press = self
@@ -1178,7 +1384,7 @@ impl AppState {
         // 4. 全局功能快捷键
         match key.code {
             KeyCode::Char('d') if ctrl => {
-                if !self.is_busy && self.input.is_empty() {
+                if !self.is_busy && !self.is_bash_running && self.input.is_empty() {
                     self.should_quit = true;
                     return AppAction::Quit;
                 }
@@ -1228,7 +1434,7 @@ impl AppState {
                 return AppAction::None;
             }
             KeyCode::Char('g') if ctrl => {
-                if !self.is_busy {
+                if !self.is_busy && !self.is_bash_running {
                     return AppAction::OpenExternalEditor;
                 }
                 return AppAction::None;
@@ -1262,11 +1468,12 @@ impl AppState {
                     self.selection.clear();
                     return AppAction::None;
                 }
-                if self.is_busy {
+                if self.is_busy || self.is_bash_running {
                     return AppAction::CancelRun;
                 }
                 if !self.input.is_empty() {
                     self.input.clear();
+                    self.sync_input_completion_overlay();
                 }
                 return AppAction::None;
             }
@@ -1588,6 +1795,7 @@ impl AppState {
         self.touched_files.clear();
         self.anomalies.clear();
         self.queued_prompts.clear();
+        self.is_bash_running = false;
         self.always_allowed_tools.clear();
         self.reveal.clear();
         self.selection.clear();
@@ -1667,6 +1875,7 @@ impl AppState {
                                 diff_raw: None,
                                 full_args: arguments,
                                 inline_meta: None,
+                                exclude_from_context: false,
                             },
                         );
                         self.items.push(ChatItem::ToolCall {
@@ -1709,6 +1918,32 @@ impl AppState {
                     ext.full_content = content;
                     ext.inline_meta = inline_meta;
                 }
+                SessionReplayItem::BashExecution {
+                    command,
+                    output,
+                    exit_code,
+                    cancelled,
+                    exclude_from_context,
+                } => {
+                    let call_id = format!("bash-replay-{}", self.items.len());
+                    let status = if cancelled {
+                        ToolState::Blocked
+                    } else if exit_code.unwrap_or(0) != 0 {
+                        ToolState::Error
+                    } else {
+                        ToolState::Done
+                    };
+                    let display = format_bash_display(&output, exit_code, cancelled);
+                    let inline_meta = bash_inline_meta(exclude_from_context, exit_code, cancelled);
+                    self.apply_local_bash_completion(
+                        call_id,
+                        &command,
+                        exclude_from_context,
+                        display,
+                        status,
+                        inline_meta,
+                    );
+                }
             }
         }
         self.push_notice(NoticeLevel::Info, view.finish_notice);
@@ -1725,6 +1960,57 @@ impl AppState {
     }
 
     fn prepare_submit(&mut self, immediate: bool) -> AppAction {
+        let preview = self.input.text().trim();
+        if preview.is_empty() {
+            self.input.take();
+            return AppAction::None;
+        }
+
+        if let Some(mode) = BashInputMode::from_input(preview) {
+            let expanded = self.input.expand_text();
+            let cmd = mode.extract_command(&expanded);
+            if cmd.is_empty() {
+                self.set_flash("请输入要在 Bash 中执行的命令（或按 Esc 退出）");
+                return AppAction::None;
+            }
+            if self.is_busy {
+                self.set_flash("模型正在生成中，请等待回合结束或按 Esc 取消后再运行 Bash 命令");
+                return AppAction::None;
+            }
+            if self.is_bash_running {
+                self.set_flash("已有 Bash 命令正在运行，请先按 Esc 取消");
+                return AppAction::None;
+            }
+
+            let raw = self.input.take();
+            let trimmed = raw.trim();
+            let command = mode.extract_command(trimmed).to_string();
+            self.overlay.active = None;
+            self.dismissed_mention = None;
+            self.input.push_history(trimmed);
+            self.scroll_to_bottom();
+            return AppAction::RunLocalBash {
+                command,
+                exclude_from_context: mode.exclude_from_context(),
+            };
+        }
+
+        if self.is_bash_running {
+            let is_safe_slash = preview
+                .strip_prefix('/')
+                .and_then(|s| s.split_whitespace().next())
+                .is_some_and(|c| {
+                    matches!(
+                        c.to_ascii_lowercase().as_str(),
+                        "exit" | "quit" | "q" | "help" | "h" | "view" | "mouse"
+                    )
+                });
+            if !is_safe_slash {
+                self.set_flash("Bash 命令正在运行，请等待完成或按 Esc 取消后再发送");
+                return AppAction::None;
+            }
+        }
+
         let raw = self.input.take();
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -2135,6 +2421,47 @@ pub(crate) fn is_read_only_compact_tool(name: &str) -> bool {
             | "read_mcp_resource"
             | "get_time"
     )
+}
+
+pub(crate) fn bash_scope_label(exclude_from_context: bool) -> &'static str {
+    if exclude_from_context {
+        "仅本地"
+    } else {
+        "已入上下文"
+    }
+}
+
+pub(crate) fn bash_inline_meta(
+    exclude_from_context: bool,
+    exit_code: Option<i32>,
+    cancelled: bool,
+) -> String {
+    let scope = bash_scope_label(exclude_from_context);
+    if cancelled {
+        format!("{scope} · 已取消")
+    } else if let Some(code) = exit_code
+        && code != 0
+    {
+        format!("{scope} · 退出码 {code}")
+    } else {
+        scope.to_string()
+    }
+}
+
+pub(crate) fn format_bash_display(output: &str, exit_code: Option<i32>, cancelled: bool) -> String {
+    let mut display = if output.trim().is_empty() {
+        "(no output)".to_string()
+    } else {
+        output.to_string()
+    };
+    if cancelled {
+        display.push_str("\n\nCommand aborted");
+    } else if let Some(code) = exit_code
+        && code != 0
+    {
+        display.push_str(&format!("\n\nCommand exited with code {code}"));
+    }
+    display
 }
 
 /// 判断工具的主要参数是否为路径（窄宽度时优先保留首部前缀与尾部文件名）。
@@ -3124,6 +3451,141 @@ mod tests {
             )
             .as_deref(),
             Some("+2 -1")
+        );
+    }
+
+    #[test]
+    fn bash_mode_prefix_detection_esc_slash_bypass_history_and_context_stats() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-bash-ui",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(BashInputMode::from_input("normal prompt"), None);
+        assert_eq!(
+            BashInputMode::from_input("  !ls -la"),
+            Some(BashInputMode::Context)
+        );
+        assert_eq!(
+            BashInputMode::from_input("  !! ls -la"),
+            Some(BashInputMode::NoContext)
+        );
+        assert_eq!(BashInputMode::from_input("!"), Some(BashInputMode::Context));
+        assert_eq!(
+            BashInputMode::from_input("!!"),
+            Some(BashInputMode::NoContext)
+        );
+
+        // 1. `!` / `!!` 禁止触发 `/` 斜杠补全与内置斜杠拦截
+        app.input.set_text_end("/he");
+        app.sync_input_completion_overlay();
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::SlashComplete { .. })
+        ));
+        app.input.set_text_end("!/help");
+        app.sync_input_completion_overlay();
+        assert_eq!(app.bash_mode(), Some(BashInputMode::Context));
+        assert!(app.overlay.active.is_none());
+
+        let act_slash_in_bash = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            act_slash_in_bash,
+            AppAction::RunLocalBash {
+                command: "/help".into(),
+                exclude_from_context: false,
+            }
+        );
+        assert!(app.overlay.active.is_none());
+        assert_eq!(app.input.history(), &["!/help".to_string()]);
+
+        // 2. 空命令 `!` / `!!` 按 Enter 给出温和 flash 提示不执行
+        for empty_cmd in ["!", "!!", "  !  "] {
+            app.input.set_text_end(empty_cmd);
+            let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(act, AppAction::None);
+            assert!(app.active_flash().is_some_and(|f| f.contains("Bash")));
+            assert_eq!(app.input.text(), empty_cmd);
+        }
+
+        // 3. 非运行态按 Esc 退出 Bash 模式并清空输入
+        app.input.set_text_end("!! pwd");
+        assert_eq!(app.bash_mode(), Some(BashInputMode::NoContext));
+        let esc_act = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(esc_act, AppAction::None);
+        assert!(app.input.is_empty());
+        assert_eq!(app.bash_mode(), None);
+
+        // 4. 并发安全：is_busy 与 is_bash_running 下拒绝运行并保留输入
+        app.is_busy = true;
+        app.input.set_text_end("! echo hi");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.input.text(), "! echo hi");
+        assert!(app.active_flash().is_some());
+        app.is_busy = false;
+
+        app.start_local_bash("lb-1", "sleep 5", false);
+        assert!(app.is_bash_running);
+        app.input.set_text_end("!! echo two");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.input.text(), "!! echo two");
+        assert!(app.active_flash().is_some_and(|f| f.contains("Esc")));
+
+        // 清空输入后按 Esc 触发 CancelRun 中断运行中的 bash
+        app.input.clear();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::CancelRun
+        );
+
+        // 5. 上下文估算隔离：! 计入 tool_tokens，!! 不污染上下文估算
+        app.apply_ui_event(UiEvent::LocalBashFinished {
+            call_id: "lb-1".into(),
+            command: "sleep 5".into(),
+            exclude_from_context: false,
+            output: Ok(LocalBashOutput {
+                display: "context output payload\n".repeat(4),
+                session_output: "context output payload\n".repeat(4),
+                exit_code: Some(0),
+                cancelled: false,
+                timed_out: false,
+            }),
+        });
+        assert!(!app.is_bash_running);
+        let tokens_after_ctx = app.side_panel_data.context.tool_tokens;
+        assert!(tokens_after_ctx > 0);
+
+        app.start_local_bash("lb-2", "cat huge_local.log", true);
+        app.apply_ui_event(UiEvent::LocalBashFinished {
+            call_id: "lb-2".into(),
+            command: "cat huge_local.log".into(),
+            exclude_from_context: true,
+            output: Ok(LocalBashOutput {
+                display: "local only massive text\n".repeat(50),
+                session_output: "local only massive text\n".repeat(50),
+                exit_code: Some(0),
+                cancelled: false,
+                timed_out: false,
+            }),
+        });
+        assert_eq!(
+            app.side_panel_data.context.tool_tokens, tokens_after_ctx,
+            "!! local bash must not pollute context breakdown"
+        );
+        assert!(
+            app.items
+                .iter()
+                .all(|it| !matches!(it, ChatItem::User { .. }))
         );
     }
 }

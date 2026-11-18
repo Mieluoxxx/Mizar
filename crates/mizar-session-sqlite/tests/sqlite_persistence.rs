@@ -246,3 +246,89 @@ async fn works_with_in_memory_sqlite_config() {
     assert_eq!(hydrated.log().len(), 1);
     app.fiber().dispose().await;
 }
+
+#[tokio::test]
+async fn persists_and_reloads_bash_execution_context_and_local_only() {
+    let db = temp_db_path("bash_exec");
+    let _guard = TempDbGuard(db.clone());
+
+    {
+        let app = Context::new();
+        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+        app.plugin(SessionStore::plugin(), ());
+        app.plugin(
+            cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+            (),
+        )
+        .await
+        .unwrap();
+
+        let store = app.sessions().unwrap();
+        let s = store.create_with(SessionCreateOptions {
+            id: Some("bash-db-1".into()),
+            cwd: Some("/repo".into()),
+            ..Default::default()
+        });
+        s.append(SessionEvent::BashExecution {
+            command: "echo ctx_ok".into(),
+            output: "ctx_ok\n".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            exclude_from_context: false,
+        });
+        s.append(SessionEvent::BashExecution {
+            command: "echo secret_local".into(),
+            output: "secret_local\n".into(),
+            exit_code: Some(1),
+            cancelled: false,
+            exclude_from_context: true,
+        });
+        s.append(SessionEvent::User {
+            text: "请总结".into(),
+        });
+        s.flush_async().await.unwrap();
+        app.fiber().dispose().await;
+    }
+
+    let app2 = Context::new();
+    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+    app2.plugin(SessionStore::plugin(), ());
+    app2.plugin(
+        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let store2 = app2.sessions().unwrap();
+    let reloaded = store2
+        .get("bash-db-1")
+        .expect("should reload session with bash executions");
+
+    assert_eq!(reloaded.header().event_count, 3);
+    // 只有 ! 与 User 是 surface 事件，!! 不占 surface_count
+    assert_eq!(reloaded.header().surface_count, 2);
+    assert_eq!(reloaded.all_entries().len(), 3);
+    assert_eq!(reloaded.log().len(), 2);
+
+    assert!(matches!(
+        &reloaded.all_entries()[1].event,
+        SessionEvent::BashExecution {
+            command,
+            output,
+            exit_code: Some(1),
+            cancelled: false,
+            exclude_from_context: true,
+        } if command == "echo secret_local" && output == "secret_local\n"
+    ));
+
+    let msgs = reloaded.derive_messages();
+    assert_eq!(msgs.len(), 2);
+    assert!(matches!(
+        &msgs[0],
+        mizar_llm::Message::User { content } if content.contains("ctx_ok")
+    ));
+    assert!(!format!("{msgs:?}").contains("secret_local"));
+
+    app2.fiber().dispose().await;
+}

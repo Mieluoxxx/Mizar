@@ -323,3 +323,116 @@ fn repair_helper_noop_when_tool_already_resolved() {
     let repaired = repair_dangling_tool_calls(&mut loaded);
     assert!(repaired.is_empty());
 }
+
+#[tokio::test]
+async fn bash_execution_separates_context_and_log_only_across_derive_and_compaction() {
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+    let s = store.create(Some("sess-bash".into()));
+
+    let ctx_ev = SessionEvent::BashExecution {
+        command: "echo hello".into(),
+        output: "hello\n".into(),
+        exit_code: Some(0),
+        cancelled: false,
+        exclude_from_context: false,
+    };
+    let local_ev = SessionEvent::BashExecution {
+        command: "cat secret.txt".into(),
+        output: "SECRET_LOCAL_ONLY\n".into(),
+        exit_code: Some(0),
+        cancelled: false,
+        exclude_from_context: true,
+    };
+    let err_ev = SessionEvent::BashExecution {
+        command: "false".into(),
+        output: "".into(),
+        exit_code: Some(2),
+        cancelled: false,
+        exclude_from_context: false,
+    };
+    let cancel_ev = SessionEvent::BashExecution {
+        command: "sleep 10".into(),
+        output: "partial\n".into(),
+        exit_code: Some(-1),
+        cancelled: true,
+        exclude_from_context: false,
+    };
+
+    assert_eq!(ctx_ev.visibility(), EntryVisibility::Surface);
+    assert_eq!(local_ev.visibility(), EntryVisibility::LogOnly);
+    assert_eq!(ctx_ev.kind_name(), "bash-execution");
+
+    // 序列化往返保真
+    let roundtrip: SessionEvent =
+        serde_json::from_str(&serde_json::to_string(&local_ev).unwrap()).unwrap();
+    assert_eq!(roundtrip, local_ev);
+
+    s.append(ctx_ev);
+    s.append(local_ev);
+    s.append(err_ev);
+    s.append(cancel_ev);
+    s.append(SessionEvent::User {
+        text: "分析以上命令输出".into(),
+    });
+
+    // 首条事件为 BashExecution 时自动派生标题
+    assert_eq!(s.header().title.as_deref(), Some("! echo hello"));
+
+    // session.log() 仅包含表面事件（不含 !!）
+    assert_eq!(s.log().len(), 4);
+    assert_eq!(s.all_entries().len(), 5);
+
+    // derive_messages() 必须包含 !（含命令、输出、退出码与取消标记），彻底排除 !!
+    let msgs = s.derive_messages();
+    assert_eq!(msgs.len(), 4);
+    match &msgs[0] {
+        Message::User { content } => {
+            assert!(content.contains("Ran `echo hello`"), "{content}");
+            assert!(content.contains("hello"), "{content}");
+        }
+        other => panic!("unexpected msg[0]: {other:?}"),
+    }
+    match &msgs[1] {
+        Message::User { content } => {
+            assert!(content.contains("Ran `false`"), "{content}");
+            assert!(content.contains("(no output)"), "{content}");
+            assert!(content.contains("Command exited with code 2"), "{content}");
+        }
+        other => panic!("unexpected msg[1]: {other:?}"),
+    }
+    match &msgs[2] {
+        Message::User { content } => {
+            assert!(content.contains("Ran `sleep 10`"), "{content}");
+            assert!(content.contains("partial"), "{content}");
+            assert!(content.contains("(command cancelled)"), "{content}");
+        }
+        other => panic!("unexpected msg[2]: {other:?}"),
+    }
+    for m in &msgs {
+        if let Message::User { content } = m {
+            assert!(!content.contains("SECRET_LOCAL_ONLY"), "{content}");
+            assert!(!content.contains("secret.txt"), "{content}");
+        }
+    }
+
+    // Compaction 后 !! 依旧不可见
+    s.append(SessionEvent::BashExecution {
+        command: "ls /private".into(),
+        output: "PRIVATE_AFTER_COMPACT".into(),
+        exit_code: Some(0),
+        cancelled: false,
+        exclude_from_context: true,
+    });
+    s.compact("summary", 1, None);
+    let after_compact = s.derive_messages();
+    assert!(after_compact.iter().all(|m| match m {
+        Message::User { content } => {
+            !content.contains("SECRET_LOCAL_ONLY") && !content.contains("PRIVATE_AFTER_COMPACT")
+        }
+        _ => true,
+    }));
+
+    app.fiber().dispose().await;
+}
