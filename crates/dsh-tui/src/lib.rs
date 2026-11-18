@@ -16,7 +16,7 @@ pub use dsh_tui_ui::{
     AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, NoticeLevel,
     ScreenMode, SessionReplayItem, SessionViewData, TerminalColors, Theme, ThemePreset, ToolState,
     UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason,
-    build_item_lines_for_scrollback, render,
+    build_item_lines_for_scrollback, build_item_lines_for_scrollback_at, render,
 };
 pub use runner::{
     ResumeTarget, TuiConfig, TuiExitSummary, format_resume_command, mount_reply_guidance_section,

@@ -125,7 +125,7 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     let screen = buffer_text(terminal.backend());
     assert!(screen.contains("测试告警消息"), "screen:\n{screen}");
     assert!(screen.contains("项目里有哪些文件"), "screen:\n{screen}");
-    assert!(screen.contains("✓ find(*)"), "screen:\n{screen}");
+    assert!(screen.contains("● find(*)"), "screen:\n{screen}");
     assert!(screen.contains("工具返回了结果"), "screen:\n{screen}");
     assert!(screen.contains("● 就绪"), "screen:\n{screen}");
 
@@ -210,6 +210,7 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
         ToolExtraMeta {
             full_content: "已更新 1 处".into(),
             diff_raw: Some("-let old_val = 1;\n+let new_val = 2;\n".into()),
+            ..Default::default()
         },
     );
 
@@ -263,15 +264,23 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
         ToolExtraMeta {
             full_content: "line1\nline2\nline3\nline4\nline5\nline6\nline7".into(),
             diff_raw: None,
+            ..Default::default()
         },
     );
     terminal.draw(|f| render(f, &mut state)).unwrap();
     let collapsed_screen = buffer_text(terminal.backend());
     assert!(
-        collapsed_screen.contains("按 Ctrl+O 展开"),
-        "expected Ctrl+O expand hint:\n{collapsed_screen}"
+        collapsed_screen.contains("(Ctrl+O 展开)"),
+        "expected inline Ctrl+O expand hint:\n{collapsed_screen}"
     );
-    assert!(!collapsed_screen.contains("点击或按"), "unexpected click hint:\n{collapsed_screen}");
+    assert!(
+        !collapsed_screen.contains("点击或按"),
+        "unexpected click hint:\n{collapsed_screen}"
+    );
+    assert!(
+        !collapsed_screen.contains("还有"),
+        "unexpected multi-line footer hint:\n{collapsed_screen}"
+    );
     assert!(!collapsed_screen.contains("line7"));
 
     let items_before = state.items.len();
@@ -881,4 +890,133 @@ async fn expands_at_mentions_via_pre_step_and_folds_on_resume() {
     drop(hook_handle.dispose());
     app_ctx.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[tokio::test]
+async fn renders_compact_consecutive_tools_and_restores_details_on_ctrl_o() {
+    let ws = crate_root();
+    let mut state = AppState::new(ws, "sess-compact-tools", Vec::new(), None, None, None);
+
+    // 1. 连续 4 次只读调用应紧排成 4 行，无行间空行、无 │ 预览框，且仅末行末尾带 (Ctrl+O 展开)
+    let read_paths = [
+        "crates/cordis/src/lib.rs",
+        "crates/dsh-agent-spine/Cargo.toml",
+        "crates/dsh-tui-ui/src/ui.rs",
+        "crates/dsh-tools/src/lib.rs",
+    ];
+    for (idx, path) in read_paths.iter().enumerate() {
+        let call_id = format!("r-{idx}");
+        state.apply_ui_event(UiEvent::ToolCall(dsh_llm::ToolCall {
+            id: call_id.clone(),
+            name: "read".into(),
+            arguments: format!(r#"{{"path":"{path}"}}"#),
+        }));
+        state.apply_ui_event(UiEvent::ToolResult {
+            call_id,
+            name: "read".into(),
+            content: "fn alpha() {}\nfn beta() {}\nfn gamma() {}".into(),
+            is_error: false,
+            blocked: false,
+            details: Some(serde_json::json!({
+                "path": path,
+                "start_line": 1,
+                "end_line": 3,
+                "total_lines": 120,
+                "truncated": false
+            })),
+        });
+    }
+
+    // 2. 长参数 bash（超过旧版 48 字符上限）+ 多行输出 + 1 条错误工具
+    let long_cmd = "cd crates/dsh-tui-ui && cargo check --all-targets --message-format=short";
+    state.apply_ui_event(UiEvent::ToolCall(dsh_llm::ToolCall {
+        id: "b-long".into(),
+        name: "bash".into(),
+        arguments: format!(r#"{{"command":"{long_cmd}"}}"#),
+    }));
+    let bash_out = (1..=30)
+        .map(|i| format!("build output line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    state.apply_ui_event(UiEvent::ToolResult {
+        call_id: "b-long".into(),
+        name: "bash".into(),
+        content: bash_out,
+        is_error: false,
+        blocked: false,
+        details: Some(serde_json::json!({ "exit_code": 0, "duration_ms": 42 })),
+    });
+
+    state.apply_ui_event(UiEvent::ToolCall(dsh_llm::ToolCall {
+        id: "r-err".into(),
+        name: "read".into(),
+        arguments: r#"{"path":"missing/file.rs"}"#.into(),
+    }));
+    state.apply_ui_event(UiEvent::ToolResult {
+        call_id: "r-err".into(),
+        name: "read".into(),
+        content: "File not found: missing/file.rs".into(),
+        is_error: true,
+        blocked: false,
+        details: None,
+    });
+
+    let backend = TestBackend::new(130, 56);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let collapsed = buffer_text(terminal.backend());
+
+    let tool_lines: Vec<&str> = collapsed
+        .lines()
+        .filter(|l| l.starts_with("● ") || l.starts_with("✗ ") || l.starts_with("  │ "))
+        .collect();
+    // 4 个 read (各 1 行) + 1 个 bash (1 头 + 2 尾行) + 1 个 error read (1 头 + 1 错误行) = 9 行
+    assert_eq!(tool_lines.len(), 9, "collapsed:\n{collapsed}");
+    assert!(
+        collapsed.contains(long_cmd),
+        "long bash command should not be cut at 48 chars:\n{collapsed}"
+    );
+    assert!(!collapsed.contains("前省略"), "collapsed:\n{collapsed}");
+    assert!(
+        !collapsed.contains("fn alpha"),
+        "read body should stay folded:\n{collapsed}"
+    );
+    assert!(
+        collapsed.contains("build output line 30"),
+        "collapsed:\n{collapsed}"
+    );
+    assert!(
+        !collapsed.contains("build output line 1\n"),
+        "collapsed:\n{collapsed}"
+    );
+    assert!(
+        collapsed.contains("File not found: missing/file.rs"),
+        "error should remain visible when collapsed:\n{collapsed}"
+    );
+    assert_eq!(
+        collapsed.matches("(Ctrl+O 展开)").count(),
+        1,
+        "expand hint should only appear once at group end:\n{collapsed}"
+    );
+
+    // 紧邻 read 行之间不应夹杂空行
+    let screen_lines: Vec<&str> = collapsed.lines().collect();
+    let first_read_row = screen_lines
+        .iter()
+        .position(|l| l.contains("crates/cordis/src/lib.rs"))
+        .expect("first read row");
+    assert!(
+        screen_lines[first_read_row + 1].contains("crates/dsh-agent-spine/Cargo.toml"),
+        "consecutive tools should not have blank line between them:\n{collapsed}"
+    );
+
+    // Ctrl+O 展开后恢复 read 全文与 bash 早期输出
+    state.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let expanded = buffer_text(terminal.backend());
+    assert!(expanded.contains("fn alpha() {}"), "expanded:\n{expanded}");
+    assert!(
+        expanded.contains("build output line 1"),
+        "expanded:\n{expanded}"
+    );
 }

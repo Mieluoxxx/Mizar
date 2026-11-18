@@ -46,7 +46,7 @@ use dsh_tui_ui::terminal::{
     write_begin_sync, write_end_sync,
 };
 use dsh_tui_ui::theme::ThemePreset;
-use dsh_tui_ui::ui::{build_item_lines_for_scrollback, render};
+use dsh_tui_ui::ui::{build_item_lines_for_scrollback_at, render};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -1006,14 +1006,10 @@ fn flush_inline_scrollback(
 
     while app.inline_committed_items < app.items.len() {
         let idx = app.inline_committed_items;
-        let item = &app.items[idx];
-        let extra = match item {
-            crate::app::ChatItem::ToolCall { id, .. } => app.tool_extras.get(id),
-            _ => None,
-        };
-        let lines = build_item_lines_for_scrollback(
-            item,
-            extra,
+        let lines = build_item_lines_for_scrollback_at(
+            &app.items,
+            idx,
+            &app.tool_extras,
             width,
             &app.theme,
             &app.emphasis,

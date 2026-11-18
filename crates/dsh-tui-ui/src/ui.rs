@@ -1,5 +1,7 @@
 //! TUI 布局与渲染引擎：双栏工作台、时间轴导轨、虚拟化流式视图、`pi-emphasis` 语法、词级 Diff 与浮层叠加。
 
+use std::collections::HashMap;
+
 use dsh_llm_types::ReasoningEffort;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -9,9 +11,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{
     AppState, ApprovalMode, ChatItem, ItemRenderKey, LaunchpadQuickAction, NoticeLevel,
-    ToolExtraMeta, ToolState, format_tokens, short_id, truncate_display,
+    ToolExtraMeta, ToolState, abbreviate_home_path, clean_bash_output_lines, count_diff_stats,
+    format_diff_stat, format_expanded_tool_args, format_tokens, is_path_arg_tool,
+    is_read_only_compact_tool, short_id, truncate_display,
 };
-use crate::editor::display_width;
+use crate::editor::{char_width, display_width};
 use crate::emphasis::EmphasisConfig;
 use crate::markdown::{
     RenderedLine, parse_inline_rich, render_diff_rich, render_markdown_rich, wrap_styled_spans_rich,
@@ -343,17 +347,83 @@ pub fn build_item_lines_for_scrollback(
             status,
             output_preview,
             ..
-        } => build_tool_lines(
-            name,
-            args_summary,
-            *status,
-            output_preview,
-            extra,
-            verbose_expanded,
-            0,
+        } => {
+            let show_expand_hint = !verbose_expanded && is_tool_expandable(item, extra, w, theme);
+            build_tool_lines(
+                name,
+                args_summary,
+                *status,
+                output_preview,
+                extra,
+                verbose_expanded,
+                ToolGroupCtx {
+                    is_group_end: true,
+                    show_expand_hint,
+                },
+                0,
+                w,
+                theme,
+            )
+        }
+        ChatItem::Notice { level, text } => build_notice_lines(*level, text, w, theme, emphasis),
+    };
+    rendered.into_iter().map(|rl| rl.line).collect()
+}
+
+/// 在完整条目切片上下文中将第 `idx` 条渲染为 Inline scrollback 行序列，保持连续工具卡片分组去空行一致。
+#[allow(clippy::too_many_arguments)]
+pub fn build_item_lines_for_scrollback_at(
+    items: &[ChatItem],
+    idx: usize,
+    tool_extras: &HashMap<String, ToolExtraMeta>,
+    width: usize,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    show_thinking: bool,
+    verbose_expanded: bool,
+) -> Vec<Line<'static>> {
+    let Some(item) = items.get(idx) else {
+        return Vec::new();
+    };
+    let w = width.max(12);
+    let rendered = match item {
+        ChatItem::User { text } => build_user_lines(text, w, theme),
+        ChatItem::Assistant { reasoning, text } => build_assistant_lines(
+            reasoning,
+            if show_thinking {
+                reasoning.as_str()
+            } else {
+                ""
+            },
+            text.as_str(),
+            show_thinking,
             w,
             theme,
+            emphasis,
         ),
+        ChatItem::ToolCall {
+            id,
+            name,
+            args_summary,
+            status,
+            output_preview,
+        } => {
+            let extra = tool_extras.get(id);
+            let group_ctx =
+                compute_tool_group_ctx(items, 0, idx, tool_extras, verbose_expanded, w, theme);
+            build_tool_lines(
+                name,
+                args_summary,
+                *status,
+                output_preview,
+                extra,
+                verbose_expanded,
+                group_ctx,
+                0,
+                w,
+                theme,
+            )
+        }
         ChatItem::Notice { level, text } => build_notice_lines(*level, text, w, theme, emphasis),
     };
     rendered.into_iter().map(|rl| rl.line).collect()
@@ -498,15 +568,30 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             } => {
                 let extra = app.tool_extras.get(id).cloned();
                 let expanded = verbose_expanded;
+                let group_ctx = compute_tool_group_ctx(
+                    &app.items,
+                    start_item,
+                    idx,
+                    &app.tool_extras,
+                    expanded,
+                    width_usize,
+                    &theme,
+                );
                 let extra_len = extra.as_ref().map_or(0, |e| {
-                    e.full_content.len() + e.diff_raw.as_ref().map_or(0, String::len)
+                    e.full_content.len()
+                        + e.diff_raw.as_ref().map_or(0, String::len)
+                        + e.full_args.len()
+                        + e.inline_meta.as_ref().map_or(0, String::len)
                 });
-                let status_code = match status {
-                    ToolState::Running => 0,
-                    ToolState::Done => 1,
-                    ToolState::Error => 2,
-                    ToolState::Blocked => 3,
+                let base_status = match status {
+                    ToolState::Running => 0u8,
+                    ToolState::Done => 1u8,
+                    ToolState::Error => 2u8,
+                    ToolState::Blocked => 3u8,
                 };
+                let status_code = base_status
+                    | if group_ctx.is_group_end { 4 } else { 0 }
+                    | if group_ctx.show_expand_hint { 8 } else { 0 };
                 let spin_key = if matches!(status, ToolState::Running) {
                     spinner_tick % BRAILLE_SPINNER.len()
                 } else {
@@ -531,6 +616,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                         output_preview,
                         extra.as_ref(),
                         expanded,
+                        group_ctx,
                         spin_key,
                         width_usize,
                         &theme,
@@ -779,6 +865,561 @@ fn build_assistant_lines(
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolGroupCtx {
+    is_group_end: bool,
+    show_expand_hint: bool,
+}
+
+const EXPAND_HINT_INLINE: &str = " (Ctrl+O 展开)";
+
+fn compute_tool_group_ctx(
+    items: &[ChatItem],
+    start_item: usize,
+    idx: usize,
+    tool_extras: &HashMap<String, ToolExtraMeta>,
+    expanded: bool,
+    width: usize,
+    theme: &Theme,
+) -> ToolGroupCtx {
+    let is_group_end =
+        idx + 1 >= items.len() || !matches!(items[idx + 1], ChatItem::ToolCall { .. });
+    if !is_group_end || expanded {
+        return ToolGroupCtx {
+            is_group_end,
+            show_expand_hint: false,
+        };
+    }
+
+    let mut show_expand_hint = false;
+    let mut j = idx;
+    while let ChatItem::ToolCall { id, .. } = &items[j] {
+        if is_tool_expandable(&items[j], tool_extras.get(id), width, theme) {
+            show_expand_hint = true;
+            break;
+        }
+        if j == start_item || j == 0 {
+            break;
+        }
+        j -= 1;
+    }
+
+    ToolGroupCtx {
+        is_group_end,
+        show_expand_hint,
+    }
+}
+
+fn tool_status_glyph(
+    status: ToolState,
+    spinner_idx: usize,
+    theme: &Theme,
+) -> (&'static str, Color) {
+    match status {
+        ToolState::Running => (
+            BRAILLE_SPINNER[spinner_idx % BRAILLE_SPINNER.len()],
+            theme.warning,
+        ),
+        ToolState::Done => ("●", theme.success),
+        ToolState::Error => ("✗", theme.error),
+        ToolState::Blocked => ("⊘", theme.error),
+    }
+}
+
+fn truncate_tail_display(s: &str, max_cols: usize) -> String {
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return "…".to_string();
+    }
+    let budget = max_cols - 1;
+    let mut rev_chars = Vec::new();
+    let mut used = 0usize;
+    for ch in s.chars().rev() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        rev_chars.push(ch);
+    }
+    let mut out = String::with_capacity(max_cols);
+    out.push('…');
+    for ch in rev_chars.into_iter().rev() {
+        out.push(ch);
+    }
+    out
+}
+
+/// 对文件路径优先保留根目录/家目录前缀与尾部文件名（如 `~/…/crates/dsh-tui-ui/src/ui.rs`）。
+fn truncate_path_middle(path: &str, max_cols: usize) -> String {
+    if display_width(path) <= max_cols {
+        return path.to_string();
+    }
+    if max_cols <= 4 {
+        return truncate_display(path, max_cols);
+    }
+
+    let (prefix, rest) = if let Some(r) = path.strip_prefix("~/") {
+        ("~/", r)
+    } else if let Some(r) = path.strip_prefix('/') {
+        ("/", r)
+    } else if let Some(r) = path.strip_prefix("./") {
+        ("./", r)
+    } else {
+        ("", path)
+    };
+
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() >= 2 {
+        let marker = format!("{prefix}…/");
+        let marker_w = display_width(&marker);
+        if marker_w >= max_cols {
+            return truncate_display(path, max_cols);
+        }
+        let tail_budget = max_cols - marker_w;
+        let last = segments[segments.len() - 1];
+        if display_width(last) > tail_budget {
+            let prefix_w = display_width(prefix);
+            let avail = max_cols.saturating_sub(prefix_w);
+            return format!("{prefix}{}", truncate_tail_display(last, avail));
+        }
+
+        let mut kept: Vec<&str> = vec![last];
+        let mut cur_w = display_width(last);
+        for seg in segments[..segments.len() - 1].iter().rev() {
+            let seg_w = display_width(seg);
+            if cur_w + 1 + seg_w > tail_budget {
+                break;
+            }
+            cur_w += 1 + seg_w;
+            kept.push(seg);
+        }
+        kept.reverse();
+        return format!("{marker}{}", kept.join("/"));
+    }
+
+    let prefix_w = display_width(prefix);
+    if prefix_w + 2 < max_cols {
+        return format!("{prefix}{}", truncate_display(rest, max_cols - prefix_w));
+    }
+    truncate_display(path, max_cols)
+}
+
+fn fit_collapsed_tool_args(name: &str, args: &str, max_cols: usize) -> String {
+    if max_cols == 0 || args.is_empty() {
+        return String::new();
+    }
+    if display_width(args) <= max_cols {
+        return args.to_string();
+    }
+    let single_path_like = !args.contains(' ') && !args.contains('\t') && args.contains('/');
+    if is_path_arg_tool(name) || single_path_like {
+        truncate_path_middle(args, max_cols)
+    } else {
+        truncate_display(args, max_cols)
+    }
+}
+
+fn resolve_inline_meta(
+    name: &str,
+    status: ToolState,
+    output_preview: &str,
+    extra: Option<&ToolExtraMeta>,
+) -> Option<String> {
+    if let Some(meta) = extra.and_then(|e| e.inline_meta.as_ref()) {
+        return Some(meta.clone());
+    }
+    if matches!(status, ToolState::Running) {
+        return None;
+    }
+    if name == "edit"
+        && !matches!(status, ToolState::Error | ToolState::Blocked)
+        && let Some(diff) = extra.and_then(|e| e.diff_raw.as_deref())
+    {
+        let (adds, dels) = count_diff_stats(diff);
+        return format_diff_stat(adds, dels);
+    }
+
+    let full_text = extra
+        .filter(|e| !e.full_content.is_empty())
+        .map_or(output_preview, |e| e.full_content.as_str());
+
+    if matches!(status, ToolState::Done) && is_read_only_compact_tool(name) {
+        let trimmed = full_text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return match name {
+            "get_time" if !trimmed.contains('\n') => Some(trimmed.to_string()),
+            "find" => {
+                if trimmed.starts_with("No files found") {
+                    Some("0 files".to_string())
+                } else {
+                    let n = full_text.lines().filter(|l| !l.trim().is_empty()).count();
+                    Some(if n == 1 {
+                        "1 file".to_string()
+                    } else {
+                        format!("{n} files")
+                    })
+                }
+            }
+            "list_dir" | "ls" => {
+                if trimmed == "（空目录）" {
+                    Some("empty".to_string())
+                } else {
+                    let n = full_text.lines().filter(|l| !l.trim().is_empty()).count();
+                    Some(if n == 1 {
+                        "1 item".to_string()
+                    } else {
+                        format!("{n} items")
+                    })
+                }
+            }
+            "skill" => Some("loaded".to_string()),
+            _ => {
+                if trimmed == "(empty file)" {
+                    Some("empty".to_string())
+                } else {
+                    let n = full_text.lines().count();
+                    Some(if n == 1 {
+                        "1 line".to_string()
+                    } else {
+                        format!("{n} lines")
+                    })
+                }
+            }
+        };
+    }
+
+    if name == "bash" && matches!(status, ToolState::Done) {
+        let lines = clean_bash_output_lines(full_text, false);
+        if lines.len() > 2 {
+            return Some(format!("{} lines", lines.len()));
+        }
+    }
+    None
+}
+
+fn compact_diff_preview(diff_raw: &str) -> (String, bool) {
+    let mut changed = Vec::new();
+    let mut skipped_non_header = false;
+    for line in diff_raw.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        if line.starts_with('+') || line.starts_with('-') {
+            changed.push(line);
+        } else if !line.trim().is_empty() {
+            skipped_non_header = true;
+        }
+    }
+    if changed.is_empty() {
+        (diff_raw.to_string(), false)
+    } else {
+        (changed.join("\n"), skipped_non_header)
+    }
+}
+
+fn collapsed_preview_lines(name: &str, status: ToolState, output_preview: &str) -> Vec<String> {
+    if matches!(status, ToolState::Error | ToolState::Blocked) {
+        let max_lines = if is_read_only_compact_tool(name) {
+            3
+        } else {
+            4
+        };
+        let lines: Vec<String> = if name == "bash" {
+            let cleaned = clean_bash_output_lines(output_preview, true);
+            let src = if cleaned.is_empty() {
+                output_preview
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect()
+            } else {
+                cleaned
+            };
+            let start = src.len().saturating_sub(max_lines);
+            src[start..].iter().map(|s| (*s).to_string()).collect()
+        } else {
+            output_preview
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(max_lines)
+                .map(ToString::to_string)
+                .collect()
+        };
+        return lines;
+    }
+
+    if is_read_only_compact_tool(name) || name == "write" {
+        return Vec::new();
+    }
+
+    if name == "bash" {
+        let cleaned = clean_bash_output_lines(output_preview, false);
+        let start = cleaned.len().saturating_sub(2);
+        return cleaned[start..].iter().map(|s| (*s).to_string()).collect();
+    }
+
+    output_preview
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.trim() != "(no output)")
+        .take(2)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn collapsed_header_budget(
+    glyph: &str,
+    name: &str,
+    abbr_args: &str,
+    inline_meta: Option<&str>,
+    show_expand_hint: bool,
+    width: usize,
+) -> (bool, bool, usize) {
+    let fixed_w = display_width(glyph) + 1 + display_width(name) + 2;
+    let hint_w = if show_expand_hint {
+        display_width(EXPAND_HINT_INLINE)
+    } else {
+        0
+    };
+    let meta_w = inline_meta.map_or(0, |m| 3 + display_width(m));
+    let full_args_w = display_width(abbr_args);
+
+    if full_args_w == 0 {
+        let rem = width.saturating_sub(fixed_w);
+        if meta_w + hint_w <= rem {
+            return (inline_meta.is_some(), show_expand_hint, 0);
+        }
+        if hint_w <= rem {
+            return (false, show_expand_hint, 0);
+        }
+        if meta_w <= rem {
+            return (inline_meta.is_some(), false, 0);
+        }
+        return (false, false, 0);
+    }
+
+    if fixed_w + full_args_w + meta_w + hint_w <= width {
+        return (inline_meta.is_some(), show_expand_hint, full_args_w);
+    }
+    if width.saturating_sub(fixed_w + meta_w + hint_w) >= 16 {
+        return (
+            inline_meta.is_some(),
+            show_expand_hint,
+            width - fixed_w - meta_w - hint_w,
+        );
+    }
+    if width.saturating_sub(fixed_w + hint_w) >= 16 {
+        return (false, show_expand_hint, width - fixed_w - hint_w);
+    }
+    if width.saturating_sub(fixed_w + meta_w) >= 12 {
+        return (inline_meta.is_some(), false, width - fixed_w - meta_w);
+    }
+    (false, false, width.saturating_sub(fixed_w))
+}
+
+fn is_tool_expandable(
+    item: &ChatItem,
+    extra: Option<&ToolExtraMeta>,
+    width: usize,
+    theme: &Theme,
+) -> bool {
+    let ChatItem::ToolCall {
+        name,
+        args_summary,
+        status,
+        output_preview,
+        ..
+    } = item
+    else {
+        return false;
+    };
+
+    let body_w = width.saturating_sub(4).max(4);
+    let inline_meta = resolve_inline_meta(name, *status, output_preview, extra);
+    let abbr_args = abbreviate_home_path(args_summary);
+    let (glyph, _) = tool_status_glyph(*status, 0, theme);
+    let (_, _, args_budget) =
+        collapsed_header_budget(glyph, name, &abbr_args, inline_meta.as_deref(), true, width);
+    if !abbr_args.is_empty() && display_width(&abbr_args) > args_budget {
+        return true;
+    }
+
+    let (_, extra_arg_lines) = format_expanded_tool_args(name, args_summary, extra);
+    if !extra_arg_lines.is_empty() {
+        return true;
+    }
+
+    let full_text = extra
+        .filter(|e| !e.full_content.is_empty())
+        .map_or(output_preview.as_str(), |e| e.full_content.as_str());
+
+    if !matches!(status, ToolState::Error | ToolState::Blocked)
+        && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
+        && !diff_raw.trim().is_empty()
+    {
+        let (compact_src, stripped) = compact_diff_preview(diff_raw);
+        if stripped {
+            return true;
+        }
+        return render_diff_rich(&compact_src, body_w, theme).len() > 4;
+    }
+
+    if matches!(status, ToolState::Running) {
+        return output_preview
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+            > 2;
+    }
+
+    if matches!(status, ToolState::Error | ToolState::Blocked) {
+        let preview_src = if output_preview.trim().is_empty() {
+            full_text
+        } else {
+            output_preview.as_str()
+        };
+        let shown = collapsed_preview_lines(name, *status, preview_src);
+        let full_count = if name == "bash" {
+            clean_bash_output_lines(full_text, true).len()
+        } else {
+            full_text.lines().filter(|l| !l.trim().is_empty()).count()
+        };
+        return full_count > shown.len() || shown.iter().any(|l| display_width(l) > body_w);
+    }
+
+    if is_read_only_compact_tool(name) {
+        if name == "get_time" {
+            let t = full_text.trim();
+            return !t.is_empty() && (t.contains('\n') || display_width(t) > 40);
+        }
+        return !full_text.trim().is_empty();
+    }
+
+    if name == "write" {
+        return !full_text.trim().is_empty();
+    }
+
+    let shown = collapsed_preview_lines(name, *status, output_preview);
+    if name == "bash" {
+        let full_lines = clean_bash_output_lines(full_text, false);
+        let has_trunc_note = full_text
+            .lines()
+            .any(|l| l.trim_start().starts_with("[Showing "));
+        return full_lines.len() > shown.len()
+            || has_trunc_note
+            || shown.iter().any(|l| display_width(l) > body_w);
+    }
+
+    let full_count = full_text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.trim() != "(no output)")
+        .count();
+    full_count > shown.len() || shown.iter().any(|l| display_width(l) > body_w)
+}
+
+struct ToolHeaderSpec<'a> {
+    name: &'a str,
+    args: &'a str,
+    status: ToolState,
+    inline_meta: Option<&'a str>,
+    spinner_idx: usize,
+    width: usize,
+    theme: &'a Theme,
+}
+
+fn build_tool_header_base_spans(
+    glyph: &'static str,
+    glyph_color: Color,
+    name: &str,
+    fitted_args: &str,
+    inline_meta: Option<&str>,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{glyph} "),
+            Style::default()
+                .fg(glyph_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({fitted_args})"),
+            Style::default().fg(theme.text_muted),
+        ),
+    ];
+    if let Some(meta) = inline_meta {
+        spans.push(Span::styled(
+            format!(" · {meta}"),
+            Style::default().fg(theme.text_dim),
+        ));
+    }
+    spans
+}
+
+fn build_collapsed_tool_header(
+    spec: &ToolHeaderSpec<'_>,
+    show_expand_hint: bool,
+) -> Vec<RenderedLine> {
+    let (glyph, glyph_color) = tool_status_glyph(spec.status, spec.spinner_idx, spec.theme);
+    let abbr_args = abbreviate_home_path(spec.args);
+    let (use_meta, use_hint, args_budget) = collapsed_header_budget(
+        glyph,
+        spec.name,
+        &abbr_args,
+        spec.inline_meta,
+        show_expand_hint,
+        spec.width,
+    );
+    let fitted_args = fit_collapsed_tool_args(spec.name, &abbr_args, args_budget);
+    let visible_meta = use_meta.then_some(spec.inline_meta).flatten();
+    let mut spans = build_tool_header_base_spans(
+        glyph,
+        glyph_color,
+        spec.name,
+        &fitted_args,
+        visible_meta,
+        spec.theme,
+    );
+    if use_hint {
+        spans.push(Span::styled(
+            EXPAND_HINT_INLINE,
+            Style::default().fg(spec.theme.text_dim),
+        ));
+    }
+
+    let line = Line::from(spans);
+    if line.width() <= spec.width {
+        vec![RenderedLine::hard(line)]
+    } else {
+        wrap_styled_spans_rich(line.spans, None, None, spec.width)
+    }
+}
+
+fn build_expanded_tool_header(spec: &ToolHeaderSpec<'_>) -> Vec<RenderedLine> {
+    let (glyph, glyph_color) = tool_status_glyph(spec.status, spec.spinner_idx, spec.theme);
+    let spans = build_tool_header_base_spans(
+        glyph,
+        glyph_color,
+        spec.name,
+        spec.args,
+        spec.inline_meta,
+        spec.theme,
+    );
+    wrap_styled_spans_rich(spans, None, None, spec.width)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_tool_lines(
     name: &str,
@@ -787,53 +1428,90 @@ fn build_tool_lines(
     output_preview: &str,
     extra: Option<&ToolExtraMeta>,
     expanded: bool,
+    group_ctx: ToolGroupCtx,
     spinner_idx: usize,
     width: usize,
     theme: &Theme,
 ) -> Vec<RenderedLine> {
     let mut out = Vec::new();
-    let (glyph, glyph_color) = match status {
-        ToolState::Running => (BRAILLE_SPINNER[spinner_idx % BRAILLE_SPINNER.len()], theme.warning),
-        ToolState::Done => ("✓", theme.success),
-        ToolState::Error => ("✗", theme.error),
-        ToolState::Blocked => ("⊘", theme.error),
-    };
-
-    let bg_card = theme.card_bg;
-    let header_spans = vec![
-        Span::styled(
-            format!("{glyph} "),
-            Style::default()
-                .fg(glyph_color)
-                .bg(bg_card)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            name.to_string(),
-            Style::default()
-                .fg(theme.text)
-                .bg(bg_card)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("({args_summary})"),
-            Style::default().fg(theme.text_muted).bg(bg_card),
-        ),
-    ];
-
-    out.extend(wrap_styled_spans_rich(header_spans, None, None, width));
-
+    let inline_meta = resolve_inline_meta(name, status, output_preview, extra);
     let body_w = width.saturating_sub(4).max(4);
     let prefix = Span::styled("  │ ", Style::default().fg(theme.border));
 
-    // 若有结构化 Diff（如 edit 工具），优先渲染词级/双栏 Diff
-    if let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
+    if !expanded {
+        out.extend(build_collapsed_tool_header(
+            &ToolHeaderSpec {
+                name,
+                args: args_summary,
+                status,
+                inline_meta: inline_meta.as_deref(),
+                spinner_idx,
+                width,
+                theme,
+            },
+            group_ctx.show_expand_hint,
+        ));
+
+        if !matches!(status, ToolState::Error | ToolState::Blocked)
+            && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
+            && !diff_raw.trim().is_empty()
+        {
+            let (compact_src, _) = compact_diff_preview(diff_raw);
+            let diff_lines = render_diff_rich(&compact_src, body_w, theme);
+            for rl in diff_lines.into_iter().take(4) {
+                let mut spans = vec![prefix.clone()];
+                spans.extend(rl.line.spans);
+                out.push(RenderedLine {
+                    line: Line::from(spans),
+                    soft_wrapped: rl.soft_wrapped,
+                });
+            }
+        } else {
+            let preview_src = if matches!(status, ToolState::Error | ToolState::Blocked)
+                && output_preview.trim().is_empty()
+                && let Some(ext) = extra
+                && !ext.full_content.is_empty()
+            {
+                ext.full_content.as_str()
+            } else {
+                output_preview
+            };
+            let body_color = match status {
+                ToolState::Error | ToolState::Blocked => theme.error,
+                ToolState::Running | ToolState::Done => theme.text_muted,
+            };
+            for raw in collapsed_preview_lines(name, status, preview_src) {
+                let clipped = truncate_display(&raw, body_w);
+                out.push(RenderedLine::hard(Line::from(vec![
+                    prefix.clone(),
+                    Span::styled(clipped, Style::default().fg(body_color)),
+                ])));
+            }
+        }
+
+        if group_ctx.is_group_end {
+            out.push(RenderedLine::hard(Line::raw("")));
+        }
+        return out;
+    }
+
+    // 展开态（Ctrl+O）：完整保留参数/脚本、完整 Diff 与全文输出
+    let (expanded_args, extra_arg_lines) = format_expanded_tool_args(name, args_summary, extra);
+    out.extend(build_expanded_tool_header(&ToolHeaderSpec {
+        name,
+        args: &expanded_args,
+        status,
+        inline_meta: inline_meta.as_deref(),
+        spinner_idx,
+        width,
+        theme,
+    }));
+
+    if !matches!(status, ToolState::Error | ToolState::Blocked)
+        && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
         && !diff_raw.trim().is_empty()
     {
-        let diff_lines = render_diff_rich(diff_raw, body_w, theme);
-        let max_show = if expanded { usize::MAX } else { 14 };
-        let total = diff_lines.len();
-        for rl in diff_lines.into_iter().take(max_show) {
+        for rl in render_diff_rich(diff_raw, body_w, theme) {
             let mut spans = vec![prefix.clone()];
             spans.extend(rl.line.spans);
             out.push(RenderedLine {
@@ -841,20 +1519,27 @@ fn build_tool_lines(
                 soft_wrapped: rl.soft_wrapped,
             });
         }
-        if !expanded && total > max_show {
-            out.extend(wrap_styled_spans_rich(
-                vec![Span::styled(
-                    format!("  │ … 共 {total} 行 Diff（按 Ctrl+O 展开）"),
-                    Style::default().fg(theme.text_dim),
-                )],
-                None,
-                None,
-                width,
-            ));
-        }
     } else {
-        let body_text = if expanded
-            && let Some(ext) = extra
+        let mut emitted = 0usize;
+        let max_lines = 160usize;
+        let mut total_omitted = 0usize;
+
+        if !extra_arg_lines.is_empty() {
+            let total_arg_lines = extra_arg_lines.len();
+            let take_n = total_arg_lines.min(max_lines);
+            total_omitted += total_arg_lines.saturating_sub(take_n);
+            for raw in extra_arg_lines.into_iter().take(take_n) {
+                out.extend(wrap_styled_spans_rich(
+                    vec![Span::styled(raw, Style::default().fg(theme.text_dim))],
+                    Some(prefix.clone()),
+                    Some(prefix.clone()),
+                    width,
+                ));
+                emitted += 1;
+            }
+        }
+
+        let body_text = if let Some(ext) = extra
             && !ext.full_content.is_empty()
         {
             ext.full_content.as_str()
@@ -868,10 +1553,10 @@ fn build_tool_lines(
                 ToolState::Running | ToolState::Done => theme.text_muted,
             };
             let raw_lines: Vec<&str> = body_text.lines().collect();
-            let max_lines = if expanded { 160 } else { 5 };
-            let truncated = raw_lines.len().saturating_sub(max_lines);
-            for raw in raw_lines.into_iter().take(max_lines) {
-                let wrapped = wrap_styled_spans_rich(
+            let rem = max_lines.saturating_sub(emitted);
+            total_omitted += raw_lines.len().saturating_sub(rem);
+            for raw in raw_lines.into_iter().take(rem) {
+                out.extend(wrap_styled_spans_rich(
                     vec![Span::styled(
                         raw.to_string(),
                         Style::default().fg(body_color),
@@ -879,26 +1564,26 @@ fn build_tool_lines(
                     Some(prefix.clone()),
                     Some(prefix.clone()),
                     width,
-                );
-                out.extend(wrapped);
-            }
-            if truncated > 0 {
-                let hint = if expanded {
-                    format!("  │ … 其余 {truncated} 行已省略（完整记录请查 Ctrl+T）")
-                } else {
-                    format!("  │ … 还有 {truncated} 行输出（按 Ctrl+O 展开）")
-                };
-                out.extend(wrap_styled_spans_rich(
-                    vec![Span::styled(hint, Style::default().fg(theme.text_dim))],
-                    None,
-                    None,
-                    width,
                 ));
             }
         }
+
+        if total_omitted > 0 {
+            out.extend(wrap_styled_spans_rich(
+                vec![Span::styled(
+                    format!("  │ … 其余 {total_omitted} 行已省略（完整记录请查 Ctrl+T）"),
+                    Style::default().fg(theme.text_dim),
+                )],
+                None,
+                None,
+                width,
+            ));
+        }
     }
 
-    out.push(RenderedLine::hard(Line::raw("")));
+    if group_ctx.is_group_end {
+        out.push(RenderedLine::hard(Line::raw("")));
+    }
     out
 }
 
@@ -1278,5 +1963,451 @@ fn color_to_rgb8(c: Color) -> Option<Rgb8> {
     match c {
         Color::Rgb(r, g, b) => Some(Rgb8::new(r, g, b)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::app::{UiEvent, abbreviate_home_with, summarize_tool_args};
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn render_buffer_text(app: &mut AppState, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut rows = Vec::new();
+        for y in 0..buf.area.height {
+            let mut row = String::new();
+            let mut x = 0;
+            while x < buf.area.width {
+                let sym = buf[(x, y)].symbol();
+                row.push_str(sym);
+                x += display_width(sym).max(1) as u16;
+            }
+            rows.push(row.trim_end().to_string());
+        }
+        rows.join("\n")
+    }
+
+    #[test]
+    fn consecutive_read_only_tools_render_one_line_each_with_single_trailing_expand_hint() {
+        let theme = Theme::mist_dark();
+        let emphasis = EmphasisConfig::default();
+        let items = vec![
+            ChatItem::ToolCall {
+                id: "t1".into(),
+                name: "read".into(),
+                args_summary: "crates/cordis/src/lib.rs".into(),
+                status: ToolState::Done,
+                output_preview: "line 1\nline 2".into(),
+            },
+            ChatItem::ToolCall {
+                id: "t2".into(),
+                name: "read_file".into(),
+                args_summary: "Cargo.toml".into(),
+                status: ToolState::Done,
+                output_preview: "[package]".into(),
+            },
+            ChatItem::ToolCall {
+                id: "t3".into(),
+                name: "list_dir".into(),
+                args_summary: "crates".into(),
+                status: ToolState::Done,
+                output_preview: "cordis/\ndsh-tui/".into(),
+            },
+            ChatItem::ToolCall {
+                id: "t4".into(),
+                name: "grep".into(),
+                args_summary: "build_tool_lines in crates".into(),
+                status: ToolState::Done,
+                output_preview: "ui.rs:10: fn build_tool_lines".into(),
+            },
+            ChatItem::ToolCall {
+                id: "t5".into(),
+                name: "find".into(),
+                args_summary: "*.rs".into(),
+                status: ToolState::Done,
+                output_preview: "src/lib.rs\nsrc/ui.rs".into(),
+            },
+        ];
+        let mut extras = HashMap::new();
+        for (i, item) in items.iter().enumerate() {
+            if let ChatItem::ToolCall { id, .. } = item {
+                extras.insert(
+                    id.clone(),
+                    ToolExtraMeta {
+                        full_content: format!("full body for {i}\nsecond line"),
+                        inline_meta: Some(format!("{} lines", (i + 1) * 10)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let mut all_lines = Vec::new();
+        for idx in 0..items.len() {
+            all_lines.extend(build_item_lines_for_scrollback_at(
+                &items, idx, &extras, 110, &theme, &emphasis, true, false,
+            ));
+        }
+
+        // 5 条工具 + 组尾 1 个空行 = 6 行；中间无空行、无 │ 预览线
+        assert_eq!(all_lines.len(), 6, "lines: {all_lines:?}");
+        let texts: Vec<String> = all_lines.iter().map(line_text).collect();
+        for (idx, line) in texts.iter().take(5).enumerate() {
+            assert!(line.starts_with("● "), "row {idx}: {line}");
+            assert!(!line.contains("│"), "unexpected rail in row {idx}: {line}");
+            if idx < 4 {
+                assert!(
+                    !line.contains("(Ctrl+O 展开)"),
+                    "mid-group row {idx} should not have expand hint: {line}"
+                );
+            } else {
+                assert!(
+                    line.ends_with("(Ctrl+O 展开)"),
+                    "last row should have inline expand hint: {line}"
+                );
+            }
+        }
+        assert!(
+            texts[5].is_empty(),
+            "expected breathing blank line after group"
+        );
+    }
+
+    #[test]
+    fn bash_collapses_long_output_and_ctrl_o_expands_full_command_and_body() {
+        let theme = Theme::mist_dark();
+        let long_cmd = "cd /tmp/workspace/dsh-rs && cargo check --workspace --all-targets --message-format=short";
+        let full_out = (1..=25)
+            .map(|i| format!("output line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extra = ToolExtraMeta {
+            full_content: full_out,
+            diff_raw: None,
+            full_args: format!(r#"{{"command":"{long_cmd}"}}"#),
+            inline_meta: Some("25 lines".into()),
+        };
+        let preview = "output line 24\noutput line 25";
+
+        let collapsed = build_tool_lines(
+            "bash",
+            long_cmd,
+            ToolState::Done,
+            preview,
+            Some(&extra),
+            false,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: true,
+            },
+            0,
+            130,
+            &theme,
+        );
+        let collapsed_txt: Vec<String> = collapsed.iter().map(|rl| line_text(&rl.line)).collect();
+        // 1 头行 + 2 尾行 + 1 组尾空行 = 4 行
+        assert_eq!(
+            collapsed_txt.len(),
+            4,
+            "collapsed:\n{}",
+            collapsed_txt.join("\n")
+        );
+        assert!(collapsed_txt[0].contains(long_cmd));
+        assert!(collapsed_txt[0].contains("25 lines"));
+        assert!(collapsed_txt[0].ends_with("(Ctrl+O 展开)"));
+        assert!(collapsed_txt[1].contains("output line 24"));
+        assert!(collapsed_txt[2].contains("output line 25"));
+
+        // 无输出 bash 单行收口且不显示 (Ctrl+O 展开)
+        let silent = build_tool_lines(
+            "bash",
+            "mkdir -p target/tmp",
+            ToolState::Done,
+            "",
+            None,
+            false,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: false,
+            },
+            0,
+            100,
+            &theme,
+        );
+        assert_eq!(silent.len(), 2);
+        assert!(!line_text(&silent[0].line).contains("Ctrl+O"));
+
+        // 展开态恢复全部 25 行输出
+        let expanded = build_tool_lines(
+            "bash",
+            "short",
+            ToolState::Done,
+            preview,
+            Some(&extra),
+            true,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: false,
+            },
+            0,
+            130,
+            &theme,
+        );
+        let expanded_joined = expanded
+            .iter()
+            .map(|rl| line_text(&rl.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_joined.contains(long_cmd), "{expanded_joined}");
+        assert!(
+            expanded_joined.contains("output line 1"),
+            "{expanded_joined}"
+        );
+        assert!(
+            expanded_joined.contains("output line 25"),
+            "{expanded_joined}"
+        );
+    }
+
+    #[test]
+    fn edit_tightens_collapsed_diff_and_errors_stay_visible_without_expand() {
+        let theme = Theme::mist_dark();
+        let diff = [
+            "--- src/ui.rs",
+            "+++ src/ui.rs",
+            "@@ -10,12 +10,12 @@",
+            " ctx1",
+            " ctx2",
+            "-old1",
+            "-old2",
+            "-old3",
+            "-old4",
+            "-old5",
+            "-old6",
+            "+new1",
+            "+new2",
+            "+new3",
+            "+new4",
+            "+new5",
+            "+new6",
+            " ctx3",
+        ]
+        .join("\n");
+        let extra = ToolExtraMeta {
+            full_content: "Successfully replaced 1 edit(s) in src/ui.rs.".into(),
+            diff_raw: Some(diff),
+            full_args: r#"{"path":"src/ui.rs"}"#.into(),
+            inline_meta: Some("+6 -6".into()),
+        };
+
+        let collapsed = build_tool_lines(
+            "edit",
+            "src/ui.rs",
+            ToolState::Done,
+            "",
+            Some(&extra),
+            false,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: true,
+            },
+            0,
+            80,
+            &theme,
+        );
+        let collapsed_txt: Vec<String> = collapsed.iter().map(|rl| line_text(&rl.line)).collect();
+        // 1 头行 + 最多 4 行 Diff + 1 组尾空行 = 6 行，且第一行 Diff 直接展示真实修改而非 ctx1
+        assert_eq!(
+            collapsed_txt.len(),
+            6,
+            "collapsed:\n{}",
+            collapsed_txt.join("\n")
+        );
+        assert!(collapsed_txt[0].contains("+6 -6"));
+        assert!(!collapsed_txt.iter().any(|l| l.contains("ctx1")));
+        assert!(collapsed_txt.iter().any(|l| l.contains("old1")));
+
+        let expanded = build_tool_lines(
+            "edit",
+            "src/ui.rs",
+            ToolState::Done,
+            "",
+            Some(&extra),
+            true,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: false,
+            },
+            0,
+            80,
+            &theme,
+        );
+        let expanded_joined = expanded
+            .iter()
+            .map(|rl| line_text(&rl.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            expanded_joined.contains("@@ -10,12 +10,12 @@"),
+            "{expanded_joined}"
+        );
+        assert!(expanded_joined.contains("new6"), "{expanded_joined}");
+
+        // 错误态无需 Ctrl+O 直接显示关键报错
+        let err_lines = build_tool_lines(
+            "read",
+            "missing.rs",
+            ToolState::Error,
+            "File not found: missing.rs",
+            None,
+            false,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: false,
+            },
+            0,
+            80,
+            &theme,
+        );
+        let err_joined = err_lines
+            .iter()
+            .map(|rl| line_text(&rl.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(err_joined.contains("✗ read(missing.rs)"), "{err_joined}");
+        assert!(
+            err_joined.contains("File not found: missing.rs"),
+            "{err_joined}"
+        );
+    }
+
+    #[test]
+    fn long_paths_use_middle_elision_and_narrow_width_does_not_panic() {
+        let theme = Theme::mist_dark();
+        let long_path = abbreviate_home_with(
+            "/Users/alice/workspace/dsh-space/very-long-subproject-name/crates/dsh-tui-ui/src/ui.rs",
+            Some("/Users/alice"),
+        );
+        assert!(long_path.starts_with("~/workspace/"));
+
+        let elided = truncate_path_middle(&long_path, 48);
+        assert!(elided.starts_with("~/…/"), "elided={elided}");
+        assert!(
+            elided.ends_with("crates/dsh-tui-ui/src/ui.rs"),
+            "elided={elided}"
+        );
+        assert!(
+            display_width(&elided) <= 48,
+            "width={}",
+            display_width(&elided)
+        );
+
+        // 20 列极窄宽度渲染不 panic
+        let narrow = build_tool_lines(
+            "read",
+            &long_path,
+            ToolState::Done,
+            "line 1\nline 2",
+            None,
+            false,
+            ToolGroupCtx {
+                is_group_end: true,
+                show_expand_hint: true,
+            },
+            0,
+            20,
+            &theme,
+        );
+        assert!(!narrow.is_empty());
+
+        // summarize_tool_args 对当前真实家目录同样执行 ~/ 缩写
+        if let Some(home) = dirs::home_dir()
+            && let Some(home_str) = home.to_str()
+            && !home_str.is_empty()
+            && home_str != "/"
+        {
+            let raw = format!(r#"{{"path":"{home_str}/workspace/demo.rs"}}"#);
+            assert_eq!(summarize_tool_args(&raw), "~/workspace/demo.rs");
+        }
+    }
+
+    #[test]
+    fn tool_group_cache_invalidates_when_adjacent_tool_arrives_or_finishes() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-cache",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::ToolCall(dsh_llm_types::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        }));
+        let frame1 = render_buffer_text(&mut app, 100, 14);
+        assert!(frame1.contains("read(a.rs)"), "{frame1}");
+
+        // 第二个工具到来后，c1 不再是组尾，必须失效缓存并消除两者之间的空行
+        app.apply_ui_event(UiEvent::ToolCall(dsh_llm_types::ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"b.rs"}"#.into(),
+        }));
+        let frame2 = render_buffer_text(&mut app, 100, 14);
+        let f2_lines: Vec<&str> = frame2.lines().collect();
+        let c1_row = f2_lines
+            .iter()
+            .position(|l| l.contains("read(a.rs)"))
+            .expect("c1 row");
+        assert!(
+            f2_lines[c1_row + 1].contains("read(b.rs)"),
+            "expected no blank line between c1 and c2:\n{frame2}"
+        );
+        assert!(
+            !frame2.contains("(Ctrl+O 展开)"),
+            "no expandable body yet:\n{frame2}"
+        );
+
+        // c1 完成后拥有可展开正文，组尾 c2 的缓存必须自动刷新并带上 (Ctrl+O 展开)
+        app.apply_ui_event(UiEvent::ToolResult {
+            call_id: "c1".into(),
+            name: "read".into(),
+            content: "pub fn a() {}\n".repeat(15),
+            is_error: false,
+            blocked: false,
+            details: Some(serde_json::json!({
+                "path": "a.rs",
+                "start_line": 1,
+                "end_line": 15,
+                "total_lines": 15,
+                "truncated": false
+            })),
+        });
+        let frame3 = render_buffer_text(&mut app, 100, 14);
+        let c2_line = frame3
+            .lines()
+            .find(|l| l.contains("read(b.rs)"))
+            .expect("c2 row");
+        assert!(
+            c2_line.contains("(Ctrl+O 展开)"),
+            "c2 should refresh with expand hint when sibling c1 becomes expandable:\n{frame3}"
+        );
     }
 }
