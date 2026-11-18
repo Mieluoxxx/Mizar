@@ -1,0 +1,25 @@
+[package]
+name = "mizar-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP 客户端与 ToolRuntime 接入插件（支持 stdio / Streamable HTTP、分级暴露、工具屏蔽与资源工具）"
+
+[lints]
+workspace = true
+
+[dependencies]
+cordis = { workspace = true }
+dirs = { workspace = true }
+mizar-llm = { workspace = true }
+mizar-system-prompt = { workspace = true }
+mizar-tools = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "time"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

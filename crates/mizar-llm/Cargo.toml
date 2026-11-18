@@ -1,0 +1,15 @@
+[package]
+name = "mizar-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "抽象 LLM 服务 ctx.llm（对应 NamiDSH packages/llm）"
+
+[lints]
+workspace = true
+
+[dependencies]
+cordis = { workspace = true }
+mizar-llm-types = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }

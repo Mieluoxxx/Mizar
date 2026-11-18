@@ -7,7 +7,7 @@
 /references/
 
 # Local runtime config & session / trajectory storage
-.dsh-rs/
+.mizar/
 /.sessions/
 /sessions/
 /trajectories/

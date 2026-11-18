@@ -1,0 +1,21 @@
+[package]
+name = "mizar-tui-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "纯终端工作台 UI 层：主题(Oklab)、pi-emphasis 语法、Markdown/Diff、编辑器、选区、侧栏、浮层与状态机（零 tokio / cordis / 后端依赖）"
+
+[lints]
+workspace = true
+
+[dependencies]
+crossterm = { workspace = true }
+dirs = { workspace = true }
+mizar-llm-types = { workspace = true }
+mizar-trajectory-core = { workspace = true }
+futures = { workspace = true }
+ignore = { workspace = true }
+ratatui = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+unicode-width = { workspace = true }

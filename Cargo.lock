@@ -374,409 +374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dsh-agent-loop"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm",
- "dsh-session",
- "dsh-system-prompt",
- "dsh-tools",
- "futures",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-agent-spine"
-version = "0.1.0"
-dependencies = [
- "axum",
- "cordis",
- "dirs",
- "dsh-agent-loop",
- "dsh-codemode",
- "dsh-instructions",
- "dsh-llm",
- "dsh-llm-mock",
- "dsh-llm-retry",
- "dsh-llm-router",
- "dsh-mcp",
- "dsh-session",
- "dsh-session-sqlite",
- "dsh-skills",
- "dsh-system-prompt",
- "dsh-tool-fs",
- "dsh-tool-search",
- "dsh-tool-time",
- "dsh-tools",
- "dsh-tools-coding",
- "dsh-trajectory",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-codemode"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-tool-search",
- "dsh-tools",
- "rquickjs",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-instructions"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dirs",
- "dsh-agent-loop",
- "dsh-llm",
- "dsh-session",
- "dsh-system-prompt",
- "dsh-tools",
- "dsh-tools-coding",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-llm"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm-types",
- "futures",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-llm-completions"
-version = "0.1.0"
-dependencies = [
- "axum",
- "cordis",
- "dsh-llm",
- "dsh-llm-http",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-llm-http"
-version = "0.1.0"
-dependencies = [
- "dsh-llm",
- "futures",
- "reqwest",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-llm-messages"
-version = "0.1.0"
-dependencies = [
- "axum",
- "cordis",
- "dsh-llm",
- "dsh-llm-http",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-llm-mock"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm",
- "futures",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-llm-responses"
-version = "0.1.0"
-dependencies = [
- "axum",
- "cordis",
- "dsh-llm",
- "dsh-llm-http",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-llm-retry"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm",
- "futures",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-llm-router"
-version = "0.1.0"
-dependencies = [
- "axum",
- "cordis",
- "dsh-llm",
- "dsh-llm-completions",
- "dsh-llm-http",
- "dsh-llm-messages",
- "dsh-llm-mock",
- "dsh-llm-responses",
- "futures",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-llm-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "dsh-mcp"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dirs",
- "dsh-llm",
- "dsh-system-prompt",
- "dsh-tools",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-session"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "dsh-session-sqlite"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm",
- "dsh-session",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-skills"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dirs",
- "dsh-agent-loop",
- "dsh-llm",
- "dsh-session",
- "dsh-system-prompt",
- "dsh-tools",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-system-prompt"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cordis",
- "tokio",
-]
-
-[[package]]
-name = "dsh-tool-fs"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-tools",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-tool-search"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-tools",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "dsh-tool-time"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cordis",
- "dsh-tools",
- "serde_json",
-]
-
-[[package]]
-name = "dsh-tools"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-llm",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "uuid",
-]
-
-[[package]]
-name = "dsh-tools-coding"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dirs",
- "dsh-system-prompt",
- "dsh-tools",
- "globset",
- "ignore",
- "libc",
- "serde",
- "serde_json",
- "similar",
- "tokio",
- "tokio-util",
- "unicode-normalization",
-]
-
-[[package]]
-name = "dsh-trajectory"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "dsh-agent-loop",
- "dsh-llm",
- "dsh-session",
- "dsh-tools",
- "dsh-trajectory-core",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-trajectory-core"
-version = "0.1.0"
-dependencies = [
- "dsh-llm-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "dsh-tui"
-version = "0.1.0"
-dependencies = [
- "cordis",
- "crossterm",
- "dsh-agent-loop",
- "dsh-agent-spine",
- "dsh-instructions",
- "dsh-llm",
- "dsh-llm-mock",
- "dsh-llm-retry",
- "dsh-llm-router",
- "dsh-mcp",
- "dsh-session",
- "dsh-skills",
- "dsh-system-prompt",
- "dsh-tools",
- "dsh-tools-coding",
- "dsh-trajectory",
- "dsh-tui-ui",
- "futures",
- "ratatui",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-tui-ui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "dirs",
- "dsh-llm-types",
- "dsh-trajectory-core",
- "futures",
- "ignore",
- "ratatui",
- "serde_json",
- "similar",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1488,6 +1085,409 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mizar-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-agent-spine"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cordis",
+ "dirs",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-codemode",
+ "mizar-instructions",
+ "mizar-llm",
+ "mizar-llm-mock",
+ "mizar-llm-retry",
+ "mizar-llm-router",
+ "mizar-mcp",
+ "mizar-session",
+ "mizar-session-sqlite",
+ "mizar-skills",
+ "mizar-system-prompt",
+ "mizar-tool-fs",
+ "mizar-tool-search",
+ "mizar-tool-time",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "mizar-trajectory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-codemode"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-tool-search",
+ "mizar-tools",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-instructions"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "dirs",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm-types",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm-completions"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-http"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "mizar-llm",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm-messages"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-mock"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-responses"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-retry"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm-router"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-completions",
+ "mizar-llm-http",
+ "mizar-llm-messages",
+ "mizar-llm-mock",
+ "mizar-llm-responses",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "mizar-mcp"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "dirs",
+ "mizar-llm",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-session"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-llm",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "mizar-session-sqlite"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-llm",
+ "mizar-session",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-skills"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "dirs",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-system-prompt"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cordis",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-tool-fs"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-tool-search"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-tool-time"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cordis",
+ "mizar-tools",
+ "serde_json",
+]
+
+[[package]]
+name = "mizar-tools"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-llm",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "mizar-tools-coding"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "dirs",
+ "globset",
+ "ignore",
+ "libc",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "similar",
+ "tokio",
+ "tokio-util",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "mizar-trajectory"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-tools",
+ "mizar-trajectory-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-trajectory-core"
+version = "0.1.0"
+dependencies = [
+ "mizar-llm-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mizar-tui"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "crossterm",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-agent-spine",
+ "mizar-instructions",
+ "mizar-llm",
+ "mizar-llm-mock",
+ "mizar-llm-retry",
+ "mizar-llm-router",
+ "mizar-mcp",
+ "mizar-session",
+ "mizar-skills",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "mizar-trajectory",
+ "mizar-tui-ui",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-tui-ui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "dirs",
+ "futures",
+ "ignore",
+ "mizar-llm-types",
+ "mizar-trajectory-core",
+ "ratatui",
+ "serde_json",
+ "similar",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
