@@ -1,6 +1,6 @@
 //! TUI 布局与渲染引擎：双栏工作台、时间轴导轨、虚拟化流式视图、`pi-emphasis` 语法、词级 Diff 与浮层叠加。
 
-use dsh_llm::ReasoningEffort;
+use dsh_llm_types::ReasoningEffort;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -238,7 +238,7 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     lines.push(Line::from(vec![
         Span::styled("  会话    ", Style::default().fg(theme.text_dim)),
         Span::styled(
-            short_id(&app.session.id),
+            short_id(&app.session_id),
             Style::default().fg(theme.text_muted),
         ),
         Span::raw("   "),

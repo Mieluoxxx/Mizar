@@ -18,7 +18,7 @@ pub use config::{
     ProtocolKind, ProviderRouteConfig, RouterConfig, RouterModelConfig, parse_protocol_api,
 };
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service};
-use dsh_llm::http::{DEFAULT_IDLE_TIMEOUT, expand_pi_value};
+use dsh_llm_http::{DEFAULT_IDLE_TIMEOUT, expand_pi_value};
 use dsh_llm::{
     BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo, ProviderInfo,
 };

@@ -15,7 +15,7 @@ use cordis::{
 use dsh_agent_loop::{AgentTurnStartEvent, EVENT_AGENT_TURN_START};
 use dsh_tools::{EVENT_TOOLS_POST_EXECUTE, PostExecuteInput, ToolResult};
 
-use crate::detector::{canonicalize_json, preview_chars, wildcard_matches};
+use dsh_trajectory_core::{canonicalize_json, preview_chars, wildcard_matches};
 
 pub const EVENT_GUARD_REPEAT: &str = "guard/repeat-tool";
 

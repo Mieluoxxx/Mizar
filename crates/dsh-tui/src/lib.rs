@@ -1,29 +1,24 @@
-//! 终端交互式 TUI 客户端：双栏工作台、时间轴导轨、自适应 OKLab 色彩、`pi-emphasis` 视觉语法与词级 Diff。
+//! 终端交互式 TUI 客户端宿主：桥接纯前端工作台 `dsh-tui-ui` 与 Cordis / AgentLoop / Trajectory 后端。
 
-pub mod app;
-pub mod editor;
-pub mod emphasis;
-pub mod markdown;
-pub mod overlay;
-pub mod reveal;
 pub mod runner;
-pub mod selection;
-pub mod side_panel;
-pub mod terminal;
-pub mod theme;
-pub mod timeline_rail;
-pub mod trajectory_scene;
-pub mod ui;
 
-pub use app::{
-    AppAction, AppState, ApprovalMode, ChatItem, LaunchpadQuickAction, NoticeLevel, ToolState,
-    UiEvent,
+pub mod emphasis {
+    pub use crate::runner::mount_reply_guidance_section;
+    pub use dsh_tui_ui::emphasis::*;
+}
+
+pub use dsh_tui_ui::{
+    app, editor, markdown, overlay, reveal, selection, side_panel, terminal, theme, timeline_rail,
+    trajectory_scene, ui,
 };
-pub use emphasis::EmphasisConfig;
+pub use dsh_tui_ui::{
+    AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, NoticeLevel,
+    ScreenMode, SessionReplayItem, SessionViewData, TerminalColors, Theme, ThemePreset, ToolState,
+    UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason,
+    build_item_lines_for_scrollback, render,
+};
 pub use runner::{
-    ResumeTarget, TuiConfig, TuiExitSummary, format_resume_command, run_tui,
-    run_tui_with_summary, subscribe_session_events, wait_for_services,
+    ResumeTarget, TuiConfig, TuiExitSummary, format_resume_command, mount_reply_guidance_section,
+    project_fork_view, project_resume_view, project_session_tree, project_session_view, run_tui,
+    run_tui_with_summary, subscribe_session_events, to_ui_log_record, wait_for_services,
 };
-pub use terminal::ScreenMode;
-pub use theme::{TerminalColors, Theme, ThemePreset};
-pub use ui::{build_item_lines_for_scrollback, render};

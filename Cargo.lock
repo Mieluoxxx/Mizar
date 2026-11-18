@@ -394,11 +394,13 @@ dependencies = [
 name = "dsh-agent-spine"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "cordis",
  "dirs",
  "dsh-agent-loop",
  "dsh-codemode",
  "dsh-llm",
+ "dsh-llm-mock",
  "dsh-llm-retry",
  "dsh-llm-router",
  "dsh-mcp",
@@ -437,14 +439,9 @@ dependencies = [
 name = "dsh-llm"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "cordis",
+ "dsh-llm-types",
  "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
  "tokio-util",
 ]
 
@@ -455,11 +452,24 @@ dependencies = [
  "axum",
  "cordis",
  "dsh-llm",
+ "dsh-llm-http",
  "futures",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dsh-llm-http"
+version = "0.1.0"
+dependencies = [
+ "dsh-llm",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -469,6 +479,7 @@ dependencies = [
  "axum",
  "cordis",
  "dsh-llm",
+ "dsh-llm-http",
  "futures",
  "reqwest",
  "serde",
@@ -494,6 +505,7 @@ dependencies = [
  "axum",
  "cordis",
  "dsh-llm",
+ "dsh-llm-http",
  "futures",
  "reqwest",
  "serde",
@@ -521,6 +533,7 @@ dependencies = [
  "cordis",
  "dsh-llm",
  "dsh-llm-completions",
+ "dsh-llm-http",
  "dsh-llm-messages",
  "dsh-llm-mock",
  "dsh-llm-responses",
@@ -528,6 +541,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dsh-llm-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -543,33 +565,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "dsh-rs"
-version = "0.1.0"
-dependencies = [
- "axum",
- "cordis",
- "dsh-agent-loop",
- "dsh-agent-spine",
- "dsh-llm",
- "dsh-llm-completions",
- "dsh-llm-messages",
- "dsh-llm-mock",
- "dsh-llm-responses",
- "dsh-llm-retry",
- "dsh-llm-router",
- "dsh-session",
- "dsh-tool-time",
- "dsh-tools",
- "dsh-trajectory",
- "dsh-webserver",
- "futures",
- "reqwest",
- "serde_json",
  "tokio",
  "tokio-util",
 ]
@@ -700,6 +695,7 @@ dependencies = [
  "dsh-llm",
  "dsh-session",
  "dsh-tools",
+ "dsh-trajectory-core",
  "serde",
  "serde_json",
  "thiserror",
@@ -708,10 +704,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-trajectory-core"
+version = "0.1.0"
+dependencies = [
+ "dsh-llm-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-tui"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "cordis",
  "crossterm",
  "dsh-agent-loop",
@@ -727,31 +731,27 @@ dependencies = [
  "dsh-tools",
  "dsh-tools-coding",
  "dsh-trajectory",
+ "dsh-tui-ui",
  "futures",
- "ignore",
  "ratatui",
- "serde",
  "serde_json",
- "similar",
  "tokio",
  "tokio-util",
- "unicode-width 0.2.0",
 ]
 
 [[package]]
-name = "dsh-webserver"
+name = "dsh-tui-ui"
 version = "0.1.0"
 dependencies = [
- "axum",
- "cordis",
- "dsh-agent-loop",
- "dsh-session",
- "dsh-trajectory",
+ "crossterm",
+ "dsh-llm-types",
+ "dsh-trajectory-core",
  "futures",
- "serde",
+ "ignore",
+ "ratatui",
  "serde_json",
- "tokio",
- "tokio-util",
+ "similar",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -2223,7 +2223,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

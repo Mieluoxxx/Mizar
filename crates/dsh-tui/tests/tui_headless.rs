@@ -18,7 +18,8 @@ use dsh_tui::selection::extract_selected_text;
 use dsh_tui::side_panel::{FileTouchRow, ToolSummaryRow};
 use dsh_tui::{
     AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, ScreenMode, UiEvent,
-    build_item_lines_for_scrollback, render, subscribe_session_events, wait_for_services,
+    build_item_lines_for_scrollback, project_fork_view, project_resume_view,
+    project_session_tree, render, subscribe_session_events, to_ui_log_record, wait_for_services,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -70,13 +71,13 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     let log_tx = tx.clone();
     app_ctx.logger().set_handler(move |rec| {
         if rec.level >= LogLevel::Warn {
-            let _ = log_tx.send(UiEvent::Log(rec.clone()));
+            let _ = log_tx.send(UiEvent::Log(to_ui_log_record(rec)));
         }
     });
 
     let mut state = AppState::new(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-        Arc::clone(&session),
+        &session.id,
         Vec::new(),
         Some("mock".into()),
         Some("mock-v1".into()),
@@ -188,7 +189,7 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
 
     // 2. 验证 [[Done]] 胶囊、CJK 相邻粗体 **证据与影响：**源码中、词级 Diff 与原始 Session 不被污染
     let session = app_ctx.sessions().unwrap().create(None);
-    let mut state = AppState::new(ws, Arc::clone(&session), Vec::new(), None, None, None);
+    let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
     state.items.push(ChatItem::Assistant {
         reasoning: String::new(),
         text: "[[Done]] **证据与影响：**源码中 `[[Done]]` 已被美化，而历史仍保持原始文本。".into(),
@@ -229,7 +230,7 @@ async fn renders_side_panel_timeline_rail_and_multi_pane_selection_fence() {
     let app_ctx = boot_mock_ctx(ws.clone()).await;
 
     let session = app_ctx.sessions().unwrap().create(None);
-    let mut state = AppState::new(ws, session, Vec::new(), None, None, None);
+    let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
 
     // 构造多轮对话触发 TimelineRail（>=2 turns）并测试 Ctrl+B 双栏侧栏
     for idx in 1..=4 {
@@ -324,7 +325,7 @@ async fn handles_overlays_theme_switch_and_approval_modal() {
     let app_ctx = boot_mock_ctx(ws.clone()).await;
 
     let session = app_ctx.sessions().unwrap().create(None);
-    let mut state = AppState::new(ws, session, Vec::new(), None, None, None);
+    let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
 
     // 1. 键入 `/` 自动打开 Slash 补全浮层，`Esc` 关闭
     state.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -344,7 +345,7 @@ async fn handles_overlays_theme_switch_and_approval_modal() {
     state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(state.approval_mode, ApprovalMode::Ask);
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = futures::channel::oneshot::channel();
     state.apply_ui_event(UiEvent::ApprovalRequested {
         tool_name: "bash".into(),
         args_preview: "{\"command\":\"cargo test\"}".into(),
@@ -383,7 +384,7 @@ async fn opens_and_renders_trajectory_scene_from_runtime() {
         .await;
     assert!(res.is_ok(), "unexpected error: {res:?}");
 
-    let mut state = AppState::new(ws, Arc::clone(&session), Vec::new(), None, None, None);
+    let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
     let act = state.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
     assert!(matches!(act, AppAction::OpenTrajectoryScene(_)));
 
@@ -424,11 +425,13 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
         text: "second step should not be forked".into(),
     });
 
-    let mut state = AppState::new(ws, Arc::clone(&session), Vec::new(), None, None, None);
+    let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
 
     // 1. `/tree` 树状浏览 + 左右平移 + 选择节点触发 ForkSessionAtSeq
     state.input.set_text_end("/tree");
-    state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let tree_act = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(tree_act, AppAction::OpenSessionTree);
+    state.open_session_tree_with(project_session_tree(&session));
     assert!(state.overlay.is_modal());
 
     let backend = TestBackend::new(90, 22);
@@ -444,14 +447,14 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     let fork_act = state.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
     assert_eq!(fork_act, AppAction::ForkSessionAtSeq(1));
 
-    // 重放截断日志验证 restore_from_session
+    // 重放截断日志验证 restore_session_view
     let forked = app_ctx.sessions().unwrap().create(None);
     for e in session.log() {
         if e.seq <= 1 {
             forked.append(e.event);
         }
     }
-    state.restore_from_session(Arc::clone(&forked), 1);
+    state.restore_session_view(project_fork_view(&forked, 1));
     assert!(
         state
             .items
@@ -466,7 +469,7 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     );
 
     // 2. 审批弹窗 `[r]` 附加拒绝理由并回传
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = futures::channel::oneshot::channel();
     state.apply_ui_event(UiEvent::ApprovalRequested {
         tool_name: "bash".into(),
         args_preview: "{\"command\":\"rm -rf tmp\"}".into(),
@@ -532,7 +535,7 @@ async fn supports_mode_toggles_external_editor_and_launchpad_actions() {
     let ws = crate_root();
     let app_ctx = boot_mock_ctx(ws.clone()).await;
     let session = app_ctx.sessions().unwrap().create(None);
-    let mut state = AppState::new(ws, session, Vec::new(), None, None, None);
+    let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
 
     // Launchpad 快捷芯片可点击激活侧栏
     let backend = TestBackend::new(100, 26);
@@ -597,8 +600,8 @@ async fn resumes_session_with_compaction_and_trace_entries_cleanly() {
     session.compact("早期讨论摘要", 2, Some(256));
 
     let empty = store.create(None);
-    let mut state = AppState::new(ws, empty, Vec::new(), None, None, None);
-    state.resume_session(Arc::clone(&session));
+    let mut state = AppState::new(ws, &empty.id, Vec::new(), None, None, None);
+    state.restore_session_view(project_resume_view(&session));
 
     let backend = TestBackend::new(100, 26);
     let mut terminal = Terminal::new(backend).unwrap();

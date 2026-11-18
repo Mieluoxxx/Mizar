@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
 use futures::Stream;
 
-use crate::error::LlmError;
+use dsh_llm_types::LlmError;
 use crate::types::{GenerateOptions, ModelInfo, ProviderInfo, StreamChunk};
 
 pub const EVENT_ADAPTERS_UPDATED: &str = "llm/adapters-updated";

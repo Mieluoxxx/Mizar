@@ -1,14 +1,16 @@
 [package]
 name = "dsh-tui"
-version = "0.1.0"
-edition = "2024"
-description = "面向 DeepSeek Harness 的交互式终端工作台（Oklab 主题、pi-emphasis 视觉语法、虚拟化流式渲染、鼠标选区与三泳道轨迹）"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "面向 DeepSeek Harness 的交互式终端工作台宿主与 CLI 入口"
+
+[lints]
+workspace = true
 
 [dependencies]
-chrono = { workspace = true }
 cordis = { workspace = true }
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 dsh-agent-loop = { workspace = true }
 dsh-agent-spine = { workspace = true }
 dsh-llm = { workspace = true }
@@ -22,12 +24,9 @@ dsh-system-prompt = { workspace = true }
 dsh-tools = { workspace = true }
 dsh-tools-coding = { workspace = true }
 dsh-trajectory = { workspace = true }
+dsh-tui-ui = { workspace = true }
 futures = { workspace = true }
-ignore = { workspace = true }
 ratatui = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-similar = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
-unicode-width = { workspace = true }

@@ -1,0 +1,9 @@
+[target.'cfg(target_os = "macos")']
+# 保留 Apple ld_prime，跳过 DWARF .dSYM 打包，缩短 macOS 增量链接耗时
+rustflags = ["-C", "split-debuginfo=unpacked"]
+
+[target.'cfg(target_os = "linux")']
+# 若 Linux 环境已安装 mold + clang，可启用下行以获得最快链接速度：
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "split-debuginfo=unpacked"]
+rustflags = ["-C", "split-debuginfo=unpacked"]

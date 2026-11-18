@@ -2,26 +2,18 @@
 //!（参考 `deepseek-harness` `ui-trajectory` / `session-stats` / `repeat-tool-reminder`）。
 
 pub mod collector;
-pub mod detector;
 pub mod guard;
-pub mod model;
-pub mod projection;
-pub mod timeline;
 
 pub use collector::{
     EVENT_TRAJECTORY_ANOMALY, EVENT_TRAJECTORY_EVENT, TrajectoryAnomalyEvent, TrajectoryConfig,
     TrajectoryContextExt, TrajectoryEventEmitted, TrajectoryRuntime, trace_events_from_entries,
     trace_events_from_session,
 };
-pub use detector::{
-    DetectorConfig, canonicalize_args_str, canonicalize_json, detect_anomalies, preview_chars,
-    sort_json_value, wildcard_matches,
-};
-pub use guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent, RepeatGuardConfig, RepeatToolGuardPlugin};
-pub use model::{
-    RecordKind, SessionStats, Severity, TimelineMode, TimelineModel, TimelineSpan,
+pub use dsh_trajectory_core::{
+    DetectorConfig, RecordKind, SessionStats, Severity, TimelineMode, TimelineModel, TimelineSpan,
     TimelineTurnBoundary, TraceEvent, TraceEventKind, TrajectoryFinding, TrajectoryRecord,
     TrajectoryReport, TrajectorySnapshot, TrajectoryStep, TrajectorySummary, TrajectoryTurn,
+    canonicalize_args_str, canonicalize_json, derive_timeline, detect_anomalies, fold_trajectory,
+    preview_chars, sort_json_value, wildcard_matches,
 };
-pub use projection::fold_trajectory;
-pub use timeline::derive_timeline;
+pub use guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent, RepeatGuardConfig, RepeatToolGuardPlugin};

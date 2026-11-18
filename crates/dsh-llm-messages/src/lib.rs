@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
-use dsh_llm::http::{
+use dsh_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
     resolve_credential, spawn_sse_stream,
 };

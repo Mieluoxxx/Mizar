@@ -1,12 +1,10 @@
 //! `pi-emphasis` 闭环视觉语法引擎：
 //!
-//! 1. 通过 `dsh-system-prompt` 仅在交互式 TUI 期间注入 `reply_style` 规范；
+//! 1. 生成交互式 TUI 期间注入的 `reply_style` 规范文本（由宿主挂载进 `dsh-system-prompt`）；
 //! 2. 保持 `Session` 存储、剪贴板复制与导出文本的原始纯净 Markdown；
 //! 3. 在渲染层将 `[[Done]]` / `[[Failed]]` / `[[Needs you]]` 等标记渲染为语义胶囊、
 //!    为标题/引导词自动加图标，并为 `✓`/`✗`/`→`/`├──` 与锚定加粗词着色。
 
-use cordis::{Cleanup, Context, CordisError};
-use dsh_system_prompt::{PromptSection, SystemPromptContextExt};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
@@ -494,24 +492,6 @@ pub fn reply_guidance_prompt() -> String {
         ctx = join_pills(CONTEXT_WORDS),
         actions = title_list(ACTION_ICONS),
     )
-}
-
-/// 在交互式 TUI 启动时向 `SystemPrompt` 挂载 `reply_style` 段落，退出时随 `Cleanup` 自动卸载。
-pub fn mount_reply_guidance_section(
-    ctx: &Context,
-    cfg: &EmphasisConfig,
-) -> Result<Option<Cleanup>, CordisError> {
-    if !cfg.enabled || !cfg.guidance {
-        return Ok(None);
-    }
-    let Ok(sp) = ctx.system_prompt() else {
-        return Ok(None);
-    };
-    let text = reply_guidance_prompt();
-    let handle = sp.section(PromptSection::new("tui.reply_style", 500, move || {
-        Some(text.clone())
-    }));
-    Ok(Some(handle))
 }
 
 #[cfg(test)]

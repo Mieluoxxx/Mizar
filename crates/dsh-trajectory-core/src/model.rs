@@ -1,6 +1,6 @@
 //! 轨迹领域模型：原始边界事件、纯折叠账本记录、全会话统计与检测告警结构。
 
-use dsh_llm::{TokenUsage, ToolCall};
+use dsh_llm_types::{TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

@@ -23,14 +23,13 @@ use dsh_session::{
 use dsh_tools::{EVENT_TOOLS_RESULT, ToolResultEvent};
 use serde_json::json;
 
-use crate::detector::{DetectorConfig, detect_anomalies, preview_chars};
-use crate::guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent};
-use crate::model::{
-    Severity, TimelineMode, TraceEvent, TraceEventKind, TrajectoryFinding, TrajectoryReport,
-    TrajectorySummary,
+use dsh_trajectory_core::{
+    DetectorConfig, Severity, TimelineMode, TraceEvent, TraceEventKind, TrajectoryFinding,
+    TrajectoryReport, TrajectorySummary, derive_timeline, detect_anomalies, fold_trajectory,
+    preview_chars,
 };
-use crate::projection::fold_trajectory;
-use crate::timeline::derive_timeline;
+
+use crate::guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent};
 
 pub const EVENT_TRAJECTORY_EVENT: &str = "trajectory/event";
 pub const EVENT_TRAJECTORY_ANOMALY: &str = "trajectory/anomaly";

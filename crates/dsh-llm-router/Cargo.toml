@@ -1,21 +1,25 @@
 [package]
 name = "dsh-llm-router"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "多提供方声明式路由与模型目录服务（灵感来自 NamiDSH packages/llm-pi-ai）"
-license = "MIT"
+
+[lints]
+workspace = true
 
 [dependencies]
 cordis = { workspace = true }
-dsh-llm = { path = "../dsh-llm", features = ["http"] }
-dsh-llm-completions = { path = "../dsh-llm-completions" }
-dsh-llm-messages = { path = "../dsh-llm-messages" }
-dsh-llm-mock = { path = "../dsh-llm-mock" }
-dsh-llm-responses = { path = "../dsh-llm-responses" }
+dsh-llm = { workspace = true }
+dsh-llm-completions = { workspace = true }
+dsh-llm-http = { workspace = true }
+dsh-llm-messages = { workspace = true }
+dsh-llm-mock = { workspace = true }
+dsh-llm-responses = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

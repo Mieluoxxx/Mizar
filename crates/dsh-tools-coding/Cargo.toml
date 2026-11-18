@@ -1,9 +1,12 @@
 [package]
 name = "dsh-tools-coding"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "核心编码工具集（read / write / edit / bash / grep / find，对齐 pi 工具体系）"
-license = "MIT"
+
+[lints]
+workspace = true
 
 [dependencies]
 cordis = { workspace = true }
@@ -16,6 +19,9 @@ libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "time"] }
 tokio-util = { workspace = true }
 unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

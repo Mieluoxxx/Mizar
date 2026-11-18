@@ -8,12 +8,38 @@
 use std::path::{Path, PathBuf};
 
 use dsh_llm::ReasoningEffort;
+#[cfg(feature = "router")]
 use dsh_llm_router::{ProviderRouteConfig, RouterConfig};
-use dsh_mcp::config::expand_env_vars;
+#[cfg(feature = "coding")]
 use dsh_tools_coding::CodingToolsPreset;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentSpineConfig, AgentToolsMode};
+#[cfg(feature = "coding")]
+use crate::AgentToolsMode;
+use crate::AgentSpineConfig;
+
+/// 解析 `${VAR}` 环境变量占位符（与 `dsh-mcp` 配置解析保持一致，避免跨 crate 强耦合）。
+#[cfg(feature = "router")]
+fn expand_env_vars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let var_name = &after[..end];
+            if let Ok(val) = std::env::var(var_name) {
+                out.push_str(&val);
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 pub const CONFIG_DIR_NAME: &str = ".dsh-rs";
 
@@ -178,6 +204,7 @@ pub struct LoadedDshConfig {
     pub global_dir: Option<PathBuf>,
     pub project_dir: PathBuf,
     pub settings: SettingsConfig,
+    #[cfg(feature = "router")]
     pub router: RouterConfig,
     pub loaded_files: Vec<PathBuf>,
     pub errors: Vec<String>,
@@ -193,6 +220,7 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>
     Ok(Some(parsed))
 }
 
+#[cfg(feature = "router")]
 fn expand_route(mut route: ProviderRouteConfig) -> ProviderRouteConfig {
     if let Some(url) = route.base_url {
         route.base_url = Some(expand_env_vars(&url));
@@ -236,16 +264,19 @@ pub fn load_dsh_config_with_global(
             Err(err) => out.errors.push(err),
         }
 
-        let models_path = dir.join("models.json");
-        match read_json_file::<RouterConfig>(&models_path) {
-            Ok(Some(router)) => {
-                for (name, route) in router.providers {
-                    out.router.providers.insert(name, expand_route(route));
+        #[cfg(feature = "router")]
+        {
+            let models_path = dir.join("models.json");
+            match read_json_file::<RouterConfig>(&models_path) {
+                Ok(Some(router)) => {
+                    for (name, route) in router.providers {
+                        out.router.providers.insert(name, expand_route(route));
+                    }
+                    out.loaded_files.push(models_path);
                 }
-                out.loaded_files.push(models_path);
+                Ok(None) => {}
+                Err(err) => out.errors.push(err),
             }
-            Ok(None) => {}
-            Err(err) => out.errors.push(err),
         }
     }
 
@@ -284,6 +315,7 @@ impl LoadedDshConfig {
             spine.session_db_path = Some(db_path.clone());
         }
 
+        #[cfg(feature = "coding")]
         if let AgentToolsMode::Coding {
             coding,
             tool_search,
@@ -345,10 +377,12 @@ impl LoadedDshConfig {
     }
 
     /// 结合环境变量覆盖与 `models.json` / `settings.json` 解析最终模型路由。
+    #[cfg(feature = "router")]
     pub fn resolve_llm_router(&self) -> Option<ResolvedLlmRouter> {
         self.resolve_llm_router_with_env(EnvLlmOverride::from_env())
     }
 
+    #[cfg(feature = "router")]
     pub fn resolve_llm_router_with_env(&self, env: EnvLlmOverride) -> Option<ResolvedLlmRouter> {
         let mut router = self.router.clone();
         let fallback_key = env.explicit_api_key.clone().or(env.provider_api_key);
@@ -465,6 +499,7 @@ impl EnvLlmOverride {
     }
 }
 
+#[cfg(feature = "router")]
 #[derive(Debug, Clone)]
 pub struct ResolvedLlmRouter {
     pub router: RouterConfig,
@@ -472,7 +507,7 @@ pub struct ResolvedLlmRouter {
     pub active_model: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "router", feature = "coding"))]
 mod tests {
     use super::*;
 

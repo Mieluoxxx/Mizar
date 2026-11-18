@@ -67,7 +67,7 @@ impl SessionPersistence for InMemoryMockBackend {
             .filter(|h| query.cwd.as_ref().is_none_or(|c| h.cwd.as_deref() == Some(c.as_str())))
             .cloned()
             .collect();
-        list.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        list.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
         if let Some(limit) = query.limit {
             list.truncate(limit);
         }

@@ -7,14 +7,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use dsh_llm::{ProviderInfo, ReasoningEffort};
+use dsh_llm_types::{ProviderInfo, ReasoningEffort};
+use futures::channel::oneshot;
 use ignore::WalkBuilder;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use tokio::sync::oneshot;
 
 use crate::editor::display_width;
 use crate::theme::{Theme, ThemePreset};

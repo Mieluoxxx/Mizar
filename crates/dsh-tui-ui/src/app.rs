@@ -5,14 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cordis::{LogLevel, LogRecord};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use dsh_agent_loop::{AgentStatus, TurnEndReason};
-use dsh_llm::{ContentBlock, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall};
-use dsh_session::{Session, SessionEvent};
-use dsh_trajectory::{TimelineMode, TrajectoryReport};
+use dsh_llm_types::{ContentBlock, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall};
+use dsh_trajectory_core::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::Value;
@@ -119,15 +116,76 @@ pub struct CachedItemLines {
     pub lines: Vec<RenderedLine>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiAgentStatus {
+    Busy,
+    Idle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiTurnEndReason {
+    Completed,
+    MaxSteps,
+    Cancelled,
+    Error { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiLogLevel {
+    Silent,
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiLogRecord {
+    pub level: UiLogLevel,
+    pub name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionReplayItem {
+    User {
+        text: String,
+    },
+    ContextNotice {
+        source: String,
+        text: String,
+    },
+    Compaction {
+        summary: String,
+        first_kept_seq: u64,
+    },
+    Assistant {
+        blocks: Vec<ContentBlock>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionViewData {
+    pub session_id: String,
+    pub session_title: Option<String>,
+    pub items: Vec<SessionReplayItem>,
+    pub finish_notice: String,
+}
+
 /// 由后端异步事件与终端外部状态投递给 UI 主循环的消息。
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    Status(AgentStatus),
+    Status(UiAgentStatus),
     TurnStart {
         turn: u64,
     },
     TurnEnd {
-        reason: TurnEndReason,
+        reason: UiTurnEndReason,
     },
     StepStart {
         ts_ms: u128,
@@ -154,12 +212,12 @@ pub enum UiEvent {
     Usage(TokenUsage),
     Anomaly(String),
     UserSkillsUpdated(Vec<String>),
-    Log(LogRecord),
+    Log(UiLogRecord),
     RunFinished(Result<String, String>),
     ApprovalRequested {
         tool_name: String,
         args_preview: String,
-        responder: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ApprovalDecision>>>>,
+        responder: Arc<std::sync::Mutex<Option<futures::channel::oneshot::Sender<ApprovalDecision>>>>,
     },
 }
 
@@ -185,6 +243,7 @@ pub enum AppAction {
     ShowMcp,
     ShowSkills,
     OpenSkillPicker,
+    OpenSessionTree,
     ForkSessionAtSeq(u64),
     OpenExternalEditor,
     SwitchScreenMode(ScreenMode),
@@ -198,7 +257,8 @@ pub enum AppAction {
 
 pub struct AppState {
     pub workspace: PathBuf,
-    pub session: Arc<Session>,
+    pub session_id: String,
+    pub session_title: Option<String>,
     pub items: Vec<ChatItem>,
     pub tool_extras: HashMap<String, ToolExtraMeta>,
     pub item_cache: HashMap<usize, CachedItemLines>,
@@ -277,7 +337,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         workspace: PathBuf,
-        session: Arc<Session>,
+        session_id: impl Into<String>,
         providers: Vec<ProviderInfo>,
         provider: Option<String>,
         model: Option<String>,
@@ -288,7 +348,8 @@ impl AppState {
         let theme = Theme::from_preset(theme_preset, Some(&probed_colors));
         Self {
             workspace,
-            session,
+            session_id: session_id.into(),
+            session_title: None,
             items: Vec::new(),
             tool_extras: HashMap::new(),
             item_cache: HashMap::new(),
@@ -500,7 +561,7 @@ impl AppState {
     pub fn apply_ui_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::Status(status) => {
-                self.is_busy = status == AgentStatus::Busy;
+                self.is_busy = status == UiAgentStatus::Busy;
                 if !self.is_busy {
                     self.streaming_assistant_open = false;
                     self.reveal.snap_all();
@@ -520,7 +581,7 @@ impl AppState {
                 self.streaming_assistant_open = false;
                 self.reveal.snap_all();
                 emit_terminal_progress(false);
-                if matches!(reason, TurnEndReason::Cancelled) {
+                if matches!(reason, UiTurnEndReason::Cancelled) {
                     self.push_notice(NoticeLevel::Info, "已中断本轮生成");
                     emit_program_status(ProgramStatusState::Idle, None, Some("Cancelled"));
                 } else {
@@ -720,9 +781,9 @@ impl AppState {
             }
             UiEvent::Log(record) => {
                 let level = match record.level {
-                    LogLevel::Error => NoticeLevel::Error,
-                    LogLevel::Warn => NoticeLevel::Warn,
-                    LogLevel::Debug | LogLevel::Info | LogLevel::Silent => return,
+                    UiLogLevel::Error => NoticeLevel::Error,
+                    UiLogLevel::Warn => NoticeLevel::Warn,
+                    UiLogLevel::Debug | UiLogLevel::Info | UiLogLevel::Silent => return,
                 };
                 self.push_notice(level, format!("[{}] {}", record.name, record.message));
             }
@@ -1420,8 +1481,13 @@ impl AppState {
         self.scroll_from_top
     }
 
-    pub fn reset_for_new_session(&mut self, session: Arc<Session>) {
-        self.session = session;
+    pub fn reset_for_new_session(
+        &mut self,
+        session_id: impl Into<String>,
+        session_title: Option<String>,
+    ) {
+        self.session_id = session_id.into();
+        self.session_title = session_title;
         self.items.clear();
         self.tool_extras.clear();
         self.item_cache.clear();
@@ -1444,59 +1510,37 @@ impl AppState {
         self.refresh_context_breakdown();
         self.push_notice(
             NoticeLevel::Info,
-            format!("已开启新会话 ({})", short_id(&self.session.id)),
+            format!("已开启新会话 ({})", short_id(&self.session_id)),
         );
     }
 
-    /// 从会话日志重放并重建界面对话流（供 `/tree` 分叉回溯使用）。
-    pub fn restore_from_session(&mut self, session: Arc<Session>, source_seq: u64) {
-        let notice = format!(
-            "已从事件 #{source_seq} 分叉至新会话 ({})，可继续发送新指令",
-            short_id(&session.id)
-        );
-        self.replay_session_entries(session, notice);
-    }
-
-    /// 从持久化历史会话重放并重建界面对话流（供 `--resume` / `--continue` 使用）。
-    pub fn resume_session(&mut self, session: Arc<Session>) {
-        let header = session.header();
-        let label = header
-            .title
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .map(|t| format!("「{t}」"))
-            .unwrap_or_else(|| short_id(&session.id).to_string());
-        let notice = format!("已恢复历史会话 {} ({label})", short_id(&session.id));
-        self.replay_session_entries(session, notice);
-    }
-
-    fn replay_session_entries(&mut self, session: Arc<Session>, finish_notice: String) {
-        self.reset_for_new_session(Arc::clone(&session));
+    /// 从投影后的纯会话视图重建界面对话流（供 `/tree` 分叉回溯与 `--resume` / `--continue` 使用）。
+    pub fn restore_session_view(&mut self, view: SessionViewData) {
+        self.reset_for_new_session(view.session_id, view.session_title);
         // 清理 reset 推送的默认欢迎通知，由真实历史替代
         self.items.clear();
 
-        for entry in session.log() {
-            match entry.event {
-                SessionEvent::User { text } => {
+        for item in view.items {
+            match item {
+                SessionReplayItem::User { text } => {
                     self.items.push(ChatItem::User { text });
                 }
-                SessionEvent::ContextNotice { source, text } => {
+                SessionReplayItem::ContextNotice { source, text } => {
                     self.items.push(ChatItem::Notice {
                         level: NoticeLevel::Info,
                         text: format!("[{source}] {text}"),
                     });
                 }
-                SessionEvent::Compaction {
+                SessionReplayItem::Compaction {
                     summary,
                     first_kept_seq,
-                    ..
                 } => {
                     self.items.push(ChatItem::Notice {
                         level: NoticeLevel::Info,
                         text: format!("[上下文压缩（保留自 #{first_kept_seq}）]\n{summary}"),
                     });
                 }
-                SessionEvent::Assistant { blocks, .. } => {
+                SessionReplayItem::Assistant { blocks } => {
                     let mut reasoning = String::new();
                     let mut text = String::new();
                     let mut calls = Vec::new();
@@ -1538,11 +1582,10 @@ impl AppState {
                         });
                     }
                 }
-                SessionEvent::ToolResult {
+                SessionReplayItem::ToolResult {
                     tool_call_id,
                     content,
                     is_error,
-                    ..
                 } => {
                     if let Some(ChatItem::ToolCall {
                         status,
@@ -1563,91 +1606,18 @@ impl AppState {
                         ext.full_content = content;
                     }
                 }
-                SessionEvent::Trace { .. } => {}
             }
         }
-        self.push_notice(NoticeLevel::Info, finish_notice);
+        self.push_notice(NoticeLevel::Info, view.finish_notice);
         self.refresh_context_breakdown();
         self.scroll_to_bottom();
     }
 
-    pub fn open_session_tree(&mut self) {
-        let log = self.session.log();
-        if log.is_empty() {
+    pub fn open_session_tree_with(&mut self, entries: Vec<SessionTreeEntry>) {
+        if entries.is_empty() {
             self.push_notice(NoticeLevel::Info, "当前会话尚无事件记录");
             return;
         }
-        let entries: Vec<SessionTreeEntry> = log
-            .into_iter()
-            .map(|entry| match entry.event {
-                SessionEvent::User { text } => SessionTreeEntry {
-                    seq: entry.seq,
-                    kind_tag: "User".into(),
-                    summary: text.replace('\n', " "),
-                    depth: 0,
-                    can_fork: true,
-                },
-                SessionEvent::ContextNotice { source, text } => SessionTreeEntry {
-                    seq: entry.seq,
-                    kind_tag: format!("Notice:{source}"),
-                    summary: text.replace('\n', " "),
-                    depth: 1,
-                    can_fork: false,
-                },
-                SessionEvent::Assistant { blocks, .. } => {
-                    let text_preview: String = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            ContentBlock::ToolCall { name, .. } => Some(name.as_str()),
-                            ContentBlock::Reasoning { .. } => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    SessionTreeEntry {
-                        seq: entry.seq,
-                        kind_tag: "Asst".into(),
-                        summary: text_preview.replace('\n', " "),
-                        depth: 1,
-                        can_fork: true,
-                    }
-                }
-                SessionEvent::ToolResult {
-                    name,
-                    content,
-                    is_error,
-                    ..
-                } => SessionTreeEntry {
-                    seq: entry.seq,
-                    kind_tag: if is_error {
-                        format!("Err:{name}")
-                    } else {
-                        format!("Tool:{name}")
-                    },
-                    summary: content.replace('\n', " "),
-                    depth: 1,
-                    can_fork: true,
-                },
-                SessionEvent::Compaction {
-                    summary,
-                    first_kept_seq,
-                    ..
-                } => SessionTreeEntry {
-                    seq: entry.seq,
-                    kind_tag: format!("Compact>={first_kept_seq}"),
-                    summary: summary.replace('\n', " "),
-                    depth: 0,
-                    can_fork: false,
-                },
-                SessionEvent::Trace { .. } => SessionTreeEntry {
-                    seq: entry.seq,
-                    kind_tag: "Trace".into(),
-                    summary: String::new(),
-                    depth: 1,
-                    can_fork: false,
-                },
-            })
-            .collect();
         self.overlay.open_session_tree(entries);
     }
 
@@ -1707,10 +1677,7 @@ impl AppState {
                 Some("list") => AppAction::ShowSkills,
                 _ => AppAction::OpenSkillPicker,
             },
-            "tree" => {
-                self.open_session_tree();
-                AppAction::None
-            }
+            "tree" => AppAction::OpenSessionTree,
             "view" => {
                 let next = match arg {
                     Some("inline") => ScreenMode::Inline,
@@ -2058,17 +2025,13 @@ fn summarize_tool_result(
 
 #[cfg(test)]
 mod tests {
-    use cordis::Context;
-
     use super::*;
 
     #[test]
     fn streams_reasoning_tools_and_text_into_items() {
-        let ctx = Context::new();
-        let session = Arc::new(Session::new(ctx, "sess-12345678"));
         let mut app = AppState::new(
             PathBuf::from("."),
-            session,
+            "sess-12345678",
             Vec::new(),
             Some("default".into()),
             Some("deepseek-chat".into()),
@@ -2107,7 +2070,7 @@ mod tests {
             ..Default::default()
         }));
         app.apply_ui_event(UiEvent::TurnEnd {
-            reason: TurnEndReason::Completed,
+            reason: UiTurnEndReason::Completed,
         });
 
         assert!(!app.is_busy);
@@ -2129,11 +2092,9 @@ mod tests {
 
     #[test]
     fn slash_commands_and_esc_cancel_work() {
-        let ctx = Context::new();
-        let session = Arc::new(Session::new(ctx, "sess-12345678"));
         let mut app = AppState::new(
             PathBuf::from("."),
-            session,
+            "sess-12345678",
             Vec::new(),
             None,
             None,

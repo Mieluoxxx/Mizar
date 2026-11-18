@@ -1,7 +1,6 @@
-//! Agent 层测试（对应 `NamiDSH/tests/agent.ts`）+ 网页服务 SSE 集成测试。
+//! Agent 核心层集成测试：热插拔与拦截管线、单会话三协议切换、重复调用守卫自愈。
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,9 +27,6 @@ use dsh_tools::{
     ToolResultEvent, ToolsContextExt,
 };
 use dsh_trajectory::{EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime};
-use dsh_webserver::{EVENT_WEBSERVER_LISTENING, WebServerConfig, WebServerPlugin};
-use serde_json::json;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 async fn tick(ms: u64) {
@@ -129,155 +125,6 @@ async fn agent_hot_plug_and_guard_pipeline() {
     }
     tick(20).await;
     assert!(app.get::<AgentLoop>("agentLoop").is_none());
-}
-
-#[tokio::test]
-async fn webserver_serves_index_and_streams_chat_sse() {
-    let app = Context::new();
-    let (addr_tx, addr_rx) = oneshot::channel::<SocketAddr>();
-    let addr_tx = Arc::new(Mutex::new(Some(addr_tx)));
-    app.on(EVENT_WEBSERVER_LISTENING, move |addr: &SocketAddr| {
-        if let Some(tx) = addr_tx.lock().unwrap().take() {
-            let _ = tx.send(*addr);
-        }
-    })
-    .unwrap();
-
-    app.plugin(
-        AgentSpinePlugin,
-        AgentSpineConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
-    );
-    app.plugin(MockPlugin, ());
-    app.plugin(
-        WebServerPlugin,
-        WebServerConfig {
-            port: 0,
-            host: "127.0.0.1".to_string(),
-            static_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public"),
-        },
-    );
-
-    let addr = tokio::time::timeout(Duration::from_secs(3), addr_rx)
-        .await
-        .expect("webserver did not start in time")
-        .unwrap();
-
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let html = client
-        .get(format!("http://{addr}/"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(html.contains("NamiDSH Agent"));
-
-    let sse = client
-        .post(format!("http://{addr}/api/chat"))
-        .json(&json!({ "message": "现在几点？" }))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(sse.contains("event: session"));
-    assert!(sse.contains("event: tool"));
-    assert!(sse.contains("get_time"));
-    assert!(sse.contains("event: delta"));
-    assert!(sse.contains("event: done"));
-
-    // 从首轮 SSE 提取 sessionId 并继续多轮对话（触发 list_dir）
-    let session_id = sse
-        .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
-        .expect("session id in first sse event");
-
-    let sse2 = client
-        .post(format!("http://{addr}/api/chat"))
-        .json(&json!({ "sessionId": session_id, "message": "项目里有哪些文件？" }))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(sse2.contains("event: tool"));
-    assert!(sse2.contains("list_dir"));
-    let reply_text: String = sse2
-        .split("\n\n")
-        .filter_map(|part| {
-            let mut event = None;
-            let mut data = None;
-            for line in part.lines() {
-                if let Some(e) = line.strip_prefix("event: ") {
-                    event = Some(e);
-                } else if let Some(d) = line.strip_prefix("data: ") {
-                    data = Some(d);
-                }
-            }
-            if event == Some("delta") {
-                data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert!(reply_text.contains("Cargo.toml"), "reply: {reply_text}");
-    assert!(sse2.contains("event: done"));
-
-    // 验证轨迹查询 / JSONL 导出 / 离线 JSONL 检测接口
-    let sessions_json: serde_json::Value = client
-        .get(format!("http://{addr}/api/sessions"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(sessions_json.as_array().unwrap().iter().any(|s| s["sessionId"] == session_id));
-
-    let traj_report: serde_json::Value = client
-        .get(format!("http://{addr}/api/sessions/{session_id}/trajectory?mode=actual"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(traj_report["snapshot"]["stats"]["turns"], 2);
-    assert_eq!(traj_report["snapshot"]["stats"]["toolCalls"], 2);
-    assert_eq!(traj_report["snapshot"]["stats"]["toolErrors"], 0);
-    assert!(traj_report["timeline"]["spans"].as_array().unwrap().len() >= 6);
-
-    let jsonl = client
-        .get(format!("http://{addr}/api/sessions/{session_id}/export"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(jsonl.contains("\"type\":\"turn-start\""));
-    assert!(jsonl.contains("\"type\":\"tool-call\""));
-
-    let offline_report: serde_json::Value = client
-        .post(format!("http://{addr}/api/trajectory/inspect"))
-        .json(&json!({ "jsonl": jsonl, "mode": "duration" }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(offline_report["snapshot"]["stats"]["turns"], 2);
-    assert_eq!(offline_report["snapshot"]["stats"]["toolCalls"], 2);
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]

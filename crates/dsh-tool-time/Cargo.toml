@@ -1,9 +1,12 @@
 [package]
 name = "dsh-tool-time"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "时间工具插件 get_time（对应 NamiDSH packages/tool-time）"
-license = "MIT"
+
+[lints]
+workspace = true
 
 [dependencies]
 chrono = { workspace = true }

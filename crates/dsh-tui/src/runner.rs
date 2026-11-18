@@ -5,48 +5,53 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use cordis::{BoxFuture, Context, CordisError, DisposableHandle, LogLevel, LogSink, Next};
+use cordis::{
+    BoxFuture, Cleanup, Context, CordisError, DisposableHandle, LogLevel, LogRecord, LogSink, Next,
+};
 use crossterm::event::{Event as TermEvent, EventStream};
 use dsh_agent_loop::{
-    AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStatusEvent, AgentStepFirstTokenEvent,
-    AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent, AgentToolResultEvent,
-    AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent, AgentUsageEvent,
-    EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_FIRST_TOKEN,
-    EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL,
-    EVENT_AGENT_TOOL_RESULT, EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END,
-    EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE, RunOptions,
+    AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent,
+    AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
+    AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
+    AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS,
+    EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA,
+    EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT, EVENT_AGENT_TOOL_UPDATE,
+    EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE, RunOptions, TurnEndReason,
 };
-use dsh_llm::{LlmContextExt, ReasoningEffort};
+use dsh_llm::{ContentBlock, LlmContextExt, ReasoningEffort};
 use dsh_mcp::{McpConnectionState, McpManager};
 use dsh_session::{
-    Session, SessionContextExt, SessionCreateOptions, SessionListQuery,
+    Session, SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
     SessionPersistenceContextExt,
 };
 use dsh_skills::{EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillRegistry};
+use dsh_system_prompt::{PromptSection, SystemPromptContextExt};
 use dsh_tools::{
     EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolExposure, ToolRuntime,
 };
 use dsh_trajectory::{
     EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime,
 };
-use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::MissedTickBehavior;
-use tokio_util::sync::CancellationToken;
-
-use crate::app::{AppAction, AppState, ApprovalMode, NoticeLevel, UiEvent, truncate_display};
-use crate::emphasis::mount_reply_guidance_section;
-use crate::overlay::{ApprovalDecision, SkillPickerItem};
-use crate::side_panel::{FileTouchRow, McpSummaryRow, ToolSummaryRow};
-use crate::terminal::{
+use dsh_tui_ui::app::{
+    AppAction, AppState, ApprovalMode, NoticeLevel, SessionReplayItem, SessionViewData,
+    UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason, short_id, truncate_display,
+};
+use dsh_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
+use dsh_tui_ui::overlay::{ApprovalDecision, SessionTreeEntry, SkillPickerItem};
+use dsh_tui_ui::side_panel::{FileTouchRow, McpSummaryRow, ToolSummaryRow};
+use dsh_tui_ui::terminal::{
     ProgramStatusState, ScreenMode, TerminalGuard, apply_terminal_modes, emit_program_status,
     resume_after_external_editor, set_mouse_capture_enabled, suspend_for_external_editor,
     write_begin_sync, write_end_sync,
 };
-use crate::theme::ThemePreset;
-use crate::ui::{build_item_lines_for_scrollback, render};
+use dsh_tui_ui::theme::ThemePreset;
+use dsh_tui_ui::ui::{build_item_lines_for_scrollback, render};
+use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::{Terminal, TerminalOptions, Viewport};
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeTarget {
@@ -162,6 +167,202 @@ impl Drop for LoggerRestoreGuard {
     }
 }
 
+/// 将交互式 TUI 回复视觉语法提示段挂载到系统提示词注册表。
+pub fn mount_reply_guidance_section(
+    ctx: &Context,
+    emphasis: &EmphasisConfig,
+) -> Result<Option<Cleanup>, CordisError> {
+    let Ok(sp) = ctx.system_prompt() else {
+        return Ok(None);
+    };
+    if !(emphasis.enabled && emphasis.guidance) {
+        return Ok(None);
+    }
+    let prompt = reply_guidance_prompt();
+    Ok(Some(sp.section(PromptSection::new(
+        "tui_reply_guidance",
+        95,
+        move || Some(prompt.clone()),
+    ))))
+}
+
+fn to_ui_status(status: AgentStatus) -> UiAgentStatus {
+    match status {
+        AgentStatus::Busy => UiAgentStatus::Busy,
+        AgentStatus::Idle => UiAgentStatus::Idle,
+    }
+}
+
+fn to_ui_turn_end_reason(reason: TurnEndReason) -> UiTurnEndReason {
+    match reason {
+        TurnEndReason::Completed => UiTurnEndReason::Completed,
+        TurnEndReason::MaxSteps => UiTurnEndReason::MaxSteps,
+        TurnEndReason::Cancelled => UiTurnEndReason::Cancelled,
+        TurnEndReason::Error { message } => UiTurnEndReason::Error { message },
+    }
+}
+
+pub fn to_ui_log_record(record: &LogRecord) -> UiLogRecord {
+    let level = match record.level {
+        LogLevel::Silent => UiLogLevel::Silent,
+        LogLevel::Error => UiLogLevel::Error,
+        LogLevel::Warn => UiLogLevel::Warn,
+        LogLevel::Info => UiLogLevel::Info,
+        LogLevel::Debug => UiLogLevel::Debug,
+    };
+    UiLogRecord {
+        level,
+        name: record.name.clone(),
+        message: record.message.clone(),
+    }
+}
+
+/// 将持久化会话日志投影为纯 UI 可重放的 `SessionViewData`。
+pub fn project_session_view(session: &Session, finish_notice: impl Into<String>) -> SessionViewData {
+    let header = session.header();
+    let items = session
+        .log()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::User { text } => Some(SessionReplayItem::User { text }),
+            SessionEvent::ContextNotice { source, text } => {
+                Some(SessionReplayItem::ContextNotice { source, text })
+            }
+            SessionEvent::Compaction {
+                summary,
+                first_kept_seq,
+                ..
+            } => Some(SessionReplayItem::Compaction {
+                summary,
+                first_kept_seq,
+            }),
+            SessionEvent::Assistant { blocks, .. } => {
+                Some(SessionReplayItem::Assistant { blocks })
+            }
+            SessionEvent::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => Some(SessionReplayItem::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            }),
+            SessionEvent::Trace { .. } => None,
+        })
+        .collect();
+    SessionViewData {
+        session_id: session.id.clone(),
+        session_title: header.title,
+        items,
+        finish_notice: finish_notice.into(),
+    }
+}
+
+/// 生成恢复会话的 UI 重放视图。
+pub fn project_resume_view(session: &Session) -> SessionViewData {
+    let header = session.header();
+    let title_suffix = header
+        .title
+        .as_deref()
+        .map(|t| format!(" · {t}"))
+        .unwrap_or_default();
+    let finish_notice = format!(
+        "已恢复历史会话 `{}`{}（共 {} 条表面事件）",
+        short_id(&session.id),
+        title_suffix,
+        header.surface_count,
+    );
+    project_session_view(session, finish_notice)
+}
+
+/// 生成分叉会话的 UI 重放视图。
+pub fn project_fork_view(session: &Session, from_seq: u64) -> SessionViewData {
+    let finish_notice = format!(
+        "🌿 已从事件 #{from_seq} 分叉至新会话 `{}`",
+        short_id(&session.id),
+    );
+    project_session_view(session, finish_notice)
+}
+
+/// 将持久化会话日志投影为 `/tree` 覆盖层条目列表。
+pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
+    session
+        .log()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::User { text } => Some(SessionTreeEntry {
+                seq: entry.seq,
+                kind_tag: "USER".to_string(),
+                summary: truncate_display(&text.replace('\n', " "), 72),
+                depth: 0,
+                can_fork: true,
+            }),
+            SessionEvent::ContextNotice { source, text } => Some(SessionTreeEntry {
+                seq: entry.seq,
+                kind_tag: "CTX ".to_string(),
+                summary: format!("[{source}] {}", truncate_display(&text.replace('\n', " "), 60)),
+                depth: 1,
+                can_fork: false,
+            }),
+            SessionEvent::Assistant { blocks, .. } => {
+                let mut parts = Vec::new();
+                for block in &blocks {
+                    match block {
+                        ContentBlock::Text { text } if !text.trim().is_empty() => {
+                            parts.push(text.trim().replace('\n', " "));
+                        }
+                        ContentBlock::ToolCall { name, .. } => {
+                            parts.push(format!("[call:{name}]"));
+                        }
+                        ContentBlock::Reasoning { .. } | ContentBlock::Text { .. } => {}
+                    }
+                }
+                let summary = if parts.is_empty() {
+                    "(empty assistant turn)".to_string()
+                } else {
+                    truncate_display(&parts.join(" "), 72)
+                };
+                Some(SessionTreeEntry {
+                    seq: entry.seq,
+                    kind_tag: "ASST".to_string(),
+                    summary,
+                    depth: 1,
+                    can_fork: true,
+                })
+            }
+            SessionEvent::ToolResult {
+                name,
+                content,
+                is_error,
+                ..
+            } => Some(SessionTreeEntry {
+                seq: entry.seq,
+                kind_tag: if is_error { "ERR " } else { "TOOL" }.to_string(),
+                summary: format!("{name}: {}", truncate_display(&content.replace('\n', " "), 60)),
+                depth: 1,
+                can_fork: true,
+            }),
+            SessionEvent::Compaction {
+                summary,
+                first_kept_seq,
+                ..
+            } => Some(SessionTreeEntry {
+                seq: entry.seq,
+                kind_tag: "COMP".to_string(),
+                summary: format!(
+                    "[keep>={first_kept_seq}] {}",
+                    truncate_display(&summary.replace('\n', " "), 56)
+                ),
+                depth: 0,
+                can_fork: false,
+            }),
+            SessionEvent::Trace { .. } => None,
+        })
+        .collect()
+}
+
 /// 订阅当前会话相关的 Agent 与轨迹事件并投递到 `tx`。
 pub fn subscribe_session_events(
     ctx: &Context,
@@ -176,7 +377,7 @@ pub fn subscribe_session_events(
         let check = is_current.clone();
         handles.push(ctx.on(EVENT_AGENT_STATUS, move |ev: &AgentStatusEvent| {
             if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::Status(ev.status));
+                let _ = tx.send(UiEvent::Status(to_ui_status(ev.status)));
             }
         })?);
     }
@@ -195,7 +396,7 @@ pub fn subscribe_session_events(
         handles.push(ctx.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
             if check(&ev.session.id) {
                 let _ = tx.send(UiEvent::TurnEnd {
-                    reason: ev.reason.clone(),
+                    reason: to_ui_turn_end_reason(ev.reason.clone()),
                 });
             }
         })?);
@@ -392,24 +593,26 @@ pub async fn run_tui_with_summary(
     let log_tx = ui_tx.clone();
     ctx.logger().set_handler(move |record| {
         if record.level >= LogLevel::Warn {
-            let _ = log_tx.send(UiEvent::Log(record.clone()));
+            let _ = log_tx.send(UiEvent::Log(to_ui_log_record(record)));
         }
     });
     let _logger_restore = LoggerRestoreGuard { ctx: ctx.clone() };
 
-    let active_sid = Arc::new(std::sync::RwLock::new(initial_session.id.clone()));
+    let mut active_session = Arc::clone(&initial_session);
+    let active_sid = Arc::new(std::sync::RwLock::new(active_session.id.clone()));
     let handles = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone())?;
 
     let mut app = AppState::new(
         config.workspace.clone(),
-        Arc::clone(&initial_session),
+        active_session.id.clone(),
         providers,
         config.provider.clone(),
         config.model.clone(),
         config.reasoning_effort,
     );
+    app.session_title = active_session.header().title;
     if resumed {
-        app.resume_session(initial_session);
+        app.restore_session_view(project_resume_view(&active_session));
     }
     if let Some((lvl, msg)) = resume_notice {
         app.push_notice(lvl, msg);
@@ -562,6 +765,7 @@ pub async fn run_tui_with_summary(
             &ctx,
             &config,
             &mut app,
+            &mut active_session,
             &mut terminal,
             &active_sid,
             &ui_tx,
@@ -597,7 +801,7 @@ pub async fn run_tui_with_summary(
         drop(handle.dispose());
     }
     Ok(TuiExitSummary {
-        session_id: app.session.id.clone(),
+        session_id: app.session_id.clone(),
         persisted: ctx.session_persistence().is_some(),
     })
 }
@@ -641,7 +845,7 @@ fn register_approval_hook(
                 let args_preview = serde_json::to_string_pretty(&exec.args)
                     .unwrap_or_else(|_| exec.args.to_string());
                 let args_preview = truncate_display(&args_preview.replace('\n', " "), 400);
-                let (tx, rx) = oneshot::channel();
+                let (tx, rx) = futures::channel::oneshot::channel();
                 if ui_tx
                     .send(UiEvent::ApprovalRequested {
                         tool_name: exec.name.clone(),
@@ -720,6 +924,7 @@ fn spawn_agent_run(
     ctx: &Context,
     config: &TuiConfig,
     app: &mut AppState,
+    active_session: &Arc<Session>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     active_cancel: &mut Option<CancellationToken>,
     prompt: String,
@@ -732,7 +937,7 @@ fn spawn_agent_run(
     *active_cancel = Some(cancel.clone());
     app.is_busy = true;
 
-    let session: Arc<Session> = Arc::clone(&app.session);
+    let session: Arc<Session> = Arc::clone(active_session);
     let run_opts = RunOptions {
         provider: app.provider.clone(),
         model: app.model.clone(),
@@ -820,6 +1025,7 @@ async fn handle_action(
     ctx: &Context,
     config: &TuiConfig,
     app: &mut AppState,
+    active_session: &mut Arc<Session>,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     active_sid: &Arc<std::sync::RwLock<String>>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
@@ -845,13 +1051,23 @@ async fn handle_action(
             *user_cancelled = false;
             if let Ok(sessions) = ctx.sessions() {
                 let next = sessions.create(None);
+                let title = next.header().title;
                 *active_sid.write().unwrap() = next.id.clone();
-                app.reset_for_new_session(next);
+                app.reset_for_new_session(next.id.clone(), title);
+                *active_session = next;
                 populate_side_panel_data(ctx, app).await;
             }
         }
         AppAction::SubmitPrompt(prompt) => {
-            spawn_agent_run(ctx, config, app, ui_tx, active_cancel, prompt);
+            spawn_agent_run(
+                ctx,
+                config,
+                app,
+                active_session,
+                ui_tx,
+                active_cancel,
+                prompt,
+            );
         }
         AppAction::SteerPrompt(prompt) => {
             if let Some(cancel) = active_cancel.as_ref() {
@@ -859,12 +1075,20 @@ async fn handle_action(
                 *user_cancelled = false;
                 cancel.cancel();
             } else {
-                spawn_agent_run(ctx, config, app, ui_tx, active_cancel, prompt);
+                spawn_agent_run(
+                    ctx,
+                    config,
+                    app,
+                    active_session,
+                    ui_tx,
+                    active_cancel,
+                    prompt,
+                );
             }
         }
         AppAction::ShowStats => {
             if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
-                if let Some(report) = traj.inspect(&app.session.id, TimelineMode::Sequence) {
+                if let Some(report) = traj.inspect(&app.session_id, TimelineMode::Sequence) {
                     let s = &report.snapshot.stats;
                     app.push_notice(
                         NoticeLevel::Info,
@@ -890,7 +1114,7 @@ async fn handle_action(
         AppAction::ShowTools => {
             if let Some(rt) = ctx.get::<ToolRuntime>("tools") {
                 let declared: std::collections::HashSet<String> = rt
-                    .list_declared(Some(&app.session.id))
+                    .list_declared(Some(&app.session_id))
                     .into_iter()
                     .map(|t| t.name)
                     .collect();
@@ -1001,10 +1225,10 @@ async fn handle_action(
         }
         AppAction::ExportTrajectory(custom_path) => {
             if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
-                if let Some(jsonl) = traj.export_jsonl(&app.session.id) {
+                if let Some(jsonl) = traj.export_jsonl(&app.session_id) {
                     let target = custom_path.unwrap_or_else(|| {
                         app.workspace
-                            .join(format!("{}.trajectory.jsonl", app.session.id))
+                            .join(format!("{}.trajectory.jsonl", app.session_id))
                     });
                     match tokio::fs::write(&target, jsonl).await {
                         Ok(()) => app.push_notice(
@@ -1067,8 +1291,11 @@ async fn handle_action(
         AppAction::OpenTrajectoryScene(mode) => {
             let report = ctx
                 .get::<TrajectoryRuntime>("trajectory")
-                .and_then(|traj| traj.inspect(&app.session.id, mode));
+                .and_then(|traj| traj.inspect(&app.session_id, mode));
             app.open_trajectory_with_report(report);
+        }
+        AppAction::OpenSessionTree => {
+            app.open_session_tree_with(project_session_tree(active_session));
         }
         AppAction::OpenSkillPicker => {
             if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
@@ -1102,10 +1329,11 @@ async fn handle_action(
         }
         AppAction::ForkSessionAtSeq(target_seq) => {
             if let Ok(sessions) = ctx.sessions() {
-                match sessions.fork(&app.session.id, target_seq, SessionCreateOptions::default()) {
+                match sessions.fork(&app.session_id, target_seq, SessionCreateOptions::default()) {
                     Ok(next) => {
                         *active_sid.write().unwrap() = next.id.clone();
-                        app.restore_from_session(next, target_seq);
+                        app.restore_session_view(project_fork_view(&next, target_seq));
+                        *active_session = next;
                         populate_side_panel_data(ctx, app).await;
                     }
                     Err(err) => {
@@ -1209,7 +1437,7 @@ async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
 
     if let Some(rt) = ctx.get::<ToolRuntime>("tools") {
         let declared: HashSet<String> = rt
-            .list_declared(Some(&app.session.id))
+            .list_declared(Some(&app.session_id))
             .into_iter()
             .map(|t| t.name)
             .collect();
@@ -1266,7 +1494,7 @@ async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
 
     let mut findings = app.anomalies.clone();
     if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory")
-        && let Some(report) = traj.inspect(&app.session.id, TimelineMode::Sequence)
+        && let Some(report) = traj.inspect(&app.session_id, TimelineMode::Sequence)
     {
         for f in report.findings {
             let line = format!("[{:?}] {}: {}", f.severity, f.title, f.summary);

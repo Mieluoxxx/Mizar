@@ -1,11 +1,17 @@
 [package]
 name = "cordis"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "迷你版 Cordis 插件框架（对应 NamiDSH packages/cordis）"
-license = "MIT"
+
+[lints]
+workspace = true
 
 [dependencies]
 futures = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

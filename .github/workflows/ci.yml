@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Install Linux fast linker (mold)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold clang
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set build optimization env
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold -C split-debuginfo=unpacked" >> "$GITHUB_ENV"
+          fi
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy check
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace

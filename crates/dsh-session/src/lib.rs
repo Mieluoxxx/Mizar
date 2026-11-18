@@ -137,12 +137,12 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
         return Vec::new();
     }
 
-    let mut next_seq = loaded.entries.last().map_or(1, |e| e.seq + 1);
+    let base_seq = loaded.entries.last().map_or(1, |e| e.seq + 1);
     let ts = now_millis();
     let mut repaired = Vec::with_capacity(pending.len());
-    for (tool_call_id, name) in pending {
+    for (offset, (tool_call_id, name)) in pending.into_iter().enumerate() {
         let entry = SessionEntry {
-            seq: next_seq,
+            seq: base_seq + offset as u64,
             event: SessionEvent::ToolResult {
                 tool_call_id,
                 name,
@@ -152,7 +152,6 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
             },
             ts,
         };
-        next_seq += 1;
         loaded.header.event_count += 1;
         loaded.header.surface_count += 1;
         loaded.header.updated_at_ms = loaded.header.updated_at_ms.max(ts);

@@ -1,9 +1,16 @@
 [package]
 name = "dsh-session-sqlite"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "基于嵌入式 SQLite (WAL + 单写者后台线程) 的 SessionPersistence 实现"
-license = "MIT"
+
+[lints]
+workspace = true
+
+[features]
+default = ["bundled"]
+bundled = ["rusqlite/bundled"]
 
 [dependencies]
 cordis = { workspace = true }
