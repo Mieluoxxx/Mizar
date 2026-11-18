@@ -1020,3 +1020,116 @@ async fn renders_compact_consecutive_tools_and_restores_details_on_ctrl_o() {
         "expanded:\n{expanded}"
     );
 }
+
+#[test]
+fn renders_wide_markdown_table_with_intact_short_col_wrapping_and_right_borders() {
+    let ws = crate_root();
+    let mut state = AppState::new(ws, "sess-wide-table", Vec::new(), None, None, None);
+
+    // 放入 2 轮用户对话以激活 TimelineRail，覆盖全屏+导轨及侧栏开启时的视口宽度边界
+    state.items.push(ChatItem::User {
+        text: "第一轮".into(),
+    });
+    state.items.push(ChatItem::Assistant {
+        reasoning: String::new(),
+        text: "收到。".into(),
+    });
+    state.items.push(ChatItem::User {
+        text: "总结四类工作".into(),
+    });
+    state.items.push(ChatItem::Assistant {
+        reasoning: String::new(),
+        text: "\
+能干的事分四类：
+
+| 类别 | 具体 |
+| --- | --- |
+| 读代码 | 读文件、全文搜索（`grep`）、按文件名查找、解释某段逻辑、追调用链、对照 `docs/plugins.md` 拓扑 |
+| 跑命令 | `cargo check -p <crate>`、`cargo check --workspace`、`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt`、`git` |
+| 改代码 | 用精确编辑做局部手术改动，新增 crate / 加工具插件 / 加 LLM 协议适配器；跨 crate 枚举改完自动跑全量 check |
+| 守规矩 | 按仓库约定来：不用 `mod.rs`、错误用 `thiserror`、副作用包 `ctx.effect`、工具描述写英文、`inject` 漏写要查、feature 组合要验最小集 |"
+            .into(),
+    });
+
+    // 1. 100 列全屏（TimelineRail 开启，chat content_area.width = 98）
+    let mut term_rail = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term_rail.draw(|f| render(f, &mut state)).unwrap();
+    let screen_rail = buffer_text(term_rail.backend());
+    for line in screen_rail
+        .lines()
+        .filter(|l| l.starts_with('│') && !l.contains("输入消息") && l.matches('│').count() >= 3)
+    {
+        let mut cols = line.split('│');
+        let c1 = cols.nth(1).unwrap_or("");
+        let c2 = cols.next().unwrap_or("");
+        assert!(
+            !c1.contains('…') && !c2.contains('…'),
+            "unexpected ellipsis in table row: {line:?}\n{screen_rail}"
+        );
+    }
+    for cat in ["读代码", "跑命令", "改代码", "守规矩"] {
+        assert!(screen_rail.contains(cat), "missing {cat}:\n{screen_rail}");
+    }
+    assert!(
+        screen_rail.contains("┌"),
+        "missing top border:\n{screen_rail}"
+    );
+    assert!(
+        screen_rail.contains("┐"),
+        "right top corner clipped:\n{screen_rail}"
+    );
+    assert!(
+        screen_rail.contains("┘"),
+        "right bottom corner clipped:\n{screen_rail}"
+    );
+    assert!(
+        screen_rail.contains("feature 组合要验最小集"),
+        "wrapped cell content missing:\n{screen_rail}"
+    );
+    assert!(
+        screen_rail.contains("-- -D warnings"),
+        "wrapped command missing:\n{screen_rail}"
+    );
+
+    // 2. 开启 SidePanel（120 列总宽，chat + divider + side_panel）仍不裁剪右边框
+    state.side_panel.open = true;
+    let mut term_split = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    term_split.draw(|f| render(f, &mut state)).unwrap();
+    let screen_split = buffer_text(term_split.backend());
+    for line in screen_split
+        .lines()
+        .filter(|l| l.starts_with('│') && !l.contains("输入消息") && l.matches('│').count() >= 3)
+    {
+        let mut cols = line.split('│');
+        let c1 = cols.nth(1).unwrap_or("");
+        let c2 = cols.next().unwrap_or("");
+        assert!(
+            !c1.contains('…') && !c2.contains('…'),
+            "unexpected ellipsis in split table row: {line:?}\n{screen_split}"
+        );
+    }
+    for cat in ["读代码", "跑命令", "改代码", "守规矩"] {
+        assert!(
+            screen_split.contains(cat),
+            "missing {cat} in split:\n{screen_split}"
+        );
+    }
+    assert!(
+        screen_split.contains("┐"),
+        "split right top corner clipped:\n{screen_split}"
+    );
+    assert!(
+        screen_split.contains("┘"),
+        "split right bottom corner clipped:\n{screen_split}"
+    );
+
+    // 3. 20 列极窄终端无 panic
+    state.side_panel.open = false;
+    let mut term_narrow = Terminal::new(TestBackend::new(20, 24)).unwrap();
+    term_narrow.draw(|f| render(f, &mut state)).unwrap();
+    let screen_narrow = buffer_text(term_narrow.backend());
+    assert!(
+        screen_narrow.contains("┌"),
+        "narrow render failed:\n{screen_narrow}"
+    );
+}

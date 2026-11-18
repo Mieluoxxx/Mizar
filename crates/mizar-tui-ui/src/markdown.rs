@@ -1,5 +1,7 @@
 //! 增强型流式 Markdown、CJK 强强调修正、`pi-emphasis` 行内渲染与词级 Diff 引擎。
 
+use std::borrow::Cow;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
@@ -919,6 +921,181 @@ fn clip_spans_to_width(
     (out, used)
 }
 
+fn parse_table_row_spans(
+    cells: &[&str],
+    cols: usize,
+    base_style: Style,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+) -> Vec<Vec<Span<'static>>> {
+    (0..cols)
+        .map(|i| {
+            let raw = cells.get(i).copied().unwrap_or("");
+            let normalized: Cow<'_, str> = if raw.contains('\t') {
+                Cow::Owned(raw.replace('\t', " "))
+            } else {
+                Cow::Borrowed(raw)
+            };
+            parse_inline_rich(&normalized, base_style, theme, emphasis, false)
+        })
+        .collect()
+}
+
+/// 在 `[mins[c], maxs[c]]` 区间内按 Water-filling（削峰填谷）分配总宽 `target`。
+fn water_fill_clamped(mins: &[usize], maxs: &[usize], target: usize) -> Vec<usize> {
+    let cols = mins.len();
+    if cols == 0 {
+        return Vec::new();
+    }
+    let min_sum: usize = mins.iter().sum();
+    if target <= min_sum {
+        return mins.to_vec();
+    }
+    let max_sum: usize = maxs.iter().sum();
+    if target >= max_sum {
+        return maxs.to_vec();
+    }
+
+    let mut lo = 0usize;
+    let mut hi = *maxs.iter().max().unwrap_or(&0);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let s: usize = (0..cols).map(|c| mid.clamp(mins[c], maxs[c])).sum();
+        if s <= target {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    let mut widths: Vec<usize> = (0..cols).map(|c| lo.clamp(mins[c], maxs[c])).collect();
+    let rem = target.saturating_sub(widths.iter().sum::<usize>());
+    if rem > 0 {
+        // 只向 `lo + 1` 时实际可扩张的列派发余数，优先补给自然宽更大的列
+        let mut candidates: Vec<usize> = (0..cols)
+            .filter(|&c| widths[c] < maxs[c] && lo >= mins[c])
+            .collect();
+        candidates.sort_by(|&a, &b| maxs[b].cmp(&maxs[a]).then_with(|| a.cmp(&b)));
+        for c in candidates.into_iter().take(rem) {
+            widths[c] += 1;
+        }
+    }
+    widths
+}
+
+/// 按 Water-filling（「保短缩长」）计算表格各列显示宽度，优先保护短列与表头完整。
+fn allocate_table_col_widths(
+    nat_widths: &[usize],
+    header_widths: &[usize],
+    avail: usize,
+) -> Vec<usize> {
+    let cols = nat_widths.len();
+    if cols == 0 {
+        return Vec::new();
+    }
+    let desired: Vec<usize> = nat_widths.iter().map(|&w| w.max(1)).collect();
+    if desired.iter().map(|&w| w.max(3)).sum::<usize>() <= avail {
+        return desired.into_iter().map(|w| w.max(3)).collect();
+    }
+    if desired.iter().sum::<usize>() <= avail {
+        return desired;
+    }
+
+    // 短列（<= 12）全量保护；宽列按表头宽度适度保护（4..=10），避免被极端长列误伤
+    const SHORT_COL_PROTECT: usize = 12;
+    const HEADER_PROTECT_MAX: usize = 10;
+    let floors: Vec<usize> = (0..cols)
+        .map(|c| {
+            if desired[c] <= SHORT_COL_PROTECT {
+                desired[c]
+            } else {
+                header_widths[c]
+                    .clamp(4, HEADER_PROTECT_MAX)
+                    .min(desired[c])
+            }
+        })
+        .collect();
+
+    if floors.iter().sum::<usize>() <= avail {
+        water_fill_clamped(&floors, &desired, avail)
+    } else {
+        // 极窄终端连保护底线都超出时，从保底宽度起用 water-filling 退让
+        let min_bounds = vec![usize::from(avail >= cols); cols];
+        water_fill_clamped(&min_bounds, &floors, avail)
+    }
+}
+
+/// 将单元格富文本折行到指定列宽；极窄列（`< 4`）安全降级为单行裁剪加省略号。
+fn wrap_table_cell(cell_spans: &[Span<'static>], col_w: usize) -> Vec<(Vec<Span<'static>>, usize)> {
+    if col_w == 0 {
+        return vec![(Vec::new(), 0)];
+    }
+    let nat_w = spans_display_width(cell_spans);
+    if nat_w <= col_w {
+        return vec![(cell_spans.to_vec(), nat_w)];
+    }
+    if col_w < 4 {
+        return vec![clip_spans_to_width(cell_spans, col_w, true)];
+    }
+
+    let wrapped = wrap_styled_spans_with_prefixes(cell_spans.to_vec(), &[], &[], col_w);
+    if wrapped.is_empty() {
+        return vec![(Vec::new(), 0)];
+    }
+    wrapped
+        .into_iter()
+        .map(|rl| {
+            let cw = spans_display_width(&rl.line.spans);
+            if cw > col_w {
+                clip_spans_to_width(&rl.line.spans, col_w, false)
+            } else {
+                (rl.line.spans, cw)
+            }
+        })
+        .collect()
+}
+
+fn render_table_fallback_plain(
+    parsed_rows: &[Vec<Vec<Span<'static>>>],
+    max_width: usize,
+    border_style: Style,
+) -> Vec<RenderedLine> {
+    let mut out = Vec::new();
+    for (r_idx, row_spans) in parsed_rows.iter().enumerate() {
+        let mut joined = Vec::new();
+        for (c_idx, cell) in row_spans.iter().enumerate() {
+            if c_idx > 0 {
+                joined.push(Span::styled(" │ ", border_style));
+            }
+            joined.extend(cell.iter().cloned());
+        }
+        if max_width < 2 {
+            let (clipped, _) = clip_spans_to_width(&joined, max_width, false);
+            out.push(RenderedLine::hard(Line::from(clipped)));
+        } else {
+            for rl in wrap_styled_spans_with_prefixes(joined, &[], &[], max_width) {
+                let cw = spans_display_width(&rl.line.spans);
+                if cw > max_width {
+                    let (clipped, _) = clip_spans_to_width(&rl.line.spans, max_width, false);
+                    out.push(RenderedLine {
+                        line: Line::from(clipped),
+                        soft_wrapped: rl.soft_wrapped,
+                    });
+                } else {
+                    out.push(rl);
+                }
+            }
+        }
+        if r_idx == 0 {
+            out.push(RenderedLine::hard(Line::from(Span::styled(
+                "─".repeat(max_width),
+                border_style,
+            ))));
+        }
+    }
+    out
+}
+
 fn render_table_block(
     rows: &[&str],
     max_width: usize,
@@ -929,80 +1106,67 @@ fn render_table_block(
     let delim = split_table_row(rows[1]);
     let cols = header.len().max(delim.len()).max(1);
     let aligns: Vec<ColAlign> = (0..cols)
-        .map(|i| delim.get(i).map(|s| parse_col_align(s)).unwrap_or(ColAlign::Left))
+        .map(|i| {
+            delim
+                .get(i)
+                .map(|s| parse_col_align(s))
+                .unwrap_or(ColAlign::Left)
+        })
         .collect();
 
     // 先解析每一格的富文本 Span，再基于真实渲染宽度计算列宽与对齐填充，
     // 防止剥除 `` ` `` / `**` 或展开 `[[Pill]]` 后破坏右侧 `│` 边框对齐。
     let mut parsed_rows: Vec<Vec<Vec<Span<'static>>>> = Vec::with_capacity(rows.len() - 1);
-    let header_style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
-    parsed_rows.push(
-        (0..cols)
-            .map(|i| {
-                parse_inline_rich(
-                    header.get(i).copied().unwrap_or(""),
-                    header_style,
-                    theme,
-                    emphasis,
-                    false,
-                )
-            })
-            .collect(),
-    );
+    let header_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    parsed_rows.push(parse_table_row_spans(
+        &header,
+        cols,
+        header_style,
+        theme,
+        emphasis,
+    ));
     let body_style = Style::default().fg(theme.text);
     for raw in &rows[2..] {
         let cells = split_table_row(raw);
-        parsed_rows.push(
-            (0..cols)
-                .map(|i| {
-                    parse_inline_rich(
-                        cells.get(i).copied().unwrap_or(""),
-                        body_style,
-                        theme,
-                        emphasis,
-                        false,
-                    )
-                })
-                .collect(),
-        );
-    }
-
-    // 边框消耗：cols + 1 个框线 + 每列左右各 1 空格
-    let chrome = cols + 1 + cols * 2;
-    let avail = max_width.saturating_sub(chrome).max(cols * 2);
-    let mut col_widths = vec![3usize; cols];
-    for r in &parsed_rows {
-        for (c, cell_spans) in r.iter().enumerate() {
-            col_widths[c] = col_widths[c].max(spans_display_width(cell_spans));
-        }
-    }
-    let sum: usize = col_widths.iter().sum();
-    if sum > avail {
-        let scale = avail as f64 / sum as f64;
-        for w in &mut col_widths {
-            *w = ((*w as f64 * scale).floor() as usize).max(2);
-        }
-        let mut cur_sum: usize = col_widths.iter().sum();
-        while cur_sum > avail {
-            if let Some(max_col) = col_widths.iter_mut().max()
-                && *max_col > 2
-            {
-                *max_col -= 1;
-                cur_sum -= 1;
-            } else {
-                break;
-            }
-        }
+        parsed_rows.push(parse_table_row_spans(
+            &cells, cols, body_style, theme, emphasis,
+        ));
     }
 
     let border_style = Style::default().fg(theme.border);
+    let padded_chrome = cols * 3 + 1;
+    let compact_chrome = cols + 1;
+    let pad_x = if max_width >= padded_chrome + cols {
+        1usize
+    } else if max_width >= compact_chrome + cols {
+        0usize
+    } else {
+        return render_table_fallback_plain(&parsed_rows, max_width, border_style);
+    };
+
+    let chrome = cols + 1 + cols * pad_x * 2;
+    let avail = max_width.saturating_sub(chrome);
+
+    let header_widths: Vec<usize> = (0..cols)
+        .map(|c| spans_display_width(&parsed_rows[0][c]).max(1))
+        .collect();
+    let mut nat_widths = vec![1usize; cols];
+    for r in &parsed_rows {
+        for (c, cell_spans) in r.iter().enumerate() {
+            nat_widths[c] = nat_widths[c].max(spans_display_width(cell_spans));
+        }
+    }
+    let col_widths = allocate_table_col_widths(&nat_widths, &header_widths, avail);
+
     let make_border = |left: &str, mid: &str, right: &str| -> RenderedLine {
         let mut s = String::from(left);
         for (i, w) in col_widths.iter().enumerate() {
             if i > 0 {
                 s.push_str(mid);
             }
-            s.push_str(&"─".repeat(*w + 2));
+            s.push_str(&"─".repeat(*w + pad_x * 2));
         }
         s.push_str(right);
         RenderedLine::hard(Line::from(Span::styled(s, border_style)))
@@ -1013,22 +1177,37 @@ fn render_table_block(
 
     for (r_idx, row_spans) in parsed_rows.iter().enumerate() {
         let is_header = r_idx == 0;
-        let mut spans = vec![Span::styled("│", border_style)];
-        for (c_idx, cell_spans) in row_spans.iter().enumerate() {
-            let w = col_widths[c_idx];
-            let (clipped_spans, cw) = clip_spans_to_width(cell_spans, w, true);
-            let pad = w.saturating_sub(cw);
-            let (left_pad, right_pad) = match aligns[c_idx] {
-                ColAlign::Left => (0, pad),
-                ColAlign::Right => (pad, 0),
-                ColAlign::Center => (pad / 2, pad - pad / 2),
-            };
-            spans.push(Span::raw(format!(" {}", " ".repeat(left_pad))));
-            spans.extend(clipped_spans);
-            spans.push(Span::raw(format!("{} ", " ".repeat(right_pad))));
-            spans.push(Span::styled("│", border_style));
+        let wrapped_cells: Vec<Vec<(Vec<Span<'static>>, usize)>> = (0..cols)
+            .map(|c_idx| wrap_table_cell(&row_spans[c_idx], col_widths[c_idx]))
+            .collect();
+        let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+
+        for sub_row in 0..row_height {
+            let mut spans = vec![Span::styled("│", border_style)];
+            for c_idx in 0..cols {
+                let w = col_widths[c_idx];
+                if let Some((cell_line_spans, cw)) = wrapped_cells[c_idx].get(sub_row) {
+                    let pad = w.saturating_sub(*cw);
+                    let (left_pad, right_pad) = match aligns[c_idx] {
+                        ColAlign::Left => (0, pad),
+                        ColAlign::Right => (pad, 0),
+                        ColAlign::Center => (pad / 2, pad - pad / 2),
+                    };
+                    if pad_x + left_pad > 0 {
+                        spans.push(Span::raw(" ".repeat(pad_x + left_pad)));
+                    }
+                    spans.extend(cell_line_spans.iter().cloned());
+                    if right_pad + pad_x > 0 {
+                        spans.push(Span::raw(" ".repeat(right_pad + pad_x)));
+                    }
+                } else {
+                    spans.push(Span::raw(" ".repeat(pad_x + w + pad_x)));
+                }
+                spans.push(Span::styled("│", border_style));
+            }
+            out.push(RenderedLine::hard(Line::from(spans)));
         }
-        out.push(RenderedLine::hard(Line::from(spans)));
+
         if is_header {
             out.push(make_border("├", "┼", "┤"));
         }
@@ -2893,6 +3072,236 @@ mod tests {
                         "powerline pill split across lines: {l:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn table_preserves_short_col_and_wraps_long_rich_cells_across_widths() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig::default();
+        let md = "\
+| 类别 | 具体 |
+| --- | --- |
+| 读代码 | 读文件、全文搜索（`grep`）、按文件名查找、解释某段逻辑、追调用链、对照 `docs/plugins.md` 拓扑 |
+| 跑命令 | `cargo check -p <crate>`、`cargo check --workspace`、`cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt`、`git` |
+| 改代码 | 用精确编辑做局部手术改动，新增 crate / 加工具插件 / 加 LLM 协议适配器；跨 crate 枚举改完自动跑全量 check |
+| 守规矩 | 按仓库约定来：不用 `mod.rs`、错误用 `thiserror`、副作用包 `ctx.effect`、工具描述写英文、`inject` 漏写要查、feature 组合要验最小集 |";
+
+        for w in [80usize, 100, 120, 140] {
+            let rendered = render_markdown_rich(md, w, &theme, &cfg);
+            assert!(
+                rendered.len() > 8,
+                "expected multi-line wrapped rows at width {w}, got {}",
+                rendered.len()
+            );
+
+            let first_w = spans_display_width(&rendered[0].line.spans);
+            assert!(
+                first_w <= w,
+                "width {w}: table width {first_w} exceeded {w}"
+            );
+
+            let mut row_texts = Vec::with_capacity(rendered.len());
+            for (idx, rl) in rendered.iter().enumerate() {
+                let rw = spans_display_width(&rl.line.spans);
+                assert_eq!(
+                    rw, first_w,
+                    "width {w} row {idx} mismatch ({rw} != {first_w})"
+                );
+                assert_eq!(
+                    rl.line.width(),
+                    rw,
+                    "width {w} row {idx} ratatui Line::width mismatch"
+                );
+                assert!(!rl.soft_wrapped, "table rows must stay hard lines");
+                let text: String = rl.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    !text.contains('…'),
+                    "unexpected ellipsis at width {w}: {text:?}"
+                );
+                row_texts.push(text);
+            }
+
+            // 边框完整闭合，且数据行之间不插额外横线（仅表头下 1 条 `├──┼──┤`）
+            assert!(
+                row_texts[0].starts_with('┌') && row_texts[0].ends_with('┐'),
+                "top border broken at {w}: {:?}",
+                row_texts[0]
+            );
+            let last = row_texts.last().unwrap();
+            assert!(
+                last.starts_with('└') && last.ends_with('┘'),
+                "bottom border broken at {w}: {last:?}"
+            );
+            let sep_count = row_texts
+                .iter()
+                .filter(|r| r.starts_with('├') && r.ends_with('┤'))
+                .count();
+            assert_eq!(sep_count, 1, "expected single header separator at {w}");
+            for row in &row_texts[1..row_texts.len() - 1] {
+                if !row.starts_with('├') {
+                    assert!(
+                        row.starts_with('│') && row.ends_with('│'),
+                        "data border broken at {w}: {row:?}"
+                    );
+                }
+            }
+
+            // 第 1 列短类别必须完整保留
+            let joined = row_texts.join("\n");
+            for cat in ["类别", "读代码", "跑命令", "改代码", "守规矩"] {
+                assert!(
+                    joined.contains(cat),
+                    "short column label {cat:?} truncated at width {w}:\n{joined}"
+                );
+            }
+
+            // 第 2 列折行后保留完整命令与全部字符（不丢字、不截断）
+            let col2_space_joined: String = row_texts
+                .iter()
+                .filter(|r| r.starts_with('│'))
+                .filter_map(|r| r.split('│').nth(2).map(str::trim))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let col2_compact: String = col2_space_joined.chars().filter(|&c| c != ' ').collect();
+            for ascii_cmd in [
+                "docs/plugins.md",
+                "cargo check -p <crate>",
+                "cargo check --workspace",
+                "cargo test --workspace",
+                "cargo clippy --workspace --all-targets -- -D warnings",
+                "cargo fmt",
+                "git",
+                "ctx.effect",
+            ] {
+                assert!(
+                    col2_space_joined.contains(ascii_cmd),
+                    "lost command {ascii_cmd:?} at width {w}:\n{col2_space_joined}\nfull:\n{joined}"
+                );
+            }
+            for raw_sentence in [
+                "读文件、全文搜索（grep）、按文件名查找、解释某段逻辑、追调用链、对照docs/plugins.md拓扑",
+                "用精确编辑做局部手术改动，新增crate/加工具插件/加LLM协议适配器；跨crate枚举改完自动跑全量check",
+                "按仓库约定来：不用mod.rs、错误用thiserror、副作用包ctx.effect、工具描述写英文、inject漏写要查、feature组合要验最小集",
+            ] {
+                assert!(
+                    col2_compact.contains(raw_sentence),
+                    "lost text {raw_sentence:?} at width {w}:\n{col2_compact}\nfull:\n{joined}"
+                );
+            }
+
+            // 确认折行后内联代码背景样式仍在
+            let has_code_bg_on_warnings = rendered.iter().any(|rl| {
+                rl.line
+                    .spans
+                    .iter()
+                    .any(|s| s.content.contains("warnings") && s.style.bg == Some(theme.code_bg))
+            });
+            assert!(
+                has_code_bg_on_warnings,
+                "inline code style lost after wrapping at width {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_water_filling_protects_multiple_short_cols_and_handles_narrow_terminals() {
+        let theme = Theme::mist_dark();
+        let cfg = EmphasisConfig {
+            enabled: true,
+            round_caps: false,
+            icons: false,
+            guidance: true,
+        };
+
+        // 1. 多列混合：3 个短列 + 1 个超长列，验证短列完整保护、对齐符号与链接样式保留
+        let multi_md = "\
+| ID | 类别 | 状态 | 详细说明与链接 |
+| ---: | :---: | --- | --- |
+| 1 | 读代码 | [[Done]] | 查看 [设计文档](https://example.com/docs) 与 `crates/mizar-tui-ui/src/markdown.rs` 折行逻辑 |
+| 2 | 守规矩 | [[Failed]] | 必须保持 `cargo clippy --workspace --all-targets -- -D warnings` 零警告通过 |";
+
+        for w in [52usize, 80, 120] {
+            let rendered = render_markdown_rich(multi_md, w, &theme, &cfg);
+            let first_w = spans_display_width(&rendered[0].line.spans);
+            assert!(first_w <= w, "width {w}: {first_w} > {w}");
+            for rl in &rendered {
+                assert_eq!(spans_display_width(&rl.line.spans), first_w);
+                assert_eq!(rl.line.width(), first_w);
+            }
+            let joined: String = rendered
+                .iter()
+                .map(|r| {
+                    r.line
+                        .spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for token in [
+                "ID",
+                "类别",
+                "状态",
+                "读代码",
+                "守规矩",
+                "Done",
+                "Failed",
+                "设计文档",
+            ] {
+                assert!(
+                    joined.contains(token),
+                    "missing {token:?} at width {w}:\n{joined}"
+                );
+            }
+            assert!(
+                rendered.iter().any(|rl| rl.line.spans.iter().any(|s| {
+                    s.content.contains("设计文档") && s.style.fg == Some(theme.link)
+                })),
+                "link color lost at width {w}"
+            );
+        }
+
+        // 2. 极窄 20 列终端：2 列宽表仍能保住 6 列短列、折行不 panic 且不越界
+        let two_col_md = "\
+| 类别 | 具体 |
+| --- | --- |
+| 读代码 | `cargo clippy --workspace --all-targets -- -D warnings` 与全量测试 |";
+        let narrow_20 = render_markdown_rich(two_col_md, 20, &theme, &cfg);
+        let w20_first = spans_display_width(&narrow_20[0].line.spans);
+        assert!(w20_first <= 20, "20-col table overflowed: {w20_first}");
+        let mut narrow_text = String::new();
+        for rl in &narrow_20 {
+            let rw = spans_display_width(&rl.line.spans);
+            assert_eq!(rw, w20_first);
+            assert_eq!(rl.line.width(), rw);
+            for s in &rl.line.spans {
+                narrow_text.push_str(s.content.as_ref());
+            }
+            narrow_text.push('\n');
+        }
+        assert!(
+            narrow_text.contains("读代码"),
+            "short col damaged at 20 cols:\n{narrow_text}"
+        );
+        assert!(narrow_text.starts_with('┌') && narrow_text.contains('┐'));
+        assert!(narrow_text.contains('└') && narrow_text.contains('┘'));
+
+        // 3. 极端列数与极窄宽度（20 / 14 / 8 / 4 列）均不 panic、不越界
+        let many_col_md = "\
+| A | B | C | D | E | F |
+| --- | --- | --- | --- | --- | --- |
+| alpha | beta | gamma | delta | epsilon | superlongtokenwithoutspaces |";
+        for w in [20usize, 14, 8, 4] {
+            let rendered = render_markdown_rich(many_col_md, w, &theme, &cfg);
+            assert!(!rendered.is_empty());
+            for rl in &rendered {
+                let rw = spans_display_width(&rl.line.spans);
+                assert!(rw <= w, "many-col narrow {w} overflowed: {rw} > {w}");
+                assert!(rl.line.width() <= w, "ratatui width overflowed at {w}");
             }
         }
     }
