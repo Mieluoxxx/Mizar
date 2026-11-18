@@ -156,6 +156,14 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     assert!(callable_names.contains(&"mcp__fff__grep"));
     assert!(!callable_names.contains(&"mcp__fff__multi_grep"));
 
+    let find_info = callable
+        .iter()
+        .find(|t| t.name == "mcp__fff__find_files")
+        .unwrap();
+    let ns = find_info.namespace.as_ref().unwrap();
+    assert_eq!(ns.description, None);
+    assert_eq!(ns.instructions.as_deref(), Some("Indexed repo search server"));
+
     // 调用 mcp__fff__grep 并保留 structured_content
     let grep_res = tools
         .execute(ToolExecution::new(
@@ -200,7 +208,14 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
 
     // 存在 codemode 暴露的工具时，SystemPrompt 应生成 mcp_servers 提示段落
     let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap().build();
-    assert!(prompt.contains("mcp__fff (codemode)"), "prompt:\n{prompt}");
+    assert!(
+        prompt.contains("Call the tools of `codemode` servers from codemode scripts."),
+        "prompt:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("mcp__fff (codemode): Indexed repo search server"),
+        "prompt:\n{prompt}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     app.fiber().dispose().await;

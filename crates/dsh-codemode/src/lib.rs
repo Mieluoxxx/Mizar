@@ -3,6 +3,7 @@
 
 pub mod declarations;
 pub mod sandbox;
+pub mod schema_ts;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -32,6 +32,7 @@ pub use config::{
 pub const LIST_MCP_RESOURCES_TOOL: &str = "list_mcp_resources";
 pub const LIST_MCP_RESOURCE_TEMPLATES_TOOL: &str = "list_mcp_resource_templates";
 pub const READ_MCP_RESOURCE_TOOL: &str = "read_mcp_resource";
+const MAX_SERVER_DESCRIPTION_CHARS: usize = 250;
 const MAX_SERVERS_SECTION_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +79,7 @@ pub struct McpServerStatus {
     pub state: McpConnectionState,
     pub registered_tools: Vec<(String, ToolExposure)>,
     pub description: Option<String>,
+    pub instructions: Option<String>,
 }
 
 struct ConnectedServer {
@@ -85,6 +87,26 @@ struct ConnectedServer {
     client: Arc<McpClient>,
     state: McpConnectionState,
     cleanups: Vec<Cleanup>,
+}
+
+fn mcp_server_summary(description: Option<&str>, instructions: Option<&str>) -> String {
+    let text = description
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| instructions.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return String::new();
+    }
+    let head: String = text.chars().take(max_chars - 1).collect();
+    format!("{}…", head.trim_end())
 }
 
 pub struct McpManager {
@@ -142,8 +164,8 @@ impl McpManager {
 
         let mut has_codemode = false;
         let mut has_deferred = false;
-        let mut lines = Vec::new();
-        for s in indirect {
+        let mut heads = Vec::with_capacity(indirect.len());
+        for s in &indirect {
             let uses_codemode = s.exposure == McpExposure::Codemode
                 || s.registered_tools
                     .iter()
@@ -158,38 +180,68 @@ impl McpManager {
             } else {
                 "tool_search"
             };
-            let head = format!("- {} ({reach})", mcp_namespace(&s.name));
-            let desc = s
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty());
-            if let Some(d) = desc {
-                let short: String = d.chars().take(200).collect();
-                lines.push(format!("{head}: {short}"));
-            } else {
-                lines.push(head);
-            }
+            heads.push(format!("- {} ({reach})", mcp_namespace(&s.name)));
         }
 
-        let mut intro = String::from("MCP servers whose tools are not declared upfront.");
+        let mut intro = String::from("MCP servers whose tools are not declared to you.");
         if has_codemode {
-            intro.push_str(" Call `codemode` server tools via codemode scripts or search them.");
+            intro.push_str(" Call the tools of `codemode` servers from codemode scripts.");
         }
         if has_deferred {
-            intro.push_str(" Load `tool_search` server tools via `tool_search`.");
+            intro.push_str(" Load the tools of `tool_search` servers with `tool_search`.");
         }
 
-        let mut out = intro;
-        for line in lines {
-            if out.len() + 1 + line.len() > MAX_SERVERS_SECTION_CHARS {
-                out.push_str("\n- ... additional servers available via tool_search/searchTools()");
-                break;
+        let omitted = |count: usize| -> Option<String> {
+            (count > 0).then(|| {
+                let suffix = if count == 1 { "" } else { "s" };
+                format!("- … {count} more server{suffix}; find their tools with searchTools()")
+            })
+        };
+        let size_for = |kept: usize| -> usize {
+            let mut len = intro.chars().count();
+            for head in heads.iter().take(kept) {
+                len += 1 + head.chars().count();
             }
-            out.push('\n');
-            out.push_str(&line);
+            if let Some(om) = omitted(indirect.len() - kept) {
+                len += 1 + om.chars().count();
+            }
+            len
+        };
+
+        let mut kept = indirect.len();
+        while kept > 0 && size_for(kept) > MAX_SERVERS_SECTION_CHARS {
+            kept -= 1;
         }
-        Some(out)
+        let per_server = if kept == 0 {
+            0
+        } else {
+            let avail = MAX_SERVERS_SECTION_CHARS.saturating_sub(size_for(kept));
+            (avail / kept)
+                .saturating_sub(2)
+                .min(MAX_SERVER_DESCRIPTION_CHARS)
+        };
+
+        let mut parts = vec![intro];
+        for (idx, s) in indirect.iter().take(kept).enumerate() {
+            let summary = if per_server > 0 {
+                let first_line = mcp_server_summary(
+                    s.description.as_deref(),
+                    s.instructions.as_deref(),
+                );
+                truncate_chars(&first_line, per_server)
+            } else {
+                String::new()
+            };
+            if summary.is_empty() {
+                parts.push(heads[idx].clone());
+            } else {
+                parts.push(format!("{}: {summary}", heads[idx]));
+            }
+        }
+        if let Some(om) = omitted(indirect.len() - kept) {
+            parts.push(om);
+        }
+        Some(parts.join("\n"))
     }
 
     pub async fn connect_configured(&self) {
@@ -242,6 +294,7 @@ impl McpManager {
                         state,
                         registered_tools: Vec::new(),
                         description: entry.config.description.clone(),
+                        instructions: None,
                     },
                 );
             }
@@ -289,13 +342,21 @@ impl McpManager {
         let ns_desc = entry
             .config
             .description
-            .clone()
-            .or_else(|| client.instructions.clone());
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let ns_instructions = client
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
         let namespace = ToolNamespace {
             name: ns_name,
             aliases: vec![entry.name.clone()],
             description: ns_desc.clone(),
-            instructions: client.instructions.clone(),
+            instructions: ns_instructions.clone(),
         };
 
         let mut cleanups = Vec::new();
@@ -338,6 +399,7 @@ impl McpManager {
             if st.description.is_none() {
                 st.description = ns_desc;
             }
+            st.instructions = ns_instructions;
         }
 
         self.servers.lock().await.insert(

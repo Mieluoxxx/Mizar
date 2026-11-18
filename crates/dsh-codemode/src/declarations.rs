@@ -1,11 +1,13 @@
-//! Codemode JS 标识符转换、工具目录渲染与 `prepare_loadout` 预算筛选（对齐 `pi` `codemode/tool.ts`）。
+//! Codemode JS 标识符转换、TypeScript 工具声明渲染与 `prepare_loadout` 预算筛选（对齐 `pi` `codemode/tool.ts`）。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use dsh_tools::{ToolExposure, ToolLoadout, ToolLoadoutChanges, ToolRuntimeInfo};
 
+use crate::schema_ts::{DEFAULT_INPUT_SCHEMA_MAX_CHARS, describe_output, render_tool_sample};
+
 pub const CODEMODE_TOOL_NAME: &str = "codemode";
-pub const DEFAULT_CODEMODE_INLINE_BUDGET: usize = 6000;
+pub const DEFAULT_CODEMODE_INLINE_BUDGET: usize = 3000;
 const CHARS_PER_TOKEN: usize = 4;
 
 /// 将工具原始名转为合法 JS 标识符（如 `mcp__fff__grep` 原样可用，`-`/`.` 等替换为 `_`）。
@@ -33,19 +35,8 @@ fn render_tool_section(info: &ToolRuntimeInfo) -> String {
     } else {
         format!("### `{id}` (`{}`)", info.name)
     };
-    let mut desc = info.description.trim().to_string();
-    for g in &info.prompt_guidelines {
-        let trimmed = g.trim();
-        if !trimmed.is_empty() {
-            desc.push_str(&format!("\n- {trimmed}"));
-        }
-    }
-    let params = serde_json::to_string(&info.parameters).unwrap_or_else(|_| "{}".into());
-    let output_note = match &info.output_schema {
-        Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"any\"".into()),
-        None => "string".to_string(),
-    };
-    format!("{heading}\n{desc}\nCall: `await tools.{id}(args)`\nInput: `{params}`\nOutput: `{output_note}`")
+    let sample = render_tool_sample(info, DEFAULT_INPUT_SCHEMA_MAX_CHARS);
+    format!("{heading}\n{}", sample.trim())
 }
 
 struct CatalogEntry {
@@ -88,20 +79,24 @@ fn select_catalog(groups: &[(Option<String>, Vec<CatalogEntry>)], budget_tokens:
     shown
 }
 
+/// 生成供模型读取的 `codemode` 工具说明书：使用说明 + 全局变量 + 预算内的 TypeScript 工具声明目录。
 pub fn create_codemode_description(callable: &[ToolRuntimeInfo], inline_budget: usize) -> String {
-    let intro = "Run JavaScript inside a sandboxed QuickJS runtime to orchestrate one or more tools in a single turn.\n\
-Only your script's returned value / `text()` / `console.log()` reaches the model; intermediate nested tool results stay out of context.\n\n\
+    let intro = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n\
+- `await tools.<name>({ ...args })` resolves to `structuredContent` when present, otherwise text, and rejects with an Error on failure.\n\
+- Optional first line: `// @options: {\"timeoutMs\": 60000}`\n\n\
 Globals:\n\
-- `tools.<name>(args)`: async call to any callable tool (resolves to `structuredContent` if present, otherwise text; throws on error)\n\
-- `ALL_TOOLS`: array of declared callable tool metadata\n\
-- `await searchTools(query, { limit?, namespace? })`: find deferred/codemode tools via BM25\n\
-- `await describeTool(name)` / `await describeNamespace(name)`: inspect full JSON schema\n\
-- `store(key, value)` / `load(key)`: persist JSON state across scripts in this session\n\
-- `text(str)` / `console.log(...)` / `return value` / `exit(msg?)`";
+- `text(value)`, `console.log(...)`, and top-level `return` add output; `exit(msg?)` ends the script.\n\
+- `store(key, value)` and `load(key)` keep JSON values across codemode calls.\n\
+- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.";
 
     let non_deferred: Vec<&ToolRuntimeInfo> = callable
         .iter()
-        .filter(|t| t.exposure != ToolExposure::Deferred && t.name != CODEMODE_TOOL_NAME)
+        .filter(|t| {
+            !matches!(
+                t.exposure,
+                ToolExposure::Deferred | ToolExposure::Hidden | ToolExposure::ModelOnly
+            ) && t.name != CODEMODE_TOOL_NAME
+        })
         .collect();
     if non_deferred.is_empty() {
         return intro.to_string();
@@ -157,8 +152,9 @@ Globals:\n\
         })
         .collect();
 
-    let shown: std::collections::HashSet<String> =
-        select_catalog(&group_vec, inline_budget).into_iter().collect();
+    let shown: HashSet<String> = select_catalog(&group_vec, inline_budget)
+        .into_iter()
+        .collect();
 
     let mut out = vec![intro.to_string(), "Nested tools:".to_string()];
     for g in grouped.values() {
@@ -168,9 +164,9 @@ Globals:\n\
             let listing = if visible.len() == g.entries.len() {
                 ""
             } else if visible.is_empty() {
-                " (tools not listed; use searchTools())"
+                " (tools not listed)"
             } else {
-                " (some tools not listed; use searchTools())"
+                " (some tools not listed)"
             };
             let mut header = format!("## {ns}{listing}");
             if let Some(d) = &g.description
@@ -189,6 +185,15 @@ Globals:\n\
     out.join("\n\n")
 }
 
+fn describe_script_call(tool: &ToolRuntimeInfo) -> String {
+    let id = to_codemode_identifier(&tool.name);
+    let out = describe_output(&tool.name, tool.output_schema.as_ref());
+    format!(
+        "{}\n\nCodemode: `tools.{id}(args)` resolves to {out}.",
+        tool.description.trim()
+    )
+}
+
 pub fn prepare_codemode_loadout(
     loadout: &ToolLoadout,
     hide_direct_in_only_mode: bool,
@@ -200,6 +205,16 @@ pub fn prepare_codemode_loadout(
         .filter(|t| t.name != CODEMODE_TOOL_NAME)
         .cloned()
         .collect();
+    let callable_names: HashSet<&str> = callable.iter().map(|t| t.name.as_str()).collect();
+
+    let mut descriptions = HashMap::new();
+    if !hide_direct_in_only_mode {
+        for tool in &loadout.declared {
+            if callable_names.contains(tool.name.as_str()) {
+                descriptions.insert(tool.name.clone(), describe_script_call(tool));
+            }
+        }
+    }
 
     let listed: Vec<ToolRuntimeInfo> = if hide_direct_in_only_mode {
         callable.clone()
@@ -211,7 +226,6 @@ pub fn prepare_codemode_loadout(
             .collect()
     };
 
-    let mut descriptions = HashMap::new();
     descriptions.insert(
         CODEMODE_TOOL_NAME.to_string(),
         create_codemode_description(&listed, inline_budget),
@@ -231,5 +245,69 @@ pub fn prepare_codemode_loadout(
     ToolLoadoutChanges {
         descriptions,
         hidden_declarations,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsh_tools::{ToolAnnotations, ToolExecutionMode, ToolNamespace};
+    use serde_json::json;
+
+    fn make_tool(name: &str, ns: Option<ToolNamespace>, exposure: ToolExposure) -> ToolRuntimeInfo {
+        ToolRuntimeInfo {
+            name: name.to_string(),
+            description: format!("Tool {name}"),
+            parameters: json!({
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "Search query" } },
+                "required": ["query"]
+            }),
+            output_schema: None,
+            exposure,
+            execution_mode: ToolExecutionMode::Parallel,
+            annotations: ToolAnnotations::default(),
+            namespace: ns,
+            default_active: None,
+            prompt_snippet: None,
+            prompt_guidelines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn renders_typescript_declarations_and_omits_namespace_instructions_from_catalog() {
+        let ns = ToolNamespace {
+            name: "mcp__fff".to_string(),
+            aliases: vec!["fff".to_string()],
+            description: None,
+            instructions: Some("VERY LONG INSTRUCTIONS THAT MUST NOT LEAK".to_string()),
+        };
+        let t1 = make_tool("mcp__fff__grep", Some(ns), ToolExposure::Codemode);
+        let desc = create_codemode_description(&[t1], DEFAULT_CODEMODE_INLINE_BUDGET);
+        assert!(desc.contains("declare const tools: { mcp__fff__grep(args:"));
+        assert!(!desc.contains("VERY LONG INSTRUCTIONS"));
+        assert!(!desc.contains("\"properties\""));
+    }
+
+    #[test]
+    fn prepare_loadout_annotates_declared_callable_tools_when_not_only_mode() {
+        let direct = make_tool("read", None, ToolExposure::Direct);
+        let cm = make_tool(
+            "mcp__demo__ping",
+            Some(ToolNamespace::new("mcp__demo")),
+            ToolExposure::Codemode,
+        );
+        let loadout = ToolLoadout {
+            declared: vec![direct.clone()],
+            callable: vec![direct, cm],
+            registered: Vec::new(),
+        };
+        let changes = prepare_codemode_loadout(&loadout, false, DEFAULT_CODEMODE_INLINE_BUDGET);
+        assert!(
+            changes.descriptions["read"]
+                .contains("Codemode: `tools.read(args)` resolves to a string.")
+        );
+        assert!(!changes.descriptions["codemode"].contains("### `read`"));
+        assert!(changes.descriptions["codemode"].contains("### `mcp__demo__ping`"));
     }
 }

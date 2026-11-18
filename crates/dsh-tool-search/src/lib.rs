@@ -115,7 +115,7 @@ impl Plugin for ToolSearchPlugin {
                 Ok::<_, dsh_tools::ToolError>(Some(tools.register(
                     ToolDefinition::async_rich_tool(
                         TOOL_SEARCH_TOOL_NAME,
-                        "Search over deferred and codemode tool metadata with BM25 and expose matching tools for your next model call. Always use this tool when an external/MCP tool is not yet declared to you.",
+                        "Search over deferred tool metadata with BM25 and expose matching tools for your next model call. Use this when a deferred (`tool_search`) MCP tool is not yet declared to you; for `codemode` servers, prefer `searchTools()` / `describeTool()` inside `codemode` scripts.",
                         json!({
                             "type": "object",
                             "properties": {
