@@ -1,0 +1,84 @@
+[package]
+name = "dsh-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust translation of NamiDSH (mini Cordis plugin framework + mini DeepSeek Harness + web Agent)"
+license = "MIT"
+
+[workspace]
+members = ["crates/*"]
+default-members = [".", "crates/*"]
+
+[workspace.dependencies]
+axum = "0.8"
+bytes = "1"
+chrono = "0.4"
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "7"
+futures = "0.3"
+globset = "0.4"
+ignore = "0.4"
+libc = "0.2"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
+rquickjs = { version = "0.14", features = ["futures", "parallel"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+unicode-normalization = "0.1"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
+
+cordis = { path = "crates/cordis" }
+dsh-llm = { path = "crates/dsh-llm" }
+dsh-llm-completions = { path = "crates/dsh-llm-completions" }
+dsh-llm-messages = { path = "crates/dsh-llm-messages" }
+dsh-llm-mock = { path = "crates/dsh-llm-mock" }
+dsh-llm-responses = { path = "crates/dsh-llm-responses" }
+dsh-llm-retry = { path = "crates/dsh-llm-retry" }
+dsh-llm-router = { path = "crates/dsh-llm-router" }
+dsh-session = { path = "crates/dsh-session" }
+dsh-session-sqlite = { path = "crates/dsh-session-sqlite" }
+dsh-tools = { path = "crates/dsh-tools" }
+dsh-tools-coding = { path = "crates/dsh-tools-coding" }
+dsh-codemode = { path = "crates/dsh-codemode" }
+dsh-tool-fs = { path = "crates/dsh-tool-fs" }
+dsh-tool-search = { path = "crates/dsh-tool-search" }
+dsh-tool-time = { path = "crates/dsh-tool-time" }
+dsh-mcp = { path = "crates/dsh-mcp" }
+dsh-skills = { path = "crates/dsh-skills" }
+dsh-system-prompt = { path = "crates/dsh-system-prompt" }
+dsh-agent-loop = { path = "crates/dsh-agent-loop" }
+dsh-agent-spine = { path = "crates/dsh-agent-spine" }
+dsh-trajectory = { path = "crates/dsh-trajectory" }
+dsh-tui = { path = "crates/dsh-tui" }
+dsh-webserver = { path = "crates/dsh-webserver" }
+
+[dependencies]
+cordis = { workspace = true }
+dsh-agent-spine = { workspace = true }
+dsh-llm-completions = { workspace = true }
+dsh-llm-messages = { workspace = true }
+dsh-llm-mock = { workspace = true }
+dsh-llm-responses = { workspace = true }
+dsh-llm-retry = { workspace = true }
+dsh-llm-router = { workspace = true }
+dsh-webserver = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+dsh-agent-loop = { workspace = true }
+dsh-llm = { workspace = true }
+dsh-session = { workspace = true }
+dsh-tool-time = { workspace = true }
+dsh-tools = { workspace = true }
+dsh-trajectory = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }

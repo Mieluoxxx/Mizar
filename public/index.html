@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NamiDSH Agent (Rust)</title>
+<style>
+  :root {
+    --bg: #fafaf8; --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5e2;
+    --card: #fff; --accent: #1d1d1f; --soft: #f2f2ef;
+    --ok: #1b7f4b; --warn: #b25e09; --err: #c92a2a; --llm: #2563eb; --tool: #0d9488;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161617; --fg: #ececec; --muted: #9a9aa0; --line: #2c2c2e;
+      --card: #1f1f21; --accent: #ececec; --soft: #262629;
+      --ok: #34d399; --warn: #fbbf24; --err: #f87171; --llm: #60a5fa; --tool: #2dd4bf;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.65 -apple-system, "PingFang SC", "Noto Sans SC", sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 28px 16px 160px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .5px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .tabs { display: flex; gap: 8px; }
+  .tab { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 10px; padding: 6px 14px; font-size: 14px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .tab.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .badge { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--err); color: #fff; }
+  .badge.hidden { display: none; }
+  .hidden { display: none !important; }
+
+  .msg { margin: 18px 0; white-space: pre-wrap; word-break: break-word; }
+  .user { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin-left: 15%; }
+  .status { color: var(--muted); font-size: 14px; }
+  .anomaly-inline { font-size: 13px; color: var(--warn); background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+
+  form#form { position: fixed; left: 0; right: 0; bottom: 0; background: linear-gradient(transparent, var(--bg) 30%); padding: 24px 16px 20px; }
+  .box { max-width: 920px; margin: 0 auto; display: flex; gap: 8px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 8px; }
+  textarea#input { flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: inherit; font: inherit; padding: 6px 8px; max-height: 200px; }
+  button.primary { border: 0; border-radius: 10px; padding: 6px 16px; background: var(--accent); color: var(--bg); font: inherit; cursor: pointer; }
+  button.primary:disabled { opacity: .4; cursor: default; }
+  button.btn, select.btn { border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; background: var(--card); color: var(--fg); font-size: 13px; cursor: pointer; }
+
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .stat-card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .stat-label { font-size: 12px; color: var(--muted); }
+  .stat-value { font-size: 17px; font-weight: 600; margin-top: 2px; }
+
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+  .lane-row { display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 8px; margin: 6px 0; }
+  .lane-label { font-size: 12px; color: var(--muted); }
+  .lane-track { position: relative; height: 22px; background: var(--soft); border-radius: 6px; overflow: hidden; }
+  .span-bar { position: absolute; top: 3px; height: 16px; border-radius: 4px; min-width: 4px; opacity: .9; cursor: pointer; }
+  .span-bar.kind-user, .span-bar.kind-context { background: var(--muted); }
+  .span-bar.kind-assistant { background: var(--llm); }
+  .span-bar.kind-tool { background: var(--tool); }
+  .span-bar.kind-anomaly, .span-bar.is-error { background: var(--err); }
+  .span-ttft { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(255,255,255,0.45); }
+  .turn-line { position: absolute; top: 0; bottom: 0; width: 1px; border-left: 1px dashed var(--muted); opacity: .5; pointer-events: none; }
+
+  .finding { border: 1px solid var(--line); border-left: 4px solid var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .finding.sev-error { border-left-color: var(--err); }
+  .finding.sev-info { border-left-color: var(--llm); }
+  .finding-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+  .pill { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--soft); color: var(--fg); font-family: ui-monospace, SFMono-Regular, monospace; }
+  .finding-body { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+  .record { border-top: 1px solid var(--line); padding: 8px 4px; font-size: 13px; }
+  .record:first-child { border-top: 0; }
+  .record-summary { display: grid; grid-template-columns: 44px 72px 72px 1fr 78px; gap: 8px; align-items: center; cursor: pointer; }
+  .record-summary:hover { background: var(--soft); border-radius: 6px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .record-detail { margin: 8px 0 4px 44px; padding: 8px 10px; background: var(--soft); border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .offline-box textarea { width: 100%; min-height: 90px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--bg); color: var(--fg); font: 12px/1.5 ui-monospace, SFMono-Regular, monospace; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>NamiDSH Agent</h1>
+      <p>迷你版 Cordis + 迷你版 DeepSeek Harness（Rust 版）</p>
+    </div>
+    <div class="tabs">
+      <button type="button" class="tab active" id="tab-chat">对话</button>
+      <button type="button" class="tab" id="tab-traj">
+        轨迹检测
+        <span class="badge hidden" id="anomaly-badge">0</span>
+      </button>
+    </div>
+  </header>
+
+  <section id="view-chat">
+    <div id="list"></div>
+  </section>
+
+  <section id="view-traj" class="hidden">
+    <div class="toolbar">
+      <select class="btn" id="session-select" aria-label="选择会话"></select>
+      <select class="btn" id="mode-select" aria-label="时间轴模式">
+        <option value="sequence">按序展开 (Sequence)</option>
+        <option value="actual">真实时间 (Actual)</option>
+        <option value="duration">压缩空闲 (Duration)</option>
+      </select>
+      <button type="button" class="btn" id="btn-refresh">刷新</button>
+      <button type="button" class="btn" id="btn-export">导出 JSONL</button>
+      <button type="button" class="btn" id="btn-toggle-offline">离线 JSONL 检测</button>
+    </div>
+
+    <div class="panel offline-box hidden" id="offline-panel">
+      <h2>离线轨迹 JSONL 检测（POST /api/trajectory/inspect）</h2>
+      <textarea id="offline-input" placeholder="粘贴 JSONL（每行一条 TraceEvent）或 JSON 数组，点击「运行检测」..."></textarea>
+      <button type="button" class="primary" id="btn-inspect-offline">运行检测</button>
+    </div>
+
+    <div class="stats-grid" id="stats-grid"></div>
+
+    <div class="panel">
+      <h2>三泳道时间轴（输入/告警 · 模型 TTFT/Decode · 工具）</h2>
+      <div id="timeline-box" class="status">暂无轨迹数据</div>
+    </div>
+
+    <div class="panel">
+      <h2>异常检测报告（R01-R06 &amp; Guard）</h2>
+      <div id="findings-box" class="status">未发现异常</div>
+    </div>
+
+    <div class="panel">
+      <h2>Turn / Step 轨迹账本</h2>
+      <div id="records-box" class="status">暂无记录</div>
+    </div>
+  </section>
+</main>
+
+<form id="form">
+  <div class="box">
+    <textarea id="input" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行" autofocus></textarea>
+    <button class="primary" id="send">发送</button>
+  </div>
+</form>
+
+<script>
+  const list = document.getElementById('list')
+  const input = document.getElementById('input')
+  const send = document.getElementById('send')
+  const form = document.getElementById('form')
+  const tabChat = document.getElementById('tab-chat')
+  const tabTraj = document.getElementById('tab-traj')
+  const viewChat = document.getElementById('view-chat')
+  const viewTraj = document.getElementById('view-traj')
+  const anomalyBadge = document.getElementById('anomaly-badge')
+  const sessionSelect = document.getElementById('session-select')
+  const modeSelect = document.getElementById('mode-select')
+  const offlinePanel = document.getElementById('offline-panel')
+  const offlineInput = document.getElementById('offline-input')
+
+  let sessionId = null
+  let anomalyCount = 0
+
+  function setTab(which) {
+    const isChat = which === 'chat'
+    tabChat.classList.toggle('active', isChat)
+    tabTraj.classList.toggle('active', !isChat)
+    viewChat.classList.toggle('hidden', !isChat)
+    viewTraj.classList.toggle('hidden', isChat)
+    form.classList.toggle('hidden', !isChat)
+    if (!isChat) loadSessionsAndTrajectory()
+  }
+
+  tabChat.addEventListener('click', () => setTab('chat'))
+  tabTraj.addEventListener('click', () => setTab('traj'))
+  document.getElementById('btn-refresh').addEventListener('click', () => loadSessionsAndTrajectory())
+  modeSelect.addEventListener('change', () => loadSelectedTrajectory())
+  sessionSelect.addEventListener('change', () => loadSelectedTrajectory())
+  document.getElementById('btn-toggle-offline').addEventListener('click', () => {
+    offlinePanel.classList.toggle('hidden')
+  })
+
+  document.getElementById('btn-export').addEventListener('click', () => {
+    const target = sessionSelect.value || sessionId
+    if (!target) return
+    window.open(`/api/sessions/${encodeURIComponent(target)}/export`, '_blank')
+  })
+
+  document.getElementById('btn-inspect-offline').addEventListener('click', async () => {
+    const raw = offlineInput.value.trim()
+    if (!raw) return
+    const payload = raw.startsWith('[')
+      ? { events: JSON.parse(raw), mode: modeSelect.value }
+      : { jsonl: raw, mode: modeSelect.value }
+    const res = await fetch('/api/trajectory/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const report = await res.json()
+    if (!res.ok) {
+      alert(report.error || '解析失败')
+      return
+    }
+    renderReport(report)
+  })
+
+  function updateBadge(count) {
+    anomalyCount = count
+    anomalyBadge.textContent = String(count)
+    anomalyBadge.classList.toggle('hidden', count === 0)
+  }
+
+  function add(cls, text) {
+    const div = document.createElement('div')
+    div.className = 'msg ' + cls
+    div.textContent = text
+    list.appendChild(div)
+    window.scrollTo(0, document.body.scrollHeight)
+    return div
+  }
+
+  async function ask(message) {
+    add('user', message)
+    const reply = add('status', '思考中…')
+    let text = ''
+    send.disabled = true
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, message }),
+      })
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += value
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop()
+        for (const part of parts) {
+          const event = part.match(/^event: (.*)$/m)?.[1]
+          const data = JSON.parse(part.match(/^data: (.*)$/m)?.[1] ?? '{}')
+          if (event === 'session') sessionId = data.id
+          if (event === 'tool' && !text) reply.textContent = '正在查询…'
+          if (event === 'delta') {
+            text += data.text
+            reply.className = 'msg'
+            reply.textContent = text
+          }
+          if (event === 'anomaly') {
+            updateBadge(anomalyCount + 1)
+            const note = document.createElement('div')
+            note.className = 'anomaly-inline'
+            note.textContent = `⚠ [${data.ruleId}] ${data.summary}`
+            list.insertBefore(note, reply)
+          }
+          if (event === 'error') { reply.className = 'msg status'; reply.textContent = '出错了：' + data.message }
+        }
+        window.scrollTo(0, document.body.scrollHeight)
+      }
+    } catch (e) {
+      reply.className = 'msg status'
+      reply.textContent = '连接失败：' + e.message
+    }
+    send.disabled = false
+    input.focus()
+    if (sessionId) {
+      fetch(`/api/sessions/${encodeURIComponent(sessionId)}/trajectory`)
+        .then(r => r.ok ? r.json() : null)
+        .then(rep => { if (rep) updateBadge(rep.findings.length) })
+        .catch(() => {})
+    }
+  }
+
+  async function loadSessionsAndTrajectory() {
+    try {
+      const res = await fetch('/api/sessions')
+      const sessions = await res.json()
+      const prev = sessionSelect.value || sessionId
+      sessionSelect.innerHTML = ''
+      for (const s of sessions) {
+        const opt = document.createElement('option')
+        opt.value = s.sessionId
+        opt.textContent = `${s.sessionId.slice(0, 8)}… (${s.turns}轮 / ${s.steps}步${s.findingsCount ? ` · ⚠${s.findingsCount}` : ''})`
+        sessionSelect.appendChild(opt)
+      }
+      if (prev && sessions.some(s => s.sessionId === prev)) {
+        sessionSelect.value = prev
+      } else if (sessions.length) {
+        sessionSelect.value = sessions[sessions.length - 1].sessionId
+      }
+      await loadSelectedTrajectory()
+    } catch (e) {
+      document.getElementById('timeline-box').textContent = '加载会话失败：' + e.message
+    }
+  }
+
+  async function loadSelectedTrajectory() {
+    const target = sessionSelect.value || sessionId
+    if (!target) return
+    const mode = modeSelect.value
+    const res = await fetch(`/api/sessions/${encodeURIComponent(target)}/trajectory?mode=${encodeURIComponent(mode)}`)
+    if (!res.ok) return
+    const report = await res.json()
+    renderReport(report)
+  }
+
+  function renderReport(report) {
+    const { snapshot, timeline, findings } = report
+    const st = snapshot.stats
+    updateBadge(findings.length)
+
+    const avgTtft = st.ttftSteps > 0 ? Math.round(st.ttftMs / st.ttftSteps) : 0
+    const statsData = [
+      ['轮次 / 步数', `${st.turns} / ${st.steps}`],
+      ['LLM 耗时', `${st.llmMs} ms`],
+      ['工具耗时', `${st.toolMs} ms`],
+      ['平均 TTFT', `${avgTtft} ms`],
+      ['Token (入/出)', `${st.inputTokens} / ${st.outputTokens}`],
+      ['工具 (总/错/拦)', `${st.toolCalls} / ${st.toolErrors} / ${st.blockedCalls}`],
+      ['检测告警', `${findings.length}`],
+    ]
+    const grid = document.getElementById('stats-grid')
+    grid.innerHTML = ''
+    for (const [label, value] of statsData) {
+      const card = document.createElement('div')
+      card.className = 'stat-card'
+      const l = document.createElement('div')
+      l.className = 'stat-label'
+      l.textContent = label
+      const v = document.createElement('div')
+      v.className = 'stat-value'
+      v.textContent = value
+      card.append(l, v)
+      grid.appendChild(card)
+    }
+
+    const tlBox = document.getElementById('timeline-box')
+    tlBox.innerHTML = ''
+    if (!timeline || !timeline.spans.length) {
+      tlBox.textContent = '暂无时间轴跨度'
+    } else {
+      const total = Math.max(1, timeline.end - timeline.start)
+      const lanes = [
+        { lane: 0, title: '输入 / 告警' },
+        { lane: 1, title: '模型 LLM' },
+        { lane: 2, title: '工具调用' },
+      ]
+      for (const l of lanes) {
+        const row = document.createElement('div')
+        row.className = 'lane-row'
+        const lbl = document.createElement('div')
+        lbl.className = 'lane-label'
+        lbl.textContent = l.title
+        const track = document.createElement('div')
+        track.className = 'lane-track'
+        for (const tb of timeline.turnBoundaries) {
+          const line = document.createElement('div')
+          line.className = 'turn-line'
+          line.style.left = `${((tb.pos - timeline.start) / total) * 100}%`
+          line.title = `Turn #${tb.turn}`
+          track.appendChild(line)
+        }
+        for (const sp of timeline.spans.filter(s => s.lane === l.lane)) {
+          const bar = document.createElement('div')
+          bar.className = `span-bar kind-${sp.kind}${sp.isError ? ' is-error' : ''}`
+          const left = ((sp.start - timeline.start) / total) * 100
+          const width = Math.max(1.2, ((sp.end - sp.start) / total) * 100)
+          bar.style.left = `${left}%`
+          bar.style.width = `${width}%`
+          bar.title = `#${sp.index} [${sp.kind}] ${sp.label} (${sp.end - sp.start}${timeline.mode === 'sequence' ? '步' : 'ms'})`
+          if (sp.ttftOffset != null && sp.end > sp.start) {
+            const ttft = document.createElement('div')
+            ttft.className = 'span-ttft'
+            ttft.style.width = `${Math.min(100, (sp.ttftOffset / (sp.end - sp.start)) * 100)}%`
+            bar.appendChild(ttft)
+          }
+          track.appendChild(bar)
+        }
+        row.append(lbl, track)
+        tlBox.appendChild(row)
+      }
+    }
+
+    const fBox = document.getElementById('findings-box')
+    fBox.innerHTML = ''
+    if (!findings.length) {
+      fBox.textContent = '未检测到异常轨迹'
+    } else {
+      for (const f of findings) {
+        const card = document.createElement('div')
+        card.className = `finding sev-${f.severity}`
+        const head = document.createElement('div')
+        head.className = 'finding-head'
+        const pill = document.createElement('span')
+        pill.className = 'pill'
+        pill.textContent = `${f.severity.toUpperCase()} · ${f.ruleId}`
+        const title = document.createElement('span')
+        title.textContent = f.title
+        head.append(pill, title)
+        const body = document.createElement('div')
+        body.className = 'finding-body'
+        const loc = f.turn != null ? ` (Turn #${f.turn}${f.step != null ? ` / Step #${f.step}` : ''})` : ''
+        body.textContent = `${f.summary}${loc}`
+        card.append(head, body)
+        fBox.appendChild(card)
+      }
+    }
+
+    const rBox = document.getElementById('records-box')
+    rBox.innerHTML = ''
+    if (!snapshot.records.length) {
+      rBox.textContent = '暂无账本记录'
+    } else {
+      for (const rec of snapshot.records) {
+        const wrap = document.createElement('div')
+        wrap.className = 'record'
+        const row = document.createElement('div')
+        row.className = 'record-summary'
+
+        const c1 = document.createElement('span')
+        c1.className = 'mono'
+        c1.textContent = `#${rec.index}`
+        const c2 = document.createElement('span')
+        c2.className = 'mono'
+        c2.textContent = rec.turn != null ? `T${rec.turn}${rec.step != null ? `/S${rec.step}` : ''}` : '-'
+        const c3 = document.createElement('span')
+        c3.className = 'pill'
+        c3.textContent = rec.kind + (rec.blocked ? '·拦' : rec.isError ? '·错' : '')
+        const c4 = document.createElement('span')
+        c4.className = 'truncate'
+        c4.textContent = rec.label
+        const c5 = document.createElement('span')
+        c5.className = 'mono'
+        c5.textContent = rec.durationMs != null ? `${rec.durationMs} ms` : '进行中…'
+        row.append(c1, c2, c3, c4, c5)
+
+        const detail = document.createElement('div')
+        detail.className = 'record-detail hidden mono'
+        const parts = []
+        if (rec.inputDetail) parts.push(`【Input】\n${rec.inputDetail}`)
+        if (rec.reasoningDetail) parts.push(`【Thinking】\n${rec.reasoningDetail}`)
+        if (rec.outputDetail) parts.push(`【Output】\n${rec.outputDetail}`)
+        if (rec.ttftMs != null) parts.push(`TTFT: ${rec.ttftMs} ms`)
+        if (rec.usage) parts.push(`Usage: ${JSON.stringify(rec.usage)}`)
+        detail.textContent = parts.join('\n\n') || '(无额外详情)'
+
+        row.addEventListener('click', () => detail.classList.toggle('hidden'))
+        wrap.append(row, detail)
+        rBox.appendChild(wrap)
+      }
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault()
+    const message = input.value.trim()
+    if (!message || send.disabled) return
+    input.value = ''
+    input.style.height = ''
+    ask(message)
+  })
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault()
+      form.requestSubmit()
+    }
+  })
+  input.addEventListener('input', () => {
+    input.style.height = ''
+    input.style.height = input.scrollHeight + 'px'
+  })
+</script>
+</body>
+</html>

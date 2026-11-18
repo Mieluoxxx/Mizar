@@ -1,0 +1,24 @@
+[package]
+name = "dsh-llm"
+version = "0.1.0"
+edition = "2024"
+description = "抽象 LLM 服务 ctx.llm（对应 NamiDSH packages/llm）"
+license = "MIT"
+
+[features]
+default = []
+http = ["dep:reqwest", "dep:tokio"]
+
+[dependencies]
+bytes = { workspace = true }
+cordis = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

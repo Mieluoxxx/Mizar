@@ -1,0 +1,12 @@
+[package]
+name = "dsh-tool-fs"
+version = "0.1.0"
+edition = "2024"
+description = "只读文件工具 read_file / list_dir（对应 NamiDSH packages/tool-fs）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dsh-tools = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

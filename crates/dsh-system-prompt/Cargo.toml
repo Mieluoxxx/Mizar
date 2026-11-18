@@ -1,0 +1,13 @@
+[package]
+name = "dsh-system-prompt"
+version = "0.1.0"
+edition = "2024"
+description = "系统提示词动态组装 ctx.systemPrompt（对应 NamiDSH packages/system-prompt）"
+license = "MIT"
+
+[dependencies]
+chrono = { workspace = true }
+cordis = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

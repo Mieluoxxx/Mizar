@@ -1,0 +1,16 @@
+[package]
+name = "dsh-llm-retry"
+version = "0.1.0"
+edition = "2024"
+description = "基于 llm/stream waterfall 的瞬时错误自动重试插件（对应 NamiDSH packages/llm-retry）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dsh-llm = { path = "../dsh-llm" }
+futures = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio-util = { workspace = true }

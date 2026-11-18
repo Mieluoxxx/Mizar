@@ -1,0 +1,19 @@
+[package]
+name = "dsh-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP 客户端与 ToolRuntime 接入插件（支持 stdio / Streamable HTTP、分级暴露、工具屏蔽与资源工具）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dirs = { workspace = true }
+dsh-llm = { workspace = true }
+dsh-system-prompt = { workspace = true }
+dsh-tools = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

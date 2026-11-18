@@ -1,0 +1,21 @@
+[package]
+name = "dsh-agent-loop"
+version = "0.1.0"
+edition = "2024"
+description = "Agent 主循环服务 ctx.agentLoop（对应 NamiDSH packages/agent-loop）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dsh-llm = { workspace = true }
+dsh-session = { workspace = true }
+dsh-system-prompt = { workspace = true }
+dsh-tools = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

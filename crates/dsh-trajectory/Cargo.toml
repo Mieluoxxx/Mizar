@@ -1,0 +1,20 @@
+[package]
+name = "dsh-trajectory"
+version = "0.1.0"
+edition = "2024"
+description = "轨迹采集、纯折叠投影、三泳道时间轴、异常检测与重复工具调用守卫（参考 deepseek-harness ui-trajectory / session-stats / repeat-tool-reminder）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dsh-agent-loop = { workspace = true }
+dsh-llm = { workspace = true }
+dsh-session = { workspace = true }
+dsh-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }

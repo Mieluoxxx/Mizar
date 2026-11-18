@@ -1,0 +1,12 @@
+[package]
+name = "dsh-tool-time"
+version = "0.1.0"
+edition = "2024"
+description = "时间工具插件 get_time（对应 NamiDSH packages/tool-time）"
+license = "MIT"
+
+[dependencies]
+chrono = { workspace = true }
+cordis = { workspace = true }
+dsh-tools = { workspace = true }
+serde_json = { workspace = true }

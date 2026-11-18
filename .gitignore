@@ -1,0 +1,43 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local reference repositories (kept untracked)
+/references/
+
+# Local runtime config & session / trajectory storage
+.dsh-rs/
+/.sessions/
+/sessions/
+/trajectories/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# macOS & OS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# Temporary files
+/tmp/
+*.tmp

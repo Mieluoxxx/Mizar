@@ -1,0 +1,16 @@
+[package]
+name = "dsh-codemode"
+version = "0.1.0"
+edition = "2024"
+description = "基于 QuickJS (rquickjs) 沙箱的多工具 JS 编排执行引擎 codemode（对齐 pi codemode）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dsh-tool-search = { workspace = true }
+dsh-tools = { workspace = true }
+rquickjs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

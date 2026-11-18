@@ -1,0 +1,15 @@
+[package]
+name = "dsh-tool-search"
+version = "0.1.0"
+edition = "2024"
+description = "BM25 工具发现与按需激活插件 tool_search（对齐 pi tool-search）"
+license = "MIT"
+
+[dependencies]
+cordis = { workspace = true }
+dsh-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
