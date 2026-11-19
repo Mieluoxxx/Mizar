@@ -1,0 +1,44 @@
+version: 2
+updates:
+  # Rust workspace（通过根 Cargo.toml [workspace.dependencies] 与 Cargo.lock 统一更新）
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 10
+    groups:
+      rust-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # 文档站 site/（Dependabot 通过 npm 生态原生支持 pnpm-lock.yaml）
+  - package-ecosystem: "npm"
+    directory: "/site"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    groups:
+      site-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions workflow 依赖
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
