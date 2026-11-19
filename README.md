@@ -18,10 +18,10 @@
 
 ### Quick Start
 
-Install the prebuilt binary on macOS (Apple Silicon / Intel) or Linux (`x86_64` / `arm64`) from [GitHub Releases](https://github.com/Mieluoxxx/mizar/releases):
+Install the prebuilt binary on macOS (Apple Silicon / Intel) or Linux (`x86_64` / `arm64`) from [GitHub Releases](https://github.com/Mieluoxxx/Mizar/releases):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/mizar/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
 ```
 
 Once installed, check or upgrade to the latest release anytime with `mizar update` (set `MIZAR_SKIP_VERSION_CHECK=1` to disable startup version checks).

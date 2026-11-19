@@ -91,9 +91,15 @@ jobs:
         with:
           ref: refs/tags/${{ needs.prepare.outputs.tag }}
 
+      - name: Read Rust toolchain version
+        id: rust-version
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml | head -n 1)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-version.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - name: Rust cache

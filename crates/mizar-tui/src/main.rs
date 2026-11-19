@@ -29,7 +29,7 @@
 //! - `PROTOCOL`：`completions`（默认）/ `responses` / `messages`
 //! - `BASE_URL`、`MODEL`、`WORKSPACE`、`MIZAR_HOME`
 //! - `MIZAR_SKIP_VERSION_CHECK` / `MIZAR_OFFLINE`：跳过启动时版本检查（`MIZAR_OFFLINE` 同时禁用更新下载）
-//! - `MIZAR_RELEASE_BASE_URL`：覆盖 GitHub Release 基址（默认为 `https://github.com/Mieluoxxx/mizar`）
+//! - `MIZAR_RELEASE_BASE_URL`：覆盖 GitHub Release 基址（默认为 `https://github.com/Mieluoxxx/Mizar`）
 
 use std::io::IsTerminal;
 use std::path::PathBuf;

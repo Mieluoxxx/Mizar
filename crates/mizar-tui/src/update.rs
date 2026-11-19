@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mizar_instructions::sha256_hex;
 use reqwest::redirect::Policy;
 
-pub const DEFAULT_RELEASE_REPO_URL: &str = "https://github.com/Mieluoxxx/mizar";
+pub const DEFAULT_RELEASE_REPO_URL: &str = "https://github.com/Mieluoxxx/Mizar";
 pub const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 

@@ -97,7 +97,7 @@ export function getGithubRepoUrl(): string {
   if (envRepo && envRepo.includes('/')) {
     return `https://github.com/${envRepo}`;
   }
-  return 'https://github.com/Mieluoxxx/mizar';
+  return 'https://github.com/Mieluoxxx/Mizar';
 }
 
 export function getEditPageUrl(

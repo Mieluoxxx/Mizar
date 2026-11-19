@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="Mieluoxxx/mizar"
+REPO="Mieluoxxx/Mizar"
 INSTALL_DIR="${MIZAR_INSTALL_DIR:-${HOME}/.local/bin}"
 VERSION="${MIZAR_VERSION:-}"
 
