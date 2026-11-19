@@ -13,7 +13,9 @@ use mizar_tools::{
 };
 use serde_json::{Value, json};
 
-pub use ranker::{Bm25Ranker, ToolSearchDocument, ToolSearchMatch, create_tool_search_document, tokenize};
+pub use ranker::{
+    Bm25Ranker, ToolSearchDocument, ToolSearchMatch, create_tool_search_document, tokenize,
+};
 
 pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 pub const DEFAULT_TOOL_SEARCH_LIMIT: usize = 8;
@@ -69,7 +71,8 @@ pub fn search_inactive_tools(
         .filter(|t| is_searchable_exposure(t.exposure) && !active.contains(&t.name))
         .collect();
 
-    let docs: Vec<ToolSearchDocument> = candidates.iter().map(create_tool_search_document).collect();
+    let docs: Vec<ToolSearchDocument> =
+        candidates.iter().map(create_tool_search_document).collect();
     let matches = Bm25Ranker::default().rank(query, &docs, limit);
 
     let matched_names: Vec<String> = matches.iter().map(|m| m.name.clone()).collect();

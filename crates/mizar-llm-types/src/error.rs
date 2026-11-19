@@ -144,8 +144,7 @@ impl LlmError {
             LlmErrorCode::RateLimit
         } else if lower.contains("refusal") || lower.contains("content_filter") {
             LlmErrorCode::ContentRefused
-        } else if matches!(status, Some(400 | 404 | 413 | 422))
-            || lower.contains("invalid_request")
+        } else if matches!(status, Some(400 | 404 | 413 | 422)) || lower.contains("invalid_request")
         {
             LlmErrorCode::InvalidRequest
         } else if matches!(status, Some(500..=599))
@@ -184,9 +183,7 @@ impl LlmError {
     }
 }
 
-fn extract_provider_error_fields(
-    body: &str,
-) -> Option<(Option<String>, Option<String>, String)> {
+fn extract_provider_error_fields(body: &str) -> Option<(Option<String>, Option<String>, String)> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let err_obj = v.get("error").unwrap_or(&v);
     let msg = err_obj
@@ -235,7 +232,11 @@ mod tests {
 
     #[test]
     fn classifies_http_and_provider_errors() {
-        let auth = LlmError::classify_http(401, None, r#"{"error":{"message":"bad key","type":"authentication_error"}}"#);
+        let auth = LlmError::classify_http(
+            401,
+            None,
+            r#"{"error":{"message":"bad key","type":"authentication_error"}}"#,
+        );
         assert_eq!(auth.code, LlmErrorCode::Auth);
         assert!(!auth.is_retryable());
 

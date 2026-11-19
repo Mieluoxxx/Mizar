@@ -87,12 +87,11 @@ pub fn format_osc_7501(
     format!("\x1b]7501;{}\x1b\\", parts.join(":"))
 }
 
-pub fn emit_program_status(
-    state: ProgramStatusState,
-    kind: Option<&str>,
-    message: Option<&str>,
-) {
-    if matches!(std::env::var("MIZAR_TUI_PROGRAM_STATUS").as_deref(), Ok("0" | "false")) {
+pub fn emit_program_status(state: ProgramStatusState, kind: Option<&str>, message: Option<&str>) {
+    if matches!(
+        std::env::var("MIZAR_TUI_PROGRAM_STATUS").as_deref(),
+        Ok("0" | "false")
+    ) {
         return;
     }
     let seq = format_osc_7501(state, kind, message);
@@ -187,7 +186,11 @@ pub fn probe_terminal_colors(timeout: Duration) -> TerminalColors {
     }
     const POLLIN_EVENT: i16 = 0x0001;
     unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: std::os::raw::c_uint, timeout: std::os::raw::c_int) -> std::os::raw::c_int;
+        fn poll(
+            fds: *mut PollFd,
+            nfds: std::os::raw::c_uint,
+            timeout: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
         fn read(fd: std::os::raw::c_int, buf: *mut std::os::raw::c_void, count: usize) -> isize;
     }
 

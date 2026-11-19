@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="site/">Docs (中文 / EN)</a> · <a href="docs/plugins.md">Architecture</a> · <a href="AGENTS.md">Contributing</a>
+  <a href="site/">Docs</a> · <a href="docs/plugins.md">Architecture</a> · <a href="AGENTS.md">Contributing</a>
 </p>
 
 ---
@@ -18,7 +18,15 @@
 
 ### Quick Start
 
-Requires **Rust 1.98.0+** (edition 2024, pinned in [`rust-toolchain.toml`](rust-toolchain.toml)).
+Install the prebuilt binary on macOS (Apple Silicon / Intel) or Linux (`x86_64` / `arm64`) from [GitHub Releases](https://github.com/Mieluoxxx/mizar/releases):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/mizar/main/scripts/install.sh | sh
+```
+
+Once installed, check or upgrade to the latest release anytime with `mizar update` (set `MIZAR_SKIP_VERSION_CHECK=1` to disable startup version checks).
+
+Or build from source (requires **Rust 1.98.0+**, edition 2024, pinned in [`rust-toolchain.toml`](rust-toolchain.toml)):
 
 ```sh
 # Launch offline demo mode (when no API key or models.json is configured)
@@ -27,11 +35,8 @@ cargo run -p mizar-tui --bin mizar
 # Or connect directly with an API key
 export DEEPSEEK_API_KEY="sk-..."   # also supports OPENAI_API_KEY / ANTHROPIC_API_KEY
 cargo run -p mizar-tui --bin mizar -- -C /path/to/repo
-```
 
-Build and install the `mizar` binary locally:
-
-```sh
+# Or install locally from the workspace
 cargo install --path crates/mizar-tui
 ```
 

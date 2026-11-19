@@ -3255,8 +3255,7 @@ mod tests {
         );
 
         // 绝对路径与未知斜杠前缀应直接作为普通消息发给模型，不被误判为未知命令
-        let abs_path_prompt =
-            "/Users/moguw/workspace/dsh-space/dsh-rs/docs/plugins.md 帮我更新一下文档";
+        let abs_path_prompt = "/Users/alice/workspace/mizar/docs/plugins.md 帮我更新一下文档";
         app.input.insert_str(abs_path_prompt);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

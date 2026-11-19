@@ -137,7 +137,10 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     let declared = tools.list_declared(Some("s1"));
     let declared_names: Vec<&str> = declared.iter().map(|t| t.name.as_str()).collect();
 
-    assert!(declared_names.contains(&"mcp__fff__grep"), "{declared_names:?}");
+    assert!(
+        declared_names.contains(&"mcp__fff__grep"),
+        "{declared_names:?}"
+    );
     assert!(declared_names.contains(&"list_mcp_resources"));
     assert!(declared_names.contains(&"read_mcp_resource"));
     assert!(
@@ -162,7 +165,10 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
         .unwrap();
     let ns = find_info.namespace.as_ref().unwrap();
     assert_eq!(ns.description, None);
-    assert_eq!(ns.instructions.as_deref(), Some("Indexed repo search server"));
+    assert_eq!(
+        ns.instructions.as_deref(),
+        Some("Indexed repo search server")
+    );
 
     // 调用 mcp__fff__grep 并保留 structured_content
     let grep_res = tools

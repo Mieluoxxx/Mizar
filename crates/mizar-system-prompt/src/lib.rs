@@ -140,9 +140,9 @@ mod tests {
         let sp = app.system_prompt().unwrap();
         let handle = app
             .effect("extra.section", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new("mid", 50, || {
-                    Some("中间段落".into())
-                }))))
+                Ok::<_, CordisError>(Some(
+                    sp.section(PromptSection::new("mid", 50, || Some("中间段落".into()))),
+                ))
             })
             .unwrap();
 

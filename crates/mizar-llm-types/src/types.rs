@@ -182,7 +182,11 @@ impl Message {
         }
     }
 
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>, is_error: bool) -> Self {
+    pub fn tool(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self::Tool {
             tool_call_id: tool_call_id.into(),
             content: content.into(),

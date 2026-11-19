@@ -89,8 +89,16 @@ const LAB_TO_LMS: [[f64; 3]; 3] = [
 ];
 
 const LMS_TO_LINEAR_SRGB: [[f64; 3]; 3] = [
-    [4.076_741_636_075_958, -3.307_711_539_258_063, 0.2309699031821043],
-    [-1.2684379732850315, 2.609_757_349_287_688, -0.341319376002657],
+    [
+        4.076_741_636_075_958,
+        -3.307_711_539_258_063,
+        0.2309699031821043,
+    ],
+    [
+        -1.2684379732850315,
+        2.609_757_349_287_688,
+        -0.341319376002657,
+    ],
     [-0.0041960761386756, -0.7034186179359362, 1.7076146940746117],
 ];
 
@@ -120,7 +128,11 @@ fn mul_mat(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
 
 fn oklab_to_linear_srgb(lab: [f64; 3]) -> [f64; 3] {
     let lms_cbrt = mul_mat(&LAB_TO_LMS, lab);
-    let lms = [lms_cbrt[0].powi(3), lms_cbrt[1].powi(3), lms_cbrt[2].powi(3)];
+    let lms = [
+        lms_cbrt[0].powi(3),
+        lms_cbrt[1].powi(3),
+        lms_cbrt[2].powi(3),
+    ];
     mul_mat(&LMS_TO_LINEAR_SRGB, lms)
 }
 
@@ -164,9 +176,8 @@ fn max_saturation(a: f64, b: f64) -> f64 {
         1.0 + sat * slopes[1],
         1.0 + sat * slopes[2],
     ];
-    let f = weights[0] * base[0].powi(3)
-        + weights[1] * base[1].powi(3)
-        + weights[2] * base[2].powi(3);
+    let f =
+        weights[0] * base[0].powi(3) + weights[1] * base[1].powi(3) + weights[2] * base[2].powi(3);
     let f1 = weights[0] * 3.0 * slopes[0] * base[0].powi(2)
         + weights[1] * 3.0 * slopes[1] * base[1].powi(2)
         + weights[2] * 3.0 * slopes[2] * base[2].powi(2);
@@ -238,8 +249,7 @@ fn chroma_stops(l: f64, a: f64, b: f64) -> (f64, f64, f64) {
                 + 4.1590124 * b
                 + a * (-2.19557347
                     + 1.75198401 * b
-                    + a * (-2.13704948
-                        - 10.02301043 * b
+                    + a * (-2.13704948 - 10.02301043 * b
                         + a * (-4.24894561 + 5.38770819 * b + 4.69891013 * a))));
     let mid_t = 0.11239642
         + 1.0
@@ -277,9 +287,7 @@ pub fn okhsl_to_rgb(hue_deg: f64, saturation: f64, lightness: f64) -> Rgb8 {
     } else {
         let t = 5.0 * (sat - 0.8);
         let k1 = (0.2 * c_mid * c_mid * 1.25 * 1.25) / c0.max(1e-9);
-        c_mid
-            + (t * k1)
-                / (1.0 - (1.0 - k1 / (c_max - c_mid).max(1e-9)) * t).max(1e-9)
+        c_mid + (t * k1) / (1.0 - (1.0 - k1 / (c_max - c_mid).max(1e-9)) * t).max(1e-9)
     };
     linear_srgb_to_rgb8(oklab_to_linear_srgb([l, chroma * a, chroma * b]))
 }
@@ -535,13 +543,34 @@ impl Theme {
                 Rgb8::new(240, 192, 96).to_color(),
             ],
             context_free: Rgb8::new(42, 48, 60).to_color(),
-            pill_success: (Rgb8::new(142, 228, 164).to_color(), Rgb8::new(31, 62, 42).to_color()),
-            pill_error: (Rgb8::new(252, 142, 152).to_color(), Rgb8::new(74, 31, 38).to_color()),
-            pill_warning: (Rgb8::new(248, 206, 114).to_color(), Rgb8::new(72, 56, 26).to_color()),
-            pill_danger: (Rgb8::new(255, 245, 245).to_color(), Rgb8::new(178, 44, 58).to_color()),
-            pill_mode: (Rgb8::new(238, 252, 255).to_color(), Rgb8::new(34, 110, 134).to_color()),
-            pill_owner: (Rgb8::new(240, 247, 255).to_color(), Rgb8::new(48, 92, 168).to_color()),
-            pill_neutral: (Rgb8::new(208, 218, 234).to_color(), Rgb8::new(48, 56, 72).to_color()),
+            pill_success: (
+                Rgb8::new(142, 228, 164).to_color(),
+                Rgb8::new(31, 62, 42).to_color(),
+            ),
+            pill_error: (
+                Rgb8::new(252, 142, 152).to_color(),
+                Rgb8::new(74, 31, 38).to_color(),
+            ),
+            pill_warning: (
+                Rgb8::new(248, 206, 114).to_color(),
+                Rgb8::new(72, 56, 26).to_color(),
+            ),
+            pill_danger: (
+                Rgb8::new(255, 245, 245).to_color(),
+                Rgb8::new(178, 44, 58).to_color(),
+            ),
+            pill_mode: (
+                Rgb8::new(238, 252, 255).to_color(),
+                Rgb8::new(34, 110, 134).to_color(),
+            ),
+            pill_owner: (
+                Rgb8::new(240, 247, 255).to_color(),
+                Rgb8::new(48, 92, 168).to_color(),
+            ),
+            pill_neutral: (
+                Rgb8::new(208, 218, 234).to_color(),
+                Rgb8::new(48, 56, 72).to_color(),
+            ),
             effort_colors: [
                 Rgb8::new(110, 118, 134).to_color(),
                 Rgb8::new(128, 156, 196).to_color(),
@@ -603,13 +632,34 @@ impl Theme {
                 Rgb8::new(204, 134, 28).to_color(),
             ],
             context_free: Rgb8::new(224, 229, 238).to_color(),
-            pill_success: (Rgb8::new(22, 108, 54).to_color(), Rgb8::new(214, 242, 224).to_color()),
-            pill_error: (Rgb8::new(178, 34, 52).to_color(), Rgb8::new(250, 222, 226).to_color()),
-            pill_warning: (Rgb8::new(148, 92, 10).to_color(), Rgb8::new(252, 238, 204).to_color()),
-            pill_danger: (Rgb8::new(255, 255, 255).to_color(), Rgb8::new(192, 42, 58).to_color()),
-            pill_mode: (Rgb8::new(255, 255, 255).to_color(), Rgb8::new(28, 124, 148).to_color()),
-            pill_owner: (Rgb8::new(255, 255, 255).to_color(), Rgb8::new(48, 96, 178).to_color()),
-            pill_neutral: (Rgb8::new(56, 66, 84).to_color(), Rgb8::new(226, 232, 242).to_color()),
+            pill_success: (
+                Rgb8::new(22, 108, 54).to_color(),
+                Rgb8::new(214, 242, 224).to_color(),
+            ),
+            pill_error: (
+                Rgb8::new(178, 34, 52).to_color(),
+                Rgb8::new(250, 222, 226).to_color(),
+            ),
+            pill_warning: (
+                Rgb8::new(148, 92, 10).to_color(),
+                Rgb8::new(252, 238, 204).to_color(),
+            ),
+            pill_danger: (
+                Rgb8::new(255, 255, 255).to_color(),
+                Rgb8::new(192, 42, 58).to_color(),
+            ),
+            pill_mode: (
+                Rgb8::new(255, 255, 255).to_color(),
+                Rgb8::new(28, 124, 148).to_color(),
+            ),
+            pill_owner: (
+                Rgb8::new(255, 255, 255).to_color(),
+                Rgb8::new(48, 96, 178).to_color(),
+            ),
+            pill_neutral: (
+                Rgb8::new(56, 66, 84).to_color(),
+                Rgb8::new(226, 232, 242).to_color(),
+            ),
             effort_colors: [
                 Rgb8::new(142, 148, 162).to_color(),
                 Rgb8::new(88, 124, 168).to_color(),

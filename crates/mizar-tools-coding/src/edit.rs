@@ -7,8 +7,8 @@ use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolOutput
 use serde_json::{Value, json};
 
 use crate::edit_diff::{
-    EditOp, apply_edits_to_normalized_content, detect_line_ending, generate_diff,
-    normalize_to_lf, restore_line_endings, strip_bom,
+    EditOp, apply_edits_to_normalized_content, detect_line_ending, generate_diff, normalize_to_lf,
+    restore_line_endings, strip_bom,
 };
 use crate::path_utils::resolve_to_cwd;
 

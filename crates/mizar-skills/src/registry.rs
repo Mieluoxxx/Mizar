@@ -204,7 +204,12 @@ impl SkillRegistry {
         loop {
             let rev_before = self.revision.load(Ordering::SeqCst);
             let providers = self.providers.lock().unwrap().clone();
-            let cache_hit = self.collect_cache.lock().unwrap().get(&options.cwd).cloned();
+            let cache_hit = self
+                .collect_cache
+                .lock()
+                .unwrap()
+                .get(&options.cwd)
+                .cloned();
             if let Some(cached) = cache_hit
                 && self.is_cache_fresh(&cached, &providers, options).await
                 && self.revision.load(Ordering::SeqCst) == rev_before
@@ -330,10 +335,8 @@ impl SkillRegistry {
 
     pub async fn snapshot(&self, options: SkillLookupOptions) -> SkillCatalogSnapshot {
         let (entries, complete) = self.collect(&options).await;
-        let mut skills: Vec<SkillSummary> = entries
-            .into_values()
-            .map(|e| e.candidate.summary)
-            .collect();
+        let mut skills: Vec<SkillSummary> =
+            entries.into_values().map(|e| e.candidate.summary).collect();
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         SkillCatalogSnapshot { skills, complete }
     }

@@ -22,7 +22,11 @@ impl SessionPersistence for InMemoryMockBackend {
             .lock()
             .unwrap()
             .insert(header.id.clone(), header.clone());
-        self.events.lock().unwrap().entry(header.id.clone()).or_default();
+        self.events
+            .lock()
+            .unwrap()
+            .entry(header.id.clone())
+            .or_default();
         Ok(())
     }
 
@@ -64,7 +68,12 @@ impl SessionPersistence for InMemoryMockBackend {
             .lock()
             .unwrap()
             .values()
-            .filter(|h| query.cwd.as_ref().is_none_or(|c| h.cwd.as_deref() == Some(c.as_str())))
+            .filter(|h| {
+                query
+                    .cwd
+                    .as_ref()
+                    .is_none_or(|c| h.cwd.as_deref() == Some(c.as_str()))
+            })
             .cloned()
             .collect();
         list.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
@@ -94,7 +103,10 @@ impl SessionPersistence for InMemoryMockBackend {
         Ok(())
     }
 
-    fn flush_async(&self, _session_id: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
+    fn flush_async(
+        &self,
+        _session_id: Option<String>,
+    ) -> BoxFuture<'static, PersistenceResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -150,7 +162,9 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
     });
 
     s.append_trace(SessionTraceEvent::TurnStart { turn: 2 });
-    s.append(SessionEvent::User { text: "继续".into() });
+    s.append(SessionEvent::User {
+        text: "继续".into(),
+    });
     s.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
             id: "c1".into(),

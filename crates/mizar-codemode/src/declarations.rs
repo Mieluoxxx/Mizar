@@ -46,7 +46,10 @@ struct CatalogEntry {
 }
 
 /// 轮询每个命名空间，保证各个命名空间都能按预算公平展示至少一部分工具。
-fn select_catalog(groups: &[(Option<String>, Vec<CatalogEntry>)], budget_tokens: usize) -> Vec<String> {
+fn select_catalog(
+    groups: &[(Option<String>, Vec<CatalogEntry>)],
+    budget_tokens: usize,
+) -> Vec<String> {
     let mut queues: Vec<Vec<&CatalogEntry>> = groups
         .iter()
         .map(|(_, entries)| {
@@ -58,7 +61,9 @@ fn select_catalog(groups: &[(Option<String>, Vec<CatalogEntry>)], budget_tokens:
 
     let mut shown = Vec::new();
     let mut remaining = budget_tokens;
-    let mut active: Vec<usize> = (0..queues.len()).filter(|&i| !queues[i].is_empty()).collect();
+    let mut active: Vec<usize> = (0..queues.len())
+        .filter(|&i| !queues[i].is_empty())
+        .collect();
 
     while !active.is_empty() {
         let mut next_active = Vec::new();
@@ -115,10 +120,7 @@ Globals:\n\
             .as_ref()
             .map(|n| n.name.clone())
             .unwrap_or_default();
-        let ns_desc = info
-            .namespace
-            .as_ref()
-            .and_then(|n| n.description.clone());
+        let ns_desc = info.namespace.as_ref().and_then(|n| n.description.clone());
         let section = render_tool_section(info);
         let cost = section.len().div_ceil(CHARS_PER_TOKEN);
         grouped
@@ -158,8 +160,11 @@ Globals:\n\
 
     let mut out = vec![intro.to_string(), "Nested tools:".to_string()];
     for g in grouped.values() {
-        let visible: Vec<&CatalogEntry> =
-            g.entries.iter().filter(|e| shown.contains(&e.name)).collect();
+        let visible: Vec<&CatalogEntry> = g
+            .entries
+            .iter()
+            .filter(|e| shown.contains(&e.name))
+            .collect();
         if let Some(ns) = &g.name {
             let listing = if visible.len() == g.entries.len() {
                 ""

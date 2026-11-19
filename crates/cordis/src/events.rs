@@ -105,8 +105,7 @@ type DynNextFn = Box<dyn FnOnce(DynAnySend) -> DynAnySend + Send>;
 type SyncEmitFn = Arc<dyn Fn(&dyn Any) + Send + Sync>;
 type SyncSignalFn = Arc<dyn Fn() + Send + Sync>;
 type SyncBailFn = Arc<dyn Fn(&dyn Any) -> Option<DynAnySend> + Send + Sync>;
-type AsyncSerialFn =
-    Arc<dyn Fn(&dyn Any) -> BoxFuture<'static, Option<DynAnySend>> + Send + Sync>;
+type AsyncSerialFn = Arc<dyn Fn(&dyn Any) -> BoxFuture<'static, Option<DynAnySend>> + Send + Sync>;
 type AsyncParallelFn =
     Arc<dyn Fn(&dyn Any) -> BoxFuture<'static, Result<(), BoxError>> + Send + Sync>;
 type WaterfallFn = Arc<dyn Fn(DynAnySend, DynNextFn) -> DynAnySend + Send + Sync>;

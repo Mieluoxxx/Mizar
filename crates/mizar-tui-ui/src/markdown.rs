@@ -114,8 +114,7 @@ pub fn render_markdown_rich(
             }
             if closed {
                 out.push(RenderedLine::hard(Line::from(Span::styled(
-                    "└─",
-                    dim_style,
+                    "└─", dim_style,
                 ))));
             }
             continue;
@@ -126,7 +125,9 @@ pub fn render_markdown_rich(
             tree_rails.clear();
             let start = idx;
             idx += 2;
-            while idx < lines.len() && lines[idx].trim().contains('|') && !lines[idx].trim().is_empty()
+            while idx < lines.len()
+                && lines[idx].trim().contains('|')
+                && !lines[idx].trim().is_empty()
             {
                 idx += 1;
             }
@@ -204,7 +205,10 @@ pub fn render_markdown_rich(
                     update_tree_rails(&mut tree_rails, depth, &tree_line.ancestor_rails, is_open);
                     let rest = tree_line.rest.trim_end();
                     let pref = Span::styled(tree_line.prefix.clone(), dim_style);
-                    let cont = Span::styled(tree_branch_cont_guide(&tree_rails, &tree_line.prefix), dim_style);
+                    let cont = Span::styled(
+                        tree_branch_cont_guide(&tree_rails, &tree_line.prefix),
+                        dim_style,
+                    );
                     let spans = if rest.is_empty() {
                         vec![Span::raw("")]
                     } else {
@@ -320,14 +324,7 @@ pub fn render_markdown_rich(
                 None
             };
             out.extend(render_bullet_item(
-                rest,
-                rail_span,
-                &pad,
-                target_w,
-                width,
-                base_style,
-                theme,
-                emphasis,
+                rest, rail_span, &pad, target_w, width, base_style, theme, emphasis,
             ));
             idx += 1;
             continue;
@@ -348,7 +345,10 @@ pub fn render_markdown_rich(
             };
             let first_str = format!("{pad}{num_prefix} ");
             let cont_str = " ".repeat(display_width(&first_str));
-            first_prefixes.push(Span::styled(first_str, Style::default().fg(theme.text_muted)));
+            first_prefixes.push(Span::styled(
+                first_str,
+                Style::default().fg(theme.text_muted),
+            ));
             cont_prefixes.push(Span::raw(cont_str));
             let spans = parse_inline_rich(rest, base_style, theme, emphasis, true);
             out.extend(wrap_styled_spans_with_prefixes(
@@ -486,12 +486,8 @@ fn is_box_border_continuation(ch: char) -> bool {
 }
 
 fn match_tree_branch_token(s: &str) -> Option<(usize, bool)> {
-    for (tok, is_open) in [
-        ("├──", true),
-        ("└──", false),
-        ("├─", true),
-        ("└─", false),
-    ] {
+    for (tok, is_open) in [("├──", true), ("└──", false), ("├─", true), ("└─", false)]
+    {
         if let Some(after) = s.strip_prefix(tok) {
             if after.chars().next().is_some_and(is_box_border_continuation) {
                 return None;
@@ -534,9 +530,7 @@ fn split_tree_prefix_raw(s: &str) -> Option<(usize, Vec<bool>, TreeKind, usize)>
             }
             let after_spaces = pos - trailing_start;
             let rest_preview = after_bar.trim_start_matches(' ');
-            if !rest_preview.starts_with('│')
-                && match_tree_branch_token(rest_preview).is_none()
-            {
+            if !rest_preview.starts_with('│') && match_tree_branch_token(rest_preview).is_none() {
                 return Some((pos, ancestor_rails, TreeKind::RailLine, pos));
             }
             // 若紧跟的是另一层 `│` 或 `├──`/`└──`，把多出的空白组折算为闭合层
@@ -636,7 +630,11 @@ fn tree_branch_cont_guide(rails: &[bool], prefix: &str) -> String {
     s
 }
 
-fn active_tree_blank_guide(lines: &[&str], scan_from: usize, tree_rails: &[bool]) -> Option<String> {
+fn active_tree_blank_guide(
+    lines: &[&str],
+    scan_from: usize,
+    tree_rails: &[bool],
+) -> Option<String> {
     let mut j = scan_from;
     while j < lines.len() && lines[j].trim().is_empty() {
         j += 1;
@@ -698,7 +696,9 @@ fn compute_key_desc_align_run(
         }
         let tree_opt = parse_tree_line(line);
         let rest_opt = match (&tree_opt, first_is_rail) {
-            (Some(t), true) if matches!(t.kind, TreeKind::RailLine) && t.prefix == first_rail_prefix => {
+            (Some(t), true)
+                if matches!(t.kind, TreeKind::RailLine) && t.prefix == first_rail_prefix =>
+            {
                 strip_unordered_bullet(t.rest.trim_start())
             }
             (None, false) => {
@@ -780,7 +780,9 @@ fn render_bullet_item(
         let kw = spans_display_width(&combined);
         let gap = target_w.saturating_sub(kw) + 1;
         combined.push(Span::styled(format!("{}— ", " ".repeat(gap)), base_style));
-        combined.extend(parse_inline_rich(tail_raw, base_style, theme, emphasis, false));
+        combined.extend(parse_inline_rich(
+            tail_raw, base_style, theme, emphasis, false,
+        ));
         combined
     } else {
         parse_inline_rich(rest, base_style, theme, emphasis, true)
@@ -1320,10 +1322,7 @@ fn highlight_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'stati
                         base_style,
                     ));
                 }
-                spans.push(Span::styled(
-                    token.to_string(),
-                    Style::default().fg(color),
-                ));
+                spans.push(Span::styled(token.to_string(), Style::default().fg(color)));
                 plain_start = i;
             }
             continue;
@@ -1473,8 +1472,7 @@ fn try_parse_strong(line: &str, byte_idx: usize, delim: &str) -> Option<(String,
             let valid_standard = !prev_ch.is_whitespace()
                 && (!is_unicode_punct(prev_ch)
                     || next_ch.is_none_or(|c| c.is_whitespace() || is_unicode_punct(c)));
-            let valid_cjk_adjacent =
-                is_unicode_punct(prev_ch) && next_ch.is_some_and(is_cjk_char);
+            let valid_cjk_adjacent = is_unicode_punct(prev_ch) && next_ch.is_some_and(is_cjk_char);
 
             if valid_standard || valid_cjk_adjacent {
                 let next_byte = byte_idx + delim.len() + abs_end + delim.len();
@@ -1528,9 +1526,7 @@ fn try_parse_italic(line: &str, byte_idx: usize) -> Option<(String, usize)> {
             }
             let prev_ch = inner.chars().next_back()?;
             let next_ch = rest[pos + 1..].chars().next();
-            if !prev_ch.is_whitespace()
-                && !next_ch.is_some_and(|c| c.is_ascii_alphanumeric())
-            {
+            if !prev_ch.is_whitespace() && !next_ch.is_some_and(|c| c.is_ascii_alphanumeric()) {
                 return Some((inner.to_string(), byte_idx + 1 + pos + 1));
             }
             pos += 1;
@@ -1567,7 +1563,8 @@ fn try_parse_pill(line: &str, byte_idx: usize) -> Option<(&str, usize)> {
     let rest = line.get(byte_idx..)?.strip_prefix("[[")?;
     let rel_end = rest.find("]]")?;
     let inner = &rest[..rel_end];
-    if inner.is_empty() || inner.contains('[') || inner.contains(']') || inner.chars().count() > 32 {
+    if inner.is_empty() || inner.contains('[') || inner.contains(']') || inner.chars().count() > 32
+    {
         return None;
     }
     Some((inner, byte_idx + 2 + rel_end + 2))
@@ -1589,7 +1586,11 @@ fn try_parse_link(line: &str, byte_idx: usize) -> Option<(&str, &str, usize)> {
     if url.contains('\n') || url.contains(' ') {
         return None;
     }
-    Some((label, url, byte_idx + 1 + close_bracket + 2 + close_paren + 1))
+    Some((
+        label,
+        url,
+        byte_idx + 1 + close_bracket + 2 + close_paren + 1,
+    ))
 }
 
 /// 富文本行内解析：支持反引号代码、CJK 修正粗体、`[[Pill]]`、动作引导词图标、`✓/✗/→/├──` 着色与 `[text](url)` 链接。
@@ -2078,11 +2079,7 @@ fn tokenize_spans_for_wrap(spans: Vec<Span<'static>>, avail_w: usize) -> Vec<Raw
             let mut w = char_width(ch);
             chars.next();
             while let Some(&(nb, nch)) = chars.peek() {
-                if nch == ' '
-                    || !nch.is_ascii()
-                    || is_cjk_char(nch)
-                    || char_width(nch) >= 2
-                {
+                if nch == ' ' || !nch.is_ascii() || is_cjk_char(nch) || char_width(nch) >= 2 {
                     break;
                 }
                 end_b = nb + nch.len_utf8();
@@ -2218,10 +2215,7 @@ fn wrap_styled_spans_with_prefixes(
     max_width: usize,
 ) -> Vec<RenderedLine> {
     let width = max_width.max(2);
-    let cont_prefix_w: usize = prefix_cont
-        .iter()
-        .map(|p| display_width(&p.content))
-        .sum();
+    let cont_prefix_w: usize = prefix_cont.iter().map(|p| display_width(&p.content)).sum();
     let avail_w = width.saturating_sub(cont_prefix_w).max(1);
 
     let raw = tokenize_spans_for_wrap(spans, avail_w);
@@ -2235,15 +2229,14 @@ fn wrap_styled_spans_with_prefixes(
     let mut pending_space: Vec<(String, Style)> = Vec::new();
     let mut pending_space_w = 0usize;
 
-    let push_prefixes = |target: &mut Vec<Span<'static>>,
-                         col: &mut usize,
-                         prefs: &[Span<'static>]| {
-        for p in prefs {
-            let pw: usize = p.content.chars().map(char_width).sum();
-            *col += pw;
-            target.push(p.clone());
-        }
-    };
+    let push_prefixes =
+        |target: &mut Vec<Span<'static>>, col: &mut usize, prefs: &[Span<'static>]| {
+            for p in prefs {
+                let pw: usize = p.content.chars().map(char_width).sum();
+                *col += pw;
+                target.push(p.clone());
+            }
+        };
 
     let flush_line = |lines: &mut Vec<RenderedLine>,
                       cur_spans: &mut Vec<Span<'static>>,
@@ -2384,11 +2377,7 @@ fn wrap_styled_spans_with_prefixes(
 }
 
 /// 使用 `similar` 进行行内词级 Diff 渲染（隔离共同前导缩进，宽屏可切分双栏）。
-pub fn render_diff_rich(
-    diff_text: &str,
-    max_width: usize,
-    theme: &Theme,
-) -> Vec<RenderedLine> {
+pub fn render_diff_rich(diff_text: &str, max_width: usize, theme: &Theme) -> Vec<RenderedLine> {
     let raw_lines: Vec<&str> = diff_text
         .lines()
         .filter(|l| !l.starts_with("--- ") && !l.starts_with("+++ "))
@@ -2463,11 +2452,7 @@ fn intra_line_word_diff_spans(
     (del_spans, add_spans)
 }
 
-fn render_unified_word_diff(
-    lines: &[&str],
-    max_width: usize,
-    theme: &Theme,
-) -> Vec<RenderedLine> {
+fn render_unified_word_diff(lines: &[&str], max_width: usize, theme: &Theme) -> Vec<RenderedLine> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < lines.len() {
@@ -2593,16 +2578,17 @@ fn render_split_diff(lines: &[&str], max_width: usize, theme: &Theme) -> Vec<Ren
     let mut out = Vec::new();
     let mut i = 0usize;
 
-    let pad_spans_to = |spans: Vec<Span<'static>>, bg: Color, target_w: usize| -> Vec<Span<'static>> {
-        let (mut clipped, used) = clip_spans_to_width(&spans, target_w, false);
-        if used < target_w {
-            clipped.push(Span::styled(
-                " ".repeat(target_w - used),
-                Style::default().bg(bg),
-            ));
-        }
-        clipped
-    };
+    let pad_spans_to =
+        |spans: Vec<Span<'static>>, bg: Color, target_w: usize| -> Vec<Span<'static>> {
+            let (mut clipped, used) = clip_spans_to_width(&spans, target_w, false);
+            if used < target_w {
+                clipped.push(Span::styled(
+                    " ".repeat(target_w - used),
+                    Style::default().bg(bg),
+                ));
+            }
+            clipped
+        };
 
     while i < lines.len() {
         let line = lines[i];
@@ -2677,7 +2663,10 @@ fn render_split_diff(lines: &[&str], max_width: usize, theme: &Theme) -> Vec<Ren
             ctx_text.clone(),
             Style::default().fg(theme.text_muted),
         )];
-        let right_ctx = vec![Span::styled(ctx_text, Style::default().fg(theme.text_muted))];
+        let right_ctx = vec![Span::styled(
+            ctx_text,
+            Style::default().fg(theme.text_muted),
+        )];
         let mut combined = pad_spans_to(left_ctx, Color::Reset, pane_w);
         combined.push(sep.clone());
         combined.extend(pad_spans_to(right_ctx, Color::Reset, pane_w));
@@ -2771,12 +2760,7 @@ mod tests {
         assert!(rendered.len() >= 8);
         let first_w = spans_display_width(&rendered[0].line.spans);
         for (row_idx, rl) in rendered.iter().enumerate() {
-            let row_str: String = rl
-                .line
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let row_str: String = rl.line.spans.iter().map(|s| s.content.as_ref()).collect();
             let rw = spans_display_width(&rl.line.spans);
             assert_eq!(
                 rw, first_w,
@@ -2842,8 +2826,18 @@ mod tests {
             .line;
         assert_eq!(core_line.spans[0].content, "├── ");
         assert_eq!(core_line.spans[0].style.fg, Some(theme.text_dim));
-        assert!(!core_line.spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(core_line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !core_line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            core_line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
 
         // 2. 子列表保留外层竖脊并缩进对齐，同时成组 key — desc 对齐 `—`
         let read_row = texts.iter().find(|l| l.contains("read")).unwrap();
@@ -2856,13 +2850,22 @@ mod tests {
         );
 
         let ff_row = texts.iter().find(|l| l.contains("find_files")).unwrap();
-        assert!(ff_row.starts_with("│  │  • find_files"), "ff row: {ff_row:?}");
+        assert!(
+            ff_row.starts_with("│  │  • find_files"),
+            "ff row: {ff_row:?}"
+        );
 
         let cg_row = texts.iter().find(|l| l.contains("codegraph")).unwrap();
-        assert!(cg_row.starts_with("│     • codegraph"), "cg row: {cg_row:?}");
+        assert!(
+            cg_row.starts_with("│     • codegraph"),
+            "cg row: {cg_row:?}"
+        );
 
         let note_row = texts.iter().find(|l| l.contains("外部工具")).unwrap();
-        assert!(note_row.starts_with("   • 外部工具"), "note row: {note_row:?}");
+        assert!(
+            note_row.starts_with("   • 外部工具"),
+            "note row: {note_row:?}"
+        );
 
         // 3. 树分支之间的空行保持竖脊不断裂
         assert!(
@@ -3018,7 +3021,12 @@ mod tests {
         // "要么在启动探测阶段就提示缺依赖" = 30 列，"." = 2 列，width=30 时必须把"赖。"一起推到下一行
         let r_punct = render_markdown_rich(md_punct, 30, &theme, &cfg);
         assert_eq!(r_punct.len(), 2);
-        let p_line1: String = r_punct[1].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let p_line1: String = r_punct[1]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert_eq!(p_line1, "赖。");
 
         // 2. 英文标识符与行内代码路径不能从中间腰斩
@@ -3034,10 +3042,7 @@ mod tests {
                 .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect();
             for l in &lines_str {
-                assert!(
-                    display_width(l) <= w,
-                    "exceeded width {w}: {l:?}"
-                );
+                assert!(display_width(l) <= w, "exceeded width {w}: {l:?}");
                 let trimmed_l = l.trim_start();
                 assert!(
                     !trimmed_l.starts_with('。')

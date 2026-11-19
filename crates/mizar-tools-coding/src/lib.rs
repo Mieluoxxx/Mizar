@@ -173,7 +173,8 @@ mod tests {
 
     #[tokio::test]
     async fn exercises_all_six_coding_tools_end_to_end() {
-        let root = std::env::temp_dir().join(format!("mizar_coding_tools_test_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("mizar_coding_tools_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join(".gitignore"), "ignored.log\n").unwrap();

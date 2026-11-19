@@ -416,7 +416,8 @@ async fn compat_08_service_class_inject_config_async_init() {
         fn init(self: Arc<Self>, _ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
             Box::pin(async move {
                 tick(1).await;
-                self.log.push(format!("  Loop init 完成, max = {}", self.max));
+                self.log
+                    .push(format!("  Loop init 完成, max = {}", self.max));
                 Ok(())
             })
         }
@@ -498,7 +499,10 @@ async fn compat_09_events_all_five_modes() {
     tick(15).await;
 
     app.emit("greet", "nami".to_string());
-    log.push(format!("  bail = {}", app.bail::<(), &str>("pick", ()).unwrap()));
+    log.push(format!(
+        "  bail = {}",
+        app.bail::<(), &str>("pick", ()).unwrap()
+    ));
     log.push(format!(
         "  serial = {}",
         app.serial::<(), &str>("pick", ()).await.unwrap()
@@ -623,7 +627,10 @@ async fn compat_12_uninjected_service_cannot_be_read_via_service() {
             if let Err(err) = ctx.service::<i32>("secret") {
                 log_q.push(format!("  直接读: {err}"));
             }
-            log_q.push(format!("  ctx.get 可以: {}", ctx.get::<i32>("secret").unwrap()));
+            log_q.push(format!(
+                "  ctx.get 可以: {}",
+                ctx.get::<i32>("secret").unwrap()
+            ));
         }),
         (),
     );

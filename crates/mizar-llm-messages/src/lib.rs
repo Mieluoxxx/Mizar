@@ -13,16 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
-use mizar_llm_http::{
-    DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
-    resolve_credential, spawn_sse_stream,
-};
+use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
     LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo, ReasoningEffort,
     ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, prefix_digest,
 };
-use futures::channel::mpsc;
+use mizar_llm_http::{
+    DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
+    resolve_credential, spawn_sse_stream,
+};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_MESSAGES: &str = "anthropic-messages";
@@ -151,7 +151,10 @@ pub fn build_request_body(
         match msg {
             Message::System { .. } => {}
             Message::User { content } => {
-                push_user_block(&mut wire_messages, json!({ "type": "text", "text": content }));
+                push_user_block(
+                    &mut wire_messages,
+                    json!({ "type": "text", "text": content }),
+                );
             }
             Message::Tool {
                 content,
@@ -642,7 +645,9 @@ impl SseStreamDecoder for MessagesSseDecoder {
                 if let Some(state) = self.blocks.get(&index) {
                     let block = match state {
                         BlockState::Text { text } => ContentBlock::Text { text: text.clone() },
-                        BlockState::Thinking { text, .. } => ContentBlock::Reasoning { text: text.clone() },
+                        BlockState::Thinking { text, .. } => {
+                            ContentBlock::Reasoning { text: text.clone() }
+                        }
                         BlockState::ToolUse {
                             id,
                             name,
@@ -668,7 +673,10 @@ impl SseStreamDecoder for MessagesSseDecoder {
                 }
             }
             "message_delta" => {
-                if let Some(sr) = payload.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                if let Some(sr) = payload
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                {
                     self.stop_reason = Some(sr.to_string());
                 }
                 if let Some(u) = payload.get("usage") {
@@ -800,7 +808,10 @@ impl LlmAdapter for MessagesAdapter {
             Ok(k) => k,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
-        let url = format!("{}/models?limit=1000", ensure_v1_root(&self.config.base_url));
+        let url = format!(
+            "{}/models?limit=1000",
+            ensure_v1_root(&self.config.base_url)
+        );
         let headers = self.build_headers(api_key.as_deref(), &[]);
         let client = self.client.clone();
         Box::pin(async move { discover_models_http(&client, &url, &headers).await })
@@ -878,8 +889,8 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::post;
-    use mizar_llm::{BlockAssembler, SseParser, ToolCall, ToolSchema};
     use futures::StreamExt;
+    use mizar_llm::{BlockAssembler, SseParser, ToolCall, ToolSchema};
     use tokio::net::TcpListener;
 
     #[test]

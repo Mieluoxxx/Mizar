@@ -13,6 +13,16 @@ import DocCard from '../../../components/mdx/DocCard.astro';
 
 export const introTabs = [
     {
+      label: 'Prebuilt Binary',
+      lang: 'bash',
+      code: `# Install on macOS (Apple Silicon / Intel) or Linux (x86_64 / arm64) to ~/.local/bin/mizar
+curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/mizar/main/scripts/install.sh | sh
+
+# Verify and launch
+mizar --version
+mizar`,
+    },
+    {
       label: 'Keyless Demo Mode',
       lang: 'bash',
       code: `# Enters offline demo mode automatically when no API key or models.json is configured

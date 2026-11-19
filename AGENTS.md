@@ -34,7 +34,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI 跑后三条，**clippy 的 warning 也算失败**。仓库**没有** xtask / scripts / rustfmt.toml / `tempfile` 依赖。
+CI 跑后三条，**clippy 的 warning 也算失败**。仓库**没有** xtask / rustfmt.toml / `tempfile` 依赖（`scripts/install.sh` 仅用于安装预编译二进制）。
 
 ---
 

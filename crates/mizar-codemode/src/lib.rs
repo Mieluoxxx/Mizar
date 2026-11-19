@@ -269,7 +269,8 @@ mod tests {
             .await;
         assert!(res_timeout.is_error);
         assert!(
-            res_timeout.content.contains("timed out") || res_timeout.content.contains("interrupted"),
+            res_timeout.content.contains("timed out")
+                || res_timeout.content.contains("interrupted"),
             "unexpected timeout msg: {}",
             res_timeout.content
         );

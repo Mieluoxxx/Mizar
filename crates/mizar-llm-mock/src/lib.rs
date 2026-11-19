@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
+use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, Message,
     ModelInfo, ProviderInfo, StreamChunk, ToolCall,
 };
-use futures::channel::mpsc;
 
 pub struct MockAdapter;
 
@@ -185,7 +185,9 @@ impl Plugin for MockPlugin {
         Box::pin(async move {
             let llm = ctx.llm()?;
             ctx.effect("llm-mock.registerAdapter", || {
-                Ok::<_, mizar_llm::LlmError>(Some(llm.register_adapter("mock", Arc::new(MockAdapter))?))
+                Ok::<_, mizar_llm::LlmError>(Some(
+                    llm.register_adapter("mock", Arc::new(MockAdapter))?,
+                ))
             })?;
             Ok(None)
         })

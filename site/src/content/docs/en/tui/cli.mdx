@@ -1,6 +1,6 @@
 ---
 title: CLI Flags
-description: All 12 Mizar command-line startup flags and scenario combinations covering workspace scoping, tool filtering, viewports, approvals, and session persistence.
+description: Mizar command-line startup flags and scenario combinations covering workspace scoping, tool filtering, viewports, approvals, session persistence, and help/version output.
 group: tui-sessions-ref
 order: 9
 ---
@@ -68,6 +68,23 @@ mizar --no-persist --no-instructions
 | `--resume [ID]` | `-r [ID]` | Resume the session matching `ID`; omit `ID` to open a recent session picker |
 | `--no-persist` | — | Disable writing this session to `~/.mizar/sessions.sqlite` |
 | `--no-instructions` | — | Skip scanning and injecting `AGENTS.md` / `CLAUDE.md` (see [Project Rules](/en/instructions/)) |
+| `--help` | `-h` | Print CLI help and exit |
+| `--version` | `-V` | Print the current version and exit |
+
+## Self-Update
+
+On startup, Mizar asynchronously checks for newer GitHub Releases in the background (disable via `MIZAR_SKIP_VERSION_CHECK=1` or `MIZAR_OFFLINE=1`) and posts a non-blocking notice if an update is available. Run:
+
+```bash
+# Update to the latest release (with SHA256 verification)
+mizar update
+
+# Check without installing
+mizar update --check
+
+# Install a specific version (including prereleases)
+mizar update --version v0.1.1
+```
 
 <Callout type="tip">
 

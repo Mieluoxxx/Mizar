@@ -1,7 +1,7 @@
 use mizar_llm_types::TokenUsage;
 use mizar_trajectory_core::{
-    DetectorConfig, TimelineMode, TraceEvent, TraceEventKind, canonicalize_json, detect_anomalies,
-    derive_timeline, fold_trajectory, wildcard_matches,
+    DetectorConfig, TimelineMode, TraceEvent, TraceEventKind, canonicalize_json, derive_timeline,
+    detect_anomalies, fold_trajectory, wildcard_matches,
 };
 use serde_json::json;
 
@@ -34,7 +34,13 @@ fn wildcard_matching_works() {
 fn folds_stats_timeline_and_detects_all_rules() {
     let events = vec![
         ev(1, 1000, TraceEventKind::TurnStart { turn: 1 }),
-        ev(2, 1000, TraceEventKind::UserMessage { text: "查一下".into() }),
+        ev(
+            2,
+            1000,
+            TraceEventKind::UserMessage {
+                text: "查一下".into(),
+            },
+        ),
         ev(
             3,
             1010,

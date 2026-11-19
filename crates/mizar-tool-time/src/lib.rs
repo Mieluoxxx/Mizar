@@ -32,7 +32,9 @@ impl Plugin for ToolTimePlugin {
                     "get_time",
                     "获取当前的日期和时间",
                     json!({ "type": "object", "properties": {} }),
-                    |_args, _exec| Ok::<_, BoxError>(Local::now().format("%Y/%m/%d %H:%M:%S").to_string()),
+                    |_args, _exec| {
+                        Ok::<_, BoxError>(Local::now().format("%Y/%m/%d %H:%M:%S").to_string())
+                    },
                 ))?))
             })?;
             Ok(None)

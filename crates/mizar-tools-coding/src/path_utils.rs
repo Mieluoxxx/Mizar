@@ -48,7 +48,11 @@ pub fn expand_user_path(raw: &str) -> PathBuf {
     PathBuf::from(without_at)
 }
 
-pub fn resolve_to_cwd(cwd: &Path, raw: &str, restrict_to_workspace: bool) -> Result<PathBuf, String> {
+pub fn resolve_to_cwd(
+    cwd: &Path,
+    raw: &str,
+    restrict_to_workspace: bool,
+) -> Result<PathBuf, String> {
     let abs_cwd = if cwd.is_absolute() {
         cwd.to_path_buf()
     } else {
@@ -91,7 +95,9 @@ pub async fn resolve_read_path(
     }
 
     let s = primary.to_string_lossy();
-    let am_pm = s.replace(" AM.", "\u{202F}AM.").replace(" PM.", "\u{202F}PM.");
+    let am_pm = s
+        .replace(" AM.", "\u{202F}AM.")
+        .replace(" PM.", "\u{202F}PM.");
     if am_pm != s {
         let alt = PathBuf::from(&am_pm);
         if tokio::fs::try_exists(&alt).await.unwrap_or(false)

@@ -99,19 +99,25 @@ impl ReflectService {
             let impl_ = self
                 .get_impl(name, false)
                 .ok_or_else(|| CordisError::MissingInject(name.to_string()))?;
-            return impl_.value.downcast::<T>().map_err(|_| CordisError::TypeMismatch {
-                name: name.to_string(),
-                expected: std::any::type_name::<T>(),
-            });
+            return impl_
+                .value
+                .downcast::<T>()
+                .map_err(|_| CordisError::TypeMismatch {
+                    name: name.to_string(),
+                    expected: std::any::type_name::<T>(),
+                });
         }
 
         let mut current = Some(ctx.fiber().clone());
         while let Some(fiber) = current {
             if let Some(impl_) = fiber.get_from_snapshot(name) {
-                return impl_.value.downcast::<T>().map_err(|_| CordisError::TypeMismatch {
-                    name: name.to_string(),
-                    expected: std::any::type_name::<T>(),
-                });
+                return impl_
+                    .value
+                    .downcast::<T>()
+                    .map_err(|_| CordisError::TypeMismatch {
+                        name: name.to_string(),
+                        expected: std::any::type_name::<T>(),
+                    });
             }
             if fiber.has_inject(name) {
                 return Err(CordisError::InactiveService(name.to_string()));

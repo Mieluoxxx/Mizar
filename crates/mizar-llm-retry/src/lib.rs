@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
+use futures::StreamExt;
+use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, EVENT_LLM_STREAM, FinishReason, GenerateOptions, LlmContextExt, LlmError,
     LlmErrorCode, LlmRuntime, StreamChunk,
 };
-use futures::StreamExt;
-use futures::channel::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -110,7 +110,9 @@ fn wrap_with_retry(
                             ..
                         } = chunk
                         {
-                            if !emitted_content && attempt < cfg.max_retries && cfg.is_retryable(code)
+                            if !emitted_content
+                                && attempt < cfg.max_retries
+                                && cfg.is_retryable(code)
                             {
                                 retry_err = Some(LlmError {
                                     code,
@@ -147,7 +149,9 @@ fn wrap_with_retry(
                         }
                     }
                     Err(err) => {
-                        if !emitted_content && attempt < cfg.max_retries && cfg.is_retryable(err.code)
+                        if !emitted_content
+                            && attempt < cfg.max_retries
+                            && cfg.is_retryable(err.code)
                         {
                             retry_err = Some(err);
                             break;
@@ -367,6 +371,9 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].is_ok());
-        assert_eq!(chunks[1].as_ref().unwrap_err().code, LlmErrorCode::RateLimit);
+        assert_eq!(
+            chunks[1].as_ref().unwrap_err().code,
+            LlmErrorCode::RateLimit
+        );
     }
 }

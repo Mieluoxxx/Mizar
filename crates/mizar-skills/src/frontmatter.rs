@@ -185,7 +185,9 @@ pub fn parse_skill_markdown(raw: &str) -> Result<ParsedSkillFile, String> {
         .cloned()
         .ok_or_else(|| "frontmatter requires `name`".to_string())?;
     if !is_skill_name(&name) {
-        return Err(format!("invalid skill name \"{name}\" (must be kebab-case)"));
+        return Err(format!(
+            "invalid skill name \"{name}\" (must be kebab-case)"
+        ));
     }
 
     let description = fields

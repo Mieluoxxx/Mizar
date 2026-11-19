@@ -158,6 +158,7 @@ pub struct TuiConfig {
     pub mouse_capture: Option<bool>,
     pub resume_session: Option<ResumeTarget>,
     pub restrict_to_workspace: bool,
+    pub check_for_updates: bool,
     pub startup_notices: Vec<(NoticeLevel, String)>,
 }
 
@@ -178,6 +179,7 @@ impl TuiConfig {
             mouse_capture: None,
             resume_session: None,
             restrict_to_workspace: false,
+            check_for_updates: false,
             startup_notices: Vec::new(),
         }
     }
@@ -841,6 +843,20 @@ pub async fn run_tui_with_summary(
     let mut pending_steer: Option<String> = None;
     let mut user_cancelled = false;
 
+    let update_check_task = if config.check_for_updates {
+        let tx_update = ui_tx.clone();
+        Some(tokio::spawn(async move {
+            if let Some(latest_tag) = crate::update::check_for_new_version().await {
+                let _ = tx_update.send(UiEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text: crate::update::format_update_notice(&latest_tag),
+                });
+            }
+        }))
+    } else {
+        None
+    };
+
     while !app.should_quit {
         if app.screen_mode == ScreenMode::Inline && !app.is_busy && !app.is_bash_running {
             flush_inline_scrollback(&mut terminal, &mut app);
@@ -946,6 +962,9 @@ pub async fn run_tui_with_summary(
         }
     }
 
+    if let Some(task) = update_check_task {
+        task.abort();
+    }
     emit_program_status(ProgramStatusState::Idle, None, None);
     if let Some(cancel) = active_cancel.take() {
         cancel.cancel();

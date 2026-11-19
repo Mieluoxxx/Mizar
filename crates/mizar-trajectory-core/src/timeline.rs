@@ -133,10 +133,7 @@ fn derive_timed(records: &[TrajectoryRecord], compress_idle: bool) -> Option<Tim
             });
         }
 
-        let ttft_offset = item
-            .rec
-            .ttft_ms
-            .map(|ttft| ttft.min(dur));
+        let ttft_offset = item.rec.ttft_ms.map(|ttft| ttft.min(dur));
 
         spans.push(TimelineSpan {
             index: item.rec.index,

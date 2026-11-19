@@ -99,7 +99,11 @@ impl Context {
     }
 
     /// 挂载插件（若当前 Context 未激活则返回 `Err(CordisError::InactiveEffect)`）。
-    pub fn try_plugin<P: Plugin>(&self, plugin: P, config: P::Config) -> Result<Fiber, CordisError> {
+    pub fn try_plugin<P: Plugin>(
+        &self,
+        plugin: P,
+        config: P::Config,
+    ) -> Result<Fiber, CordisError> {
         self.root.registry.plugin(self, plugin, config)
     }
 

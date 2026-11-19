@@ -5,16 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
-use mizar_llm_http::{
-    DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
-    spawn_sse_stream, trim_base_url,
-};
+use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
     LlmContextExt, LlmError, Message, ModelInfo, ProviderInfo, ReasoningEffort, ReplayEnvelope,
     SseEvent, StreamChunk, TokenUsage,
 };
-use futures::channel::mpsc;
+use mizar_llm_http::{
+    DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
+    spawn_sse_stream, trim_base_url,
+};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_RESPONSES: &str = "openai-responses";
@@ -472,7 +472,9 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                         self.usage = Some(u);
                     }
                     if event_type == "response.incomplete"
-                        || resp_obj.pointer("/incomplete_details/reason").and_then(Value::as_str)
+                        || resp_obj
+                            .pointer("/incomplete_details/reason")
+                            .and_then(Value::as_str)
                             == Some("max_output_tokens")
                     {
                         self.finish_reason = Some(FinishReason::MaxTokens);
@@ -525,11 +527,14 @@ impl SseStreamDecoder for ResponsesSseDecoder {
             return Ok(());
         }
 
-        let reason = self.finish_reason.clone().unwrap_or(if self.has_tool_calls {
-            FinishReason::ToolCalls
-        } else {
-            FinishReason::Stop
-        });
+        let reason = self
+            .finish_reason
+            .clone()
+            .unwrap_or(if self.has_tool_calls {
+                FinishReason::ToolCalls
+            } else {
+                FinishReason::Stop
+            });
         let replay = ReplayEnvelope {
             protocol: PROTOCOL_RESPONSES.to_string(),
             provider: self.provider.clone(),
@@ -558,10 +563,7 @@ impl ResponsesAdapter {
             .base_url
             .clone()
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let model = config
-            .model
-            .clone()
-            .unwrap_or_else(|| "gpt-5".to_string());
+        let model = config.model.clone().unwrap_or_else(|| "gpt-5".to_string());
         Self {
             config,
             base_url,
@@ -634,10 +636,7 @@ impl LlmAdapter for ResponsesAdapter {
             }
         };
 
-        let model = options
-            .model
-            .clone()
-            .unwrap_or_else(|| self.model.clone());
+        let model = options.model.clone().unwrap_or_else(|| self.model.clone());
         let body = build_request_body(&self.config, &options, &model);
         let url = format!("{}/responses", trim_base_url(&self.base_url));
         let headers = self.build_headers(api_key.as_deref(), &options.headers);
@@ -696,8 +695,8 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::post;
-    use mizar_llm::{BlockAssembler, SseParser, ToolCall};
     use futures::StreamExt;
+    use mizar_llm::{BlockAssembler, SseParser, ToolCall};
     use tokio::net::TcpListener;
 
     #[test]

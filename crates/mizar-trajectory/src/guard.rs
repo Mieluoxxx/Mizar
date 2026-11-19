@@ -105,8 +105,10 @@ impl Plugin for RepeatToolGuardPlugin {
             }
             if !seen.insert(v) {
                 issues.push(
-                    ValidationIssue::new("repeat-tool-guard: `thresholds` must not contain duplicates")
-                        .at(["thresholds"]),
+                    ValidationIssue::new(
+                        "repeat-tool-guard: `thresholds` must not contain duplicates",
+                    )
+                    .at(["thresholds"]),
                 );
                 break;
             }

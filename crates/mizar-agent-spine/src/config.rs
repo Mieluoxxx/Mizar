@@ -707,15 +707,40 @@ impl LoadedMizarConfig {
 
         if env.explicit_api_key.is_some() || (router.providers.is_empty() && fallback_key.is_some())
         {
-            let protocol = env
-                .protocol
-                .as_deref()
-                .unwrap_or("completions")
-                .to_ascii_lowercase();
-            let mut route = match protocol.as_str() {
-                "responses" => ProviderRouteConfig::openai_responses("API_KEY"),
-                "messages" | "anthropic" => ProviderRouteConfig::anthropic_messages("API_KEY"),
-                _ => ProviderRouteConfig::openai_completions("API_KEY"),
+            let env_hint = if env.explicit_api_key.is_some() {
+                None
+            } else {
+                env.provider_hint
+            };
+            let mut route = if let Some(protocol) = env.protocol.as_deref() {
+                match protocol.to_ascii_lowercase().as_str() {
+                    "responses" | "openai-responses" => {
+                        ProviderRouteConfig::openai_responses("API_KEY")
+                    }
+                    "messages" | "anthropic" | "anthropic-messages" => {
+                        ProviderRouteConfig::anthropic_messages("API_KEY")
+                    }
+                    "deepseek" => ProviderRouteConfig::deepseek_completions("API_KEY"),
+                    _ => match env_hint {
+                        Some(EnvProviderKind::Deepseek) => {
+                            ProviderRouteConfig::deepseek_completions("DEEPSEEK_API_KEY")
+                        }
+                        _ => ProviderRouteConfig::openai_completions("API_KEY"),
+                    },
+                }
+            } else {
+                match env_hint {
+                    Some(EnvProviderKind::Anthropic) => {
+                        ProviderRouteConfig::anthropic_messages("ANTHROPIC_API_KEY")
+                    }
+                    Some(EnvProviderKind::Deepseek) => {
+                        ProviderRouteConfig::deepseek_completions("DEEPSEEK_API_KEY")
+                    }
+                    Some(EnvProviderKind::Openai) => {
+                        ProviderRouteConfig::openai_completions("OPENAI_API_KEY")
+                    }
+                    None => ProviderRouteConfig::openai_completions("API_KEY"),
+                }
             };
             route.api_key = fallback_key;
             if let Some(url) = env.base_url {
@@ -793,10 +818,18 @@ impl LoadedMizarConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvProviderKind {
+    Openai,
+    Anthropic,
+    Deepseek,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EnvLlmOverride {
     pub explicit_api_key: Option<String>,
     pub provider_api_key: Option<String>,
+    pub provider_hint: Option<EnvProviderKind>,
     pub protocol: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -808,14 +841,30 @@ fn env_non_empty(key: &str) -> Option<String> {
 
 impl EnvLlmOverride {
     pub fn from_env() -> Self {
+        Self::from_lookup(env_non_empty)
+    }
+
+    pub fn from_lookup<F>(mut lookup: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut clean = |k: &str| lookup(k).filter(|s| !s.trim().is_empty());
+        let (provider_api_key, provider_hint) = if let Some(k) = clean("OPENAI_API_KEY") {
+            (Some(k), Some(EnvProviderKind::Openai))
+        } else if let Some(k) = clean("ANTHROPIC_API_KEY") {
+            (Some(k), Some(EnvProviderKind::Anthropic))
+        } else if let Some(k) = clean("DEEPSEEK_API_KEY") {
+            (Some(k), Some(EnvProviderKind::Deepseek))
+        } else {
+            (None, None)
+        };
         Self {
-            explicit_api_key: env_non_empty("API_KEY"),
-            provider_api_key: env_non_empty("OPENAI_API_KEY")
-                .or_else(|| env_non_empty("ANTHROPIC_API_KEY"))
-                .or_else(|| env_non_empty("DEEPSEEK_API_KEY")),
-            protocol: env_non_empty("PROTOCOL"),
-            base_url: env_non_empty("BASE_URL"),
-            model: env_non_empty("MODEL"),
+            explicit_api_key: clean("API_KEY"),
+            provider_api_key,
+            provider_hint,
+            protocol: clean("PROTOCOL"),
+            base_url: clean("BASE_URL"),
+            model: clean("MODEL"),
         }
     }
 }
@@ -1054,6 +1103,71 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn provider_specific_env_keys_infer_matching_endpoint_and_model() {
+        let empty_cfg = LoadedMizarConfig::default();
+
+        // 仅设 DEEPSEEK_API_KEY 时应走 DeepSeek 端点与 deepseek-chat，而非 OpenAI
+        let ds_env = EnvLlmOverride::from_lookup(|k| match k {
+            "DEEPSEEK_API_KEY" => Some("sk-ds".to_string()),
+            _ => None,
+        });
+        let ds_resolved = empty_cfg
+            .resolve_llm_router_with_env(ds_env)
+            .expect("DEEPSEEK_API_KEY should resolve");
+        let ds_route = &ds_resolved.router.providers["default"];
+        assert_eq!(
+            ds_route.protocol,
+            mizar_llm_router::ProtocolKind::OpenaiCompletions
+        );
+        assert_eq!(
+            ds_route.base_url.as_deref(),
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(ds_resolved.active_model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(ds_route.api_key.as_deref(), Some("sk-ds"));
+
+        // 仅设 ANTHROPIC_API_KEY 时应走 Anthropic Messages 协议与 claude 模型
+        let ant_env = EnvLlmOverride::from_lookup(|k| match k {
+            "ANTHROPIC_API_KEY" => Some("sk-ant".to_string()),
+            _ => None,
+        });
+        let ant_resolved = empty_cfg
+            .resolve_llm_router_with_env(ant_env)
+            .expect("ANTHROPIC_API_KEY should resolve");
+        let ant_route = &ant_resolved.router.providers["default"];
+        assert_eq!(
+            ant_route.protocol,
+            mizar_llm_router::ProtocolKind::AnthropicMessages
+        );
+        assert_eq!(
+            ant_route.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(
+            ant_resolved.active_model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+
+        // 显式 BASE_URL / MODEL 覆盖推断默认值
+        let ds_custom = EnvLlmOverride::from_lookup(|k| match k {
+            "DEEPSEEK_API_KEY" => Some("sk-ds".to_string()),
+            "MODEL" => Some("deepseek-reasoner".to_string()),
+            "BASE_URL" => Some("https://proxy.example.com/v1".to_string()),
+            _ => None,
+        });
+        let custom_resolved = empty_cfg.resolve_llm_router_with_env(ds_custom).unwrap();
+        let custom_route = &custom_resolved.router.providers["default"];
+        assert_eq!(
+            custom_route.base_url.as_deref(),
+            Some("https://proxy.example.com/v1")
+        );
+        assert_eq!(
+            custom_resolved.active_model.as_deref(),
+            Some("deepseek-reasoner")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1142,5 +1256,70 @@ mod disabled_plugins_tests {
         assert_eq!(raw_empty["disabledPlugins"], serde_json::json!([]));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn provider_specific_env_keys_infer_matching_endpoint_and_model() {
+        let empty_cfg = LoadedMizarConfig::default();
+
+        // 仅设 DEEPSEEK_API_KEY 时应走 DeepSeek 端点与 deepseek-chat，而非 OpenAI
+        let ds_env = EnvLlmOverride::from_lookup(|k| match k {
+            "DEEPSEEK_API_KEY" => Some("sk-ds".to_string()),
+            _ => None,
+        });
+        let ds_resolved = empty_cfg
+            .resolve_llm_router_with_env(ds_env)
+            .expect("DEEPSEEK_API_KEY should resolve");
+        let ds_route = &ds_resolved.router.providers["default"];
+        assert_eq!(
+            ds_route.protocol,
+            mizar_llm_router::ProtocolKind::OpenaiCompletions
+        );
+        assert_eq!(
+            ds_route.base_url.as_deref(),
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(ds_resolved.active_model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(ds_route.api_key.as_deref(), Some("sk-ds"));
+
+        // 仅设 ANTHROPIC_API_KEY 时应走 Anthropic Messages 协议与 claude 模型
+        let ant_env = EnvLlmOverride::from_lookup(|k| match k {
+            "ANTHROPIC_API_KEY" => Some("sk-ant".to_string()),
+            _ => None,
+        });
+        let ant_resolved = empty_cfg
+            .resolve_llm_router_with_env(ant_env)
+            .expect("ANTHROPIC_API_KEY should resolve");
+        let ant_route = &ant_resolved.router.providers["default"];
+        assert_eq!(
+            ant_route.protocol,
+            mizar_llm_router::ProtocolKind::AnthropicMessages
+        );
+        assert_eq!(
+            ant_route.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(
+            ant_resolved.active_model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+
+        // 显式 BASE_URL / MODEL 覆盖推断默认值
+        let ds_custom = EnvLlmOverride::from_lookup(|k| match k {
+            "DEEPSEEK_API_KEY" => Some("sk-ds".to_string()),
+            "MODEL" => Some("deepseek-reasoner".to_string()),
+            "BASE_URL" => Some("https://proxy.example.com/v1".to_string()),
+            _ => None,
+        });
+        let custom_resolved = empty_cfg.resolve_llm_router_with_env(ds_custom).unwrap();
+        let custom_route = &custom_resolved.router.providers["default"];
+        assert_eq!(
+            custom_route.base_url.as_deref(),
+            Some("https://proxy.example.com/v1")
+        );
+        assert_eq!(
+            custom_resolved.active_model.as_deref(),
+            Some("deepseek-reasoner")
+        );
     }
 }

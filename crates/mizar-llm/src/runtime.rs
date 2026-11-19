@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
 use futures::Stream;
 
-use mizar_llm_types::LlmError;
 use crate::types::{GenerateOptions, ModelInfo, ProviderInfo, StreamChunk};
+use mizar_llm_types::LlmError;
 
 pub const EVENT_ADAPTERS_UPDATED: &str = "llm/adapters-updated";
 pub const EVENT_LLM_STREAM: &str = "llm/stream";
@@ -193,9 +193,9 @@ impl LlmRuntime {
             .resolve_adapter(options.provider.as_deref())
             .ok_or_else(LlmError::no_adapter)?;
 
-        Ok(self.ctx.waterfall(EVENT_LLM_STREAM, options, move |opts| {
-            adapter.stream(opts)
-        }))
+        Ok(self
+            .ctx
+            .waterfall(EVENT_LLM_STREAM, options, move |opts| adapter.stream(opts)))
     }
 }
 

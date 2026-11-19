@@ -9,6 +9,7 @@ pub use collector::{
     TrajectoryContextExt, TrajectoryEventEmitted, TrajectoryRuntime, trace_events_from_entries,
     trace_events_from_session,
 };
+pub use guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent, RepeatGuardConfig, RepeatToolGuardPlugin};
 pub use mizar_trajectory_core::{
     DetectorConfig, RecordKind, SessionStats, Severity, TimelineMode, TimelineModel, TimelineSpan,
     TimelineTurnBoundary, TraceEvent, TraceEventKind, TrajectoryFinding, TrajectoryRecord,
@@ -16,4 +17,3 @@ pub use mizar_trajectory_core::{
     canonicalize_args_str, canonicalize_json, derive_timeline, detect_anomalies, fold_trajectory,
     preview_chars, sort_json_value, wildcard_matches,
 };
-pub use guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent, RepeatGuardConfig, RepeatToolGuardPlugin};

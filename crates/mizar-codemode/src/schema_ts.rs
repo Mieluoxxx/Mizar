@@ -289,7 +289,9 @@ fn sanitize_line_terminators(s: &str) -> String {
     out
 }
 
-fn normalize_draft04_bounds(obj: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+fn normalize_draft04_bounds(
+    obj: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
     let mut out = obj.clone();
     if obj.get("exclusiveMinimum").and_then(Value::as_bool) == Some(true) {
         if let Some(min_val) = obj.get("minimum").cloned() {
@@ -562,7 +564,9 @@ fn describe_fields(schema: &Value, root: &Value, depth: usize) -> Option<String>
     let fields: Vec<String> = props
         .iter()
         .map(|(name, field)| {
-            let const_val = follow_ref(field, root).as_object().and_then(|o| o.get("const"));
+            let const_val = follow_ref(field, root)
+                .as_object()
+                .and_then(|o| o.get("const"));
             let nested = if let Some(cv) = const_val {
                 serde_json::to_string(cv).ok()
             } else if depth > 0 {
@@ -699,7 +703,10 @@ mod tests {
             })),
         );
         let sample = render_tool_sample(&info, DEFAULT_INPUT_SCHEMA_MAX_CHARS);
-        assert!(sample.contains("codemode tool declaration:\n```ts"), "{sample}");
+        assert!(
+            sample.contains("codemode tool declaration:\n```ts"),
+            "{sample}"
+        );
         assert!(
             sample.contains("mcp__fff__grep(args: { pattern: string; }): Promise<{"),
             "{sample}"

@@ -668,7 +668,7 @@ mod tests {
         assert_eq!(input.active_slash_trigger(), Some((0, "mod".to_string())));
 
         input.clear();
-        input.insert_str("/Users/moguw/docs/plugins.md");
+        input.insert_str("/Users/alice/docs/plugins.md");
         assert_eq!(input.active_slash_trigger(), None);
 
         input.clear();

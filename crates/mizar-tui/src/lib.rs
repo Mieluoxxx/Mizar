@@ -2,6 +2,7 @@
 
 pub mod mentions;
 pub mod runner;
+pub mod update;
 
 pub mod emphasis {
     pub use crate::runner::mount_reply_guidance_section;
@@ -9,15 +10,15 @@ pub mod emphasis {
 }
 
 pub use mizar_tui_ui::{
-    app, editor, markdown, overlay, reveal, selection, side_panel, terminal, theme, timeline_rail,
-    trajectory_scene, ui,
-};
-pub use mizar_tui_ui::{
     AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, NoticeLevel,
     ScreenMode, SessionReplayItem, SessionViewData, TerminalColors, Theme, ThemePreset, ToolState,
     UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason,
     build_item_lines_for_scrollback, build_item_lines_for_scrollback_at,
     build_welcome_lines_for_scrollback, render,
+};
+pub use mizar_tui_ui::{
+    app, editor, markdown, overlay, reveal, selection, side_panel, terminal, theme, timeline_rail,
+    trajectory_scene, ui,
 };
 pub use runner::{
     ResumeTarget, TuiConfig, TuiExitSummary, format_resume_command, mount_reply_guidance_section,

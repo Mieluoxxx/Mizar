@@ -102,7 +102,10 @@ fn split_line_spans(content: &str) -> Vec<LineSpan> {
     spans
 }
 
-fn get_replacement_line_range(lines: &[LineSpan], rep: &TextReplacement) -> Result<(usize, usize), String> {
+fn get_replacement_line_range(
+    lines: &[LineSpan],
+    rep: &TextReplacement,
+) -> Result<(usize, usize), String> {
     let rep_start = rep.match_index;
     let rep_end = rep.match_index + rep.match_length;
 
@@ -345,9 +348,7 @@ pub fn apply_edits_to_normalized_content(
     let new_content = apply_replacements(normalized_content, &final_replacements, 0);
     if new_content == normalized_content {
         return Err(if total == 1 {
-            format!(
-                "No changes made to {path}. The replacement produced identical content."
-            )
+            format!("No changes made to {path}. The replacement produced identical content.")
         } else {
             format!("No changes made to {path}. The replacements produced identical content.")
         });
@@ -421,12 +422,16 @@ mod tests {
         .unwrap();
 
         assert!(applied.used_fuzzy_match);
-        let final_out = format!("{bom}{}", restore_line_endings(&applied.new_content, ending));
+        let final_out = format!(
+            "{bom}{}",
+            restore_line_endings(&applied.new_content, ending)
+        );
         assert!(final_out.starts_with('\u{FEFF}'));
         assert!(final_out.contains("let s = \"hi\";\r\n"));
         assert!(final_out.contains("println!(\"rust\");\r\n"));
 
-        let (diff, first_line) = generate_diff("demo.rs", &applied.base_content, &applied.new_content, 2);
+        let (diff, first_line) =
+            generate_diff("demo.rs", &applied.base_content, &applied.new_content, 2);
         assert!(diff.contains("-\t") || diff.contains("-    let s"));
         assert_eq!(first_line, Some(2));
     }

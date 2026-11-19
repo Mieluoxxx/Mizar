@@ -8,16 +8,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
-use mizar_llm_http::{
-    DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
-    spawn_sse_stream, trim_base_url,
-};
+use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
     LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo, ReasoningEffort,
     ReplayEnvelope, SseEvent, StreamChunk, TokenUsage,
 };
-use futures::channel::mpsc;
+use mizar_llm_http::{
+    DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
+    spawn_sse_stream, trim_base_url,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -748,8 +748,8 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::post;
-    use mizar_llm::{BlockAssembler, SseParser, ToolCall};
     use futures::StreamExt;
+    use mizar_llm::{BlockAssembler, SseParser, ToolCall};
     use tokio::net::TcpListener;
 
     #[test]

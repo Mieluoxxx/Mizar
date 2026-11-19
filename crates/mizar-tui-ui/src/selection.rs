@@ -301,11 +301,7 @@ fn is_word_char(sym: &str) -> bool {
     if ch.is_whitespace() {
         return false;
     }
-    ch.is_alphanumeric()
-        || matches!(
-            ch,
-            '/' | '-' | '+' | '\\' | '~' | '_' | '.' | ':' | '@'
-        )
+    ch.is_alphanumeric() || matches!(ch, '/' | '-' | '+' | '\\' | '~' | '_' | '.' | ':' | '@')
 }
 
 fn expand_word_bounds(buf: &Buffer, fence: Rect, col: u16, row: u16) -> (u16, u16) {
@@ -570,7 +566,12 @@ mod tests {
     #[test]
     fn double_click_selects_word_and_strips_pill_caps() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
-        buf.set_string(0, 0, "run \u{e0b6}Done\u{e0b4} src/app.rs", Style::default());
+        buf.set_string(
+            0,
+            0,
+            "run \u{e0b6}Done\u{e0b4} src/app.rs",
+            Style::default(),
+        );
         let mut geom = SelectionGeometry {
             chat_rect: Some(Rect::new(0, 0, 30, 1)),
             ..Default::default()

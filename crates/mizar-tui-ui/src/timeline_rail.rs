@@ -157,9 +157,7 @@ pub fn render_timeline_rail(
     let active_style = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let hover_style = Style::default()
-        .fg(theme.link)
-        .add_modifier(Modifier::BOLD);
+    let hover_style = Style::default().fg(theme.link).add_modifier(Modifier::BOLD);
 
     let up_style = if snap.up_idx.is_none() {
         dim_style

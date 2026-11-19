@@ -39,10 +39,9 @@ impl ProtocolKind {
 pub fn parse_protocol_api(raw: &str) -> Result<ProtocolKind, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "openai-completions" | "completions" => Ok(ProtocolKind::OpenaiCompletions),
-        "openai-responses"
-        | "openai-codex-responses"
-        | "azure-openai-responses"
-        | "responses" => Ok(ProtocolKind::OpenaiResponses),
+        "openai-responses" | "openai-codex-responses" | "azure-openai-responses" | "responses" => {
+            Ok(ProtocolKind::OpenaiResponses)
+        }
         "anthropic-messages" | "anthropic" | "messages" => Ok(ProtocolKind::AnthropicMessages),
         "mock" => Ok(ProtocolKind::Mock),
         other => Err(other.to_string()),
@@ -358,10 +357,7 @@ impl RouterModelConfig {
     }
 
     /// 按 Pi 的 `thinkingLevelMap` 与 `reasoning` 能力裁剪/映射推理档位。
-    pub fn resolve_thinking_level(
-        &self,
-        requested: ReasoningEffort,
-    ) -> Option<ReasoningEffort> {
+    pub fn resolve_thinking_level(&self, requested: ReasoningEffort) -> Option<ReasoningEffort> {
         if self.reasoning == Some(false) {
             return None;
         }
@@ -418,10 +414,7 @@ impl RouterModelConfig {
         None
     }
 
-    pub fn effective_temperature(
-        &self,
-        effort: Option<ReasoningEffort>,
-    ) -> Option<f32> {
+    pub fn effective_temperature(&self, effort: Option<ReasoningEffort>) -> Option<f32> {
         let from_level = effort.and_then(|e| {
             self.sampling_params_by_thinking_level
                 .get(effort_to_key(e))
@@ -429,7 +422,11 @@ impl RouterModelConfig {
                 .and_then(Value::as_f64)
         });
         from_level
-            .or_else(|| self.sampling_params.get("temperature").and_then(Value::as_f64))
+            .or_else(|| {
+                self.sampling_params
+                    .get("temperature")
+                    .and_then(Value::as_f64)
+            })
             .map(|v| v as f32)
     }
 
@@ -505,6 +502,18 @@ impl ProviderRouteConfig {
             api_key_env: Some(api_key_env.into()),
             model: Some("gpt-4o".to_string()),
             compat: Some(CompatConfig::from(CompletionsCompat::openai())),
+            ..Self::default()
+        }
+    }
+
+    pub fn deepseek_completions(api_key_env: impl Into<String>) -> Self {
+        Self {
+            protocol: ProtocolKind::OpenaiCompletions,
+            display_name: Some("DeepSeek".to_string()),
+            base_url: Some("https://api.deepseek.com/v1".to_string()),
+            api_key_env: Some(api_key_env.into()),
+            model: Some("deepseek-chat".to_string()),
+            compat: Some(CompatConfig::from(CompletionsCompat::deepseek())),
             ..Self::default()
         }
     }

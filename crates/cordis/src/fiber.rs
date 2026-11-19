@@ -60,8 +60,14 @@ pub enum CordisError {
     Validation(ValidationError),
     InactiveService(String),
     MissingInject(String),
-    TypeMismatch { name: String, expected: &'static str },
-    DuplicateService { name: String, owner: String },
+    TypeMismatch {
+        name: String,
+        expected: &'static str,
+    },
+    DuplicateService {
+        name: String,
+        owner: String,
+    },
     Message(String),
 }
 
@@ -98,7 +104,10 @@ impl fmt::Display for CordisError {
             Self::InactiveEffect => write!(f, "cannot create effect on inactive context"),
             Self::Validation(v) => write!(f, "{v}"),
             Self::InactiveService(name) => {
-                write!(f, "cannot get required service \"{name}\" in inactive context")
+                write!(
+                    f,
+                    "cannot get required service \"{name}\" in inactive context"
+                )
             }
             Self::MissingInject(name) => {
                 write!(f, "cannot get property \"{name}\" without inject")
@@ -664,11 +673,7 @@ impl Fiber {
                     break;
                 }
             }
-            if missing {
-                INACTIVE.to_string()
-            } else {
-                buf
-            }
+            if missing { INACTIVE.to_string() } else { buf }
         };
         self.0.set_epoch(epoch);
     }

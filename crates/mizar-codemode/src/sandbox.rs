@@ -46,7 +46,12 @@ fn preview_json(v: &Value, max_chars: usize) -> String {
 fn format_preview_calls(calls: &[CodemodeNestedCall]) -> String {
     calls
         .iter()
-        .map(|c| format!("{} {}({}) [{}ms]", c.status, c.name, c.args_preview, c.duration_ms))
+        .map(|c| {
+            format!(
+                "{} {}({}) [{}ms]",
+                c.status, c.name, c.args_preview, c.duration_ms
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -155,10 +160,7 @@ pub async fn execute_codemode_script(
     };
     let _permit = permit;
 
-    let session_key = call_ctx
-        .session_id()
-        .unwrap_or("__default__")
-        .to_string();
+    let session_key = call_ctx.session_id().unwrap_or("__default__").to_string();
 
     let callable: Vec<ToolRuntimeInfo> = tools_rt
         .list_callable(call_ctx.session_id())

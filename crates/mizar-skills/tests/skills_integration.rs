@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordis::{Context, Service};
+use futures::channel::mpsc;
 use mizar_agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopContextExt};
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmRuntime, Message,
@@ -15,7 +16,6 @@ use mizar_skills::{
 };
 use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_tools::{ToolRuntime, ToolsContextExt};
-use futures::channel::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -60,7 +60,9 @@ metadata:
     assert!(parse_skill_markdown("---\ndisableModelInvocation: true\n---").is_err());
 
     assert_eq!(
-        extract_skill_gestures("check /usr/bin and 5/8 then /rust-review and /deploy-now please /rust-review"),
+        extract_skill_gestures(
+            "check /usr/bin and 5/8 then /rust-review and /deploy-now please /rust-review"
+        ),
         vec!["rust-review".to_string(), "deploy-now".to_string()]
     );
 }
@@ -152,9 +154,10 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
                 .lock()
                 .unwrap()
                 .push(options.messages.clone());
-            self.seen_tools.lock().unwrap().push(
-                options.tools.iter().map(|t| t.name.clone()).collect(),
-            );
+            self.seen_tools
+                .lock()
+                .unwrap()
+                .push(options.tools.iter().map(|t| t.name.clone()).collect());
             let (tx, rx) = mpsc::unbounded();
             tokio::spawn(async move {
                 match n {
@@ -239,7 +242,11 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
         seen_messages: Arc::clone(&seen_messages),
         seen_tools: Arc::clone(&seen_tools),
     });
-    let _llm_cleanup = ctx.llm().unwrap().register_adapter("scripted", adapter).unwrap();
+    let _llm_cleanup = ctx
+        .llm()
+        .unwrap()
+        .register_adapter("scripted", adapter)
+        .unwrap();
 
     let session = ctx.sessions().unwrap().create(None);
     let agent = ctx.agent_loop().unwrap();

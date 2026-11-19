@@ -140,7 +140,8 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                     stats.interrupted_steps += 1;
                 }
                 if let Some(turn_entry) = turns_map.get_mut(turn)
-                    && let Some(step_entry) = turn_entry.steps.iter_mut().rev().find(|s| s.step == *step)
+                    && let Some(step_entry) =
+                        turn_entry.steps.iter_mut().rev().find(|s| s.step == *step)
                 {
                     step_entry.ended_at_ms = Some(ev.ts_ms);
                     step_entry.outcome = Some(outcome.clone());

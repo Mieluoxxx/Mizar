@@ -18,15 +18,17 @@ pub use config::{
     ProtocolKind, ProviderRouteConfig, RouterConfig, RouterModelConfig, parse_protocol_api,
 };
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service};
-use mizar_llm_http::{DEFAULT_IDLE_TIMEOUT, expand_pi_value};
+use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo, ProviderInfo,
 };
 use mizar_llm_completions::{CompletionsAdapter, CompletionsCompat, CompletionsConfig};
-use mizar_llm_messages::{DEFAULT_ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS, MessagesAdapter, MessagesConfig};
+use mizar_llm_http::{DEFAULT_IDLE_TIMEOUT, expand_pi_value};
+use mizar_llm_messages::{
+    DEFAULT_ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS, MessagesAdapter, MessagesConfig,
+};
 use mizar_llm_mock::MockAdapter;
 use mizar_llm_responses::{ResponsesAdapter, ResponsesConfig};
-use futures::channel::mpsc;
 
 pub const EVENT_ROUTER_HEADERS: &str = "llm-router/request-headers";
 
@@ -130,9 +132,7 @@ impl LlmAdapter for RoutedAdapter {
             options.model = model.clone();
         }
 
-        let target = model
-            .as_deref()
-            .and_then(|id| self.model_routes.get(id));
+        let target = model.as_deref().and_then(|id| self.model_routes.get(id));
 
         let (protocol, adapter, overlay_headers) = match target {
             Some(t) => {
@@ -257,7 +257,10 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 .base_url
                 .unwrap_or("https://api.anthropic.com")
                 .to_string(),
-            model: spec.default_model.unwrap_or("claude-sonnet-4-5").to_string(),
+            model: spec
+                .default_model
+                .unwrap_or("claude-sonnet-4-5")
+                .to_string(),
             default_max_tokens: spec.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             anthropic_version: spec
                 .anthropic_version
@@ -478,8 +481,8 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use cordis::Next;
-    use mizar_llm::{BlockAssembler, LlmErrorCode, LlmRuntime, Message};
     use futures::StreamExt;
+    use mizar_llm::{BlockAssembler, LlmErrorCode, LlmRuntime, Message};
     use tokio::net::TcpListener;
 
     #[tokio::test]

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::types::{
-    ContentBlock, ContentBlockKind, FinishReason, Message, ReplayEnvelope, StreamChunk, ToolCall,
-    TokenUsage,
+    ContentBlock, ContentBlockKind, FinishReason, Message, ReplayEnvelope, StreamChunk, TokenUsage,
+    ToolCall,
 };
 
 struct PartialBlock {

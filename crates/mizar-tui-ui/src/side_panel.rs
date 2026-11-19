@@ -152,7 +152,9 @@ impl SidePanelState {
             return None;
         }
         let max_panel = total_width.saturating_sub(CHAT_MIN_COLS + 1);
-        let panel_w = self.width.clamp(PANEL_MIN_COLS, max_panel.max(PANEL_MIN_COLS));
+        let panel_w = self
+            .width
+            .clamp(PANEL_MIN_COLS, max_panel.max(PANEL_MIN_COLS));
         let chat_w = total_width.saturating_sub(panel_w + 1);
         Some((chat_w, chat_w, panel_w))
     }
@@ -280,7 +282,10 @@ pub fn render_side_panel(
     // Row 1: 水平连接线（与分割线 row 1 的 `├` 对齐）
     let rule = "─".repeat(area.width as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(rule.clone(), Style::default().fg(theme.border))),
+        Paragraph::new(Span::styled(
+            rule.clone(),
+            Style::default().fg(theme.border),
+        )),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
 
@@ -356,9 +361,7 @@ fn build_context_lines(
     out.push(Line::from(vec![
         Span::styled(
             "上下文占用 ",
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{total_used} / {window} ({pct:.1}%)"),
@@ -413,7 +416,10 @@ fn build_context_lines(
     for (i, (name, tok)) in labels.iter().enumerate() {
         out.push(Line::from(vec![
             Span::styled("■ ", Style::default().fg(theme.context_segments[i])),
-            Span::styled(format!("{name:<11} "), Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("{name:<11} "),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(format!("{tok:>7} tok"), Style::default().fg(theme.text)),
         ]));
     }
@@ -421,9 +427,7 @@ fn build_context_lines(
     out.push(Line::default());
     out.push(Line::from(Span::styled(
         "实时生成仪表",
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     )));
     let tps_str = ctx
         .tps
@@ -437,7 +441,10 @@ fn build_context_lines(
     };
     out.push(Line::from(vec![
         Span::styled("TPS:  ", Style::default().fg(theme.text_muted)),
-        Span::styled(tps_str, Style::default().fg(tps_col).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            tps_str,
+            Style::default().fg(tps_col).add_modifier(Modifier::BOLD),
+        ),
     ]));
     if !ctx.tps_history.is_empty() {
         let spark = unicode_sparkline(&ctx.tps_history, width.saturating_sub(7).max(6));
@@ -479,9 +486,7 @@ fn build_context_lines(
         out.push(Line::default());
         out.push(Line::from(Span::styled(
             format!("指令文件 ({})", instructions.len()),
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )));
         for row in instructions {
             let (badge, col) = if row.omitted {
@@ -540,9 +545,7 @@ fn build_files_lines(
 ) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("会话访问/变更文件 ({})", files.len()),
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))];
     if files.is_empty() {
         out.push(Line::from(Span::styled(
@@ -566,9 +569,7 @@ fn build_files_lines(
     out.push(Line::default());
     out.push(Line::from(Span::styled(
         format!("工作区 Git 状态 ({})", git_changes.len()),
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     )));
     if !git_diff_stat.trim().is_empty() {
         out.push(Line::from(Span::styled(
@@ -606,9 +607,7 @@ fn build_tools_lines(
 ) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("MCP 服务 ({})", mcps.len()),
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))];
     if mcps.is_empty() {
         out.push(Line::from(Span::styled(
@@ -633,9 +632,7 @@ fn build_tools_lines(
     out.push(Line::default());
     out.push(Line::from(Span::styled(
         format!("已注册工具 ({})", tools.len()),
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     )));
     for t in tools {
         out.push(Line::from(vec![
@@ -648,7 +645,10 @@ fn build_tools_lines(
                 }),
             ),
             Span::styled(t.name.clone(), Style::default().fg(theme.text)),
-            Span::styled(format!(" [{}]", t.exposure), Style::default().fg(theme.text_dim)),
+            Span::styled(
+                format!(" [{}]", t.exposure),
+                Style::default().fg(theme.text_dim),
+            ),
         ]));
     }
     out
@@ -663,23 +663,29 @@ fn build_stats_lines(
     let mut out = vec![
         Line::from(Span::styled(
             "累计用量与异常",
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
         Line::default(),
         Line::from(vec![
             Span::styled("Input:  ", Style::default().fg(theme.text_muted)),
-            Span::styled(format!("{}", ctx.input_tokens), Style::default().fg(theme.text)),
+            Span::styled(
+                format!("{}", ctx.input_tokens),
+                Style::default().fg(theme.text),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Output: ", Style::default().fg(theme.text_muted)),
-            Span::styled(format!("{}", ctx.output_tokens), Style::default().fg(theme.text)),
+            Span::styled(
+                format!("{}", ctx.output_tokens),
+                Style::default().fg(theme.text),
+            ),
         ]),
         Line::default(),
         Line::from(Span::styled(
             format!("轨迹告警 ({})", findings.len()),
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
     if findings.is_empty() {

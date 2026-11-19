@@ -1508,6 +1508,7 @@ dependencies = [
  "mizar-trajectory",
  "mizar-tui-ui",
  "ratatui",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-util",

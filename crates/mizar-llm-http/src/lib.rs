@@ -39,9 +39,8 @@ pub struct SseRequest {
 fn build_header_map(headers: &[(String, String)]) -> Result<HeaderMap, LlmError> {
     let mut map = HeaderMap::new();
     for (k, v) in headers {
-        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-            LlmError::invalid_request(format!("invalid header name \"{k}\": {e}"))
-        })?;
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| LlmError::invalid_request(format!("invalid header name \"{k}\": {e}")))?;
         let val = HeaderValue::from_str(v).map_err(|e| {
             LlmError::invalid_request(format!("invalid header value for \"{k}\": {e}"))
         })?;
@@ -62,7 +61,10 @@ fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 }
 
 /// 共用 SSE 流式请求驱动：处理取消、HTTP 错误归类、空闲超时与帧解码。
-pub fn spawn_sse_stream<D: SseStreamDecoder>(req_spec: SseRequest, mut decoder: D) -> BoxChunkStream {
+pub fn spawn_sse_stream<D: SseStreamDecoder>(
+    req_spec: SseRequest,
+    mut decoder: D,
+) -> BoxChunkStream {
     let (tx, rx) = mpsc::unbounded();
 
     tokio::spawn(async move {
@@ -138,7 +140,8 @@ pub fn spawn_sse_stream<D: SseStreamDecoder>(req_spec: SseRequest, mut decoder: 
             let bytes = match chunk_res {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = tx.unbounded_send(Err(LlmError::transport(format!("stream error: {e}"))));
+                    let _ =
+                        tx.unbounded_send(Err(LlmError::transport(format!("stream error: {e}"))));
                     return;
                 }
             };
@@ -410,7 +413,10 @@ pub fn parse_models_payload(payload: &Value) -> Vec<ModelInfo> {
                     .get("id")
                     .or_else(|| item.get("name"))
                     .and_then(Value::as_str)?;
-                let id = raw_name.strip_prefix("models/").unwrap_or(raw_name).to_string();
+                let id = raw_name
+                    .strip_prefix("models/")
+                    .unwrap_or(raw_name)
+                    .to_string();
                 let name = item
                     .get("displayName")
                     .or_else(|| item.get("display_name"))

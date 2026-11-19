@@ -97,87 +97,91 @@ impl Plugin for ToolFsPlugin {
             let tools = ctx.tools()?;
             let root_list = config.root.clone();
             ctx.effect("tool-fs.list_dir", || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(ToolDefinition::async_tool(
-                    "list_dir",
-                    "列出目录里的文件和子目录（路径相对于工作目录）",
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string", "description": "目录路径，默认 ." }
-                        }
-                    }),
-                    move |args: Value, _exec| {
-                        let root = root_list.clone();
-                        async move {
-                            let req = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                            let full = safe_path(&root, req)?;
-                            let mut entries = tokio::fs::read_dir(&full).await?;
-                            let mut names = Vec::new();
-                            while let Some(entry) = entries.next_entry().await? {
-                                let name = entry.file_name().to_string_lossy().into_owned();
-                                if name.starts_with('.') || name == "node_modules" {
-                                    continue;
+                Ok::<_, mizar_tools::ToolError>(Some(tools.register(
+                    ToolDefinition::async_tool(
+                        "list_dir",
+                        "列出目录里的文件和子目录（路径相对于工作目录）",
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "目录路径，默认 ." }
+                            }
+                        }),
+                        move |args: Value, _exec| {
+                            let root = root_list.clone();
+                            async move {
+                                let req = args.get("path").and_then(Value::as_str).unwrap_or(".");
+                                let full = safe_path(&root, req)?;
+                                let mut entries = tokio::fs::read_dir(&full).await?;
+                                let mut names = Vec::new();
+                                while let Some(entry) = entries.next_entry().await? {
+                                    let name = entry.file_name().to_string_lossy().into_owned();
+                                    if name.starts_with('.') || name == "node_modules" {
+                                        continue;
+                                    }
+                                    let is_dir = entry
+                                        .file_type()
+                                        .await
+                                        .map(|t| t.is_dir())
+                                        .unwrap_or(false);
+                                    if is_dir {
+                                        names.push(format!("{name}/"));
+                                    } else {
+                                        names.push(name);
+                                    }
                                 }
-                                let is_dir = entry
-                                    .file_type()
-                                    .await
-                                    .map(|t| t.is_dir())
-                                    .unwrap_or(false);
-                                if is_dir {
-                                    names.push(format!("{name}/"));
+                                names.sort();
+                                if names.is_empty() {
+                                    Ok::<_, BoxError>("（空目录）".to_string())
                                 } else {
-                                    names.push(name);
+                                    Ok(names.join("\n"))
                                 }
                             }
-                            names.sort();
-                            if names.is_empty() {
-                                Ok::<_, BoxError>("（空目录）".to_string())
-                            } else {
-                                Ok(names.join("\n"))
-                            }
-                        }
-                    },
-                ))?))
+                        },
+                    ),
+                )?))
             })?;
 
             let root_read = config.root;
             let max_bytes = config.max_bytes;
             ctx.effect("tool-fs.read_file", || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(ToolDefinition::async_tool(
-                    "read_file",
-                    "读取一个文本文件的内容（路径相对于工作目录）",
-                    json!({
-                        "type": "object",
-                        "properties": { "path": { "type": "string" } },
-                        "required": ["path"]
-                    }),
-                    move |args: Value, _exec| {
-                        let root = root_read.clone();
-                        async move {
-                            let req = args
-                                .get("path")
-                                .and_then(Value::as_str)
-                                .ok_or("缺少 path 参数")?;
-                            let full = safe_path(&root, req)?;
-                            let meta = tokio::fs::metadata(&full).await?;
-                            let content = tokio::fs::read_to_string(&full).await?;
-                            if meta.len() > max_bytes as u64 {
-                                // 按字符边界安全截断，避免切在多字节 UTF-8 字符中间
-                                let mut end = max_bytes.min(content.len());
-                                while end > 0 && !content.is_char_boundary(end) {
-                                    end -= 1;
+                Ok::<_, mizar_tools::ToolError>(Some(tools.register(
+                    ToolDefinition::async_tool(
+                        "read_file",
+                        "读取一个文本文件的内容（路径相对于工作目录）",
+                        json!({
+                            "type": "object",
+                            "properties": { "path": { "type": "string" } },
+                            "required": ["path"]
+                        }),
+                        move |args: Value, _exec| {
+                            let root = root_read.clone();
+                            async move {
+                                let req = args
+                                    .get("path")
+                                    .and_then(Value::as_str)
+                                    .ok_or("缺少 path 参数")?;
+                                let full = safe_path(&root, req)?;
+                                let meta = tokio::fs::metadata(&full).await?;
+                                let content = tokio::fs::read_to_string(&full).await?;
+                                if meta.len() > max_bytes as u64 {
+                                    // 按字符边界安全截断，避免切在多字节 UTF-8 字符中间
+                                    let mut end = max_bytes.min(content.len());
+                                    while end > 0 && !content.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    Ok::<_, BoxError>(format!(
+                                        "{}\n…（文件太大，只读了前 {} 字节）",
+                                        &content[..end],
+                                        max_bytes
+                                    ))
+                                } else {
+                                    Ok(content)
                                 }
-                                Ok::<_, BoxError>(format!(
-                                    "{}\n…（文件太大，只读了前 {} 字节）",
-                                    &content[..end],
-                                    max_bytes
-                                ))
-                            } else {
-                                Ok(content)
                             }
-                        }
-                    },
-                ))?))
+                        },
+                    ),
+                )?))
             })?;
 
             Ok(None)

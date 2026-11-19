@@ -276,9 +276,8 @@ impl<C: Send + Sync + Clone + 'static> PluginDef<C> {
     }
 
     pub fn inject(self, inject: impl Into<Inject>) -> Self {
-        let mut inner = Arc::try_unwrap(self.0).unwrap_or_else(|_| {
-            panic!("PluginDef::inject must be called before cloning/mounting")
-        });
+        let mut inner = Arc::try_unwrap(self.0)
+            .unwrap_or_else(|_| panic!("PluginDef::inject must be called before cloning/mounting"));
         inner.inject = inject.into();
         Self(Arc::new(inner))
     }

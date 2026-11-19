@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use mizar_tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
-use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolOutput};
 use globset::GlobBuilder;
 use ignore::WalkBuilder;
+use mizar_tools::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
+use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolOutput};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -70,7 +70,11 @@ async fn run_fd(
         let abs_pat = if Path::new(&clean_pat).is_absolute() {
             clean_pat.clone()
         } else {
-            format!("{}/{}", search_path.to_string_lossy().trim_end_matches('/'), clean_pat)
+            format!(
+                "{}/{}",
+                search_path.to_string_lossy().trim_end_matches('/'),
+                clean_pat
+            )
         };
         cmd.arg(abs_pat);
     } else {

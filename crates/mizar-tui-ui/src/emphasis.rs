@@ -288,7 +288,10 @@ pub fn parse_pill(raw_label: &str) -> ParsedPill {
         let kl = k.to_ascii_lowercase();
         lower == kl
             || (lower.starts_with(&kl)
-                && lower.as_bytes().get(kl.len()).is_some_and(|b| *b == b' ' || *b == b':'))
+                && lower
+                    .as_bytes()
+                    .get(kl.len())
+                    .is_some_and(|b| *b == b' ' || *b == b':'))
     });
 
     let canonical = known.and_then(|k| {
@@ -306,14 +309,12 @@ pub fn parse_pill(raw_label: &str) -> ParsedPill {
         _ => body,
     };
 
-    let icon = own
-        .map(|(ch, _)| ch.to_string())
-        .or_else(|| {
-            PILL_ICONS
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, ic)| (*ic).to_string())
-        });
+    let icon = own.map(|(ch, _)| ch.to_string()).or_else(|| {
+        PILL_ICONS
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, ic)| (*ic).to_string())
+    });
 
     let tone = tone_of_key(&key);
     ParsedPill {
@@ -344,7 +345,11 @@ pub fn tone_of_key(key: &str) -> PillTone {
 }
 
 /// 将 `[[label]]` 渲染为带语义背景/圆角帽的 `Span` 列表（空格转为 `\u{00a0}` 防折行截断）。
-pub fn render_pill_spans(raw_label: &str, theme: &Theme, cfg: &EmphasisConfig) -> Vec<Span<'static>> {
+pub fn render_pill_spans(
+    raw_label: &str,
+    theme: &Theme,
+    cfg: &EmphasisConfig,
+) -> Vec<Span<'static>> {
     if !cfg.enabled {
         return vec![Span::styled(
             format!("[[{raw_label}]]"),
@@ -377,10 +382,7 @@ pub fn render_pill_spans(raw_label: &str, theme: &Theme, cfg: &EmphasisConfig) -
 
     let has_panel_bg = !matches!(bg, Color::Reset);
     let label_style = if has_panel_bg {
-        Style::default()
-            .fg(fg)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(fg)
@@ -432,7 +434,12 @@ pub fn decorate_label_with_icon(label: &str, cfg: &EmphasisConfig) -> String {
         .iter()
         .find(|(k, _)| *k == word)
         .map(|(_, ic)| *ic)
-        .or_else(|| PILL_ICONS.iter().find(|(k, _)| *k == word).map(|(_, ic)| *ic))
+        .or_else(|| {
+            PILL_ICONS
+                .iter()
+                .find(|(k, _)| *k == word)
+                .map(|(_, ic)| *ic)
+        })
         .or_else(|| {
             if trimmed.ends_with(':') {
                 ACTION_ICONS

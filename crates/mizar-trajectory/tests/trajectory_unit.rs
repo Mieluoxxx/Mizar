@@ -44,12 +44,9 @@ async fn repeat_guard_validates_config_fail_loud() {
 async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
     let app = Context::new();
     app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(
-        TrajectoryRuntime::plugin(),
-        TrajectoryConfig::default(),
-    )
-    .await
-    .unwrap();
+    app.plugin(TrajectoryRuntime::plugin(), TrajectoryConfig::default())
+        .await
+        .unwrap();
     app.plugin(
         RepeatToolGuardPlugin,
         RepeatGuardConfig {
@@ -155,7 +152,11 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
         .await;
     assert!(!r3.blocked);
     assert_eq!(r3.additional_contexts.len(), 1);
-    assert!(r3.additional_contexts[0].text.contains("consecutive_calls: 3"));
+    assert!(
+        r3.additional_contexts[0]
+            .text
+            .contains("consecutive_calls: 3")
+    );
 
     // 5. 再来一次连续同参 grep（此时是连续第 3 次 grep，无 todo_write 间隔）-> 额外触发 R01_REPEAT_TOOL_CALL
     let _r4 = tools

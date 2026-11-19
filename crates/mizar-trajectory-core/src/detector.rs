@@ -166,10 +166,7 @@ pub fn detect_anomalies(
                 rule_id: "R02_CONSECUTIVE_TOOL_ERRORS".to_string(),
                 severity: Severity::Error,
                 title: "工具连续报错空转".to_string(),
-                summary: format!(
-                    "连续 {} 次工具执行失败（最近一次：{}）",
-                    *cnt, last_tool
-                ),
+                summary: format!("连续 {} 次工具执行失败（最近一次：{}）", *cnt, last_tool),
                 turn,
                 step,
                 seq: Some(seq),
@@ -193,7 +190,12 @@ pub fn detect_anomalies(
                 if let Some(prev_turn) = current_turn
                     && prev_turn != *turn
                 {
-                    report_unclosed_for_turn(prev_turn, &mut open_steps, &mut open_tools, &mut findings);
+                    report_unclosed_for_turn(
+                        prev_turn,
+                        &mut open_steps,
+                        &mut open_tools,
+                        &mut findings,
+                    );
                 }
                 current_turn = Some(*turn);
             }
@@ -215,7 +217,9 @@ pub fn detect_anomalies(
                         rule_id: "R04_MAX_STEPS_EXHAUSTED".to_string(),
                         severity: Severity::Error,
                         title: "达到最大步数上限".to_string(),
-                        summary: format!("Turn #{turn} 在未得出最终答案前达到 max_steps 上限并停止"),
+                        summary: format!(
+                            "Turn #{turn} 在未得出最终答案前达到 max_steps 上限并停止"
+                        ),
                         turn: Some(*turn),
                         step: None,
                         seq: Some(ev.seq),
@@ -287,9 +291,7 @@ pub fn detect_anomalies(
                 let turn = meta.map(|m| m.0).or(current_turn);
                 let step = meta.map(|m| m.1);
 
-                if *blocked
-                    && let Some((_, _, orig_name, canon)) = meta
-                {
+                if *blocked && let Some((_, _, orig_name, canon)) = meta {
                     denied_keys.insert((orig_name.clone(), canon.clone()));
                 }
 
@@ -351,7 +353,10 @@ pub fn detect_anomalies(
                             "工具 {} 执行耗时过长",
                             rec.tool_name.as_deref().unwrap_or("unknown")
                         ),
-                        summary: format!("工具执行耗时 {} ms，超过阈值 {} ms", dur, cfg.slow_tool_ms),
+                        summary: format!(
+                            "工具执行耗时 {} ms，超过阈值 {} ms",
+                            dur, cfg.slow_tool_ms
+                        ),
                         turn: rec.turn,
                         step: rec.step,
                         seq: Some(rec.seq),
@@ -388,7 +393,10 @@ fn report_unclosed_for_turn(
                 rule_id: "R05_UNCLOSED_BOUNDARY".to_string(),
                 severity: Severity::Warn,
                 title: "存在未闭合的 Step 边界".to_string(),
-                summary: format!("Turn #{} Step #{} 在轮次结束前未记录 step/end", key.0, key.1),
+                summary: format!(
+                    "Turn #{} Step #{} 在轮次结束前未记录 step/end",
+                    key.0, key.1
+                ),
                 turn: Some(key.0),
                 step: Some(key.1),
                 seq: Some(seq),

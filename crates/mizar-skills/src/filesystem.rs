@@ -134,7 +134,9 @@ impl FilesystemSkillProvider {
         let user_agents_dir = self
             .config
             .include_default_roots
-            .then(|| resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills")))
+            .then(|| {
+                resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills"))
+            })
             .flatten();
         let user_agents_key = user_agents_dir
             .as_ref()
@@ -379,7 +381,10 @@ async fn read_and_parse_skill(
     Ok(Some((canonical, parsed)))
 }
 
-async fn run_cancellable<T, F>(cancel: &tokio_util::sync::CancellationToken, fut: F) -> Result<T, String>
+async fn run_cancellable<T, F>(
+    cancel: &tokio_util::sync::CancellationToken,
+    fut: F,
+) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
 {
@@ -395,12 +400,18 @@ impl SkillProvider for FilesystemSkillProvider {
         &self.config.provider_name
     }
 
-    fn fingerprint(&self, options: &SkillLookupOptions) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
+    fn fingerprint(
+        &self,
+        options: &SkillLookupOptions,
+    ) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
         let roots = self.resolve_roots(options.cwd.as_deref());
         Box::pin(async move { Some(compute_roots_fingerprint(&roots)) })
     }
 
-    fn list(&self, options: SkillLookupOptions) -> BoxFuture<'_, Result<SkillProviderObservation, String>> {
+    fn list(
+        &self,
+        options: SkillLookupOptions,
+    ) -> BoxFuture<'_, Result<SkillProviderObservation, String>> {
         Box::pin(async move {
             let roots = self.resolve_roots(options.cwd.as_deref());
             let mut candidates = Vec::new();

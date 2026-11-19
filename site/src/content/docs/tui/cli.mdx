@@ -1,6 +1,6 @@
 ---
 title: CLI 参数
-description: Mizar 全部 12 个命令行启动参数与按场景组合方式：工作区与权限裁剪、视口审批、会话接续与免持久化模式。
+description: Mizar 命令行启动参数与按场景组合方式：工作区与权限裁剪、视口审批、会话接续、免持久化与帮助/版本信息。
 group: tui-sessions-ref
 order: 9
 ---
@@ -68,6 +68,23 @@ mizar --no-persist --no-instructions
 | `--resume [ID]` | `-r [ID]` | 按指定 ID 恢复会话；省略 ID 时弹出最近会话选择框 |
 | `--no-persist` | — | 禁用本次会话写入 `~/.mizar/sessions.sqlite` |
 | `--no-instructions` | — | 跳过扫描并注入 `AGENTS.md` / `CLAUDE.md`（参见 [项目规则](/instructions/)） |
+| `--help` | `-h` | 打印命令行参数帮助并退出 |
+| `--version` | `-V` | 打印当前版本号并退出 |
+
+## 检查与原地更新
+
+Mizar 启动后会在后台静默检查是否有新版本（可用 `MIZAR_SKIP_VERSION_CHECK=1` 或 `MIZAR_OFFLINE=1` 关闭），发现更新时会在界面提示；退出后执行一条命令即可完成 SHA256 校验与原地更新：
+
+```bash
+# 检查并更新到最新正式 Release
+mizar update
+
+# 仅检查是否有新版本，不下载替换
+mizar update --check
+
+# 指定版本安装（例如预发布版本）
+mizar update --version v0.1.1
+```
 
 <Callout type="tip">
 

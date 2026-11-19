@@ -220,11 +220,20 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
     terminal.draw(|f| render(f, &mut state)).unwrap();
 
     let screen = buffer_text(terminal.backend());
-    assert!(!screen.contains("[▸ 展开]") && !screen.contains("[▾ 收起]"), "button should be removed:\n{screen}");
+    assert!(
+        !screen.contains("[▸ 展开]") && !screen.contains("[▾ 收起]"),
+        "button should be removed:\n{screen}"
+    );
     assert!(screen.contains("Done"), "screen:\n{screen}");
     assert!(screen.contains("证据与影响：源码中"), "screen:\n{screen}");
-    assert!(screen.contains("cargo fmt --all 单独提交"), "screen:\n{screen}");
-    assert!(!screen.contains("**cargo"), "raw asterisks leaked:\n{screen}");
+    assert!(
+        screen.contains("cargo fmt --all 单独提交"),
+        "screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("**cargo"),
+        "raw asterisks leaked:\n{screen}"
+    );
     assert_eq!(
         screen.matches("Investigate").count(),
         1,
@@ -236,11 +245,15 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
         .position(|l| l.contains("Let me write Chinese content."))
         .expect("thinking line");
     assert!(
-        lines.get(think_idx + 1).is_some_and(|l| l.trim().is_empty()),
+        lines
+            .get(think_idx + 1)
+            .is_some_and(|l| l.trim().is_empty()),
         "expected blank line between thinking and response:\n{screen}"
     );
     assert!(
-        lines.get(think_idx + 2).is_some_and(|l| l.contains("Investigate")),
+        lines
+            .get(think_idx + 2)
+            .is_some_and(|l| l.contains("Investigate")),
         "expected standalone mode pill after blank line:\n{screen}"
     );
     assert!(
@@ -291,7 +304,10 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
     assert_eq!(state.items.len(), items_before);
     terminal.draw(|f| render(f, &mut state)).unwrap();
     let expanded_screen = buffer_text(terminal.backend());
-    assert!(expanded_screen.contains("line7"), "expected expanded output:\n{expanded_screen}");
+    assert!(
+        expanded_screen.contains("line7"),
+        "expected expanded output:\n{expanded_screen}"
+    );
     assert!(expanded_screen.contains("Let me write Chinese content."));
     assert!(!expanded_screen.contains("[▾ 收起]"));
 
@@ -325,7 +341,9 @@ async fn renders_side_panel_timeline_rail_and_multi_pane_selection_fence() {
         });
         state.items.push(ChatItem::Assistant {
             reasoning: String::new(),
-            text: format!("第 {idx} 轮结论：[[Done]] 完成第 {idx} 轮核查。\n第一行摘要\n第二行详细说明"),
+            text: format!(
+                "第 {idx} 轮结论：[[Done]] 完成第 {idx} 轮核查。\n第一行摘要\n第二行详细说明"
+            ),
         });
     }
     state.side_panel_data.tools.push(ToolSummaryRow {
@@ -346,7 +364,10 @@ async fn renders_side_panel_timeline_rail_and_multi_pane_selection_fence() {
     assert!(screen.contains("Context"), "screen:\n{screen}");
     assert!(state.rail_geo.is_some(), "expected TimelineRail geometry");
     let chat_rect = state.selection_geom.chat_rect.expect("chat rect");
-    let side_rect = state.selection_geom.side_panel_rect.expect("side panel rect");
+    let side_rect = state
+        .selection_geom
+        .side_panel_rect
+        .expect("side panel rect");
     assert!(chat_rect.x + chat_rect.width < side_rect.x);
 
     // 拖拽分割线调整侧栏宽度
@@ -397,7 +418,10 @@ async fn renders_side_panel_timeline_rail_and_multi_pane_selection_fence() {
         &state.selection_geom,
     )
     .expect("extracted chat selection");
-    assert!(copied.contains("检查模块边界与渲染性能"), "copied:\n{copied}");
+    assert!(
+        copied.contains("检查模块边界与渲染性能"),
+        "copied:\n{copied}"
+    );
     assert!(copied.contains("完成第 2 轮核查"), "copied:\n{copied}");
     assert!(!copied.contains("Context"), "leaked side panel:\n{copied}");
     assert!(!copied.contains('\u{e0b6}') && !copied.contains('\u{e0b4}'));
@@ -490,7 +514,10 @@ async fn opens_and_renders_trajectory_scene_from_runtime() {
     state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     terminal.draw(|f| render(f, &mut state)).unwrap();
     let hotspots_screen = buffer_text(terminal.backend());
-    assert!(hotspots_screen.contains("find"), "hotspots:\n{hotspots_screen}");
+    assert!(
+        hotspots_screen.contains("find"),
+        "hotspots:\n{hotspots_screen}"
+    );
 
     state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!state.trajectory_scene.open);
@@ -567,7 +594,10 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     }
     terminal.draw(|f| render(f, &mut state)).unwrap();
     let approval_screen = buffer_text(terminal.backend());
-    assert!(approval_screen.contains("use rg"), "screen:\n{approval_screen}");
+    assert!(
+        approval_screen.contains("use rg"),
+        "screen:\n{approval_screen}"
+    );
     state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         rx.await.unwrap(),
@@ -736,8 +766,14 @@ async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_inst
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &mut state)).unwrap();
     let screen = buffer_text(terminal.backend());
-    assert!(screen.contains("已加载指令：AGENTS.md, CLAUDE.md"), "screen:\n{screen}");
-    assert!(!screen.contains("SECRET_RAW_BODY_DO_NOT_DUMP"), "screen:\n{screen}");
+    assert!(
+        screen.contains("已加载指令：AGENTS.md, CLAUDE.md"),
+        "screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("SECRET_RAW_BODY_DO_NOT_DUMP"),
+        "screen:\n{screen}"
+    );
     assert!(screen.contains("已加载可用技能目录"), "screen:\n{screen}");
     assert!(screen.contains("指令文件 (1)"), "screen:\n{screen}");
 
@@ -769,9 +805,15 @@ async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_inst
     assert!(!state.overlay.is_open());
 
     state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    assert_eq!(state.reasoning_effort, Some(mizar_llm::ReasoningEffort::Low));
+    assert_eq!(
+        state.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::Low)
+    );
     state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    assert_eq!(state.reasoning_effort, Some(mizar_llm::ReasoningEffort::High));
+    assert_eq!(
+        state.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::High)
+    );
 
     state.is_busy = true;
     state.input.insert_str("follow up");
@@ -846,7 +888,9 @@ async fn expands_at_mentions_via_pre_step_and_folds_on_resume() {
     assert_eq!(mention_notices.len(), 1);
     let body = &mention_notices[0];
     assert!(
-        body.contains("<attached-file path=\"src/demo.rs\" lines=\"2-3\">\nline 2\nline 3\n</attached-file>"),
+        body.contains(
+            "<attached-file path=\"src/demo.rs\" lines=\"2-3\">\nline 2\nline 3\n</attached-file>"
+        ),
         "body:\n{body}"
     );
     assert!(!body.contains("line 1"), "body:\n{body}");

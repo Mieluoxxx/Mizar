@@ -238,7 +238,9 @@ impl TrajectorySceneState {
         let col = mouse.column;
         let row = mouse.row;
         let contains = |r: Option<Rect>| -> bool {
-            r.is_some_and(|a| col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height)
+            r.is_some_and(|a| {
+                col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height
+            })
         };
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -287,26 +289,22 @@ impl TrajectorySceneState {
                     return TrajectoryKeyOutcome::Consumed;
                 }
             }
-            MouseEventKind::ScrollUp => {
-                match self.tab {
-                    TrajectoryTab::Timeline => self.cursor = self.cursor.saturating_sub(3),
-                    TrajectoryTab::Hotspots => {
-                        self.hotspot_cursor = self.hotspot_cursor.saturating_sub(1)
-                    }
+            MouseEventKind::ScrollUp => match self.tab {
+                TrajectoryTab::Timeline => self.cursor = self.cursor.saturating_sub(3),
+                TrajectoryTab::Hotspots => {
+                    self.hotspot_cursor = self.hotspot_cursor.saturating_sub(1)
                 }
-            }
-            MouseEventKind::ScrollDown => {
-                match self.tab {
-                    TrajectoryTab::Timeline => {
-                        let max = self.filtered_indices().len().saturating_sub(1);
-                        self.cursor = (self.cursor + 3).min(max);
-                    }
-                    TrajectoryTab::Hotspots => {
-                        let max = self.hotspots().len().saturating_sub(1);
-                        self.hotspot_cursor = (self.hotspot_cursor + 1).min(max);
-                    }
+            },
+            MouseEventKind::ScrollDown => match self.tab {
+                TrajectoryTab::Timeline => {
+                    let max = self.filtered_indices().len().saturating_sub(1);
+                    self.cursor = (self.cursor + 3).min(max);
                 }
-            }
+                TrajectoryTab::Hotspots => {
+                    let max = self.hotspots().len().saturating_sub(1);
+                    self.hotspot_cursor = (self.hotspot_cursor + 1).min(max);
+                }
+            },
             _ => {}
         }
         TrajectoryKeyOutcome::Consumed
@@ -328,10 +326,7 @@ pub fn render_trajectory_scene(
 ) {
     frame.render_widget(Clear, area);
     if area.width < 20 || area.height < 12 {
-        frame.render_widget(
-            Paragraph::new("终端尺寸过小，按 Esc 返回"),
-            area,
-        );
+        frame.render_widget(Paragraph::new("终端尺寸过小，按 Esc 返回"), area);
         return;
     }
 
@@ -404,7 +399,10 @@ fn render_header(
         Span::raw(" "),
         Span::styled(" Hotspots ", hs_style),
         Span::styled(" │ ", Style::default().fg(theme.border)),
-        Span::styled(format!("[轴: {mode_label}]"), Style::default().fg(theme.info)),
+        Span::styled(
+            format!("[轴: {mode_label}]"),
+            Style::default().fg(theme.info),
+        ),
         Span::raw("  "),
         Span::styled(stats_str, Style::default().fg(theme.text_muted)),
     ]);
@@ -448,7 +446,10 @@ fn render_waveband(
 
     let Some(report) = &state.report else {
         frame.render_widget(
-            Paragraph::new(Span::styled("暂无波形事件", Style::default().fg(theme.text_dim))),
+            Paragraph::new(Span::styled(
+                "暂无波形事件",
+                Style::default().fg(theme.text_dim),
+            )),
             inner,
         );
         return;
@@ -467,10 +468,9 @@ fn render_waveband(
         let span_total = tl.end.saturating_sub(tl.start).max(1);
         for sp in &tl.spans {
             let row = if sp.lane == 2 { 1 } else { 0 };
-            let c0 = (((sp.start.saturating_sub(tl.start)) as f64 / span_total as f64)
-                * w as f64) as usize;
-            let c1 = (((sp.end.saturating_sub(tl.start)) as f64 / span_total as f64)
-                * w as f64)
+            let c0 = (((sp.start.saturating_sub(tl.start)) as f64 / span_total as f64) * w as f64)
+                as usize;
+            let c1 = (((sp.end.saturating_sub(tl.start)) as f64 / span_total as f64) * w as f64)
                 .ceil() as usize;
             for c in c0.min(w - 1)..=c1.min(w - 1) {
                 lane_rows[row][c] = if sp.lane == 1 { '▆' } else { '▃' };
@@ -617,7 +617,14 @@ fn format_ledger_row(
         RecordKind::User => ("USER   ", theme.accent),
         RecordKind::Context => ("CTX    ", theme.text_muted),
         RecordKind::Assistant => ("MODEL  ", theme.info),
-        RecordKind::Tool => ("TOOL   ", if rec.is_error { theme.error } else { theme.success }),
+        RecordKind::Tool => (
+            "TOOL   ",
+            if rec.is_error {
+                theme.error
+            } else {
+                theme.success
+            },
+        ),
         RecordKind::Anomaly => ("ALERT  ", theme.warning),
     };
     let turn_str = rec
@@ -644,7 +651,11 @@ fn format_ledger_row(
     Line::from(vec![
         Span::styled(
             pointer,
-            bg_style.fg(if selected { theme.accent } else { theme.text_dim }),
+            bg_style.fg(if selected {
+                theme.accent
+            } else {
+                theme.text_dim
+            }),
         ),
         Span::styled(turn_str, bg_style.fg(theme.text_dim)),
         Span::styled(" ", bg_style),
@@ -692,21 +703,25 @@ fn render_inspector(
     lines.push(Line::from(vec![
         Span::styled(
             format!("#{} {} ", rec.index + 1, rec.label),
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(usage_info, Style::default().fg(theme.text_muted)),
     ]));
     if let Some(inp) = &rec.input_detail {
         lines.push(Line::from(Span::styled(
-            format!("输入: {}", clip_text(inp, inner.width.saturating_sub(6) as usize)),
+            format!(
+                "输入: {}",
+                clip_text(inp, inner.width.saturating_sub(6) as usize)
+            ),
             Style::default().fg(theme.info),
         )));
     }
     if let Some(out) = &rec.output_detail {
         lines.push(Line::from(Span::styled(
-            format!("输出: {}", clip_text(out, inner.width.saturating_sub(6) as usize)),
+            format!(
+                "输出: {}",
+                clip_text(out, inner.width.saturating_sub(6) as usize)
+            ),
             Style::default().fg(theme.text_muted),
         )));
     }
@@ -725,12 +740,7 @@ fn render_inspector(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_hint_bar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &TrajectorySceneState,
-    theme: &Theme,
-) {
+fn render_hint_bar(frame: &mut Frame<'_>, area: Rect, state: &TrajectorySceneState, theme: &Theme) {
     let text = if state.search_active {
         format!(" 搜索: {}█  (Enter 确认 / Esc 取消)", state.query)
     } else {
