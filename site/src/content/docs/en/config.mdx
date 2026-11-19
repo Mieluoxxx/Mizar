@@ -37,15 +37,16 @@ Configuration layers stack from lowest to highest priority, with later layers ov
 <DiagramEmbed
   id="config-precedence"
   title="Four-Level Precedence & Dual-Track Merge Rules"
-  caption="Regular scalar fields follow last-write-wins overrides, whereas excludeTools and skills.customDirs merge across layers via safe union append."
+  caption="Regular scalar fields follow last-write-wins overrides, whereas excludeTools, skills.customDirs, and disabledPlugins merge across layers via safe union append and deduplication."
 />
 
-## Why Blocklists and Skill Directories Append Instead of Replacing
+## Why Blocklists, Skill Dirs, and Disabled Modules Append Instead of Replacing
 
-Most fields use "project config replaces global config," but two settings are intentionally merged by **cross-layer union append**:
+Most fields use "project config replaces global config," but three settings are intentionally merged by **cross-layer union append**:
 
 - `excludeTools`: The global blocklist, project blocklist, and CLI `--exclude-tools` flag all accumulate. If you disable a dangerous command personally in `~/.mizar/settings.json`, a repository's `.mizar/settings.json` that also excludes `edit` will not wipe out your personal safeguard.
 - `skills.customDirs`: Personal global skill directories and project-configured team skill directories are combined so shared and repository-private skills coexist.
+- `disabledPlugins`: Built-in optional module IDs disabled at global and project levels are merged, sorted, and deduplicated, while core kernel services remain protected and cannot be disabled.
 
 <Callout type="note">
   All configuration keys use <code>camelCase</code> (for example, <code>defaultProvider</code>). The only retained legacy alias is <code>defaultThinkingLevel</code>, which is equivalent to <code>reasoningEffort</code>.
@@ -137,3 +138,57 @@ In large monorepos, you can expand or tighten the `AGENTS.md` context budget and
 - `instructions.maxBytes` (default `65536`) caps the total bytes of injected rule files; when exceeded, rules closest to the current directory are kept first. Any single file exceeding `maxSourceBytes` (default 1 MiB) is skipped automatically.
 - `followSubdirs` (default `true`) dynamically loads subdirectory rule files when reading or editing files deeper in the tree.
 - `skills.enabled` toggles `.agents/skills` discovery; `customDirs` mounts additional shared team skill directories.
+
+## Context Compaction & Episodic Recall
+
+Long refactoring runs and verbose tool outputs no longer force a manual `/clear`—fine-tune automatic pruning, checkpoint summarization, and FTS5 recall under `compaction` and `recall` (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)):
+
+```json title="Compaction engine and recall controls"
+{
+  "compaction": {
+    "enabled": true,
+    "autoPrune": true,
+    "autoCompact": true,
+    "softWindowCap": 380000,
+    "triggerRatio": 0.8,
+    "pruneThresholdChars": 6000,
+    "coldCacheIdleSecs": 300,
+    "reusePrefixCache": true,
+    "disableSummaryReasoning": true,
+    "enableReadDedup": true,
+    "enableWriteAfterCompactGuard": true
+  },
+  "recall": {
+    "enabled": true,
+    "autoActivateOnCompaction": true,
+    "defaultSearchLimit": 8,
+    "readCharLimit": 6000
+  }
+}
+```
+
+- `softWindowCap` (default `380000`): Applies a gentle compaction ceiling even on 1M-token models to preserve attention quality and cache efficiency; set to `0` to disable.
+- `reusePrefixCache` (default `true`) and `disableSummaryReasoning` (default `true`): Append summary instructions at the tail to reuse the main conversation's Prompt Cache and disable hidden reasoning tokens during summarization.
+- `enableWriteAfterCompactGuard` & `enableReadDedup`: Prevent stale whole-file `write` overwrites after compaction (while always permitting targeted `edit` calls) and deduplicate unchanged `read` ranges within the same compaction epoch.
+- `recall`: `recall_search` / `recall_read` stay `Deferred` at zero cost until `autoActivateOnCompaction` (default `true`) activates them after the first prune/compaction or inside a forked lineage.
+
+## UI Preferences, `/settings` Modal & Module Toggles
+
+Run `/settings` (alias `/config`) inside the TUI to open an interactive overlay grouped into **Interface**, **Runtime**, **Compaction**, and **Modules**—changes apply live and persist atomically to `~/.mizar/settings.json` via `patch_settings_file` without disturbing any hand-written JSON keys:
+
+```json title="UI persistence and optional module toggles"
+{
+  "disabledPlugins": ["mcp", "tool-search"],
+  "ui": {
+    "theme": "auto",
+    "screenMode": "fullscreen",
+    "showThinking": true,
+    "verboseExpanded": false,
+    "sidePanelOpen": true,
+    "mouseCapture": true,
+    "approvalMode": "auto"
+  }
+}
+```
+
+- `disabledPlugins`: Declaratively disables built-in optional Cordis module IDs (`tool-time`, `tool-fs`, `tools-coding`, `tool-search`, `codemode`, `mcp`, `skills`, `instructions`, `compaction`, `recall`, `trajectory`, `repeat-guard`). Under the **Modules** group in `/settings`, you can hot-mount or hot-unload modules while idle (toggling is blocked while a turn is running); core services (`llm`, `sessions`, `tools`, `systemPrompt`, `agentLoop`, `spinePlugins`) are self-protected and can never be disabled.

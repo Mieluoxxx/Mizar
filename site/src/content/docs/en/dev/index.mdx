@@ -1,6 +1,6 @@
 ---
 title: Workspace Layering & Isolation Boundaries
-description: Mizar's 28-crate Rust 1.98 microkernel layering, the cordis assembly main loop, and the three zero-runtime pure-core isolation boundaries.
+description: Mizar's 30-crate Rust 1.98 microkernel layering, the cordis assembly main loop, and the three zero-runtime pure-core isolation boundaries.
 group: dev-arch
 order: 18
 ---
@@ -8,14 +8,14 @@ order: 18
 import Callout from '../../../../components/mdx/Callout.astro';
 import DiagramEmbed from '../../../../components/DiagramEmbed.astro';
 
-Mizar is built on **Rust 1.98.0** (edition 2024). The workspace consists of **28 crates** wired together around the custom **`cordis`** microkernel via service injection (`inject` / `provide`) to form the `"stream model call → execute tools → write back to session"` main loop, delivered as a terminal workbench through **`mizar-tui`** (the single binary entry point `mizar`).
+Mizar is built on **Rust 1.98.0** (edition 2024). The workspace consists of **30 crates** wired together around the custom **`cordis`** microkernel via service injection (`inject` / `provide`) to form the `"stream model call → execute tools → write back to session"` main loop, delivered as a terminal workbench through **`mizar-tui`** (the single binary entry point `mizar`).
 
 The authoritative architecture references in the repository are **`docs/plugins.md`** and **`AGENTS.md`**; this section focuses on architectural boundaries, [hands-on plugin development](/en/dev/cordis/), and [engineering conventions](/en/dev/conventions/).
 
 <DiagramEmbed
   id="cordis-architecture"
-  title="28-Crate Microkernel Layering & Three Isolation Boundaries"
-  caption="Pure core crates must never touch async/I/O/database runtimes; plugin crates request dependencies from the host via camelCase service names; the host layer assembles the full runtime by feature flags."
+  title="30-Crate Microkernel Layering & Three Isolation Boundaries"
+  caption="Pure core crates must never touch async/I/O/database runtimes; plugin crates request dependencies from the host via camelCase service names; the host layer assembles and hot-controls the runtime via feature flags and spinePlugins."
 />
 
 ## Three Zero-Runtime Isolation Boundaries
@@ -37,8 +37,8 @@ The following **3 core crates are strictly prohibited from adding** `tokio`, `co
 | **Microkernel** | `cordis` | Fiber state machine, service `provide`/`inject`, `ctx.effect` cleanup, and 5 event dispatch modes |
 | **Pure Core** | `mizar-tui-ui` · `mizar-llm-types` · `mizar-trajectory-core` | Zero-runtime pure data/UI state machines supporting fast standalone unit tests and `cargo check` |
 | **LLM Protocols & Routing** | `mizar-llm-http` · `mizar-llm-router` · `mizar-llm-{completions,responses,messages,mock}` | Credential expansion, `completions`/`responses`/`messages` protocol adapters, and mock latency simulation |
-| **Tools, Extensions & Storage** | `mizar-tools` · `mizar-tools-coding` · `mizar-mcp` · `mizar-codemode` · `mizar-tool-search` · `mizar-instructions` · `mizar-skills` · `mizar-session` · `mizar-session-sqlite` | Tool exposure/truncation/serialized write queue, MCP/QuickJS sandbox, instruction & skill discovery, and WAL persistence |
-| **Host & Binary Entry** | `mizar-agent-loop` · `mizar-agent-spine` · `mizar-tui` | Main loop orchestration, 28-crate feature-gated assembly (`AgentSpinePlugin`), and terminal event host |
+| **Tools, Extensions, Memory & Storage** | `mizar-tools` · `mizar-tools-coding` · `mizar-mcp` · `mizar-codemode` · `mizar-tool-search` · `mizar-instructions` · `mizar-skills` · `mizar-compaction` · `mizar-recall` · `mizar-session` · `mizar-session-sqlite` | Tool exposure/truncation/serialized write queue, MCP/QuickJS sandbox, instruction & skill discovery, L1–L3 compaction & FTS5 recall, and WAL persistence |
+| **Host & Binary Entry** | `mizar-agent-loop` · `mizar-agent-spine` · `mizar-tui` | Main loop orchestration, 30-crate feature-gated assembly (`AgentSpinePlugin` / `spinePlugins` hot toggling), and terminal event host |
 
 ## Fast Local Verification Commands
 

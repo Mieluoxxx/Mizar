@@ -81,8 +81,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Config & Precedence',
         },
         description: {
-          zh: '全局与项目级 settings.json 的覆盖合并规则、严格 JSON 校验与按需能力配置。',
-          en: 'Global and project-level settings.json merge rules, strict JSON validation, and opt-in capabilities.',
+          zh: '全局与项目级 settings.json 合并规则、/settings 实时配置、上下文压缩与模块热开关。',
+          en: 'Global and project settings.json merge rules, live /settings modal, compaction, and module toggles.',
         },
       },
       {
@@ -186,8 +186,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Sessions, Forking & /trace',
         },
         description: {
-          zh: '恢复历史会话、用 /tree 从任意回合分叉探索，以及在 /trace 三泳道视图中排查耗时热点。',
-          en: 'Resume sessions, branch at any turn with /tree, and inspect latency hotspots in the three-lane /trace profiler.',
+          zh: '恢复历史会话、/tree 分叉探索、/compact 上下文压缩与 FTS5 回溯，及 /trace 三泳道排查热点。',
+          en: 'Resume sessions, fork with /tree, compact context via /compact + FTS5 recall, and profile latency in /trace.',
         },
       },
       {
@@ -373,8 +373,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Workspace Layers & Cores',
         },
         description: {
-          zh: '28 个 crate 的职责分层，以及严禁引入运行时依赖的三大纯核心边界。',
-          en: 'Responsibilities across the 28 workspace crates and the three pure core crates shielded from runtime deps.',
+          zh: '30 个 crate 的职责分层，以及严禁引入运行时依赖的三大纯核心边界。',
+          en: 'Responsibilities across the 30 workspace crates and the three pure core crates shielded from runtime deps.',
         },
       },
       {

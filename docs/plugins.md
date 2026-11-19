@@ -50,7 +50,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 ## 四、工具插件
 
-以下插件中，4.1–4.4 与 4.5 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.6 `mizar-instructions` 是例外**：它不注册任何工具、不声明 `inject`，纯以事件订阅方式向会话注入 `ContextNotice`。
+以下插件中，4.1–4.5 及 4.7 的 `mizar-recall` 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.6 `mizar-instructions` 与 4.7 `mizar-compaction` 是例外**：前者不注册任何工具、仅订阅事件注入 `ContextNotice`，后者提供 `"compaction"` 服务并通过步前与工具管线执行上下文压缩与压后护栏。
 
 工具的可达性由 `mizar-tools` 的 **`ToolExposure`** 统一控制：
 
@@ -88,7 +88,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 服务结构体 | 提供服务名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json` 加载配置（项目级可用 `override` 仅改单个 Server 的暴露等级），支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`，`Accept: application/json, text/event-stream`）两种传输；按 Server 与逐工具两级配置暴露等级（`McpExposure` 默认 `Codemode`，支持通配符匹配），后台异步连接不阻塞启动；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`mizar-llm`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json` 加载配置（项目级省略 `command`/`url` 的同名条目作为增量补丁覆盖 `exposure` / `toolExposure` 等字段），支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`，`Accept: application/json, text/event-stream`）两种传输；按 Server 与逐工具两级配置暴露等级（`McpExposure` 默认 `Codemode`，支持通配符匹配），后台异步连接不阻塞启动；`close_all` 通过关闭标记与 `CancellationToken` 等待在途连接退出以支持安全热卸载；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`mizar-llm`、`mizar-system-prompt`、`mizar-tools` |
 
 ### 4.5 技能系统
 
@@ -106,7 +106,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 服务 / 插件结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | **四级渐进上下文压缩与压后工具守卫**：步前水位估算（含 380k 软顶、regrowth 防抖与冷缓存机会窗）→ L1 零模型批量 `ToolResultPrune` 剪枝锁存 → L2 软硬分离检查点摘要（确定性 `<mizar-digest>` + 同前缀尾置指令 + `reasoning: off` + `<= 0.5*B` Re-plan + `answeredRoute`）→ L3 溢出与隐性连续截断（`cutOffs >= 2`）自动恢复；挂载 `tools/pre-execute`（压后拦陈旧整文件 `write` 放行 `edit`）与 `tools/post-execute`（跨压缩感知 `read-dedup`）；暴露 `compact_now` 供 TUI `/compact [focus]` 调用 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | **渐进上下文压缩与压后工具护栏**：步前水位估算（含 380k 软顶、regrowth 防抖与 300s 冷缓存机会窗）→ L1 零模型批量 `ToolResultPrune` 剪枝锁存 → L2 软硬分离检查点摘要（确定性 `<mizar-digest>` + 同前缀尾置指令 + `reasoning: off` + `<= 0.5*B` Re-plan + `answeredRoute`）→ L3 溢出与隐性连续截断（`cutOffs >= 2`）自动恢复；挂载 `tools/pre-execute`（压后拦陈旧整文件 `write` 放行 `edit`）与 `tools/post-execute`（跨压缩感知 `read-dedup`）；暴露 `compact_now` 供 TUI `/compact [focus]` 调用，且在 `AgentSpinePlugin` 中先于 `instructions` / `skills` / `recall` 装配以便压缩后同步触发重注与激活 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
 | **`mizar-recall`** | `RecallPlugin` | `"recall"` | `recall_search`、`recall_read` | `["sessions", "tools"]` | **无损情景回溯工具**：默认以 `ToolExposure::Deferred` 零开销挂载，一旦本会话发生首次剪枝/压缩或处于 `parent_id` 谱系中即自动激活为模型可见；穿透压缩边界检索 SQLite FTS5 1..=3 n-gram 索引（无持久化时自动退回内存扫描），支持 `current` / `lineage` / `workspace` 作用域校验、`is_current_session` 标记、字符分页与 `to_file` 旁路导出 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools` |
 
 ---
@@ -124,7 +124,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | Crate | 插件 / 服务结构体 | 插件名 / 提供服务 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-agent-loop`** | `AgentLoop` | `"AgentLoop"` / 提供 `"agentLoop"` | **Agent 主循环**：串联「记录用户输入 → 拼装提示词与历史 → 流式调模型 → 执行工具并写回会话 → 直到最终回答」，广播全套 `agent/*` 流式事件；`max_steps` 默认 `None` 不限步数，靠模型收敛、重复守卫与 `CancellationToken` 终止 | `["llm", "tools", "sessions", "systemPrompt"]` | `cordis`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
-| **`mizar-trajectory`** | `TrajectoryRuntime` + `RepeatToolGuardPlugin` | `"trajectory"` / `"repeat-tool-guard"` | **轨迹观测运行时**：基于 `mizar-trajectory-core` 模型与检测器，订阅会话与 `agent/*` 事件实时采集 `TraceEvent`（广播 `trajectory/anomaly`），可选落盘 `{export_dir}/{session_id}.jsonl`；`RepeatToolGuardPlugin` 在 `tools/post-execute` waterfall 上捕捉连续重复调用并追加提醒或强制拦截 | 无（全部通过事件订阅接入） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools`、`mizar-trajectory-core` |
+| **`mizar-trajectory`** | `TrajectoryRuntime` + `RepeatToolGuardPlugin` | `"trajectory"`（服务）/ `"repeat-tool-guard"` | **轨迹观测运行时**：基于 `mizar-trajectory-core` 模型与检测器提供 `"trajectory"` 服务，订阅会话与 `agent/*` 事件实时采集 `TraceEvent`（广播 `trajectory/anomaly`），可选落盘 `{export_dir}/{session_id}.jsonl`；`RepeatToolGuardPlugin` 在 `tools/post-execute` waterfall 上捕捉连续重复调用并追加提醒或强制拦截 | 无（全部通过事件订阅接入） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools`、`mizar-trajectory-core` |
 
 ---
 
@@ -132,8 +132,8 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务，再通过 `SpinePlugins`（`SpinePluginsContextExt`）统一管理内置可选模块（`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`compaction`、`recall`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用）。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 读写配置 | 无（自身负责装配与控制） | `thiserror`、`tokio` 及按 Cargo features 选配的后端 crate |
-| **`mizar-tui`** | 可执行文件 `mizar` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `mizar-tui-ui`；`/settings` `[模块]` 分组对接 `"spinePlugins"`（执行中拒绝切换，空闲热切换后原子回写 `~/.mizar/settings.json` 并动态刷新侧栏、技能与 `/settings` 状态）。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测，按需访问 `"spinePlugins"` 与可选服务） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理 12 个内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用）。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写配置 | 无（自身负责装配与控制） | `thiserror`、`tokio` 及按 Cargo features 选配的后端 crate |
+| **`mizar-tui`** | 可执行文件 `mizar` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `mizar-tui-ui`；支持欢迎画布、`!` / `!!` 本地 Bash 模式、可取消的 `/compact [focus]` 进度压缩，以及 `/settings`（`/config`）的 `[界面]` / `[运行]` / `[压缩]` / `[模块]` 实时切换并原子回写 `~/.mizar/settings.json`（其中 `[模块]` 开关在任务执行中保护禁止切换，空闲切换后即时刷新侧栏、技能与工具状态）。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测，按需访问 `"spinePlugins"`、`compaction`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
 ---
 
@@ -194,10 +194,10 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `toolSearch` | object | `autoEnable` / `defaultLimit` |
 | `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
 | `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` / `followSubdirs` |
-| `compaction` | object | `enabled` / `autoCompact` / `autoPrune` / `softWindowCap` / `triggerRatio` / `pruneThresholdChars` / `coldCacheIdleSecs` / `reusePrefixCache` / `disableSummaryReasoning` / `enableReadDedup` / `enableWriteAfterCompactGuard` |
-| `recall` | object | `enabled` / `autoActivateOnCompaction` / `defaultSearchLimit` / `readCharLimit` |
+| `compaction` | object | `enabled` / `autoCompact` / `autoPrune` / `softWindowCap`（默认 `380000`）/ `triggerRatio`（默认 `0.80`）/ `pruneThresholdChars`（默认 `6000`）/ `coldCacheIdleSecs`（默认 `300`）/ `reusePrefixCache` / `disableSummaryReasoning` / `enableReadDedup` / `enableWriteAfterCompactGuard` |
+| `recall` | object | `enabled` / `autoActivateOnCompaction` / `defaultSearchLimit`（默认 `8`）/ `readCharLimit`（默认 `6000`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 
 `models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/mizar-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，并额外支持每个 Server 的 `exposure` 与 `toolExposure`。
 
-> **注意**：`restrictToWorkspace` 默认关闭且 `TuiConfig::approval_mode` 默认为 `Auto`，即开箱状态下 `bash` / `write` / `edit` 可触达工作区外路径且无审批弹窗；需要沙箱感时请显式开启 `restrictToWorkspace` 并搭配 `--approve`。
+> **注意**：`restrictToWorkspace` 默认关闭且 `TuiConfig::approval_mode` 默认为 `Auto`，即开箱状态下 `bash` / `write` / `edit` 可触达工作区外路径且无审批弹窗；需要沙箱感时请显式开启 `restrictToWorkspace` 并搭配 `--approve`（或通过 `/settings` / `/approval ask` 运行期开启审批）。

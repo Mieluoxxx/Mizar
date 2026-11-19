@@ -37,15 +37,16 @@ import DiagramEmbed from '../../components/DiagramEmbed.astro';
 <DiagramEmbed
   id="config-precedence"
   title="四级配置叠加与双轨合并规则"
-  caption="普通标量采用“后者覆写前者”，而 excludeTools 与 skills.customDirs 跨层级合并时会做安全并集追加。"
+  caption="普通标量采用“后者覆写前者”，而 excludeTools、skills.customDirs 与 disabledPlugins 跨层级合并时会做安全并集追加与去重。"
 />
 
-## 为什么黑名单和技能目录采用追加而不是清空
+## 为什么黑名单、技能目录与模块屏蔽采用追加而不是清空
 
-绝大多数字段都是“项目配置直接替换全局配置”，但有两项刻意设计为**跨层级并集追加**：
+绝大多数字段都是“项目配置直接替换全局配置”，但有三项刻意设计为**跨层级并集追加**：
 
 - `excludeTools`：全局屏蔽列表、项目屏蔽列表与 CLI `--exclude-tools` 参数全部累加生效。假设你个人在 `~/.mizar/settings.json` 禁用了一个高危命令，即使某个开源项目自己的 `.mizar/settings.json` 又屏蔽了 `edit`，你的个人防线依然不会被顺手清空。
 - `skills.customDirs`：全局个人技能目录与当前项目指定的团队技能目录会合并扫描，让公共技能与仓库私有技能共存。
+- `disabledPlugins`：全局与项目声明禁用的内置可选模块 ID 会合并、排序并去重，同时对核心内核服务实施自保护（不可禁用）。
 
 <Callout type="note">
   所有配置键名均采用 <code>camelCase</code>（例如 <code>defaultProvider</code>）。唯一保留的历史兼容别名是 <code>defaultThinkingLevel</code>，等价于 <code>reasoningEffort</code>。
@@ -137,3 +138,57 @@ import DiagramEmbed from '../../components/DiagramEmbed.astro';
 - `instructions.maxBytes`（默认 `65536`）限制注入模型的规则总字节数；超过预算时会优先保留离当前目录最近的规则。单个超过 `maxSourceBytes`（默认 1 MiB）的超大文件会自动跳过。
 - `followSubdirs`（默认 `true`）允许在读取或编辑深层子目录文件时动态补载该目录的规则文件。
 - `skills.enabled` 控制是否启用 `.agents/skills`；`customDirs` 可额外挂载团队公共技能目录。
+
+## 上下文压缩与情景记忆回溯
+
+长时间重构与大量工具输出不再只能手动 `/clear` 重来，可通过 `compaction` 与 `recall` 精细调优（详见 [会话、分叉与性能轨迹](/tui/sessions/)）：
+
+```json title="压缩引擎与情景回溯配置"
+{
+  "compaction": {
+    "enabled": true,
+    "autoPrune": true,
+    "autoCompact": true,
+    "softWindowCap": 380000,
+    "triggerRatio": 0.8,
+    "pruneThresholdChars": 6000,
+    "coldCacheIdleSecs": 300,
+    "reusePrefixCache": true,
+    "disableSummaryReasoning": true,
+    "enableReadDedup": true,
+    "enableWriteAfterCompactGuard": true
+  },
+  "recall": {
+    "enabled": true,
+    "autoActivateOnCompaction": true,
+    "defaultSearchLimit": 8,
+    "readCharLimit": 6000
+  }
+}
+```
+
+- `softWindowCap`（默认 `380000`）：即使在 1M 超大窗口模型上也维持温和软顶，避免注意力衰退与缓存效益下降；设为 `0` 关闭软顶。
+- `reusePrefixCache`（默认 `true`）与 `disableSummaryReasoning`（默认 `true`）：摘要请求尾置指令以复用主对话 Prompt Cache，并关闭思考以防隐藏推理挤占摘要预算。
+- `enableWriteAfterCompactGuard` & `enableReadDedup`：压缩后拦截对已存在文件未经重读的整文件 `write`（始终放行 `edit`），并对同一压缩代次内未改动的重复 `read` 自动去重。
+- `recall`：`recall_search` / `recall_read` 默认按 `Deferred` 零成本待命，`autoActivateOnCompaction`（默认 `true`）在首轮剪枝/压缩或分叉会话中自动向模型激活。
+
+## 界面偏好、`/settings` 面板与模块启停
+
+在终端内输入 `/settings`（别名 `/config`）即可打开按 **[界面]**、**[运行]**、**[压缩]**、**[模块]** 分组的交互式设置浮层——切换后即时生效，并采用增量原子修补（`patch_settings_file`）写回全局 `~/.mizar/settings.json`，不会破坏手写的其他 JSON 字段：
+
+```json title="界面偏好与可选模块屏蔽"
+{
+  "disabledPlugins": ["mcp", "tool-search"],
+  "ui": {
+    "theme": "auto",
+    "screenMode": "fullscreen",
+    "showThinking": true,
+    "verboseExpanded": false,
+    "sidePanelOpen": true,
+    "mouseCapture": true,
+    "approvalMode": "auto"
+  }
+}
+```
+
+- `disabledPlugins`：声明禁用内置可选 Cordis 模块 ID（如 `tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`compaction`、`recall`、`trajectory`、`repeat-guard`）。在 `/settings` 的 **[模块]** 分组中可在空闲时实时热挂载/热卸载（任务运行中自动保护拒绝切换）；`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins` 受核心自保护，任何配置均不可禁用。

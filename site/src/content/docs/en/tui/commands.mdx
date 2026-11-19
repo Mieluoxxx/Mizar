@@ -13,15 +13,17 @@ Typing `/` at the beginning of the input box opens slash command completion. For
 
 | Command | Shortcut | Description |
 | :--- | :--- | :--- |
+| `/settings` · `/config` | — | Open the interactive configuration modal (UI, runtime, compaction, and live module toggles with atomic save) |
 | `/model` | <kbd>Ctrl</kbd>+<kbd>L</kbd> | Interactively switch between configured providers and models |
 | `/effort` | <kbd>Tab</kbd> | Adjust reasoning effort (`off` through `max`; press `Tab` on an empty input to cycle) |
 | `/thinking` | — | Expand or collapse model reasoning chain display |
 | `/theme` | — | Live-preview and switch terminal color themes (6 presets; see [Terminal Themes](/en/tui/themes/)) |
 
-## Session & Branching Control
+## Session, Compaction & Branching Control
 
 | Command | Description |
 | :--- | :--- |
+| `/compact [focus]` | Manually trigger checkpoint compaction with an optional focus note (cancelable via `Esc`; see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
 | `/tree` | Open the conversation tree view to fork and explore a new approach from any prior turn (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
 | `/clear` · `/new` | Clear the current viewport and start a brand-new session |
 | `/export` | Export the current session as readable text or transcript records |

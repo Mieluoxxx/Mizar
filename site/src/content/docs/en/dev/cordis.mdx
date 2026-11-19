@@ -66,7 +66,7 @@ impl Plugin for ToolTimePlugin {
 
 ## `inject` / `provide` and `ctx.effect` Invariants
 
-- **Service naming and accessors**: Standard `cordis` service names uniformly use camelCase (`llm`, `tools`, `sessions`, `systemPrompt`, `agentLoop`, `skills`, `mcp`, `trajectory`). Production code must always call `<Name>ContextExt` extension methods (such as `ctx.tools()?`) rather than querying the service map directly.
+- **Service naming and accessors**: Standard `cordis` service names uniformly use camelCase (`llm`, `tools`, `sessions`, `systemPrompt`, `agentLoop`, `skills`, `mcp`, `trajectory`, `compaction`, `spinePlugins`). Production code must always call `<Name>ContextExt` extension methods (such as `ctx.tools()?`) rather than querying the service map directly.
 - **Side effects must go through `ctx.effect("<crate>-<action>", ...)`**: Returned cleanup handles are managed by the framework. When a plugin unloads or reloads, the Fiber state machine guarantees **automatic cleanup in reverse registration order** for every side effect (unregistering tools, stopping background tasks)—the core invariant that prevents resource leaks.
 
 ## Tool Visibility (`ToolExposure`) & Three-Stage Pipeline

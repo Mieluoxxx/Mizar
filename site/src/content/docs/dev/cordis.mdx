@@ -66,7 +66,7 @@ impl Plugin for ToolTimePlugin {
 
 ## `inject` / `provide` 与 `ctx.effect` 不变量
 
-- **服务命名与访问器**：`cordis` 标准服务名统一为 camelCase（`llm`、`tools`、`sessions`、`systemPrompt`、`agentLoop`、`skills`、`mcp`、`trajectory`）。生产代码一律调用 `<Name>ContextExt` 扩展方法（例如 `ctx.tools()?`），不要裸查服务表。
+- **服务命名与访问器**：`cordis` 标准服务名统一为 camelCase（`llm`、`tools`、`sessions`、`systemPrompt`、`agentLoop`、`skills`、`mcp`、`trajectory`、`compaction`、`spinePlugins`）。生产代码一律调用 `<Name>ContextExt` 扩展方法（例如 `ctx.tools()?`），不要裸查服务表。
 - **副作用必须走 `ctx.effect("<crate>-<动作>", ...)`**：返回的销毁句柄由框架托管。当插件卸载或重载时，Fiber 状态机保证按**注册的倒序自动清理**所有副作用（撤销工具、停止后台任务），这是不遗漏资源泄漏的核心不变量。
 
 ## 工具可见性（`ToolExposure`）与三道管线

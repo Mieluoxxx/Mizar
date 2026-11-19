@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="site/public/favicon.svg" width="36" alt="Mizar" />
+  <img src="site/public/favicon.svg" width="44" alt="Mizar" />
 </p>
 
 <h1 align="center">Mizar</h1>
@@ -41,7 +41,7 @@ cargo install --path crates/mizar-tui
 - **Local Bash (`!` / `!!`)**: Run `!cmd` to feed command output into the next model turn, or `!!cmd` to run locally with zero token cost.
 - **Rules & Skills**: Hierarchical `AGENTS.md` / `CLAUDE.md` discovery under a `64 KiB` budget plus hot-reloaded `SKILL.md` workflows.
 - **MCP & Codemode**: Connect Stdio/HTTP MCP servers via `mcp.json`, discover large tool catalogs on demand with `tool_search`, and batch-call tools inside an isolated QuickJS (`rquickjs`) sandbox.
-- **Providers & Persistence**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json`, backed by WAL SQLite sessions (`/tree` branching & `/trace` profiler).
+- **Providers & Persistence**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by WAL SQLite sessions (`/tree` branching, `/compact` + FTS5 recall, & `/trace` profiler).
 
 ### Documentation & Development
 
@@ -50,9 +50,9 @@ cargo install --path crates/mizar-tui
   pnpm --dir site install --frozen-lockfile
   pnpm --dir site dev
   ```
-- **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (28 workspace crates built on `cordis`)
+- **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (30 workspace crates built on `cordis`)
 - **Agent & Contributor Rules**: [`AGENTS.md`](AGENTS.md)
 
 ### License
 
-MIT
+[MIT](LICENSE)

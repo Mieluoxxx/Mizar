@@ -65,7 +65,7 @@ Mizar：
 1. **直接声明（`Direct`）**：如 `read`、`edit`、`bash`，模型从第一轮起就知道它的存在并能直接发起调用。
 2. **仅向模型声明 / 防嵌套（`ModelOnly`）**：如按需搜工具的 `tool_search` 和执行 JS 编排的 `codemode`，模型可以直接触发它们，但沙箱脚本内部不能递归调用它们。
 3. **仅在沙箱内部调用（`Codemode`）**：所有 MCP 服务器工具默认属于这一层——完全不占对话首轮上下文，需要时模型在 [Codemode 沙箱](/codemode/) 里一键批量调通。
-4. **按需搜出 / 延迟加载（`Deferred`）**：配置为 `deferred` 的外部工具平时静默隐藏，模型调用 `tool_search` 命中后才进入直接可用视野。
+4. **按需搜出 / 延迟加载（`Deferred`）**：例如情景记忆工具 `recall_search` / `recall_read` 与标记为 `deferred` 的外部工具平时静默隐藏，在触发条件（如会话发生剪枝/压缩）或经 `tool_search` 命中后才进入直接可用视野。
 5. **彻底隐藏（`Hidden`）**：被 `excludeTools` 或配置为 `hidden` 的工具对模型和沙箱均不可见。
 
 ## 工具裁剪与权限控制

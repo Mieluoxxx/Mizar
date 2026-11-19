@@ -1,15 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 25" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
   <style>
-    .bg { fill: #161616; }
-    .fg { fill: #fbfbfb; }
-    .inner { fill: #4b4b4b; }
+    .fg { fill: #161616; }
+    .star { fill: #3b5cf6; }
     @media (prefers-color-scheme: dark) {
-      .bg { fill: #fafafa; }
-      .fg { fill: #0c0c0c; }
-      .inner { fill: #6a6a6a; }
+      .fg { fill: #fafafa; }
+      .star { fill: #6b8fff; }
     }
   </style>
-  <rect class="bg" width="20" height="25"/>
-  <path class="fg" d="M3 4H17V21H14V8.5L10 13.5L6 8.5V21H3V4Z"/>
-  <rect class="inner" x="8.5" y="15" width="3" height="6"/>
+  <path class="fg" d="M4 27V6.8H8.6L15.6 15L18.4 12.1L21.1 14.8L15.6 20.6L8.2 12.2V27H4Z"/>
+  <path class="fg" d="M21.5 16.8H25.7V27H21.5V16.8Z"/>
+  <path class="star" d="M23.6 5.6 Q24.416 9.584 28.4 10.4 Q24.416 11.216 23.6 15.2 Q22.784 11.216 18.8 10.4 Q22.784 9.584 23.6 5.6 Z"/>
+  <path class="fg" d="M28.6 2.4 Q29.16 3.84 30.6 4.4 Q29.16 4.96 28.6 6.4 Q28.04 4.96 26.6 4.4 Q28.04 3.84 28.6 2.4 Z"/>
 </svg>

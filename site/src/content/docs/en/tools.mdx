@@ -65,7 +65,7 @@ From the user's perspective, tools operate in five `ToolExposure` tiers:
 1. **Direct (`Direct`)**: Tools like `read`, `edit`, and `bash` are declared to the model from turn one and can be invoked directly.
 2. **Model-only / No nesting (`ModelOnly`)**: Meta-tools such as `tool_search` and `codemode` can be called directly by the model, but cannot be called recursively from inside sandbox scripts.
 3. **Sandbox-only (`Codemode`)**: All MCP server tools default to this tier—consuming zero tokens in the initial turn while remaining batch-callable inside the [Codemode Sandbox](/en/codemode/).
-4. **On-demand discovery (`Deferred`)**: External tools marked `deferred` stay hidden until `tool_search` surfaces them into active scope.
+4. **On-demand discovery (`Deferred`)**: Tools such as episodic recall (`recall_search` / `recall_read`) and external tools marked `deferred` stay hidden until activated by session triggers (such as pruning/compaction) or surfaced via `tool_search`.
 5. **Hidden (`Hidden`)**: Tools matched by `excludeTools` or configured as `hidden` are invisible to both the model and the sandbox.
 
 ## Tool Filtering & Permissions

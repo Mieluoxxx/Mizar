@@ -1,6 +1,6 @@
 ---
 title: Workspace 分层与隔离边界
-description: Mizar 28-crate Rust 1.98 微内核架构分层、cordis 装配主循环，以及三大零运行时核心隔离红线。
+description: Mizar 30-crate Rust 1.98 微内核架构分层、cordis 装配主循环，以及三大零运行时核心隔离红线。
 group: dev-arch
 order: 18
 ---
@@ -8,14 +8,14 @@ order: 18
 import Callout from '../../../components/mdx/Callout.astro';
 import DiagramEmbed from '../../../components/DiagramEmbed.astro';
 
-Mizar 基于 **Rust 1.98.0**（edition 2024）构建，整个工作区由 **28 个 crate** 组成，围绕自研微内核 **`cordis`** 通过服务注入（`inject` / `provide`）装配成「流式调模型 → 执行工具 → 回写会话」的主循环，并以 **`mizar-tui`**（唯一二进制入口 `mizar`）交付终端工作台。
+Mizar 基于 **Rust 1.98.0**（edition 2024）构建，整个工作区由 **30 个 crate** 组成，围绕自研微内核 **`cordis`** 通过服务注入（`inject` / `provide`）装配成「流式调模型 → 执行工具 → 回写会话」的主循环，并以 **`mizar-tui`**（唯一二进制入口 `mizar`）交付终端工作台。
 
 仓库内的权威架构文档为 **`docs/plugins.md`** 与 **`AGENTS.md`**；架构与开发章节聚焦架构红线、[插件开发实操](/dev/cordis/) 与 [工程规范](/dev/conventions/)。
 
 <DiagramEmbed
   id="cordis-architecture"
-  title="28-Crate 微内核分层与三大隔离边界"
-  caption="纯核心层严禁接触异步/I/O/数据库运行时；插件层通过 camelCase 服务名向宿主请求依赖；宿主层按 feature 组合装配完整运行时。"
+  title="30-Crate 微内核分层与三大隔离边界"
+  caption="纯核心层严禁接触异步/I/O/数据库运行时；插件层通过 camelCase 服务名向宿主请求依赖；宿主层按 feature 与 spinePlugins 装配并热控制完整运行时。"
 />
 
 ## 三大零运行时隔离红线
@@ -37,8 +37,8 @@ Mizar 基于 **Rust 1.98.0**（edition 2024）构建，整个工作区由 **28 �
 | **微内核** | `cordis` | Fiber 状态机、服务 `provide`/`inject`、`ctx.effect` 清理与 5 种事件分发 |
 | **纯核心层** | `mizar-tui-ui` · `mizar-llm-types` · `mizar-trajectory-core` | 零运行时纯数据/UI 状态机，可独立做快速单测与 `cargo check` |
 | **模型协议与路由** | `mizar-llm-http` · `mizar-llm-router` · `mizar-llm-{completions,responses,messages,mock}` | 凭据展开、`completions`/`responses`/`messages` 协议适配与延迟模拟 |
-| **工具、扩展与存储** | `mizar-tools` · `mizar-tools-coding` · `mizar-mcp` · `mizar-codemode` · `mizar-tool-search` · `mizar-instructions` · `mizar-skills` · `mizar-session` · `mizar-session-sqlite` | 工具暴露/截断/串行写队列、MCP/QuickJS 沙箱、指令技能发现与 WAL 持久化 |
-| **宿主与运行入口** | `mizar-agent-loop` · `mizar-agent-spine` · `mizar-tui` | 主循环调度、28-crate 条件特征装配（`AgentSpinePlugin`）与终端事件宿主 |
+| **工具、扩展、记忆与存储** | `mizar-tools` · `mizar-tools-coding` · `mizar-mcp` · `mizar-codemode` · `mizar-tool-search` · `mizar-instructions` · `mizar-skills` · `mizar-compaction` · `mizar-recall` · `mizar-session` · `mizar-session-sqlite` | 工具暴露/截断/串行写队列、MCP/QuickJS 沙箱、指令技能发现、L1–L3 上下文压缩与 FTS5 情景回溯、WAL 持久化 |
+| **宿主与运行入口** | `mizar-agent-loop` · `mizar-agent-spine` · `mizar-tui` | 主循环调度、30-crate 条件特征装配（`AgentSpinePlugin` / `spinePlugins` 热启停）与终端事件宿主 |
 
 ## 本地快速验证命令
 
