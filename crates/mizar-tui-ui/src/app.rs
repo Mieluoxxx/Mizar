@@ -375,6 +375,7 @@ pub struct AppState {
     // 双模视图与鼠标开关
     pub screen_mode: ScreenMode,
     pub inline_committed_items: usize,
+    pub inline_welcome_committed: bool,
     pub mouse_capture_enabled: bool,
     pub launchpad_hit_rects: Vec<(LaunchpadQuickAction, Rect)>,
 
@@ -460,6 +461,7 @@ impl AppState {
             streaming_assistant_open: false,
             screen_mode: ScreenMode::Fullscreen,
             inline_committed_items: 0,
+            inline_welcome_committed: false,
             mouse_capture_enabled: true,
             launchpad_hit_rects: Vec::new(),
             theme_preset,
@@ -1806,6 +1808,7 @@ impl AppState {
         self.last_tps = None;
         self.tps_history.clear();
         self.inline_committed_items = 0;
+        self.inline_welcome_committed = false;
         self.scroll_from_top = 0;
         self.auto_scroll = true;
         self.streaming_assistant_open = false;

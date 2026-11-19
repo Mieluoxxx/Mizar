@@ -49,7 +49,9 @@ use mizar_tui_ui::terminal::{
     write_begin_sync, write_end_sync,
 };
 use mizar_tui_ui::theme::ThemePreset;
-use mizar_tui_ui::ui::{build_item_lines_for_scrollback_at, render};
+use mizar_tui_ui::ui::{
+    build_item_lines_for_scrollback_at, build_welcome_lines_for_scrollback, render,
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -1117,8 +1119,28 @@ fn create_terminal(
     }
 }
 
-fn flush_inline_scrollback(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+fn insert_scrollback_lines<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    lines: &[ratatui::text::Line<'static>],
+    chunk_max: usize,
+) {
+    for chunk in lines.chunks(chunk_max) {
+        let h = chunk.len() as u16;
+        let _ = terminal.insert_before(h, |buf| {
+            for (row_off, line) in chunk.iter().enumerate() {
+                buf.set_line(
+                    buf.area.x,
+                    buf.area.y + row_off as u16,
+                    line,
+                    buf.area.width,
+                );
+            }
+        });
+    }
+}
+
+fn flush_inline_scrollback<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     app: &mut AppState,
 ) {
     if app.inline_committed_items >= app.items.len() {
@@ -1129,6 +1151,13 @@ fn flush_inline_scrollback(
     };
     let width = size.width.max(20) as usize;
     let chunk_max = size.height.saturating_sub(2).max(4) as usize;
+
+    // 首次写入原生 scrollback 时先写入欢迎页序言（含 1 行尾空行），切回全屏再返 Inline 不重复追加
+    if !app.inline_welcome_committed {
+        let welcome_lines = build_welcome_lines_for_scrollback(app, width);
+        insert_scrollback_lines(terminal, &welcome_lines, chunk_max);
+        app.inline_welcome_committed = true;
+    }
 
     while app.inline_committed_items < app.items.len() {
         let idx = app.inline_committed_items;
@@ -1142,14 +1171,7 @@ fn flush_inline_scrollback(
             app.show_thinking,
             app.verbose_expanded,
         );
-        for chunk in lines.chunks(chunk_max) {
-            let h = chunk.len() as u16;
-            let _ = terminal.insert_before(h, |buf| {
-                for (row_off, line) in chunk.iter().enumerate() {
-                    buf.set_line(buf.area.x, buf.area.y + row_off as u16, line, buf.area.width);
-                }
-            });
-        }
+        insert_scrollback_lines(terminal, &lines, chunk_max);
         app.inline_committed_items += 1;
     }
 }
@@ -2068,5 +2090,58 @@ mod tests {
         ));
 
         ctx.fiber().dispose().await;
+    }
+
+    #[test]
+    fn flush_inline_scrollback_commits_welcome_once_and_resets_on_new_session() {
+        use mizar_tui_ui::app::NoticeLevel;
+        use mizar_tui_ui::terminal::ScreenMode;
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(10),
+            },
+        )
+        .unwrap();
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-inline-flush",
+            Vec::new(),
+            Some("mock".into()),
+            Some("mock-v1".into()),
+            None,
+        );
+        app.screen_mode = ScreenMode::Inline;
+
+        // 空会话调用 flush_inline_scrollback 不提前提交欢迎页
+        super::flush_inline_scrollback(&mut terminal, &mut app);
+        assert!(!app.inline_welcome_committed);
+        assert_eq!(app.inline_committed_items, 0);
+
+        // 首条通知到来：先写欢迎页（inline_welcome_committed = true），再写通知
+        app.push_notice(NoticeLevel::Info, "已切换后续请求模型为：mock/mock-v1");
+        super::flush_inline_scrollback(&mut terminal, &mut app);
+        assert!(app.inline_welcome_committed);
+        assert_eq!(app.inline_committed_items, 1);
+
+        // 切到 Fullscreen 后新增条目再切回 Inline，不重置或重复写入欢迎页
+        app.screen_mode = ScreenMode::Fullscreen;
+        app.push_user_message("追加问题");
+        app.screen_mode = ScreenMode::Inline;
+        super::flush_inline_scrollback(&mut terminal, &mut app);
+        assert!(app.inline_welcome_committed);
+        assert_eq!(app.inline_committed_items, 2);
+
+        // /new 重置后再次允许写入新会话欢迎页
+        app.reset_for_new_session("sess-inline-flush-2", None);
+        assert!(!app.inline_welcome_committed);
+        assert_eq!(app.inline_committed_items, 0);
+        super::flush_inline_scrollback(&mut terminal, &mut app);
+        assert!(app.inline_welcome_committed);
+        assert_eq!(app.inline_committed_items, 1);
     }
 }

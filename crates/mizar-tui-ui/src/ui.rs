@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders};
 
 use crate::app::{
     AppState, ApprovalMode, BashInputMode, ChatItem, ItemRenderKey, LaunchpadQuickAction,
@@ -18,8 +18,7 @@ use crate::app::{
 use crate::editor::{char_width, display_width};
 use crate::emphasis::EmphasisConfig;
 use crate::markdown::{
-    RenderedLine, parse_inline_rich, render_diff_rich, render_markdown_rich, wrap_styled_spans,
-    wrap_styled_spans_rich,
+    RenderedLine, parse_inline_rich, render_diff_rich, render_markdown_rich, wrap_styled_spans_rich,
 };
 use crate::overlay::render_overlay;
 use crate::reveal::RevealSlot;
@@ -119,14 +118,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
 
     app.selection_geom.input_rect = Some(input_area);
 
-    // 4. 渲染对话历史或 Launchpad 欢迎页
+    // 4. 渲染对话历史（含顶部欢迎页序言）
     if transcript_area.height > 0 && transcript_area.width > 0 {
-        if app.items.is_empty() {
-            app.selection_geom.chat_rect = Some(transcript_area);
-            render_welcome(frame, transcript_area, app);
-        } else {
-            render_transcript(frame, transcript_area, app);
-        }
+        render_transcript(frame, transcript_area, app);
     }
 
     // 5. 渲染排队待发送条
@@ -162,16 +156,31 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     app.last_buffer = Some(frame.buffer_mut().clone());
 }
 
-fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+/// Launchpad 快捷操作芯片在欢迎页行内的水平跨度元数据。
+struct WelcomeChipSpan {
+    action: LaunchpadQuickAction,
+    x_offset: u16,
+    width: u16,
+}
+
+/// 欢迎页序言构行结果：包含行序列以及快捷操作行相对该块的索引与各按钮水平跨度。
+struct WelcomeSection {
+    lines: Vec<RenderedLine>,
+    chips_line_idx: Option<usize>,
+    chip_spans: Vec<WelcomeChipSpan>,
+}
+
+/// 统一构建 Launchpad 欢迎页序言行与快捷芯片相对布局，供全屏对话流与 Inline 原生 scrollback 共用。
+fn build_welcome_section(app: &AppState, width: usize, height: usize) -> WelcomeSection {
     let theme = &app.theme;
     let model_label = app.active_model_label();
     let effort_str = format_effort_label(app.reasoning_effort);
     let effort_col = effort_color(theme, app.reasoning_effort);
 
-    // 极窄终端紧凑模式（如 20x8）
-    if area.height < 7 || area.width < 36 {
-        let lines = vec![
-            Line::from(vec![
+    // 极窄或极矮终端紧凑模式（如 20x8）
+    if height < 7 || width < 36 {
+        let mut lines = wrap_styled_spans_rich(
+            vec![
                 Span::styled(
                     "Mizar",
                     Style::default()
@@ -180,54 +189,62 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    truncate_display(&model_label, area.width.saturating_sub(2) as usize),
+                    truncate_display(&model_label, width.saturating_sub(2)),
                     Style::default().fg(theme.text),
                 ),
-            ]),
-            Line::from(Span::styled(
-                truncate_display(&model_label, area.width as usize),
-                Style::default().fg(theme.success),
-            )),
-            Line::from(Span::styled(
-                truncate_display(&app.workspace.display().to_string(), area.width as usize),
-                Style::default().fg(theme.text_muted),
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-        return;
+            ],
+            None,
+            None,
+            width.max(1),
+        );
+        lines.push(RenderedLine::hard(Line::from(Span::styled(
+            truncate_display(&model_label, width),
+            Style::default().fg(theme.success),
+        ))));
+        lines.push(RenderedLine::hard(Line::from(Span::styled(
+            truncate_display(&app.workspace.display().to_string(), width),
+            Style::default().fg(theme.text_muted),
+        ))));
+        return WelcomeSection {
+            lines,
+            chips_line_idx: None,
+            chip_spans: Vec::new(),
+        };
     }
 
     let ws_str = truncate_display(
         &app.workspace.display().to_string(),
-        area.width.saturating_sub(14) as usize,
+        width.saturating_sub(14),
     );
-    let rule_w = (area.width.saturating_sub(4) as usize).min(64);
+    let rule_w = width.saturating_sub(4).min(64);
     let sep = "─".repeat(rule_w);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let show_banner = area.width >= 46 && area.height >= 16;
+    let mut lines: Vec<RenderedLine> = Vec::new();
+    let show_banner = width >= 46 && height >= 16;
     let top_pad = if show_banner {
-        if area.height >= 20 {
+        if height >= 20 {
             2
-        } else if area.height >= 18 {
+        } else if height >= 18 {
             1
         } else {
             0
         }
-    } else if area.height >= 14 {
+    } else if height >= 14 {
         2
     } else {
         0
     };
     for _ in 0..top_pad {
-        lines.push(Line::raw(""));
+        lines.push(RenderedLine::hard(Line::raw("")));
     }
 
     if show_banner {
-        append_welcome_banner(&mut lines, theme);
+        let mut banner = Vec::with_capacity(WELCOME_ASCII_LOGO.len());
+        append_welcome_banner(&mut banner, theme);
+        lines.extend(banner.into_iter().map(RenderedLine::hard));
     }
 
-    lines.push(Line::from(vec![
+    lines.push(RenderedLine::hard(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             "◆ Mizar",
@@ -240,16 +257,15 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             format!("theme: {}", theme.id),
             Style::default().fg(theme.text_muted),
         ),
-    ]));
-    lines.push(Line::from(Span::styled(
+    ])));
+    lines.push(RenderedLine::hard(Line::from(Span::styled(
         format!("  {sep}"),
         Style::default().fg(theme.border),
-    )));
-    lines.push(Line::from(vec![
+    ))));
+    lines.push(RenderedLine::hard(Line::from(vec![
         Span::styled("  工作区  ", Style::default().fg(theme.text_dim)),
         Span::styled(ws_str, Style::default().fg(theme.text)),
-    ]));
-    let wrap_w = area.width as usize;
+    ])));
     push_welcome_wrapped(
         &mut lines,
         Span::styled("  模型    ", Style::default().fg(theme.text_dim)),
@@ -266,7 +282,7 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 Style::default().fg(effort_col),
             ),
         ],
-        wrap_w,
+        width,
     );
     push_welcome_wrapped(
         &mut lines,
@@ -282,9 +298,9 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 Style::default().fg(theme.text_dim),
             ),
         ],
-        wrap_w,
+        width,
     );
-    lines.push(Line::raw(""));
+    lines.push(RenderedLine::hard(Line::raw("")));
     push_welcome_wrapped(
         &mut lines,
         Span::styled("  操作    ", Style::default().fg(theme.text_dim)),
@@ -318,7 +334,7 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             ),
             Span::styled(" 侧栏", Style::default().fg(theme.text_muted)),
         ],
-        wrap_w,
+        width,
     );
     push_welcome_wrapped(
         &mut lines,
@@ -360,53 +376,71 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             ),
             Span::styled(" 帮助", Style::default().fg(theme.text_muted)),
         ],
-        wrap_w,
+        width,
     );
 
-    if area.height >= 12 && area.width >= 56 {
-        let chip_y = area.y + (lines.len() as u16) + 1;
-        if chip_y < area.y + area.height {
-            let actions = [
-                (" [模型] ", LaunchpadQuickAction::ModelPicker),
-                (" [主题] ", LaunchpadQuickAction::ThemePicker),
-                (" [技能] ", LaunchpadQuickAction::SkillPicker),
-                (" [轨迹] ", LaunchpadQuickAction::TrajectoryScene),
-                (" [侧栏] ", LaunchpadQuickAction::ToggleSidePanel),
-            ];
-            lines.push(Line::raw(""));
-            let mut chip_spans = vec![Span::styled("  快捷    ", Style::default().fg(theme.text_dim))];
-            let mut cur_x = area.x + 10;
-            for (label, qa) in actions {
-                let w = display_width(label) as u16;
-                if cur_x + w < area.x + area.width {
-                    app.launchpad_hit_rects
-                        .push((qa, Rect::new(cur_x, chip_y, w, 1)));
-                    chip_spans.push(Span::styled(
-                        label,
-                        Style::default()
-                            .fg(theme.accent)
-                            .bg(theme.card_bg)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    chip_spans.push(Span::raw(" "));
-                    cur_x += w + 1;
-                }
+    let mut chips_line_idx = None;
+    let mut chip_spans_meta = Vec::new();
+    if height >= 12 && width >= 56 && lines.len() + 1 < height {
+        let actions = [
+            (" [模型] ", LaunchpadQuickAction::ModelPicker),
+            (" [主题] ", LaunchpadQuickAction::ThemePicker),
+            (" [技能] ", LaunchpadQuickAction::SkillPicker),
+            (" [轨迹] ", LaunchpadQuickAction::TrajectoryScene),
+            (" [侧栏] ", LaunchpadQuickAction::ToggleSidePanel),
+        ];
+        lines.push(RenderedLine::hard(Line::raw("")));
+        chips_line_idx = Some(lines.len());
+        let mut chip_spans = vec![Span::styled(
+            "  快捷    ",
+            Style::default().fg(theme.text_dim),
+        )];
+        let mut x_off: u16 = 10;
+        for (label, qa) in actions {
+            let w = display_width(label) as u16;
+            if (x_off as usize) + (w as usize) < width {
+                chip_spans_meta.push(WelcomeChipSpan {
+                    action: qa,
+                    x_offset: x_off,
+                    width: w,
+                });
+                chip_spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.card_bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                chip_spans.push(Span::raw(" "));
+                x_off += w + 1;
             }
-            lines.push(Line::from(chip_spans));
         }
+        lines.push(RenderedLine::hard(Line::from(chip_spans)));
     }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    WelcomeSection {
+        lines,
+        chips_line_idx,
+        chip_spans: chip_spans_meta,
+    }
+}
+
+/// 将欢迎页序言构成为可写入 Inline 原生 scrollback 的行序列（末尾附带 1 行空行分隔后续消息）。
+pub fn build_welcome_lines_for_scrollback(app: &AppState, width: usize) -> Vec<Line<'static>> {
+    let section = build_welcome_section(app, width.max(12), usize::MAX);
+    let mut lines: Vec<Line<'static>> = section.lines.into_iter().map(|rl| rl.line).collect();
+    lines.push(Line::raw(""));
+    lines
 }
 
 /// 将欢迎页带标签前导的元数据/快捷键行按视口宽度折行并保持 10 列悬挂缩进，确保 `lines.len()` 与真实行数一致。
 fn push_welcome_wrapped(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<RenderedLine>,
     prefix_first: Span<'static>,
     spans: Vec<Span<'static>>,
     width: usize,
 ) {
-    lines.extend(wrap_styled_spans(
+    lines.extend(wrap_styled_spans_rich(
         spans,
         Some(prefix_first),
         Some(Span::raw("          ")),
@@ -654,7 +688,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let verbose_expanded = app.verbose_expanded;
     let spinner_tick = app.spinner_tick;
 
-    if app.screen_mode == ScreenMode::Inline && start_item >= total_items {
+    if app.screen_mode == ScreenMode::Inline && !app.items.is_empty() && start_item >= total_items {
         let hint = Line::from(vec![
             Span::styled(" ↑ 历史回复已归档至终端原生滚动区 ", Style::default().fg(theme.text_dim)),
             Span::styled("│ F3 切回全屏", Style::default().fg(theme.accent)),
@@ -666,6 +700,23 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             content_area.width,
         );
         return;
+    }
+
+    // 全屏模式始终在顶部保留欢迎页序言；Inline 模式仅在空会话时于视口内渲染欢迎页
+    let mut welcome_chips: Option<(usize, Vec<WelcomeChipSpan>)> = None;
+    if app.screen_mode == ScreenMode::Fullscreen || app.items.is_empty() {
+        let welcome = build_welcome_section(
+            app,
+            content_area.width as usize,
+            content_area.height as usize,
+        );
+        all_lines.extend(welcome.lines);
+        if let Some(chip_line_idx) = welcome.chips_line_idx {
+            welcome_chips = Some((chip_line_idx, welcome.chip_spans));
+        }
+        if start_item < total_items {
+            all_lines.push(RenderedLine::hard(Line::raw("")));
+        }
     }
 
     for idx in start_item..total_items {
@@ -838,10 +889,14 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     }
 
     let total_lines_u16 = all_lines.len().min(u16::MAX as usize) as u16;
-    app.last_viewport_height = content_area.height;
-    app.last_total_lines = total_lines_u16;
-
-    let scroll_top = app.effective_scroll(content_area.height, total_lines_u16) as usize;
+    let scroll_top = if app.items.is_empty() && app.auto_scroll {
+        app.last_viewport_height = content_area.height;
+        app.last_total_lines = total_lines_u16;
+        app.scroll_from_top = 0;
+        0
+    } else {
+        app.effective_scroll(content_area.height, total_lines_u16) as usize
+    };
     let max_scroll = total_lines_u16.saturating_sub(content_area.height) as usize;
     app.timeline_snap = build_timeline_snapshot(turns, scroll_top, max_scroll);
 
@@ -901,6 +956,20 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             col_end,
             rl.soft_wrapped,
         );
+    }
+
+    // 仅当快捷操作行落在可视区间 `[sticky_rows..view_h)` 内时动态投影命中矩形
+    if let Some((chip_line_idx, chip_spans)) = welcome_chips
+        && chip_line_idx >= scroll_top + sticky_rows
+        && chip_line_idx - scroll_top < view_h
+    {
+        let y = content_area.y + (chip_line_idx - scroll_top) as u16;
+        for chip in chip_spans {
+            app.launchpad_hit_rects.push((
+                chip.action,
+                Rect::new(content_area.x + chip.x_offset, y, chip.width, 1),
+            ));
+        }
     }
 
     // 2 列时间轴导轨绘制（使用同一份 timeline_snap 快照）
@@ -2906,5 +2975,257 @@ mod tests {
         let (expanded_screen, _) = draw_with_border(&mut app);
         assert!(expanded_screen.contains("line 1"), "{expanded_screen}");
         assert!(expanded_screen.contains("line 4"), "{expanded_screen}");
+    }
+
+    #[test]
+    fn welcome_persists_above_notices_and_turns_with_dynamic_chip_projection() {
+        use crate::selection::extract_selected_text;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-append",
+            Vec::new(),
+            Some("mock".into()),
+            Some("mock-v1".into()),
+            None,
+        );
+
+        // 1. 推送模型切换通知后，欢迎页仍在顶部，通知隔 1 行空行紧随其后，芯片命中矩形精准对齐
+        app.push_notice(NoticeLevel::Info, "已切换后续请求模型为：mock/mock-v1");
+        let after_notice = render_buffer_text(&mut app, 100, 30);
+        assert!(
+            after_notice.contains(WELCOME_ASCII_LOGO[0]),
+            "welcome banner replaced by notice:\n{after_notice}"
+        );
+        assert!(after_notice.contains("◆ Mizar"), "{after_notice}");
+        assert!(
+            after_notice.contains("已切换后续请求模型为：mock/mock-v1"),
+            "{after_notice}"
+        );
+        let notice_lines: Vec<&str> = after_notice.lines().collect();
+        let chip_row = notice_lines
+            .iter()
+            .position(|l| l.contains("[模型]"))
+            .expect("chips row");
+        let notice_row = notice_lines
+            .iter()
+            .position(|l| l.contains("已切换后续请求模型为"))
+            .expect("notice row");
+        assert_eq!(
+            notice_row,
+            chip_row + 2,
+            "expected exactly 1 blank line between welcome and first notice:\n{after_notice}"
+        );
+        assert!(!app.launchpad_hit_rects.is_empty());
+        for (_, rect) in &app.launchpad_hit_rects {
+            assert_eq!(rect.y as usize, chip_row, "hit rect misaligned: {rect:?}");
+        }
+
+        // 2. 首轮对话直接追加在欢迎页与通知之后
+        app.push_user_message("第一轮问题");
+        app.items.push(ChatItem::Assistant {
+            reasoning: String::new(),
+            text: "第一轮答复".into(),
+        });
+        let after_turn1 = render_buffer_text(&mut app, 100, 34);
+        assert!(after_turn1.contains(WELCOME_ASCII_LOGO[0]), "{after_turn1}");
+        assert!(after_turn1.contains("第一轮问题"), "{after_turn1}");
+        assert!(after_turn1.contains("第一轮答复"), "{after_turn1}");
+        let t1_lines: Vec<&str> = after_turn1.lines().collect();
+        let welcome_idx = t1_lines.iter().position(|l| l.contains("◆ Mizar")).unwrap();
+        let user1_idx = t1_lines
+            .iter()
+            .position(|l| l.contains("第一轮问题"))
+            .unwrap();
+        let asst1_idx = t1_lines
+            .iter()
+            .position(|l| l.contains("第一轮答复"))
+            .unwrap();
+        assert!(welcome_idx < user1_idx && user1_idx < asst1_idx);
+
+        // 3. 多轮超屏后 auto_scroll 自然顶出欢迎页，快捷芯片滚出视口时不注册误命中
+        for i in 2..=6 {
+            app.push_user_message(&format!("第 {i} 轮问题"));
+            app.items.push(ChatItem::Assistant {
+                reasoning: String::new(),
+                text: format!("第 {i} 轮正文\n细节 A\n细节 B"),
+            });
+        }
+        let scrolled_bottom = render_buffer_text(&mut app, 100, 26);
+        assert!(
+            !scrolled_bottom.contains(WELCOME_ASCII_LOGO[0]),
+            "welcome should scroll off top when conversation overflows:\n{scrolled_bottom}"
+        );
+        assert!(scrolled_bottom.contains("第 6 轮正文"), "{scrolled_bottom}");
+        assert!(
+            app.launchpad_hit_rects.is_empty(),
+            "off-screen chips must not register hit rects: {:?}",
+            app.launchpad_hit_rects
+        );
+        assert!(
+            app.timeline_snap
+                .turns
+                .first()
+                .is_some_and(|t| t.top_line > 10),
+            "timeline turn top_line should include welcome offset: {:?}",
+            app.timeline_snap.turns
+        );
+
+        // 4. 部分向上滚动时，芯片命中矩形随 scroll_top 同步上移且不与吸顶条重叠
+        app.auto_scroll = false;
+        app.scroll_from_top = 4;
+        let partial = render_buffer_text(&mut app, 100, 26);
+        let partial_chip_row = partial
+            .lines()
+            .position(|l| l.contains("[模型]"))
+            .expect("partially scrolled chips row");
+        assert!(!app.launchpad_hit_rects.is_empty());
+        for (_, rect) in &app.launchpad_hit_rects {
+            assert_eq!(rect.y as usize, partial_chip_row);
+        }
+
+        // 5. 滚回顶部后，欢迎页完整可见、无吸顶条遮挡、划词复制与点击侧栏芯片均可正常工作
+        app.scroll_up(u16::MAX);
+        let back_top = render_buffer_text(&mut app, 100, 26);
+        assert!(back_top.contains(WELCOME_ASCII_LOGO[0]), "{back_top}");
+        assert!(back_top.contains("◆ Mizar"), "{back_top}");
+        assert!(!back_top.contains("↳ Turn #"), "{back_top}");
+        let top_lines: Vec<&str> = back_top.lines().collect();
+        let top_chip_row = top_lines
+            .iter()
+            .position(|l| l.contains("[模型]"))
+            .expect("top chip row");
+        assert!(!app.launchpad_hit_rects.is_empty());
+        let (_, side_chip) = app
+            .launchpad_hit_rects
+            .iter()
+            .find(|(qa, _)| matches!(qa, LaunchpadQuickAction::ToggleSidePanel))
+            .expect("side panel chip at top")
+            .clone();
+        assert_eq!(side_chip.y as usize, top_chip_row);
+
+        // 验证欢迎页区域登记了 SelectionPane::Chat，支持划词提取
+        let mizar_row = top_lines
+            .iter()
+            .position(|l| l.contains("◆ Mizar"))
+            .unwrap() as u16;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: mizar_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 10,
+            row: mizar_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10,
+            row: mizar_row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        let selected = extract_selected_text(
+            app.last_buffer.as_ref().unwrap(),
+            &app.selection,
+            &app.selection_geom,
+        )
+        .expect("welcome selection text");
+        assert!(selected.contains("Mizar"), "selected={selected:?}");
+        app.selection.clear();
+
+        // 单击侧栏快捷芯片应正常触发 ToggleSidePanel
+        let act = app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: side_chip.x + 1,
+            row: side_chip.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert_eq!(act, crate::app::AppAction::RefreshSidePanelData);
+        assert!(app.side_panel.open);
+
+        // 6. 激活 TimelineRail（60 列窄边界，content_area.width = 58）时，欢迎页与芯片不得越界侵占导轨列
+        app.side_panel.open = false;
+        app.scroll_up(u16::MAX);
+        let _rail_top = render_buffer_text(&mut app, 60, 26);
+        let rail = app.rail_geo.expect("rail active at 60 cols with >=2 turns");
+        assert_eq!(rail.area.x, 58);
+        for (_, rect) in &app.launchpad_hit_rects {
+            assert!(
+                rect.x + rect.width <= rail.area.x,
+                "welcome chip overlapped timeline rail: {rect:?} vs rail {rail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_mode_renders_welcome_when_empty_and_scrollback_helper_appends_blank_line() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-inline-ui",
+            Vec::new(),
+            Some("mock".into()),
+            Some("mock-v1".into()),
+            None,
+        );
+        app.screen_mode = ScreenMode::Inline;
+        assert!(!app.inline_welcome_committed);
+
+        // 1. 空会话 Inline viewport 直接展示欢迎页，不显示“已归档”提示
+        let empty_inline = render_buffer_text(&mut app, 80, 12);
+        assert!(empty_inline.contains("Mizar"), "{empty_inline}");
+        assert!(!empty_inline.contains("历史回复已归档"), "{empty_inline}");
+
+        // 2. 非空且有未提交 item 时，Inline viewport 仅绘制 start_item..total_items，不重复画欢迎页
+        app.push_user_message("未提交提问");
+        app.items.push(ChatItem::Assistant {
+            reasoning: String::new(),
+            text: "流式输出中".into(),
+        });
+        let streaming_inline = render_buffer_text(&mut app, 80, 12);
+        assert!(
+            streaming_inline.contains("未提交提问"),
+            "{streaming_inline}"
+        );
+        assert!(
+            streaming_inline.contains("流式输出中"),
+            "{streaming_inline}"
+        );
+        assert!(
+            !streaming_inline.contains("◆ Mizar"),
+            "must not duplicate welcome in inline viewport:\n{streaming_inline}"
+        );
+
+        // 3. 全部 commit 后显示归档提示
+        app.inline_welcome_committed = true;
+        app.inline_committed_items = app.items.len();
+        let archived_inline = render_buffer_text(&mut app, 80, 12);
+        assert!(
+            archived_inline.contains("历史回复已归档至终端原生滚动区"),
+            "{archived_inline}"
+        );
+
+        // 4. build_welcome_lines_for_scrollback 复用统一逻辑并附带 1 行尾空行
+        let sb_lines = build_welcome_lines_for_scrollback(&app, 80);
+        let sb_text: Vec<String> = sb_lines.iter().map(line_text).collect();
+        for row in WELCOME_ASCII_LOGO {
+            assert!(
+                sb_text.iter().any(|l| l.contains(row)),
+                "missing banner row {row:?} in scrollback"
+            );
+        }
+        assert!(sb_text.iter().any(|l| l.contains("◆ Mizar")));
+        assert!(
+            sb_text.last().is_some_and(|l| l.is_empty()),
+            "expected trailing blank line: {sb_text:?}"
+        );
+
+        // 5. reset_for_new_session 重置 inline_welcome_committed
+        app.reset_for_new_session("sess-inline-next", None);
+        assert!(!app.inline_welcome_committed);
+        assert_eq!(app.inline_committed_items, 0);
     }
 }

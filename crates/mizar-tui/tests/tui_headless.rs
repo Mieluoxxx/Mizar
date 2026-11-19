@@ -17,8 +17,9 @@ use mizar_tui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui::selection::extract_selected_text;
 use mizar_tui::side_panel::{FileTouchRow, ToolSummaryRow};
 use mizar_tui::{
-    AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, ScreenMode, UiEvent,
-    build_item_lines_for_scrollback, project_fork_view, project_resume_view,
+    AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, ScreenMode,
+    SessionReplayItem, SessionViewData, UiEvent, build_item_lines_for_scrollback,
+    build_welcome_lines_for_scrollback, project_fork_view, project_resume_view,
     project_session_tree, render, subscribe_session_events, to_ui_log_record, wait_for_services,
 };
 use ratatui::Terminal;
@@ -1472,4 +1473,230 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
 
     ctx2.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&tmp_root);
+}
+
+#[test]
+fn appends_notices_and_turns_after_welcome_with_scroll_and_hit_rect_projection() {
+    let ws = crate_root();
+    let providers = vec![mizar_llm::ProviderInfo {
+        id: "mock".into(),
+        name: "Mock".into(),
+        protocol: "mock".into(),
+        models: vec![
+            mizar_llm::ModelInfo {
+                id: "mock-v1".into(),
+                name: "Mock V1".into(),
+                context_window: Some(32_768),
+                max_tokens: Some(4096),
+                reasoning_efforts: Vec::new(),
+            },
+            mizar_llm::ModelInfo {
+                id: "mock-v2".into(),
+                name: "Mock V2".into(),
+                context_window: Some(64_000),
+                max_tokens: Some(4096),
+                reasoning_efforts: Vec::new(),
+            },
+        ],
+    }];
+    let mut state = AppState::new(
+        ws,
+        "sess-welcome-append",
+        providers,
+        Some("mock".into()),
+        Some("mock-v1".into()),
+        None,
+    );
+
+    let backend = TestBackend::new(100, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // 1. 初始空会话：欢迎页 + 快捷芯片命中矩形
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let initial_screen = buffer_text(terminal.backend());
+    assert!(initial_screen.contains("◆ Mizar"), "{initial_screen}");
+    assert!(!state.launchpad_hit_rects.is_empty());
+
+    // 2. 通过 Ctrl+L 打开模型选择器并切换模型，产生 Notice；欢迎页应留在顶部，通知紧随其后
+    state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+    assert!(state.overlay.is_modal());
+    state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!state.overlay.is_open());
+
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let after_notice = buffer_text(terminal.backend());
+    assert!(after_notice.contains("███╗   ███╗"), "{after_notice}");
+    assert!(after_notice.contains("◆ Mizar"), "{after_notice}");
+    assert!(
+        after_notice.contains("已切换后续请求模型为：mock/mock-v2"),
+        "{after_notice}"
+    );
+    let notice_pos = after_notice.find("已切换后续请求模型为").unwrap();
+    let mizar_pos = after_notice.find("◆ Mizar").unwrap();
+    assert!(mizar_pos < notice_pos, "{after_notice}");
+
+    // 3. 首轮对话直接追加在通知后
+    state.push_user_message("请列出 Cargo workspace");
+    state.items.push(ChatItem::Assistant {
+        reasoning: String::new(),
+        text: "这是首轮回答。".into(),
+    });
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let after_turn1 = buffer_text(terminal.backend());
+    assert!(after_turn1.contains("◆ Mizar"), "{after_turn1}");
+    assert!(
+        after_turn1.contains("请列出 Cargo workspace"),
+        "{after_turn1}"
+    );
+    assert!(after_turn1.contains("这是首轮回答。"), "{after_turn1}");
+
+    // 4. 多轮超屏后 auto_scroll 自动顶出欢迎页，且滚出视口的快捷芯片不注册误命中
+    for turn in 2..=6 {
+        state.push_user_message(&format!("第 {turn} 轮问题"));
+        state.items.push(ChatItem::Assistant {
+            reasoning: String::new(),
+            text: format!("第 {turn} 轮回复\n补充行 A\n补充行 B\n补充行 C"),
+        });
+    }
+    let mut small_term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    small_term.draw(|f| render(f, &mut state)).unwrap();
+    let bottom_screen = buffer_text(small_term.backend());
+    assert!(
+        !bottom_screen.contains("███╗   ███╗"),
+        "expected welcome scrolled above viewport:\n{bottom_screen}"
+    );
+    assert!(bottom_screen.contains("第 6 轮回复"), "{bottom_screen}");
+    assert!(
+        state.launchpad_hit_rects.is_empty(),
+        "off-screen chips should not register hits: {:?}",
+        state.launchpad_hit_rects
+    );
+
+    // 5. 滚回顶部后欢迎页仍可见，且重新注册可点击命中矩形
+    state.scroll_up(u16::MAX);
+    small_term.draw(|f| render(f, &mut state)).unwrap();
+    let top_screen = buffer_text(small_term.backend());
+    assert!(top_screen.contains("███╗   ███╗"), "{top_screen}");
+    assert!(top_screen.contains("◆ Mizar"), "{top_screen}");
+    let (_, toggle_rect) = state
+        .launchpad_hit_rects
+        .iter()
+        .find(|(qa, _)| matches!(qa, LaunchpadQuickAction::ToggleSidePanel))
+        .expect("expected toggle side panel chip after scrolling back to top")
+        .clone();
+    let click_act = state.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: toggle_rect.x + 1,
+        row: toggle_rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(click_act, AppAction::RefreshSidePanelData);
+    assert!(state.side_panel.open);
+    state.side_panel.open = false;
+
+    // 6. 恢复长历史后默认停留在最新消息底部，上翻仍可见欢迎页
+    let long_items = (1..=8)
+        .flat_map(|i| {
+            [
+                SessionReplayItem::User {
+                    text: format!("恢复轮次 {i}"),
+                },
+                SessionReplayItem::Assistant {
+                    blocks: vec![mizar_llm::ContentBlock::Text {
+                        text: format!("恢复回答 {i}\n扩展说明 {i}"),
+                    }],
+                },
+            ]
+        })
+        .collect();
+    state.restore_session_view(SessionViewData {
+        session_id: "sess-long-resume".into(),
+        session_title: None,
+        items: long_items,
+        finish_notice: "已恢复历史会话".into(),
+    });
+    assert!(state.auto_scroll);
+    small_term.draw(|f| render(f, &mut state)).unwrap();
+    let resumed_bottom = buffer_text(small_term.backend());
+    assert!(
+        resumed_bottom.contains("已恢复历史会话"),
+        "{resumed_bottom}"
+    );
+    assert!(!resumed_bottom.contains("███╗   ███╗"), "{resumed_bottom}");
+    state.scroll_up(u16::MAX);
+    small_term.draw(|f| render(f, &mut state)).unwrap();
+    let resumed_top = buffer_text(small_term.backend());
+    assert!(resumed_top.contains("███╗   ███╗"), "{resumed_top}");
+
+    // 7. /new 重置会话保留顶部欢迎页并紧跟新会话提示
+    state.reset_for_new_session("sess-after-new", None);
+    small_term.draw(|f| render(f, &mut state)).unwrap();
+    let after_new = buffer_text(small_term.backend());
+    assert!(after_new.contains("◆ Mizar"), "{after_new}");
+    assert!(after_new.contains("已开启新会话"), "{after_new}");
+}
+
+#[test]
+fn inline_mode_tracks_welcome_commit_state_and_scrollback_lines() {
+    let ws = crate_root();
+    let mut state = AppState::new(
+        ws,
+        "sess-inline-headless",
+        Vec::new(),
+        Some("mock".into()),
+        Some("mock-v1".into()),
+        None,
+    );
+    state.screen_mode = ScreenMode::Inline;
+    assert!(!state.inline_welcome_committed);
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+
+    // 空 Inline 会话直接在视口内绘制欢迎页
+    term.draw(|f| render(f, &mut state)).unwrap();
+    let empty_screen = buffer_text(term.backend());
+    assert!(empty_screen.contains("Mizar"), "{empty_screen}");
+    assert!(!empty_screen.contains("历史回复已归档"), "{empty_screen}");
+
+    // scrollback 欢迎页 helper 产出包含艺术字与 1 行尾空行的行序列
+    let sb_lines = build_welcome_lines_for_scrollback(&state, 80);
+    let sb_text: Vec<String> = sb_lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    assert!(sb_text.iter().any(|l| l.contains("███╗   ███╗")));
+    assert!(sb_text.iter().any(|l| l.contains("◆ Mizar")));
+    assert!(sb_text.last().is_some_and(|l| l.is_empty()));
+
+    // 有未 commit 对话项时，Inline 视口仅绘制未提交区段，不重复绘制欢迎页
+    state.push_user_message("Inline 首轮提问");
+    state.items.push(ChatItem::Assistant {
+        reasoning: String::new(),
+        text: "Inline 流式回答".into(),
+    });
+    term.draw(|f| render(f, &mut state)).unwrap();
+    let active_screen = buffer_text(term.backend());
+    assert!(active_screen.contains("Inline 首轮提问"), "{active_screen}");
+    assert!(active_screen.contains("Inline 流式回答"), "{active_screen}");
+    assert!(!active_screen.contains("◆ Mizar"), "{active_screen}");
+
+    // 已 commit 后展示归档提示；reset_for_new_session 重置 inline_welcome_committed
+    state.inline_welcome_committed = true;
+    state.inline_committed_items = state.items.len();
+    term.draw(|f| render(f, &mut state)).unwrap();
+    let archived_screen = buffer_text(term.backend());
+    assert!(
+        archived_screen.contains("历史回复已归档至终端原生滚动区"),
+        "{archived_screen}"
+    );
+
+    state.reset_for_new_session("sess-inline-reset", None);
+    assert!(!state.inline_welcome_committed);
+    assert_eq!(state.inline_committed_items, 0);
 }

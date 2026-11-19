@@ -25,4 +25,7 @@ pub use app::{
 pub use emphasis::EmphasisConfig;
 pub use terminal::ScreenMode;
 pub use theme::{TerminalColors, Theme, ThemePreset};
-pub use ui::{build_item_lines_for_scrollback, build_item_lines_for_scrollback_at, render};
+pub use ui::{
+    build_item_lines_for_scrollback, build_item_lines_for_scrollback_at,
+    build_welcome_lines_for_scrollback, render,
+};
