@@ -24,7 +24,7 @@ Install the prebuilt binary on macOS (Apple Silicon / Intel) or Linux (`x86_64` 
 curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
 ```
 
-Once installed, check or upgrade to the latest release anytime with `mizar update` (set `MIZAR_SKIP_VERSION_CHECK=1` to disable startup version checks).
+Once installed, check or upgrade to the latest release anytime with `mizar update` (set `MIZAR_SKIP_VERSION_CHECK=1` to disable startup version checks). Note: the built-in `grep` tool requires `ripgrep` (`rg`) on `PATH`.
 
 Or build from source (requires **Rust 1.98.0+**, edition 2024, pinned in [`rust-toolchain.toml`](rust-toolchain.toml)):
 

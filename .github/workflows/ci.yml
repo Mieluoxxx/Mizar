@@ -29,9 +29,13 @@ jobs:
           toolchain: ${{ steps.rust-version.outputs.channel }}
           components: rustfmt, clippy
 
-      - name: Install Linux fast linker (mold)
+      - name: Install Linux fast linker (mold) and ripgrep
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mold clang
+        run: sudo apt-get update && sudo apt-get install -y mold clang ripgrep
+
+      - name: Install macOS ripgrep
+        if: runner.os == 'macOS'
+        run: command -v rg >/dev/null 2>&1 || brew install ripgrep
 
       - name: Configure sccache
         uses: mozilla-actions/sccache-action@v0.0.9

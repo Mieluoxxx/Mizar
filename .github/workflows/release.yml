@@ -122,8 +122,8 @@ jobs:
           bin="target/${TARGET}/release/mizar"
           test -x "$bin"
           if [ "$CROSS" = "true" ]; then
-            lipo -info "$bin"
-            lipo -verify_arch x86_64 "$bin"
+            lipo "$bin" -info
+            lipo "$bin" -verify_arch x86_64
           else
             "$bin" --version | grep -Fx "mizar ${EXPECTED_VERSION}"
           fi
