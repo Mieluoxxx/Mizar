@@ -9,7 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="site/">Docs</a> · <a href="docs/plugins.md">Architecture</a> · <a href="AGENTS.md">Contributing</a>
+  <a href="https://github.com/Mieluoxxx/Mizar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Mieluoxxx/Mizar/ci.yml?branch=main&label=CI" alt="CI" /></a>
+  <a href="https://github.com/Mieluoxxx/Mizar/releases/latest"><img src="https://img.shields.io/github/v/release/Mieluoxxx/Mizar" alt="Latest Release" /></a>
+  <a href="https://mieluoxxx.github.io/Mizar/en/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-0969da" alt="Docs" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Mieluoxxx/Mizar" alt="MIT License" /></a>
+</p>
+
+<p align="center">
+  <a href="https://mieluoxxx.github.io/Mizar/en/">Docs</a> · <a href="https://mieluoxxx.github.io/Mizar/">中文文档</a> · <a href="https://github.com/Mieluoxxx/Mizar/releases">Releases</a> · <a href="docs/plugins.md">Architecture</a> · <a href="AGENTS.md">Contributing</a>
 </p>
 
 ---
@@ -50,7 +57,8 @@ cargo install --path crates/mizar-tui
 
 ### Documentation & Development
 
-- **Bilingual Docs Site**: [`site/`](site/) (Chinese & English Astro + Pagefind site; deployed via [`.github/workflows/pages.yml`](.github/workflows/pages.yml))
+- **Online Docs**: [English](https://mieluoxxx.github.io/Mizar/en/) · [中文文档](https://mieluoxxx.github.io/Mizar/) (deployed to GitHub Pages via [`.github/workflows/pages.yml`](.github/workflows/pages.yml))
+- **Docs Site Source**: [`site/`](site/) (Chinese & English Astro + Pagefind site)
   ```sh
   pnpm --dir site install --frozen-lockfile
   pnpm --dir site dev
