@@ -3,7 +3,7 @@
 给在本仓库工作的 AI coding agent 的说明。
 
 **Mizar** = Rust 重写的终端 AI 编程 Agent：`mizar`（`mizar-tui`）是唯一可执行入口，`cordis` 是自研微内核，
-28 个 crate 靠 `inject` / `provide` 装配成「流式调模型 → 执行工具 → 回写会话」的主循环。
+30 个 crate 靠 `inject` / `provide` 装配成「流式调模型 → 执行工具 → 回写会话」的主循环。
 
 架构权威文本是 **[docs/plugins.md](docs/plugins.md)**。本文件不复述它，只记「反直觉、看代码看不出来」的规则。
 
@@ -58,7 +58,7 @@ impl Plugin for XxxPlugin {
 
 - **`inject` 漏写不 panic**：`ctx.service()` 返回 `MissingInject`，插件进 `FAILED`，工具**静默消失** —— 比 panic 难查得多。
 - **副作用必须包 `ctx.effect("id", ...)`**，id 用 `"<crate>-<动作>"`。卸载时倒序自动清理，这是核心不变量。
-- 服务名：`llm` `tools` `sessions` `systemPrompt` `agentLoop` `skills` `mcp` `trajectory`。
+- 服务名：`llm` `tools` `sessions` `systemPrompt` `agentLoop` `skills` `mcp` `trajectory` `compaction`。
   一律走 `<Name>ContextExt`（`ctx.tools()?`），不裸取。
 
 ### 工具
@@ -116,7 +116,7 @@ Verified:
 
 - **改 `mizar-tui-ui` 的枚举/结构体字段，`mizar-tui` 的构造点会一起断**。`OverlayKind` / `OverlayAction` / `UiEvent`
   横跨两个 crate，一次改完再跑 `cargo check --workspace`，别只 check 单个。
-- **feature 组合会漏编**。`mizar-agent-spine` 有 `legacy`/`coding`/`sqlite`/`trajectory`/`router`，
+- **feature 组合会漏编**。`mizar-agent-spine` 有 `legacy`/`coding`/`compaction`/`sqlite`/`trajectory`/`router`，
   可选依赖的 `use` 必须配 `#[cfg(feature)]`。验最小组合：`cargo check -p mizar-agent-spine --no-default-features`。
 - **改 crate 结构 / `inject` / 服务名时，`docs/plugins.md` 的表格与拓扑图要同步改**，否则立刻过期。
 - **沙箱默认关闭**：`restrictToWorkspace` 默认 `false`，`bash` 能碰工作区外。别假设有隔离。

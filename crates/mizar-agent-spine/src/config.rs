@@ -14,9 +14,9 @@ use mizar_llm_router::{ProviderRouteConfig, RouterConfig};
 use mizar_tools_coding::CodingToolsPreset;
 use serde::{Deserialize, Serialize};
 
+use crate::AgentSpineConfig;
 #[cfg(feature = "coding")]
 use crate::AgentToolsMode;
-use crate::AgentSpineConfig;
 
 /// 解析 `${VAR}` 环境变量占位符（与 `mizar-mcp` 配置解析保持一致，避免跨 crate 强耦合）。
 #[cfg(feature = "router")]
@@ -114,6 +114,43 @@ pub struct InstructionsSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
+pub struct CompactionSettings {
+    pub enabled: Option<bool>,
+    pub auto_compact: Option<bool>,
+    pub auto_prune: Option<bool>,
+    pub soft_window_cap: Option<u64>,
+    pub trigger_ratio: Option<f64>,
+    pub prune_threshold_chars: Option<usize>,
+    pub cold_cache_idle_secs: Option<u64>,
+    pub reuse_prefix_cache: Option<bool>,
+    pub disable_summary_reasoning: Option<bool>,
+    pub enable_read_dedup: Option<bool>,
+    pub enable_write_after_compact_guard: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RecallSettings {
+    pub enabled: Option<bool>,
+    pub auto_activate_on_compaction: Option<bool>,
+    pub default_search_limit: Option<usize>,
+    pub read_char_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UiSettings {
+    pub theme: Option<String>,
+    pub screen_mode: Option<String>,
+    pub show_thinking: Option<bool>,
+    pub verbose_expanded: Option<bool>,
+    pub side_panel_open: Option<bool>,
+    pub mouse_capture: Option<bool>,
+    pub approval_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SettingsConfig {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
@@ -132,6 +169,9 @@ pub struct SettingsConfig {
     pub tool_search: Option<ToolSearchSettings>,
     pub skills: Option<SkillsSettings>,
     pub instructions: Option<InstructionsSettings>,
+    pub compaction: Option<CompactionSettings>,
+    pub recall: Option<RecallSettings>,
+    pub ui: Option<UiSettings>,
 }
 
 impl SettingsConfig {
@@ -233,7 +273,135 @@ impl SettingsConfig {
                 dst.follow_subdirs = inst.follow_subdirs;
             }
         }
+        if let Some(comp) = other.compaction {
+            let dst = self.compaction.get_or_insert_with(Default::default);
+            if comp.enabled.is_some() {
+                dst.enabled = comp.enabled;
+            }
+            if comp.auto_compact.is_some() {
+                dst.auto_compact = comp.auto_compact;
+            }
+            if comp.auto_prune.is_some() {
+                dst.auto_prune = comp.auto_prune;
+            }
+            if comp.soft_window_cap.is_some() {
+                dst.soft_window_cap = comp.soft_window_cap;
+            }
+            if comp.trigger_ratio.is_some() {
+                dst.trigger_ratio = comp.trigger_ratio;
+            }
+            if comp.prune_threshold_chars.is_some() {
+                dst.prune_threshold_chars = comp.prune_threshold_chars;
+            }
+            if comp.cold_cache_idle_secs.is_some() {
+                dst.cold_cache_idle_secs = comp.cold_cache_idle_secs;
+            }
+            if comp.reuse_prefix_cache.is_some() {
+                dst.reuse_prefix_cache = comp.reuse_prefix_cache;
+            }
+            if comp.disable_summary_reasoning.is_some() {
+                dst.disable_summary_reasoning = comp.disable_summary_reasoning;
+            }
+            if comp.enable_read_dedup.is_some() {
+                dst.enable_read_dedup = comp.enable_read_dedup;
+            }
+            if comp.enable_write_after_compact_guard.is_some() {
+                dst.enable_write_after_compact_guard = comp.enable_write_after_compact_guard;
+            }
+        }
+        if let Some(rec) = other.recall {
+            let dst = self.recall.get_or_insert_with(Default::default);
+            if rec.enabled.is_some() {
+                dst.enabled = rec.enabled;
+            }
+            if rec.auto_activate_on_compaction.is_some() {
+                dst.auto_activate_on_compaction = rec.auto_activate_on_compaction;
+            }
+            if rec.default_search_limit.is_some() {
+                dst.default_search_limit = rec.default_search_limit;
+            }
+            if rec.read_char_limit.is_some() {
+                dst.read_char_limit = rec.read_char_limit;
+            }
+        }
+        if let Some(ui) = other.ui {
+            let dst = self.ui.get_or_insert_with(Default::default);
+            if ui.theme.is_some() {
+                dst.theme = ui.theme;
+            }
+            if ui.screen_mode.is_some() {
+                dst.screen_mode = ui.screen_mode;
+            }
+            if ui.show_thinking.is_some() {
+                dst.show_thinking = ui.show_thinking;
+            }
+            if ui.verbose_expanded.is_some() {
+                dst.verbose_expanded = ui.verbose_expanded;
+            }
+            if ui.side_panel_open.is_some() {
+                dst.side_panel_open = ui.side_panel_open;
+            }
+            if ui.mouse_capture.is_some() {
+                dst.mouse_capture = ui.mouse_capture;
+            }
+            if ui.approval_mode.is_some() {
+                dst.approval_mode = ui.approval_mode;
+            }
+        }
     }
+}
+
+/// 解析全局 `settings.json` 路径（默认 `~/.mizar/settings.json`，受 `MIZAR_HOME` 覆盖）。
+pub fn resolve_global_settings_path() -> Option<PathBuf> {
+    resolve_global_config_dir().map(|dir| dir.join("settings.json"))
+}
+
+/// 原子化增量修补 `settings.json`：仅更新调用方修改的键，完好保留其他手写字段。
+pub fn patch_settings_file(
+    path: &Path,
+    patch: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<(), String> {
+    let mut root_map = if path.exists() {
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let no_bom = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+        if no_bom.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            let val: serde_json::Value =
+                serde_json::from_str(no_bom).map_err(|e| format!("{}: {e}", path.display()))?;
+            match val {
+                serde_json::Value::Object(m) => m,
+                _ => {
+                    return Err(format!(
+                        "{}: settings.json 顶层必须为 JSON 对象",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    patch(&mut root_map);
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let mut rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root_map))
+        .map_err(|e| e.to_string())?;
+    rendered.push('\n');
+
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, rendered.as_bytes())
+        .map_err(|e| format!("{}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("{}: {e}", path.display())
+    })?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -350,6 +518,63 @@ impl LoadedMizarConfig {
         }
         if let Some(db_path) = &self.settings.session_db {
             spine.session_db_path = Some(db_path.clone());
+        }
+
+        #[cfg(feature = "compaction")]
+        {
+            if let Some(comp) = &self.settings.compaction
+                && let Some(dst) = spine.compaction.as_mut()
+            {
+                if let Some(v) = comp.enabled {
+                    dst.enabled = v;
+                }
+                if let Some(v) = comp.auto_compact {
+                    dst.auto_compact = v;
+                }
+                if let Some(v) = comp.auto_prune {
+                    dst.auto_prune = v;
+                }
+                if let Some(v) = comp.soft_window_cap {
+                    dst.soft_window_cap = v;
+                }
+                if let Some(v) = comp.trigger_ratio {
+                    dst.trigger_ratio = v;
+                }
+                if let Some(v) = comp.prune_threshold_chars {
+                    dst.prune_threshold_chars = v;
+                }
+                if let Some(v) = comp.cold_cache_idle_secs {
+                    dst.cold_cache_idle_secs = v;
+                }
+                if let Some(v) = comp.reuse_prefix_cache {
+                    dst.reuse_prefix_cache = v;
+                }
+                if let Some(v) = comp.disable_summary_reasoning {
+                    dst.disable_summary_reasoning = v;
+                }
+                if let Some(v) = comp.enable_read_dedup {
+                    dst.enable_read_dedup = v;
+                }
+                if let Some(v) = comp.enable_write_after_compact_guard {
+                    dst.enable_write_after_compact_guard = v;
+                }
+            }
+            if let Some(rec) = &self.settings.recall
+                && let Some(dst) = spine.recall.as_mut()
+            {
+                if let Some(v) = rec.enabled {
+                    dst.enabled = v;
+                }
+                if let Some(v) = rec.auto_activate_on_compaction {
+                    dst.auto_activate_on_compaction = v;
+                }
+                if let Some(v) = rec.default_search_limit {
+                    dst.default_search_limit = v;
+                }
+                if let Some(v) = rec.read_char_limit {
+                    dst.read_char_limit = v;
+                }
+            }
         }
 
         #[cfg(feature = "coding")]
@@ -490,7 +715,10 @@ impl LoadedMizarConfig {
             .filter(|name| router.providers.contains_key(*name))
             .cloned()
             .or_else(|| {
-                let target_model = env.model.as_deref().or(self.settings.default_model.as_deref())?;
+                let target_model = env
+                    .model
+                    .as_deref()
+                    .or(self.settings.default_model.as_deref())?;
                 router
                     .providers
                     .iter()
@@ -624,7 +852,10 @@ mod tests {
         assert_eq!(loaded.settings.default_provider.as_deref(), Some("openai"));
         assert_eq!(loaded.settings.default_model.as_deref(), Some("gpt-4o"));
         assert_eq!(loaded.settings.max_steps, Some(40));
-        assert_eq!(loaded.settings.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            loaded.settings.reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
         assert!(loaded.router.providers.contains_key("openai"));
 
         let resolved = loaded
@@ -650,16 +881,21 @@ mod tests {
         assert!(env_overridden.router.providers.contains_key("default"));
 
         let empty_cfg = LoadedMizarConfig::default();
-        assert!(empty_cfg
-            .resolve_llm_router_with_env(EnvLlmOverride::default())
-            .is_none());
+        assert!(
+            empty_cfg
+                .resolve_llm_router_with_env(EnvLlmOverride::default())
+                .is_none()
+        );
 
         let mut spine = AgentSpineConfig::coding(&proj);
         loaded.apply_to_spine(&mut spine);
         assert_eq!(spine.agent.provider.as_deref(), Some("openai"));
         assert_eq!(spine.agent.model.as_deref(), Some("gpt-4o"));
         assert_eq!(spine.agent.max_steps, Some(40));
-        assert_eq!(spine.exclude_tools, vec!["mcp__fff__multi_grep".to_string()]);
+        assert_eq!(
+            spine.exclude_tools,
+            vec!["mcp__fff__multi_grep".to_string()]
+        );
         match &spine.tools_mode {
             AgentToolsMode::Coding {
                 coding,
@@ -746,6 +982,44 @@ mod tests {
             resolved.active_model.as_deref(),
             Some("mayoru-messages/claude-sonnet-5-5")
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn patch_settings_file_preserves_unrelated_keys_and_merges_ui() {
+        let tmp =
+            std::env::temp_dir().join(format!("mizar_patch_settings_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let file = tmp.join("settings.json");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            &file,
+            r#"{
+                "persona": "keep me",
+                "excludeTools": ["mcp__demo__drop"]
+            }"#,
+        )
+        .unwrap();
+
+        patch_settings_file(&file, |root| {
+            root.insert(
+                "ui".into(),
+                serde_json::json!({ "theme": "sakura-dark", "showThinking": false }),
+            );
+        })
+        .unwrap();
+
+        let loaded = load_mizar_config_with_global(&tmp.join("proj"), Some(&tmp));
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(loaded.settings.persona.as_deref(), Some("keep me"));
+        assert_eq!(
+            loaded.settings.exclude_tools,
+            vec!["mcp__demo__drop".to_string()]
+        );
+        let ui = loaded.settings.ui.as_ref().unwrap();
+        assert_eq!(ui.theme.as_deref(), Some("sakura-dark"));
+        assert_eq!(ui.show_thinking, Some(false));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

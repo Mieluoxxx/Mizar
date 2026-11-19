@@ -8,8 +8,7 @@ use mizar_agent_loop::{
 };
 use mizar_session::SessionEvent;
 use mizar_tools::{
-    ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput,
-    ToolsContextExt,
+    ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput, ToolsContextExt,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -382,8 +381,8 @@ impl Plugin for SkillsPlugin {
 
                             let prev_record =
                                 published_map.lock().unwrap().get(&session.id).cloned();
-                            let (prev_still_visible, had_catalog_notice) =
-                                session.with_visible_entries(|entries| {
+                            let (prev_still_visible, had_catalog_notice) = session
+                                .with_visible_entries(|entries| {
                                     let still_vis = prev_record.as_ref().is_some_and(|rec| {
                                         entries.iter().any(|entry| {
                                             entry.seq == rec.seq
@@ -442,15 +441,14 @@ impl Plugin for SkillsPlugin {
                                 let mut collected = Vec::new();
                                 for entry in entries.iter().rev() {
                                     match &entry.event {
-                                        SessionEvent::User { text } => {
-                                            collected.push(text.clone())
-                                        }
+                                        SessionEvent::User { text } => collected.push(text.clone()),
                                         SessionEvent::ContextNotice { source, .. }
                                             if source != SKILL_INVOCATION_SOURCE => {}
                                         SessionEvent::ContextNotice { .. }
                                         | SessionEvent::Assistant { .. }
                                         | SessionEvent::ToolResult { .. }
                                         | SessionEvent::Compaction { .. }
+                                        | SessionEvent::ToolResultPrune { .. }
                                         | SessionEvent::BashExecution { .. }
                                         | SessionEvent::Trace { .. } => break,
                                     }
@@ -493,7 +491,10 @@ impl Plugin for SkillsPlugin {
 }
 
 /// 辅助函数：读取工作区下可用技能摘要清单。
-pub async fn list_workspace_skills(ctx: &Context, workspace: &std::path::Path) -> Vec<SkillSummary> {
+pub async fn list_workspace_skills(
+    ctx: &Context,
+    workspace: &std::path::Path,
+) -> Vec<SkillSummary> {
     if let Ok(reg) = ctx.skills() {
         return reg
             .list(SkillLookupOptions {

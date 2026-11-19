@@ -52,6 +52,8 @@ mizar-tool-time = { path = "crates/mizar-tool-time" }
 mizar-mcp = { path = "crates/mizar-mcp" }
 mizar-skills = { path = "crates/mizar-skills" }
 mizar-instructions = { path = "crates/mizar-instructions" }
+mizar-compaction = { path = "crates/mizar-compaction" }
+mizar-recall = { path = "crates/mizar-recall" }
 mizar-system-prompt = { path = "crates/mizar-system-prompt" }
 mizar-agent-loop = { path = "crates/mizar-agent-loop" }
 mizar-agent-spine = { path = "crates/mizar-agent-spine" }

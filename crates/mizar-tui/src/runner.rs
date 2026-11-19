@@ -10,14 +10,21 @@ use cordis::{
     BoxFuture, Cleanup, Context, CordisError, DisposableHandle, LogLevel, LogRecord, LogSink, Next,
 };
 use crossterm::event::{Event as TermEvent, EventStream};
+use futures::StreamExt;
 use mizar_agent_loop::{
     AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent,
     AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
     AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
-    AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS,
-    EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA,
-    EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT, EVENT_AGENT_TOOL_UPDATE,
-    EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE, RunOptions, TurnEndReason,
+    AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_FIRST_TOKEN,
+    EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
+    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
+    RunOptions, TurnEndReason,
+};
+use mizar_agent_spine::{
+    CompactionContextExt, CompactionEndEvent, CompactionError, CompactionProgressEvent,
+    CompactionStartEvent, CompactionTrigger, EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS,
+    EVENT_COMPACTION_START, ManualCompactOptions, patch_settings_file,
+    resolve_global_settings_path, strip_summary_wrapper,
 };
 use mizar_instructions::AgentInstructions;
 use mizar_llm::{ContentBlock, LlmContextExt, ReasoningEffort};
@@ -41,8 +48,12 @@ use mizar_tui_ui::app::{
     truncate_display,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
-use mizar_tui_ui::overlay::{ApprovalDecision, SessionTreeEntry, SkillPickerItem};
-use mizar_tui_ui::side_panel::{FileTouchRow, InstructionSummaryRow, McpSummaryRow, ToolSummaryRow};
+use mizar_tui_ui::overlay::{
+    ApprovalDecision, SessionTreeEntry, SettingEntry, SettingItemKind, SkillPickerItem,
+};
+use mizar_tui_ui::side_panel::{
+    FileTouchRow, InstructionSummaryRow, McpSummaryRow, ToolSummaryRow,
+};
 use mizar_tui_ui::terminal::{
     ProgramStatusState, ScreenMode, TerminalGuard, apply_terminal_modes, emit_program_status,
     resume_after_external_editor, set_mouse_capture_enabled, suspend_for_external_editor,
@@ -52,7 +63,6 @@ use mizar_tui_ui::theme::ThemePreset;
 use mizar_tui_ui::ui::{
     build_item_lines_for_scrollback_at, build_welcome_lines_for_scrollback, render,
 };
-use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
@@ -75,8 +85,7 @@ pub struct TuiExitSummary {
 fn shell_quote_arg(raw: &str) -> String {
     if !raw.is_empty()
         && raw.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'_' | b'-' | b'.' | b'/' | b'~' | b':' | b'@')
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'~' | b':' | b'@')
         })
     {
         return raw.to_string();
@@ -142,6 +151,10 @@ pub struct TuiConfig {
     pub approval_mode: ApprovalMode,
     pub theme_preset: Option<ThemePreset>,
     pub screen_mode: ScreenMode,
+    pub show_thinking: Option<bool>,
+    pub verbose_expanded: Option<bool>,
+    pub side_panel_open: Option<bool>,
+    pub mouse_capture: Option<bool>,
     pub resume_session: Option<ResumeTarget>,
     pub restrict_to_workspace: bool,
     pub startup_notices: Vec<(NoticeLevel, String)>,
@@ -158,6 +171,10 @@ impl TuiConfig {
             approval_mode: ApprovalMode::Auto,
             theme_preset: None,
             screen_mode: ScreenMode::Fullscreen,
+            show_thinking: None,
+            verbose_expanded: None,
+            side_panel_open: None,
+            mouse_capture: None,
             resume_session: None,
             restrict_to_workspace: false,
             startup_notices: Vec::new(),
@@ -226,7 +243,10 @@ pub fn to_ui_log_record(record: &LogRecord) -> UiLogRecord {
 }
 
 /// 将持久化会话日志投影为纯 UI 可重放的 `SessionViewData`（含 `!` 与 `!!` 本地命令记录）。
-pub fn project_session_view(session: &Session, finish_notice: impl Into<String>) -> SessionViewData {
+pub fn project_session_view(
+    session: &Session,
+    finish_notice: impl Into<String>,
+) -> SessionViewData {
     let header = session.header();
     let items = session
         .all_entries()
@@ -241,12 +261,10 @@ pub fn project_session_view(session: &Session, finish_notice: impl Into<String>)
                 first_kept_seq,
                 ..
             } => Some(SessionReplayItem::Compaction {
-                summary,
+                summary: strip_summary_wrapper(&summary),
                 first_kept_seq,
             }),
-            SessionEvent::Assistant { blocks, .. } => {
-                Some(SessionReplayItem::Assistant { blocks })
-            }
+            SessionEvent::Assistant { blocks, .. } => Some(SessionReplayItem::Assistant { blocks }),
             SessionEvent::ToolResult {
                 tool_call_id,
                 content,
@@ -270,7 +288,7 @@ pub fn project_session_view(session: &Session, finish_notice: impl Into<String>)
                 cancelled,
                 exclude_from_context,
             }),
-            SessionEvent::Trace { .. } => None,
+            SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => None,
         })
         .collect();
     SessionViewData {
@@ -323,7 +341,10 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
             SessionEvent::ContextNotice { source, text } => Some(SessionTreeEntry {
                 seq: entry.seq,
                 kind_tag: "CTX ".to_string(),
-                summary: format!("[{source}] {}", truncate_display(&text.replace('\n', " "), 60)),
+                summary: format!(
+                    "[{source}] {}",
+                    truncate_display(&text.replace('\n', " "), 60)
+                ),
                 depth: 1,
                 can_fork: false,
             }),
@@ -361,7 +382,10 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
             } => Some(SessionTreeEntry {
                 seq: entry.seq,
                 kind_tag: if is_error { "ERR " } else { "TOOL" }.to_string(),
-                summary: format!("{name}: {}", truncate_display(&content.replace('\n', " "), 60)),
+                summary: format!(
+                    "{name}: {}",
+                    truncate_display(&content.replace('\n', " "), 60)
+                ),
                 depth: 1,
                 can_fork: true,
             }),
@@ -412,7 +436,7 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
                     can_fork: true,
                 })
             }
-            SessionEvent::Trace { .. } => None,
+            SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => None,
         })
         .collect()
 }
@@ -438,11 +462,13 @@ pub fn subscribe_session_events(
     {
         let tx = tx.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
-            if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::TurnStart { turn: ev.turn });
-            }
-        })?);
+        handles.push(
+            ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::TurnStart { turn: ev.turn });
+                }
+            })?,
+        );
     }
     {
         let tx = tx.clone();
@@ -458,39 +484,33 @@ pub fn subscribe_session_events(
     {
         let tx = tx.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
-            if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::StepStart { ts_ms: ev.ts_ms });
-            }
-        })?);
+        handles.push(
+            ctx.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::StepStart { ts_ms: ev.ts_ms });
+                }
+            })?,
+        );
     }
     {
         let tx = tx.clone();
         let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_STEP_FIRST_TOKEN, move |ev: &AgentStepFirstTokenEvent| {
+        handles.push(ctx.on(
+            EVENT_AGENT_STEP_FIRST_TOKEN,
+            move |ev: &AgentStepFirstTokenEvent| {
                 if check(&ev.session.id) {
                     let _ = tx.send(UiEvent::FirstToken { ts_ms: ev.ts_ms });
                 }
-            })?,
-        );
-    }
-    {
-        let tx = tx.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
-            if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::TextDelta(ev.text.clone()));
-            }
-        })?);
+            },
+        )?);
     }
     {
         let tx = tx.clone();
         let check = is_current.clone();
         handles.push(
-            ctx.on(EVENT_AGENT_REASONING_DELTA, move |ev: &AgentReasoningDeltaEvent| {
+            ctx.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::ReasoningDelta(ev.text.clone()));
+                    let _ = tx.send(UiEvent::TextDelta(ev.text.clone()));
                 }
             })?,
         );
@@ -498,40 +518,58 @@ pub fn subscribe_session_events(
     {
         let tx = tx.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
-            if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::ToolCall(ev.call.clone()));
-            }
-        })?);
+        handles.push(ctx.on(
+            EVENT_AGENT_REASONING_DELTA,
+            move |ev: &AgentReasoningDeltaEvent| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::ReasoningDelta(ev.text.clone()));
+                }
+            },
+        )?);
     }
     {
         let tx = tx.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
-            if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::ToolUpdate {
-                    call_id: ev.tool_call_id.clone(),
-                    name: ev.name.clone(),
-                    preview: ev.preview.clone(),
-                });
-            }
-        })?);
+        handles.push(
+            ctx.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::ToolCall(ev.call.clone()));
+                }
+            })?,
+        );
     }
     {
         let tx = tx.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
-            if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::ToolResult {
-                    call_id: ev.tool_call_id.clone(),
-                    name: ev.name.clone(),
-                    content: ev.content.clone(),
-                    is_error: ev.is_error,
-                    blocked: ev.blocked,
-                    details: ev.details.clone(),
-                });
-            }
-        })?);
+        handles.push(
+            ctx.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::ToolUpdate {
+                        call_id: ev.tool_call_id.clone(),
+                        name: ev.name.clone(),
+                        preview: ev.preview.clone(),
+                    });
+                }
+            })?,
+        );
+    }
+    {
+        let tx = tx.clone();
+        let check = is_current.clone();
+        handles.push(
+            ctx.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::ToolResult {
+                        call_id: ev.tool_call_id.clone(),
+                        name: ev.name.clone(),
+                        content: ev.content.clone(),
+                        is_error: ev.is_error,
+                        blocked: ev.blocked,
+                        details: ev.details.clone(),
+                    });
+                }
+            })?,
+        );
     }
     {
         let tx = tx.clone();
@@ -544,11 +582,60 @@ pub fn subscribe_session_events(
     }
     {
         let tx = tx.clone();
-        let check = is_current;
-        handles.push(
-            ctx.on(EVENT_TRAJECTORY_ANOMALY, move |ev: &TrajectoryAnomalyEvent| {
+        let check = is_current.clone();
+        handles.push(ctx.on(
+            EVENT_TRAJECTORY_ANOMALY,
+            move |ev: &TrajectoryAnomalyEvent| {
                 if check(&ev.session_id) {
                     let _ = tx.send(UiEvent::Anomaly(ev.finding.summary.clone()));
+                }
+            },
+        )?);
+    }
+    {
+        let tx = tx.clone();
+        let check = is_current.clone();
+        handles.push(
+            ctx.on(EVENT_COMPACTION_START, move |ev: &CompactionStartEvent| {
+                if check(&ev.session_id) {
+                    let _ = tx.send(UiEvent::CompactionStarted {
+                        trigger: ev.trigger.as_str().to_string(),
+                    });
+                }
+            })?,
+        );
+    }
+    {
+        let tx = tx.clone();
+        let check = is_current.clone();
+        handles.push(ctx.on(
+            EVENT_COMPACTION_PROGRESS,
+            move |ev: &CompactionProgressEvent| {
+                if check(&ev.session_id) {
+                    let _ = tx.send(UiEvent::CompactionProgress {
+                        stage: ev.stage.clone(),
+                        delta_chars: ev.delta_chars,
+                    });
+                }
+            },
+        )?);
+    }
+    {
+        let tx = tx.clone();
+        let check = is_current;
+        handles.push(
+            ctx.on(EVENT_COMPACTION_END, move |ev: &CompactionEndEvent| {
+                if check(&ev.session_id) {
+                    let _ = tx.send(UiEvent::CompactionFinished {
+                        outcome: ev.outcome.as_str().to_string(),
+                        tokens_before: Some(ev.tokens_before),
+                        tokens_after: Some(ev.tokens_after),
+                        pruned_count: ev.pruned_count,
+                        first_kept_seq: ev.first_kept_seq,
+                        summary_preview: ev.summary_preview.clone(),
+                        message: ev.skipped_reason.clone(),
+                        is_manual: ev.trigger == CompactionTrigger::Manual,
+                    });
                 }
             })?,
         );
@@ -559,7 +646,9 @@ pub fn subscribe_session_events(
 
 /// 等待 `agentLoop`、`sessions`、`llm` 核心服务以及所有已挂载插件就绪（消除异步挂载竞态）。
 pub async fn wait_for_services(ctx: &Context) -> Result<(), Box<dyn std::error::Error>> {
-    if ctx.get::<mizar_agent_loop::AgentLoop>("agentLoop").is_none()
+    if ctx
+        .get::<mizar_agent_loop::AgentLoop>("agentLoop")
+        .is_none()
         || ctx.get::<mizar_session::SessionStore>("sessions").is_none()
         || ctx.get::<mizar_llm::LlmRuntime>("llm").is_none()
     {
@@ -636,10 +725,7 @@ pub async fn run_tui_with_summary(
         }
         None => (sessions.create(None), false),
     };
-    let providers = ctx
-        .llm()
-        .map(|l| l.provider_infos())
-        .unwrap_or_default();
+    let providers = ctx.llm().map(|l| l.provider_infos()).unwrap_or_default();
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
 
@@ -718,7 +804,18 @@ pub async fn run_tui_with_summary(
 
     app.approval_mode = config.approval_mode;
     app.screen_mode = config.screen_mode;
-    app.mouse_capture_enabled = config.screen_mode == ScreenMode::Fullscreen;
+    if let Some(v) = config.show_thinking {
+        app.show_thinking = v;
+    }
+    if let Some(v) = config.verbose_expanded {
+        app.verbose_expanded = v;
+    }
+    if let Some(v) = config.side_panel_open {
+        app.side_panel.open = v;
+    }
+    app.mouse_capture_enabled = config
+        .mouse_capture
+        .unwrap_or(config.screen_mode == ScreenMode::Fullscreen);
     if let Some(preset) = config.theme_preset {
         app.set_theme_preset(preset);
     }
@@ -881,7 +978,8 @@ fn register_approval_hook(
     let ctx_lookup = ctx.clone();
     ctx.on_waterfall(
         EVENT_TOOLS_PRE_EXECUTE,
-        move |exec: ToolExecution, next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+        move |exec: ToolExecution,
+              next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
             let ui_tx = ui_tx.clone();
             let snap_lock = Arc::clone(&approval_snap);
             let ctx_inner = ctx_lookup.clone();
@@ -942,7 +1040,15 @@ fn tool_needs_approval(ctx: &Context, tool_name: &str) -> bool {
     }
     !matches!(
         tool_name,
-        "read" | "grep" | "find" | "ls" | "tool_search" | "mcp_list_resources" | "mcp_read_resource"
+        "read"
+            | "grep"
+            | "find"
+            | "ls"
+            | "tool_search"
+            | "recall_search"
+            | "recall_read"
+            | "mcp_list_resources"
+            | "mcp_read_resource"
     )
 }
 
@@ -958,6 +1064,15 @@ fn process_ui_event(
         *user_cancelled = false;
         app.apply_ui_event(event);
         return AppAction::None;
+    }
+
+    if let UiEvent::CompactionFinished { is_manual, .. } = event {
+        if is_manual {
+            *active_cancel = None;
+            *user_cancelled = false;
+        }
+        app.apply_ui_event(event);
+        return AppAction::RefreshSidePanelData;
     }
 
     if let UiEvent::RunFinished(ref res) = event {
@@ -980,7 +1095,10 @@ fn process_ui_event(
         if !was_aborted && !is_ok && !app.queued_prompts.is_empty() {
             app.push_notice(
                 NoticeLevel::Warn,
-                format!("上一轮未成功，已保留 {} 条排队消息", app.queued_prompts.len()),
+                format!(
+                    "上一轮未成功，已保留 {} 条排队消息",
+                    app.queued_prompts.len()
+                ),
             );
         }
         return AppAction::RefreshSidePanelData;
@@ -1202,6 +1320,50 @@ async fn handle_action(
                 cancel.cancel();
             }
         }
+        AppAction::CompactSession(focus) => {
+            let Ok(compaction) = ctx.compaction() else {
+                app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
+                return;
+            };
+            if !compaction.config().enabled {
+                app.push_notice(NoticeLevel::Info, "上下文压缩已在配置中禁用");
+                return;
+            }
+            let cancel = CancellationToken::new();
+            *active_cancel = Some(cancel.clone());
+            *user_cancelled = false;
+            app.is_compacting = true;
+            app.compaction_status = Some("手动压缩中…".to_string());
+
+            let session = Arc::clone(active_session);
+            let opts = ManualCompactOptions {
+                provider: app.provider.clone(),
+                model: app.model.clone(),
+                focus,
+            };
+            let tx = ui_tx.clone();
+            tokio::spawn(async move {
+                match compaction.compact_now(session, opts, cancel).await {
+                    Ok(_) | Err(CompactionError::Llm(_)) => {
+                        // Pipeline 内部已广播 `EVENT_COMPACTION_END`，避免重复投递
+                    }
+                    Err(
+                        err @ (CompactionError::AlreadyRunning(_) | CompactionError::Cordis(_)),
+                    ) => {
+                        let _ = tx.send(UiEvent::CompactionFinished {
+                            outcome: "failed".to_string(),
+                            tokens_before: None,
+                            tokens_after: None,
+                            pruned_count: 0,
+                            first_kept_seq: None,
+                            summary_preview: None,
+                            message: Some(err.to_string()),
+                            is_manual: true,
+                        });
+                    }
+                }
+            });
+        }
         AppAction::NewSession => {
             *pending_steer = None;
             *user_cancelled = false;
@@ -1400,14 +1562,18 @@ async fn handle_action(
             if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
                 let report = inst.probe_report(Some(&app.session_id));
                 if !report.enabled {
-                    app.push_notice(NoticeLevel::Info, "工作区指令加载已禁用（--no-instructions 或 settings.json）");
+                    app.push_notice(
+                        NoticeLevel::Info,
+                        "工作区指令加载已禁用（--no-instructions 或 settings.json）",
+                    );
                 } else if report.scopes.is_empty() {
                     app.push_notice(
                         NoticeLevel::Info,
                         "未发现 AGENTS.md / CLAUDE.md 指令文件（可在 ~/.mizar/、~/.agents/ 或工作区/Git 祖先目录添加）",
                     );
                 } else {
-                    let mut lines = vec![format!("已探测指令文件（共 {} 个）：", report.scopes.len())];
+                    let mut lines =
+                        vec![format!("已探测指令文件（共 {} 个）：", report.scopes.len())];
                     for s in report.scopes {
                         let status = if s.omitted {
                             "已省略(超出预算)"
@@ -1445,9 +1611,7 @@ async fn handle_action(
                             NoticeLevel::Info,
                             format!("轨迹已导出至：{}", target.display()),
                         ),
-                        Err(err) => {
-                            app.push_notice(NoticeLevel::Error, format!("导出失败：{err}"))
-                        }
+                        Err(err) => app.push_notice(NoticeLevel::Error, format!("导出失败：{err}")),
                     }
                 } else {
                     app.push_notice(NoticeLevel::Info, "当前会话暂无轨迹事件可导出");
@@ -1509,6 +1673,22 @@ async fn handle_action(
         }
         AppAction::OpenSessionTree => {
             app.open_session_tree_with(project_session_tree(active_session));
+        }
+        AppAction::OpenSettings(initial_query) => {
+            let items = build_settings_entries(ctx, app);
+            let save_hint = resolve_global_settings_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.mizar/settings.json".to_string());
+            app.overlay.open_settings(items, initial_query, save_hint);
+        }
+        AppAction::ApplySetting { key, value } => {
+            apply_host_setting_change(ctx, app, terminal, &key, &value).await;
+            if let Err(err) = persist_setting_change(&key, &value) {
+                app.push_notice(
+                    NoticeLevel::Warn,
+                    format!("配置 `{key}` 已实时生效，但写入 settings.json 失败：{err}"),
+                );
+            }
         }
         AppAction::OpenSkillPicker => {
             if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
@@ -1639,6 +1819,373 @@ async fn handle_action(
             }
         }
     }
+}
+
+fn choice_index(options: &[&str], current: &str) -> usize {
+    options
+        .iter()
+        .position(|opt| opt.eq_ignore_ascii_case(current))
+        .unwrap_or(0)
+}
+
+fn format_soft_window_cap_label(cap: u64) -> &'static str {
+    match cap {
+        0 => "off",
+        1..=160_000 => "128k",
+        160_001..=260_000 => "200k",
+        260_001..=440_000 => "380k",
+        _ => "512k",
+    }
+}
+
+fn parse_soft_window_cap_label(label: &str) -> u64 {
+    match label {
+        "off" | "0" => 0,
+        "128k" => 128_000,
+        "200k" => 200_000,
+        "380k" => 380_000,
+        "512k" => 512_000,
+        _ => 380_000,
+    }
+}
+
+fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry> {
+    let theme_opts = [
+        "auto",
+        "mist-dark",
+        "mist-light",
+        "sakura-dark",
+        "system",
+        "ansi16",
+    ];
+    let screen_opts = ["fullscreen", "inline"];
+    let approval_opts = ["auto", "ask"];
+    let effort_opts = [
+        "default", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ];
+    let current_effort = app
+        .reasoning_effort
+        .map(|e| format!("{e:?}").to_lowercase())
+        .unwrap_or_else(|| "default".to_string());
+
+    let mut items = vec![
+        SettingEntry {
+            key: "ui.theme".into(),
+            category: "界面".into(),
+            label: "主题配色".into(),
+            description: "切换 Oklab / 自适应终端主题，切换后即时刷新".into(),
+            kind: SettingItemKind::Choice {
+                options: theme_opts.iter().map(|s| s.to_string()).collect(),
+                selected: choice_index(&theme_opts, app.theme_preset.name()),
+            },
+        },
+        SettingEntry {
+            key: "ui.screenMode".into(),
+            category: "界面".into(),
+            label: "终端视图模式".into(),
+            description: "fullscreen（全屏独立缓冲区）或 inline（内联保留终端滚屏历史）".into(),
+            kind: SettingItemKind::Choice {
+                options: screen_opts.iter().map(|s| s.to_string()).collect(),
+                selected: choice_index(&screen_opts, app.screen_mode.as_str()),
+            },
+        },
+        SettingEntry {
+            key: "ui.showThinking".into(),
+            category: "界面".into(),
+            label: "显示思考过程".into(),
+            description: "在对话流中显示模型的推理思考块（快捷键 Ctrl+O）".into(),
+            kind: SettingItemKind::Toggle {
+                value: app.show_thinking,
+            },
+        },
+        SettingEntry {
+            key: "ui.verboseExpanded".into(),
+            category: "界面".into(),
+            label: "展开工具详情".into(),
+            description: "默认展开工具参数与折叠 diff 预览（快捷键 Ctrl+O）".into(),
+            kind: SettingItemKind::Toggle {
+                value: app.verbose_expanded,
+            },
+        },
+        SettingEntry {
+            key: "ui.sidePanelOpen".into(),
+            category: "界面".into(),
+            label: "右侧信息分栏".into(),
+            description: "展开或隐藏右侧上下文占用、文件变更与工具侧栏（快捷键 Ctrl+B）".into(),
+            kind: SettingItemKind::Toggle {
+                value: app.side_panel.open,
+            },
+        },
+        SettingEntry {
+            key: "ui.mouseCapture".into(),
+            category: "界面".into(),
+            label: "鼠标追踪与点击".into(),
+            description: "开启应用内鼠标滚动/点击；关闭后可直接使用终端原生划词复制（F2）".into(),
+            kind: SettingItemKind::Toggle {
+                value: app.mouse_capture_enabled,
+            },
+        },
+        SettingEntry {
+            key: "ui.approvalMode".into(),
+            category: "运行".into(),
+            label: "危险工具审批模式".into(),
+            description: "auto 自动放行；ask 在写文件与执行 Shell 前弹窗确认".into(),
+            kind: SettingItemKind::Choice {
+                options: approval_opts.iter().map(|s| s.to_string()).collect(),
+                selected: choice_index(&approval_opts, app.approval_mode.as_str()),
+            },
+        },
+        SettingEntry {
+            key: "reasoningEffort".into(),
+            category: "运行".into(),
+            label: "默认思考强度".into(),
+            description: "控制推理模型的思考预算（default 使用模型默认；也可用 Tab 快速循环）"
+                .into(),
+            kind: SettingItemKind::Choice {
+                options: effort_opts.iter().map(|s| s.to_string()).collect(),
+                selected: choice_index(&effort_opts, &current_effort),
+            },
+        },
+    ];
+
+    if let Ok(comp) = ctx.compaction() {
+        let cfg = comp.config();
+        let cap_opts = ["off", "128k", "200k", "380k", "512k"];
+        items.extend([
+            SettingEntry {
+                key: "compaction.enabled".into(),
+                category: "压缩".into(),
+                label: "启用上下文压缩".into(),
+                description: "总开关：关闭后不会执行自动剪枝、自动压缩或 /compact".into(),
+                kind: SettingItemKind::Toggle { value: cfg.enabled },
+            },
+            SettingEntry {
+                key: "compaction.autoPrune".into(),
+                category: "压缩".into(),
+                label: "L1 零模型大输出剪枝".into(),
+                description:
+                    "达到水位时优先对较早轮次大工具输出留头尾+recall句柄，省去 LLM 摘要费用".into(),
+                kind: SettingItemKind::Toggle {
+                    value: cfg.auto_prune,
+                },
+            },
+            SettingEntry {
+                key: "compaction.autoCompact".into(),
+                category: "压缩".into(),
+                label: "L2 自动检查点摘要".into(),
+                description: "L1 剪枝仍超阈值时自动生成软硬分离检查点摘要".into(),
+                kind: SettingItemKind::Toggle {
+                    value: cfg.auto_compact,
+                },
+            },
+            SettingEntry {
+                key: "compaction.reusePrefixCache".into(),
+                category: "压缩".into(),
+                label: "尾置指令复用前缀缓存".into(),
+                description: "摘要请求复用主对话前缀以吃满 Prompt Cache，失败自动回退纯净转写"
+                    .into(),
+                kind: SettingItemKind::Toggle {
+                    value: cfg.reuse_prefix_cache,
+                },
+            },
+            SettingEntry {
+                key: "compaction.disableSummaryReasoning".into(),
+                category: "压缩".into(),
+                label: "摘要请求关闭思考".into(),
+                description: "生成压缩摘要时设 reasoning_effort=off，防止隐藏思考耗尽输出预算"
+                    .into(),
+                kind: SettingItemKind::Toggle {
+                    value: cfg.disable_summary_reasoning,
+                },
+            },
+            SettingEntry {
+                key: "compaction.enableReadDedup".into(),
+                category: "压缩".into(),
+                label: "跨压缩感知重复读去重".into(),
+                description: "同一压缩代次内重复 read 未改动文件区间时返回简短提示，压后自动失效"
+                    .into(),
+                kind: SettingItemKind::Toggle {
+                    value: cfg.enable_read_dedup,
+                },
+            },
+            SettingEntry {
+                key: "compaction.enableWriteAfterCompactGuard".into(),
+                category: "压缩".into(),
+                label: "压后陈旧整文件写保护".into(),
+                description:
+                    "拦截对压缩前 read 过的已存在文件直接整文件 write，始终放行 edit 与新建".into(),
+                kind: SettingItemKind::Toggle {
+                    value: cfg.enable_write_after_compact_guard,
+                },
+            },
+            SettingEntry {
+                key: "compaction.softWindowCap".into(),
+                category: "压缩".into(),
+                label: "超大窗口软顶".into(),
+                description:
+                    "为 1M 等超大窗口模型设置触发软上限（默认 380k），保持注意力与缓存效率".into(),
+                kind: SettingItemKind::Choice {
+                    options: cap_opts.iter().map(|s| s.to_string()).collect(),
+                    selected: choice_index(
+                        &cap_opts,
+                        format_soft_window_cap_label(cfg.soft_window_cap),
+                    ),
+                },
+            },
+        ]);
+    }
+
+    items
+}
+
+async fn apply_host_setting_change(
+    ctx: &Context,
+    app: &mut AppState,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    key: &str,
+    value: &str,
+) {
+    match key {
+        "ui.screenMode" => {
+            let next_mode = if value == "inline" {
+                ScreenMode::Inline
+            } else {
+                ScreenMode::Fullscreen
+            };
+            if next_mode != app.screen_mode {
+                app.screen_mode = next_mode;
+                app.selection.clear();
+                app.item_cache.clear();
+                let _ = apply_terminal_modes(next_mode, app.mouse_capture_enabled);
+                if let Ok(rebuilt) = create_terminal(next_mode) {
+                    *terminal = rebuilt;
+                    if next_mode == ScreenMode::Fullscreen {
+                        app.scroll_to_bottom();
+                    }
+                }
+            }
+        }
+        "ui.mouseCapture" => {
+            let enabled = value == "true";
+            app.mouse_capture_enabled = enabled;
+            let _ = set_mouse_capture_enabled(enabled);
+        }
+        "ui.sidePanelOpen" => {
+            if app.side_panel.open {
+                populate_side_panel_data(ctx, app).await;
+            }
+        }
+        k if k.starts_with("compaction.") => {
+            if let Ok(comp) = ctx.compaction() {
+                let flag = value == "true";
+                comp.update_config(|cfg| match k {
+                    "compaction.enabled" => cfg.enabled = flag,
+                    "compaction.autoPrune" => cfg.auto_prune = flag,
+                    "compaction.autoCompact" => cfg.auto_compact = flag,
+                    "compaction.reusePrefixCache" => cfg.reuse_prefix_cache = flag,
+                    "compaction.disableSummaryReasoning" => cfg.disable_summary_reasoning = flag,
+                    "compaction.enableReadDedup" => cfg.enable_read_dedup = flag,
+                    "compaction.enableWriteAfterCompactGuard" => {
+                        cfg.enable_write_after_compact_guard = flag
+                    }
+                    "compaction.softWindowCap" => {
+                        cfg.soft_window_cap = parse_soft_window_cap_label(value)
+                    }
+                    _ => {}
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn upsert_nested_json(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    section: &str,
+    field: &str,
+    val: serde_json::Value,
+) {
+    let entry = root
+        .entry(section.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert(field.to_string(), val);
+    }
+}
+
+fn persist_setting_change(key: &str, value: &str) -> Result<(), String> {
+    let path = resolve_global_settings_path()
+        .ok_or_else(|| "无法解析 ~/.mizar/settings.json 路径".to_string())?;
+    patch_settings_file(&path, |root| match key {
+        "reasoningEffort" => {
+            if value == "default" {
+                root.remove("reasoningEffort");
+            } else {
+                root.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+        }
+        "ui.theme" => upsert_nested_json(
+            root,
+            "ui",
+            "theme",
+            serde_json::Value::String(value.to_string()),
+        ),
+        "ui.screenMode" => upsert_nested_json(
+            root,
+            "ui",
+            "screenMode",
+            serde_json::Value::String(value.to_string()),
+        ),
+        "ui.approvalMode" => upsert_nested_json(
+            root,
+            "ui",
+            "approvalMode",
+            serde_json::Value::String(value.to_string()),
+        ),
+        "ui.showThinking" => upsert_nested_json(
+            root,
+            "ui",
+            "showThinking",
+            serde_json::Value::Bool(value == "true"),
+        ),
+        "ui.verboseExpanded" => upsert_nested_json(
+            root,
+            "ui",
+            "verboseExpanded",
+            serde_json::Value::Bool(value == "true"),
+        ),
+        "ui.sidePanelOpen" => upsert_nested_json(
+            root,
+            "ui",
+            "sidePanelOpen",
+            serde_json::Value::Bool(value == "true"),
+        ),
+        "ui.mouseCapture" => upsert_nested_json(
+            root,
+            "ui",
+            "mouseCapture",
+            serde_json::Value::Bool(value == "true"),
+        ),
+        "compaction.softWindowCap" => upsert_nested_json(
+            root,
+            "compaction",
+            "softWindowCap",
+            serde_json::Value::Number(serde_json::Number::from(parse_soft_window_cap_label(value))),
+        ),
+        k if let Some(field) = k.strip_prefix("compaction.") => upsert_nested_json(
+            root,
+            "compaction",
+            field,
+            serde_json::Value::Bool(value == "true"),
+        ),
+        _ => {}
+    })
 }
 
 async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
@@ -1796,17 +2343,13 @@ fn find_model_in_provider<'a>(
     provider: &'a mizar_llm::ProviderInfo,
     spec: &str,
 ) -> Option<&'a mizar_llm::ModelInfo> {
-    provider
-        .models
-        .iter()
-        .find(|m| m.id == spec)
-        .or_else(|| {
-            let lower = spec.to_ascii_lowercase();
-            provider
-                .models
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(&lower))
-        })
+    provider.models.iter().find(|m| m.id == spec).or_else(|| {
+        let lower = spec.to_ascii_lowercase();
+        provider
+            .models
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(&lower))
+    })
 }
 
 /// 解析 `/model <spec>`：优先识别带 `/` 的完整模型 ID（如 `mayoru-completions/gemini-4-hydrogen`），

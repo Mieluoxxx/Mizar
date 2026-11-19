@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{Context, CordisError, Inject, Service};
+use futures::StreamExt;
+use futures::future::join_all;
 use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, LlmContextExt, LlmError, LlmErrorCode, Message,
     ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
@@ -18,8 +20,6 @@ use mizar_tools::{
     ToolExecution, ToolExecutionMode, ToolResult, ToolRuntime, ToolUpdate, ToolUpdateCallback,
     ToolsContextExt,
 };
-use futures::StreamExt;
-use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const EVENT_AGENT_STATUS: &str = "agent/status";
 pub const EVENT_AGENT_PRE_STEP: &str = "agent/pre-step";
+pub const EVENT_AGENT_CONTEXT_OVERFLOW: &str = "agent/context-overflow";
 pub const EVENT_AGENT_REQUEST: &str = "agent/request";
 pub const EVENT_AGENT_TEXT_DELTA: &str = "agent/text-delta";
 pub const EVENT_AGENT_REASONING_DELTA: &str = "agent/reasoning-delta";
@@ -106,6 +107,20 @@ pub struct AgentPreStepEvent {
     pub session: Arc<Session>,
     pub turn: u64,
     pub step: usize,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub cancel: CancellationToken,
+}
+
+/// 当模型调用遭遇上下文窗口溢出或隐性连续截断时发出（`serial` 派发，返回 `Some(true)` 表示已释放空间并允许当前步重试）。
+#[derive(Clone)]
+pub struct AgentContextOverflowEvent {
+    pub session: Arc<Session>,
+    pub turn: u64,
+    pub step: usize,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reason: String,
     pub cancel: CancellationToken,
 }
 
@@ -197,6 +212,8 @@ pub struct AgentStepEndEvent {
     pub session: Arc<Session>,
     pub turn: u64,
     pub step: usize,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub outcome: StepOutcome,
     pub usage: Option<TokenUsage>,
     pub ts_ms: u128,
@@ -322,6 +339,8 @@ struct StepGuard {
     session: Arc<Session>,
     turn: u64,
     step: usize,
+    provider: Option<String>,
+    model: Option<String>,
     outcome: StepOutcome,
     usage: Option<TokenUsage>,
 }
@@ -347,6 +366,8 @@ impl Drop for StepGuard {
                 session: Arc::clone(&self.session),
                 turn: self.turn,
                 step: self.step,
+                provider: self.provider.clone(),
+                model: self.model.clone(),
                 outcome: self.outcome.clone(),
                 usage: self.usage,
                 ts_ms: now_millis(),
@@ -414,7 +435,10 @@ impl AgentLoop {
 
         let provider = options.provider.or_else(|| self.config.provider.clone());
         let model = options.model.or_else(|| self.config.model.clone());
-        let max_steps = options.max_steps.or(self.config.max_steps).map(|n| n.max(1));
+        let max_steps = options
+            .max_steps
+            .or(self.config.max_steps)
+            .map(|n| n.max(1));
         let max_tokens = options.max_tokens.or(self.config.max_tokens);
         let temperature = options.temperature.or(self.config.temperature);
         let reasoning_effort = options.reasoning_effort.or(self.config.reasoning_effort);
@@ -445,6 +469,8 @@ impl AgentLoop {
         };
 
         let mut step = 0usize;
+        let mut overflow_recovered = false;
+        let mut consecutive_short_cutoffs = 0usize;
         loop {
             step += 1;
             if let Some(limit) = max_steps
@@ -464,6 +490,8 @@ impl AgentLoop {
                         session: Arc::clone(&session),
                         turn,
                         step,
+                        provider: provider.clone(),
+                        model: model.clone(),
                         cancel: cancel.clone(),
                     },
                 )
@@ -506,6 +534,8 @@ impl AgentLoop {
                 session: Arc::clone(&session),
                 turn,
                 step,
+                provider: provider.clone(),
+                model: model.clone(),
                 outcome: StepOutcome::Cancelled,
                 usage: None,
             };
@@ -529,8 +559,47 @@ impl AgentLoop {
             }) {
                 Ok(s) => s,
                 Err(err) => {
+                    if err.code == LlmErrorCode::ContextWindowExceeded
+                        && !overflow_recovered
+                        && !cancel.is_cancelled()
+                    {
+                        let recovered = self
+                            .ctx
+                            .serial::<AgentContextOverflowEvent, bool>(
+                                EVENT_AGENT_CONTEXT_OVERFLOW,
+                                AgentContextOverflowEvent {
+                                    session: Arc::clone(&session),
+                                    turn,
+                                    step,
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    reason: err.to_string(),
+                                    cancel: cancel.clone(),
+                                },
+                            )
+                            .await
+                            .unwrap_or(false);
+                        if recovered {
+                            overflow_recovered = true;
+                            consecutive_short_cutoffs = 0;
+                            step_guard.finish(
+                                StepOutcome::Error {
+                                    message: "context overflow recovered; retrying".to_string(),
+                                },
+                                None,
+                            );
+                            drop(step_guard);
+                            step = step.saturating_sub(1);
+                            continue;
+                        }
+                    }
                     let msg = err.to_string();
-                    step_guard.finish(StepOutcome::Error { message: msg.clone() }, None);
+                    step_guard.finish(
+                        StepOutcome::Error {
+                            message: msg.clone(),
+                        },
+                        None,
+                    );
                     turn_guard.set_reason(TurnEndReason::Error { message: msg });
                     return Err(AgentError::Llm(err));
                 }
@@ -538,17 +607,30 @@ impl AgentLoop {
 
             let mut assembler = BlockAssembler::new();
             let mut first_token_emitted = false;
+            let mut stream_overflow_err: Option<LlmError> = None;
             while let Some(chunk_res) = stream.next().await {
                 let chunk = match chunk_res {
                     Ok(c) => c,
                     Err(err) => {
+                        if err.code == LlmErrorCode::ContextWindowExceeded
+                            && !overflow_recovered
+                            && !cancel.is_cancelled()
+                        {
+                            stream_overflow_err = Some(err);
+                            break;
+                        }
                         if err.code == LlmErrorCode::Cancelled {
                             flush_interrupted_assistant(&session, &assembler);
                             step_guard.finish(StepOutcome::Cancelled, assembler.usage());
                             turn_guard.set_reason(TurnEndReason::Cancelled);
                         } else {
                             let msg = err.to_string();
-                            step_guard.finish(StepOutcome::Error { message: msg.clone() }, None);
+                            step_guard.finish(
+                                StepOutcome::Error {
+                                    message: msg.clone(),
+                                },
+                                None,
+                            );
                             turn_guard.set_reason(TurnEndReason::Error { message: msg });
                         }
                         return Err(AgentError::Llm(err));
@@ -613,6 +695,47 @@ impl AgentLoop {
                 assembler.push(chunk);
             }
 
+            if let Some(err) = stream_overflow_err {
+                let recovered = self
+                    .ctx
+                    .serial::<AgentContextOverflowEvent, bool>(
+                        EVENT_AGENT_CONTEXT_OVERFLOW,
+                        AgentContextOverflowEvent {
+                            session: Arc::clone(&session),
+                            turn,
+                            step,
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reason: err.to_string(),
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap_or(false);
+                if recovered {
+                    overflow_recovered = true;
+                    consecutive_short_cutoffs = 0;
+                    step_guard.finish(
+                        StepOutcome::Error {
+                            message: "context overflow recovered; retrying".to_string(),
+                        },
+                        None,
+                    );
+                    drop(step_guard);
+                    step = step.saturating_sub(1);
+                    continue;
+                }
+                let msg = err.to_string();
+                step_guard.finish(
+                    StepOutcome::Error {
+                        message: msg.clone(),
+                    },
+                    None,
+                );
+                turn_guard.set_reason(TurnEndReason::Error { message: msg });
+                return Err(AgentError::Llm(err));
+            }
+
             let finish_reason = assembler.finish();
             match &finish_reason {
                 FinishReason::Aborted => {
@@ -633,8 +756,47 @@ impl AgentLoop {
                         status: *status,
                         retry_after_ms: *retry_after_ms,
                     };
+                    if err.code == LlmErrorCode::ContextWindowExceeded
+                        && !overflow_recovered
+                        && !cancel.is_cancelled()
+                    {
+                        let recovered = self
+                            .ctx
+                            .serial::<AgentContextOverflowEvent, bool>(
+                                EVENT_AGENT_CONTEXT_OVERFLOW,
+                                AgentContextOverflowEvent {
+                                    session: Arc::clone(&session),
+                                    turn,
+                                    step,
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    reason: err.to_string(),
+                                    cancel: cancel.clone(),
+                                },
+                            )
+                            .await
+                            .unwrap_or(false);
+                        if recovered {
+                            overflow_recovered = true;
+                            consecutive_short_cutoffs = 0;
+                            step_guard.finish(
+                                StepOutcome::Error {
+                                    message: "context overflow recovered; retrying".to_string(),
+                                },
+                                None,
+                            );
+                            drop(step_guard);
+                            step = step.saturating_sub(1);
+                            continue;
+                        }
+                    }
                     let msg = err.to_string();
-                    step_guard.finish(StepOutcome::Error { message: msg.clone() }, None);
+                    step_guard.finish(
+                        StepOutcome::Error {
+                            message: msg.clone(),
+                        },
+                        None,
+                    );
                     turn_guard.set_reason(TurnEndReason::Error { message: msg });
                     return Err(AgentError::Llm(err));
                 }
@@ -647,13 +809,73 @@ impl AgentLoop {
             let blocks = assembler.blocks();
             let replay = assembler.replay();
 
+            // 识别隐性小窗口截断：0 输出 `MaxTokens`（pi）或连续两次极短 `MaxTokens`（DS-Bot `cutOffs >= 2`）
+            let is_zero_len_cutoff = matches!(finish_reason, FinishReason::MaxTokens)
+                && calls.is_empty()
+                && blocks.is_empty();
+            let is_short_cutoff = matches!(finish_reason, FinishReason::MaxTokens)
+                && calls.is_empty()
+                && text.chars().count() < 200;
+            if is_short_cutoff {
+                consecutive_short_cutoffs += 1;
+            } else {
+                consecutive_short_cutoffs = 0;
+            }
+
+            if (is_zero_len_cutoff || consecutive_short_cutoffs >= 2)
+                && !overflow_recovered
+                && !cancel.is_cancelled()
+            {
+                let reason = if is_zero_len_cutoff {
+                    "zero-output max_tokens cutoff (suspected context window overflow)".to_string()
+                } else {
+                    format!(
+                        "consecutive short max_tokens cutoffs ({consecutive_short_cutoffs}, suspected implicit small context window)"
+                    )
+                };
+                let recovered = self
+                    .ctx
+                    .serial::<AgentContextOverflowEvent, bool>(
+                        EVENT_AGENT_CONTEXT_OVERFLOW,
+                        AgentContextOverflowEvent {
+                            session: Arc::clone(&session),
+                            turn,
+                            step,
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            reason,
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap_or(false);
+                if recovered {
+                    overflow_recovered = true;
+                    consecutive_short_cutoffs = 0;
+                    step_guard.finish(
+                        StepOutcome::Error {
+                            message: "implicit cutoff overflow recovered; retrying".to_string(),
+                        },
+                        usage,
+                    );
+                    drop(step_guard);
+                    step = step.saturating_sub(1);
+                    continue;
+                }
+            }
+
             if calls.is_empty() && blocks.is_empty() {
                 let err = LlmError::new(
                     LlmErrorCode::EmptyResponse,
                     "model output must contain either output text or tool calls",
                 );
                 let msg = err.to_string();
-                step_guard.finish(StepOutcome::Error { message: msg.clone() }, usage);
+                step_guard.finish(
+                    StepOutcome::Error {
+                        message: msg.clone(),
+                    },
+                    usage,
+                );
                 turn_guard.set_reason(TurnEndReason::Error { message: msg });
                 return Err(AgentError::Llm(err));
             }
@@ -846,11 +1068,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use cordis::PluginDef;
+    use futures::channel::mpsc;
     use mizar_llm::{BoxChunkStream, LlmAdapter, LlmRuntime};
     use mizar_session::{SessionContextExt, SessionStore};
     use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
     use mizar_tools::{ToolDefinition, ToolRuntime};
-    use futures::channel::mpsc;
 
     use super::*;
 
@@ -940,7 +1162,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, AgentError::Llm(e) if e.code == LlmErrorCode::Cancelled));
-        assert_eq!(*seen_models.lock().unwrap(), vec![Some("custom-model".into())]);
+        assert_eq!(
+            *seen_models.lock().unwrap(),
+            vec![Some("custom-model".into())]
+        );
 
         let log = session.log();
         assert_eq!(log.len(), 2);
@@ -1074,20 +1299,28 @@ mod tests {
         let overlapped_reg = Arc::clone(&overlapped);
         let _reg = tools
             .register(
-                ToolDefinition::async_rich_tool("par_tool", "parallel test", json!({}), move |args, call_ctx| {
-                    let cur = Arc::clone(&in_flight_reg);
-                    let ov = Arc::clone(&overlapped_reg);
-                    async move {
-                        call_ctx.emit_update("running...", None);
-                        let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
-                        if now >= 2 {
-                            ov.store(true, Ordering::SeqCst);
+                ToolDefinition::async_rich_tool(
+                    "par_tool",
+                    "parallel test",
+                    json!({}),
+                    move |args, call_ctx| {
+                        let cur = Arc::clone(&in_flight_reg);
+                        let ov = Arc::clone(&overlapped_reg);
+                        async move {
+                            call_ctx.emit_update("running...", None);
+                            let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                            if now >= 2 {
+                                ov.store(true, Ordering::SeqCst);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                            cur.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<_, cordis::BoxError>(mizar_tools::ToolOutput::text(format!(
+                                "id={}",
+                                args["id"]
+                            )))
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                        cur.fetch_sub(1, Ordering::SeqCst);
-                        Ok::<_, cordis::BoxError>(mizar_tools::ToolOutput::text(format!("id={}", args["id"])))
-                    }
-                })
+                    },
+                )
                 .with_execution_mode(ToolExecutionMode::Parallel),
             )
             .unwrap();
@@ -1100,7 +1333,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer, "all done");
-        assert!(overlapped.load(Ordering::SeqCst), "parallel tools should overlap");
+        assert!(
+            overlapped.load(Ordering::SeqCst),
+            "parallel tools should overlap"
+        );
         assert_eq!(updates.lock().unwrap().len(), 2);
 
         app.fiber().dispose().await;
@@ -1143,9 +1379,12 @@ mod tests {
         let _reg = app
             .tools()
             .unwrap()
-            .register(ToolDefinition::sync_tool("ping", "ping", json!({}), |_, _| {
-                Ok::<_, cordis::BoxError>("pong".to_string())
-            }))
+            .register(ToolDefinition::sync_tool(
+                "ping",
+                "ping",
+                json!({}),
+                |_, _| Ok::<_, cordis::BoxError>("pong".to_string()),
+            ))
             .unwrap();
 
         // 默认不限步数：12 步工具链应顺利跑完而非被旧的 8 步限制打断
@@ -1182,7 +1421,10 @@ mod tests {
             .await
             .unwrap();
         assert!(capped.contains("max_steps=2"));
-        assert_eq!(end_reasons.lock().unwrap().last(), Some(&TurnEndReason::MaxSteps));
+        assert_eq!(
+            end_reasons.lock().unwrap().last(),
+            Some(&TurnEndReason::MaxSteps)
+        );
 
         app.fiber().dispose().await;
     }

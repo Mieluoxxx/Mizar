@@ -37,6 +37,8 @@ async fn emit_pre_step(ctx: &Context, session: &Arc<mizar_session::Session>, ste
                 session: Arc::clone(session),
                 turn: 1,
                 step,
+                provider: None,
+                model: None,
                 cancel: CancellationToken::new(),
             },
         )

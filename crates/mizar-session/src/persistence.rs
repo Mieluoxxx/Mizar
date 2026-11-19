@@ -7,7 +7,8 @@ use cordis::{BoxFuture, Context};
 use thiserror::Error;
 
 use crate::model::{
-    LoadedSession, SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    LoadedSession, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionHeader,
+    SessionHeaderPatch, SessionListQuery,
 };
 
 pub const SERVICE_SESSION_PERSISTENCE: &str = "sessionPersistence";
@@ -39,8 +40,7 @@ pub type PersistenceResult<T> = Result<T, PersistenceError>;
 pub trait SessionPersistence: Send + Sync + 'static {
     fn create_session(&self, header: &SessionHeader) -> PersistenceResult<()>;
 
-    fn update_header(&self, session_id: &str, patch: SessionHeaderPatch)
-        -> PersistenceResult<()>;
+    fn update_header(&self, session_id: &str, patch: SessionHeaderPatch) -> PersistenceResult<()>;
 
     fn load_session(&self, session_id: &str) -> PersistenceResult<Option<LoadedSession>>;
 
@@ -58,6 +58,14 @@ pub trait SessionPersistence: Send + Sync + 'static {
         up_to_seq: u64,
         new_header: &SessionHeader,
     ) -> PersistenceResult<LoadedSession>;
+
+    /// 可选的全文情景检索（如 SQLite FTS5 N-gram）；未实现时返回 `Ok(None)` 由上层退回内存扫描。
+    fn search_recall(
+        &self,
+        _query: &RecallSearchQuery,
+    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
+        Ok(None)
+    }
 }
 
 /// 包装 `Arc<dyn SessionPersistence>` 以便通过 Cordis `ctx.provide` 注册与查找。

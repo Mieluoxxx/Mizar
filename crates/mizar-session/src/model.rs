@@ -77,6 +77,20 @@ pub enum SessionTraceEvent {
         #[serde(default)]
         evidence: Value,
     },
+    /// 压缩事务开始标记（LogOnly，崩溃/回放时未闭合的 start 自动忽略，避免卡死）。
+    CompactionStart {
+        trigger: String,
+    },
+    /// 压缩事务结束标记（LogOnly）。
+    CompactionEnd {
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_kept_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+    },
 }
 
 impl SessionTraceEvent {
@@ -90,8 +104,49 @@ impl SessionTraceEvent {
             Self::ToolCall { .. } => "tool-call",
             Self::ToolOutcome { .. } => "tool-outcome",
             Self::Anomaly { .. } => "anomaly",
+            Self::CompactionStart { .. } => "compaction-start",
+            Self::CompactionEnd { .. } => "compaction-end",
         }
     }
+}
+
+/// 若压缩切点落在当前未完成 turn 中途，钉住该 turn 的原始用户输入并附带 `seq` 句柄。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedInput {
+    pub seq: u64,
+    pub text: String,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// 压缩检查点的确定性硬事实摘要：由代码从历史事件直接提取并跨轮滚动，不依赖 LLM 复述。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionDigest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands_run: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_inputs: Vec<PinnedInput>,
+}
+
+impl CompactionDigest {
+    pub fn is_empty(&self) -> bool {
+        self.modified_files.is_empty()
+            && self.commands_run.is_empty()
+            && self.pinned_inputs.is_empty()
+    }
+}
+
+/// 投影层工具结果剪枝项：不修改原始 `ToolResult`，仅在构造模型消息时替换为紧凑预览与 recall 句柄。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrunedToolResult {
+    pub target_seq: u64,
+    pub replacement: String,
+    pub original_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +179,15 @@ pub enum SessionEvent {
         first_kept_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        #[serde(default, skip_serializing_if = "CompactionDigest::is_empty")]
+        digest: CompactionDigest,
+    },
+    /// 零模型投影层批量剪枝记录（`EntryVisibility::LogOnly`）：
+    /// 一次性锁存较早 `ToolResult` 的紧凑预览，原文仍完整保留在日志中供 `recall` 查阅。
+    ToolResultPrune {
+        pruned: Vec<PrunedToolResult>,
     },
     /// 本地执行的 Shell 命令（`!` 载入上下文 / `!!` 仅本地审计不载入上下文）。
     BashExecution {
@@ -159,7 +223,7 @@ impl SessionEvent {
 
     pub fn visibility(&self) -> EntryVisibility {
         match self {
-            Self::Trace { .. } => EntryVisibility::LogOnly,
+            Self::Trace { .. } | Self::ToolResultPrune { .. } => EntryVisibility::LogOnly,
             Self::BashExecution {
                 exclude_from_context,
                 ..
@@ -189,6 +253,7 @@ impl SessionEvent {
             Self::Assistant { .. } => "assistant",
             Self::ToolResult { .. } => "tool-result",
             Self::Compaction { .. } => "compaction",
+            Self::ToolResultPrune { .. } => "tool-result-prune",
             Self::BashExecution { .. } => "bash-execution",
             Self::Trace { detail } => detail.kind_name(),
         }
@@ -281,6 +346,32 @@ pub struct SessionListQuery {
     pub limit: Option<usize>,
 }
 
+/// 面向情景回溯（`recall`）的持久化层检索参数。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallSearchQuery {
+    pub query: String,
+    /// 限定搜索的会话 ID 列表；为空时结合 `cwd` 搜索工作区会话。
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub limit: usize,
+}
+
+/// 单条情景回溯命中结果（带会话来源与 `seq` 锚点）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallSearchHit {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
+    pub seq: u64,
+    pub ts: u128,
+    pub kind: String,
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
     pub header: SessionHeader,
@@ -289,10 +380,7 @@ pub struct LoadedSession {
 
 /// 从首条用户输入提取简短单行会话标题（超过 72 字符自动截断）。
 pub fn derive_session_title(input: &str) -> Option<String> {
-    let first_line = input
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
+    let first_line = input.lines().map(str::trim).find(|line| !line.is_empty())?;
     let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;

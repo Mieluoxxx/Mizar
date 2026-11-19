@@ -154,6 +154,7 @@ fn entry_to_trace_event(
                 text,
             }
         }
+        SessionEvent::ToolResultPrune { .. } => return None,
         SessionEvent::Trace { detail } => match detail {
             SessionTraceEvent::TurnStart { turn } => TraceEventKind::TurnStart { turn: *turn },
             SessionTraceEvent::TurnEnd { turn, reason } => TraceEventKind::TurnEnd {
@@ -224,6 +225,9 @@ fn entry_to_trace_event(
                 summary: summary.clone(),
                 evidence: evidence.clone(),
             },
+            SessionTraceEvent::CompactionStart { .. } | SessionTraceEvent::CompactionEnd { .. } => {
+                return None;
+            }
         },
     };
 
@@ -381,9 +385,7 @@ impl TrajectoryRuntime {
         }
         let events = {
             let buffers = self.buffers.lock().unwrap();
-            buffers
-                .get(session_id)
-                .map(|b| b.standalone_events.clone())
+            buffers.get(session_id).map(|b| b.standalone_events.clone())
         }?;
         Some(self.inspect_events(session_id, &events, mode))
     }
@@ -803,7 +805,11 @@ impl Service for TrajectoryRuntime {
                     "守卫检测到工具 {} 连续重复调用 {} 次{}",
                     ev.tool_name,
                     ev.count,
-                    if ev.blocked { "（已强制拦截）" } else { "（已向模型注入提醒）" }
+                    if ev.blocked {
+                        "（已强制拦截）"
+                    } else {
+                        "（已向模型注入提醒）"
+                    }
                 );
                 let evidence = json!({
                     "tool": ev.tool_name,

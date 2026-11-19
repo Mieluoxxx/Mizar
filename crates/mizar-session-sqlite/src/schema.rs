@@ -68,9 +68,27 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
              PRIMARY KEY (session_id, seq),
              FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS session_recall_docs (
+             doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL,
+             seq INTEGER NOT NULL,
+             ts_ms INTEGER NOT NULL,
+             kind TEXT NOT NULL,
+             preview TEXT NOT NULL,
+             UNIQUE(session_id, seq),
+             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_recall_docs_session_seq
+             ON session_recall_docs(session_id, seq);
+         CREATE VIRTUAL TABLE IF NOT EXISTS session_recall_fts USING fts5(
+             terms,
+             content='',
+             tokenize='ascii'
+         );
          PRAGMA user_version = 1;",
     )
     .map_err(map_sqlite_err)?;
+
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 # Mizar 插件与模块清单
 
-本文档介绍 `crates/` 下共 **28 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
+本文档介绍 `crates/` 下共 **30 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
 
 目前仓库为纯 Virtual Workspace，唯一的终端入口为 `crates/mizar-tui/src/main.rs`（`mizar-tui`），通过 `mizar-agent-spine` 按需装配 Agent 能力并由纯前端工作台 `mizar-tui-ui` 渲染界面。**纯模型/纯 UI 层**与**异步插件宿主层**已彻底解耦。
 
@@ -102,13 +102,20 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-instructions`** | `AgentInstructions` | `"agentInstructions"` / `"agent-instructions"` | —（不注册工具） | 无（事件订阅 `tools/result` + `agent/pre-step`） | **多层级 `AGENTS.md` / `CLAUDE.md` 自动加载与热同步**：扫描 `~/.mizar/`（`MIZAR_HOME`）与 `~/.agents/`（`MIZAR_AGENTS_HOME`）、由 `.git` 项目根到工作区的祖先链，以及 `read`/`write`/`edit` 触达的子目录（`follow_subdirs`）；默认候选 `AGENTS.md` / `CLAUDE.md` 与 `.local.md` 变体。同组按去空白 SHA-256 摘要去重、不同内容并存；超预算时**优先淘汰最宽泛的祖先**以保住近目录指令，并在正文做 UTF-8 安全截断。默认 `max_bytes` 65 536、`max_source_bytes` 1 MiB（超出即跳过该文件）；通过 `agent/pre-step` 注入 `ContextNotice`，文件增删改时发增量提示，并在历史压缩后自动重建基线 | `cordis`、`mizar-agent-loop`、`mizar-session`、`mizar-tools` |
 
+### 4.7 上下文压缩与无损情景回溯
+
+| Crate | 服务 / 插件结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | **四级渐进上下文压缩与压后工具守卫**：步前水位估算（含 380k 软顶、regrowth 防抖与冷缓存机会窗）→ L1 零模型批量 `ToolResultPrune` 剪枝锁存 → L2 软硬分离检查点摘要（确定性 `<mizar-digest>` + 同前缀尾置指令 + `reasoning: off` + `<= 0.5*B` Re-plan + `answeredRoute`）→ L3 溢出与隐性连续截断（`cutOffs >= 2`）自动恢复；挂载 `tools/pre-execute`（压后拦陈旧整文件 `write` 放行 `edit`）与 `tools/post-execute`（跨压缩感知 `read-dedup`）；暴露 `compact_now` 供 TUI `/compact [focus]` 调用 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-recall`** | `RecallPlugin` | `"recall"` | `recall_search`、`recall_read` | `["sessions", "tools"]` | **无损情景回溯工具**：默认以 `ToolExposure::Deferred` 零开销挂载，一旦本会话发生首次剪枝/压缩或处于 `parent_id` 谱系中即自动激活为模型可见；穿透压缩边界检索 SQLite FTS5 1..=3 n-gram 索引（无持久化时自动退回内存扫描），支持 `current` / `lineage` / `workspace` 作用域校验、`is_current_session` 标记、字符分页与 `to_file` 旁路导出 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools` |
+
 ---
 
 ## 五、会话持久化
 
 | Crate | 插件结构体 | 插件名 | 提供服务名 | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-session-sqlite`** | `SqlitePersistencePlugin` | `"session-persistence-sqlite"` | `"sessionPersistence"` | **嵌入式 SQLite 持久化**：WAL 模式 + `busy_timeout`，独占 **Single-Writer 后台线程**通过批量事务提交把写入隔离在 Tokio 调度器外；只读连接加 `query_only`；支持关闭 `bundled` feature 以链接系统 SQLite。默认路径 `~/.mizar/sessions.sqlite`（`MIZAR_SESSION_DB` 可覆盖，设为 `none`/`off` 关闭落盘） | `cordis`、`mizar-session` |
+| **`mizar-session-sqlite`** | `SqlitePersistencePlugin` | `"session-persistence-sqlite"` | `"sessionPersistence"` | **嵌入式 SQLite 持久化 + FTS5 情景索引**：WAL 模式 + `busy_timeout`，独占 **Single-Writer 后台线程**通过批量事务提交把写入隔离在 Tokio 调度器外；只读连接加 `query_only`；内建无内容 FTS5 1..=3 Unicode scalar n-gram 索引（`session_recall_docs` + `session_recall_fts`），供 `mizar-recall` 毫秒级穿透检索中英文与代码标识符；支持关闭 `bundled` feature 以链接系统 SQLite。默认路径 `~/.mizar/sessions.sqlite`（`MIZAR_SESSION_DB` 可覆盖，设为 `none`/`off` 关闭落盘） | `cordis`、`mizar-llm-types`、`mizar-session` |
 
 ---
 
@@ -125,7 +132,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` | `"agent-spine"` | **核心装配套件**：支持通过 Cargo features（`legacy` / `coding` / `sqlite` / `trajectory` / `router`）按需裁剪插件栈（`--no-default-features` 仅拉起最小微内核与核心服务）。同时提供 `load_mizar_config` 读取 `~/.mizar/` 与 `<workspace>/.mizar/` 下的 `settings.json` / `models.json` / `mcp.json` | 无（自身负责装配） | 按 Cargo features 选配后端 crate |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` | `"agent-spine"` | **核心装配套件**：支持通过 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `trajectory` / `router`）按需裁剪插件栈（`--no-default-features` 仅拉起最小微内核与核心服务）。同时提供 `load_mizar_config` 读取 `~/.mizar/` 与 `<workspace>/.mizar/` 下的 `settings.json` / `models.json` / `mcp.json` | 无（自身负责装配） | 按 Cargo features 选配后端 crate |
 | **`mizar-tui`** | 可执行文件 `mizar` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `mizar-tui-ui`。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
 ---
@@ -145,11 +152,11 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 │  mizar-session-sqlite  (sessionPersistence)                                │
 └───────────────────────────────┬────────────────────────────────────────────┘
                                 v
-┌─ 工具插件层（除 mizar-instructions 外均 inject ["tools"]） ────────────────┐
+┌─ 工具与上下文管理插件层 ───────────────────────────────────────────────────┐
 │  coding: mizar-tools-coding / mizar-tool-search / mizar-codemode           │
 │  legacy: mizar-tool-fs / mizar-tool-time                                   │
-│  extra : mizar-mcp / mizar-skills                                          │
-│  notice: mizar-instructions（不注册工具，仅注入 ContextNotice）            │
+│  extra : mizar-mcp / mizar-skills / mizar-recall                           │
+│  ctx   : mizar-compaction（compaction）/ mizar-instructions（ContextNotice）│
 └───────────────────────────────┬────────────────────────────────────────────┘
                                 v
 ┌─ 基础服务与模型层 ─────────────────────────────────────────────────────────┐
@@ -186,6 +193,9 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `toolSearch` | object | `autoEnable` / `defaultLimit` |
 | `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
 | `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` / `followSubdirs` |
+| `compaction` | object | `enabled` / `autoCompact` / `autoPrune` / `softWindowCap` / `triggerRatio` / `pruneThresholdChars` / `coldCacheIdleSecs` / `reusePrefixCache` / `disableSummaryReasoning` / `enableReadDedup` / `enableWriteAfterCompactGuard` |
+| `recall` | object | `enabled` / `autoActivateOnCompaction` / `defaultSearchLimit` / `readCharLimit` |
+| `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 
 `models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/mizar-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，并额外支持每个 Server 的 `exposure` 与 `toolExposure`。
 

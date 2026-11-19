@@ -17,7 +17,8 @@ use mizar_llm::{ContentBlock, Message};
 use uuid::Uuid;
 
 pub use model::{
-    EntryVisibility, LoadedSession, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
+    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
+    RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
     SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionTraceEvent,
     TraceSeverity, derive_session_title,
 };
@@ -108,6 +109,62 @@ fn collect_visible_indices(log: &[SessionEntry]) -> Vec<usize> {
     indices
 }
 
+fn collect_pruned_map(log: &[SessionEntry]) -> HashMap<u64, String> {
+    let mut map = HashMap::new();
+    for entry in log {
+        if let SessionEvent::ToolResultPrune { pruned } = &entry.event {
+            for item in pruned {
+                map.insert(item.target_seq, item.replacement.clone());
+            }
+        }
+    }
+    map
+}
+
+/// 将压缩检查点统一格式化为发给模型的软硬分离上下文块。
+pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> String {
+    let mut out = String::new();
+    out.push_str("<mizar-compaction>\n");
+    if !digest.is_empty() {
+        out.push_str("<mizar-digest>\n");
+        if !digest.modified_files.is_empty() {
+            out.push_str("Modified files (authoritative tool record):\n");
+            for path in &digest.modified_files {
+                out.push_str("- ");
+                out.push_str(path);
+                out.push('\n');
+            }
+        }
+        if !digest.commands_run.is_empty() {
+            out.push_str("Commands run (authoritative tool record):\n");
+            for cmd in &digest.commands_run {
+                out.push_str("- ");
+                out.push_str(cmd);
+                out.push('\n');
+            }
+        }
+        if !digest.pinned_inputs.is_empty() {
+            out.push_str("Pinned active-turn user input:\n");
+            for pin in &digest.pinned_inputs {
+                out.push_str(&format!("[input seq #{}]", pin.seq));
+                if pin.truncated {
+                    out.push_str(" (truncated; use recall_read for full text)");
+                }
+                out.push('\n');
+                out.push_str(&pin.text);
+                out.push('\n');
+            }
+        }
+        out.push_str("</mizar-digest>\n");
+    }
+    out.push_str("<mizar-summary>\n");
+    out.push_str(summary.trim());
+    out.push_str("\n</mizar-summary>\n");
+    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall_search` / `recall_read`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
+    out.push_str("</mizar-compaction>");
+    out
+}
+
 /// 检查从持久化或分叉截断加载的日志尾部是否残留未返回 `ToolResult` 的工具调用。
 /// 若存在悬挂工具调用，则自动追加合成的 `TOOL_OUTCOME_UNKNOWN` 错误结果以保持对话协议合法。
 pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntry> {
@@ -131,6 +188,7 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
             }
             SessionEvent::ContextNotice { .. }
             | SessionEvent::BashExecution { .. }
+            | SessionEvent::ToolResultPrune { .. }
             | SessionEvent::Trace { .. } => {}
         }
     }
@@ -297,9 +355,7 @@ impl Session {
             let surface_entries: Vec<&SessionEntry> = inner
                 .log
                 .iter()
-                .filter(|e| {
-                    e.is_surface() && !matches!(e.event, SessionEvent::Compaction { .. })
-                })
+                .filter(|e| e.is_surface() && !matches!(e.event, SessionEvent::Compaction { .. }))
                 .collect();
             let next_seq = inner.log.last().map_or(1, |e| e.seq + 1);
             if keep_recent_surface == 0 || surface_entries.is_empty() {
@@ -322,9 +378,61 @@ impl Session {
             summary: summary.into(),
             first_kept_seq,
             tokens_before,
+            tokens_after: None,
+            digest: CompactionDigest::default(),
         });
         let inner = self.inner.lock().unwrap();
         inner.log.last().map_or(first_kept_seq, |e| e.seq)
+    }
+
+    /// 以显式计算好的 `first_kept_seq` 与确定性硬事实 `digest` 追加一条 `Compaction` 检查点。
+    pub fn compact_at(
+        self: &Arc<Self>,
+        summary: impl Into<String>,
+        first_kept_seq: u64,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+        digest: CompactionDigest,
+    ) -> u64 {
+        self.append(SessionEvent::Compaction {
+            summary: summary.into(),
+            first_kept_seq,
+            tokens_before,
+            tokens_after,
+            digest,
+        });
+        let inner = self.inner.lock().unwrap();
+        inner.log.last().map_or(first_kept_seq, |e| e.seq)
+    }
+
+    /// 追加一批锁存的投影层工具输出剪枝记录（不修改原始 `ToolResult` 事件）。
+    pub fn append_prune(self: &Arc<Self>, pruned: Vec<PrunedToolResult>) -> Option<u64> {
+        if pruned.is_empty() {
+            return None;
+        }
+        self.append(SessionEvent::ToolResultPrune { pruned });
+        let inner = self.inner.lock().unwrap();
+        inner.log.last().map(|e| e.seq)
+    }
+
+    /// 返回当前已锁存的所有工具结果剪枝映射（`target_seq -> replacement`）。
+    pub fn pruned_map(&self) -> HashMap<u64, String> {
+        let inner = self.inner.lock().unwrap();
+        collect_pruned_map(&inner.log)
+    }
+
+    /// 返回最新一条事件序号（空会话返回 `0`）。
+    pub fn last_seq(&self) -> u64 {
+        self.inner.lock().unwrap().log.last().map_or(0, |e| e.seq)
+    }
+
+    /// 若会话发生过压缩，返回最新一条 `Compaction` 条目本身的 `seq` 与 `first_kept_seq`。
+    pub fn latest_compaction_boundary(&self) -> Option<(u64, u64)> {
+        let inner = self.inner.lock().unwrap();
+        inner.log.iter().rev().find_map(|e| match &e.event {
+            SessionEvent::Compaction { first_kept_seq, .. } => Some((e.seq, *first_kept_seq)),
+            _ => None,
+        })
     }
 
     pub fn flush(&self) -> PersistenceResult<()> {
@@ -385,13 +493,15 @@ impl Session {
         f(&inner.log)
     }
 
-    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口并跳过 `LogOnly` 事件）。
+    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口与 `ToolResultPrune` 剪枝投影并跳过 `LogOnly` 事件）。
     pub fn derive_messages(&self) -> Vec<Message> {
         let inner = self.inner.lock().unwrap();
         let indices = collect_visible_indices(&inner.log);
+        let pruned_map = collect_pruned_map(&inner.log);
         let mut messages = Vec::with_capacity(indices.len());
         for idx in indices {
-            match &inner.log[idx].event {
+            let entry = &inner.log[idx];
+            match &entry.event {
                 SessionEvent::User { text } => messages.push(Message::User {
                     content: text.clone(),
                 }),
@@ -410,15 +520,21 @@ impl Session {
                     is_error,
                     ..
                 } => {
+                    let effective_content = pruned_map
+                        .get(&entry.seq)
+                        .cloned()
+                        .unwrap_or_else(|| content.clone());
                     messages.push(Message::Tool {
-                        content: content.clone(),
+                        content: effective_content,
                         tool_call_id: tool_call_id.clone(),
                         is_error: *is_error,
                     });
                 }
-                SessionEvent::Compaction { summary, .. } => {
+                SessionEvent::Compaction {
+                    summary, digest, ..
+                } => {
                     messages.push(Message::User {
-                        content: format!("[历史对话摘要]\n{summary}"),
+                        content: render_compaction_message(summary, digest),
                     });
                 }
                 SessionEvent::BashExecution {
@@ -450,7 +566,7 @@ impl Session {
                         messages.push(Message::User { content });
                     }
                 }
-                SessionEvent::Trace { .. } => {}
+                SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => {}
             }
         }
         messages
@@ -501,9 +617,10 @@ impl SessionStore {
         if let Some(backend) = self.ctx.session_persistence()
             && let Err(err) = backend.create_session(&header)
         {
-            self.ctx
-                .logger_named("session")
-                .warn(format!("持久化创建会话失败 (session={}): {err}", session.id));
+            self.ctx.logger_named("session").warn(format!(
+                "持久化创建会话失败 (session={}): {err}",
+                session.id
+            ));
         }
 
         self.ctx.emit(
@@ -580,7 +697,10 @@ impl SessionStore {
         let now = now_millis();
         let parent_header = parent.header();
         let mut new_header = SessionHeader::new(new_id.clone(), now);
-        new_header.cwd = opts.cwd.or(parent_header.cwd).or_else(|| self.default_cwd());
+        new_header.cwd = opts
+            .cwd
+            .or(parent_header.cwd)
+            .or_else(|| self.default_cwd());
         new_header.title = opts.title.or(parent_header.title);
         new_header.parent_id = Some(from_session_id.to_string());
         new_header.fork_seq = Some(up_to_seq);
@@ -624,6 +744,34 @@ impl SessionStore {
         self.sessions.lock().unwrap().values().cloned().collect()
     }
 
+    /// 沿 `parent_id` 向上回溯会话谱系链（首元素为当前 `session_id`，最多 64 代，防环）。
+    pub fn lineage_session_ids(&self, session_id: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut cur = Some(session_id.to_string());
+        let mut depth = 0usize;
+        while let Some(id) = cur {
+            if depth >= 64 || chain.contains(&id) {
+                break;
+            }
+            chain.push(id.clone());
+            depth += 1;
+            cur = self.get(&id).and_then(|s| s.header().parent_id);
+        }
+        chain
+    }
+
+    /// 委托给持久化后端执行全文情景回溯（未启用或不支持索引时返回 `Ok(None)`）。
+    pub fn search_recall(
+        &self,
+        query: &RecallSearchQuery,
+    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
+        if let Some(backend) = self.ctx.session_persistence() {
+            backend.search_recall(query)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。
     pub fn list_headers(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
         if let Some(backend) = self.ctx.session_persistence() {
@@ -636,7 +784,12 @@ impl SessionStore {
             .unwrap()
             .values()
             .map(|s| s.header())
-            .filter(|h| query.cwd.as_ref().is_none_or(|c| h.cwd.as_deref() == Some(c.as_str())))
+            .filter(|h| {
+                query
+                    .cwd
+                    .as_ref()
+                    .is_none_or(|c| h.cwd.as_deref() == Some(c.as_str()))
+            })
             .collect();
         headers.sort_by(|a, b| {
             b.updated_at_ms

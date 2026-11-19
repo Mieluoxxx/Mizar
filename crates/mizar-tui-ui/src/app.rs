@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use mizar_llm_types::{ContentBlock, ModelInfo, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall};
+use mizar_llm_types::{
+    ContentBlock, ModelInfo, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall,
+};
 use mizar_trajectory_core::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -26,14 +28,12 @@ use crate::reveal::{RevealController, RevealSlot};
 use crate::selection::{
     SelectionGeometry, SelectionState, copy_to_clipboard, extract_selected_text,
 };
-use crate::side_panel::{
-    ContextBreakdownSnapshot, FileTouchRow, SidePanelData, SidePanelState,
+use crate::side_panel::{ContextBreakdownSnapshot, FileTouchRow, SidePanelData, SidePanelState};
+use crate::terminal::{
+    ProgramStatusState, ScreenMode, emit_program_status, emit_terminal_progress,
 };
-use crate::terminal::{ProgramStatusState, ScreenMode, emit_program_status, emit_terminal_progress};
 use crate::theme::{TerminalColors, Theme, ThemePreset};
-use crate::timeline_rail::{
-    RailGeometry, RailHit, TimelineSnapshot, hit_test_rail,
-};
+use crate::timeline_rail::{RailGeometry, RailHit, TimelineSnapshot, hit_test_rail};
 use crate::trajectory_scene::{TrajectoryKeyOutcome, TrajectorySceneState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +288,25 @@ pub enum UiEvent {
     ApprovalRequested {
         tool_name: String,
         args_preview: String,
-        responder: Arc<std::sync::Mutex<Option<futures::channel::oneshot::Sender<ApprovalDecision>>>>,
+        responder:
+            Arc<std::sync::Mutex<Option<futures::channel::oneshot::Sender<ApprovalDecision>>>>,
+    },
+    CompactionStarted {
+        trigger: String,
+    },
+    CompactionProgress {
+        stage: String,
+        delta_chars: usize,
+    },
+    CompactionFinished {
+        outcome: String,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+        pruned_count: usize,
+        first_kept_seq: Option<u64>,
+        summary_preview: Option<String>,
+        message: Option<String>,
+        is_manual: bool,
     },
 }
 
@@ -312,6 +330,7 @@ pub enum AppAction {
         exclude_from_context: bool,
     },
     CancelRun,
+    CompactSession(Option<String>),
     NewSession,
     ShowStats,
     ShowTools,
@@ -319,6 +338,11 @@ pub enum AppAction {
     ShowSkills,
     ShowInstructions,
     OpenSkillPicker,
+    OpenSettings(Option<String>),
+    ApplySetting {
+        key: String,
+        value: String,
+    },
     OpenSessionTree,
     ForkSessionAtSeq(u64),
     OpenExternalEditor,
@@ -343,6 +367,8 @@ pub struct AppState {
     pub queued_prompts: Vec<String>,
     pub is_busy: bool,
     pub is_bash_running: bool,
+    pub is_compacting: bool,
+    pub compaction_status: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub providers: Vec<ProviderInfo>,
@@ -435,6 +461,8 @@ impl AppState {
             queued_prompts: Vec::new(),
             is_busy: false,
             is_bash_running: false,
+            is_compacting: false,
+            compaction_status: None,
             provider,
             model,
             providers,
@@ -712,7 +740,8 @@ impl AppState {
         }
         // ~3.5 chars/token 估算比例，总占用以实测 total_usage 为主
         let est = |chars: usize| -> u64 { (chars as u64).div_ceil(4) };
-        let used_est = (est(user_chars) + est(asst_chars) + est(reason_chars) + est(tool_chars)).max(1);
+        let used_est =
+            (est(user_chars) + est(asst_chars) + est(reason_chars) + est(tool_chars)).max(1);
         let measured = self.total_usage.input_tokens + self.total_usage.output_tokens;
         let scale = if measured > 0 {
             measured as f64 / used_est as f64
@@ -858,11 +887,7 @@ impl AppState {
                         .and_then(Value::as_str)
                 {
                     let op = call.name.clone();
-                    if !self
-                        .touched_files
-                        .iter()
-                        .any(|f| f.path == p && f.op == op)
-                    {
+                    if !self.touched_files.iter().any(|f| f.path == p && f.op == op) {
                         self.touched_files.push(FileTouchRow {
                             path: p.to_string(),
                             op,
@@ -1009,11 +1034,7 @@ impl AppState {
                     && !err.contains("request aborted")
                 {
                     self.push_notice(NoticeLevel::Error, format!("请求失败：{err}"));
-                    emit_program_status(
-                        ProgramStatusState::Error,
-                        None,
-                        Some("Request failed"),
-                    );
+                    emit_program_status(ProgramStatusState::Error, None, Some("Request failed"));
                 }
                 self.refresh_context_breakdown();
             }
@@ -1072,6 +1093,103 @@ impl AppState {
                         Some(&format!("Approve {tool_name}")),
                     );
                     self.overlay.open_approval(tool_name, args_preview, tx);
+                }
+            }
+            UiEvent::CompactionStarted { trigger } => {
+                self.is_compacting = true;
+                let label = match trigger.as_str() {
+                    "manual" => "手动压缩中…",
+                    "overflow" => "溢出恢复压缩中…",
+                    "cold-cache" => "冷缓存整理中…",
+                    _ => "上下文压缩中…",
+                };
+                self.compaction_status = Some(label.to_string());
+            }
+            UiEvent::CompactionProgress { stage, delta_chars } => {
+                self.is_compacting = true;
+                let status = match stage.as_str() {
+                    "pruned" => "压缩中 · 已剪枝大输出".to_string(),
+                    "prefill" => "压缩中 · prefill…".to_string(),
+                    "transcript" => "压缩中 · 整理记录…".to_string(),
+                    "summary" => format!("压缩中 · 摘要 {delta_chars} 字"),
+                    other => format!("压缩中 · {other}"),
+                };
+                self.compaction_status = Some(status);
+            }
+            UiEvent::CompactionFinished {
+                outcome,
+                tokens_before,
+                tokens_after,
+                pruned_count,
+                first_kept_seq,
+                summary_preview,
+                message,
+                is_manual,
+            } => {
+                self.is_compacting = false;
+                self.compaction_status = None;
+                // 遵循 dsh-TUI 原则：total_usage 计费读数永不随压缩回退，仅刷新上下文占用视图
+                self.refresh_context_breakdown();
+
+                match outcome.as_str() {
+                    "pruned-only" => {
+                        let delta = match (tokens_before, tokens_after) {
+                            (Some(b), Some(a)) if b > a => {
+                                format!("，{} → {} tok（↓{}）", b, a, b - a)
+                            }
+                            _ => String::new(),
+                        };
+                        self.push_notice(
+                            NoticeLevel::Info,
+                            format!(
+                                "✓ 零模型剪枝完成：裁减 {pruned_count} 条大输出{delta}（原文保留，可用 recall_read 随时查阅）"
+                            ),
+                        );
+                    }
+                    "compacted" => {
+                        let kept_tag = first_kept_seq
+                            .map(|s| format!("保留自 #{s}"))
+                            .unwrap_or_else(|| "已折叠".to_string());
+                        let tok_tag = match (tokens_before, tokens_after) {
+                            (Some(b), Some(a)) => {
+                                let saved = b.saturating_sub(a);
+                                format!(" · {b} → {a} tok (↓{saved})")
+                            }
+                            _ => String::new(),
+                        };
+                        let prune_tag = if pruned_count > 0 {
+                            format!(" · 剪枝 {pruned_count} 条")
+                        } else {
+                            String::new()
+                        };
+                        let body = summary_preview
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("\n{s}"))
+                            .unwrap_or_default();
+                        self.push_notice(
+                            NoticeLevel::Info,
+                            format!("✓ 上下文压缩完成（{kept_tag}{tok_tag}{prune_tag}）{body}"),
+                        );
+                    }
+                    "skipped" => {
+                        if is_manual {
+                            let reason =
+                                message.unwrap_or_else(|| "当前历史较短，暂无可压缩段落".into());
+                            self.push_notice(NoticeLevel::Info, format!("跳过压缩：{reason}"));
+                        }
+                    }
+                    "failed" => {
+                        let err_msg = message.unwrap_or_else(|| "未知错误".into());
+                        if !err_msg.contains("request aborted") {
+                            self.push_notice(
+                                NoticeLevel::Warn,
+                                format!("上下文压缩失败：{err_msg}"),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1248,6 +1366,47 @@ impl AppState {
                     AppAction::ForkSessionAtSeq(seq)
                 }
             }
+            OverlayAction::UpdateSetting { key, value } => {
+                match key.as_str() {
+                    "ui.theme" => {
+                        if let Some(preset) = ThemePreset::parse(&value) {
+                            self.set_theme_preset(preset);
+                        }
+                    }
+                    "ui.showThinking" => {
+                        self.show_thinking = value == "true";
+                        self.item_cache.clear();
+                    }
+                    "ui.verboseExpanded" => {
+                        self.verbose_expanded = value == "true";
+                        self.item_cache.clear();
+                    }
+                    "ui.sidePanelOpen" => {
+                        self.side_panel.open = value == "true";
+                        self.item_cache.clear();
+                    }
+                    "ui.mouseCapture" => {
+                        self.mouse_capture_enabled = value == "true";
+                    }
+                    "ui.approvalMode" => {
+                        self.approval_mode = if value == "ask" {
+                            ApprovalMode::Ask
+                        } else {
+                            ApprovalMode::Auto
+                        };
+                    }
+                    "reasoningEffort" => {
+                        if value == "default" {
+                            self.reasoning_effort = None;
+                        } else if let Some(eff) = parse_effort(&value) {
+                            self.reasoning_effort = Some(eff);
+                        }
+                    }
+                    _ => {}
+                }
+                self.set_flash(format!("✓ 已更新 {key} = {value}"));
+                AppAction::ApplySetting { key, value }
+            }
             OverlayAction::ResolveApproval { decision } => {
                 if let Some(OverlayKind::Approval(mut ap)) = self.overlay.active.take() {
                     if decision == ApprovalDecision::AllowAlwaysForTool {
@@ -1274,7 +1433,12 @@ impl AppState {
     fn apply_effort(&mut self, effort: ReasoningEffort, with_notice: bool) {
         let changed = self.reasoning_effort != Some(effort);
         self.reasoning_effort = Some(effort);
-        if changed && matches!(effort, ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max) {
+        if changed
+            && matches!(
+                effort,
+                ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max
+            )
+        {
             self.effort_ignition_at = Some(Instant::now());
         }
         let label = format!("{effort:?}").to_lowercase();
@@ -1338,7 +1502,8 @@ impl AppState {
         if matches!(key.code, KeyCode::Char('c')) && ctrl {
             if self.selection.is_active()
                 && let Some(buf) = &self.last_buffer
-                && let Some(copied) = extract_selected_text(buf, &self.selection, &self.selection_geom)
+                && let Some(copied) =
+                    extract_selected_text(buf, &self.selection, &self.selection_geom)
             {
                 let _ = copy_to_clipboard(&copied);
                 let chars = copied.chars().count();
@@ -1360,7 +1525,7 @@ impl AppState {
                 self.last_ctrl_c_at = None;
                 return AppAction::None;
             }
-            if self.is_busy || self.is_bash_running {
+            if self.is_busy || self.is_bash_running || self.is_compacting {
                 return AppAction::CancelRun;
             }
             let double_press = self
@@ -1470,7 +1635,7 @@ impl AppState {
                     self.selection.clear();
                     return AppAction::None;
                 }
-                if self.is_busy || self.is_bash_running {
+                if self.is_busy || self.is_bash_running || self.is_compacting {
                     return AppAction::CancelRun;
                 }
                 if !self.input.is_empty() {
@@ -1798,6 +1963,8 @@ impl AppState {
         self.anomalies.clear();
         self.queued_prompts.clear();
         self.is_bash_running = false;
+        self.is_compacting = false;
+        self.compaction_status = None;
         self.always_allowed_tools.clear();
         self.reveal.clear();
         self.selection.clear();
@@ -2066,6 +2233,7 @@ impl AppState {
                 self.overlay.open_help();
                 AppAction::None
             }
+            "settings" | "config" => AppAction::OpenSettings(arg.map(ToString::to_string)),
             "tools" => AppAction::ShowTools,
             "mcp" => AppAction::ShowMcp,
             "skills" => match arg {
@@ -2165,10 +2333,7 @@ impl AppState {
             },
             "clear" | "new" => {
                 if self.is_busy {
-                    self.push_notice(
-                        NoticeLevel::Warn,
-                        "请先按 Esc 中断当前任务再开启新会话",
-                    );
+                    self.push_notice(NoticeLevel::Warn, "请先按 Esc 中断当前任务再开启新会话");
                     AppAction::None
                 } else {
                     AppAction::NewSession
@@ -2177,7 +2342,11 @@ impl AppState {
             "thinking" => {
                 self.show_thinking = !self.show_thinking;
                 self.item_cache.clear();
-                let state = if self.show_thinking { "开启" } else { "隐藏" };
+                let state = if self.show_thinking {
+                    "开启"
+                } else {
+                    "隐藏"
+                };
                 self.push_notice(NoticeLevel::Info, format!("思考过程显示已{state}"));
                 AppAction::None
             }
@@ -2205,6 +2374,17 @@ impl AppState {
                 }
             },
             "stats" => AppAction::ShowStats,
+            "compact" => {
+                if self.is_busy || self.is_bash_running || self.is_compacting {
+                    self.push_notice(
+                        NoticeLevel::Warn,
+                        "当前已有任务或压缩正在运行，请先等待完成或按 Esc 取消后再执行 /compact",
+                    );
+                    AppAction::None
+                } else {
+                    AppAction::CompactSession(arg.map(ToString::to_string))
+                }
+            }
             "export" => AppAction::ExportTrajectory(arg.map(PathBuf::from)),
             _ => AppAction::None,
         }
@@ -2219,6 +2399,8 @@ fn is_builtin_slash_cmd(cmd: &str) -> bool {
             | "q"
             | "help"
             | "h"
+            | "settings"
+            | "config"
             | "tools"
             | "mcp"
             | "skills"
@@ -2229,6 +2411,7 @@ fn is_builtin_slash_cmd(cmd: &str) -> bool {
             | "model"
             | "effort"
             | "stats"
+            | "compact"
             | "export"
             | "trace"
             | "tree"
@@ -2248,7 +2431,8 @@ fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
         let mut refs = Vec::new();
         for line in text.lines() {
             let trimmed = line.trim();
-            if (trimmed.starts_with("<attached-file ") || trimmed.starts_with("<attached-directory "))
+            if (trimmed.starts_with("<attached-file ")
+                || trimmed.starts_with("<attached-directory "))
                 && let Some(p_start) = trimmed.find("path=\"")
             {
                 let after = &trimmed[p_start + 6..];
@@ -2282,7 +2466,10 @@ fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
             }
         }
         return if paths.is_empty() {
-            format!("[{source}] {}", truncate_display(&text.replace('\n', " "), 96))
+            format!(
+                "[{source}] {}",
+                truncate_display(&text.replace('\n', " "), 96)
+            )
         } else {
             format!("[{source}] 已加载指令：{}", paths.join(", "))
         };
@@ -3256,8 +3443,7 @@ mod tests {
             Some(OverlayKind::FileMention { matches, .. }) => matches
                 .iter()
                 .position(|c| {
-                    c.path == "src/"
-                        && c.kind == crate::mentions::MentionCandidateKind::Directory
+                    c.path == "src/" && c.kind == crate::mentions::MentionCandidateKind::Directory
                 })
                 .expect("expected src/ directory candidate"),
             _ => panic!("expected FileMention overlay"),
@@ -3590,5 +3776,131 @@ mod tests {
                 .iter()
                 .all(|it| !matches!(it, ChatItem::User { .. }))
         );
+    }
+
+    #[test]
+    fn compact_slash_command_esc_cancel_and_usage_preservation() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-compact-ui",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::Usage(TokenUsage {
+            input_tokens: 1_200,
+            output_tokens: 300,
+            total_tokens: Some(1_500),
+            ..TokenUsage::default()
+        }));
+
+        // 1. `/compact 保留重构决策` -> CompactSession(Some(...))
+        app.input.set_text_end("/compact 保留重构决策");
+        let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(act, AppAction::CompactSession(Some("保留重构决策".into())));
+
+        // 2. 压缩中状态更新 + Esc 中断
+        app.apply_ui_event(UiEvent::CompactionStarted {
+            trigger: "manual".into(),
+        });
+        assert!(app.is_compacting);
+        app.apply_ui_event(UiEvent::CompactionProgress {
+            stage: "summary".into(),
+            delta_chars: 180,
+        });
+        assert!(
+            app.compaction_status
+                .as_deref()
+                .is_some_and(|s| s.contains("180"))
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::CancelRun
+        );
+
+        // 3. 压缩完成后清状态、展示摘要通知，且计费 total_usage 不回退
+        app.apply_ui_event(UiEvent::CompactionFinished {
+            outcome: "compacted".into(),
+            tokens_before: Some(12_000),
+            tokens_after: Some(2_400),
+            pruned_count: 2,
+            first_kept_seq: Some(10),
+            summary_preview: Some("已完成核心重构".into()),
+            message: None,
+            is_manual: true,
+        });
+        assert!(!app.is_compacting);
+        assert!(app.compaction_status.is_none());
+        assert_eq!(app.total_usage.input_tokens, 1_200);
+        assert_eq!(app.total_usage.output_tokens, 300);
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            ChatItem::Notice { text, .. } if text.contains("保留自 #10") && text.contains("已完成核心重构")
+        )));
+    }
+
+    #[test]
+    fn settings_slash_command_and_modal_live_toggle_work() {
+        use crate::overlay::{SettingEntry, SettingItemKind};
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-settings-ui",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        // 1. `/settings 压缩` 触发 OpenSettings(Some("压缩"))
+        app.input.set_text_end("/settings 压缩");
+        let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(act, AppAction::OpenSettings(Some("压缩".into())));
+
+        // 2. 打开设置浮层后按 Enter 切换第一项并保持浮层展开
+        app.overlay.open_settings(
+            vec![
+                SettingEntry {
+                    key: "ui.showThinking".into(),
+                    category: "界面".into(),
+                    label: "显示思考过程".into(),
+                    description: "开关推理块".into(),
+                    kind: SettingItemKind::Toggle { value: true },
+                },
+                SettingEntry {
+                    key: "compaction.autoPrune".into(),
+                    category: "压缩".into(),
+                    label: "L1 零模型剪枝".into(),
+                    description: "自动剪枝".into(),
+                    kind: SettingItemKind::Toggle { value: true },
+                },
+            ],
+            None,
+            "~/.mizar/settings.json".into(),
+        );
+        assert!(app.overlay.is_modal());
+        assert!(app.show_thinking);
+
+        let toggle_act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            toggle_act,
+            AppAction::ApplySetting {
+                key: "ui.showThinking".into(),
+                value: "false".into(),
+            }
+        );
+        assert!(!app.show_thinking);
+        assert!(
+            app.overlay.is_open(),
+            "settings modal should stay open after toggle"
+        );
+
+        // 3. 输入关键词过滤后按一次 Esc 清空过滤，再按一次 Esc 关闭浮层
+        let _ = app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let _ = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlay.is_open());
+        let _ = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.overlay.is_open());
     }
 }

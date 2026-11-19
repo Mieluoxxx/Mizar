@@ -365,11 +365,13 @@ pub struct ToolLoadoutChanges {
     pub hidden_declarations: Vec<String>,
 }
 
-pub type PrepareLoadoutFn =
-    Arc<dyn Fn(&ToolLoadout) -> Option<ToolLoadoutChanges> + Send + Sync>;
+pub type PrepareLoadoutFn = Arc<dyn Fn(&ToolLoadout) -> Option<ToolLoadoutChanges> + Send + Sync>;
 
-pub type ToolRichExecFn =
-    Arc<dyn Fn(Value, ToolCallContext) -> BoxFuture<'static, Result<ToolOutput, BoxError>> + Send + Sync>;
+pub type ToolRichExecFn = Arc<
+    dyn Fn(Value, ToolCallContext) -> BoxFuture<'static, Result<ToolOutput, BoxError>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct ToolDefinition {
@@ -417,8 +419,9 @@ impl ToolDefinition {
         E: Into<BoxError>,
     {
         Self::async_rich_tool(name, description, parameters, move |args, call_ctx| {
-            let res: Result<ToolOutput, BoxError> =
-                execute(args, call_ctx.exec).map(ToolOutput::text).map_err(Into::into);
+            let res: Result<ToolOutput, BoxError> = execute(args, call_ctx.exec)
+                .map(ToolOutput::text)
+                .map_err(Into::into);
             async move { res }
         })
     }
@@ -582,8 +585,10 @@ impl ToolState {
         if let Some(include) = &self.include_patterns {
             return include.iter().any(|p| wildcard_matches(p, &tool.name));
         }
-        tool.default_active
-            .unwrap_or(matches!(tool.exposure, ToolExposure::Direct | ToolExposure::ModelOnly))
+        tool.default_active.unwrap_or(matches!(
+            tool.exposure,
+            ToolExposure::Direct | ToolExposure::ModelOnly
+        ))
     }
 
     fn resolve_active_defs(&self, session_id: Option<&str>) -> Vec<ToolDefinition> {
@@ -810,6 +815,21 @@ impl ToolRuntime {
         added
     }
 
+    /// 重置指定会话的动态激活/显式工具集（常用于上下文压缩边界清理旧阶段按需激活的延迟工具）。
+    /// 返回是否实际清除了会话级状态。
+    pub fn reset_session_activations(&self, session_id: &str) -> bool {
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            let a = st.session_added.remove(session_id).is_some();
+            let b = st.session_explicit.remove(session_id).is_some();
+            a || b
+        };
+        if changed {
+            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        }
+        changed
+    }
+
     /// 给模型看的工具清单（无特定会话上下文时返回默认声明集）。
     pub fn list(&self) -> Vec<ToolSchema> {
         self.list_declared(None)
@@ -828,7 +848,8 @@ impl ToolRuntime {
             let st = self.state.lock().unwrap();
             let active_defs = st.resolve_active_defs(session_id);
             let callable = st.resolve_callable_infos(&active_defs);
-            let registered: Vec<ToolRuntimeInfo> = st.tools.iter().map(ToolDefinition::info).collect();
+            let registered: Vec<ToolRuntimeInfo> =
+                st.tools.iter().map(ToolDefinition::info).collect();
             (active_defs, callable, registered)
         };
 
@@ -909,7 +930,8 @@ impl ToolRuntime {
     }
 
     pub async fn execute(self: &Arc<Self>, exec: ToolExecution) -> ToolResult {
-        self.execute_with(exec, CancellationToken::new(), None).await
+        self.execute_with(exec, CancellationToken::new(), None)
+            .await
     }
 
     pub async fn execute_with(
@@ -1071,8 +1093,10 @@ mod tests {
 
         let _c1 = tools
             .register(
-                ToolDefinition::sync_tool("read", "read file", json!({}), |_, _| Ok::<_, BoxError>("text".into()))
-                    .with_execution_mode(ToolExecutionMode::Parallel),
+                ToolDefinition::sync_tool("read", "read file", json!({}), |_, _| {
+                    Ok::<_, BoxError>("text".into())
+                })
+                .with_execution_mode(ToolExecutionMode::Parallel),
             )
             .unwrap();
         let _c2 = tools
@@ -1091,8 +1115,12 @@ mod tests {
                 .with_exposure(ToolExposure::ModelOnly)
                 .with_prepare_loadout(|loadout| {
                     let mut descriptions = HashMap::new();
-                    let names: Vec<&str> = loadout.callable.iter().map(|t| t.name.as_str()).collect();
-                    descriptions.insert("codemode".to_string(), format!("callable: {}", names.join(",")));
+                    let names: Vec<&str> =
+                        loadout.callable.iter().map(|t| t.name.as_str()).collect();
+                    descriptions.insert(
+                        "codemode".to_string(),
+                        format!("callable: {}", names.join(",")),
+                    );
                     Some(ToolLoadoutChanges {
                         descriptions,
                         hidden_declarations: Vec::new(),
@@ -1111,7 +1139,10 @@ mod tests {
         assert_eq!(newly, vec!["mcp_secret".to_string()]);
         let declared_after = tools.list_declared(Some("s1"));
         assert_eq!(
-            declared_after.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            declared_after
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["read", "codemode", "mcp_secret"]
         );
 

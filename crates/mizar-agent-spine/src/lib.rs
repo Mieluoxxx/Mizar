@@ -7,18 +7,30 @@ pub mod config;
 
 use std::path::PathBuf;
 
+#[cfg(feature = "router")]
+pub use config::ResolvedLlmRouter;
+pub use config::{
+    CONFIG_DIR_NAME, CodemodeSettings, CompactionSettings, EnvLlmOverride, InstructionsSettings,
+    LoadedMizarConfig, RecallSettings, SettingsConfig, SkillsSettings, ToolSearchSettings,
+    UiSettings, load_mizar_config, load_mizar_config_with_global, patch_settings_file,
+    resolve_default_session_db_path, resolve_global_config_dir, resolve_global_settings_path,
+    resolve_project_config_dir,
+};
+#[cfg(feature = "compaction")]
+pub use mizar_compaction::{
+    CompactionConfig, CompactionContextExt, CompactionEndEvent, CompactionError, CompactionOutcome,
+    CompactionProgressEvent, CompactionReport, CompactionRuntime, CompactionStartEvent,
+    CompactionTrigger, ContextPressureReport, EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS,
+    EVENT_COMPACTION_START, ManualCompactOptions, strip_summary_wrapper,
+};
 #[cfg(feature = "coding")]
 pub use mizar_instructions::{
     AGENT_INSTRUCTIONS_SOURCE, AgentInstructions, InstructionScopeKind, InstructionScopeStatus,
     InstructionsConfig, InstructionsContextExt, SessionInstructionsReport,
 };
-#[cfg(feature = "router")]
-pub use config::ResolvedLlmRouter;
-pub use config::{
-    CONFIG_DIR_NAME, CodemodeSettings, EnvLlmOverride, InstructionsSettings, LoadedMizarConfig,
-    SettingsConfig, SkillsSettings, ToolSearchSettings, load_mizar_config,
-    load_mizar_config_with_global, resolve_default_session_db_path, resolve_global_config_dir,
-    resolve_project_config_dir,
+#[cfg(feature = "compaction")]
+pub use mizar_recall::{
+    RECALL_READ_TOOL_NAME, RECALL_SEARCH_TOOL_NAME, RecallConfig, RecallPlugin,
 };
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin, Service};
@@ -85,6 +97,12 @@ pub struct AgentSpineConfig {
     /// 是否启用重复工具调用守卫（默认开启）。
     #[cfg(feature = "trajectory")]
     pub repeat_guard: Option<RepeatGuardConfig>,
+    /// 是否启用四级上下文压缩与压后工具守卫服务（默认开启）。
+    #[cfg(feature = "compaction")]
+    pub compaction: Option<CompactionConfig>,
+    /// 是否启用无损情景回溯工具（`recall_search` / `recall_read`，默认开启且按需自动激活）。
+    #[cfg(feature = "compaction")]
+    pub recall: Option<RecallConfig>,
     /// 可选：会话 SQLite 持久化数据库路径；为 `None` 时保持纯内存模式（适合测试）。
     pub session_db_path: Option<PathBuf>,
 }
@@ -107,6 +125,10 @@ impl AgentSpineConfig {
             trajectory: Some(TrajectoryConfig::default()),
             #[cfg(feature = "trajectory")]
             repeat_guard: Some(RepeatGuardConfig::default()),
+            #[cfg(feature = "compaction")]
+            compaction: Some(CompactionConfig::default()),
+            #[cfg(feature = "compaction")]
+            recall: Some(RecallConfig::default()),
             session_db_path: None,
         }
     }
@@ -134,6 +156,10 @@ impl AgentSpineConfig {
             trajectory: Some(TrajectoryConfig::default()),
             #[cfg(feature = "trajectory")]
             repeat_guard: Some(RepeatGuardConfig::default()),
+            #[cfg(feature = "compaction")]
+            compaction: Some(CompactionConfig::default()),
+            #[cfg(feature = "compaction")]
+            recall: Some(RecallConfig::default()),
             session_db_path: None,
         }
     }
@@ -197,6 +223,14 @@ impl Plugin for AgentSpinePlugin {
                 },
             )?;
 
+            // 在 `instructions` / `skills` / `recall` 之前挂载 `CompactionRuntime`：
+            // 使同一次 `agent/pre-step` 中先完成压缩推进 `compacted_up_to_seq`，
+            // 随后指令、技能与回溯工具立即可见新压缩边界并当步完成重注/激活。
+            #[cfg(feature = "compaction")]
+            if let Some(compaction_cfg) = config.compaction {
+                ctx.try_plugin(CompactionRuntime::plugin(), compaction_cfg)?;
+            }
+
             match config.tools_mode {
                 AgentToolsMode::None => {
                     let _ = config.workspace;
@@ -223,6 +257,11 @@ impl Plugin for AgentSpinePlugin {
                     ctx.try_plugin(SkillsPlugin, skills)?;
                     ctx.try_plugin(AgentInstructions::plugin(), instructions)?;
                 }
+            }
+
+            #[cfg(feature = "compaction")]
+            if let Some(recall_cfg) = config.recall {
+                ctx.try_plugin(RecallPlugin, recall_cfg)?;
             }
 
             if config.include_tools.is_some() || !config.exclude_tools.is_empty() {

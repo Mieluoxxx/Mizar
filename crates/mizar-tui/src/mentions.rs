@@ -253,6 +253,7 @@ pub fn register_mention_hook(
                                 | SessionEvent::Assistant { .. }
                                 | SessionEvent::ToolResult { .. }
                                 | SessionEvent::Compaction { .. }
+                                | SessionEvent::ToolResultPrune { .. }
                                 | SessionEvent::BashExecution { .. }
                                 | SessionEvent::Trace { .. } => break,
                             }

@@ -3,12 +3,14 @@
 use std::sync::mpsc;
 
 use mizar_session::{
-    LoadedSession, PersistenceError, PersistenceResult, SESSION_FORMAT_VERSION, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
+    SESSION_FORMAT_VERSION, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
+    SessionListQuery,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::oneshot;
 
+use crate::recall::{index_entry_in_tx, index_session_events_in_tx, search_recall_from_conn};
 use crate::schema::{
     list_sessions_from_conn, load_session_from_conn, map_sqlite_err, millis_to_i64, visibility_str,
 };
@@ -57,6 +59,10 @@ pub enum WriteCmd {
         query: SessionListQuery,
         reply: mpsc::SyncSender<PersistenceResult<Vec<SessionHeader>>>,
     },
+    SearchRecall {
+        query: RecallSearchQuery,
+        reply: mpsc::SyncSender<PersistenceResult<Vec<RecallSearchHit>>>,
+    },
     Flush(BarrierReply),
     Shutdown(mpsc::SyncSender<PersistenceResult<()>>),
 }
@@ -67,6 +73,7 @@ fn stops_batch_collection(cmd: &WriteCmd) -> bool {
         WriteCmd::ForkSession { .. }
             | WriteCmd::LoadSession { .. }
             | WriteCmd::ListSessions { .. }
+            | WriteCmd::SearchRecall { .. }
             | WriteCmd::Shutdown(_)
     )
 }
@@ -142,6 +149,13 @@ pub fn run_writer_loop(mut conn: Connection, rx: mpsc::Receiver<WriteCmd>) {
                 WriteCmd::ListSessions { query, reply } => {
                     let res = match write_res {
                         Ok(()) => list_sessions_from_conn(&conn, &query),
+                        Err(err) => Err(err),
+                    };
+                    let _ = reply.send(res);
+                }
+                WriteCmd::SearchRecall { query, reply } => {
+                    let res = match write_res {
+                        Ok(()) => search_recall_from_conn(&conn, &query),
                         Err(err) => Err(err),
                     };
                     let _ = reply.send(res);
@@ -228,7 +242,11 @@ fn append_entries_in_tx(
             )
             .map_err(map_sqlite_err)?;
         ensure
-            .execute(params![session_id, i64::from(SESSION_FORMAT_VERSION), first_ts])
+            .execute(params![
+                session_id,
+                i64::from(SESSION_FORMAT_VERSION),
+                first_ts
+            ])
             .map_err(map_sqlite_err)?;
     }
 
@@ -270,6 +288,7 @@ fn append_entries_in_tx(
                         max_compacted.map_or(*first_kept_seq, |prev| prev.max(*first_kept_seq)),
                     );
                 }
+                index_entry_in_tx(tx, session_id, entry)?;
             }
         }
     }
@@ -375,6 +394,8 @@ fn exec_fork(
         [&new_header.id],
     )
     .map_err(map_sqlite_err)?;
+
+    index_session_events_in_tx(&tx, &new_header.id)?;
 
     let loaded = load_session_from_conn(&tx, &new_header.id)?
         .ok_or_else(|| PersistenceError::NotFound(new_header.id.clone()))?;

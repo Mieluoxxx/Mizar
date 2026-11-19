@@ -8,9 +8,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use mizar_llm_types::{ProviderInfo, ReasoningEffort};
 use futures::channel::oneshot;
 use ignore::WalkBuilder;
+use mizar_llm_types::{ProviderInfo, ReasoningEffort};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -38,6 +38,11 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
             takes_arg: false,
         },
         SlashEntry {
+            command: "settings".into(),
+            description: "打开交互式配置面板（实时生效并自动保存）".into(),
+            takes_arg: false,
+        },
+        SlashEntry {
             command: "model".into(),
             description: "交互切换模型 / Provider (Ctrl+L)".into(),
             takes_arg: true,
@@ -45,6 +50,11 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
         SlashEntry {
             command: "effort".into(),
             description: "调整思考强度 (Tab 切换 / off..max)".into(),
+            takes_arg: true,
+        },
+        SlashEntry {
+            command: "compact".into(),
+            description: "手动压缩当前会话上下文（可附聚焦说明）".into(),
             takes_arg: true,
         },
         SlashEntry {
@@ -333,16 +343,11 @@ fn expand_home_dir_prefix(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn list_path_candidates(
-    workspace: &Path,
-    query: &str,
-    limit: usize,
-) -> Vec<MentionCandidate> {
+fn list_path_candidates(workspace: &Path, query: &str, limit: usize) -> Vec<MentionCandidate> {
     let normalized = query.replace('\\', "/");
     let raw_slash = query.rfind(['/', '\\']);
     let slash = normalized.rfind('/');
-    let bare_dir =
-        slash.is_none() && matches!(normalized.as_str(), "." | ".." | "~");
+    let bare_dir = slash.is_none() && matches!(normalized.as_str(), "." | ".." | "~");
 
     let dir_part = if bare_dir {
         format!("{normalized}/")
@@ -360,7 +365,11 @@ fn list_path_candidates(
         String::new()
     };
 
-    let display_sep = if display_dir.ends_with('\\') { '\\' } else { '/' };
+    let display_sep = if display_dir.ends_with('\\') {
+        '\\'
+    } else {
+        '/'
+    };
     let name_query = if bare_dir {
         ""
     } else if let Some(pos) = slash {
@@ -473,6 +482,62 @@ pub struct ModelPickerItem {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingItemKind {
+    Toggle {
+        value: bool,
+    },
+    Choice {
+        options: Vec<String>,
+        selected: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingEntry {
+    pub key: String,
+    pub category: String,
+    pub label: String,
+    pub description: String,
+    pub kind: SettingItemKind,
+}
+
+impl SettingEntry {
+    pub fn display_value(&self) -> String {
+        match &self.kind {
+            SettingItemKind::Toggle { value } => {
+                if *value {
+                    "● ON".to_string()
+                } else {
+                    "○ OFF".to_string()
+                }
+            }
+            SettingItemKind::Choice { options, selected } => options
+                .get(*selected)
+                .map(|v| format!("◂ {v} ▸"))
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn step_value(&mut self, delta: isize) -> String {
+        match &mut self.kind {
+            SettingItemKind::Toggle { value } => {
+                *value = !*value;
+                if *value { "true" } else { "false" }.to_string()
+            }
+            SettingItemKind::Choice { options, selected } => {
+                if options.is_empty() {
+                    return String::new();
+                }
+                let len = options.len() as isize;
+                let next = ((*selected as isize + delta).rem_euclid(len)) as usize;
+                *selected = next;
+                options[next].clone()
+            }
+        }
+    }
+}
+
 pub enum OverlayKind {
     SlashComplete {
         token_start: usize,
@@ -518,6 +583,12 @@ pub enum OverlayKind {
     HelpModal {
         scroll: usize,
     },
+    SettingsModal {
+        items: Vec<SettingEntry>,
+        query: String,
+        selected: usize,
+        save_path_hint: String,
+    },
     Approval(PendingApproval),
 }
 
@@ -547,6 +618,10 @@ pub enum OverlayAction {
     ApplyHistory(String),
     InsertSkillSlash(String),
     ForkSessionAtSeq(u64),
+    UpdateSetting {
+        key: String,
+        value: String,
+    },
     ResolveApproval {
         decision: ApprovalDecision,
     },
@@ -571,6 +646,7 @@ impl OverlayState {
                     | OverlayKind::SkillPicker { .. }
                     | OverlayKind::SessionTree { .. }
                     | OverlayKind::HelpModal { .. }
+                    | OverlayKind::SettingsModal { .. }
                     | OverlayKind::Approval(_)
             )
         )
@@ -597,7 +673,11 @@ impl OverlayState {
             }
         }
         let selected = current_model
-            .and_then(|cur| items.iter().position(|it| it.model_id == cur || it.label == cur))
+            .and_then(|cur| {
+                items
+                    .iter()
+                    .position(|it| it.model_id == cur || it.label == cur)
+            })
             .unwrap_or(0);
         self.active = Some(OverlayKind::ModelPicker {
             items,
@@ -655,7 +735,26 @@ impl OverlayState {
         self.active = Some(OverlayKind::HelpModal { scroll: 0 });
     }
 
-    pub fn open_approval(&mut self, tool_name: String, args_preview: String, responder: oneshot::Sender<ApprovalDecision>) {
+    pub fn open_settings(
+        &mut self,
+        items: Vec<SettingEntry>,
+        initial_query: Option<String>,
+        save_path_hint: String,
+    ) {
+        self.active = Some(OverlayKind::SettingsModal {
+            items,
+            query: initial_query.unwrap_or_default(),
+            selected: 0,
+            save_path_hint,
+        });
+    }
+
+    pub fn open_approval(
+        &mut self,
+        tool_name: String,
+        args_preview: String,
+        responder: oneshot::Sender<ApprovalDecision>,
+    ) {
         self.active = Some(OverlayKind::Approval(PendingApproval {
             tool_name,
             args_preview,
@@ -691,11 +790,13 @@ impl OverlayState {
                         }
                         Some(OverlayAction::None)
                     }
-                    KeyCode::Tab => entries.get(*selected).map(|e| OverlayAction::CompleteSlash {
-                        token_start: *token_start,
-                        command: e.command.clone(),
-                        execute_now: false,
-                    }),
+                    KeyCode::Tab => entries
+                        .get(*selected)
+                        .map(|e| OverlayAction::CompleteSlash {
+                            token_start: *token_start,
+                            command: e.command.clone(),
+                            execute_now: false,
+                        }),
                     KeyCode::Enter
                         if key.modifiers == KeyModifiers::NONE && !entries.is_empty() =>
                     {
@@ -751,7 +852,10 @@ impl OverlayState {
                     .iter()
                     .filter(|it| {
                         query.is_empty()
-                            || it.label.to_ascii_lowercase().contains(&query.to_ascii_lowercase())
+                            || it
+                                .label
+                                .to_ascii_lowercase()
+                                .contains(&query.to_ascii_lowercase())
                     })
                     .collect();
                 match key.code {
@@ -766,10 +870,14 @@ impl OverlayState {
                         }
                         Some(OverlayAction::None)
                     }
-                    KeyCode::Enter => filtered.get(*selected).map(|it| OverlayAction::SelectModel {
-                        provider: it.provider_id.clone(),
-                        model: it.model_id.clone(),
-                    }),
+                    KeyCode::Enter => {
+                        filtered
+                            .get(*selected)
+                            .map(|it| OverlayAction::SelectModel {
+                                provider: it.provider_id.clone(),
+                                model: it.model_id.clone(),
+                            })
+                    }
                     KeyCode::Backspace => {
                         query.pop();
                         *selected = 0;
@@ -950,6 +1058,82 @@ impl OverlayState {
                 }
                 _ => Some(OverlayAction::None),
             },
+            OverlayKind::SettingsModal {
+                items,
+                query,
+                selected,
+                ..
+            } => {
+                let filtered_indices = filter_setting_indices(items, query);
+                match key.code {
+                    KeyCode::Esc => {
+                        if !query.is_empty() {
+                            query.clear();
+                            *selected = 0;
+                            Some(OverlayAction::None)
+                        } else {
+                            Some(OverlayAction::Close)
+                        }
+                    }
+                    KeyCode::Up => {
+                        *selected = selected.saturating_sub(1);
+                        Some(OverlayAction::None)
+                    }
+                    KeyCode::Down => {
+                        if !filtered_indices.is_empty() {
+                            *selected = (*selected + 1).min(filtered_indices.len() - 1);
+                        }
+                        Some(OverlayAction::None)
+                    }
+                    KeyCode::Left => {
+                        if let Some(&item_idx) = filtered_indices.get(*selected) {
+                            let item = &mut items[item_idx];
+                            let value = item.step_value(-1);
+                            Some(OverlayAction::UpdateSetting {
+                                key: item.key.clone(),
+                                value,
+                            })
+                        } else {
+                            Some(OverlayAction::None)
+                        }
+                    }
+                    KeyCode::Right | KeyCode::Enter => {
+                        if let Some(&item_idx) = filtered_indices.get(*selected) {
+                            let item = &mut items[item_idx];
+                            let value = item.step_value(1);
+                            Some(OverlayAction::UpdateSetting {
+                                key: item.key.clone(),
+                                value,
+                            })
+                        } else {
+                            Some(OverlayAction::None)
+                        }
+                    }
+                    KeyCode::Char(' ') if query.is_empty() => {
+                        if let Some(&item_idx) = filtered_indices.get(*selected) {
+                            let item = &mut items[item_idx];
+                            let value = item.step_value(1);
+                            Some(OverlayAction::UpdateSetting {
+                                key: item.key.clone(),
+                                value,
+                            })
+                        } else {
+                            Some(OverlayAction::None)
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *selected = 0;
+                        Some(OverlayAction::None)
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        *selected = 0;
+                        Some(OverlayAction::None)
+                    }
+                    _ => Some(OverlayAction::None),
+                }
+            }
             OverlayKind::Approval(ap) => {
                 if ap.editing_reason {
                     match key.code {
@@ -978,9 +1162,11 @@ impl OverlayState {
                     }
                 } else {
                     match key.code {
-                        KeyCode::Char('y') | KeyCode::Enter => Some(OverlayAction::ResolveApproval {
-                            decision: ApprovalDecision::AllowOnce,
-                        }),
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            Some(OverlayAction::ResolveApproval {
+                                decision: ApprovalDecision::AllowOnce,
+                            })
+                        }
                         KeyCode::Char('a') => Some(OverlayAction::ResolveApproval {
                             decision: ApprovalDecision::AllowAlwaysForTool,
                         }),
@@ -1017,9 +1203,7 @@ impl OverlayState {
                         let idx = *idx;
                         return match active {
                             OverlayKind::SlashComplete {
-                                token_start,
-                                query,
-                                ..
+                                token_start, query, ..
                             } => {
                                 let list = filter_slash(skill_names, query);
                                 list.get(idx).map(|e| OverlayAction::CompleteSlash {
@@ -1058,9 +1242,10 @@ impl OverlayState {
                                     model: it.model_id.clone(),
                                 })
                             }
-                            OverlayKind::EffortPicker { .. } => {
-                                all_efforts().get(idx).copied().map(OverlayAction::SelectEffort)
-                            }
+                            OverlayKind::EffortPicker { .. } => all_efforts()
+                                .get(idx)
+                                .copied()
+                                .map(OverlayAction::SelectEffort),
                             OverlayKind::ThemePicker { .. } => ThemePreset::all()
                                 .get(idx)
                                 .copied()
@@ -1101,6 +1286,25 @@ impl OverlayState {
                                     _ => ApprovalDecision::Deny,
                                 };
                                 Some(OverlayAction::ResolveApproval { decision })
+                            }
+                            OverlayKind::SettingsModal {
+                                items,
+                                query,
+                                selected,
+                                ..
+                            } => {
+                                let filtered_indices = filter_setting_indices(items, query);
+                                if let Some(&item_idx) = filtered_indices.get(idx) {
+                                    *selected = idx;
+                                    let item = &mut items[item_idx];
+                                    let value = item.step_value(1);
+                                    Some(OverlayAction::UpdateSetting {
+                                        key: item.key.clone(),
+                                        value,
+                                    })
+                                } else {
+                                    None
+                                }
                             }
                             OverlayKind::HelpModal { .. } => None,
                         };
@@ -1158,6 +1362,167 @@ fn filter_history(history: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
+fn filter_setting_indices(items: &[SettingEntry], query: &str) -> Vec<usize> {
+    let q = query.trim().to_ascii_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            q.is_empty()
+                || item.key.to_ascii_lowercase().contains(&q)
+                || item.category.to_ascii_lowercase().contains(&q)
+                || item.label.to_ascii_lowercase().contains(&q)
+                || item.description.to_ascii_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_settings_modal(
+    frame: &mut Frame<'_>,
+    full_area: Rect,
+    items: &[SettingEntry],
+    query: &str,
+    selected: usize,
+    save_path_hint: &str,
+    theme: &Theme,
+    state: &mut OverlayState,
+) {
+    let filtered = filter_setting_indices(items, query);
+    let box_w = full_area.width.saturating_sub(4).clamp(44, 86);
+    let box_h = full_area.height.saturating_sub(4).clamp(11, 22);
+    let x = full_area.x + (full_area.width.saturating_sub(box_w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(box_h)) / 2;
+    let rect = Rect::new(x, y, box_w, box_h);
+
+    frame.render_widget(Clear, rect);
+    let title = if query.is_empty() {
+        " ⚙ 设置中心 (/settings · ↑↓ 移动 · ←/→/Enter 切换 · Esc 关闭) ".to_string()
+    } else {
+        format!(" ⚙ 设置中心 [过滤: {query}] (Esc 清空过滤) ")
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focus))
+        .style(Style::default().bg(theme.panel_bg));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    state.last_box = Some(rect);
+
+    if inner.height < 4 || inner.width < 16 {
+        return;
+    }
+
+    // 底部预留 3 行（分割线 + 当前项说明 + 保存路径提示）
+    let list_h = (inner.height as usize).saturating_sub(3).max(1);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner.height as usize);
+
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (没有匹配的配置项)",
+            Style::default().fg(theme.text_dim),
+        )));
+        while lines.len() < list_h {
+            lines.push(Line::default());
+        }
+    } else {
+        let sel = selected.min(filtered.len() - 1);
+        let start = sel
+            .saturating_sub(list_h / 2)
+            .min(filtered.len().saturating_sub(list_h));
+        let end = (start + list_h).min(filtered.len());
+
+        for (offset, &item_idx) in filtered[start..end].iter().enumerate() {
+            let abs = start + offset;
+            let is_sel = abs == sel;
+            let item = &items[item_idx];
+            let row_rect = Rect::new(inner.x, inner.y + offset as u16, inner.width, 1);
+            state.item_rects.push((abs, row_rect));
+
+            let bg = if is_sel {
+                theme.card_bg_alt
+            } else {
+                theme.panel_bg
+            };
+            let ptr = if is_sel { "▸ " } else { "  " };
+            let cat_tag = format!("[{}] ", item.category);
+            let val_str = item.display_value();
+            let val_style = match &item.kind {
+                SettingItemKind::Toggle { value: true } => Style::default()
+                    .fg(theme.success)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+                SettingItemKind::Toggle { value: false } => {
+                    Style::default().fg(theme.text_dim).bg(bg)
+                }
+                SettingItemKind::Choice { .. } => Style::default()
+                    .fg(theme.accent)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            };
+
+            let left_w = 2 + display_width(&cat_tag) + display_width(&item.label);
+            let right_w = display_width(&val_str) + 1;
+            let pad = (inner.width as usize)
+                .saturating_sub(left_w + right_w)
+                .max(2);
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    ptr,
+                    Style::default()
+                        .fg(if is_sel { theme.accent } else { theme.text_dim })
+                        .bg(bg),
+                ),
+                Span::styled(cat_tag, Style::default().fg(theme.info).bg(bg)),
+                Span::styled(
+                    item.label.clone(),
+                    Style::default()
+                        .fg(if is_sel { theme.accent } else { theme.text })
+                        .bg(bg)
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+                Span::styled(val_str, val_style),
+                Span::styled(" ", Style::default().bg(bg)),
+            ]));
+        }
+        while lines.len() < list_h {
+            lines.push(Line::default());
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        "─".repeat(inner.width as usize),
+        Style::default().fg(theme.border),
+    )));
+    let desc = filtered
+        .get(selected.min(filtered.len().saturating_sub(1)))
+        .map(|&idx| items[idx].description.as_str())
+        .unwrap_or("输入关键词快速搜索配置项");
+    lines.push(Line::from(Span::styled(
+        format!(" {desc}"),
+        Style::default().fg(theme.text_muted),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(" 自动即时生效并保存至: {save_path_hint}"),
+        Style::default().fg(theme.text_dim),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 pub fn render_overlay(
     frame: &mut Frame<'_>,
     full_area: Rect,
@@ -1173,7 +1538,9 @@ pub fn render_overlay(
     };
 
     match active {
-        OverlayKind::SlashComplete { query, selected, .. } => {
+        OverlayKind::SlashComplete {
+            query, selected, ..
+        } => {
             let entries = filter_slash(skill_names, query);
             let rows: Vec<(String, String)> = entries
                 .iter()
@@ -1207,16 +1574,7 @@ pub fn render_overlay(
                 .collect();
             let title = format!(" 文件/目录引用: @{query} (Tab/Enter 插入 · Esc 隐藏) ");
             render_anchored_list_sized(
-                frame,
-                full_area,
-                input_area,
-                &title,
-                &rows,
-                *selected,
-                max_w,
-                10,
-                theme,
-                state,
+                frame, full_area, input_area, &title, &rows, *selected, max_w, 10, theme, state,
             );
         }
         OverlayKind::ModelPicker {
@@ -1317,12 +1675,7 @@ pub fn render_overlay(
                             .to_ascii_lowercase()
                             .contains(&query.to_ascii_lowercase())
                 })
-                .map(|s| {
-                    (
-                        format!("/{} [{}]", s.name, s.source),
-                        s.description.clone(),
-                    )
-                })
+                .map(|s| (format!("/{} [{}]", s.name, s.source), s.description.clone()))
                 .collect();
             let title = format!(" 交互式技能选择器 [过滤: {query}] (Enter 填入) ");
             render_centered_list(frame, full_area, &title, &rows, *selected, theme, state);
@@ -1353,6 +1706,27 @@ pub fn render_overlay(
         }
         OverlayKind::HelpModal { scroll } => {
             render_help_modal(frame, full_area, *scroll, theme, state);
+        }
+        OverlayKind::SettingsModal {
+            items,
+            query,
+            selected,
+            save_path_hint,
+        } => {
+            let items_cloned = items.clone();
+            let query_cloned = query.clone();
+            let sel = *selected;
+            let save_hint = save_path_hint.clone();
+            render_settings_modal(
+                frame,
+                full_area,
+                &items_cloned,
+                &query_cloned,
+                sel,
+                &save_hint,
+                theme,
+                state,
+            );
         }
         OverlayKind::Approval(ap) => {
             let tool_name = ap.tool_name.clone();
@@ -1489,7 +1863,10 @@ fn draw_list_box(
 
     if rows.is_empty() || inner.height == 0 {
         frame.render_widget(
-            Paragraph::new(Span::styled("  (无匹配项)", Style::default().fg(theme.text_dim))),
+            Paragraph::new(Span::styled(
+                "  (无匹配项)",
+                Style::default().fg(theme.text_dim),
+            )),
             inner,
         );
         return;
@@ -1497,7 +1874,9 @@ fn draw_list_box(
 
     let sel = selected.min(rows.len() - 1);
     let cap = inner.height as usize;
-    let start = sel.saturating_sub(cap / 2).min(rows.len().saturating_sub(cap));
+    let start = sel
+        .saturating_sub(cap / 2)
+        .min(rows.len().saturating_sub(cap));
     let end = (start + cap).min(rows.len());
 
     let mut lines = Vec::new();
@@ -1558,7 +1937,8 @@ fn render_approval_modal(
     state: &mut OverlayState,
 ) {
     let box_w = full_area.width.saturating_sub(6).clamp(40, 82);
-    let box_h = if editing_reason { 11u16 } else { 10u16 }.min(full_area.height.saturating_sub(2).max(6));
+    let box_h =
+        if editing_reason { 11u16 } else { 10u16 }.min(full_area.height.saturating_sub(2).max(6));
     let x = full_area.x + (full_area.width.saturating_sub(box_w)) / 2;
     let y = full_area.y + (full_area.height.saturating_sub(box_h)) / 2;
     let rect = Rect::new(x, y, box_w, box_h);
@@ -1598,12 +1978,11 @@ fn render_approval_modal(
         lines.push(Line::from(vec![
             Span::styled(
                 "拒绝理由（Enter 提交 / Esc 返回）：",
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("{deny_reason}▏"),
-                Style::default().fg(theme.text),
-            ),
+            Span::styled(format!("{deny_reason}▏"), Style::default().fg(theme.text)),
         ]));
     } else {
         lines.push(Line::from(vec![
@@ -1621,17 +2000,23 @@ fn render_approval_modal(
             Span::raw(" "),
             Span::styled(
                 " [r] 拒绝附理由 ",
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
                 " [n/Esc] 拒绝 ",
-                Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
     if !editing_reason && inner.height >= 4 {
-        state.item_rects.push((0, Rect::new(inner.x, inner.y + 3, 18, 1)));
+        state
+            .item_rects
+            .push((0, Rect::new(inner.x, inner.y + 3, 18, 1)));
         state
             .item_rects
             .push((1, Rect::new(inner.x + 19, inner.y + 3, 15, 1)));
@@ -1670,22 +2055,62 @@ fn render_help_modal(
     state.last_box = Some(rect);
 
     let items = [
-        ("Enter (空闲 / 运行中)", "空闲直接发送；运行中自动加入 Follow-up 队列"),
-        ("!cmd / !!cmd", "直接执行本地 Bash 命令（! 载入上下文 / !! 仅本地不入上下文）"),
+        (
+            "Enter (空闲 / 运行中)",
+            "空闲直接发送；运行中自动加入 Follow-up 队列",
+        ),
+        (
+            "!cmd / !!cmd",
+            "直接执行本地 Bash 命令（! 载入上下文 / !! 仅本地不入上下文）",
+        ),
         ("Ctrl+Enter", "立即发送（运行中打断当前回合并立即插队发送）"),
-        ("Shift+Enter / Ctrl+J", "插入换行；粘贴超长文本自动折叠为原子块"),
+        (
+            "Shift+Enter / Ctrl+J",
+            "插入换行；粘贴超长文本自动折叠为原子块",
+        ),
         ("Tab", "循环切换思考等级（补全浮层内为补全选中项）"),
         ("Ctrl+L", "打开交互式模型选择器（等同 /model）"),
         ("Esc", "取消选区或浮层 -> 暂停当前生成 -> 清空输入"),
-        ("Ctrl+C", "复制选区 / 关闭弹窗 / 单击清空输入 / 中断或双击退出"),
-        ("鼠标划词 / 双击 / 三击", "应用级分栏选区（自动拼接软换行），松手自动复制；F2 切换鼠标追踪"),
-        ("Ctrl+B / Ctrl+O", "Ctrl+B 开关侧栏；Ctrl+O 展开/折叠思考与完整工具输出"),
-        ("Ctrl+T / /trace", "打开全屏三泳道轨迹分析器（WaveBand + Timeline + Hotspots）"),
-        ("Ctrl+G / Ctrl+E", "Ctrl+G 调用 $EDITOR 编辑草稿；Ctrl+E 展开折叠粘贴块"),
-        ("Ctrl+R / Ctrl+Z / Ctrl+Y", "历史模糊搜索 / 词级撤销 / KillRing 粘回"),
-        ("/tree /skills /view", "会话分支树回溯 / 交互技能选择 / Fullscreen↔Inline 视图热切"),
-        ("/model /effort /theme", "交互切换模型、思考深度与 Oklab 自适应主题"),
-        ("/approval [auto|ask]", "开启或关闭工具调用交互式审批确认弹窗（支持拒绝附理由）"),
+        (
+            "Ctrl+C",
+            "复制选区 / 关闭弹窗 / 单击清空输入 / 中断或双击退出",
+        ),
+        (
+            "鼠标划词 / 双击 / 三击",
+            "应用级分栏选区（自动拼接软换行），松手自动复制；F2 切换鼠标追踪",
+        ),
+        (
+            "Ctrl+B / Ctrl+O",
+            "Ctrl+B 开关侧栏；Ctrl+O 展开/折叠思考与完整工具输出",
+        ),
+        (
+            "Ctrl+T / /trace",
+            "打开全屏三泳道轨迹分析器（WaveBand + Timeline + Hotspots）",
+        ),
+        (
+            "Ctrl+G / Ctrl+E",
+            "Ctrl+G 调用 $EDITOR 编辑草稿；Ctrl+E 展开折叠粘贴块",
+        ),
+        (
+            "Ctrl+R / Ctrl+Z / Ctrl+Y",
+            "历史模糊搜索 / 词级撤销 / KillRing 粘回",
+        ),
+        (
+            "/settings /compact",
+            "打开交互式设置面板（即时生效并持久化）/ 手动压缩上下文",
+        ),
+        (
+            "/tree /skills /view",
+            "会话分支树回溯 / 交互技能选择 / Fullscreen↔Inline 视图热切",
+        ),
+        (
+            "/model /effort /theme",
+            "交互切换模型、思考深度与 Oklab 自适应主题",
+        ),
+        (
+            "/approval [auto|ask]",
+            "开启或关闭工具调用交互式审批确认弹窗（支持拒绝附理由）",
+        ),
     ];
     let cap = inner.height as usize;
     let start = scroll.min(items.len().saturating_sub(cap));
@@ -1722,8 +2147,8 @@ mod tests {
             )
             .is_some()
         );
-        let s1 = fuzzy_subsequence_score("app", "app.rs", "app.rs", MentionCandidateKind::File)
-            .unwrap();
+        let s1 =
+            fuzzy_subsequence_score("app", "app.rs", "app.rs", MentionCandidateKind::File).unwrap();
         let s2 = fuzzy_subsequence_score(
             "app",
             "crates/mizar-tui/src/app.rs",
@@ -1736,10 +2161,8 @@ mod tests {
 
     #[test]
     fn workspace_file_cache_indexes_over_256_entries_and_lists_directories() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mizar_tui_file_cache_test_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("mizar_tui_file_cache_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("crates/sub")).unwrap();
         for idx in 0..320 {
@@ -1750,7 +2173,9 @@ mod tests {
         let mut cache = WorkspaceFileCache::default();
         let matches = cache.match_query(&tmp, "target_deep");
         assert!(
-            matches.iter().any(|c| c.path == "crates/sub/target_deep.rs"),
+            matches
+                .iter()
+                .any(|c| c.path == "crates/sub/target_deep.rs"),
             "expected deep file beyond 256 limit, got: {matches:?}"
         );
 
@@ -1816,8 +2241,14 @@ mod tests {
             lines.push(row);
         }
         let rendered = lines.join("\n");
-        assert!(rendered.contains("@crates/mizar-tui/"), "rendered:\n{rendered}");
-        assert!(rendered.contains("@crates/Cargo.toml"), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("@crates/mizar-tui/"),
+            "rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("@crates/Cargo.toml"),
+            "rendered:\n{rendered}"
+        );
         assert!(
             !rendered.contains("  dir"),
             "unexpected dir badge in rendered overlay:\n{rendered}"

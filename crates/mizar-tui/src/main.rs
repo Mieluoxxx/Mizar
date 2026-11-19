@@ -165,7 +165,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tui_cfg = TuiConfig::new(workspace);
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
-    tui_cfg.theme_preset = cli.theme;
+    if let Some(ui) = &loaded_cfg.settings.ui {
+        if let Some(ref theme_name) = ui.theme {
+            tui_cfg.theme_preset = mizar_tui_ui::theme::ThemePreset::parse(theme_name);
+        }
+        if let Some(ref mode) = ui.screen_mode {
+            tui_cfg.screen_mode = match mode.trim().to_ascii_lowercase().as_str() {
+                "inline" => ScreenMode::Inline,
+                _ => ScreenMode::Fullscreen,
+            };
+        }
+        tui_cfg.show_thinking = ui.show_thinking;
+        tui_cfg.verbose_expanded = ui.verbose_expanded;
+        tui_cfg.side_panel_open = ui.side_panel_open;
+        tui_cfg.mouse_capture = ui.mouse_capture;
+        if let Some(ref approval) = ui.approval_mode {
+            tui_cfg.approval_mode = match approval.trim().to_ascii_lowercase().as_str() {
+                "ask" => ApprovalMode::Ask,
+                _ => ApprovalMode::Auto,
+            };
+        }
+    }
+    if cli.theme.is_some() {
+        tui_cfg.theme_preset = cli.theme;
+    }
     tui_cfg.resume_session = cli.resume_session;
     tui_cfg.restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
     if cli.inline {

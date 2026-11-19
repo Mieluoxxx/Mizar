@@ -63,26 +63,26 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     }
 
     // 2. 双栏 / 单栏工作台分配
-    let chat_area = if let Some((chat_w, divider_x, panel_w)) = app.side_panel.split_columns(area.width)
-    {
-        app.side_panel.divider_col = Some(divider_x);
-        let chat_rect = Rect::new(area.x, area.y, chat_w, area.height);
-        let divider_rect = Rect::new(area.x + divider_x, area.y, 1, area.height);
-        let panel_rect = Rect::new(area.x + divider_x + 1, area.y, panel_w, area.height);
+    let chat_area =
+        if let Some((chat_w, divider_x, panel_w)) = app.side_panel.split_columns(area.width) {
+            app.side_panel.divider_col = Some(divider_x);
+            let chat_rect = Rect::new(area.x, area.y, chat_w, area.height);
+            let divider_rect = Rect::new(area.x + divider_x, area.y, 1, area.height);
+            let panel_rect = Rect::new(area.x + divider_x + 1, area.y, panel_w, area.height);
 
-        render_divider_column(frame, divider_rect, &app.side_panel, &app.theme);
-        render_side_panel(
-            frame,
-            panel_rect,
-            &mut app.side_panel,
-            &app.side_panel_data,
-            &app.theme,
-            &mut app.selection_geom,
-        );
-        chat_rect
-    } else {
-        area
-    };
+            render_divider_column(frame, divider_rect, &app.side_panel, &app.theme);
+            render_side_panel(
+                frame,
+                panel_rect,
+                &mut app.side_panel,
+                &app.side_panel_data,
+                &app.theme,
+                &mut app.selection_geom,
+            );
+            chat_rect
+        } else {
+            area
+        };
 
     // 3. 对话区垂直切分：transcript + queued strip + input + status bar
     let input_inner_w = chat_area.width.saturating_sub(2).max(1);
@@ -102,7 +102,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let transcript_h = avail_h.saturating_sub(queued_h + input_h);
 
     let transcript_area = Rect::new(chat_area.x, chat_area.y, chat_area.width, transcript_h);
-    let queued_area = Rect::new(chat_area.x, chat_area.y + transcript_h, chat_area.width, queued_h);
+    let queued_area = Rect::new(
+        chat_area.x,
+        chat_area.y + transcript_h,
+        chat_area.width,
+        queued_h,
+    );
     let input_area = Rect::new(
         chat_area.x,
         chat_area.y + transcript_h + queued_h,
@@ -556,7 +561,11 @@ pub fn build_item_lines_for_scrollback(
         ChatItem::User { text } => build_user_lines(text, w, theme),
         ChatItem::Assistant { reasoning, text } => build_assistant_lines(
             reasoning,
-            if show_thinking { reasoning.as_str() } else { "" },
+            if show_thinking {
+                reasoning.as_str()
+            } else {
+                ""
+            },
             text.as_str(),
             show_thinking,
             w,
@@ -690,7 +699,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
 
     if app.screen_mode == ScreenMode::Inline && !app.items.is_empty() && start_item >= total_items {
         let hint = Line::from(vec![
-            Span::styled(" ↑ 历史回复已归档至终端原生滚动区 ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                " ↑ 历史回复已归档至终端原生滚动区 ",
+                Style::default().fg(theme.text_dim),
+            ),
             Span::styled("│ F3 切回全屏", Style::default().fg(theme.accent)),
         ]);
         frame.buffer_mut().set_line(
@@ -753,8 +765,11 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 all_lines.extend(lines);
             }
             ChatItem::Assistant { reasoning, text } => {
-                app.reveal
-                    .observe(RevealSlot::AssistantReasoning(idx), reasoning, is_last_active);
+                app.reveal.observe(
+                    RevealSlot::AssistantReasoning(idx),
+                    reasoning,
+                    is_last_active,
+                );
                 app.reveal
                     .observe(RevealSlot::AssistantText(idx), text, is_last_active);
 
@@ -920,7 +935,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             let label = format!(
                 " ↳ Turn #{}: {} ",
                 pinned_idx + 1,
-                truncate_display(&turn.preview, content_area.width.saturating_sub(14) as usize)
+                truncate_display(
+                    &turn.preview,
+                    content_area.width.saturating_sub(14) as usize
+                )
             );
             buf.set_stringn(
                 content_area.x,
@@ -2022,10 +2040,7 @@ fn render_input_box(
     let buf = frame.buffer_mut();
 
     if app.input.is_empty() {
-        let placeholder = truncate_display(
-            "输入消息、/ 命令或 @ 文件引用…",
-            inner.width as usize,
-        );
+        let placeholder = truncate_display("输入消息、/ 命令或 @ 文件引用…", inner.width as usize);
         buf.set_stringn(
             inner.x,
             inner.y,
@@ -2106,15 +2121,21 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let theme = app.theme.clone();
     let is_busy = app.is_busy;
     let is_bash = app.is_bash_running;
+    let is_compacting = app.is_compacting;
     let spinner = BRAILLE_SPINNER[app.spinner_tick % BRAILLE_SPINNER.len()];
-    let status_text = if is_busy {
+    let status_text = if is_compacting {
+        let detail = app.compaction_status.as_deref().unwrap_or("上下文压缩中…");
+        format!("{spinner} {detail}")
+    } else if is_busy {
         format!("{spinner} 运行中")
     } else if is_bash {
         format!("{spinner} Bash")
     } else {
         "● 就绪".to_string()
     };
-    let status_color = if is_busy || is_bash {
+    let status_color = if is_compacting {
+        theme.info
+    } else if is_busy || is_bash {
         theme.warning
     } else {
         theme.success
@@ -2187,10 +2208,16 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
 
     if app.screen_mode == ScreenMode::Inline && avail >= 44 {
         spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
-        spans.push(Span::styled("[inline · F3全屏]", Style::default().fg(theme.info)));
+        spans.push(Span::styled(
+            "[inline · F3全屏]",
+            Style::default().fg(theme.info),
+        ));
     } else if !app.mouse_capture_enabled && avail >= 48 {
         spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
-        spans.push(Span::styled("[原生选区 · F2恢复]", Style::default().fg(theme.info)));
+        spans.push(Span::styled(
+            "[原生选区 · F2恢复]",
+            Style::default().fg(theme.info),
+        ));
     }
 
     if !auto_scroll && avail >= 44 {

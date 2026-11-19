@@ -1,5 +1,6 @@
 //! 基于嵌入式 SQLite（WAL + Single-Writer 后台线程）的 `SessionPersistence` 实现与 Cordis 插件。
 
+pub mod recall;
 pub mod schema;
 pub mod writer;
 
@@ -9,13 +10,14 @@ use std::thread::JoinHandle;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin};
 use mizar_session::{
-    LoadedSession, PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionEntry,
-    SessionHeader, SessionHeaderPatch, SessionListQuery, SessionPersistence,
-    SessionPersistenceHandle,
+    LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
+    SERVICE_SESSION_PERSISTENCE, SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    SessionPersistence, SessionPersistenceHandle,
 };
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::oneshot;
 
+use crate::recall::search_recall_from_conn;
 use crate::schema::{
     configure_reader_connection, init_schema, list_sessions_from_conn, load_session_from_conn,
     map_sqlite_err,
@@ -47,7 +49,10 @@ impl SqliteSessionPersistence {
         let path = db_path.as_ref();
         let is_memory = path == Path::new(":memory:");
 
-        if !is_memory && let Some(parent) = path.parent() && !parent.as_os_str().is_empty() {
+        if !is_memory
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(parent)?;
         }
 
@@ -115,11 +120,7 @@ impl SessionPersistence for SqliteSessionPersistence {
         self.send_cmd(WriteCmd::CreateSession(header.clone()))
     }
 
-    fn update_header(
-        &self,
-        session_id: &str,
-        patch: SessionHeaderPatch,
-    ) -> PersistenceResult<()> {
+    fn update_header(&self, session_id: &str, patch: SessionHeaderPatch) -> PersistenceResult<()> {
         self.send_cmd(WriteCmd::UpdateHeader {
             session_id: session_id.to_string(),
             patch,
@@ -172,7 +173,10 @@ impl SessionPersistence for SqliteSessionPersistence {
         reply_rx.recv().map_err(|_| PersistenceError::Closed)?
     }
 
-    fn flush_async(&self, _session_id: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
+    fn flush_async(
+        &self,
+        _session_id: Option<String>,
+    ) -> BoxFuture<'static, PersistenceResult<()>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let send_res = self.send_cmd(WriteCmd::Flush(BarrierReply::Async(reply_tx)));
         Box::pin(async move {
@@ -195,6 +199,27 @@ impl SessionPersistence for SqliteSessionPersistence {
             reply: reply_tx,
         })?;
         reply_rx.recv().map_err(|_| PersistenceError::Closed)?
+    }
+
+    fn search_recall(
+        &self,
+        query: &RecallSearchQuery,
+    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
+        if let Some(ref reader) = self.reader {
+            self.flush(None)?;
+            let conn = reader.lock().unwrap();
+            search_recall_from_conn(&conn, query).map(Some)
+        } else {
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            self.send_cmd(WriteCmd::SearchRecall {
+                query: query.clone(),
+                reply: reply_tx,
+            })?;
+            reply_rx
+                .recv()
+                .map_err(|_| PersistenceError::Closed)?
+                .map(Some)
+        }
     }
 }
 

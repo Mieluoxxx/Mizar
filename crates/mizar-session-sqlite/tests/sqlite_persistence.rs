@@ -15,7 +15,10 @@ fn temp_db_path(name: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir()
-        .join(format!("mizar_sqlite_test_{name}_{}_{nanos}", std::process::id()))
+        .join(format!(
+            "mizar_sqlite_test_{name}_{}_{nanos}",
+            std::process::id()
+        ))
         .join("sessions.sqlite")
 }
 
@@ -35,7 +38,10 @@ async fn persists_and_hydrates_sessions_across_restarts() {
     let _guard = TempDbGuard(db_path.clone());
 
     let app1 = Context::new();
-    app1.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db_path));
+    app1.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
     app1.plugin(SessionStore::plugin(), ());
     app1.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -90,7 +96,10 @@ async fn persists_and_hydrates_sessions_across_restarts() {
 
     // 模拟全新进程重启，重新打开同一个 SQLite 文件
     let app2 = Context::new();
-    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db_path));
+    app2.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -136,7 +145,10 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
     let _guard = TempDbGuard(db_path.clone());
 
     let app = Context::new();
-    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db_path));
+    app.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
     app.plugin(SessionStore::plugin(), ());
     app.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -167,10 +179,14 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
 
     // 在 seq=4（未返 ToolResult 的 Assistant）处分叉，应持久化复制前缀并自愈悬挂 tool_call
     let child = store
-        .fork("parent", 4, SessionCreateOptions {
-            id: Some("child".into()),
-            ..Default::default()
-        })
+        .fork(
+            "parent",
+            4,
+            SessionCreateOptions {
+                id: Some("child".into()),
+                ..Default::default()
+            },
+        )
         .unwrap();
     assert_eq!(child.header().parent_id.as_deref(), Some("parent"));
     assert_eq!(child.header().fork_seq, Some(4));
@@ -197,7 +213,10 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
 
     // 重启验证 child 的 compaction 与 repaired tool_result 都落了盘
     let app2 = Context::new();
-    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db_path));
+    app2.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -331,4 +350,99 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
     assert!(!format!("{msgs:?}").contains("secret_local"));
 
     app2.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
+    use mizar_session::RecallSearchQuery;
+
+    let db = temp_db_path("recall_fts5");
+    let _guard = TempDbGuard(db.clone());
+
+    let app = Context::new();
+    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+    app.plugin(SessionStore::plugin(), ());
+    app.plugin(
+        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let store = app.sessions().unwrap();
+    let s1 = store.create_with(SessionCreateOptions {
+        id: Some("s1".into()),
+        cwd: Some("/ws/alpha".into()),
+        ..Default::default()
+    });
+    s1.append(SessionEvent::User {
+        text: "早期决策：使用 compacted_up_to_seq 追踪历史压缩水位".into(),
+    });
+    s1.append(SessionEvent::User {
+        text: "我们来排查 Ryugi 画板与任务看板的双向状态同步问题".into(),
+    });
+    s1.append(SessionEvent::ToolResult {
+        tool_call_id: "tc-1".into(),
+        name: "read".into(),
+        content: "fn resolve_anchor_node() { /* unique_anchor_marker_99 */ }".into(),
+        is_error: false,
+    });
+    // 即使发生压缩，压缩前的原始事件仍必须可穿透检索
+    s1.compact("已确认看板边界", 0, Some(1000));
+    s1.flush_async().await.unwrap();
+
+    // 分叉子会话也应自动具备前缀事件的 FTS5 索引
+    let forked = store
+        .fork("s1", 2, SessionCreateOptions::default())
+        .unwrap();
+    forked.flush_async().await.unwrap();
+
+    // Rust 标识符检索
+    let hits_ident = store
+        .search_recall(&RecallSearchQuery {
+            query: "compacted_up_to_seq".into(),
+            session_ids: vec![forked.id.clone()],
+            cwd: None,
+            limit: 10,
+        })
+        .unwrap()
+        .expect("sqlite backend should return Some(hits)");
+    assert!(
+        hits_ident
+            .iter()
+            .any(|h| h.session_id == forked.id && h.seq == 1),
+        "expected forked session FTS hit, got: {hits_ident:?}"
+    );
+
+    // 中文 2 字短词检索（穿透 Compaction 边界）
+    let hits_cjk = store
+        .search_recall(&RecallSearchQuery {
+            query: "画板".into(),
+            session_ids: vec!["s1".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        hits_cjk.iter().any(|h| h.session_id == "s1" && h.seq == 2),
+        "expected Chinese 2-char hit across compaction, got: {hits_cjk:?}"
+    );
+
+    // ToolResult 原文子串检索（穿透 Compaction 边界）
+    let hits_tool = store
+        .search_recall(&RecallSearchQuery {
+            query: "unique_anchor_marker_99".into(),
+            session_ids: vec!["s1".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        hits_tool.iter().any(|h| h.session_id == "s1" && h.seq == 3),
+        "expected tool result hit across compaction, got: {hits_tool:?}"
+    );
+
+    app.fiber().dispose().await;
 }

@@ -1114,12 +1114,14 @@ dependencies = [
  "futures",
  "mizar-agent-loop",
  "mizar-codemode",
+ "mizar-compaction",
  "mizar-instructions",
  "mizar-llm",
  "mizar-llm-mock",
  "mizar-llm-retry",
  "mizar-llm-router",
  "mizar-mcp",
+ "mizar-recall",
  "mizar-session",
  "mizar-session-sqlite",
  "mizar-skills",
@@ -1146,6 +1148,25 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-compaction"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]
@@ -1304,6 +1325,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mizar-recall"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-session-sqlite",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "mizar-session"
 version = "0.1.0"
 dependencies = [
@@ -1322,6 +1359,7 @@ version = "0.1.0"
 dependencies = [
  "cordis",
  "mizar-llm",
+ "mizar-llm-types",
  "mizar-session",
  "rusqlite",
  "serde",
