@@ -10,7 +10,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::post;
-use cordis::{BoxFuture, Context, CordisError, Next, PluginDef, Service};
+use cordis::{BoxFuture, Context, CordisError, FiberState, Next, PluginDef, Service};
 use mizar_agent_loop::{AgentLoop, AgentLoopContextExt};
 use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin};
 use mizar_llm::{
@@ -31,8 +31,36 @@ use mizar_trajectory::{
 };
 use tokio_util::sync::CancellationToken;
 
-async fn tick(ms: u64) {
-    tokio::time::sleep(Duration::from_millis(ms)).await;
+async fn wait_all_settled(app: &Context) {
+    // 子插件注册与服务通知可能跨多轮异步调度完成，循环等到所有 Fiber 稳态且连续两轮状态不再变化。
+    loop {
+        tokio::task::yield_now().await;
+        let fibers: Vec<_> = app
+            .registry()
+            .values()
+            .into_iter()
+            .flat_map(|rt| rt.fibers())
+            .collect();
+        let before: Vec<_> = fibers.iter().map(|f| (f.uid(), f.state())).collect();
+        for fiber in &fibers {
+            let _ = fiber.wait_settled().await;
+        }
+        tokio::task::yield_now().await;
+        let after: Vec<_> = app
+            .registry()
+            .values()
+            .into_iter()
+            .flat_map(|rt| rt.fibers())
+            .map(|f| (f.uid(), f.state()))
+            .collect();
+        if before == after
+            && after
+                .iter()
+                .all(|(_, s)| !matches!(s, FiberState::Loading | FiberState::Unloading))
+        {
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -53,7 +81,7 @@ async fn agent_hot_plug_and_guard_pipeline() {
         AgentSpinePlugin,
         AgentSpineConfig::new(std::env::current_dir().unwrap()),
     );
-    tick(30).await;
+    wait_all_settled(&app).await;
 
     let ask = |text: &str| {
         let app = app.clone();
@@ -92,7 +120,7 @@ async fn agent_hot_plug_and_guard_pipeline() {
         }),
         (),
     );
-    tick(20).await;
+    wait_all_settled(&app).await;
     let answer = ask("现在几点？").await;
     assert!(answer.contains("已拦截"), "unexpected: {answer}");
 
@@ -102,8 +130,12 @@ async fn agent_hot_plug_and_guard_pipeline() {
     assert!(!answer.contains("已拦截"), "unexpected: {answer}");
 
     // 5. 拔掉工具插件：工具自动从工具表消失，模型就不会再调用它
-    app.registry().delete(&ToolTimePlugin);
-    tick(20).await;
+    if let Some(rt) = app.registry().delete(&ToolTimePlugin) {
+        for fiber in rt.fibers() {
+            fiber.dispose().await;
+        }
+    }
+    wait_all_settled(&app).await;
     assert!(
         !app.tools()
             .unwrap()
@@ -125,7 +157,7 @@ async fn agent_hot_plug_and_guard_pipeline() {
     for fiber in llm_rt.fibers() {
         fiber.dispose().await;
     }
-    tick(20).await;
+    wait_all_settled(&app).await;
     assert!(app.get::<AgentLoop>("agentLoop").is_none());
 }
 
@@ -249,7 +281,7 @@ async fn agent_switches_across_completions_responses_and_messages_in_one_session
         },
     );
     app.plugin(LlmRouter::plugin(), RouterConfig { providers });
-    tick(30).await;
+    wait_all_settled(&app).await;
 
     let llm = app.llm().unwrap();
     let session = app.sessions().unwrap().create(None);
@@ -410,7 +442,7 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
         .inject(["llm"]),
         (),
     );
-    tick(30).await;
+    wait_all_settled(&app).await;
 
     let session = app.sessions().unwrap().create(None);
     let reply = app
