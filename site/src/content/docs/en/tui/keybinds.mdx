@@ -1,0 +1,52 @@
+---
+title: Keybinds
+description: Scannable reference for Mizar's sending controls, editor shortcuts, viewport and panel toggles, local Bash prefixes, and transcript navigation keys.
+group: tui-workflow
+order: 7
+---
+
+import Callout from '../../../../components/mdx/Callout.astro';
+
+All built-in keyboard shortcuts and input mode prefixes across the Mizar terminal workbench are grouped below. For `@` mentions, paste folding, and queue vs. steer behavior, see [Terminal UI & Dual-Mode Viewports](/en/tui/); for slash commands, see [Commands](/en/tui/commands/).
+
+## Sending & Editor
+
+| Shortcut | Action |
+| :--- | :--- |
+| <kbd>Enter</kbd> | Submit prompt; when busy, append message to the trailing Follow-up queue |
+| <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | Immediate Steer: interrupt current streaming or tool execution and pivot to your new instruction |
+| <kbd>Shift</kbd>+<kbd>Enter</kbd> · <kbd>Alt</kbd>+<kbd>Enter</kbd> · <kbd>Ctrl</kbd>+<kbd>J</kbd> | Insert a manual newline while editing a multi-line prompt |
+| <kbd>Ctrl</kbd>+<kbd>E</kbd> | Expand a folded long-paste badge (`[paste #1 +42 lines]`) inline into editable plain text |
+| <kbd>Ctrl</kbd>+<kbd>G</kbd> | Open `$VISUAL` or `$EDITOR` external editor for composing complex prompts |
+| <kbd>Ctrl</kbd>+<kbd>R</kbd> | Fuzzy-search previously sent prompt history |
+| <kbd>Ctrl</kbd>+<kbd>W</kbd> / <kbd>Ctrl</kbd>+<kbd>K</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> | Delete previous word / delete to end of line / paste deleted text |
+| <kbd>Ctrl</kbd>+<kbd>Z</kbd> | Undo the most recent input box edit |
+| <kbd>Tab</kbd> | Confirm selection when a completion popup is open; cycle reasoning effort (`/effort`, `off` to `max`) when input is empty |
+
+## Viewports, Panels & Mode Switches
+
+| Shortcut | Action |
+| :--- | :--- |
+| <kbd>!</kbd> / <kbd>!!</kbd> | Prefix on an empty input box to enter [Local Bash Mode](/en/tui/bash-mode/) (`!` enters context, `!!` stays local-only) |
+| <kbd>F3</kbd> | Losslessly switch between Fullscreen and Inline viewports (`/view`) |
+| <kbd>F2</kbd> | Release or recapture terminal mouse events for native drag-select copying in Fullscreen (`/mouse`) |
+| <kbd>Ctrl</kbd>+<kbd>B</kbd> | Toggle the right-hand split diagnostics panel when terminal width ≥ 96 columns (`/panel`) |
+| <kbd>Ctrl</kbd>+<kbd>T</kbd> | Open the full-screen three-lane trajectory analyzer ([`/trace`](/en/tui/sessions/)) |
+| <kbd>Ctrl</kbd>+<kbd>L</kbd> | Open the interactive provider and model switcher (`/model`) |
+| <kbd>Ctrl</kbd>+<kbd>O</kbd> | Toggle expansion of all reasoning chains and tool details in the message stream |
+
+## Transcript Navigation & Exit
+
+| Shortcut | Action |
+| :--- | :--- |
+| <kbd>PageUp</kbd> / <kbd>PageDown</kbd> · <kbd>Ctrl</kbd>+<kbd>U</kbd> | Page up and down through conversation history and long outputs |
+| <kbd>Ctrl</kbd>+<kbd>Home</kbd> / <kbd>Ctrl</kbd>+<kbd>End</kbd> | Jump straight to the top of the conversation or back to the latest message |
+| <kbd>?</kbd> | Open the keybinding cheat-sheet overlay from an empty input box |
+| <kbd>Esc</kbd> | Close the active overlay, exit Bash mode, or abort a running task / child process group |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>D</kbd> | Clear the input box or safely exit Mizar |
+
+<Callout type="tip">
+
+In Fullscreen mode, besides pressing <kbd>F2</kbd>, macOS Terminal, iTerm2, Ghostty, and most terminal emulators let you hold <kbd>Option</kbd> (or <kbd>Alt</kbd>) to drag-select text directly. For keybindings specific to the `/trace` profiler view, see [Sessions, Branching & Performance Traces](/en/tui/sessions/).
+
+</Callout>

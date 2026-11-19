@@ -1,0 +1,114 @@
+---
+title: MCP 服务器接入
+description: 通过 mcp.json 接入本地 Stdio 与远程 HTTP MCP 服务器，查看连接状态并在项目内做 override-only 局部裁剪。
+group: capabilities
+order: 12
+---
+
+import CodeTabs from '../../components/mdx/CodeTabs.astro';
+import Callout from '../../components/mdx/Callout.astro';
+
+export const mcpTabs = [
+    {
+      label: '完整示例 (Stdio + HTTP)',
+      lang: 'json',
+      code: `{
+  "mcpServers": {
+    "sqlite": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "./app.db"],
+      "timeoutMs": 30000
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/sse",
+      "headers": {
+        "Authorization": "Bearer \${LINEAR_API_KEY}"
+      }
+    }
+  }
+}`,
+    },
+    {
+      label: '全局共享库 (.mizar/mcp.json)',
+      lang: 'json',
+      code: `{
+  "mcpServers": {
+    "db": {
+      "command": "npx",
+      "args": ["-y", "my-org-db-mcp"],
+      "env": {
+        "DB_URL": "\${TEAM_DB_URL}"
+      }
+    }
+  }
+}`,
+    },
+  ];
+
+Mizar 通过标准 Model Context Protocol (MCP) 接入外部数据源、工单系统、浏览器或数据库工具。全局配置放在 `~/.mizar/mcp.json`，项目配置放在 `<workspace>/.mizar/mcp.json`。
+
+## 1 分钟接入本地 Stdio 与远程 HTTP 服务
+
+`command`、`args`、`env`、`url` 和 `headers` 均支持 `${VAR}` 环境变量展开。下面这份示例同时接入了一个本地进程服务和一个远程流式 HTTP 服务：
+
+<CodeTabs tabs={mcpTabs} />
+
+启动 `mizar` 时，所有已启用的 MCP 服务会在后台异步握手连接，**不会阻塞界面首屏打开**。进入会话后，随时输入 [`/mcp`](/tui/commands/) 查看每个服务的连接状态、已注册工具数与超时或报错详情。
+
+## 命名规则与资源读取
+
+连接成功后，MCP 工具会被规范化为 `mcp__<server>__<tool>`（例如 `mcp__sqlite__read_query`），在沙箱与搜索中均沿用该名称。如果远端服务额外暴露了 MCP Resources 或 Resource Templates，Mizar 还会自动补充 `list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource` 三个读取工具。
+
+## 团队共享连接，当前项目只做局部裁剪（`override-only`）
+
+这是多仓库协作中最常见的场景：你在 `~/.mizar/mcp.json` 配好了一个公司数据库或工单 MCP 连接（带着团队 Token 和启动命令），但在当前代码仓库里，你想做到两件事：
+
+1. 彻底隐藏所有带删除语义的 `drop_*` 工具，防止误删表；
+2. 把高频读取工具 `get_issue` / `query_readonly` 提到直接暴露给模型，其余工具留在默认沙箱里按需调用。
+
+在项目根目录的 `.mizar/mcp.json` 中，只需**省略 `command` 与 `url`**，只写下需要覆盖的字段即可：
+
+```json title="<workspace>/.mizar/mcp.json（override-only 模式）"
+{
+  "mcpServers": {
+    "db": {
+      "exposure": "codemode",
+      "toolExposure": {
+        "drop_*": "hidden",
+        "query_readonly": "direct"
+      },
+      "timeoutMs": 45000
+    }
+  }
+}
+```
+
+当项目配置同时省略了 `command` 和 `url` 时，Mizar 不会认为这是一条残缺定义，而是自动把它视作针对全局同名服务的**局部补丁**：
+
+- 全局配置的启动命令、环境变量或远程鉴权头原封不动保留；
+- `toolExposure` 会按工具名合并，支持 `*` 通配符（匹配多条时，**模式越长越具体，优先级越高**，例如 `drop_table_*` 优先于 `drop_*`）；
+- 你还可以直接设置 `"enabled": false` 在某个项目内临时静默关闭某个全局 MCP 服务。
+
+<Callout type="info" title="四种常用 exposure 档位">
+  <code>codemode</code>（MCP 默认）：不占首轮对话上下文，供模型在 JS 沙箱中脚本化调用。<br />
+  <code>deferred</code>：平时隐藏，让模型先通过 <code>tool_search</code> 搜出后再调用。<br />
+  <code>direct</code>：像内置工具一样直接出现在模型工具列表里，适合只有两三个核心接口的小服务。<br />
+  <code>hidden</code>：彻底禁用，既不暴露给模型也不允许沙箱脚本访问。
+</Callout>
+
+## 如果不想默认走沙箱编排
+
+如果你的 MCP 工具只有两三个、参数非常简单，希望它们一上线就直接让模型可见，可以显式关闭自动沙箱收录，或直接在单个服务上写 `"exposure": "direct"`：
+
+```json title="让轻量 MCP 工具直接进入模型工具栏"
+{
+  "autoEnableCodemode": false,
+  "mcpServers": {
+    "time": {
+      "command": "npx",
+      "args": ["-y", "mcp-time"],
+      "exposure": "direct"
+    }
+  }
+}
+```

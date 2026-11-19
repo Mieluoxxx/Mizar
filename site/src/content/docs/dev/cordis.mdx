@@ -1,0 +1,100 @@
+---
+title: Cordis 微内核与新增工具
+description: 基于 cordis Plugin trait 编写最小工具插件：inject/provide 注入契约、ctx.effect 倒序清理、5 级 ToolExposure 与 5 种事件分发模式。
+group: dev-arch
+order: 19
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+
+`cordis` 通过插件注册、上下文依赖注入与生命周期托管把各个子系统解耦装配。编写工具插件、接入新 LLM 协议（参考 `crates/mizar-llm-mock/src/lib.rs`）或挂载事件监听，都遵循同一套契约。
+
+## 最小可运行工具插件（41 行）
+
+仓库里最简短的标准参考实现位于 `crates/mizar-tool-time/src/lib.rs`：
+
+```rust title="crates/mizar-tool-time/src/lib.rs"
+use chrono::Local;
+use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
+use mizar_tools::{ToolDefinition, ToolsContextExt};
+use serde_json::json;
+
+#[derive(Default, Clone, Copy)]
+pub struct ToolTimePlugin;
+
+impl Plugin for ToolTimePlugin {
+    type Config = ();
+
+    fn name(&self) -> Option<&str> {
+        Some("tool-time") // kebab-case 插件名
+    }
+
+    fn inject(&self) -> Inject {
+        Inject::from(["tools"]) // camelCase 服务名
+    }
+
+    fn apply(
+        &self,
+        ctx: Context,
+        _config: Self::Config,
+    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
+        Box::pin(async move {
+            let tools = ctx.tools()?;
+            ctx.effect("tool-time.register", || {
+                Ok::<_, mizar_tools::ToolError>(Some(tools.register(
+                    ToolDefinition::sync_tool(
+                        "get_time",
+                        "Get current local date and time.",
+                        json!({ "type": "object", "properties": {} }),
+                        |_args, _exec| {
+                            Ok::<_, BoxError>(
+                                Local::now().format("%Y/%m/%d %H:%M:%S").to_string(),
+                            )
+                        },
+                    ),
+                )?))
+            })?;
+            Ok(None)
+        })
+    }
+}
+```
+
+<Callout type="warning" title="高频踩坑：漏写 fn inject() 不会当场 panic">
+  如果在 <code>apply</code> 中调用了 <code>ctx.tools()?</code> 或其他 <code>ctx.service()</code>，却忘了在 <code>fn inject()</code> 声明对应服务名，<code>cordis</code> <strong>不会</strong>直接 panic，而是返回 <code>MissingInject</code> 错误导致该插件进入 <code>FAILED</code> 状态，工具随之<strong>静默消失</strong>——排查成本远高于 panic。
+</Callout>
+
+## `inject` / `provide` 与 `ctx.effect` 不变量
+
+- **服务命名与访问器**：`cordis` 标准服务名统一为 camelCase（`llm`、`tools`、`sessions`、`systemPrompt`、`agentLoop`、`skills`、`mcp`、`trajectory`）。生产代码一律调用 `<Name>ContextExt` 扩展方法（例如 `ctx.tools()?`），不要裸查服务表。
+- **副作用必须走 `ctx.effect("<crate>-<动作>", ...)`**：返回的销毁句柄由框架托管。当插件卸载或重载时，Fiber 状态机保证按**注册的倒序自动清理**所有副作用（撤销工具、停止后台任务），这是不遗漏资源泄漏的核心不变量。
+
+## 工具可见性（`ToolExposure`）与三道管线
+
+注册工具时需明确选定 `ToolExposure`，选错会导致工具静默不可见：
+
+| `ToolExposure` 枚举 | 行为语义 | 适用场景 |
+| :--- | :--- | :--- |
+| `Direct` | 对大模型直接暴露且沙箱可用 | 核心内置工具（`read` / `bash` / `grep`） |
+| `ModelOnly` | 对大模型可见，禁止沙箱递归调用 | 元工具（`codemode` / `tool_search`） |
+| `Codemode` | 只进沙箱声明、不占首轮 prompt | 外部 MCP 工具默认值 |
+| `Deferred` | 平时隐藏，仅能靠 `tool_search` 检出 | 大型冷门服务 |
+| `Hidden` | 对模型与沙箱完全屏蔽 | 项目显式禁用工具 |
+
+`crates/mizar-tools/src/lib.rs` 对工具执行串联了三道 waterfall 钩子（校验/拦截、执行包装、输出加工）。凡涉及到同一文件路径写入或修改的新工具，务必通过 `with_file_mutation_queue` 串行化，防止模型并发 tool call 时互相踩写。
+
+## `cordis` 五种事件分发语义
+
+在 `crates/cordis/src/events.rs` 中，插件间可通过事件总线完成不同松耦合协作：
+
+- `dispatch`：按顺序逐个调用监听函数。
+- `bail`：顺序调用直到某个监听器返回 `Some(result)` 即短路返回。
+- `waterfall`：管道式依次变换并向下传递值（工具管线核心机制）。
+- `parallel`：并发执行所有订阅处理器并汇总。
+- `emit`：只发出通知不等待返回结果（适合统计/日志同步）。
+
+## 把新插件接进宿主
+
+1. 按照 root `Cargo.toml` 规范：在 `[workspace.dependencies]` 登记新 crate 或第三方版本，子 crate 内只写 `{ workspace = true }` 与 `[lints] workspace = true`（完整规范见 [工程规范、门控与测试](/dev/conventions/)）。
+2. 在 `crates/mizar-agent-spine/src/lib.rs` 的 `apply` 装配链中注册插件（可选插件需配好 `#[cfg(feature = "...")]` 与依赖声明；层级关系见 [Workspace 分层与隔离边界](/dev/)）。
+3. 同步更新权威文档 **`docs/plugins.md`** 的 crate 表格与拓扑关系，保持文档与依赖树零漂移。

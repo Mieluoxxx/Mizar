@@ -41,3 +41,9 @@
 # Temporary files
 /tmp/
 *.tmp
+
+# Astro docs site build artifacts & dependencies
+site/node_modules/
+site/dist/
+site/.astro/
+

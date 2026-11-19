@@ -1,0 +1,114 @@
+---
+title: Permissions & Security
+description: Control tool access with toolsPreset, tools / excludeTools, restrictToWorkspace, and --approve execution gates, with three ready-to-use hardening profiles.
+group: rules-security
+order: 16
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../../components/DiagramEmbed.astro';
+
+<Callout type="warning" title="Default mode prioritizes uninterrupted solo development with no filesystem isolation">
+  Out of the box (<code>restrictToWorkspace: false</code> with execution approval disabled), all built-in tools can access files outside the workspace, and <code>bash</code> runs arbitrary shell commands with your current terminal user's privileges. Before auditing untrusted codebases, connecting sensitive databases, or running unattended workflows, enable tool filtering and the two safeguards below.
+</Callout>
+
+## Tool Presets & Wildcard Filtering
+
+Before configuring path checks or interactive prompts, the cleanest way to restrict capabilities is to remove unneeded tools outright. Narrow the active toolset via CLI flags or `.mizar/settings.json`:
+
+| Preset | CLI Flag / Config | Available Tools | Best For |
+| :--- | :--- | :--- | :--- |
+| **Full tools** | Default / `"toolsPreset": "all"` | `read` `write` `edit` `bash` `grep` `find` | Everyday full-stack development |
+| **Minimal coding** | `--minimal` / `"minimal"` | `read` `edit` `write` `bash` | Direct code edits and running tests |
+| **Read-only audit** | `--read-only` / `"read-only"` | `read` `grep` `find` | Architecture Q&A, audits, code review |
+
+For finer control by tool name, use the `tools` allowlist (mapped internally to `includeTools`; CLI `--tools` / `-t`) and `excludeTools` blocklist (CLI `--exclude-tools` / `-xt`), both supporting `*` wildcards:
+
+- **Last-write-wins allowlist vs. cumulative union blocklist (`excludeTools`)**: `toolsPreset` and `tools` override earlier layers, whereas `excludeTools` merges via **deduplicated union append** across global `~/.mizar/settings.json`, project `<workspace>/.mizar/settings.json`, and CLI `-xt` / `--exclude-tools` so personal safeguards are never wiped out by a repository config.
+- **Layering blocks on dangerous MCP tools**: For `mcp__<server>__<tool>` entries, you can block patterns in `excludeTools` (such as `"mcp__prod__*"` or `"mcp__*__drop_*"`) or mark `"drop_*": "hidden"` under `toolExposure` in `.mizar/mcp.json` (see [MCP Server Integration](/en/mcp/)).
+
+For example, disable `write` and block production MCP tools in a workspace:
+
+```json title=".mizar/settings.json"
+{
+  "tools": ["read", "edit", "grep", "find", "bash"],
+  "excludeTools": ["write", "mcp__prod__*"]
+}
+```
+
+You can also override tools for a single session on the command line using `-t read,grep` or `-xt write,bash`.
+
+## Why `restrictToWorkspace` Doesn't Contain `bash`
+
+Many users assume adding `"restrictToWorkspace": true` in `.mizar/settings.json` places Mizar inside an OS-level sandbox—that is a dangerous misconception.
+
+In Mizar's architecture, **path boundary constraints** and **action execution approval** are two orthogonal lines of defense:
+
+<DiagramEmbed
+  id="security-matrix"
+  title="Security Boundaries 2×2 Orthogonal Matrix"
+  caption="restrictToWorkspace constrains file read/write, search tools, and @ file references; --approve and /approval ask gate every actual invocation of non-read-only tools."
+/>
+
+Specifically, here is what each control enforces:
+
+- **`restrictToWorkspace: true`**: Strictly blocks `read`, `write`, `edit`, `grep`, `find`, and `@` file references in the input box if their resolved path escapes the workspace root. **It does not sandbox the `bash` tool**—because normal build commands (such as reading `~/.cargo` caches or invoking `/usr/bin/env`) legitimately require paths outside the repo.
+- **`--approve` / [`/approval ask`](/en/tui/commands/)**: Whenever the model attempts to run a **non-read-only tool** (including `write`, `edit`, `bash`, and external MCP or `codemode` calls not marked read-only), the TUI pauses and opens an approval prompt with four choices:
+  - <kbd>y</kbd> / <kbd>Enter</kbd>: Allow this single invocation;
+  - <kbd>a</kbd>: Trust this tool for the remainder of the current session;
+  - <kbd>r</kbd>: Reject and attach a reason telling the model to try a different approach;
+  - <kbd>n</kbd> / <kbd>Esc</kbd>: Reject and abort the tool call immediately.
+
+In addition, local shell commands you type yourself (`!cmd` or `!!cmd`) are **user-initiated actions** and do not trigger an approval prompt back at you; you can also switch back to automatic approval anytime with `/approval off` (or `/approval auto`).
+
+## Three Ready-to-Use Profiles by Trust Level
+
+Choose the profile that matches how much you trust the repository in front of you:
+
+### Scenario 1: Read-Only Audit of an Untrusted Repo
+
+When you want Mizar to read, search, and analyze vulnerabilities with zero disk writes or command execution—and prevent `@` or search tools from leaving the repo directory:
+
+```bash title="Strictest zero-write audit launch command"
+mizar --read-only --approve --workspace /path/to/untrusted-repo
+```
+
+Pair this with a local `.mizar/settings.json` that locks down the workspace boundary (preventing even read-only peeks into `~/.ssh`):
+
+```json title=".mizar/settings.json (audit mode)"
+{
+  "toolsPreset": "read-only",
+  "restrictToWorkspace": true,
+  "excludeTools": ["bash", "write", "edit"]
+}
+```
+
+### Scenario 2: Controlled Development in a Shared Repo
+
+Allow the model to edit files and run tests, while requiring your confirmation for state-changing operations and blocking production MCP tools:
+
+```json title=".mizar/settings.json (team controlled mode)"
+{
+  "restrictToWorkspace": true,
+  "excludeTools": ["mcp__prod__*"],
+  "codemode": {
+    "timeoutMs": 60000
+  }
+}
+```
+
+Launch with interactive approval enabled:
+
+```bash title="Enable interactive approval"
+mizar --approve
+```
+
+### Scenario 3: Full-Speed Personal Development
+
+When building features, refactoring, and running full CI suites in a local repository you completely control, run the default mode directly:
+
+```bash title="Default high-speed mode"
+mizar
+```
+
+Even in default mode, you can tighten permissions mid-session by running [`/approval ask`](/en/tui/commands/) in the input box, or press the <kbd>Esc</kbd> [shortcut](/en/tui/keybinds/) to immediately terminate both the active model turn and any `bash` process tree.

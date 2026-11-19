@@ -1,0 +1,54 @@
+---
+import { getEntry, render } from 'astro:content';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { cleanMdxToMarkdown } from '../../lib/markdown';
+import DiagramEmbed from '../../components/DiagramEmbed.astro';
+import CodeTabs from '../../components/mdx/CodeTabs.astro';
+import Callout from '../../components/mdx/Callout.astro';
+import Steps from '../../components/mdx/Steps.astro';
+import CardGroup from '../../components/mdx/CardGroup.astro';
+import DocCard from '../../components/mdx/DocCard.astro';
+import MdPre from '../../components/mdx/MdPre.astro';
+import MdTable from '../../components/mdx/MdTable.astro';
+import MdH2 from '../../components/mdx/MdH2.astro';
+import MdH3 from '../../components/mdx/MdH3.astro';
+import MdH4 from '../../components/mdx/MdH4.astro';
+
+const entry =
+  (await getEntry('docs', 'en/intro')) ?? (await getEntry('docs', 'intro'));
+if (!entry) {
+  throw new Error('Missing intro documentation entry');
+}
+
+const { Content, headings } = await render(entry);
+const markdownSource = cleanMdxToMarkdown(
+  entry.data.title,
+  entry.body || '',
+  'en',
+);
+const mdxComponents = {
+  DiagramEmbed,
+  CodeTabs,
+  Callout,
+  Steps,
+  CardGroup,
+  DocCard,
+  pre: MdPre,
+  table: MdTable,
+  h2: MdH2,
+  h3: MdH3,
+  h4: MdH4,
+};
+---
+
+<DocsLayout
+  slug="intro"
+  locale="en"
+  title={entry.data.title}
+  description={entry.data.description}
+  headings={headings}
+  markdownSource={markdownSource}
+  filePath={entry.filePath}
+>
+  <Content components={mdxComponents} />
+</DocsLayout>

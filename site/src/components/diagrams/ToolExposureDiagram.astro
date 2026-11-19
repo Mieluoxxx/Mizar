@@ -1,0 +1,245 @@
+---
+import DiagramFrame from './DiagramFrame.astro';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  caption?: string;
+  locale?: Locale;
+}
+
+const { caption } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const isEn = locale === 'en';
+---
+
+<DiagramFrame
+  fig="FIG 04"
+  title={isEn ? 'ToolExposure Levels & tool_search / codemode Loop' : 'ToolExposure 五级暴露与 tool_search / codemode 省上下文闭环'}
+  caption={caption}
+  locale={locale}
+>
+  <svg
+    viewBox="0 0 840 520"
+    width="840"
+    height="520"
+    role="img"
+    aria-label={isEn
+      ? 'Mizar ToolExposure five-level visibility model (Direct, ModelOnly, Codemode, Deferred, Hidden) with BM25 tool_search lazy activation and QuickJS codemode sandbox'
+      : 'Mizar ToolExposure 五级暴露模型（Direct、ModelOnly、Codemode、Deferred、Hidden）与 tool_search BM25 懒激活、codemode QuickJS 沙箱省上下文双闭环'}
+  >
+    <defs>
+      <pattern id="exp-hatch-sandbox" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--link)" stroke-width="1" stroke-opacity="0.20" />
+      </pattern>
+      <pattern id="exp-hatch-hidden" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="5" stroke="var(--status-outage)" stroke-width="1" stroke-opacity="0.22" />
+      </pattern>
+      <marker id="exp-arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--grey-9)" />
+      </marker>
+      <marker id="exp-arr-link" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--link)" />
+      </marker>
+      <marker id="exp-arr-ok" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--status-ok)" />
+      </marker>
+      <marker id="exp-arr-warn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--status-degraded)" />
+      </marker>
+    </defs>
+
+    {/* 左上：ToolExposure 五级暴露表 */}
+    <g>
+      <rect x="21" y="20" width="396" height="284" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <rect x="21" y="20" width="396" height="26" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <text x="33" y="37" font-size="11" font-weight="700" fill="var(--grey-11)">{isEn ? 'ToolExposure Visibility Matrix' : 'ToolExposure 五级可见性矩阵'}</text>
+      <text x="405" y="37" font-size="9.5" text-anchor="end" fill="var(--grey-8)">mizar-tools</text>
+
+      {/* 列头 */}
+      <text x="34" y="61" font-size="9.5" font-weight="700" fill="var(--grey-8)">{isEn ? 'Level' : '暴露等级'}</text>
+      <text x="122" y="61" font-size="9.5" font-weight="700" fill="var(--grey-8)">{isEn ? 'Schema' : '模型声明'}</text>
+      <text x="184" y="61" font-size="9.5" font-weight="700" fill="var(--grey-8)">{isEn ? 'Sandbox' : '进沙箱'}</text>
+      <text x="238" y="61" font-size="9.5" font-weight="700" fill="var(--grey-8)">{isEn ? 'Typical Tools / Behavior' : '典型工具 / 行为'}</text>
+      <line x1="31" y1="67" x2="407" y2="67" stroke="var(--border)" stroke-width="1" />
+
+      {/* Row 1: Direct */}
+      <rect x="31" y="73" width="376" height="36" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1" />
+      <circle cx="42" cy="91" r="3.5" fill="var(--status-ok)" />
+      <text x="52" y="95" font-size="10.5" font-weight="700" fill="var(--grey-11)">Direct</text>
+      <text x="122" y="95" font-size="9.5" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Direct' : '✓ 直接'}</text>
+      <text x="184" y="95" font-size="9.5" fill="var(--grey-10)">{isEn ? '✓ Call' : '✓ 可调'}</text>
+      <text x="238" y="95" font-size="9.5" fill="var(--grey-10)">read / bash / edit / grep</text>
+
+      {/* Row 2: ModelOnly */}
+      <rect x="31" y="114" width="376" height="36" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
+      <circle cx="42" cy="132" r="3.5" fill="var(--link)" />
+      <text x="52" y="136" font-size="10.5" font-weight="700" fill="var(--grey-11)">ModelOnly</text>
+      <text x="122" y="136" font-size="9.5" font-weight="600" fill="var(--link)">{isEn ? '✓ Direct' : '✓ 直接'}</text>
+      <text x="184" y="136" font-size="9.5" font-weight="600" fill="var(--callout-danger-ink)">{isEn ? '✕ Deny' : '✕ 禁嵌'}</text>
+      <text x="238" y="136" font-size="9.5" fill="var(--grey-10)">tool_search · codemode</text>
+
+      {/* Row 3: Codemode */}
+      <rect x="31" y="155" width="376" height="36" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <circle cx="42" cy="173" r="3.5" fill="var(--link)" />
+      <text x="52" y="177" font-size="10.5" font-weight="700" fill="var(--grey-11)">Codemode</text>
+      <text x="122" y="177" font-size="9.5" fill="var(--grey-8)">{isEn ? '○ Lazy' : '○ 按需'}</text>
+      <text x="184" y="177" font-size="9.5" font-weight="600" fill="var(--link)">{isEn ? '✓ List' : '✓ 列目'}</text>
+      <text x="238" y="177" font-size="9.5" fill="var(--grey-10)">{isEn ? 'MCP default (3000-char list)' : 'MCP 默认 (3000 字符目录)'}</text>
+
+      {/* Row 4: Deferred */}
+      <rect x="31" y="196" width="376" height="36" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <circle cx="42" cy="214" r="3.5" fill="var(--status-degraded)" />
+      <text x="52" y="218" font-size="10.5" font-weight="700" fill="var(--grey-11)">Deferred</text>
+      <text x="122" y="218" font-size="9.5" fill="var(--callout-caution-ink)">{isEn ? '○ Sleep' : '○ 休眠'}</text>
+      <text x="184" y="218" font-size="9.5" fill="var(--grey-10)">{isEn ? '✓ Hide' : '✓ 隐身'}</text>
+      <text x="238" y="218" font-size="9.5" fill="var(--grey-10)">{isEn ? 'Large MCP (search to load)' : '大规模 MCP (靠检索激活)'}</text>
+
+      {/* Row 5: Hidden */}
+      <rect x="31" y="237" width="376" height="36" fill="var(--code-del-tint)" stroke="var(--status-outage)" stroke-width="1" />
+      <rect x="31" y="237" width="376" height="36" fill="url(#exp-hatch-hidden)" />
+      <rect x="36" y="242" width="366" height="26" fill="var(--grey-2)" opacity="0.88" />
+      <circle cx="46" cy="255" r="3.5" fill="var(--status-outage)" />
+      <text x="56" y="259" font-size="10.5" font-weight="700" fill="var(--grey-11)">Hidden</text>
+      <text x="122" y="259" font-size="9.5" font-weight="600" fill="var(--callout-danger-ink)">{isEn ? '✕ Hide' : '✕ 屏蔽'}</text>
+      <text x="184" y="259" font-size="9.5" font-weight="600" fill="var(--callout-danger-ink)">{isEn ? '✕ Ban' : '✕ 禁止'}</text>
+      <text x="238" y="259" font-size="9.5" fill="var(--grey-10)">{isEn ? 'Blocked via excludeTools' : 'excludeTools 显式屏蔽'}</text>
+
+      {/* 激活优先级底注 */}
+      <text x="33" y="293" font-size="9" fill="var(--grey-8)">
+        {isEn
+          ? 'Priority: excludeTools/Hidden ✕ > includeTools > override > default'
+          : '优先级: excludeTools/Hidden ✕ > includeTools > override > default'}
+      </text>
+
+      <rect x="19" y="18" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+
+    {/* 左下：tool_search BM25 懒激活闭环 */}
+    <g>
+      <rect x="21" y="322" width="396" height="176" fill="var(--grey-2)" stroke="var(--status-degraded)" stroke-width="1.35" />
+      <rect x="21" y="322" width="396" height="26" fill="var(--grey-3)" stroke="var(--status-degraded)" stroke-width="1.35" />
+      <text x="33" y="339" font-size={isEn ? 10.5 : 11} font-weight="700" fill="var(--grey-11)">{isEn ? 'Loop A · tool_search BM25 Lazy Load' : '闭环 A · tool_search BM25 懒激活机制'}</text>
+      <text x="405" y="339" font-size="9.5" text-anchor="end" fill="var(--callout-caution-ink)">LAZY LOAD</text>
+
+      <rect x="35" y="362" width="110" height="66" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" stroke-dasharray="3 2" />
+      <text x="90" y="384" font-size="10" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Dormant Pool' : '休眠工具池'}</text>
+      <text x="90" y="401" font-size={isEn ? 9 : 9.5} text-anchor="middle" fill="var(--grey-8)">Codemode / Deferred</text>
+      <text x="90" y="417" font-size={isEn ? 9 : 9.5} text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? '0 Initial Tokens' : '初始 0 Token 占用'}</text>
+
+      <line x1="145" y1="395" x2="165" y2="395" stroke="var(--status-degraded)" stroke-width="1.3" marker-end="url(#exp-arr-warn)" />
+
+      <rect x="168" y="362" width="116" height="66" fill="var(--grey-3)" stroke="var(--status-degraded)" stroke-width="1.1" />
+      <text x="226" y="382" font-size="10.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'BM25 Search' : 'BM25 检索'}</text>
+      <text x="226" y="399" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">name×4.0 · ns×2.0</text>
+      <text x="226" y="416" font-size="9.5" text-anchor="middle" fill="var(--grey-8)">defaultLimit = 8</text>
+
+      <line x1="284" y1="395" x2="304" y2="395" stroke="var(--status-ok)" stroke-width="1.3" marker-end="url(#exp-arr-ok)" />
+
+      <rect x="307" y="362" width="96" height="66" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.1" />
+      <text x="355" y="384" font-size="10" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? 'Session Load' : '会话激活'}</text>
+      <text x="355" y="401" font-size="9" text-anchor="middle" fill="var(--grey-10)">activate_tools</text>
+      <text x="355" y="417" font-size="9" text-anchor="middle" fill="var(--grey-8)">{isEn ? 'Session-scoped' : '仅限当前会话'}</text>
+
+      <rect x="35" y="440" width="368" height="44" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="47" y="458" font-size="9.5" fill="var(--grey-10)">{isEn ? '• Auto-enabled when Codemode/Deferred tools exist' : '• 存在任意 Codemode/Deferred 工具时自动激活 tool_search'}</text>
+      <text x="47" y="474" font-size="9.5" fill="var(--grey-8)">{isEn ? '• Matched tools join schemas on the next LLM turn' : '• 命中工具在下一次 LLM 请求时自动加入声明列表'}</text>
+
+      <rect x="19" y="494" width="4" height="4" fill="var(--status-degraded)" />
+    </g>
+
+    {/* 从休眠激活连线至模型上下文窗口（走中间干净 30px 通道） */}
+    <path d="M 403 395 H 432 V 88 H 444" fill="none" stroke="var(--status-ok)" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#exp-arr-ok)" />
+    <rect x="421" y="232" width="22" height="62" fill="var(--grey-1)" stroke="var(--status-ok)" stroke-width="0.9" />
+    {
+      isEn ? (
+        <text
+          x="432"
+          y="263"
+          font-size="8.5"
+          font-weight="700"
+          text-anchor="middle"
+          dominant-baseline="central"
+          transform="rotate(-90 432 263)"
+          fill="var(--callout-tip-ink)"
+        >
+          NEXT TURN
+        </text>
+      ) : (
+        <>
+          <text x="432" y="246" font-size="8.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">下</text>
+          <text x="432" y="260" font-size="8.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">轮</text>
+          <text x="432" y="274" font-size="8.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">注</text>
+          <text x="432" y="288" font-size="8.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">入</text>
+        </>
+      )
+    }
+
+    {/* 从 Codemode 矩阵行连线至沙箱目录 */}
+    <path d="M 407 173 H 424 V 256 H 458" fill="none" stroke="var(--link)" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#exp-arr-link)" />
+
+    {/* 右上：模型上下文窗口 */}
+    <g>
+      <rect x="447" y="20" width="372" height="140" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.35" />
+      <rect x="447" y="20" width="372" height="26" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.35" />
+      <text x="459" y="37" font-size={isEn ? 10.5 : 11} font-weight="700" fill="var(--grey-11)">{isEn ? 'LLM Context Window (Tool Schemas)' : 'LLM 上下文窗口（Tool Schemas）'}</text>
+      <text x="807" y="37" font-size="9.5" text-anchor="end" fill="var(--link)">CONTEXT BUDGET</text>
+
+      <rect x="461" y="58" width="174" height="86" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.1" />
+      <text x="473" y="77" font-size={isEn ? 10 : 10.5} font-weight="700" fill="var(--callout-tip-ink)">{isEn ? 'Minimal Active Schemas' : '仅声明精简工具集'}</text>
+      <text x="473" y="96" font-size="9.5" fill="var(--grey-11)">• Direct + ModelOnly</text>
+      <text x="473" y="113" font-size="9.5" fill="var(--grey-10)">{isEn ? '• + BM25-loaded tools' : '• + 本轮 BM25 激活工具'}</text>
+      <text x="473" y="130" font-size="9.5" fill="var(--grey-8)">{isEn ? '(onlyMode hides Direct)' : '(onlyMode 可再隐藏 Direct)'}</text>
+
+      <rect x="647" y="58" width="158" height="86" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="726" y="78" font-size="10.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Token Savings' : '省上下文效果'}</text>
+      <text x="726" y="99" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'Dozens of MCP tools' : '几十个 MCP 工具'}</text>
+      <text x="726" y="115" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? '→ 1 codemode schema' : '仅占 1 个 codemode'}</text>
+      <text x="726" y="131" font-size="9.5" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? '+ 1 tool_search' : '+ 1 个 tool_search'}</text>
+
+      <rect x="817" y="18" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+
+    {/* 模型 <-> 沙箱双向控制与摘要返回线 */}
+    <line x1="538" y1="160" x2="538" y2="202" stroke="var(--link)" stroke-width="1.4" marker-end="url(#exp-arr-link)" />
+    <rect x="472" y="170" width="132" height="18" fill="var(--grey-1)" stroke="var(--link)" stroke-width="0.9" />
+    <text x="538" y="183" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--link)">{isEn ? '① Run async JS' : '① 下发 async JS 脚本'}</text>
+
+    <line x1="728" y1="205" x2="728" y2="163" stroke="var(--status-ok)" stroke-width="1.5" marker-end="url(#exp-arr-ok)" />
+    <rect x="648" y="170" width="160" height="18" fill="var(--grey-1)" stroke="var(--status-ok)" stroke-width="0.9" />
+    <text x="728" y="183" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? '③ Compact JSON only' : '③ 仅返回精炼汇总 JSON'}</text>
+
+    {/* 右下：codemode QuickJS 沙箱编排闭环 */}
+    <g>
+      <rect x="447" y="205" width="372" height="293" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.5" />
+      <rect x="447" y="205" width="372" height="28" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.5" />
+      <rect x="447" y="205" width="372" height="28" fill="url(#exp-hatch-sandbox)" />
+      <rect x="459" y="209" width="218" height="20" fill="var(--grey-2)" stroke="var(--link)" stroke-width="0.9" />
+      <text x="468" y="223" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Loop B · codemode QuickJS' : '闭环 B · codemode QuickJS 沙箱'}</text>
+      <text x="807" y="223" font-size="9.5" font-weight="700" text-anchor="end" fill="var(--link)">rquickjs</text>
+
+      {/* 脚本调度层 */}
+      <rect x="461" y="244" width="344" height="58" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="473" y="262" font-size="10" font-weight="700" fill="var(--grey-11)">{isEn ? 'Async JS Orchestrator (inlineBudget=3000)' : '异步 JS 编排体（inlineBudget=3000 字符）'}</text>
+      <text x="473" y="279" font-size="9.5" fill="var(--link)">await Promise.all([tools.mcp__a(), tools.read()])</text>
+      <text x="473" y="294" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Built-ins: searchTools / describeTool / store / load' : '内建 searchTools() / describeTool() / store() / load()'}</text>
+
+      {/* 大数据留守隔离区 */}
+      <rect x="461" y="312" width="344" height="94" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.2" stroke-dasharray="4 2" />
+      <rect x="461" y="312" width="344" height="94" fill="url(#exp-hatch-sandbox)" />
+      <rect x="473" y="322" width="320" height="74" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1" />
+      <text x="633" y="341" font-size={isEn ? 10.5 : 11} font-weight="700" text-anchor="middle" fill="var(--link)">{isEn ? '② Digest Large Payloads Inside Sandbox' : '② 大数据留在沙箱内存消化（关键省流）'}</text>
+      <text x="485" y="360" font-size="9.5" fill="var(--grey-10)">{isEn ? '• Filter large files & lists in QuickJS heap' : '• 原始大文件 / 多步列表只在 QuickJS 堆内过滤计算'}</text>
+      <text x="485" y="376" font-size="9.5" fill="var(--grey-10)">{isEn ? '• Calls Direct/Codemode/Deferred; no ModelOnly' : '• 可调用 Direct/Codemode/Deferred；禁止套娃 ModelOnly'}</text>
+      <text x="485" y="391" font-size="9.5" fill="var(--grey-8)">{isEn ? '• Limits: 256 MiB RAM · 1 MiB stack · 120s · 2w' : '• 资源锁：256 MiB 内存 · 1 MiB 栈 · 120s · workers=2'}</text>
+
+      {/* 汇总返回区 */}
+      <rect x="461" y="416" width="344" height="68" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.2" />
+      <text x="473" y="436" font-size={isEn ? 10 : 10.5} font-weight="700" fill="var(--callout-tip-ink)">{isEn ? 'Return Aggregated Summary / structuredContent' : '聚合输出回传模型（Summary / structuredContent）'}</text>
+      <text x="473" y="454" font-size="9.5" fill="var(--grey-11)">{isEn ? 'return / text() / console.log → compact output' : 'return / text() / console.log 汇总为紧凑结果'}</text>
+      <text x="473" y="471" font-size="9.5" fill="var(--grey-9)">{isEn ? 'Logs CodemodeNestedCall spans for /trace audit' : '同步记录 CodemodeNestedCall 耗时轨迹供 /trace 审阅'}</text>
+
+      <rect x="445" y="203" width="4" height="4" fill="var(--link)" />
+      <rect x="817" y="496" width="4" height="4" fill="var(--link)" />
+    </g>
+  </svg>
+</DiagramFrame>

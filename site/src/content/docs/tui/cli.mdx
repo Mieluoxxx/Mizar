@@ -1,0 +1,76 @@
+---
+title: CLI 参数
+description: Mizar 全部 12 个命令行启动参数与按场景组合方式：工作区与权限裁剪、视口审批、会话接续与免持久化模式。
+group: tui-sessions-ref
+order: 9
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+
+命令行参数与 `~/.mizar/settings.json`（见 [配置与优先级](/config/)）互相配合：日常习惯写入配置文件，临时切换仓库、权限档位或会话状态直接带上 CLI 参数覆盖即可。
+
+```bash title="快速查看完整内置参数帮助"
+mizar --help
+```
+
+## 切换工作区与裁剪工具权限
+
+无需先 `cd` 进目标仓库，可用 `-C`（`--workspace`）直接指定工作根目录，并配合预设或通配名单控制开放给模型的工具（详见 [内置工具](/tools/) 与 [权限与安全](/security/)）：
+
+```bash title="工作区与工具裁剪组合"
+# 指定目录并以精简 4 工具模式启动（read / edit / write / bash）
+mizar -C ~/code/payment-service --minimal
+
+# 对陌生仓库使用只读审计，彻底隔离修改类工具
+mizar -C /tmp/audit-repo --read-only
+
+# 精细白名单或补充额外黑名单（黑名单与配置文件累加生效）
+mizar -t read,grep,find -xt mcp__prod__*
+```
+
+| 参数 | 短标志 | 作用 |
+| :--- | :--- | :--- |
+| `--workspace <DIR>` | `-C` | 指定本次会话的工作区根目录 |
+| `--minimal` | — | 仅保留 `read`、`bash`、`edit`、`write` 四件套 |
+| `--read-only` | — | 仅允许 `read`、`grep`、`find` 三个只读工具 |
+| `--tools <LIST>` | `-t` | 逗号分隔的启用工具白名单（支持 `*`） |
+| `--exclude-tools <LIST>` | `-xt` | 逗号分隔的附加屏蔽清单，会与配置文件累加 |
+
+## 控制视口、审批与主题外观
+
+```bash title="交互形态与安全确认组合"
+# Inline 内联视口 + 非只读工具执行前均需手工审批 + 指定粉樱暗色主题
+mizar --inline --approve --theme sakura-dark
+```
+
+| 参数 | 作用 |
+| :--- | :--- |
+| `--inline` | 启动时直接使用保留终端滚动区的 Inline 视口（会话中可用 [`F3`](/tui/) 切换） |
+| `--approve` | 对非只读工具调用（写入、Shell 等）弹出人工审批 confirmation（详见 [权限与安全](/security/)） |
+| `--theme <PRESET>` | 覆盖自动探测的主题，可选 6 套预设之一（详见 [终端主题](/tui/themes/)） |
+
+## 接续会话、免持久化与纯净规则模式
+
+```bash title="会话接续与只读容器启动组合"
+# 自动恢复当前目录最近一次对话
+mizar -c
+
+# 打开交互选择器恢复指定或历史任意会话
+mizar -r
+
+# 容器/脚本一次性执行：不写入 sqlite 历史库，也不加载 AGENTS.md
+mizar --no-persist --no-instructions
+```
+
+| 参数 | 短标志 | 作用 |
+| :--- | :--- | :--- |
+| `--continue` | `-c` | 自动接续当前工作区最近保存的一条会话（详见 [会话、分叉与性能轨迹](/tui/sessions/)） |
+| `--resume [ID]` | `-r [ID]` | 按指定 ID 恢复会话；省略 ID 时弹出最近会话选择框 |
+| `--no-persist` | — | 禁用本次会话写入 `~/.mizar/sessions.sqlite` |
+| `--no-instructions` | — | 跳过扫描并注入 `AGENTS.md` / `CLAUDE.md`（参见 [项目规则](/instructions/)） |
+
+<Callout type="tip">
+
+若想了解启动时的终端背景亮度探测机制以及 `auto`、`mist-dark`、`sakura-dark`、`ansi16` 等 6 套预设配色的细节，请前往 [终端主题](/tui/themes/)。
+
+</Callout>

@@ -1,0 +1,73 @@
+---
+title: Built-in Tools
+description: Explore Mizar's 6 built-in local coding tools, large-output truncation guards, and ToolExposure visibility tiers.
+group: capabilities
+order: 11
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../../components/DiagramEmbed.astro';
+
+Give Mizar a typical engineering task and it automatically chains its built-in tools to investigate, edit, and verify—without manual code copying or ad-hoc scripting:
+
+```text title="Sample conversation"
+You: Check why settings.json fails to write in a read-only container, and add a unit test.
+
+Mizar:
+1. find  → Locate config loading and storage source files
+2. grep  → Search for sessionDb / mkdir failure points
+3. read  → Inspect surrounding error handling and existing test conventions
+4. edit  → Apply a targeted patch to the source file
+5. bash  → Run cargo test to verify the fix passes
+```
+
+## Capabilities & Safeguards of the 6 Built-in Tools
+
+Every built-in tool is designed around one principle: preserve essential signal without blowing out the model's context window in a single turn.
+
+### `read` · Chunked File Reading
+
+Reads files by start and length (`offset` and `limit`). When output exceeds **2,000 lines** or **50 KiB**, it truncates after the leading slice and tells you at the bottom of the output which line number to resume from. Reading a file inside a deep subdirectory also automatically discovers any `AGENTS.md` rules scoped to that directory.
+
+### `grep` & `find` · Directory Scanning & Regex Search
+
+Built on high-speed search primitives that automatically honor `.gitignore` and skip hidden noise directories. By default, `grep` caps results at **100 matches** and truncates individual lines longer than **500 characters** (such as minified files); `find` caps results at **1,000 paths** to avoid flooding context with `node_modules` or `target/`.
+
+### `edit` & `write` · Serialized Safe Mutations
+
+`write` creates or overwrites entire files; `edit` requires an exact context match before applying replacements (supporting multiple edits in a single call and tolerant of minor smart-quote differences). **Consecutive mutations to the same file path are automatically queued and executed serially** so concurrent tool calls never clobber one another.
+
+### `bash` · Local Shell & Large-Output Spooling
+
+Runs builds, tests, and scripts inside a dedicated process group (pressing `Esc` terminates the shell together with all spawned child processes). When stdout / stderr exceeds **2,000 lines** or **50 KiB**:
+
+- `bash` keeps only the **tail** of the latest output so verbose build logs don't crowd out the final error;
+- At the same time, it writes the **complete raw log** to `mizar/mizar-bash-*.log` under the system temp directory and returns that path so you or the model can inspect full details via `read`.
+
+<Callout type="note" title="No hard path isolation by default">
+
+To keep everyday development frictionless, `read`, `edit`, and `bash` can access paths and commands outside the workspace by default. When running inside an untrusted repository, review [Permissions & Security](/en/security/) to configure tool filtering, workspace path confinement, and approval gates.
+
+</Callout>
+
+## Why Connecting Hundreds of Tools Doesn't Blow Up Context
+
+If you attach a hundred external MCP tools and dump all their JSON Schemas into the model context, token costs soar and tool-selection accuracy drops sharply. Mizar assigns each tool an explicit `ToolExposure` visibility tier to balance instant availability against a lean prompt budget:
+
+<DiagramEmbed
+  id="tool-exposure"
+  title="Tool Exposure Tiers & Context Budget Loop"
+  caption="Built-in core tools are directly visible to the model; MCP tools default to on-demand sandbox invocation; discovery and orchestration meta-tools let the model pull definitions as needed."
+/>
+
+From the user's perspective, tools operate in five `ToolExposure` tiers:
+
+1. **Direct (`Direct`)**: Tools like `read`, `edit`, and `bash` are declared to the model from turn one and can be invoked directly.
+2. **Model-only / No nesting (`ModelOnly`)**: Meta-tools such as `tool_search` and `codemode` can be called directly by the model, but cannot be called recursively from inside sandbox scripts.
+3. **Sandbox-only (`Codemode`)**: All MCP server tools default to this tier—consuming zero tokens in the initial turn while remaining batch-callable inside the [Codemode Sandbox](/en/codemode/).
+4. **On-demand discovery (`Deferred`)**: External tools marked `deferred` stay hidden until `tool_search` surfaces them into active scope.
+5. **Hidden (`Hidden`)**: Tools matched by `excludeTools` or configured as `hidden` are invisible to both the model and the sandbox.
+
+## Tool Filtering & Permissions
+
+Not every task needs all tools enabled. You can scope active tools via `toolsPreset` (`all` / `minimal` / `read-only`), the `tools` allowlist (corresponding internally to `includeTools`) and `excludeTools` blocklist in `settings.json`, or CLI flags (`--minimal`, `--read-only`, `-t` / `-xt`), and inspect active tiers anytime with [`/tools`](/en/tui/commands/). See [Permissions & Security](/en/security/) for the full preset matrix, cross-layer union rules, and `--approve` prompts.

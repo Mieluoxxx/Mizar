@@ -1,0 +1,172 @@
+---
+title: 模型与凭据
+description: 在 ~/.mizar/models.json 中配置 DeepSeek、OpenAI、Anthropic 与本地模型服务，并用环境变量或系统钥匙串安全管理密钥。
+group: configuration
+order: 3
+---
+
+import CodeTabs from '../../components/mdx/CodeTabs.astro';
+import Callout from '../../components/mdx/Callout.astro';
+
+export const providersTabs = [
+    {
+      label: 'DeepSeek + OpenAI',
+      lang: 'json',
+      code: `{
+  "providers": {
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "$DEEPSEEK_API_KEY",
+      "models": [
+        { "id": "deepseek-chat", "reasoning": false, "contextWindow": 128000 },
+        { "id": "deepseek-reasoner", "reasoning": true, "contextWindow": 128000 }
+      ]
+    },
+    "openai": {
+      "api": "openai-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "$OPENAI_API_KEY",
+      "models": [
+        { "id": "gpt-5", "reasoning": true, "contextWindow": 272000 }
+      ]
+    }
+  }
+}`,
+    },
+    {
+      label: 'Anthropic Messages',
+      lang: 'json',
+      code: `{
+  "providers": {
+    "anthropic": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "\${ANTHROPIC_API_KEY}",
+      "models": [
+        {
+          "id": "claude-sonnet-4-5",
+          "reasoning": true,
+          "contextWindow": 200000,
+          "maxTokens": 16384
+        }
+      ]
+    }
+  }
+}`,
+    },
+  ];
+
+想持久化多个模型提供方并在会话里用 [`/model`](/tui/commands/) 随时切换，只需创建 `~/.mizar/models.json`（或项目级 `.mizar/models.json`）：
+
+<CodeTabs tabs={providersTabs} />
+
+支持的协议字段可写为 `api` 或 `protocol`，常用值对应三套主流 Wire 协议：
+
+- `openai-completions`（简写 `completions`）：标准 `/chat/completions` 接口，兼容绝大多数第三方与本地推理引擎。
+- `openai-responses`（简写 `responses`，亦兼容 `openai-codex-responses` / `azure-openai-responses`）：OpenAI Responses 流式协议。
+- `anthropic-messages`（简写 `anthropic` / `messages`）：Anthropic `/v1/messages` 协议。
+
+## 安全引用密钥与系统钥匙串
+
+**永远不要把明文 API Key 直接提交到仓库。**在 `models.json` 的 `apiKey` 和自定义 `headers` 中，Mizar 支持三类动态凭据解析：
+
+1. **环境变量引用**：写作 `$VAR` 或 `${VAR}`，或者直接填写 `"apiKeyEnv": "MY_CUSTOM_KEY"`。此外 `baseUrl` 中也支持 `${VAR}` 展开（适合切换企业内网或区域网关）。
+2. **命令行动态读取（推荐配合系统钥匙串）**：值以 `!` 开头时，Mizar 会在真正发起模型请求前通过 `sh -c` 执行该命令，并自动去掉标准输出末尾换行符。
+
+下面是一个把密钥存进 macOS Keychain、不在磁盘留明文的真实写法：
+
+```bash title="将密钥存入 macOS Keychain"
+security add-generic-password -a "$USER" -s "mizar-deepseek" -w "sk-your-key-here"
+```
+
+```json title="在 ~/.mizar/models.json 中从钥匙串按需读取"
+{
+  "providers": {
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "!security find-generic-password -a \\"$USER\\" -s mizar-deepseek -w",
+      "models": [{ "id": "deepseek-chat" }]
+    }
+  }
+}
+```
+
+如果凭据或 Header 本身就带有字面量 `$` 或以 `!` 开头，使用以下转义规则避免被误解析：
+
+- 字面量 `$` 写成 `$$`（例如 `token-$$123` 解析后为 `token-$123`）。
+- 以字面量 `!` 开头的字符串写成 `$!`（例如 `$!literal` 解析后为 `!literal`）。
+
+<Callout type="warning" title="环境变量缺失不会静默透传">
+  如果引用的环境变量未设置或为空，或者 <code>!command</code> 返回非零退出码，Mizar 会在请求阶段直接报告凭据缺失错误，绝不会把未展开的 <code>$VAR</code> 字符串当作 Bearer Token 发往上游服务器。
+</Callout>
+
+## 环境变量直连与覆盖规则
+
+在临时调试、CI 脚本或切换测试环境时，环境变量可以跳过或覆盖配置文件中的路由：
+
+- **通用直连（最高优先级）**：一旦设置了 `API_KEY`，Mizar 会直接构造一个名为 `default` 的活跃通道（无论是否已有 `models.json`），并用 `PROTOCOL`（默认 `completions`）、`BASE_URL` 与 `MODEL` 组装它。
+- **局部覆盖现有配置**：如果已有 `models.json` 且未设置 `API_KEY`，单独导出 `BASE_URL` 或 `MODEL` 会精准覆写当前默认通道的地址或模型 ID，而无需改写配置文件。
+- **零配置自动探测**：若尚未创建任何 `models.json` 提供方，Mizar 会自动检查 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`，命中即自动装配对应协议并连线。
+
+```bash title="零配置文件临时切换网关"
+API_KEY="sk-test" PROTOCOL="anthropic" BASE_URL="https://proxy.internal" MODEL="claude-sonnet-4-5" mizar
+```
+
+## 接入本地 Ollama / vLLM
+
+本地推理服务大多暴露 OpenAI Chat Completions 兼容接口且不强制鉴权，配置如下即可接入：
+
+```json title="Ollama / vLLM 本地模型示例"
+{
+  "providers": {
+    "ollama": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "apiKey": "ollama",
+      "compat": {
+        "thinkingFormat": "qwen",
+        "supportsUsageInStreaming": true
+      },
+      "models": [
+        {
+          "id": "qwen2.5-coder:32b",
+          "name": "Qwen 2.5 Coder 32B",
+          "reasoning": false,
+          "contextWindow": 32768
+        }
+      ]
+    }
+  }
+}
+```
+
+对于无需鉴权头或使用非 Bearer 头的私有网关，还可以搭配提供方级别的 `"authHeader": false` 或 `"useBearerAuth": false`。
+
+## 场景化模型微调（`modelOverrides` 与按档调参）
+
+项目仓库常常希望沿用个人 `~/.mizar/models.json` 定义好的连接信息，只针对特定模型覆写上下文窗口或推理档位采样参数。此时把 `modelOverrides` 写进项目 `.mizar/models.json` 即可按 `models[].id` 自动叠加：
+
+```json title="为推理模型按思考档位匹配采样参数"
+{
+  "providers": {
+    "openai": {
+      "modelOverrides": {
+        "gpt-5": {
+          "reasoningEfforts": ["low", "medium", "high"],
+          "samplingParamsByThinkingLevel": {
+            "low": { "temperature": 0.2, "maxTokens": 4096 },
+            "high": { "temperature": 0.6, "maxTokens": 16384 }
+          },
+          "compat": {
+            "maxTokensField": "maxCompletionTokens"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+常用的 `compat` 兼容字段还包括 `thinkingFormat`（`none` / `deepseek` / `openai` / `openrouter` / `qwen`）、`forceAdaptiveThinking`、`sendSessionAffinityHeaders` 与 `supportsMaxOutputTokens`，用以适配不同兼容网关的细微差异。

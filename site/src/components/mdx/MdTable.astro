@@ -1,0 +1,14 @@
+---
+import { getUiStrings } from '../../data/i18n';
+import { getLocaleFromUrl } from '../../lib/url';
+
+const props = Astro.props;
+const locale = getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+---
+
+<div class="docs-table-scroll" tabindex="0" role="region" aria-label={ui.tableRegionAria}>
+  <table {...props}>
+    <slot />
+  </table>
+</div>

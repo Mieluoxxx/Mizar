@@ -1,0 +1,26 @@
+---
+import { getUiStrings } from '../data/i18n';
+import { docHref, getLocaleFromUrl, type Locale } from '../lib/url';
+
+interface Props {
+  locale?: Locale;
+}
+
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+---
+
+<div data-component="brand-lockup">
+  <a
+    data-slot="logo-link"
+    href={docHref('intro', locale)}
+    aria-label={ui.brandHomeAria}
+  >
+    <svg width="20" height="25" viewBox="0 0 20 25" fill="none" aria-hidden="true">
+      <rect x="0" y="0" width="20" height="25" fill="var(--text-strong)" />
+      <path d="M3 4H17V21H14V8.5L10 13.5L6 8.5V21H3V4Z" fill="var(--bg)" />
+      <rect x="8.5" y="15" width="3" height="6" fill="var(--grey-7)" />
+    </svg>
+    <span data-slot="wordmark">{ui.brandWordmark}</span>
+  </a>
+</div>

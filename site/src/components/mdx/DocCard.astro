@@ -1,0 +1,20 @@
+---
+import { docHref, getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  title: string;
+  description: string;
+  slug?: string;
+  href?: string;
+  locale?: Locale;
+}
+
+const { title, description, slug, href } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const targetHref = href || (slug ? docHref(slug, locale) : '#');
+---
+
+<a data-component="docs-card" href={targetHref}>
+  <strong>{title}</strong>
+  <div>{description}</div>
+</a>

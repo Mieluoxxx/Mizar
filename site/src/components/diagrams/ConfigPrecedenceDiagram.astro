@@ -1,0 +1,241 @@
+---
+import DiagramFrame from './DiagramFrame.astro';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  caption?: string;
+  locale?: Locale;
+}
+
+const { caption } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const isEn = locale === 'en';
+---
+
+<DiagramFrame
+  fig="FIG 01"
+  title={isEn ? 'Four-Tier Config Precedence & Dual-Track Merge' : '四级配置叠加优先级与双轨合并规则'}
+  caption={caption}
+  locale={locale}
+>
+  <svg
+    viewBox="0 0 840 500"
+    width="840"
+    height="500"
+    role="img"
+    aria-label={isEn
+      ? 'Mizar four-tier config precedence (global dir, workspace dir, env vars, CLI flags) with scalar override and union-append merge paths'
+      : 'Mizar 四级配置叠加优先级（全局目录、工作区目录、环境变量、CLI 参数）与标量覆盖、并集追加双轨合并流程图'}
+  >
+    <defs>
+      <pattern id="cfg-hatch-scalar" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--link)" stroke-width="1" stroke-opacity="0.24" />
+      </pattern>
+      <pattern id="cfg-hatch-union" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--status-ok)" stroke-width="1" stroke-opacity="0.24" />
+      </pattern>
+      <marker id="cfg-arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--grey-9)" />
+      </marker>
+      <marker id="cfg-arr-link" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--link)" />
+      </marker>
+      <marker id="cfg-arr-ok" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--status-ok)" />
+      </marker>
+    </defs>
+
+    {/* 顶部四级优先级标题 */}
+    <text x="21" y="15" font-size="10.5" fill="var(--grey-8)" letter-spacing="0.06em">
+      {isEn
+        ? 'PRECEDENCE CHAIN · LOWEST ─────────────────────────────▶ HIGHEST PRIORITY'
+        : 'PRECEDENCE CHAIN · 低优先级 ─────────────────────────▶ 最高运行时优先级'}
+    </text>
+
+    {/* L1: 全局目录 */}
+    <g>
+      <rect x="21" y="24" width="180" height="122" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <rect x="21" y="24" width="180" height="26" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="33" y="41" font-size="11" font-weight="700" fill="var(--grey-11)">{isEn ? 'L1 Global' : 'L1 全局默认'}</text>
+      <text x="189" y="41" font-size="10" text-anchor="end" fill="var(--grey-8)">LOW</text>
+      <text x="33" y="70" font-size="12" font-weight="600" fill="var(--grey-11)">~/.mizar/</text>
+      <text x="33" y="88" font-size="10.5" fill="var(--grey-8)">{isEn ? 'Set via MIZAR_HOME' : 'MIZAR_HOME 可重定向'}</text>
+      <text x="33" y="109" font-size="10.5" fill="var(--link)">settings · models · mcp</text>
+      <text x="33" y="130" font-size="10.5" fill="var(--grey-9)">defaultModel: "gpt-4o"</text>
+      <rect x="19" y="22" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+      <rect x="199" y="144" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+
+    {/* L1 -> L2 */}
+    <line x1="203" y1="85" x2="224" y2="85" stroke="var(--grey-9)" stroke-width="1.3" marker-end="url(#cfg-arr-ink)" />
+
+    {/* L2: 工作区目录 */}
+    <g>
+      <rect x="227" y="24" width="180" height="122" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <rect x="227" y="24" width="180" height="26" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="239" y="41" font-size="11" font-weight="700" fill="var(--grey-11)">{isEn ? 'L2 Workspace' : 'L2 项目工作区'}</text>
+      <text x="395" y="41" font-size="10" text-anchor="end" fill="var(--grey-8)">PROJECT</text>
+      <text x="239" y="70" font-size="11.5" font-weight="600" fill="var(--grey-11)">{'<workspace>/.mizar/'}</text>
+      <text x="239" y="88" font-size="10.5" fill="var(--grey-8)">{isEn ? 'Project-local overrides' : '项目内局部覆盖与追加'}</text>
+      <text x="239" y="109" font-size="10.5" fill="var(--link)">toolsPreset: "minimal"</text>
+      <text x="239" y="130" font-size="10.5" fill="var(--grey-9)">excludeTools: ["bash"]</text>
+      <rect x="225" y="22" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+
+    {/* L2 -> L3 */}
+    <line x1="409" y1="85" x2="430" y2="85" stroke="var(--grey-9)" stroke-width="1.3" marker-end="url(#cfg-arr-ink)" />
+
+    {/* L3: 环境变量 */}
+    <g>
+      <rect x="433" y="24" width="180" height="122" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <rect x="433" y="24" width="180" height="26" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="445" y="41" font-size="11" font-weight="700" fill="var(--grey-11)">{isEn ? 'L3 Env Vars' : 'L3 环境变量'}</text>
+      <text x="601" y="41" font-size="10" text-anchor="end" fill="var(--grey-8)">ENV</text>
+      <text x="445" y="70" font-size="11" font-weight="600" fill="var(--grey-11)">{isEn ? 'Runtime Env Overrides' : '运行时环境变量覆写'}</text>
+      <text x="445" y="88" font-size="9.8" fill="var(--grey-8)">API_KEY · MODEL · BASE_URL</text>
+      <text x="445" y="109" font-size="10.5" fill="var(--link)">PROTOCOL · WORKSPACE</text>
+      <text x="445" y="130" font-size="10.5" fill="var(--grey-9)">MIZAR_SESSION_DB</text>
+      <rect x="431" y="22" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+
+    {/* L3 -> L4 */}
+    <line x1="615" y1="85" x2="636" y2="85" stroke="var(--link)" stroke-width="1.4" marker-end="url(#cfg-arr-link)" />
+
+    {/* L4: CLI 启动参数 */}
+    <g>
+      <rect x="639" y="24" width="180" height="122" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.5" />
+      <rect x="639" y="24" width="180" height="26" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.5" />
+      <text x="651" y="41" font-size="11" font-weight="700" fill="var(--grey-11)">{isEn ? 'L4 CLI Flags' : 'L4 CLI 启动参数'}</text>
+      <text x="807" y="41" font-size="10" font-weight="700" text-anchor="end" fill="var(--link)">HIGH</text>
+      <text x="651" y="70" font-size="12" font-weight="600" fill="var(--grey-11)">mizar [FLAGS]</text>
+      <text x="651" y="88" font-size="10.5" fill="var(--grey-8)">--minimal / --read-only</text>
+      <text x="651" y="109" font-size="10.5" fill="var(--link)">-t / -xt / -C / --approve</text>
+      <text x="651" y="130" font-size="10.5" fill="var(--grey-9)">--no-persist / --inline</text>
+      <rect x="637" y="22" width="4" height="4" fill="var(--link)" />
+      <rect x="817" y="144" width="4" height="4" fill="var(--link)" />
+    </g>
+
+    {/* 中部合并总线 */}
+    <path d="M 111 146 V 168 H 729 V 146" fill="none" stroke="var(--border-strong)" stroke-width="1.2" />
+    <line x1="317" y1="146" x2="317" y2="168" stroke="var(--border-strong)" stroke-width="1.2" />
+    <line x1="523" y1="146" x2="523" y2="168" stroke="var(--border-strong)" stroke-width="1.2" />
+    <rect x="109" y="144" width="4" height="4" fill="var(--grey-8)" />
+    <rect x="315" y="144" width="4" height="4" fill="var(--grey-8)" />
+    <rect x="521" y="144" width="4" height="4" fill="var(--grey-8)" />
+    <rect x="727" y="144" width="4" height="4" fill="var(--link)" />
+
+    {/* 从总线分流到双轨 */}
+    <path d="M 215 168 V 196" fill="none" stroke="var(--link)" stroke-width="1.4" marker-end="url(#cfg-arr-link)" />
+    <path d="M 625 168 V 196" fill="none" stroke="var(--status-ok)" stroke-width="1.4" marker-end="url(#cfg-arr-ok)" />
+
+    <rect x="312" y="157" width="216" height="21" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+    <text x="420" y="171" font-size="10.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">
+      {isEn ? 'Dual-Track Merge Dispatch' : '双轨合并策略分发'}
+    </text>
+
+    {/* 轨道 A：标量覆盖 */}
+    <g>
+      <rect x="21" y="200" width="388" height="162" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.35" />
+      <rect x="21" y="200" width="388" height="28" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.35" />
+      <rect x="21" y="200" width="388" height="28" fill="url(#cfg-hatch-scalar)" />
+      <rect x="33" y="204" width="224" height="20" fill="var(--grey-2)" stroke="var(--link)" stroke-width="0.9" />
+      <text x="42" y="218" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Track A · Scalar Override' : '轨 A · 标量覆盖（后者胜出）'}</text>
+      <text x="396" y="218" font-size="10" font-weight="700" text-anchor="end" fill="var(--link)">LAST-WRITE-WINS</text>
+
+      {/* 级联槽位示意 */}
+      <rect x="35" y="242" width="84" height="44" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 2" />
+      <text x="77" y="259" font-size="10" text-anchor="middle" fill="var(--grey-8)">{isEn ? 'L1 Global' : 'L1 全局'}</text>
+      <text x="77" y="276" font-size="10.5" text-anchor="middle" fill="var(--grey-8)" text-decoration="line-through">"gpt-4o"</text>
+
+      <line x1="121" y1="264" x2="133" y2="264" stroke="var(--grey-8)" stroke-width="1.1" marker-end="url(#cfg-arr-ink)" />
+
+      <rect x="135" y="242" width="88" height="44" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" stroke-dasharray="3 2" />
+      <text x="179" y="259" font-size="10" text-anchor="middle" fill="var(--grey-8)">{isEn ? 'L2 Project' : 'L2 项目'}</text>
+      <text x="179" y="276" font-size="10" text-anchor="middle" fill="var(--grey-9)">"minimal"</text>
+
+      <line x1="225" y1="264" x2="237" y2="264" stroke="var(--grey-8)" stroke-width="1.1" marker-end="url(#cfg-arr-ink)" />
+
+      <rect x="239" y="242" width="72" height="44" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="275" y="259" font-size="10" text-anchor="middle" fill="var(--grey-8)">L3/L4</text>
+      <text x="275" y="276" font-size="10" text-anchor="middle" fill="var(--grey-10)">$MODEL</text>
+
+      <line x1="313" y1="264" x2="325" y2="264" stroke="var(--link)" stroke-width="1.3" marker-end="url(#cfg-arr-link)" />
+
+      <rect x="327" y="242" width="68" height="44" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.3" />
+      <text x="361" y="260" font-size="10.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Active' : '生效'}</text>
+      <text x="361" y="277" font-size="9.5" text-anchor="middle" fill="var(--link)">{isEn ? 'Override' : '单值覆盖'}</text>
+
+      {/* 典型字段 */}
+      <rect x="35" y="300" width="360" height="48" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="47" y="319" font-size="10" font-weight="600" fill="var(--grey-11)">{isEn ? 'Scalar fields:' : '典型标量字段：'}</text>
+      <text x={isEn ? 140 : 135} y="319" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-9)">defaultModel · toolsPreset · maxSteps</text>
+      <text x="47" y="337" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-8)">reasoningEffort · restrictToWorkspace · sessionDb</text>
+
+      <rect x="19" y="198" width="4" height="4" fill="var(--link)" />
+      <rect x="407" y="360" width="4" height="4" fill="var(--link)" />
+    </g>
+
+    {/* 轨道 B：并集追加去重 */}
+    <g>
+      <rect x="431" y="200" width="388" height="162" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1.35" />
+      <rect x="431" y="200" width="388" height="28" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.35" />
+      <rect x="431" y="200" width="388" height="28" fill="url(#cfg-hatch-union)" />
+      <rect x="443" y="204" width="236" height="20" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="0.9" />
+      <text x="452" y="218" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Track B · Union Append (Dedup)' : '轨 B · 并集追加去重（累加保留）'}</text>
+      <text x="806" y="218" font-size="10" font-weight="700" text-anchor="end" fill="var(--callout-tip-ink)">UNION APPEND</text>
+
+      {/* 三来源并入 */}
+      <rect x="445" y="238" width="122" height="18" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="453" y="251" font-size="10" fill="var(--grey-10)">L1: "mcp__prod__*"</text>
+
+      <rect x="445" y="260" width="122" height="18" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="453" y="273" font-size="10" fill="var(--grey-10)">L2: "bash"</text>
+
+      <rect x="445" y="282" width="122" height="18" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="453" y="295" font-size="10" fill="var(--grey-10)">L4: -xt "rm_*"</text>
+
+      {/* 汇合线 */}
+      <path d="M 567 247 H 592 V 291 H 567" fill="none" stroke="var(--status-ok)" stroke-width="1.2" />
+      <line x1="567" y1="269" x2="612" y2="269" stroke="var(--status-ok)" stroke-width="1.3" marker-end="url(#cfg-arr-ok)" />
+
+      {/* 并集结果框 */}
+      <rect x="615" y="238" width="190" height="62" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.3" />
+      <text x="710" y="256" font-size="10" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? 'Deduped Union · Additive' : '去重并集 · 不清空前级'}</text>
+      <text x="710" y="274" font-size="10" text-anchor="middle" fill="var(--grey-11)">["mcp__prod__*", "bash",</text>
+      <text x="710" y="290" font-size="10" text-anchor="middle" fill="var(--grey-11)">"rm_*"]</text>
+
+      {/* 适用字段 */}
+      <rect x="445" y="308" width="360" height="40" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="457" y="325" font-size="10" font-weight="600" fill="var(--grey-11)">{isEn ? 'Union fields:' : '并集字段：'}</text>
+      <text x={isEn ? 542 : 518} y="325" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-9)">{isEn ? 'excludeTools (Global + Proj + -xt)' : 'excludeTools（全局 + 项目 + CLI -xt）'}</text>
+      <text x="457" y="341" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-8)">{isEn ? 'skills.customDirs (Global + Project deduped)' : 'skills.customDirs（全局 + 项目去重追加）'}</text>
+
+      <rect x="429" y="198" width="4" height="4" fill="var(--status-ok)" />
+      <rect x="817" y="360" width="4" height="4" fill="var(--status-ok)" />
+    </g>
+
+    {/* 双轨汇入底部运行时装配 */}
+    <path d="M 215 362 V 382" fill="none" stroke="var(--link)" stroke-width="1.3" marker-end="url(#cfg-arr-link)" />
+    <path d="M 625 362 V 382" fill="none" stroke="var(--status-ok)" stroke-width="1.3" marker-end="url(#cfg-arr-ok)" />
+
+    {/* 底部规则：Strict JSON 与 Router 解析 */}
+    <g>
+      <rect x="21" y="386" width="388" height="92" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <rect x="21" y="386" width="388" height="24" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="33" y="402" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Strict JSON Parsing (Validated at Startup)' : 'Strict JSON 解析规则（启动强校验）'}</text>
+      <text x="33" y="430" font-size={isEn ? 10 : 11} fill="var(--callout-tip-ink)">{isEn ? '✓ Strips UTF-8 BOM' : '✓ 自动剥离 UTF-8 BOM'}</text>
+      <text x={isEn ? 195 : 210} y="430" font-size={isEn ? 10 : 11} fill="var(--callout-danger-ink)">{isEn ? '✕ No JSONC / trailing commas' : '✕ 禁止 JSONC 注释 / 尾逗号'}</text>
+      <text x="33" y="452" font-size={isEn ? 9.8 : 10.5} fill="var(--grey-9)">{isEn ? 'Syntax errors report file path & line in top banner' : '格式有误时在启动顶部通知栏明示路径与行号'}</text>
+      <text x="33" y="468" font-size={isEn ? 9.5 : 10} fill="var(--grey-8)">{isEn ? 'Merged config drives runtime defaults & safety rules' : '合并结果统一装配至运行时默认策略与安全边界'}</text>
+    </g>
+
+    <g>
+      <rect x="431" y="386" width="388" height="92" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <rect x="431" y="386" width="388" height="24" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="443" y="402" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Model Routing & Credential Resolution' : '模型路由与凭据解析顺序'}</text>
+      <text x="443" y="430" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-10)">{isEn ? '1. Explicit API_KEY or keyless models.json → direct route' : '1. 显式 API_KEY 或无 models.json 密钥 → 构造直连路由'}</text>
+      <text x="443" y="449" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-9)">{isEn ? '2. models.json resolves $VAR / ${VAR} / !command' : '2. models.json 支持 $VAR / ${VAR} / !command 动态读取'}</text>
+      <text x="443" y="468" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-8)">{isEn ? '3. None configured → fallback to offline demo (mock-v1)' : '3. 均未配置 → 自动回退离线演示模式 (mock-v1)'}</text>
+    </g>
+  </svg>
+</DiagramFrame>

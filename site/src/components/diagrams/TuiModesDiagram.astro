@@ -1,0 +1,235 @@
+---
+import DiagramFrame from './DiagramFrame.astro';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  caption?: string;
+  locale?: Locale;
+}
+
+const { caption } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const isEn = locale === 'en';
+---
+
+<DiagramFrame
+  fig="FIG 02"
+  title={isEn ? 'TUI Dual Workbench: Fullscreen vs Inline' : 'TUI 双模工作台：Fullscreen vs Inline'}
+  caption={caption}
+  locale={locale}
+>
+  <svg
+    viewBox="0 0 840 495"
+    width="840"
+    height="495"
+    role="img"
+    aria-label={isEn
+      ? 'Mizar TUI dual-mode architecture: Fullscreen dual-pane workbench with TimelineRail on the left, Inline native scrollback with compact bottom viewport on the right, and F3/F2 runtime hot-switching in the center'
+      : 'Mizar TUI 双模工作台架构图：左侧 Fullscreen 默认双栏工作台与 TimelineRail，右侧 Inline 终端原生滚动归档与底部紧凑视口，中间 F3 与 F2 切换控制'}
+  >
+    <defs>
+      <pattern id="tui-hatch-term" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--status-ok)" stroke-width="1" stroke-opacity="0.20" />
+      </pattern>
+      <pattern id="tui-hatch-panel" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="5" stroke="var(--link)" stroke-width="0.9" stroke-opacity="0.18" />
+      </pattern>
+      <marker id="tui-arr-link" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--link)" />
+      </marker>
+      <marker id="tui-arr-link-rev" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 9 1.5 L 1.5 5 L 9 8.5 Z" fill="var(--link)" />
+      </marker>
+      <marker id="tui-arr-ok" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--status-ok)" />
+      </marker>
+    </defs>
+
+    {/* 左侧：Fullscreen 默认工作台 */}
+    <g>
+      <rect x="21" y="20" width="406" height="374" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="21" y="20" width="406" height="28" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <text x="33" y="38" font-size={isEn ? 11 : 11.5} font-weight="700" fill="var(--grey-11)">{isEn ? 'Fullscreen Workbench (Alternate Screen)' : 'Fullscreen 默认工作台 (Alternate Screen)'}</text>
+      <text x="415" y="38" font-size="10" font-weight="700" text-anchor="end" fill="var(--link)">DEFAULT</text>
+
+      {/* 内部终端布局外框 */}
+      <rect x="31" y="58" width="386" height="300" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1.1" />
+
+      {/* 左侧对话主区 */}
+      <rect x="31" y="58" width="222" height="214" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="41" y="75" font-size="10" font-weight="700" fill="var(--grey-8)">{isEn ? 'TRANSCRIPT (Virtualized)' : 'TRANSCRIPT (虚拟化渲染)'}</text>
+
+      {/* 用户消息块 */}
+      <rect x="41" y="84" width="202" height="28" fill="var(--grey-2)" stroke="var(--border)" stroke-width="1" />
+      <rect x="41" y="84" width="3" height="28" fill="var(--link)" />
+      <text x="51" y="102" font-size={isEn ? 10 : 10.5} fill="var(--grey-11)">{isEn ? 'USER: Refactor config merge' : 'USER: 重构 config 合并测试'}</text>
+
+      {/* 助手与工具块 */}
+      <rect x="41" y="120" width="202" height="72" fill="var(--grey-2)" stroke="var(--border)" stroke-width="1" />
+      <rect x="41" y="120" width="3" height="72" fill="var(--status-ok)" />
+      <text x="51" y="137" font-size="10" font-weight="600" fill="var(--grey-10)">ASST · Thinking + Markdown</text>
+      <rect x="51" y="145" width="182" height="22" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="0.9" />
+      <text x="59" y="160" font-size="10" fill="var(--callout-tip-ink)">● read config.rs [Done]</text>
+      <text x="51" y="183" font-size={isEn ? 9.5 : 10} fill="var(--grey-8)">{isEn ? 'Word-diff · pi-emphasis cues' : '词级 Diff · pi-emphasis 高亮'}</text>
+
+      {/* 第二个 Turn 块 */}
+      <rect x="41" y="200" width="202" height="58" fill="var(--grey-2)" stroke="var(--border)" stroke-width="1" />
+      <text x="51" y="218" font-size={isEn ? 9.5 : 10} fill="var(--grey-10)">{isEn ? 'ASST: Updated config merge' : 'ASST: 已更新配置合并逻辑'}</text>
+      <text x="51" y="236" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Ctrl+O expand thinking & args' : 'Ctrl+O 展开思考与完整参数'}</text>
+      <text x="51" y="250" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Ctrl+T open /trace profiler' : 'Ctrl+T 跳转全屏轨迹分析'}</text>
+
+      {/* 2 列 TimelineRail 轨道 */}
+      <rect x="253" y="58" width="22" height="214" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <line x1="264" y1="92" x2="264" y2="212" stroke="var(--border-strong)" stroke-width="1" stroke-dasharray="2 2" />
+      <text x="264" y="84" font-size="10" text-anchor="middle" fill="var(--grey-8)">▲</text>
+      <circle cx="264" cy="112" r="2.2" fill="var(--grey-7)" />
+      <circle cx="264" cy="142" r="3.6" fill="var(--link)" />
+      <circle cx="264" cy="172" r="2.2" fill="var(--grey-7)" />
+      <circle cx="264" cy="196" r="2.2" fill="var(--grey-7)" />
+      <text x="264" y="224" font-size="10" text-anchor="middle" fill="var(--grey-8)">▼</text>
+      <text x="264" y="248" font-size="8.5" text-anchor="middle" fill="var(--link)">Rail</text>
+      <text x="264" y="260" font-size={isEn ? 7.8 : 8.5} text-anchor="middle" fill="var(--grey-8)">{isEn ? '2col' : '2列'}</text>
+
+      {/* 底部输入栏 + 状态栏 */}
+      <rect x="31" y="274" width="244" height="56" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.1" />
+      <text x="41" y="293" font-size="10.5" fill="var(--grey-11)">&gt; @src/app.rs#L12-18 ...</text>
+      <text x="41" y="313" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Tab: effort · /: cmd · !/!!: Bash' : 'Tab: effort · /: 命令 · !/!!: Bash'}</text>
+
+      <rect x="31" y="332" width="244" height="26" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="41" y="349" font-size="9.5" fill="var(--grey-10)">deepseek · auto · ↑4.2k · 68t/s</text>
+
+      {/* 可拖拽 1 列分割线 */}
+      <rect x="275" y="58" width="12" height="300" fill="url(#tui-hatch-panel)" />
+      <line x1="281" y1="58" x2="281" y2="358" stroke="var(--link)" stroke-width="1.4" />
+      <text x="281" y="84" font-size="10" text-anchor="middle" fill="var(--link)">├</text>
+      <text x="281" y="336" font-size="10" text-anchor="middle" fill="var(--link)">├</text>
+      <rect x="268" y="198" width="26" height="16" fill="var(--grey-2)" stroke="var(--link)" stroke-width="0.9" />
+      <text x="281" y="209" font-size="9" font-weight="700" text-anchor="middle" fill="var(--link)">⇄</text>
+
+      {/* 右侧 Ctrl+B 分栏面板 */}
+      <rect x="287" y="58" width="130" height="300" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1" />
+      <rect x="287" y="58" width="130" height="24" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="293" y="74" font-size="9.5" font-weight="700" fill="var(--link)">Ctx</text>
+      <text x="321" y="74" font-size="9.5" fill="var(--grey-8)">File</text>
+      <text x="353" y="74" font-size="9.5" fill="var(--grey-8)">Tool</text>
+      <text x="387" y="74" font-size="9.5" fill="var(--grey-8)">Stat</text>
+      <line x1="291" y1="81" x2="315" y2="81" stroke="var(--link)" stroke-width="2" />
+
+      {/* 5 段上下文条 */}
+      <text x="295" y="102" font-size="9.5" font-weight="600" fill="var(--grey-11)">Context 38%</text>
+      <rect x="295" y="110" width="20" height="10" fill="var(--link)" />
+      <rect x="316" y="110" width="18" height="10" fill="var(--status-ok)" />
+      <rect x="335" y="110" width="14" height="10" fill="var(--status-degraded)" />
+      <rect x="350" y="110" width="10" height="10" fill="var(--grey-8)" />
+      <rect x="361" y="110" width="46" height="10" fill="var(--grey-4)" stroke="var(--border)" stroke-width="0.8" />
+
+      <text x="295" y="144" font-size="9.5" fill="var(--grey-9)">TTFT: 280 ms</text>
+      <text x="295" y="162" font-size="9.5" fill="var(--grey-9)">TPS : 68.4 t/s</text>
+      <line x1="295" y1="178" x2="409" y2="178" stroke="var(--border)" stroke-width="1" />
+      <text x="295" y="198" font-size="9.5" font-weight="600" fill="var(--grey-10)">{isEn ? 'Drag resize (^B)' : '拖拽调宽 (Ctrl+B)'}</text>
+      <text x="295" y="216" font-size="9" fill="var(--grey-8)">{isEn ? '42 cols def · min 30' : '默认 42 列 · 最小 30'}</text>
+      <text x="295" y="234" font-size="9" fill="var(--grey-8)">{isEn ? 'Shown at ≥ 96 cols' : '终端 ≥ 96 列时显示'}</text>
+      <text x="295" y="252" font-size="9" fill="var(--grey-8)">{isEn ? 'Auto-hide if narrow' : '窄屏自动退回单栏'}</text>
+
+      <rect x="295" y="276" width="114" height="68" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="303" y="296" font-size={isEn ? 9 : 9.5} font-weight="600" fill="var(--grey-11)">{isEn ? 'TimelineRail Rules' : 'TimelineRail 条件'}</text>
+      <text x="303" y="314" font-size={isEn ? 8.5 : 9} fill="var(--grey-8)">{isEn ? 'w ≥ 60 & ≥ 2 turns' : '宽 ≥ 60 列且 ≥ 2 轮'}</text>
+      <text x="303" y="331" font-size={isEn ? 8.5 : 9} fill="var(--grey-8)">{isEn ? 'Click jumps to turn' : '鼠标点击直跳用户轮'}</text>
+
+      {/* 底部注脚 */}
+      <text x="224" y="380" font-size={isEn ? 9 : 9.5} text-anchor="middle" fill="var(--grey-9)">
+        {isEn
+          ? 'mouse_capture=true · in-app drag selection & double-click copy'
+          : '启用鼠标捕捉 (mouse_capture=true) · 支持应用内拖拽选区与双击取词'}
+      </text>
+
+      <rect x="19" y="18" width="4" height="4" fill="var(--link)" />
+      <rect x="425" y="392" width="4" height="4" fill="var(--link)" />
+    </g>
+
+    {/* 中间切换桥：F3 与 F2 */}
+    <g>
+      <line x1="429" y1="145" x2="505" y2="145" stroke="var(--link)" stroke-width="1.4" marker-start="url(#tui-arr-link-rev)" marker-end="url(#tui-arr-link)" />
+      <rect x="435" y="108" width="66" height="72" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.2" />
+      <text x="468" y="128" font-size="12" font-weight="700" text-anchor="middle" fill="var(--link)">F3</text>
+      <text x="468" y="146" font-size="10" text-anchor="middle" fill="var(--grey-10)">/view</text>
+      <text x="468" y="167" font-size={isEn ? 9 : 9.5} text-anchor="middle" fill="var(--grey-8)">{isEn ? 'Hot Switch' : '模式热切'}</text>
+
+      <line x1="429" y1="265" x2="505" y2="265" stroke="var(--status-ok)" stroke-width="1.3" stroke-dasharray="3 2" marker-end="url(#tui-arr-ok)" />
+      <rect x="435" y="228" width="66" height="72" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1.2" />
+      <text x="468" y="248" font-size="12" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">F2</text>
+      <text x="468" y="266" font-size="10" text-anchor="middle" fill="var(--grey-10)">/mouse</text>
+      <text x="468" y="287" font-size={isEn ? 8.5 : 9.5} text-anchor="middle" fill="var(--grey-8)">{isEn ? 'Text Select' : '原生划词'}</text>
+    </g>
+
+    {/* 右侧：Inline 行内模式 */}
+    <g>
+      <rect x="509" y="20" width="310" height="374" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1.4" />
+      <rect x="509" y="20" width="310" height="28" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.4" />
+      <text x="521" y="38" font-size={isEn ? 11 : 11.5} font-weight="700" fill="var(--grey-11)">{isEn ? 'Inline Mode (--inline)' : 'Inline 行内模式 (--inline)'}</text>
+      <text x="807" y="38" font-size="10" font-weight="700" text-anchor="end" fill="var(--callout-tip-ink)">SCROLLBACK</text>
+
+      {/* 上半部分：终端原生滚动区 */}
+      <rect x="519" y="58" width="290" height="166" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.1" stroke-dasharray="4 2" />
+      <rect x="519" y="58" width="290" height="166" fill="url(#tui-hatch-term)" />
+
+      <rect x="529" y="66" width="270" height="22" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1" />
+      <text x="664" y="81" font-size="10.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? 'Native Terminal Scrollback' : '终端原生滚动区 (Native Scrollback)'}</text>
+
+      <rect x="529" y="96" width="270" height="44" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="541" y="114" font-size="10" font-weight="600" fill="var(--grey-11)">{isEn ? 'Turn #1 [Flushed to scrollback]' : 'Turn #1 [已归档上推至原生终端]'}</text>
+      <text x="541" y="131" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Native scrollbar, Cmd+F & free selection' : '支持终端原生滚动条、Cmd+F 与自由划词'}</text>
+
+      <rect x="529" y="148" width="270" height="44" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="541" y="166" font-size="10" font-weight="600" fill="var(--grey-11)">{isEn ? 'Turn #2 [Flushed to scrollback]' : 'Turn #2 [已归档上推至原生终端]'}</text>
+      <text x="541" y="183" font-size={isEn ? 8.5 : 9.5} fill="var(--grey-8)">{isEn ? '! / !! local bash outputs persist in scrollback' : '! / !! 本地命令结果同样永久保留在滚回区'}</text>
+
+      <rect x="564" y="198" width="200" height="18" fill="var(--grey-2)" stroke="var(--border)" stroke-width="0.9" />
+      <text x="664" y="211" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'Auto-archives turns when idle' : '空闲时自动归档至原生终端滚回区'}</text>
+
+      {/* 上推箭头 */}
+      <line x1="600" y1="258" x2="600" y2="230" stroke="var(--status-ok)" stroke-width="1.4" marker-end="url(#tui-arr-ok)" />
+      <line x1="728" y1="258" x2="728" y2="230" stroke="var(--status-ok)" stroke-width="1.4" marker-end="url(#tui-arr-ok)" />
+      <rect x="594" y="234" width="140" height="18" fill="var(--grey-1)" stroke="var(--status-ok)" stroke-width="0.9" />
+      <text x="664" y="246" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? 'Flush & Keep History' : '逐段上推 · 保留历史'}</text>
+
+      {/* 下半部分：底部紧凑交互视口 */}
+      <rect x="519" y="260" width="290" height="98" fill="var(--grey-1)" stroke="var(--status-ok)" stroke-width="1.3" />
+      <rect x="519" y="260" width="290" height="22" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="531" y="275" font-size="10" font-weight="700" fill="var(--grey-11)">{isEn ? 'Inline Viewport (7..14 adaptive rows)' : 'Inline 底部视口 (7..14 行自适应)'}</text>
+
+      <text x="531" y="300" font-size="10" fill="var(--grey-10)">{isEn ? '⠋ Streaming output / active tool card' : '⠋ 当前流式输出 / 工具状态卡片'}</text>
+      <rect x="529" y="310" width="270" height="24" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1" />
+      <text x="539" y="326" font-size="10" fill="var(--grey-11)">{isEn ? '> Enter prompt or !cmd ...' : '> 输入提示词或 !cmd ...'}</text>
+      <text x="531" y="350" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Status · model · approval · tokens' : '状态栏 · model · approval · tokens'}</text>
+
+      {/* 底部注脚 */}
+      <text x="664" y="380" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">
+        {isEn
+          ? 'mouse_capture=false · no AltScreen overlay'
+          : '默认关闭鼠标捕捉 (mouse_capture=false) · 无 AltScreen 遮挡'}
+      </text>
+
+      <rect x="507" y="18" width="4" height="4" fill="var(--status-ok)" />
+      <rect x="817" y="392" width="4" height="4" fill="var(--status-ok)" />
+    </g>
+
+    {/* 底部三枚交互快捷键卡片 */}
+    <g>
+      <rect x="21" y="410" width="254" height="66" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.1" />
+      <text x="35" y="432" font-size="11" font-weight="700" fill="var(--link)">F3 · /view [fullscreen|inline]</text>
+      <text x="35" y="451" font-size={isEn ? 10 : 10.5} fill="var(--grey-9)">{isEn ? 'Hot-swap viewport mode at runtime' : '运行时热切换双模视图，保留当前'}</text>
+      <text x="35" y="466" font-size={isEn ? 10 : 10.5} fill="var(--grey-8)">{isEn ? 'preserving context & scroll history' : '会话上下文与滚动历史'}</text>
+
+      <rect x="293" y="410" width="254" height="66" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.1" />
+      <text x="307" y="432" font-size="11" font-weight="700" fill="var(--callout-tip-ink)">F2 · /mouse [on|off]</text>
+      <text x="307" y="451" font-size={isEn ? 10 : 10.5} fill="var(--grey-9)">{isEn ? 'Pause mouse capture in Fullscreen' : '在 Fullscreen 下暂停鼠标捕捉以放行'}</text>
+      <text x="307" y="466" font-size={isEn ? 10 : 10.5} fill="var(--grey-8)">{isEn ? 'for native selection; press again' : '终端原生划词复制，再按恢复交互'}</text>
+
+      <rect x="565" y="410" width="254" height="66" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.1" />
+      <text x="579" y="432" font-size="11" font-weight="700" fill="var(--grey-11)">{isEn ? 'Ctrl+B · /panel (≥ 96 cols)' : 'Ctrl+B · /panel（≥ 96 列）'}</text>
+      <text x="579" y="451" font-size={isEn ? 9.8 : 10.5} fill="var(--grey-9)">{isEn ? 'Toggle & drag-resize right side panel' : '展开/收起右侧分栏并支持拖拽调宽'}</text>
+      <text x="579" y="466" font-size={isEn ? 9 : 10.5} fill="var(--grey-8)">{isEn ? 'TimelineRail needs ≥60 cols & ≥2 turns' : 'TimelineRail 需 ≥ 60 列且 ≥ 2 轮'}</text>
+    </g>
+  </svg>
+</DiagramFrame>

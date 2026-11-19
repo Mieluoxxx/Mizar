@@ -1,0 +1,67 @@
+---
+import { getUiStrings } from '../../data/i18n';
+import { getLocaleFromUrl } from '../../lib/url';
+
+const {
+  'data-title': explicitTitle,
+  'data-kind': explicitKind,
+  ...restProps
+} = Astro.props as Record<string, unknown>;
+const locale = getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const lang = String(restProps['data-language'] || 'code');
+const isTerminal = ['bash', 'sh', 'zsh', 'shell', 'console', 'text', 'plaintext'].includes(
+  lang.toLowerCase(),
+);
+const kind = explicitKind === 'file' || explicitKind === 'terminal'
+  ? explicitKind
+  : isTerminal
+    ? 'terminal'
+    : 'file';
+const uid = `mdpre-${Math.random().toString(36).slice(2, 9)}`;
+const label =
+  typeof explicitTitle === 'string' && explicitTitle.trim()
+    ? explicitTitle
+    : lang === 'plaintext'
+      ? 'TEXT'
+      : lang.toUpperCase();
+---
+
+<div data-component="code-frame" data-kind={kind}>
+  <div data-slot="code-head">
+    <span data-slot="code-label">
+      {
+        isTerminal ? (
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" aria-hidden="true">
+            <rect x="1.75" y="2.75" width="12.5" height="10.5" />
+            <path d="M4.75 6L6.75 8L4.75 10" />
+            <path d="M8.75 10.25H11.25" />
+          </svg>
+        ) : (
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" aria-hidden="true">
+            <path d="M3.75 1.75H9.25L12.25 4.75V14.25H3.75Z" />
+            <path d="M9.25 1.75V4.75H12.25" />
+          </svg>
+        )
+      }
+      <span>{label}</span>
+    </span>
+    <span class="copy-action-wrap">
+      <button
+        type="button"
+        class="copy-action-btn"
+        command="--copy"
+        commandfor={uid}
+        aria-label={ui.codeCopyAria(label)}
+      >
+        <span data-slot="copy-labels" aria-hidden="true">
+          <span data-label="idle">{ui.codeCopyIdle}</span>
+          <span data-label="copied">{ui.codeCopyCopied}</span>
+          <span data-label="failed">{ui.codeCopyFailed}</span>
+        </span>
+      </button>
+      <span class="visually-hidden" role="status"></span>
+    </span>
+  </div>
+  <pre id={uid} tabindex="0" {...restProps}><slot /></pre>
+</div>

@@ -1,0 +1,72 @@
+---
+title: Reusable Skills
+description: Author SKILL.md workflows under .agents/skills/, invoke them on demand in chat via /skill-name, and hot-reload changes automatically.
+group: rules-security
+order: 15
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+
+`AGENTS.md` is ideal for always-on repository conventions; by contrast, workflows you only trigger on occasion—such as "run a pre-release security audit" or "draft release notes using our team template"—belong in a **Skill** so they don't bloat everyday context while remaining reproducible on demand.
+
+## Step-by-Step: Building a `/review` Skill
+
+Create `.agents/skills/review/SKILL.md` in your repository:
+
+```markdown title=".agents/skills/review/SKILL.md"
+---
+name: review
+description: Review changed or specified modules for correctness, error handling, and missing tests.
+when-to-use: Ask to review code, inspect diffs, or audit a directory before commit.
+---
+
+Review the target code in the following order:
+1. Use find and read to check boundary conditions, error handling, and null/empty edge cases;
+2. Flag risks that could cause silent failures or data races, citing exact file paths and line numbers;
+3. For each issue found, propose the minimal fix and ask before applying edits.
+```
+
+No rebuild or restart required. Inside Mizar, trigger it directly from the input box:
+
+```text title="Invoke a skill in conversation"
+/review src/
+```
+
+Mizar expands the skill instructions along with your trailing argument `src/` and sends them to the model. Alternatively, you can write a plain natural-language request and let the model match `description` and `when-to-use` from the skill catalog to load and follow the skill automatically.
+
+## Skill Layout & Frontmatter Fields
+
+Mizar recognizes two directory layouts under a skills root:
+
+- **Directory layout (recommended)**: `<skill-dir>/SKILL.md` (scanned up to 8 levels deep; ideal when placing helper scripts or example files alongside the skill).
+- **Single-file layout**: `<name>.md` directly inside the skills root (a top-level `SKILL.md` itself is never treated as a single-file skill).
+
+In YAML frontmatter, `name` (must be kebab-case: lowercase letters, digits, hyphens) and `description` are required, alongside three optional control fields:
+
+- `when-to-use`: Guides the model on which user intents should trigger the skill proactively.
+- `disable-model-invocation: true`: Prevents the model from invoking the skill autonomously; only explicit `/<name>` commands from the user can run it (useful for release scripts or irreversible cleanup).
+- `user-invocable: false`: Hides the skill from the user's `/<name>` autocomplete menu while keeping it available as background knowledge the model can load on its own.
+
+<Callout type="note">
+  To keep large skill catalogs from crowding out initial context, each catalog <code>description</code> is trimmed at <code>skills.catalogDescriptionMaxLength</code> (default <code>500</code> characters) when indexed; the full skill body is only loaded when the skill is actually invoked.
+</Callout>
+
+## Directory Precedence: Project Overrides Global
+
+When a skill with the same name (such as `review`) exists in both global and project locations, Mizar resolves conflicts from highest to lowest priority, with higher layers overriding global definitions:
+
+1. **`.agents/skills` in the current workspace and repository root** (highest priority; repo-specific workflows)
+2. **`skills.customDirs` configured in `settings.json`** (matched in listed order for shared team skill libraries)
+3. **Global `~/.agents/skills`** (or the `skills` directory under `MIZAR_AGENTS_HOME`)
+4. **Built-in bundled skill directory** (or `MIZAR_BUNDLED_SKILL_DIR`)
+
+For example, your `~/.agents/skills/review/SKILL.md` can define a general Rust checklist, while a frontend repository's `.agents/skills/review/SKILL.md` customizes checks for React and TypeScript. Entering that repository and running `/review` automatically activates the repo-specific version without clashing with your global setup.
+
+## Instant Hot Reload & `/skills` Management
+
+If you ask Mizar to create or modify a skill file via `write` or `edit` mid-session, the skill cache **invalidates and reloads immediately upon completion**—so you can invoke `/skill-name` on the very next turn.
+
+Run either [slash command](/en/tui/commands/) anytime to inspect active skills and where they came from:
+
+- `/skills`: Opens an interactive skill picker with filtering, preview, and one-click insertion into the input box.
+- `/skills list`: Prints a plain-text list of all registered skills, their invocation mode, and their source paths.

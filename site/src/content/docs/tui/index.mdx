@@ -1,0 +1,105 @@
+---
+title: 终端界面与双模视口
+description: 掌握 Mizar 的 Fullscreen 与 Inline 双模视口、Ctrl+B 诊断面板、F2 鼠标划词、@ 文件引用、长粘贴折叠以及排队/插队发送。
+group: tui-workflow
+order: 4
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../../components/DiagramEmbed.astro';
+
+Mizar 围绕高强度终端编码设计了两套随时可热切换的视口形态：**Fullscreen 全屏模式** 与 **Inline 内联模式**。无需退出重开，会话进行到一半也能按 <kbd>F3</kbd>（或输入 `/view`）瞬间切换，所有消息、工作队列与面板状态保持原封不动。
+
+```bash title="按需指定初始视口启动"
+# 默认：Fullscreen 全屏工作台
+mizar
+
+# Inline 内联视口（保留终端历史输出在上方直接可滚）
+mizar --inline
+```
+
+## 什么时候用 Fullscreen，什么时候用 Inline？
+
+- **Fullscreen（默认，备用屏幕 Buffer）**：适合沉浸式大型重构、代码审查和开着侧栏盯多个任务进度。长输出、树状分叉选择器（[`/tree`](/tui/sessions/)）与三泳道轨迹分析器（[`/trace`](/tui/sessions/)）都会占满最佳视觉空间。
+- **Inline（内联视口，保留主终端滚动区）**：适合习惯在同一个 Terminal Tab 里交替跑宿主 Shell 命令与 AI 问答的工作流。Inline 会把输入和近期对话收拢进终端底部的 **7–14 行**视口（随终端高度自适应），让你一眼同时对照上方刚跑完的日志与下方 AI 的诊断。
+
+<DiagramEmbed
+  id="tui-modes"
+  title="Fullscreen 与 Inline 双模视口分区"
+  caption="Fullscreen 使用终端备用屏幕以容纳完整对话流、浮动浮层与分栏侧边栏；Inline 将工作区固定在 7–14 行滚动窗内，保护上方宿主终端滚动历史。"
+/>
+
+## 分栏诊断面板（<kbd>Ctrl</kbd>+<kbd>B</kbd>）
+
+当你的终端窗口宽度达到 **96 列以上**时，按 <kbd>Ctrl</kbd>+<kbd>B</kbd>（或执行 `/panel`）可在右侧展开或收起实时诊断侧栏，包含四个可切换的标签页（按方向键或鼠标点击切换）：
+
+1. **Context**：直观拆分系统提示词、项目规则（`AGENTS.md`）、对话轮次与工具定义各自的 Token 占比。
+2. **Files**：列出本次会话中被读取、新建与编辑过的所有文件路径。
+3. **Tools**：统计累计工具调用次数、最近状态以及当前仍在运行中的长任务。
+4. **Stats**：展示会话输入/输出 Token 消耗、耗时节奏与本地命令统计。
+
+## 空闲 Launchpad 与快速起步
+
+新开空白会话时，输入栏上方会渲染一组交互式快捷入口（Launchpad），点击或用快捷键即可直接唤起高频动作：
+
+- 搜索并 `@` 引用工作区文件
+- 检查当前生效的工具清单（`/tools`，参见 [内置工具](/tools/)）
+- 检查哪些 `AGENTS.md` 已载入及剩余预算（`/instructions`，参见 [项目规则 (AGENTS.md)](/instructions/)）
+- 直接切入 `!` 本地命令演练环境（参见 [本地 Bash 模式](/tui/bash-mode/)）
+
+## 原生鼠标划词放行（<kbd>F2</kbd>）
+
+全屏模式下 Mizar 默认开启鼠标支持，方便直接用滚轮滑阅长对话、点击侧栏 Tab 或轨迹图区域；代价是直接拖选文字时会触发画面滚动。
+
+遇到想整段拖选复制报错的场景：
+
+- 按一次 <kbd>F2</kbd>（或执行 `/mouse`）即可暂时把鼠标控制权交还给宿主终端，左键像在普通终端一样自由划词复制；
+- 复制完再按一次 <kbd>F2</kbd>，鼠标滚轮与点击交互立即恢复。
+
+<Callout type="tip">
+  macOS Terminal、iTerm2、Ghostty 与大多数终端还支持按住 <kbd>Option</kbd>（或 <kbd>Alt</kbd>）强行触发原生划词，甚至无需按 <code>F2</code>。
+</Callout>
+
+## `@` 文件与行号精确引用
+
+高效喂入上下文不需要手工粘贴整文件。在输入框任何位置敲入 `@`，补全浮层会自动列出受 `.gitignore` 过滤后的工作区目录树；而写在邮箱里的 `dev@company.com` 不会误触发补全（需要位于行首、空格或括号/中文标点之后）。
+
+```text title="@ 引用常用语法"
+# 引用指定行区间，省下整文件 Token
+@src/config.rs#L18-45 这个合并函数的边界条件对吗？
+
+# 目录逐层下钻：选中目录后继续输入即可进子目录
+@crates/mizar-tools/
+
+# 包含空格的路径可用双引号包裹
+@"docs/release notes/v1.md" 核对一下这份清单
+```
+
+引用机制自带保护阈值，防止一不小心把编译产物或超大日志文件贴进对话：
+
+- 单文件超过 **50,000 字符**自动截断，单条消息所有引用总计上限 **200,000 字符**；
+- 目录展开最多列出 **200 项**，超过 **16 MiB** 的文件或二进制文件会自动跳过并提示。
+
+## 长粘贴自动折叠与 <kbd>Ctrl</kbd>+<kbd>E</kbd> 展开
+
+从终端或日志系统粘贴一大段堆栈报错（超过 **8 行** 或 **600 字符**）时，Mizar 不会把编辑器撑成几百行让人找不到光标，而是自动压缩成一枚干净的占位标签：
+
+```text title="折叠效果示例"
+请帮我分析下面这段报错里的根本原因：
+[paste #1 +42 lines]
+```
+
+发送时 Mizar 会自动还原全部原始内容喂给模型；如果你在发送前想删掉最后几行杂音，按一下 <kbd>Ctrl</kbd>+<kbd>E</kbd> 就能把它原地展开成明文编辑。
+
+## 排队 Follow-up vs 立即插队打断
+
+当助手正在流式输出或接连执行工具时，不需要干等它跑完再写下一条指令，直接在输入框继续打字并用两种发送方式控制节奏：
+
+- **<kbd>Enter</kbd>（排队 Follow-up）**：当前任务未结束时，按 `Enter` 会把你的新消息放进尾部排队序列。Mizar 等正在进行的这轮自然收尾并给出回答后，紧接着自动接过下一条任务。
+- **<kbd>Ctrl</kbd>+<kbd>Enter</kbd>（立即插队 Steer）**：发现模型走偏方向（例如去改错了文件）时，直接输入修正要求并按 `Ctrl+Enter`，立刻中断当前流式/工具执行，当场转向你的新指示。
+
+<Callout type="tip">
+
+想在一段提示词里手工换行继续写，用 <kbd>Shift</kbd>+<kbd>Enter</kbd>、<kbd>Alt</kbd>+<kbd>Enter</kbd> 或 <kbd>Ctrl</kbd>+<kbd>J</kbd> 均可。完整命令与热键速查请参阅 [斜杠命令](/tui/commands/) 与 [快捷键速查](/tui/keybinds/)。
+
+</Callout>

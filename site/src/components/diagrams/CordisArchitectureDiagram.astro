@@ -1,0 +1,304 @@
+---
+import DiagramFrame from './DiagramFrame.astro';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  caption?: string;
+  locale?: Locale;
+}
+
+const { caption } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const isEn = locale === 'en';
+---
+
+<DiagramFrame
+  fig="FIG 08"
+  title={isEn ? 'Cordis 28-Crate Architecture & Pure Core Boundaries' : 'Cordis 28-Crate 分层架构与编译隔离红线'}
+  caption={caption}
+  locale={locale}
+>
+  <svg
+    viewBox="0 0 840 545"
+    width="840"
+    height="545"
+    role="img"
+    aria-label={isEn
+      ? 'Mizar 28-crate layered architecture and compile-time isolation boundary: 25 runtime/plugin crates on the left from host down to cordis microkernel, a strict dependency firewall in the center forbidding tokio/cordis/reqwest/rquickjs/rusqlite, and 3 pure core crates on the right'
+      : 'Mizar 28 个 Crate 分层架构与编译隔离红线：左侧为宿主装配、编排观测、工具插件、核心服务、HTTP 协议栈与底层 cordis 微内核共 25 个 crate；中间为禁止引入 tokio/cordis/reqwest/rquickjs/rusqlite 的编译隔离红线；右侧为受保护的 mizar-tui-ui、mizar-trajectory-core 与 mizar-llm-types 3 个纯核心 crate'}
+  >
+    <defs>
+      <pattern id="cord-hatch-firewall" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--status-outage)" stroke-width="1.1" stroke-opacity="0.28" />
+      </pattern>
+      <pattern id="cord-hatch-core" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--link)" stroke-width="1" stroke-opacity="0.18" />
+      </pattern>
+      <pattern id="cord-hatch-spine" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <line x1="0" y1="0" x2="0" y2="6" stroke="var(--status-ok)" stroke-width="1" stroke-opacity="0.18" />
+      </pattern>
+      <marker id="cord-arr-ink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--grey-9)" />
+      </marker>
+      <marker id="cord-arr-link" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--link)" />
+      </marker>
+      <marker id="cord-arr-ok" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+        <path d="M 1 1.5 L 8.5 5 L 1 8.5 Z" fill="var(--status-ok)" />
+      </marker>
+    </defs>
+
+    {/* ================= 左侧：运行时与插件栈 (25 Crates) ================= */}
+
+    {/* 第 1 层：宿主与装配层 (2) */}
+    <g>
+      <rect x="21" y="20" width="514" height="68" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <rect x="21" y="20" width="514" height="22" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <text x="33" y="35" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'L1 Host Binary & Feature Spine (2 Crates)' : 'L1 终端宿主 & Feature 装配层 (2 Crates)'}</text>
+      <text x="523" y="35" font-size="9" text-anchor="end" fill="var(--grey-8)">HOST / SPINE</text>
+
+      <rect x="33" y="48" width="218" height="32" fill="var(--grey-1)" stroke="var(--link)" stroke-width="1.1" />
+      <text x="142" y="63" font-size="10" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'mizar-tui (mizar binary)' : 'mizar-tui (mizar 入口)'}</text>
+      <text x="142" y="75" font-size="8.5" text-anchor="middle" fill="var(--grey-8)">{isEn ? 'CLI · Approval · Event Bridge' : 'CLI · 审批回调 · 事件桥接'}</text>
+
+      <line x1="251" y1="64" x2="269" y2="64" stroke="var(--grey-9)" stroke-width="1.2" marker-end="url(#cord-arr-ink)" />
+
+      <rect x="272" y="48" width="251" height="32" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1.1" />
+      <text x="397" y="63" font-size="10" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-agent-spine (AgentSpinePlugin)</text>
+      <text x="397" y="75" font-size="8.5" text-anchor="middle" fill="var(--grey-8)">legacy / coding / sqlite / trajectory / router</text>
+
+      <rect x="19" y="18" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+
+    {/* L1 -> L2 */}
+    <line x1="278" y1="88" x2="278" y2="100" stroke="var(--grey-9)" stroke-width="1.2" marker-end="url(#cord-arr-ink)" />
+
+    {/* 第 2 层：编排、观测与持久化层 (3) */}
+    <g>
+      <rect x="21" y="102" width="514" height="64" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <rect x="21" y="102" width="514" height="22" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <text x="33" y="117" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'L2 Agent Loop, Trace & Storage (3 Crates)' : 'L2 Agent 编排、观测与持久化层 (3 Crates)'}</text>
+
+      <rect x="33" y="130" width="156" height="28" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="111" y="143" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-agent-loop</text>
+      <text x="111" y="154" font-size="8.5" text-anchor="middle" fill="var(--link)">provide "agentLoop"</text>
+
+      <rect x="199" y="130" width="162" height="28" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="280" y="143" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-trajectory</text>
+      <text x="280" y="154" font-size="8.5" text-anchor="middle" fill="var(--grey-8)">{isEn ? 'Trace + repeat-tool-guard' : '轨迹 + repeat-tool-guard'}</text>
+
+      <rect x="371" y="130" width="152" height="28" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="447" y="143" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-session-sqlite</text>
+      <text x="447" y="154" font-size="8.5" text-anchor="middle" fill="var(--grey-8)">WAL · Single-Writer</text>
+    </g>
+
+    {/* L2 -> L3 */}
+    <line x1="278" y1="166" x2="278" y2="178" stroke="var(--grey-9)" stroke-width="1.2" marker-end="url(#cord-arr-ink)" />
+
+    {/* 第 3 层：工具与指令插件层 (8) */}
+    <g>
+      <rect x="21" y="180" width="514" height="114" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <rect x="21" y="180" width="514" height="22" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <text x="33" y="195" font-size={isEn ? 9.5 : 10.5} font-weight="700" fill="var(--grey-11)">
+        {isEn
+          ? 'L3 Tool & Instruction Plugins (8 Crates · inject ["tools"] except instructions)'
+          : 'L3 工具与指令插件层 (8 Crates · 除 instructions 外均 inject ["tools"])'}
+      </text>
+
+      {/* Row 1 */}
+      <rect x="33" y="208" width="124" height="24" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="95" y="224" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-tools-coding</text>
+
+      <rect x="164" y="208" width="118" height="24" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="223" y="224" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-tool-search</text>
+
+      <rect x="289" y="208" width="118" height="24" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="348" y="224" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-codemode</text>
+
+      <rect x="414" y="208" width="109" height="24" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="468" y="224" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-mcp</text>
+
+      {/* Row 2 */}
+      <rect x="33" y="237" width="96" height="24" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="81" y="253" font-size="9.2" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-skills</text>
+
+      <rect x="135" y="237" width="96" height="24" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="183" y="253" font-size="9.2" text-anchor="middle" fill="var(--grey-9)">mizar-tool-fs</text>
+
+      <rect x="237" y="237" width="104" height="24" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="289" y="253" font-size="9.2" text-anchor="middle" fill="var(--grey-9)">mizar-tool-time</text>
+
+      <rect x="347" y="237" width="176" height="24" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1" />
+      <text x="435" y="253" font-size="8.4" font-weight="600" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? 'mizar-instructions (no inject)' : 'mizar-instructions (无 inject)'}</text>
+
+      {/* Waterfall 管线条 */}
+      <rect x="33" y="266" width="490" height="21" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
+      <text x="278" y="280" font-size={isEn ? 9 : 9.5} font-weight="600" text-anchor="middle" fill="var(--grey-10)">
+        {isEn
+          ? '3-Stage Tool Waterfall: tools/pre-execute ──▶ tools/execute ──▶ tools/post-execute'
+          : '工具三段 Waterfall: tools/pre-execute  ──▶  tools/execute  ──▶  tools/post-execute'}
+      </text>
+    </g>
+
+    {/* L3 -> L4 */}
+    <line x1="278" y1="294" x2="278" y2="306" stroke="var(--grey-9)" stroke-width="1.2" marker-end="url(#cord-arr-ink)" />
+
+    {/* 第 4 层：基础服务与 LLM 栈 (11) */}
+    <g>
+      <rect x="21" y="308" width="514" height="122" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <rect x="21" y="308" width="514" height="22" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.3" />
+      <text x="33" y="323" font-size={isEn ? 10 : 10.5} font-weight="700" fill="var(--grey-11)">{isEn ? 'L4 Core Services & HTTP / Protocol Stack (4 + 7 = 11 Crates)' : 'L4 核心基础服务 & HTTP / 协议路由栈 (4 + 7 = 11 Crates)'}</text>
+
+      {/* 4 Core Services */}
+      <rect x="33" y="336" width="114" height="26" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
+      <text x="90" y="353" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-llm ("llm")</text>
+
+      <rect x="154" y="336" width="124" height="26" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="216" y="353" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-session</text>
+
+      <rect x="285" y="336" width="126" height="26" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="348" y="353" font-size="9" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-system-prompt</text>
+
+      <rect x="418" y="336" width="105" height="26" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="470" y="353" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-tools</text>
+
+      {/* Router & HTTP & Retry */}
+      <rect x="33" y="369" width="186" height="24" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="126" y="385" font-size="9" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-llm-router ("llmRouter")</text>
+
+      <rect x="226" y="369" width="158" height="24" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="305" y="385" font-size="9" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-llm-http (reqwest)</text>
+
+      <rect x="391" y="369" width="132" height="24" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
+      <text x="457" y="385" font-size="9" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-llm-retry</text>
+
+      {/* 4 Protocol Adapters */}
+      <rect x="33" y="399" width="136" height="23" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="101" y="414" font-size="9" text-anchor="middle" fill="var(--grey-10)">mizar-llm-completions</text>
+
+      <rect x="176" y="399" width="124" height="23" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="238" y="414" font-size="9" text-anchor="middle" fill="var(--grey-10)">mizar-llm-responses</text>
+
+      <rect x="307" y="399" width="118" height="23" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="366" y="414" font-size="9" text-anchor="middle" fill="var(--grey-10)">mizar-llm-messages</text>
+
+      <rect x="432" y="399" width="91" height="23" fill="var(--grey-1)" stroke="var(--border)" stroke-width="1" />
+      <text x="477" y="414" font-size="9" text-anchor="middle" fill="var(--grey-10)">mizar-llm-mock</text>
+    </g>
+
+    {/* L4 -> L5 */}
+    <line x1="278" y1="430" x2="278" y2="442" stroke="var(--status-ok)" stroke-width="1.3" marker-end="url(#cord-arr-ok)" />
+
+    {/* 第 5 层：cordis 微内核 (1) */}
+    <g>
+      <rect x="21" y="445" width="514" height="80" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.4" />
+      <rect x="21" y="445" width="514" height="80" fill="url(#cord-hatch-spine)" />
+      <rect x="21" y="445" width="514" height="22" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1.3" />
+      <text x="33" y="460" font-size={isEn ? 9.5 : 10.5} font-weight="700" fill="var(--callout-tip-ink)">
+        {isEn
+          ? 'L5 cordis Kernel (1 Crate · Context Tree / Fiber FSM / inject & provide)'
+          : 'L5 cordis 微内核 (1 Crate · Context 树 / Fiber 状态机 / inject & provide)'}
+      </text>
+
+      <rect x="33" y="474" width="256" height="42" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1" />
+      <text x="161" y="492" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? '5 Event Dispatch Modes' : '5 种事件分发模式'}</text>
+      <text x="161" y="508" font-size="9" text-anchor="middle" fill="var(--grey-9)">emit · parallel · serial · bail · waterfall</text>
+
+      <rect x="299" y="474" width="224" height="42" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1" />
+      <text x="411" y="492" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? 'ctx.effect("id", ...) Invariant' : 'ctx.effect("id", ...) 不变量'}</text>
+      <text x="411" y="508" font-size="9" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'LIFO cleanup on Fiber unload' : 'Fiber 卸载时按创建逆序自动清理'}</text>
+
+      <rect x="19" y="523" width="4" height="4" fill="var(--status-ok)" />
+    </g>
+
+    {/* ================= 中间：编译隔离红线 (Compilation Firewall) ================= */}
+    <g>
+      <rect x="548" y="20" width="78" height="505" fill="var(--code-del-tint)" stroke="var(--status-outage)" stroke-width="1.8" />
+      <rect x="548" y="20" width="78" height="505" fill="url(#cord-hatch-firewall)" />
+
+      {/* 红线顶部标签 */}
+      <rect x="553" y="26" width="68" height="36" fill="var(--grey-2)" stroke="var(--status-outage)" stroke-width="1.2" />
+      <text x="587" y="42" font-size={isEn ? 9.5 : 10} font-weight="700" text-anchor="middle" fill="var(--callout-danger-ink)">{isEn ? 'COMPILE' : '编译隔离'}</text>
+      <text x="587" y="56" font-size={isEn ? 9.5 : 10} font-weight="700" text-anchor="middle" fill="var(--callout-danger-ink)">{isEn ? 'BOUNDARY' : '红线'}</text>
+
+      {/* 五项禁令依赖卡片（置于 y=166..312 之间，上下留出单向依赖通道） */}
+      <rect x="552" y="168" width="70" height="148" fill="var(--grey-2)" stroke="var(--status-outage)" stroke-width="1.3" />
+      <text x="587" y="185" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--callout-danger-ink)">{isEn ? 'FORBIDDEN' : '禁止引入'}</text>
+      <line x1="558" y1="192" x2="616" y2="192" stroke="var(--status-outage)" stroke-width="0.9" />
+
+      <text x="587" y="210" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">✕ tokio</text>
+      <text x="587" y="232" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">✕ cordis</text>
+      <text x="587" y="254" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">✕ reqwest</text>
+      <text x="587" y="276" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">✕ rquickjs</text>
+      <text x="587" y="298" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">✕ rusqlite</text>
+
+      {/* 红线底部说明 */}
+      <rect x="552" y="428" width="70" height="86" fill="var(--grey-2)" stroke="var(--status-outage)" stroke-width="1.2" />
+      <text x="587" y="449" font-size="9.5" font-weight="700" text-anchor="middle" fill="var(--callout-danger-ink)">{isEn ? 'NO CROSS' : '严禁越界'}</text>
+      <text x="587" y="468" font-size="8.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'Async/HTTP' : '异步/HTTP/DB'}</text>
+      <text x="587" y="483" font-size="8.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'belongs in' : '须上移到'}</text>
+      <text x="587" y="498" font-size="8.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Host layer' : '宿主层'}</text>
+
+      <rect x="546" y="18" width="4" height="4" fill="var(--status-outage)" />
+      <rect x="624" y="523" width="4" height="4" fill="var(--status-outage)" />
+    </g>
+
+    {/* ================= 单向安全依赖跨线（避开禁令卡片） ================= */}
+    {/* mizar-tui -> mizar-tui-ui (y=78) */}
+    <line x1="535" y1="78" x2="635" y2="78" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+    {/* mizar-trajectory -> mizar-trajectory-core (y=138) */}
+    <line x1="535" y1="138" x2="635" y2="138" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+    {/* mizar-llm -> mizar-llm-types (y=350) */}
+    <line x1="535" y1="350" x2="635" y2="350" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+
+    {/* ================= 右侧：受保护的 3 个纯核心 Crate ================= */}
+    <g>
+      {/* 1. mizar-tui-ui */}
+      <rect x="639" y="20" width="180" height="92" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="20" width="180" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="20" width="180" height="24" fill="url(#cord-hatch-core)" />
+      <rect x="647" y="23" width="114" height="18" fill="var(--grey-2)" />
+      <text x="653" y="36" font-size="10.5" font-weight="700" fill="var(--grey-11)">mizar-tui-ui</text>
+      <text x="809" y="36" font-size="8.5" font-weight="700" text-anchor="end" fill="var(--link)">PURE UI</text>
+      <text x="651" y="61" font-size={isEn ? 9 : 9.5} fill="var(--grey-10)">{isEn ? 'AppState · Virtual Markdown' : 'AppState · 虚拟化 Markdown'}</text>
+      <text x="651" y="78" font-size={isEn ? 8.5 : 9.5} fill="var(--grey-9)">{isEn ? 'Split · Overlay · Oklab Theme' : '双栏 · Overlay · Oklab 主题'}</text>
+      <text x="651" y="99" font-size="9" font-weight="600" fill="var(--link)">{isEn ? 'cargo check -p sub-sec loop' : 'cargo check -p 秒级回路'}</text>
+      <rect x="817" y="18" width="4" height="4" fill="var(--link)" />
+
+      {/* 2. mizar-trajectory-core */}
+      <rect x="639" y="128" width="180" height="92" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="128" width="180" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="128" width="180" height="24" fill="url(#cord-hatch-core)" />
+      <rect x="647" y="131" width="154" height="18" fill="var(--grey-2)" />
+      <text x="653" y="144" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-trajectory-core</text>
+      <text x="651" y="169" font-size={isEn ? 9 : 9.5} fill="var(--grey-10)">{isEn ? 'Fold Snapshot · 3-Lane Axes' : '轨迹折叠快照 · 三泳道轴'}</text>
+      <text x="651" y="186" font-size={isEn ? 9 : 9.5} fill="var(--grey-9)">{isEn ? 'Anomaly Rules · RepeatGuard' : '异常规则引擎 · RepeatGuard'}</text>
+      <text x="651" y="207" font-size="9" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero Async · Pure Tests' : '✓ 零异步 · 纯函数单测'}</text>
+
+      {/* 3. mizar-llm-types */}
+      <rect x="639" y="324" width="180" height="92" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="324" width="180" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="324" width="180" height="24" fill="url(#cord-hatch-core)" />
+      <rect x="647" y="327" width="124" height="18" fill="var(--grey-2)" />
+      <text x="653" y="340" font-size="10.5" font-weight="700" fill="var(--grey-11)">mizar-llm-types</text>
+      <text x="651" y="365" font-size="9.5" fill="var(--grey-10)">Message · ContentBlock</text>
+      <text x="651" y="382" font-size="9.5" fill="var(--grey-9)">BlockAssembler · SseParser</text>
+      <text x="651" y="403" font-size="9" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero tokio / reqwest' : '✓ 零 tokio / reqwest'}</text>
+
+      {/* 纯核心之间的依赖线：mizar-tui-ui -> trajectory-core & llm-types */}
+      <line x1="729" y1="112" x2="729" y2="125" stroke="var(--link)" stroke-width="1.2" marker-end="url(#cord-arr-link)" />
+      <line x1="729" y1="220" x2="729" y2="321" stroke="var(--link)" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#cord-arr-link)" />
+      <rect x="676" y="260" width="106" height="20" fill="var(--grey-1)" stroke="var(--link)" stroke-width="0.9" />
+      <text x="729" y="274" font-size="8.5" text-anchor="middle" fill="var(--link)">{isEn ? 'ui reuses core' : 'ui 复用类型核心'}</text>
+
+      {/* 右下总结卡：28 Crates 统计与边界 */}
+      <rect x="639" y="432" width="180" height="93" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="729" y="453" font-size={isEn ? 10 : 10.5} font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Pure Cores (3 Crates)' : '纯核心孤岛 (3 Crates)'}</text>
+      <text x="651" y="473" font-size="9.5" fill="var(--grey-10)">{isEn ? '• 28 Workspace Crates' : '• 全仓 28 Crates Virtual'}</text>
+      <text x="651" y="490" font-size="9.5" fill="var(--grey-9)">• Rust 1.98 · Ed 2024</text>
+      <text x="651" y="507" font-size={isEn ? 9 : 9.5} fill="var(--grey-9)">{isEn ? '• Headless UI Regression' : '• 无终端 Headless 回归'}</text>
+
+      <rect x="817" y="523" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
+    </g>
+  </svg>
+</DiagramFrame>

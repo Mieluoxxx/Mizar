@@ -1,0 +1,21 @@
+---
+import { getCalloutDefaultTitle, type CalloutType } from '../../data/i18n';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  type?: CalloutType;
+  title?: string;
+  locale?: Locale;
+}
+
+const { type = 'note', title } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const headingText = title || getCalloutDefaultTitle(type, locale);
+---
+
+<div data-component="callout" data-type={type}>
+  <strong>{headingText}</strong>
+  <div>
+    <slot />
+  </div>
+</div>

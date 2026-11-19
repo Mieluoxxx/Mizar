@@ -1,0 +1,53 @@
+---
+import { getUiStrings } from '../data/i18n';
+import { getLocaleFromUrl, type Locale } from '../lib/url';
+
+export interface TocHeading {
+  depth: number;
+  slug: string;
+  text: string;
+}
+
+interface Props {
+  headings: TocHeading[];
+  locale?: Locale;
+}
+
+const { headings } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const tocHeadings = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+<aside data-component="aside" aria-label={ui.asideNavAria}>
+  <div data-component="docs-aside">
+    <button
+      type="button"
+      data-slot="search"
+      data-search-open
+      aria-label={ui.searchOpenAria}
+      aria-haspopup="dialog"
+      aria-keyshortcuts="Meta+K Control+K /"
+    >
+      <span>{ui.searchTrigger}</span>
+      <kbd dir="ltr">⌘K</kbd>
+    </button>
+
+    {
+      tocHeadings.length > 0 && (
+        <nav data-component="on-this-page" aria-label={ui.tocNavAria}>
+          <span data-slot="heading">{ui.contentsHeading}</span>
+          <ul>
+            {tocHeadings.map((h) => (
+              <li data-level={String(h.depth)}>
+                <a href={`#${h.slug}`} title={h.text} data-toc-link>
+                  {h.text}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      )
+    }
+  </div>
+</aside>

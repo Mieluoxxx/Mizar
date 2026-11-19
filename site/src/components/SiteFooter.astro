@@ -1,0 +1,263 @@
+---
+import { getUiStrings } from '../data/i18n';
+import { docHref, getGithubRepoUrl, getLocaleFromUrl, type Locale } from '../lib/url';
+
+interface Props {
+  locale?: Locale;
+}
+
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const githubUrl = getGithubRepoUrl();
+---
+
+<footer data-component="site-footer" data-layout="list">
+  <div data-slot="secondary">
+    <nav data-component="secondary-nav" aria-label={ui.footerNavAria}>
+      <ul>
+        <li>
+          <a href={docHref('dev', locale)}>
+            <span data-slot="box" aria-hidden="true">
+              [<span data-slot="fill"></span>]
+            </span>
+            <span>{ui.footerDevLabel}</span>
+          </a>
+        </li>
+        <li>
+          <a href={docHref('troubleshooting', locale)}>
+            <span data-slot="box" aria-hidden="true">
+              [<span data-slot="fill"></span>]
+            </span>
+            <span>{ui.footerTroubleshootingLabel}</span>
+          </a>
+        </li>
+        <li>
+          <a href={githubUrl} target="_blank" rel="noopener">
+            <span data-slot="box" aria-hidden="true">
+              [<span data-slot="fill"></span>]
+            </span>
+            <span>GitHub</span>
+          </a>
+        </li>
+        <li>
+          <a href={`${githubUrl}/blob/main/Cargo.toml`} target="_blank" rel="noopener">
+            <span data-slot="box" aria-hidden="true">
+              [<span data-slot="fill"></span>]
+            </span>
+            <span>MIT License</span>
+          </a>
+        </li>
+        <li>
+          <a href={docHref('tui/sessions', locale)} data-component="status" title={ui.footerStatusTitle}>
+            <span data-slot="bars" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+            </span>
+            <span data-slot="status-text">{ui.footerStatusText}</span>
+          </a>
+        </li>
+      </ul>
+    </nav>
+
+    <div data-component="footer-controls">
+      <div data-component="theme-toggle" role="group" aria-label={ui.themeGroupAria}>
+        <button
+          type="button"
+          data-theme-btn="system"
+          aria-pressed="false"
+          aria-label={ui.themeSystemAria}
+          title={ui.themeSystemTitle}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+            <rect x="2" y="2.75" width="12" height="8.5" />
+            <path d="M5.5 14H10.5M8 11.25V14" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          data-theme-btn="light"
+          aria-pressed="false"
+          aria-label={ui.themeLightAria}
+          title={ui.themeLightTitle}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.2" />
+            <path d="M8 1.5V3.75M8 12.25V14.5M1.5 8H3.75M12.25 8H14.5M3.3 3.3L4.9 4.9M11.1 11.1L12.7 12.7M12.7 3.3L11.1 4.9M4.9 11.1L3.3 12.7" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          data-theme-btn="dark"
+          aria-pressed="false"
+          aria-label={ui.themeDarkAria}
+          title={ui.themeDarkTitle}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+            <path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5A5.5 5.5 0 1 0 13.5 9.5Z" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+
+      <div data-component="theme-toggle" role="group" aria-label={ui.markdownExportGroupAria}>
+        <button
+          type="button"
+          data-copy-markdown
+          data-state="idle"
+          aria-label={ui.copyMarkdownAria}
+          title={ui.copyMarkdownTitle}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+            <rect x="1.75" y="3.25" width="12.5" height="9.5" />
+            <path d="M4.25 10V6L6.25 8.2L8.25 6V10M11.25 6V10M9.75 8.5L11.25 10L12.75 8.5" stroke-linejoin="miter" />
+          </svg>
+        </button>
+        <span class="visually-hidden" role="status"></span>
+      </div>
+    </div>
+
+    <span data-slot="copyright">©2026 Mizar · MIT License</span>
+  </div>
+
+  <div data-slot="main">
+    <div data-component="wordmark">
+      <svg viewBox="-2 4 148 34" preserveAspectRatio="xMinYMin meet" role="img" aria-label="MIZAR">
+        <defs>
+          <pattern id="mizar-hatch" width="2.2" height="2.2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="2.2" />
+          </pattern>
+          <pattern id="mizar-hatch-active" width="2.2" height="2.2" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="2.2" stroke="var(--link)" />
+          </pattern>
+        </defs>
+
+        <!-- M -->
+        <g data-slot="letter" data-letter="M">
+          <path
+            d="M0 6H6V12H12V18H18V12H24V6H30V36H24V18H18V24H12V18H6V36H0Z"
+            data-slot="fill"
+            fill="url(#mizar-hatch)"
+          />
+          <path d="M0 6H6V12H12V18H18V12H24V6H30V36H24V18H18V24H12V18H6V36H0Z" data-slot="outline" />
+          <path d="M6 12V18M12 18H18M24 12V18" data-slot="outline" />
+          <rect data-slot="node" x="-0.45" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="5.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="5.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="11.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="11.55" y="17.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="17.55" y="17.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="17.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="23.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="23.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="29.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="29.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="23.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="23.55" y="17.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="17.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="11.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="5.55" y="17.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="5.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="-0.45" y="35.55" width="0.9" height="0.9" />
+        </g>
+
+        <!-- I -->
+        <g data-slot="letter" data-letter="I">
+          <path
+            d="M36 6H54V12H48V30H54V36H36V30H42V12H36Z"
+            data-slot="fill"
+            fill="url(#mizar-hatch)"
+          />
+          <path d="M36 6H54V12H48V30H54V36H36V30H42V12H36Z" data-slot="outline" />
+          <path d="M42 12H48M42 30H48" data-slot="outline" />
+          <rect data-slot="node" x="35.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="53.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="53.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="47.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="47.55" y="29.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="53.55" y="29.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="53.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="35.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="35.55" y="29.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="41.55" y="29.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="41.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="35.55" y="11.55" width="0.9" height="0.9" />
+        </g>
+
+        <!-- Z -->
+        <g data-slot="letter" data-letter="Z">
+          <path
+            d="M60 6H84V12L68 30H84V36H60V30L76 12H60Z"
+            data-slot="fill"
+            fill="url(#mizar-hatch)"
+          />
+          <path d="M60 6H84V12L68 30H84V36H60V30L76 12H60Z" data-slot="outline" />
+          <path d="M76 12H84M60 30H68" data-slot="outline" />
+          <rect data-slot="node" x="59.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="83.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="83.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="75.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="59.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="67.55" y="29.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="83.55" y="29.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="83.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="59.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="59.55" y="29.55" width="0.9" height="0.9" />
+        </g>
+
+        <!-- A -->
+        <g data-slot="letter" data-letter="A">
+          <path
+            fill-rule="evenodd"
+            d="M90 6H114V36H108V24H96V36H90ZM96 12V18H108V12Z"
+            data-slot="fill"
+            fill="url(#mizar-hatch)"
+          />
+          <path d="M90 6H114V36H108V24H96V36H90Z" data-slot="outline" />
+          <path d="M96 12H108V18H96Z" data-slot="outline" />
+          <path d="M90 24H96M108 24H114" data-slot="outline" />
+          <rect data-slot="node" x="89.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="113.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="113.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="107.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="107.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="95.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="95.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="89.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="95.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="107.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="107.55" y="17.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="95.55" y="17.55" width="0.9" height="0.9" />
+        </g>
+
+        <!-- R -->
+        <g data-slot="letter" data-letter="R">
+          <path
+            fill-rule="evenodd"
+            d="M120 6H144V24H134L144 36H136L126 24V36H120ZM126 12V18H138V12Z"
+            data-slot="fill"
+            fill="url(#mizar-hatch)"
+          />
+          <path d="M120 6H144V24H134L144 36H136L126 24V36H120Z" data-slot="outline" />
+          <path d="M126 12H138V18H126Z" data-slot="outline" />
+          <path d="M120 24H134" data-slot="outline" />
+          <rect data-slot="node" x="119.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="143.55" y="5.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="143.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="133.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="143.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="135.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="125.55" y="23.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="125.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="119.55" y="35.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="125.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="137.55" y="11.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="137.55" y="17.55" width="0.9" height="0.9" />
+          <rect data-slot="node" x="125.55" y="17.55" width="0.9" height="0.9" />
+        </g>
+      </svg>
+    </div>
+  </div>
+</footer>

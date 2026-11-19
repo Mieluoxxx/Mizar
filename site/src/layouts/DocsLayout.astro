@@ -1,0 +1,982 @@
+---
+import '@fontsource/ibm-plex-mono/latin-400.css';
+import '@fontsource/ibm-plex-mono/latin-500.css';
+import '@fontsource/ibm-plex-mono/latin-600.css';
+import '@fontsource/ibm-plex-mono/latin-700.css';
+import '../styles/docs.css';
+
+import BrandMark from '../components/BrandMark.astro';
+import LangSwitcher from '../components/LangSwitcher.astro';
+import SidebarNav from '../components/SidebarNav.astro';
+import RightAside, { type TocHeading } from '../components/RightAside.astro';
+import SiteFooter from '../components/SiteFooter.astro';
+import SearchDialog from '../components/SearchDialog.astro';
+import { getUiStrings } from '../data/i18n';
+import { getGroupTitleForSlug, getPagination } from '../data/navigation';
+import {
+  assetHref,
+  docHref,
+  getEditPageUrl,
+  getGithubRepoUrl,
+  getLocaleFromUrl,
+  type Locale,
+} from '../lib/url';
+
+interface Props {
+  slug: string;
+  locale?: Locale;
+  title: string;
+  description: string;
+  headings: TocHeading[];
+  markdownSource: string;
+  filePath?: string;
+}
+
+const { slug, title, description, headings, markdownSource, filePath } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const groupTitle = getGroupTitleForSlug(slug, locale);
+const { prev, next } = getPagination(slug, locale);
+const githubUrl = getGithubRepoUrl();
+const editUrl = getEditPageUrl(slug, filePath, locale);
+const siteBase = Astro.site ?? Astro.url;
+const zhAltUrl = new URL(docHref(slug, 'zh'), siteBase).toString();
+const enAltUrl = new URL(docHref(slug, 'en'), siteBase).toString();
+const tocHeadings = headings.filter((h) => h.depth === 2 || h.depth === 3);
+const safeMarkdownJson = JSON.stringify(markdownSource).replace(/</g, '\\u003c');
+---
+
+<!doctype html>
+<html lang={locale === 'zh' ? 'zh-CN' : 'en'} dir="ltr" data-theme="system" data-locale={locale}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>{title} | {ui.siteTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="alternate" hreflang="zh-CN" href={zhAltUrl} />
+    <link rel="alternate" hreflang="en" href={enAltUrl} />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfbfb" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0c0c0c" />
+    <meta name="color-scheme" content="light dark" />
+    <script is:inline>
+      (() => {
+        try {
+          const saved = localStorage.getItem('mizar-docs-theme');
+          const mode = saved === 'light' || saved === 'dark' ? saved : 'system';
+          const meta = document.querySelector('meta[name="color-scheme"]');
+          if (meta) {
+            meta.content = mode === 'system' ? 'light dark' : mode;
+          }
+          document.documentElement.dataset.theme = mode;
+        } catch {}
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href={assetHref('favicon.svg')} />
+  </head>
+  <body>
+    <div
+      data-site="true"
+      data-page="docs"
+      data-layout="docs"
+      data-locale={locale}
+      data-copy-copied={ui.copyStatusCopied}
+      data-copy-copied-markdown={ui.copyStatusCopiedMarkdown}
+      data-copy-failed={ui.copyStatusFailed}
+    >
+      <a href="#article-title" class="skip-link visually-hidden">{ui.skipToContent}</a>
+
+      <header data-component="topbar">
+        <BrandMark locale={locale} />
+        <div data-slot="topbar-actions">
+          <LangSwitcher slug={slug} locale={locale} />
+          <button
+            type="button"
+            data-slot="search-button"
+            data-search-open
+            aria-label={ui.searchOpenAria}
+            aria-haspopup="dialog"
+          >
+            <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <circle cx="7.2" cy="7.2" r="5" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+              <path d="M11 11L13.5 13.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" vector-effect="non-scaling-stroke" />
+            </svg>
+          </button>
+          <a
+            href={githubUrl}
+            target="_blank"
+            rel="noopener"
+            data-component="github-link"
+            aria-label={ui.topbarGithubAria}
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z" />
+            </svg>
+          </a>
+        </div>
+      </header>
+
+      <a
+        href={githubUrl}
+        target="_blank"
+        rel="noopener"
+        data-component="github-link"
+        data-owner="corner"
+        aria-label={ui.cornerGithubAria}
+      >
+        <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z" />
+        </svg>
+      </a>
+
+      <div data-slot="frame">
+        <SidebarNav currentSlug={slug} locale={locale} />
+
+        <main data-component="content" id="content" tabindex="-1">
+          <article
+            data-component="docs-article"
+            data-pagefind-body
+            data-pagefind-meta={`title:${title}`}
+          >
+            <h1
+              id="article-title"
+              tabindex="-1"
+              data-pf-track={groupTitle}
+              data-pagefind-meta="track[data-pf-track]"
+            >
+              {title}
+            </h1>
+
+            {
+              tocHeadings.length > 0 && (
+                <details data-component="contents-menu" data-pagefind-ignore>
+                  <summary>
+                    <span>{ui.contentsHeading}</span>
+                    <svg width="14" height="14" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                      <path
+                        d="M3 4.5L6 7.5L9 4.5"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linecap="square"
+                        vector-effect="non-scaling-stroke"
+                      />
+                    </svg>
+                  </summary>
+                  <ul>
+                    {tocHeadings.map((h) => (
+                      <li data-level={String(h.depth)}>
+                        <a href={`#${h.slug}`}>{h.text}</a>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )
+            }
+
+            <slot />
+
+            <footer data-pagefind-ignore>
+              {(prev || next) && (
+                <nav data-component="pagination" aria-label={ui.paginationAria}>
+                  {prev ? (
+                    <a href={docHref(prev.slug, locale)} rel="prev">
+                      <small>{ui.prevLabel}</small>
+                      <span>{prev.label}</span>
+                    </a>
+                  ) : (
+                    <span />
+                  )}
+                  {next && (
+                    <a href={docHref(next.slug, locale)} rel="next">
+                      <small>{ui.nextLabel}</small>
+                      <span>{next.label}</span>
+                    </a>
+                  )}
+                </nav>
+              )}
+
+              <div data-component="edit-link">
+                <a href={editUrl} target="_blank" rel="noopener">
+                  {ui.editOnGithub}
+                  <span data-slot="sr-only">{ui.opensInNewTabSr}</span>
+                </a>
+                <span class="copy-action-wrap">
+                  <button
+                    type="button"
+                    data-copy-markdown
+                    data-state="idle"
+                  >
+                    <span data-slot="copy-labels" aria-hidden="true">
+                      <span data-label="idle">{ui.copyMarkdownIdle}</span>
+                      <span data-label="copied">{ui.copyMarkdownCopied}</span>
+                      <span data-label="failed">{ui.copyMarkdownFailed}</span>
+                    </span>
+                    <span data-slot="sr-only">{ui.copyMarkdownAria}</span>
+                  </button>
+                  <span class="visually-hidden" role="status"></span>
+                </span>
+              </div>
+            </footer>
+          </article>
+        </main>
+
+        <RightAside headings={headings} locale={locale} />
+      </div>
+
+      <SiteFooter locale={locale} />
+    </div>
+
+    <SearchDialog locale={locale} />
+
+    <script type="application/json" id="mizar-page-markdown" set:html={safeMarkdownJson} />
+
+    <script>
+      (() => {
+        const THEME_KEY = 'mizar-docs-theme';
+
+        // ------------------------------------------------------------------
+        // 1. 三态主题切换（System / Light / Dark，遵循 dark-mode-toggle 规范）
+        // ------------------------------------------------------------------
+        function applyTheme(mode: string, persist = true) {
+          const normalized =
+            mode === 'light' || mode === 'dark' ? mode : 'system';
+          const root = document.documentElement;
+          if (persist) {
+            root.classList.add('theme-switching');
+          }
+          const meta = document.querySelector('meta[name="color-scheme"]');
+          if (meta instanceof HTMLMetaElement) {
+            meta.content = normalized === 'system' ? 'light dark' : normalized;
+          }
+          root.dataset.theme = normalized;
+          document
+            .querySelectorAll<HTMLButtonElement>('[data-theme-btn]')
+            .forEach((btn) => {
+              const active = btn.dataset.themeBtn === normalized;
+              btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+            });
+
+          if (persist) {
+            void root.offsetHeight;
+            requestAnimationFrame(() => {
+              root.classList.remove('theme-switching');
+            });
+            try {
+              if (normalized === 'system') {
+                localStorage.removeItem(THEME_KEY);
+              } else {
+                localStorage.setItem(THEME_KEY, normalized);
+              }
+            } catch {}
+          }
+        }
+
+        const initialTheme = document.documentElement.dataset.theme || 'system';
+        applyTheme(initialTheme, false);
+
+        document
+          .querySelectorAll<HTMLButtonElement>('[data-theme-btn]')
+          .forEach((btn) => {
+            btn.addEventListener('click', () => {
+              applyTheme(btn.dataset.themeBtn || 'system', true);
+            });
+          });
+
+        window.addEventListener('storage', (e) => {
+          if (e.key === THEME_KEY) {
+            applyTheme(e.newValue || 'system', false);
+          }
+        });
+
+        // ------------------------------------------------------------------
+        // 2. 剪贴板复制（遵循 modern-web-guidance copy-button 规范）
+        // ------------------------------------------------------------------
+        const siteRoot = document.querySelector<HTMLElement>('[data-site]');
+        const copyCopiedLabel = siteRoot?.dataset.copyCopied || 'Copied';
+        const copyMarkdownCopiedLabel =
+          siteRoot?.dataset.copyCopiedMarkdown || 'Copied Markdown';
+        const copyFailedLabel = siteRoot?.dataset.copyFailed || 'Copy failed';
+        const copyTimers = new WeakMap<HTMLElement, number>();
+        let lastAnnouncement = '';
+
+        function reportCopy(
+          button: HTMLElement,
+          ok: boolean,
+          copiedLabel = copyCopiedLabel,
+        ) {
+          const nextEl = button.nextElementSibling;
+          const tip = nextEl instanceof HTMLElement && nextEl.getAttribute('role') === 'status'
+            ? nextEl
+            : null;
+          const prevTimer = copyTimers.get(button);
+          if (prevTimer) window.clearTimeout(prevTimer);
+
+          button.removeAttribute('data-copied');
+          button.removeAttribute('data-failed');
+
+          let message = ok ? copiedLabel : copyFailedLabel;
+          if (message === lastAnnouncement) message += '\u00A0';
+          lastAnnouncement = message;
+
+          if (tip) tip.textContent = '';
+          void button.offsetWidth;
+          button.setAttribute(ok ? 'data-copied' : 'data-failed', '');
+          if (tip) {
+            requestAnimationFrame(() => {
+              tip.textContent = message;
+            });
+          }
+
+          copyTimers.set(
+            button,
+            window.setTimeout(() => {
+              button.removeAttribute('data-copied');
+              button.removeAttribute('data-failed');
+              if (tip) tip.textContent = '';
+            }, 2000),
+          );
+        }
+
+        function legacyCopy(text: string): boolean {
+          const field = Object.assign(document.createElement('textarea'), {
+            value: text,
+          });
+          field.setAttribute('readonly', '');
+          field.style.cssText = 'position:fixed;inset-block-start:0;opacity:0';
+          document.body.append(field);
+          field.select();
+          try {
+            return (document as unknown as { execCommand(cmd: string): boolean }).execCommand('copy');
+          } finally {
+            field.remove();
+          }
+        }
+
+        async function writeClipboard(text: string): Promise<boolean> {
+          if (!text) return false;
+          if (window.isSecureContext && navigator.clipboard?.writeText) {
+            try {
+              await navigator.clipboard.writeText(text);
+              return true;
+            } catch {
+              return legacyCopy(text);
+            }
+          }
+          return legacyCopy(text);
+        }
+
+        async function handleCopyTarget(button: HTMLElement, target: Element | null) {
+          if (!target) return;
+          const text =
+            target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
+              ? target.value
+              : target instanceof HTMLElement
+                ? target.innerText.trim()
+                : (target.textContent || '').trim();
+          const ok = await writeClipboard(text);
+          reportCopy(button, ok);
+        }
+
+        document.addEventListener(
+          'command',
+          (event: Event) => {
+            const cmdEvent = event as Event & {
+              command?: string;
+              source?: Element | null;
+              target?: Element | null;
+            };
+            if (
+              cmdEvent.command?.startsWith('--copy') &&
+              cmdEvent.source instanceof HTMLElement
+            ) {
+              void handleCopyTarget(cmdEvent.source, cmdEvent.target ?? null);
+            }
+          },
+          true,
+        );
+
+        if (!('CommandEvent' in window)) {
+          document.addEventListener('click', (event) => {
+            const targetEl = event.target instanceof Element ? event.target : null;
+            const button = targetEl?.closest<HTMLButtonElement>('button[command^="--copy"]');
+            if (!button) return;
+            const targetId = button.getAttribute('commandfor');
+            const target = targetId ? document.getElementById(targetId) : null;
+            void handleCopyTarget(button, target);
+          });
+        }
+
+        // Copy as Markdown
+        const markdownScript = document.getElementById('mizar-page-markdown');
+        let pageMarkdown = '';
+        if (markdownScript?.textContent) {
+          try {
+            pageMarkdown = JSON.parse(markdownScript.textContent);
+          } catch {
+            pageMarkdown = markdownScript.textContent;
+          }
+        }
+
+        document
+          .querySelectorAll<HTMLButtonElement>('[data-copy-markdown]')
+          .forEach((btn) => {
+            btn.addEventListener('click', async () => {
+              const ok = await writeClipboard(pageMarkdown);
+              reportCopy(btn, ok, copyMarkdownCopiedLabel);
+            });
+          });
+
+        // 标题锚点点击复制链接
+        document
+          .querySelectorAll<HTMLAnchorElement>('[data-heading-anchor]')
+          .forEach((anchor) => {
+            anchor.addEventListener('click', async () => {
+              const id = anchor.dataset.headingAnchor;
+              if (!id) return;
+              const url = `${location.href.split('#')[0]}#${id}`;
+              const ok = await writeClipboard(url);
+              if (ok) {
+                anchor.dataset.state = 'copied';
+                window.setTimeout(() => {
+                  delete anchor.dataset.state;
+                }, 1500);
+              }
+            });
+          });
+
+        // ------------------------------------------------------------------
+        // 3. CodeTabs（遵循 tabs 规范：Selection follows focus + until-found）
+        // ------------------------------------------------------------------
+        document
+          .querySelectorAll<HTMLElement>('[data-code-tabs]')
+          .forEach((groupEl) => {
+            const tabs = Array.from(
+              groupEl.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+            );
+            const panels = Array.from(
+              groupEl.querySelectorAll<HTMLElement>('[role="tabpanel"]'),
+            );
+            const copyBtn = groupEl.querySelector<HTMLButtonElement>('[data-tabs-copy]');
+
+            function selectTab(selectedTab: HTMLButtonElement) {
+              const panelId = selectedTab.dataset.panel;
+              tabs.forEach((tab) => {
+                const active = tab === selectedTab;
+                tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                tab.toggleAttribute('focusgroupstart', active);
+              });
+              panels.forEach((panel) => {
+                if (panel.id === panelId) {
+                  panel.removeAttribute('hidden');
+                  panel.setAttribute('tabindex', '0');
+                } else {
+                  (panel as unknown as { hidden: string | boolean }).hidden = 'until-found';
+                  panel.removeAttribute('tabindex');
+                }
+              });
+              if (copyBtn && selectedTab.dataset.copyTarget) {
+                copyBtn.setAttribute('commandfor', selectedTab.dataset.copyTarget);
+              }
+            }
+
+            tabs.forEach((tab, index) => {
+              tab.addEventListener('click', () => selectTab(tab));
+              tab.addEventListener('keydown', (e) => {
+                let nextIdx = index;
+                if (e.key === 'ArrowRight') nextIdx = (index + 1) % tabs.length;
+                else if (e.key === 'ArrowLeft')
+                  nextIdx = (index - 1 + tabs.length) % tabs.length;
+                else if (e.key === 'Home') nextIdx = 0;
+                else if (e.key === 'End') nextIdx = tabs.length - 1;
+                else return;
+                e.preventDefault();
+                tabs[nextIdx].focus();
+                selectTab(tabs[nextIdx]);
+              });
+            });
+
+            panels.forEach((panel) => {
+              panel.addEventListener('beforematch', () => {
+                const owner = tabs.find((t) => t.dataset.panel === panel.id);
+                if (owner) selectTab(owner);
+              });
+            });
+          });
+
+        // ------------------------------------------------------------------
+        // 4. 移动端 Section Nav 抽屉
+        // ------------------------------------------------------------------
+        const sectionNav = document.querySelector<HTMLElement>('[data-section-nav]');
+        const sectionToggle = sectionNav?.querySelector<HTMLButtonElement>('[data-slot="section-toggle"]');
+        if (sectionNav && sectionToggle) {
+          const setNavOpen = (open: boolean) => {
+            sectionNav.toggleAttribute('data-open', open);
+            sectionToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+          };
+
+          sectionToggle.addEventListener('click', () => {
+            setNavOpen(!sectionNav.hasAttribute('data-open'));
+          });
+
+          sectionNav.querySelectorAll('a').forEach((link) => {
+            link.addEventListener('click', () => setNavOpen(false));
+          });
+
+          document.addEventListener('click', (e) => {
+            if (
+              sectionNav.hasAttribute('data-open') &&
+              e.target instanceof Node &&
+              !sectionNav.contains(e.target)
+            ) {
+              setNavOpen(false);
+            }
+          });
+
+          document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && sectionNav.hasAttribute('data-open')) {
+              setNavOpen(false);
+              sectionToggle.focus();
+            }
+          });
+        }
+
+        // ------------------------------------------------------------------
+        // 5. ScrollSpy 右侧 CONTENTS 高亮（原生 :target-current + IO 回退）
+        // ------------------------------------------------------------------
+        const tocLinks = Array.from(
+          document.querySelectorAll<HTMLAnchorElement>('[data-toc-link]'),
+        );
+        if (tocLinks.length > 0) {
+          const targets = tocLinks
+            .map((a) => {
+              const id = a.getAttribute('href')?.slice(1) || '';
+              const el = id ? document.getElementById(id) : null;
+              return el ? { link: a, el } : null;
+            })
+            .filter((x): x is { link: HTMLAnchorElement; el: HTMLElement } => x !== null);
+
+          const setActiveToc = (activeId: string) => {
+            tocLinks.forEach((link) => {
+              const match = link.getAttribute('href') === `#${activeId}`;
+              link.classList.toggle('target-current', match);
+              if (match) {
+                link.setAttribute('aria-current', 'location');
+              } else {
+                link.removeAttribute('aria-current');
+              }
+            });
+          };
+
+          const updateFromScroll = () => {
+            let current = targets[0]?.el.id || '';
+            const threshold = 120;
+            for (const item of targets) {
+              if (item.el.getBoundingClientRect().top <= threshold) {
+                current = item.el.id;
+              }
+            }
+            if (current) setActiveToc(current);
+          };
+
+          if (CSS.supports('scroll-target-group: auto')) {
+            const syncNative = () => {
+              const nativeCurrent = document.querySelector<HTMLAnchorElement>(
+                '[data-component="on-this-page"] a:target-current',
+              );
+              if (nativeCurrent) {
+                const id = nativeCurrent.getAttribute('href')?.slice(1) || '';
+                if (id) setActiveToc(id);
+              } else {
+                updateFromScroll();
+              }
+            };
+            syncNative();
+            document.addEventListener('scrollend', syncNative);
+            window.addEventListener('scroll', updateFromScroll, { passive: true });
+          } else {
+            const observer = new IntersectionObserver(
+              () => updateFromScroll(),
+              { rootMargin: '-12% 0px -70% 0px', threshold: 0 },
+            );
+            targets.forEach(({ el }) => observer.observe(el));
+            updateFromScroll();
+          }
+        }
+
+        // ------------------------------------------------------------------
+        // 6. Cmd/Ctrl+K 搜索浮层（Pagefind 主引擎 + search-index.json 降级）
+        // ------------------------------------------------------------------
+        const dialogEl = document.getElementById('mizar-search-dialog');
+        if (dialogEl instanceof HTMLDialogElement) {
+          const dialog: HTMLDialogElement = dialogEl;
+          const searchInput = document.getElementById('mizar-search-input');
+          const resultsContainer = document.getElementById('mizar-search-results');
+          const closeBtn = dialog.querySelector<HTMLButtonElement>('[data-search-close]');
+          const activeLocale =
+            dialog.dataset.locale === 'en' ||
+            document.documentElement.dataset.locale === 'en'
+              ? 'en'
+              : 'zh';
+          const recommendedLabel =
+            dialog.dataset.recommendedLabel || 'RECOMMENDED';
+          const resultsPrefix = dialog.dataset.resultsPrefix || 'RESULTS';
+          const emptyQueryTemplate =
+            dialog.dataset.emptyQueryTemplate ||
+            'No results found for "{query}".';
+          const emptyDefaultText =
+            dialog.dataset.emptyDefault || 'No recommended entries.';
+          const pagefindUrl = dialog.dataset.pagefindUrl || '';
+          const fallbackUrl = dialog.dataset.fallbackUrl || '';
+          let defaultItems: Array<{
+            slug: string;
+            title: string;
+            groupLabel?: string;
+            description: string;
+            href: string;
+          }> = [];
+          try {
+            defaultItems = JSON.parse(dialog.dataset.defaultItems || '[]');
+          } catch {}
+
+          interface SearchResultItem {
+            title: string;
+            snippet: string;
+            context: string;
+            href: string;
+          }
+
+          interface FallbackDoc {
+            locale?: string;
+            slug: string;
+            title: string;
+            group: string;
+            description: string;
+            headings: string[];
+            text: string;
+            href: string;
+          }
+
+          let pagefindApi: {
+            init?: () => Promise<void>;
+            search: (q: string) => Promise<{
+              results: Array<{
+                data: () => Promise<{
+                  url: string;
+                  meta?: { title?: string; track?: string };
+                  excerpt?: string;
+                }>;
+              }>;
+            }>;
+          } | null = null;
+          let pagefindAttempted = false;
+          let fallbackDocs: FallbackDoc[] | null = null;
+          let activeIndex = -1;
+          let searchSeq = 0;
+
+          async function ensurePagefind() {
+            if (pagefindApi || pagefindAttempted) return pagefindApi;
+            pagefindAttempted = true;
+            if (!pagefindUrl) return null;
+            try {
+              const mod = await import(/* @vite-ignore */ pagefindUrl);
+              if (mod && typeof mod.search === 'function') {
+                if (typeof mod.init === 'function') await mod.init();
+                pagefindApi = mod;
+              }
+            } catch {
+              pagefindApi = null;
+            }
+            return pagefindApi;
+          }
+
+          async function ensureFallback(): Promise<FallbackDoc[]> {
+            if (fallbackDocs) return fallbackDocs;
+            if (!fallbackUrl) return [];
+            try {
+              const res = await fetch(fallbackUrl);
+              if (res.ok) {
+                fallbackDocs = await res.json();
+                return fallbackDocs || [];
+              }
+            } catch {}
+            return [];
+          }
+
+          function appendHighlightedText(parent: HTMLElement, text: string, query: string) {
+            if (!query) {
+              parent.textContent = text;
+              return;
+            }
+            const lowerText = text.toLowerCase();
+            const lowerQuery = query.toLowerCase();
+            let pos = 0;
+            while (pos < text.length) {
+              const idx = lowerText.indexOf(lowerQuery, pos);
+              if (idx === -1) {
+                parent.append(document.createTextNode(text.slice(pos)));
+                break;
+              }
+              if (idx > pos) {
+                parent.append(document.createTextNode(text.slice(pos, idx)));
+              }
+              const mark = document.createElement('mark');
+              mark.textContent = text.slice(idx, idx + query.length);
+              parent.append(mark);
+              pos = idx + query.length;
+            }
+          }
+
+          function renderResults(
+            items: SearchResultItem[],
+            groupLabel: string,
+            query: string,
+          ) {
+            if (!resultsContainer) return;
+            resultsContainer.replaceChildren();
+            resultsContainer.dataset.query = query;
+            activeIndex = -1;
+
+            if (items.length === 0) {
+              const empty = document.createElement('p');
+              empty.setAttribute('data-slot', 'empty');
+              empty.textContent = query
+                ? emptyQueryTemplate.replace('{query}', query)
+                : emptyDefaultText;
+              resultsContainer.append(empty);
+              return;
+            }
+
+            const group = document.createElement('div');
+            group.setAttribute('data-slot', 'group');
+            group.textContent = groupLabel;
+            resultsContainer.append(group);
+
+            items.forEach((item, idx) => {
+              const a = document.createElement('a');
+              a.setAttribute('data-slot', 'option');
+              a.setAttribute('role', 'option');
+              a.href = item.href;
+              if (idx === 0) {
+                a.dataset.active = 'true';
+                activeIndex = 0;
+              }
+
+              const textWrap = document.createElement('span');
+              textWrap.setAttribute('data-slot', 'text');
+
+              const titleEl = document.createElement('span');
+              titleEl.setAttribute('data-slot', 'title');
+              appendHighlightedText(titleEl, item.title, query);
+
+              const snippetEl = document.createElement('span');
+              snippetEl.setAttribute('data-slot', 'snippet');
+              appendHighlightedText(snippetEl, item.snippet, query);
+
+              textWrap.append(titleEl, snippetEl);
+
+              const ctxEl = document.createElement('span');
+              ctxEl.setAttribute('data-slot', 'context');
+              ctxEl.textContent = item.context;
+
+              a.append(textWrap, ctxEl);
+              a.addEventListener('click', () => dialog.close());
+              resultsContainer.append(a);
+            });
+          }
+
+          function buildSnippet(text: string, query: string): string {
+            const idx = text.toLowerCase().indexOf(query.toLowerCase());
+            if (idx === -1) return text.slice(0, 120);
+            const start = Math.max(0, idx - 32);
+            const end = Math.min(text.length, idx + query.length + 88);
+            return `${start > 0 ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`;
+          }
+
+          async function runSearch(rawQuery: string) {
+            const seq = ++searchSeq;
+            const query = rawQuery.trim();
+            if (!query) {
+              renderResults(
+                defaultItems.map((d) => ({
+                  title: d.title,
+                  snippet: d.description,
+                  context: d.groupLabel || d.slug,
+                  href: d.href,
+                })),
+                recommendedLabel,
+                '',
+              );
+              return;
+            }
+
+            const pf = await ensurePagefind();
+            if (seq !== searchSeq) return;
+
+            if (pf) {
+              const searchRes = await pf.search(query);
+              if (seq !== searchSeq) return;
+              const top = searchRes.results.slice(0, 10);
+              const loaded = await Promise.all(top.map((r) => r.data()));
+              if (seq !== searchSeq) return;
+              const items: SearchResultItem[] = loaded.map((d) => {
+                const parsed = new DOMParser().parseFromString(d.excerpt || '', 'text/html');
+                const plainExcerpt = (parsed.body.textContent || '').replace(/\s+/g, ' ').trim();
+                const trackCtx = d.meta?.track ? `${d.meta.track}` : d.url;
+                return {
+                  title: d.meta?.title || d.url,
+                  snippet: plainExcerpt,
+                  context: trackCtx,
+                  href: d.url,
+                };
+              });
+              if (items.length > 0) {
+                renderResults(items, `${resultsPrefix} (${searchRes.results.length})`, query);
+                return;
+              }
+            }
+
+            // 降级搜索（用于 dev 模式或 Pagefind 无命中时精确匹配中文/字段名，按当前语言过滤）
+            const docs = (await ensureFallback()).filter(
+              (doc) => (doc.locale || 'zh') === activeLocale,
+            );
+            if (seq !== searchSeq) return;
+            const qLower = query.toLowerCase();
+            const matched = docs
+              .map((doc) => {
+                let score = 0;
+                if (doc.title.toLowerCase().includes(qLower)) score += 10;
+                if (doc.headings.some((h) => h.toLowerCase().includes(qLower))) score += 5;
+                if (doc.description.toLowerCase().includes(qLower)) score += 3;
+                if (doc.text.toLowerCase().includes(qLower)) score += 1;
+                return { doc, score };
+              })
+              .filter((r) => r.score > 0)
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 10)
+              .map(({ doc }) => ({
+                title: doc.title,
+                snippet: doc.text.toLowerCase().includes(qLower)
+                  ? buildSnippet(doc.text, query)
+                  : doc.description,
+                context: doc.group,
+                href: doc.href,
+              }));
+            renderResults(matched, `${resultsPrefix} (${matched.length})`, query);
+          }
+
+          function openSearch() {
+            if (!dialog.open) {
+              dialog.showModal();
+            }
+            if (searchInput instanceof HTMLInputElement) {
+              searchInput.focus();
+              searchInput.select();
+              void runSearch(searchInput.value);
+            }
+          }
+
+          document
+            .querySelectorAll<HTMLElement>('[data-search-open]')
+            .forEach((btn) => {
+              btn.addEventListener('click', openSearch);
+            });
+
+          closeBtn?.addEventListener('click', () => dialog.close());
+
+          // 遵循 dialog 规范：仅当不支持 closedBy 属性时提供 pointer light-dismiss 回退
+          if (!('closedBy' in HTMLDialogElement.prototype)) {
+            const panel = dialog.querySelector<HTMLElement>('[data-slot="panel"]');
+            let pressedOutside = false;
+            const isOutside = (e: PointerEvent) => {
+              if (!panel) return false;
+              const r = panel.getBoundingClientRect();
+              return (
+                e.clientX < r.left ||
+                e.clientX > r.right ||
+                e.clientY < r.top ||
+                e.clientY > r.bottom
+              );
+            };
+            dialog.addEventListener('pointerdown', (e) => {
+              pressedOutside = isOutside(e);
+            });
+            dialog.addEventListener('pointerup', (e) => {
+              if (pressedOutside && isOutside(e)) dialog.close();
+            });
+          } else {
+            // 即便支持 closedby="any"，因为 dialog 自身占满视口包裹固定居中 panel，
+            // 点击 panel 外围（即 dialog 元素自身区域）时也应关闭弹窗
+            const panel = dialog.querySelector<HTMLElement>('[data-slot="panel"]');
+            dialog.addEventListener('click', (e) => {
+              if (panel && e.target instanceof Node && !panel.contains(e.target)) {
+                dialog.close();
+              }
+            });
+          }
+
+          if (searchInput instanceof HTMLInputElement) {
+            searchInput.addEventListener('input', () => {
+              void runSearch(searchInput.value);
+            });
+
+            searchInput.addEventListener('keydown', (e) => {
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                dialog.close();
+                return;
+              }
+              if (!resultsContainer) return;
+              const options = Array.from(
+                resultsContainer.querySelectorAll<HTMLAnchorElement>('[data-slot="option"]'),
+              );
+              if (options.length === 0) return;
+
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                activeIndex = (activeIndex + 1) % options.length;
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                activeIndex = (activeIndex - 1 + options.length) % options.length;
+              } else if (e.key === 'Enter' && activeIndex >= 0) {
+                e.preventDefault();
+                options[activeIndex].click();
+                return;
+              } else {
+                return;
+              }
+
+              options.forEach((opt, i) => {
+                if (i === activeIndex) {
+                  opt.dataset.active = 'true';
+                  opt.scrollIntoView({ block: 'nearest' });
+                } else {
+                  delete opt.dataset.active;
+                }
+              });
+            });
+          }
+
+          document.addEventListener('keydown', (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+              e.preventDefault();
+              if (dialog.open) dialog.close();
+              else openSearch();
+              return;
+            }
+            if (
+              e.key === '/' &&
+              !e.metaKey &&
+              !e.ctrlKey &&
+              !e.altKey &&
+              !(e.target instanceof HTMLInputElement) &&
+              !(e.target instanceof HTMLTextAreaElement) &&
+              !(e.target instanceof HTMLElement && e.target.isContentEditable)
+            ) {
+              e.preventDefault();
+              openSearch();
+            }
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>

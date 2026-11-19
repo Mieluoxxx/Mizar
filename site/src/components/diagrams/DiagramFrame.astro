@@ -1,0 +1,215 @@
+---
+import { getUiStrings } from '../../data/i18n';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+interface Props {
+  fig: string;
+  title: string;
+  caption?: string;
+  locale?: Locale;
+}
+
+const { fig, title, caption } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const normalizedFig = fig.trim().toUpperCase().startsWith('FIG')
+  ? fig.trim().toUpperCase()
+  : `FIG ${fig.trim().toUpperCase()}`;
+const ariaLabel = `${normalizedFig} · ${title}`;
+---
+
+<figure class="mizar-diagram" data-component="diagram-frame">
+  <div class="diagram-head">
+    <div class="diagram-label">
+      <svg
+        class="diagram-icon"
+        width="14"
+        height="14"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.35"
+        stroke-linecap="square"
+        aria-hidden="true"
+      >
+        <rect x="2" y="2" width="12" height="12" />
+        <path d="M5.5 2V14M2 5.5H14" />
+        <rect x="1.25" y="1.25" width="1.5" height="1.5" fill="currentColor" stroke="none" />
+        <rect x="13.25" y="13.25" width="1.5" height="1.5" fill="currentColor" stroke="none" />
+      </svg>
+      <span class="diagram-fig">{normalizedFig}</span>
+      <span class="diagram-title">{title}</span>
+    </div>
+    <span class="diagram-meta" aria-hidden="true">
+      <span class="meta-desktop">{ui.diagramMetaDesktop}</span>
+      <span class="meta-mobile">{ui.diagramMetaMobile}</span>
+    </span>
+  </div>
+
+  <div class="diagram-stage" tabindex="0" role="region" aria-label={ariaLabel}>
+    <div class="diagram-canvas">
+      <slot />
+    </div>
+  </div>
+
+  {
+    caption && (
+      <figcaption class="diagram-caption">
+        {caption}
+      </figcaption>
+    )
+  }
+</figure>
+
+<style>
+  .mizar-diagram {
+    position: relative;
+    margin: 1.5rem 0 1.75rem;
+    max-width: min(100%, 52.5rem);
+    border: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--code-body);
+  }
+
+  .mizar-diagram::before,
+  .mizar-diagram::after {
+    content: "";
+    position: absolute;
+    width: 5px;
+    height: 5px;
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .mizar-diagram::before {
+    top: -3px;
+    left: -3px;
+  }
+
+  .mizar-diagram::after {
+    bottom: -3px;
+    right: -3px;
+  }
+
+  .diagram-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    min-height: 2.35rem;
+    padding: 0.45rem 0.9rem;
+    background: var(--code-head);
+    border-bottom: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: var(--fs-micro);
+    line-height: 1.4;
+    letter-spacing: 0.04em;
+  }
+
+  .diagram-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .diagram-icon {
+    flex-shrink: 0;
+    color: var(--text-weak);
+  }
+
+  .diagram-fig {
+    font-weight: 700;
+    color: var(--text-strong);
+    white-space: nowrap;
+    padding: 0.05rem 0.38rem;
+    background: var(--grey-3);
+    border: 1px solid var(--border-strong);
+  }
+
+  .diagram-title {
+    color: var(--text-weak);
+    font-weight: 500;
+  }
+
+  .diagram-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--text-faint);
+    white-space: nowrap;
+  }
+
+  .meta-mobile {
+    display: none;
+  }
+
+  .diagram-stage {
+    position: relative;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    background-color: var(--code-body);
+    background-image: radial-gradient(
+      color-mix(in srgb, var(--border-strong) 52%, transparent) 0.75px,
+      transparent 0.75px
+    );
+    background-size: 16px 16px;
+    background-position: 8px 8px;
+    padding: 0.75rem;
+  }
+
+  .diagram-stage:focus-visible {
+    outline: 2px solid var(--link);
+    outline-offset: -2px;
+  }
+
+  .diagram-canvas {
+    width: 100%;
+  }
+
+  .diagram-canvas :global(svg) {
+    display: block;
+    width: 100%;
+    height: auto;
+    font-family: var(--font-mono);
+    user-select: none;
+  }
+
+  .diagram-canvas :global(svg text) {
+    font-family: var(--font-mono);
+  }
+
+  .diagram-caption {
+    border-top: 1px solid var(--border);
+    background: var(--code-head);
+    padding: 0.65rem 0.9rem;
+    font-family: var(--font-sans);
+    font-size: var(--fs-meta);
+    line-height: 1.55;
+    color: var(--text-weak);
+  }
+
+  @media (max-width: 40rem) {
+    .meta-desktop {
+      display: none;
+    }
+
+    .meta-mobile {
+      display: inline;
+      color: var(--link);
+    }
+
+    .diagram-stage {
+      padding: 0.5rem;
+    }
+
+    .diagram-canvas {
+      min-width: 580px;
+    }
+  }
+</style>

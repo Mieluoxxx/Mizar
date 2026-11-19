@@ -1,0 +1,73 @@
+---
+title: 内置工具
+description: 了解 Mizar 默认提供的 6 个本地编程工具、大输出截断保护与 ToolExposure 五级暴露层级。
+group: capabilities
+order: 11
+---
+
+import Callout from '../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../components/DiagramEmbed.astro';
+
+向 Mizar 发送一条典型需求，它会自动串联多个内置工具完成排查、改动与验证，无需你手工复制代码或运行脚本：
+
+```text title="示例对话"
+你：帮我查一下 settings.json 为什么在只读容器里无法写入，顺手补一条单测。
+
+Mizar：
+1. find  → 定位配置加载与存储相关源文件
+2. grep  → 检索 sessionDb / mkdir 相关出错点
+3. read  → 分片精读错误上下文与现有测试风格
+4. edit  → 在目标文件做精确局部替换
+5. bash  → 运行 cargo test 验证修复通过
+```
+
+## 6 个内置工具的能力与防护
+
+所有内置工具都围绕「尽量保留关键信息、绝不一次性撑爆模型窗口」来设计：
+
+### `read` · 分片读文件
+
+按起止行号（`offset` 与 `limit`）读取文件。超过 **2,000 行** 或 **50 KiB** 时自动在头部截断，并在输出末尾告诉你下一步从第几行续读。读取某个深层子目录的文件时，还会顺带发现该子目录自带的 `AGENTS.md` 规则。
+
+### `grep` 与 `find` · 目录扫描与正则检索
+
+底层使用高速检索并自动遵守 `.gitignore`、跳过隐藏噪声目录。`grep` 默认最多返回 **100 条**匹配并裁切单行超过 **500 字符**的极长 minified 文本；`find` 默认最多返回 **1,000 条**路径，避免意外扫描 `node_modules` 或 `target/`。
+
+### `edit` 与 `write` · 串行安全修改
+
+`write` 用于创建或覆写完整文件；`edit` 要求精确匹配一段既有上下文再替换（支持在单次调用里提交一组多处修改，也兼容智能引号细微差异）。**对同一文件路径的连续修改会自动进入排队串行执行**，不会因为并发调用互相覆盖。
+
+### `bash` · 本地 Shell 与大输出落盘
+
+执行构建、测试或脚本命令时，会在独立进程组中拉起 Shell（按 `Esc` 中断会连同所有派生子进程一并清理）。当 stdout / stderr 超过 **2,000 行** 或 **50 KiB** 时：
+
+- `bash` 只保留**最后一段**最新输出交给模型，避免构建长日志把关键报错顶掉；
+- 同时把**完整原始日志**写进系统临时目录下的 `mizar/mizar-bash-*.log`，返回路径供你或模型用 `read` 随时回看全量细节。
+
+<Callout type="note" title="默认无路径硬隔离">
+
+为保证开发顺畅，`read` / `edit` / `bash` 默认均可访问工作区之外的文件或命令。如在陌生仓库运行，务必前往 [权限与安全](/security/) 配置工具裁剪、工作区路径约束与审批闸门。
+
+</Callout>
+
+## 为什么接入海量工具不会撑爆上下文？
+
+如果你接了上百个外部 MCP 工具，全部把 JSON Schema 塞进模型上下文不仅极其昂贵，还会显著降低工具选择准确率。Mizar 为每个工具分配了清晰的 `ToolExposure` 可见性层级，在“随时可用”与“保持精简上下文”之间自动取得平衡：
+
+<DiagramEmbed
+  id="tool-exposure"
+  title="工具可见性与上下文预算闭环"
+  caption="内置核心工具直接对模型可见；MCP 工具默认退入沙箱按需调用；发现与编排元工具允许模型主动按需检出。"
+/>
+
+从使用者的视角看，模型与工具共有五种 `ToolExposure` 暴露状态：
+
+1. **直接声明（`Direct`）**：如 `read`、`edit`、`bash`，模型从第一轮起就知道它的存在并能直接发起调用。
+2. **仅向模型声明 / 防嵌套（`ModelOnly`）**：如按需搜工具的 `tool_search` 和执行 JS 编排的 `codemode`，模型可以直接触发它们，但沙箱脚本内部不能递归调用它们。
+3. **仅在沙箱内部调用（`Codemode`）**：所有 MCP 服务器工具默认属于这一层——完全不占对话首轮上下文，需要时模型在 [Codemode 沙箱](/codemode/) 里一键批量调通。
+4. **按需搜出 / 延迟加载（`Deferred`）**：配置为 `deferred` 的外部工具平时静默隐藏，模型调用 `tool_search` 命中后才进入直接可用视野。
+5. **彻底隐藏（`Hidden`）**：被 `excludeTools` 或配置为 `hidden` 的工具对模型和沙箱均不可见。
+
+## 工具裁剪与权限控制
+
+不同任务不需要开放全部能力。你可以通过 `settings.json` 的 `toolsPreset`（`all` / `minimal` / `read-only`）、`tools` 白名单（内部对应 `includeTools`）与 `excludeTools` 黑名单，或 CLI 启动参数 `--minimal`、`--read-only`、`-t` / `-xt` 随时收窄可用工具，也可以输入 [`/tools`](/tui/commands/) 查看当前生效层级。完整权限预设矩阵、跨层级并集规则与 `--approve` 审批闸门请见 [权限与安全](/security/)。

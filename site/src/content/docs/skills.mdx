@@ -1,0 +1,72 @@
+---
+title: 可复用技能 (Skills)
+description: 编写 .agents/skills/ 下的 SKILL.md 封装团队工作流，在对话里用 /技能名 一键调用并支持热重载。
+group: rules-security
+order: 15
+---
+
+import Callout from '../../components/mdx/Callout.astro';
+
+`AGENTS.md` 适合存放全项目常驻的编码规范；而像“上线前做一次安全审计”“按团队模板生成变更说明”这类**只在特定时刻触发的任务流程**，写成 Skill 按需呼出既不浪费平时上下文，又可以精确复用步骤。
+
+## 手把手建一个 `/review` 技能
+
+在当前仓库创建 `.agents/skills/review/SKILL.md`：
+
+```markdown title=".agents/skills/review/SKILL.md"
+---
+name: review
+description: Review changed or specified modules for correctness, error handling, and missing tests.
+when-to-use: Ask to review code, inspect diffs, or audit a directory before commit.
+---
+
+请按以下顺序审查目标代码：
+1. 先用 find / read 检查边界条件、错误处理与空值处理；
+2. 指出可能导致静默失败或数据竞争的风险点，附带精确文件路径与行号；
+3. 若发现问题，说明最小修改建议并询问是否直接动手修复。
+```
+
+无需重启或编译。进入 Mizar 后，直接在输入框敲入下面这句即可触发：
+
+```text title="在对话中调用技能"
+/review src/
+```
+
+Mizar 会把技能正文连同你的附加参数 `src/` 一并展开提交给模型；或者你也可以只写自然语言请求，让模型根据索引里的 `description` 与 `when-to-use` 自动决定读取并执行该技能。
+
+## 技能文件结构与 Frontmatter 字段
+
+Mizar 在技能根目录下同时识别两种组织方式：
+
+- **目录型（推荐）**：`<skill-dir>/SKILL.md`（最多向下扫描 8 层，适合旁边顺带存放脚本或示例文件）。
+- **单文件型**：直接在技能根目录下放 `<name>.md`（不会把顶层的 `SKILL.md` 当作单文件技能）。
+
+YAML Frontmatter 中 `name` 与 `description` 为必填项（`name` 需符合 kebab-case 小写字母/数字/连字符规则），另支持三个常用控制开关：
+
+- `when-to-use`：提示模型在什么意图下适合主动启用此技能。
+- `disable-model-invocation: true`：禁止模型自行调用，只允许用户手工键入 `/<name>` 触发（适合发布脚本、不可逆清理动作）。
+- `user-invocable: false`：不出现在用户输入 `/<name>` 自动补全列表里，仅作为模型后台可自主调用的辅助知识。
+
+<Callout type="note">
+  为防止海量技能说明撑爆开场上下文，技能目录里的每条 <code>description</code> 在注入索引时超过 <code>skills.catalogDescriptionMaxLength</code>（默认 <code>500</code> 字符）会被安全裁剪；具体操作步骤正文只有当技能实际触发时才会加载。
+</Callout>
+
+## 目录优先级：项目级覆盖用户全局级
+
+当全局目录和当前项目里存在同名技能（例如都叫 `review`）时，Mizar 按下列优先级从高到低仲裁，高优先级直接覆盖同名全局技能：
+
+1. **当前工作区及仓库根目录的 `.agents/skills`**（优先级最高，专属于本仓库流程）
+2. **`settings.json` 中配置的 `skills.customDirs`**（按配置先后顺序匹配团队共享技能库）
+3. **用户全局 `~/.agents/skills`**（或环境变量 `MIZAR_AGENTS_HOME` 下的 `skills` 目录）
+4. **内置兜底技能目录**（或环境变量 `MIZAR_BUNDLED_SKILL_DIR`）
+
+例如你的 `~/.agents/skills/review/SKILL.md` 写了一套通用 Rust 检查单，而公司的前端仓库 `.agents/skills/review/SKILL.md` 针对 React / TypeScript 定制了检查项；进入那个仓库后输入 `/review`，自动生效的就是仓库专属版本，绝不用担心和全局冲突。
+
+## 修改即热生效与 `/skills` 管理
+
+如果在会话中你直接让 Mizar 用 `write` 或 `edit` 新增或改写了某个技能文件，技能缓存会在写入完成那一刻**自动失效并重新加载**——紧接着下一轮就能输入新的 `/技能名` 开跑。
+
+随时在对话中输入下面两条[斜杠命令](/tui/commands/)查看当前生效的所有技能及来源层级：
+
+- `/skills`：打开交互式技能选择器，支持筛选预览并直接插入输入框；
+- `/skills list`：以纯文本清单打印所有已注册技能、触发方式与来源路径。

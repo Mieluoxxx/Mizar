@@ -1,0 +1,139 @@
+---
+title: Configuration & Precedence
+description: Use ~/.mizar/settings.json and project-level .mizar/settings.json to customize default models, tool permissions, sandbox orchestration, and rule budgets.
+group: configuration
+order: 2
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../../components/DiagramEmbed.astro';
+
+Start by creating a minimal global configuration that tells Mizar your preferred model, reasoning effort, and default tool scope:
+
+```json title="~/.mizar/settings.json"
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-chat",
+  "reasoningEffort": "medium",
+  "toolsPreset": "all"
+}
+```
+
+Save the file and restart `mizar` for changes to take effect. Global settings live at `~/.mizar/settings.json` by default (redirectable via the `MIZAR_HOME` environment variable), while project-specific settings live at `.mizar/settings.json` in the repository root.
+
+<Callout type="warning" title="Strict JSON Syntax: No Comments or Trailing Commas">
+  When parsing <code>settings.json</code>, <code>models.json</code>, and <code>mcp.json</code>, Mizar only strips a UTF-8 BOM automatically—it <strong>does not support</strong> <code>//</code> or <code>/* */</code> comments, nor trailing commas. Invalid syntax fails immediately at startup to prevent silent misconfiguration.
+</Callout>
+
+## Four-Level Configuration Precedence
+
+Configuration layers stack from lowest to highest priority, with later layers overriding scalar fields of the same name from earlier ones:
+
+1. **Built-in defaults**: Ready out of the box when no configuration files exist.
+2. **Global directory `~/.mizar/`** (or `$MIZAR_HOME`): Personal default model, shared credentials, and cross-project blocklists.
+3. **Project directory `<workspace>/.mizar/`**: Committed to the team repository to override model preferences, rule paths, or MCP constraints for that repo.
+4. **Environment variables & CLI flags**: One-off overrides for the current run, such as `--minimal`, `--approve`, `API_KEY`, `MODEL`, or `MIZAR_SESSION_DB`.
+
+<DiagramEmbed
+  id="config-precedence"
+  title="Four-Level Precedence & Dual-Track Merge Rules"
+  caption="Regular scalar fields follow last-write-wins overrides, whereas excludeTools and skills.customDirs merge across layers via safe union append."
+/>
+
+## Why Blocklists and Skill Directories Append Instead of Replacing
+
+Most fields use "project config replaces global config," but two settings are intentionally merged by **cross-layer union append**:
+
+- `excludeTools`: The global blocklist, project blocklist, and CLI `--exclude-tools` flag all accumulate. If you disable a dangerous command personally in `~/.mizar/settings.json`, a repository's `.mizar/settings.json` that also excludes `edit` will not wipe out your personal safeguard.
+- `skills.customDirs`: Personal global skill directories and project-configured team skill directories are combined so shared and repository-private skills coexist.
+
+<Callout type="note">
+  All configuration keys use <code>camelCase</code> (for example, <code>defaultProvider</code>). The only retained legacy alias is <code>defaultThinkingLevel</code>, which is equivalent to <code>reasoningEffort</code>.
+</Callout>
+
+## Core Model & Session Fields
+
+The most common runtime defaults placed in your global `settings.json` are:
+
+```json title="Model and session preferences"
+{
+  "defaultProvider": "openai",
+  "defaultModel": "gpt-5",
+  "reasoningEffort": "high",
+  "maxSteps": 40,
+  "persona": "Be concise and direct; check relevant tests before making edits.",
+  "sessionDb": "~/.mizar/sessions.sqlite"
+}
+```
+
+- `reasoningEffort`: Default thinking level for reasoning models (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+- `maxSteps`: Maximum consecutive tool-call steps per turn; set to `0` for unlimited.
+- `persona`: Persistent collaboration style instructions appended to the default system prompt.
+- `sessionDb`: Custom path for the session SQLite database; you can also set the `MIZAR_SESSION_DB` environment variable to `none` or `off` to disable disk persistence temporarily.
+
+## Tool Presets & Workspace Boundaries
+
+When a task only needs file inspection or scoped editing, narrowing tool permissions in `.mizar/settings.json` is far more reliable than verbal reminders:
+
+```json title="<workspace>/.mizar/settings.json"
+{
+  "toolsPreset": "minimal",
+  "tools": ["read", "edit", "write", "grep", "find"],
+  "excludeTools": ["mcp__prod__*"],
+  "restrictToWorkspace": true
+}
+```
+
+- `toolsPreset`: Three built-in presets—`all` (all 6 tools, default), `minimal` (`read`/`bash`/`edit`/`write` only), and `read-only` (`read`/`grep`/`find` only).
+- `tools` / `excludeTools`: Allowlist and blocklist filters; both support `*` wildcards (such as `mcp__prod__*`).
+- `restrictToWorkspace`: Defaults to `false`; setting `true` blocks file tools and `@` references from accessing paths outside the workspace root. **Note that this does not restrict `bash` commands**—see [Permissions & Security](/en/security/) for the full security policy.
+
+## On-Demand Discovery & Codemode Sandbox
+
+When connecting many MCP tools, use these two sections to keep context bloat under control:
+
+```json title="Tool discovery and orchestration settings"
+{
+  "toolSearch": {
+    "autoEnable": true,
+    "defaultLimit": 8
+  },
+  "codemode": {
+    "autoEnable": true,
+    "onlyMode": false,
+    "inlineBudget": 3000,
+    "timeoutMs": 120000
+  }
+}
+```
+
+- `toolSearch.autoEnable` (default `true`) and `defaultLimit` (default `8`): Automatically exposes `tool_search` when deferred tools exist, returning up to 8 matching tools per query.
+- `codemode.autoEnable` (default `true`) and `onlyMode` (default `false`): Automatically exposes the `codemode` JS runner when sandbox-managed tools are registered; enabling `onlyMode` routes direct tools through the sandbox as well.
+- `codemode.inlineBudget` (default `3000` tokens) and `timeoutMs` (default `120000` ms): Controls the token budget for inlining tool type signatures into the system prompt and the default per-run sandbox timeout.
+
+## Project Rules & Skill Scanning
+
+In large monorepos, you can expand or tighten the `AGENTS.md` context budget and rule discovery behavior as needed:
+
+```json title="Rule discovery and skill directory controls"
+{
+  "instructions": {
+    "enabled": true,
+    "candidates": ["AGENTS.md", "CLAUDE.md"],
+    "localCandidates": ["AGENTS.local.md", "CLAUDE.local.md"],
+    "projectRootMarkers": [".git"],
+    "maxBytes": 65536,
+    "maxSourceBytes": 1048576,
+    "followSubdirs": true
+  },
+  "skills": {
+    "enabled": true,
+    "customDirs": ["~/team-skills", ".internal/skills"],
+    "catalogDescriptionMaxLength": 500
+  }
+}
+```
+
+- `instructions.maxBytes` (default `65536`) caps the total bytes of injected rule files; when exceeded, rules closest to the current directory are kept first. Any single file exceeding `maxSourceBytes` (default 1 MiB) is skipped automatically.
+- `followSubdirs` (default `true`) dynamically loads subdirectory rule files when reading or editing files deeper in the tree.
+- `skills.enabled` toggles `.agents/skills` discovery; `customDirs` mounts additional shared team skill directories.

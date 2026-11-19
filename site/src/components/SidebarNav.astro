@@ -1,0 +1,78 @@
+---
+import BrandMark from './BrandMark.astro';
+import LangSwitcher from './LangSwitcher.astro';
+import { getUiStrings } from '../data/i18n';
+import { getNavGroups, getPageMeta } from '../data/navigation';
+import { docHref, getLocaleFromUrl, type Locale } from '../lib/url';
+
+interface Props {
+  currentSlug: string;
+  locale?: Locale;
+}
+
+const { currentSlug } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const navGroups = getNavGroups(locale);
+const currentItem = getPageMeta(currentSlug, locale);
+---
+
+<aside data-component="sidebar" aria-label={ui.sidebarAsideAria}>
+  <div data-slot="sidebar-head">
+    <BrandMark locale={locale} />
+    <LangSwitcher slug={currentSlug} locale={locale} />
+  </div>
+
+  <div data-component="section-nav" data-section-nav>
+    <button
+      type="button"
+      data-slot="section-toggle"
+      aria-expanded="false"
+      aria-controls="section-nav-body"
+      aria-label={`${ui.sidebarToggleAriaPrefix}: ${currentItem?.label ?? ui.brandWordmark}`}
+    >
+      <span data-slot="current">[-] {currentItem?.label ?? ui.brandWordmark}</span>
+      <svg width="14" height="14" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+        <path
+          d="M3 4.5L6 7.5L9 4.5"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="square"
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
+    </button>
+
+    <div data-slot="section-body" id="section-nav-body">
+      <nav data-component="docs-nav" aria-label={ui.sidebarNavAria}>
+        {
+          navGroups.map((group) => (
+            <div data-slot="group">
+              <span data-slot="group-title" id={`docs-nav-${group.id}`}>
+                {group.title}
+              </span>
+              <ul aria-labelledby={`docs-nav-${group.id}`}>
+                {group.items.map((item) => {
+                  const isActive = item.slug === currentSlug;
+                  return (
+                    <li>
+                      <a
+                        href={docHref(item.slug, locale)}
+                        aria-current={isActive ? 'page' : undefined}
+                      >
+                        <span data-slot="box" aria-hidden="true">
+                          [<span data-slot="fill"></span>]
+                        </span>
+                        <span data-slot="label">{item.label}</span>
+                      </a>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))
+        }
+      </nav>
+    </div>
+  </div>
+</aside>

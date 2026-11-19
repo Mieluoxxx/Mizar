@@ -1,0 +1,114 @@
+---
+title: MCP Server Integration
+description: Connect local Stdio and remote HTTP MCP servers via mcp.json, inspect connection status, and apply project-level override-only exposure trimming.
+group: capabilities
+order: 12
+---
+
+import CodeTabs from '../../../components/mdx/CodeTabs.astro';
+import Callout from '../../../components/mdx/Callout.astro';
+
+export const mcpTabs = [
+    {
+      label: 'Full Example (Stdio + HTTP)',
+      lang: 'json',
+      code: `{
+  "mcpServers": {
+    "sqlite": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "./app.db"],
+      "timeoutMs": 30000
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/sse",
+      "headers": {
+        "Authorization": "Bearer \${LINEAR_API_KEY}"
+      }
+    }
+  }
+}`,
+    },
+    {
+      label: 'Global Shared Registry (.mizar/mcp.json)',
+      lang: 'json',
+      code: `{
+  "mcpServers": {
+    "db": {
+      "command": "npx",
+      "args": ["-y", "my-org-db-mcp"],
+      "env": {
+        "DB_URL": "\${TEAM_DB_URL}"
+      }
+    }
+  }
+}`,
+    },
+  ];
+
+Mizar connects to external data sources, issue trackers, browsers, and databases using the standard Model Context Protocol (MCP). Global servers live in `~/.mizar/mcp.json`, and project-specific servers live in `<workspace>/.mizar/mcp.json`.
+
+## Connect Local Stdio & Remote HTTP Servers in 1 Minute
+
+`${VAR}` environment variable expansion is supported across `command`, `args`, `env`, `url`, and `headers`. The example below configures both a local child-process server and a remote streaming HTTP server:
+
+<CodeTabs tabs={mcpTabs} />
+
+When `mizar` starts, all enabled MCP servers perform their handshake asynchronously in the background—**never blocking the initial UI render**. Inside a session, run [`/mcp`](/en/tui/commands/) anytime to inspect each server's connection state, registered tool count, and any timeout or error details.
+
+## Naming Convention & Resource Reading
+
+Once connected, MCP tools are normalized as `mcp__<server>__<tool>` (for example, `mcp__sqlite__read_query`), and keep the same name in both the sandbox and tool search. If a remote server also exposes MCP Resources or Resource Templates, Mizar automatically provides `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource`.
+
+## Shared Team Connections with Project-Local Trimming (`override-only`)
+
+In multi-repo workflows, you often define a shared database or ticketing MCP server once in `~/.mizar/mcp.json` (complete with launch commands and team tokens), while wanting a specific repository to:
+
+1. Completely hide destructive `drop_*` tools to prevent accidental table drops;
+2. Promote frequent read tools like `get_issue` or `query_readonly` to direct model access while leaving everything else in the default sandbox.
+
+In the repository's `.mizar/mcp.json`, simply **omit `command` and `url`** and declare only the fields you want to override:
+
+```json title="<workspace>/.mizar/mcp.json (override-only mode)"
+{
+  "mcpServers": {
+    "db": {
+      "exposure": "codemode",
+      "toolExposure": {
+        "drop_*": "hidden",
+        "query_readonly": "direct"
+      },
+      "timeoutMs": 45000
+    }
+  }
+}
+```
+
+When a project entry omits both `command` and `url`, Mizar treats it not as an incomplete server definition, but as a **targeted patch** layered on top of the same-named global server:
+
+- The global server's launch command, environment variables, and remote auth headers are preserved intact;
+- `toolExposure` entries merge by tool name and support `*` wildcards (when multiple patterns match, **longer/more-specific patterns win**, so `drop_table_*` overrides `drop_*`);
+- You can also set `"enabled": false` to silently disable a global MCP server inside a specific project.
+
+<Callout type="info" title="Four Common exposure Modes">
+  <code>codemode</code> (MCP default): Omitted from initial turn context; invoked programmatically inside the JS sandbox.<br />
+  <code>deferred</code>: Hidden initially and surfaced on demand via <code>tool_search</code>.<br />
+  <code>direct</code>: Exposed directly alongside built-in tools—best for small servers with just two or three core endpoints.<br />
+  <code>hidden</code>: Completely disabled for both the model and sandbox scripts.
+</Callout>
+
+## Opting Out of Default Sandbox Orchestration
+
+If an MCP server only provides two or three simple tools and you want the model to see them immediately upon startup, disable automatic sandbox wrapping or set `"exposure": "direct"` on that server:
+
+```json title="Expose lightweight MCP tools directly to the model"
+{
+  "autoEnableCodemode": false,
+  "mcpServers": {
+    "time": {
+      "command": "npx",
+      "args": ["-y", "mcp-time"],
+      "exposure": "direct"
+    }
+  }
+}
+```

@@ -1,0 +1,77 @@
+---
+title: 项目规则 (AGENTS.md)
+description: 让 Mizar 自动发现全局、仓库根目录与深层子目录中的 AGENTS.md 与本地覆盖规则，了解去重、子目录动态补载与 64 KiB 预算淘汰策略。
+group: rules-security
+order: 14
+---
+
+import Callout from '../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../components/DiagramEmbed.astro';
+
+在仓库根目录新建一份 5 行长的 `AGENTS.md`，下次启动 Mizar 就会立刻读懂项目约束：
+
+```markdown title="AGENTS.md"
+# 仓库开发约定
+
+- 修改 Rust 代码前先读 `docs/architecture.md`。
+- 提交前必须运行 `cargo test --workspace` 并确认全绿。
+- 所有配置字段统一使用 camelCase，不要引入注释或末尾逗号。
+- 错误提示面朝终端用户时写中文，模型工具描述写英文。
+```
+
+## 兼容 `AGENTS.md`、`CLAUDE.md` 与 `.local.md`
+
+现实中的多工具仓库往往同时存在不同成员写下的规则文件。Mizar 按以下默认文件名清单开箱即扫，无需强行迁移历史文件：
+
+- **入库共享规则**：`AGENTS.md`、`CLAUDE.md`
+- **个人本地覆盖（不提交 Git）**：`AGENTS.local.md`、`CLAUDE.local.md`
+
+同一目录内如果存在多份规则，共享规则在前、`.local.md` 在后。而且全局目录也会额外兼顾 `~/.agents/AGENTS.md`，方便统一管理个人全局习惯。
+
+## 在大型仓库里如何发现与保近弃远
+
+假设你正在一个包含几十个微服务的 Monorepo 中启动 Mizar，当前工作目录在 `services/billing`：
+
+```text title="典型 Monorepo 规则发现路径链"
+~/.mizar/AGENTS.md                   ← 全局偏好（个人最宽泛规则）
+~/.agents/AGENTS.md                  ← 全局通用规则
+repo/
+├── .git/                            ← 向上追溯到仓库根目录即止
+├── AGENTS.md                        ← 全仓库统一规范
+└── services/
+    └── billing/                     ← 启动时的工作目录
+        ├── AGENTS.md                ← 计费服务规范
+        ├── AGENTS.local.md          ← 本地调试临时提示
+        └── migrations/
+            └── AGENTS.md            ← 当 read/edit 触及 migrations/ 下文件时自动补载
+```
+
+这套机制的完整生命周期如下：
+
+<DiagramEmbed
+  id="instructions-discovery"
+  title="指令沿目录链发现与 64 KiB 淘汰机制"
+  caption="启动时扫描全局目录与 .git 到工作目录的祖先链；对话中触达子目录时自动追加补载；接近 64 KiB 预算时从最宽泛的祖先规则开始整份淘汰。"
+/>
+
+1. **祖先链自上而下**：启动时 Mizar 从工作目录向上查找项目根标记（默认 `.git`），再沿着「根 → 当前目录」顺次读取规则。子目录更贴近当前代码，优先级也更高。
+2. **随工作流动态潜入子目录**：如果模型随后使用 `read`、`write` 或 `edit` 访问了更深层的 `services/billing/migrations/001.sql`，且默认配置 `followSubdirs: true` 未被关闭，Mizar 会自动补载 `migrations/AGENTS.md`（直到预算上限为止），不用事先把全仓库所有模块的说明都堆进开场提示词。
+3. **内容指纹去重**：全球组与项目组内分别对去除首尾空白后的全文做哈希比对，完全相同的规则文件（例如符号链接或复制的模板）不会重复占用宝贵上下文。
+4. **超大单文件跳过**：任何超过 **1 MiB**（`1,048,576` 字节，可由 `instructions.maxSourceBytes` 调整）的规则文件会被直接跳过并提示，防止误把日志或文档集当作规则注入。
+5. **超限“保近弃远”淘汰**：所有指令合集上限默认 **65,536 字节（64 KiB）**。当团队各层级规则加起来超出预算时，Mizar 会**优先保留离你当前工作目录最近的规则与个人本地规则**，先整份丢弃最外围的全局与顶层祖先规则；若只剩单份最新/最近规则依然超长，则在 UTF-8 字符边界安全截断尾部。
+
+## 用 `/instructions` 快速诊断
+
+觉得某个要求模型似乎“没看到”，或者怀疑规则写得太长被截断了？在 TUI 输入框里直接执行：
+
+```text title="TUI 内置指令检查"
+/instructions
+```
+
+该[斜杠命令](/tui/commands/)会按当前生效顺序列出每一份已加载规则文件的来源层级、准确字节数，以及是否有文件因为重复、超单文件上限或超出 64 KiB 总预算而被截断或省略。如果今天只想做一次纯净排查而不加载任何目录规则，启动时加上 `--no-instructions` 即可。
+
+<Callout type="tip">
+
+你也可以在 `.mizar/settings.json` 中自定义 `instructions.candidates`、`projectRootMarkers`（例如增加 `Cargo.toml`）或把 `maxBytes` 调大。详见 [配置与优先级](/config/)。
+
+</Callout>

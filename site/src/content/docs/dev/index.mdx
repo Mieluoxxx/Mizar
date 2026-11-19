@@ -1,0 +1,58 @@
+---
+title: Workspace 分层与隔离边界
+description: Mizar 28-crate Rust 1.98 微内核架构分层、cordis 装配主循环，以及三大零运行时核心隔离红线。
+group: dev-arch
+order: 18
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../../components/DiagramEmbed.astro';
+
+Mizar 基于 **Rust 1.98.0**（edition 2024）构建，整个工作区由 **28 个 crate** 组成，围绕自研微内核 **`cordis`** 通过服务注入（`inject` / `provide`）装配成「流式调模型 → 执行工具 → 回写会话」的主循环，并以 **`mizar-tui`**（唯一二进制入口 `mizar`）交付终端工作台。
+
+仓库内的权威架构文档为 **`docs/plugins.md`** 与 **`AGENTS.md`**；架构与开发章节聚焦架构红线、[插件开发实操](/dev/cordis/) 与 [工程规范](/dev/conventions/)。
+
+<DiagramEmbed
+  id="cordis-architecture"
+  title="28-Crate 微内核分层与三大隔离边界"
+  caption="纯核心层严禁接触异步/I/O/数据库运行时；插件层通过 camelCase 服务名向宿主请求依赖；宿主层按 feature 组合装配完整运行时。"
+/>
+
+## 三大零运行时隔离红线
+
+以下 **3 个核心 crate 严禁引入** `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite` 依赖：
+
+- `mizar-tui-ui`：纯终端渲染状态机、Markdown 高亮、主题与 `@` / 编辑器交互逻辑；
+- `mizar-llm-types`：纯模型协议数据结构、消息块与能力类型契约；
+- `mizar-trajectory-core`：纯轨迹采样、三泳道时间轴计算与热点模型。
+
+<Callout type="warning" title="编译能过，但架构红线不可突破">
+  虽然 Cargo 技术上允许你在这三个 crate 里加上 <code>tokio</code>，但一旦引入，异步或 I/O 副作用就会污染纯状态机与跨端数据模型，导致快照测试与独立复用失效。需要任何异步调度、HTTP 通信、JS 沙箱或落盘能力，必须上移到 <code>mizar-tui</code> 或 <code>mizar-agent-spine</code> 宿主层处理。
+</Callout>
+
+## 五层 Crate 拓扑概览
+
+| 架构层级 | 核心 Crate 代表 | 职责边界 |
+| :--- | :--- | :--- |
+| **微内核** | `cordis` | Fiber 状态机、服务 `provide`/`inject`、`ctx.effect` 清理与 5 种事件分发 |
+| **纯核心层** | `mizar-tui-ui` · `mizar-llm-types` · `mizar-trajectory-core` | 零运行时纯数据/UI 状态机，可独立做快速单测与 `cargo check` |
+| **模型协议与路由** | `mizar-llm-http` · `mizar-llm-router` · `mizar-llm-{completions,responses,messages,mock}` | 凭据展开、`completions`/`responses`/`messages` 协议适配与延迟模拟 |
+| **工具、扩展与存储** | `mizar-tools` · `mizar-tools-coding` · `mizar-mcp` · `mizar-codemode` · `mizar-tool-search` · `mizar-instructions` · `mizar-skills` · `mizar-session` · `mizar-session-sqlite` | 工具暴露/截断/串行写队列、MCP/QuickJS 沙箱、指令技能发现与 WAL 持久化 |
+| **宿主与运行入口** | `mizar-agent-loop` · `mizar-agent-spine` · `mizar-tui` | 主循环调度、28-crate 条件特征装配（`AgentSpinePlugin`）与终端事件宿主 |
+
+## 本地快速验证命令
+
+修改 UI 相关纯逻辑可使用秒级单包检查；调整跨 crate 枚举、协议或装配顺序时务必运行完整 workspace 验证（CI 以 clippy zero-warning 与测试全绿为准）：
+
+```bash title="常用开发与 CI 验证回路"
+# 修改 UI 时的秒级快检
+cargo check -p mizar-tui-ui
+
+# 验证最小 feature 裁剪组合不漏编译门控
+cargo check -p mizar-agent-spine --no-default-features
+
+# CI 完整检查（与仓库要求完全一致）
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```

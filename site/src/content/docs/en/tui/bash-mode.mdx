@@ -1,0 +1,56 @@
+---
+title: Local Bash Mode (! / !!)
+description: Prefix ! or !! in the input box to run local shell commands directly, controlling which outputs enter model context and which stay strictly local with zero tokens.
+group: tui-workflow
+order: 5
+---
+
+import Callout from '../../../../components/mdx/Callout.astro';
+import DiagramEmbed from '../../../../components/DiagramEmbed.astro';
+
+When coding, you often need to run a quick command to check reality while talking to the AI—glancing at `git status`, running tests, or checking whether a port is occupied. There is no need to switch out of the TUI and copy-paste errors back in: simply prefix your input with `!` or `!!` directly in Mizar's input box.
+
+## Core Difference Between `!` and `!!`
+
+Deciding between one or two exclamation marks comes down to a single question: **Do you want the model to see this command and its output on the next turn?**
+
+```text title="Real-world mixed workflow example"
+!!git status                          # Local workspace check only (0 tokens, excluded from context)
+!cargo test                           # Run tests and feed failure output into the next turn's context
+Why did the 2nd test assertion fail?  # The model already sees the stack trace above and starts fixing it
+```
+
+Both paths diverge as shown below:
+
+<DiagramEmbed
+  id="bash-flow"
+  title="! vs. !! Local Bash Context Routing"
+  caption="A !cmd command's input, exit code, and output are added to the session context for the model's next turn; !!cmd displays locally and saves to terminal history while completely bypassing model context and compaction."
+/>
+
+## Visual Cues & Seamless Switching
+
+Typing `!` as the first character in an empty input box triggers immediate visual cues so you never accidentally send a local-only command to the model (or vice versa):
+
+- **Typing a single `!`**: The input box highlights with a green accent border, and the header banner explicitly displays **`Bash (! · 载入上下文 · Enter 执行 · Esc 退出)`** (*in context · Enter to run · Esc to exit*); once the command finishes, the message entry carries the **`· 已入上下文`** (*in context*) badge.
+- **Typing a second `!` to form `!!`**: The input box switches to a muted neutral border, and the header banner changes to **`Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出)`** (*no context · Enter to run · Esc to exit*); once finished, the entry carries the **`· 仅本地`** (*local only*) badge.
+- **Returning to normal chat at any time**: Delete the leading exclamation mark(s) back to an empty line, or press <kbd>Esc</kbd>, and the input box immediately returns to standard chat mode.
+
+<Callout type="note" title="Bypasses model approval prompts">
+
+Because `!` and `!!` commands are explicitly typed and confirmed by you with Enter, local Bash mode does not trigger a redundant confirmation dialog even if `--approve` (see [CLI Flags](/en/tui/cli/)) or `/approval ask` (see [Commands](/en/tui/commands/)) is enabled for the session.
+
+</Callout>
+
+## Aborting Long Tasks & Large-Output Spillover Protection
+
+- **Single-command serialization**: Only one local Bash command runs at a time, preventing accidental back-to-back conflicting writes.
+- **Cleanly kill the entire process tree with <kbd>Esc</kbd>**: If a `cargo test` run loops endlessly or you forgot `--once` on a dev server, pressing <kbd>Esc</kbd> sends a termination signal to the dedicated process group, ensuring all spawned child processes are cleaned up with no zombie processes holding ports or file locks.
+- **2,000-line / 50 KiB large-output spillover**: When a local command emits tens of thousands of build log lines, the chat stream concisely displays the trailing core error excerpt while automatically saving the **full log** under your system temp directory as `mizar/mizar-bash-*.log` and printing the path for full inspection.
+
+## Behavior Across Session Resume & `/tree` Branches
+
+Both `!` and `!!` executions are persisted to the local session database `~/.mizar/sessions.sqlite` (for session management details, see [Sessions, Branching & Performance Traces](/en/tui/sessions/)). This means:
+
+- When you return via `mizar -c` or `mizar --resume`, earlier `!!git log` outputs remain neatly visible in the transcript view for your own reference;
+- Yet when sending requests to the LLM, computing sidebar `Context` usage, or triggering long-conversation compaction, `!!` entries are strictly excluded—preserving human notes without spending a single input token.

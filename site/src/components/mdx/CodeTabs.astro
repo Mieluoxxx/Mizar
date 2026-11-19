@@ -1,0 +1,102 @@
+---
+import { Code } from 'astro:components';
+import type { ComponentProps } from 'astro/types';
+import { getUiStrings } from '../../data/i18n';
+import { getLocaleFromUrl, type Locale } from '../../lib/url';
+
+type CodeLang = ComponentProps<typeof Code>['lang'];
+
+export interface CodeTabItem {
+  label: string;
+  code: string;
+  lang?: string;
+}
+
+interface Props {
+  tabs: CodeTabItem[];
+  ariaLabel?: string;
+  locale?: Locale;
+}
+
+const { tabs, ariaLabel } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const tabListLabel = ariaLabel || ui.codeTabsAria;
+const groupId = `ct-${Math.random().toString(36).slice(2, 9)}`;
+const firstPanelCodeId = `${groupId}-code-0`;
+---
+
+<div data-component="code-tabs" data-code-tabs>
+  <div data-slot="tabs-bar">
+    <div role="tablist" {...({ focusgroup: 'tablist nomemory' } as Record<string, unknown>)} aria-label={tabListLabel}>
+      {
+        tabs.map((tab, i) => {
+          const isSelected = i === 0;
+          const tabId = `${groupId}-tab-${i}`;
+          const panelId = `${groupId}-panel-${i}`;
+          const codeId = `${groupId}-code-${i}`;
+          return (
+            <button
+              type="button"
+              role="tab"
+              id={tabId}
+              aria-selected={isSelected ? 'true' : 'false'}
+              {...((isSelected ? { focusgroupstart: '' } : {}) as Record<string, unknown>)}
+              data-panel={panelId}
+              data-copy-target={codeId}
+            >
+              {tab.label}
+            </button>
+          );
+        })
+      }
+    </div>
+
+    <div data-slot="copy-bar">
+      <span class="copy-action-wrap">
+        <button
+          type="button"
+          class="copy-action-btn"
+          command="--copy"
+          commandfor={firstPanelCodeId}
+          data-tabs-copy
+          aria-label={ui.codeTabsCopyAria}
+        >
+          <span data-slot="copy-labels" aria-hidden="true">
+            <span data-label="idle">{ui.codeCopyIdle}</span>
+            <span data-label="copied">{ui.codeCopyCopied}</span>
+            <span data-label="failed">{ui.codeCopyFailed}</span>
+          </span>
+        </button>
+        <span class="visually-hidden" role="status"></span>
+      </span>
+    </div>
+  </div>
+
+  {
+    tabs.map((tab, i) => {
+      const isSelected = i === 0;
+      const tabId = `${groupId}-tab-${i}`;
+      const panelId = `${groupId}-panel-${i}`;
+      const codeId = `${groupId}-code-${i}`;
+      const trimmed = tab.code.replace(/^\n+|\n+$/g, '');
+      return (
+        <div
+          role="tabpanel"
+          id={panelId}
+          aria-labelledby={tabId}
+          tabindex={isSelected ? '0' : undefined}
+          hidden={isSelected ? undefined : ('until-found' as unknown as boolean)}
+        >
+          <div class="tab-panel-body" id={codeId}>
+            <Code
+              code={trimmed}
+              lang={(tab.lang || 'bash') as CodeLang}
+              theme="css-variables"
+            />
+          </div>
+        </div>
+      );
+    })
+  }
+</div>

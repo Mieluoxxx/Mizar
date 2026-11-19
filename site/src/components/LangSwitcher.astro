@@ -1,0 +1,34 @@
+---
+import { getUiStrings } from '../data/i18n';
+import { docHref, getLocaleFromUrl, type Locale } from '../lib/url';
+
+interface Props {
+  slug: string;
+  locale?: Locale;
+}
+
+const { slug } = Astro.props;
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const zhHref = docHref(slug, 'zh');
+const enHref = docHref(slug, 'en');
+---
+
+<div data-component="lang-switch" role="group" aria-label={ui.langSwitchAria}>
+  <a
+    href={zhHref}
+    hreflang="zh-CN"
+    lang="zh-CN"
+    aria-current={locale === 'zh' ? 'page' : undefined}
+  >
+    中文
+  </a>
+  <a
+    href={enHref}
+    hreflang="en"
+    lang="en"
+    aria-current={locale === 'en' ? 'page' : undefined}
+  >
+    EN
+  </a>
+</div>

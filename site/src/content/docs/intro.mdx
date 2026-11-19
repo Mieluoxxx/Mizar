@@ -1,0 +1,100 @@
+---
+title: 简介与快速开始
+description: 在终端启动 Mizar，30 秒内完成免 Key 试玩、环境变量直连大模型或源码编译安装，并掌握第一分钟的核心用法。
+group: quickstart
+order: 1
+---
+
+import CodeTabs from '../../components/mdx/CodeTabs.astro';
+import Callout from '../../components/mdx/Callout.astro';
+import Steps from '../../components/mdx/Steps.astro';
+import CardGroup from '../../components/mdx/CardGroup.astro';
+import DocCard from '../../components/mdx/DocCard.astro';
+
+export const introTabs = [
+    {
+      label: '免 Key 演示试玩',
+      lang: 'bash',
+      code: `# 在未设置 API Key 且未配置 models.json 时，自动进入离线演示模式
+cargo run -p mizar-tui --bin mizar`,
+    },
+    {
+      label: '环境变量一键连大模型',
+      lang: 'bash',
+      code: `# 任选一种官方兼容变量即可直连，无需先写配置文件
+export DEEPSEEK_API_KEY="sk-..."
+cargo run -p mizar-tui --bin mizar -- -C /path/to/your-project
+
+# 也支持 OPENAI_API_KEY / ANTHROPIC_API_KEY，或自定义网关：
+# API_KEY="sk-..." BASE_URL="https://api.example.com/v1" MODEL="deepseek-chat" mizar`,
+    },
+    {
+      label: '编译安装 mizar',
+      lang: 'bash',
+      code: `# 编译 release 二进制（需 Rust 1.98.0+）并安装到 PATH
+cargo build -p mizar-tui --release --bin mizar
+install -m 755 target/release/mizar ~/.local/bin/mizar
+
+# 之后在任意仓库目录直接运行
+mizar`,
+    },
+  ];
+
+Mizar 是一个面向终端的 AI 编程工作台，专为重度命令行工作流打造。它同时提供全屏看板与保留终端滚动历史的 Inline 双模视口，并内置本地 Shell 直执行、跨层项目规则发现、MCP 服务接入与轻量 JS 编排沙箱。
+
+无论你是想先体验交互界面，还是立刻接上 DeepSeek、OpenAI 或 Anthropic 开始改代码，一条命令即可进入工作状态。
+
+## 30 秒跑通第一次启动
+
+根据你手头是否有现成 API Key 或已安装 Rust 1.98 工具链，任选下面一种方式起步：
+
+<CodeTabs tabs={introTabs} />
+
+<Callout type="info" title="界面顶部显示 mock-v1？">
+
+当系统环境变量与 `models.json` 中都找不到任何可用密钥时，Mizar 会安全回退到内置离线演示模式，让你依然可以演练界面操作、本地 `!` 命令和面板布局，而不会消耗额度。接入真实模型请前往 [模型与凭据](/providers/)。
+
+</Callout>
+
+## 启动后第一分钟做什么
+
+进入工作台后，不必一次记住所有[快捷键](/tui/keybinds/)，先尝试这三件最立竿见影的事：
+
+<Steps>
+  <li>
+    <p><strong>用 <code>@</code> 把关键源码精确喂给模型</strong>：在输入框输入 <code>@</code> 会弹出受 <code>.gitignore</code> 保护的文件补全列表。你甚至可以直接写 <code>@src/main.rs#L1-40 这段参数解析有哪些边界情况？</code>，省去大段复制粘贴。</p>
+  </li>
+  <li>
+    <p><strong>用 <code>!</code> 和 <code>!!</code> 就在输入框里跑终端命令</strong>：以 <code>!!git status</code> 开头的命令纯属本地快速瞄一眼，不会写入对话上下文也不花一分钱 Token；换成单感叹号 <code>!cargo test</code>，命令报错会顺理成章成为下一轮对话背景，接着让 AI 帮你修即可。</p>
+  </li>
+  <li>
+    <p><strong>用<a href="/tui/commands/">斜杠命令</a>与<a href="/tui/keybinds/">热键</a>掌控视图</strong>：按 <kbd>Ctrl</kbd>+<kbd>B</kbd> 打开右侧状态面板查看当前上下文占用与活跃文件；按 <kbd>F3</kbd> 在全屏专注模式与 Inline 滚动模式间无损切换；输入 <code>/model</code> 或 <code>/effort</code> 随时调整模型与推理深度。</p>
+  </li>
+</Steps>
+
+## 继续深入
+
+把常用工作台跑顺之后，按你最关心的方向继续往下读：
+
+<CardGroup>
+  <DocCard
+    title="配置与优先级"
+    description="了解 ~/.mizar 与项目 .mizar 的覆盖与追加规则，定制默认工具与预算。"
+    slug="config"
+  />
+  <DocCard
+    title="模型与凭据"
+    description="配置 DeepSeek / OpenAI / Anthropic 与系统钥匙串，安全管理 API Key。"
+    slug="providers"
+  />
+  <DocCard
+    title="终端工作台 (TUI & CLI)"
+    description="掌握全屏/Inline 双视口、! / !! 本地 Shell、@ 引用与快捷键。"
+    slug="tui"
+  />
+  <DocCard
+    title="项目规则 (AGENTS.md)"
+    description="让 Mizar 自动读懂仓库规范与子目录上下文，而不撑爆模型窗口。"
+    slug="instructions"
+  />
+</CardGroup>

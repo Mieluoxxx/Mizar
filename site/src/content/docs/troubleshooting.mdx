@@ -1,0 +1,112 @@
+---
+title: 排障指南
+description: 按真实高频现象排查：演示假模型回退、MCP 不生效、严格 JSON 校验报错、只读环境写库失败与终端鼠标划词冲突。
+group: rules-security
+order: 17
+---
+
+import Callout from '../../components/mdx/Callout.astro';
+
+按你在终端里实际看到的现象定位原因并直接执行对应修复步骤。
+
+## 1. 界面顶部显示 `mock-v1`，回答全是演示模板
+
+### 原因
+
+当 Mizar 启动时，如果环境变量（`API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`）与 `models.json` 中没有任何一条有效提供方配置，它会自动进入内置的离线演示模式 `mock` / `mock-v1`。
+
+### 解决方法
+
+最快验证线路是否通畅的方式，是直接带环境变量启动：
+
+```bash title="临时环境变量直连"
+DEEPSEEK_API_KEY="sk-your-key" mizar
+```
+
+若需要长期保存多个模型通道，请按 [模型与凭据](/providers/) 在 `~/.mizar/models.json` 中配好 `providers`，或者先运行 [`/model`](/tui/commands/) 确认是否选中了 `mock` 作为默认模型。
+
+## 2. 配好了 `mcp.json`，但模型回复不知道有这些工具
+
+### 原因
+
+通常只有两种情况：
+
+1. **服务连接失败但首屏未阻塞**：Mizar 在后台异步握手 MCP，连接超时的服务会在背景悄悄记为异常，不会把 TUI 启动卡死；
+2. **工具默认归入沙箱（`codemode`）且或被项目覆盖屏蔽**：默认暴露下，MCP 工具不直接塞进模型的直调列表，如果 `mcp.json` 中设了 `"autoEnableCodemode": false` 又没把单个工具改成 `"direct"`，模型就既看不见直调列表也找不到 `codemode`。
+
+### 解决方法
+
+在 TUI 输入框里输入下面两条[斜杠命令](/tui/commands/)当场自检：
+
+```text title="在 TUI 内快速诊断工具与 MCP 状态"
+/mcp
+/tools
+```
+
+- 查看 `/mcp` 输出中对应服务器是 `Connected` 还是报错信息（例如 `${VAR}` 环境变量未导出导致地址或 Token 为空）；
+- 若测试阶段希望最直观看到工具调用，先在 `.mizar/mcp.json` 中给该服务加上 `"exposure": "direct"`。
+
+## 3. 修改配置文件后启动直接报错（或配置似乎没生效）
+
+### 原因
+
+Mizar 对 `~/.mizar/` 和 `<workspace>/.mizar/` 下的 `settings.json`、`models.json`、`mcp.json` 采用**严格 JSON 解析**：
+
+- 写入 `//` 或 `/* */` 注释会解析失败；
+- 对象或数组最后多留了一个逗号（trailing comma）会解析失败；
+- 在不同配置文件误用了 `snake_case` 键名（例如写成 `default_model` 而不是 `defaultModel`）也会导致字段落空；
+- 如果同时在环境变量设置了 `API_KEY` 或 `MODEL`，它们会盖过 `settings.json` 与 `models.json`。
+
+### 解决方法
+
+用标准 JSON 校验工具立刻查出行号与语法错误：
+
+```bash title="一键检查三份 JSON 配置文件语法"
+for f in ~/.mizar/*.json .mizar/*.json; do
+  [ -f "$f" ] && python3 -m json.tool "$f" >/dev/null && echo "OK: $f"
+done
+```
+
+如果怀疑是旧环境残留的环境变量盖过了配置文件，先清查当前 Shell 环境：
+
+```bash title="排查环境变量是否抢先覆盖"
+env | rg '^(MIZAR_|API_KEY|PROTOCOL|BASE_URL|MODEL|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY)'
+```
+
+## 4. 在只读容器、CI 或只读磁盘中启动报错无法建库
+
+### 原因
+
+Mizar 默认会把对话历史与分支树写入 `~/.mizar/sessions.sqlite`（SQLite WAL 模式）。如果容器内的 `HOME` 不可写或挂载盘是只读的，建库或创建 `-wal` / `-shm` 文件就会失败。
+
+### 解决方法
+
+关闭会话持久化，或将 `MIZAR_HOME` / `MIZAR_SESSION_DB` 指到可写的临时目录：
+
+```bash title="纯内存无盘模式运行 Mizar"
+# 方式 A：CLI 参数禁用磁盘持久化
+mizar --no-persist
+
+# 方式 B：通过环境变量全局禁用（也可写 "off"）
+MIZAR_SESSION_DB=none mizar
+
+# 方式 C：把配置与会话目录重定向到 /tmp
+MIZAR_HOME=/tmp/mizar-home mizar
+```
+
+## 5. 终端里用鼠标拖选复制文字时只是在上下滚屏
+
+### 原因
+
+全屏模式下 Mizar 默认接管终端鼠标事件，以便你直接用滚轮浏览长输出、点击切换 Tab 或滚动轨迹面板。这会暂时接管常规左键拖选行为。
+
+### 解决方法
+
+两种零配置办法，随手选用：
+
+- **切换开关**：在界面里随时按 <kbd>F2</kbd>（或输入 [`/mouse`](/tui/commands/)）暂时交出鼠标控制权，此时终端标题栏或状态行会提示进入原生鼠标选择，可直接左键划词复制；复制完再按一次 <kbd>F2</kbd> 恢复面板滚动。
+- **终端临时绕过[快捷键](/tui/keybinds/)**：在大多数现代终端（macOS Terminal / iTerm2 / Ghostty / WezTerm / Alacritty）中，按住 <kbd>Option</kbd>（或 <kbd>Alt</kbd> / <kbd>Shift</kbd>）再拖选，可以不切模式直接强制原生划词复制。
+
+<Callout type="tip" title="也别忘了零损失双模式">
+  如果长时间都需要复制终端历史或与宿主 Shell 命令交织，直接按 <kbd>F3</kbd>（或用 <code>mizar --inline</code> 启动）切换到保留终端滚动历史的 Inline 视口。
+</Callout>

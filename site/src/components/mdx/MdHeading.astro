@@ -1,0 +1,30 @@
+---
+import { getUiStrings } from '../../data/i18n';
+import { getLocaleFromUrl } from '../../lib/url';
+
+interface Props {
+  level: 2 | 3 | 4;
+  id?: string;
+}
+
+const { level, id, ...rest } = Astro.props;
+const locale = getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const Tag = (`h${level}` as 'h2' | 'h3' | 'h4');
+---
+
+<Tag id={id} class="docs-heading" tabindex={id ? '-1' : undefined} {...rest}>
+  <span><slot /></span>
+  {
+    id && (
+      <a
+        href={`#${id}`}
+        class="heading-anchor"
+        data-heading-anchor={id}
+        aria-label={ui.copyHeadingAnchorAria}
+      >
+        <span aria-hidden="true">#</span>
+      </a>
+    )
+  }
+</Tag>

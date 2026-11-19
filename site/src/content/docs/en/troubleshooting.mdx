@@ -1,0 +1,112 @@
+---
+title: Troubleshooting
+description: Diagnose common issues by symptom—demo-mode fallback, unused MCP tools, strict JSON syntax errors, read-only database failures, and mouse text selection.
+group: rules-security
+order: 17
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+
+Locate the exact symptom you're seeing in the terminal and apply the corresponding fix.
+
+## 1. Header shows `mock-v1` and responses are canned demo templates
+
+### Cause
+
+When Mizar starts without any valid provider configuration in environment variables (`API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`) or `models.json`, it automatically enters the built-in offline demo mode (`mock` / `mock-v1`).
+
+### Resolution
+
+The fastest way to verify connectivity is to pass an environment variable directly on launch:
+
+```bash title="Direct connection via temporary environment variable"
+DEEPSEEK_API_KEY="sk-your-key" mizar
+```
+
+To persist one or more providers long-term, configure `providers` in `~/.mizar/models.json` following [Models & Credentials](/en/providers/), or run [`/model`](/en/tui/commands/) to check whether `mock` is currently selected as your default model.
+
+## 2. `mcp.json` is configured, but the model doesn't know those tools exist
+
+### Cause
+
+This usually comes down to one of two things:
+
+1. **Background handshake failure**: Mizar connects to MCP servers asynchronously so a broken or slow server never freezes TUI startup, recording failures in the background instead;
+2. **Tools live in `codemode` by default or were hidden by overrides**: By default, MCP tools aren't injected into the model's direct tool list. If `"autoEnableCodemode": false` is set in `mcp.json` without marking individual servers or tools `"direct"`, the model sees neither direct tools nor `codemode`.
+
+### Resolution
+
+Run these two [slash commands](/en/tui/commands/) inside the TUI input box:
+
+```text title="Inspect tool and MCP status inside the TUI"
+/mcp
+/tools
+```
+
+- Check `/mcp` output to see whether the server shows `Connected` or an error message (for instance, an unset `${VAR}` leaving a URL or token empty);
+- While testing, temporarily set `"exposure": "direct"` on the server in `.mizar/mcp.json` so tool calls appear directly in the model's tool list.
+
+## 3. Startup fails immediately after editing config (or settings seem ignored)
+
+### Cause
+
+Mizar enforces **strict JSON parsing** for `settings.json`, `models.json`, and `mcp.json` under `~/.mizar/` and `<workspace>/.mizar/`:
+
+- `//` or `/* */` comments fail to parse;
+- Trailing commas at the end of objects or arrays fail to parse;
+- Using `snake_case` keys (such as `default_model` instead of `defaultModel`) causes fields to be ignored;
+- Exporting `API_KEY` or `MODEL` in your shell overrides values in `settings.json` and `models.json`.
+
+### Resolution
+
+Validate all three JSON files at once to pinpoint syntax errors and line numbers:
+
+```bash title="Validate syntax across all JSON config files"
+for f in ~/.mizar/*.json .mizar/*.json; do
+  [ -f "$f" ] && python3 -m json.tool "$f" >/dev/null && echo "OK: $f"
+done
+```
+
+If leftover shell variables might be overriding your configuration files, inspect your current environment:
+
+```bash title="Check for overriding environment variables"
+env | rg '^(MIZAR_|API_KEY|PROTOCOL|BASE_URL|MODEL|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY)'
+```
+
+## 4. Startup fails to create session DB in read-only containers, CI, or read-only mounts
+
+### Cause
+
+By default, Mizar writes conversation history and branch trees to `~/.mizar/sessions.sqlite` (using SQLite WAL mode). If `$HOME` is unwritable or mounted read-only inside a container, creating the database or `-wal` / `-shm` sidecar files fails.
+
+### Resolution
+
+Disable disk persistence or point `MIZAR_HOME` / `MIZAR_SESSION_DB` to a writable temp directory:
+
+```bash title="Run Mizar in-memory with no disk writes"
+# Option A: Disable persistence via CLI flag
+mizar --no-persist
+
+# Option B: Disable globally via env var ("off" also works)
+MIZAR_SESSION_DB=none mizar
+
+# Option C: Redirect config and session storage to /tmp
+MIZAR_HOME=/tmp/mizar-home mizar
+```
+
+## 5. Dragging with the mouse in the terminal scrolls instead of selecting text
+
+### Cause
+
+In Fullscreen mode, Mizar captures terminal mouse events so you can scroll long outputs, click tabs, and navigate trace panels with the wheel. That temporarily intercepts standard left-click text selection.
+
+### Resolution
+
+Two zero-config options work out of the box:
+
+- **Toggle mouse capture**: Press <kbd>F2</kbd> (or run [`/mouse`](/en/tui/commands/)) anytime to temporarily hand mouse control back to the terminal. The status bar indicates native mouse selection mode so you can drag-select and copy normally; press <kbd>F2</kbd> again to re-enable panel scrolling.
+- **Terminal bypass [shortcut](/en/tui/keybinds/)**: In most modern terminals (macOS Terminal, iTerm2, Ghostty, WezTerm, Alacritty), holding <kbd>Option</kbd> (or <kbd>Alt</kbd> / <kbd>Shift</kbd>) while dragging forces native text selection without toggling modes.
+
+<Callout type="tip" title="Don't forget lossless dual-mode viewports">
+  If you frequently copy terminal scrollback or interleave Mizar with host shell commands, press <kbd>F3</kbd> (or launch with <code>mizar --inline</code>) to switch to the Inline viewport that preserves native terminal scrollback.
+</Callout>

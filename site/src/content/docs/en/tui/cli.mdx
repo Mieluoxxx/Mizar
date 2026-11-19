@@ -1,0 +1,76 @@
+---
+title: CLI Flags
+description: All 12 Mizar command-line startup flags and scenario combinations covering workspace scoping, tool filtering, viewports, approvals, and session persistence.
+group: tui-sessions-ref
+order: 9
+---
+
+import Callout from '../../../../components/mdx/Callout.astro';
+
+CLI flags work hand in hand with `~/.mizar/settings.json` (see [Configuration & Precedence](/en/config/)): store your everyday defaults in the config file, and pass CLI flags whenever you want to temporarily override the workspace, permission profile, or session behavior.
+
+```bash title="Quickly view the full built-in flag help"
+mizar --help
+```
+
+## Switch Workspace & Scope Tool Permissions
+
+You don't need to `cd` into a repository first—pass `-C` (`--workspace`) to set the workspace root directly, and combine presets or wildcard lists to control which tools are exposed to the model (see [Built-in Tools](/en/tools/) and [Permissions & Security](/en/security/)):
+
+```bash title="Workspace and tool-scoping combinations"
+# Specify a directory and launch in minimal 4-tool mode (read / edit / write / bash)
+mizar -C ~/code/payment-service --minimal
+
+# Run a read-only audit on an unfamiliar repo, isolating all mutating tools
+mizar -C /tmp/audit-repo --read-only
+
+# Fine-grained allowlist plus extra exclusions (exclusions stack with settings.json)
+mizar -t read,grep,find -xt mcp__prod__*
+```
+
+| Flag | Short Flag | Purpose |
+| :--- | :--- | :--- |
+| `--workspace <DIR>` | `-C` | Set the workspace root directory for this session |
+| `--minimal` | — | Keep only the core four tools: `read`, `bash`, `edit`, and `write` |
+| `--read-only` | — | Allow only the three read-only tools: `read`, `grep`, and `find` |
+| `--tools <LIST>` | `-t` | Comma-separated allowlist of enabled tools (supports `*`) |
+| `--exclude-tools <LIST>` | `-xt` | Comma-separated extra exclusion list; stacks with config file rules |
+
+## Control Viewport, Approvals & Theme
+
+```bash title="Viewport mode, safety approval, and theme combination"
+# Inline viewport + manual confirmation before non-read-only tools + sakura-dark theme
+mizar --inline --approve --theme sakura-dark
+```
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--inline` | Start directly in Inline viewport mode preserving terminal scrollback (switchable mid-session with [`F3`](/en/tui/)) |
+| `--approve` | Prompt for manual approval confirmation before non-read-only tool calls (writes, shell commands, etc.; see [Permissions & Security](/en/security/)) |
+| `--theme <PRESET>` | Override auto-detected theme with one of the 6 preset options (see [Terminal Themes](/en/tui/themes/)) |
+
+## Resume Sessions, Skip Persistence & Clean Rules Mode
+
+```bash title="Session resume and ephemeral container launch combinations"
+# Automatically resume the most recent conversation in the current directory
+mizar -c
+
+# Open the interactive picker to resume a specific or past session
+mizar -r
+
+# One-off container/script run: skip writing sqlite history and skip loading AGENTS.md
+mizar --no-persist --no-instructions
+```
+
+| Flag | Short Flag | Purpose |
+| :--- | :--- | :--- |
+| `--continue` | `-c` | Automatically continue the most recently saved session in the current workspace (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
+| `--resume [ID]` | `-r [ID]` | Resume the session matching `ID`; omit `ID` to open a recent session picker |
+| `--no-persist` | — | Disable writing this session to `~/.mizar/sessions.sqlite` |
+| `--no-instructions` | — | Skip scanning and injecting `AGENTS.md` / `CLAUDE.md` (see [Project Rules](/en/instructions/)) |
+
+<Callout type="tip">
+
+For details on startup terminal background luminance probing and the 6 color presets (`auto`, `mist-dark`, `mist-light`, `sakura-dark`, `system`, and `ansi16`), see [Terminal Themes](/en/tui/themes/).
+
+</Callout>

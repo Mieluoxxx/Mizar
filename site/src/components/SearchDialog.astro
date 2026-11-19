@@ -1,0 +1,98 @@
+---
+import { getUiStrings } from '../data/i18n';
+import { getPageMeta } from '../data/navigation';
+import { assetHref, docHref, getLocaleFromUrl, type Locale } from '../lib/url';
+
+interface Props {
+  locale?: Locale;
+}
+
+const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
+const ui = getUiStrings(locale);
+const pagefindUrl = assetHref('pagefind/pagefind.js');
+const fallbackIndexUrl = assetHref('search-index.json');
+const recommendedSlugs = [
+  'intro',
+  'config',
+  'providers',
+  'tui',
+  'tui/keybinds',
+  'security',
+  'dev',
+];
+const defaultItems = recommendedSlugs
+  .map((slug) => getPageMeta(slug, locale))
+  .filter((item): item is NonNullable<typeof item> => Boolean(item))
+  .map((item) => ({
+    slug: item.slug,
+    title: item.title,
+    groupLabel: item.groupTitle,
+    description: item.description,
+    href: docHref(item.slug, locale),
+  }));
+---
+
+<dialog
+  data-search-dialog
+  id="mizar-search-dialog"
+  closedby="any"
+  aria-labelledby="search-dialog-title"
+  data-locale={locale}
+  data-pagefind-url={pagefindUrl}
+  data-fallback-url={fallbackIndexUrl}
+  data-default-items={JSON.stringify(defaultItems)}
+  data-recommended-label={ui.searchRecommendedHeading}
+  data-results-prefix={ui.searchResultsPrefix}
+  data-empty-query-template={ui.searchEmptyQueryTemplate}
+  data-empty-default={ui.searchEmptyDefault}
+>
+  <h2 id="search-dialog-title" class="visually-hidden">{ui.searchModalTitle}</h2>
+  <div data-slot="panel">
+    <div data-slot="field">
+      <svg
+        data-slot="icon"
+        width="16"
+        height="16"
+        viewBox="0 0 16 16"
+        fill="none"
+        aria-hidden="true"
+      >
+        <circle
+          cx="7.2"
+          cy="7.2"
+          r="5"
+          stroke="currentColor"
+          stroke-width="1.5"
+          vector-effect="non-scaling-stroke"
+        />
+        <path
+          d="M11 11L13.5 13.5"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="square"
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
+      <input
+        type="search"
+        id="mizar-search-input"
+        placeholder={ui.searchPlaceholder}
+        autocomplete="off"
+        spellcheck="false"
+        autofocus
+        aria-label={ui.searchInputAria}
+      />
+      <button
+        type="button"
+        data-slot="close"
+        data-search-close
+        aria-label={ui.searchCloseAria}
+      >
+        ESC
+      </button>
+    </div>
+
+    <div data-slot="results" id="mizar-search-results" role="listbox" aria-label={ui.searchResultsAria}>
+    </div>
+  </div>
+</dialog>
