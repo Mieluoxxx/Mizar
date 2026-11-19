@@ -132,8 +132,8 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` | `"agent-spine"` | **核心装配套件**：支持通过 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `trajectory` / `router`）按需裁剪插件栈（`--no-default-features` 仅拉起最小微内核与核心服务）。同时提供 `load_mizar_config` 读取 `~/.mizar/` 与 `<workspace>/.mizar/` 下的 `settings.json` / `models.json` / `mcp.json` | 无（自身负责装配） | 按 Cargo features 选配后端 crate |
-| **`mizar-tui`** | 可执行文件 `mizar` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `mizar-tui-ui`。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务，再通过 `SpinePlugins`（`SpinePluginsContextExt`）统一管理内置可选模块（`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`compaction`、`recall`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用）。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 读写配置 | 无（自身负责装配与控制） | `thiserror`、`tokio` 及按 Cargo features 选配的后端 crate |
+| **`mizar-tui`** | 可执行文件 `mizar` | 终端宿主与 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，把 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样桥接到纯前端 crate `mizar-tui-ui`；`/settings` `[模块]` 分组对接 `"spinePlugins"`（执行中拒绝切换，空闲热切换后原子回写 `~/.mizar/settings.json` 并动态刷新侧栏、技能与 `/settings` 状态）。CLI 支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测，按需访问 `"spinePlugins"` 与可选服务） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
 ---
 
@@ -143,7 +143,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 ┌─ 终端入口 / 纯前端分离 ────────────────────────────────────────────────────┐
 │  crates/mizar-tui (CLI + 异步宿主适配)                                     │
 │    ├─► crates/mizar-tui-ui  ──► mizar-llm-types / mizar-trajectory-core    │
-│    └─► crates/mizar-agent-spine (feature-gated 装配层)                     │
+│    └─► crates/mizar-agent-spine (feature-gated 装配层 + spinePlugins)     │
 └───────────────────────────────┬────────────────────────────────────────────┘
                                 v
 ┌─ 编排与观测层 ─────────────────────────────────────────────────────────────┐
@@ -174,7 +174,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 ## 九、配置字段速查
 
-全局 `~/.mizar/` 与项目 `<workspace>/.mizar/` 会按目录顺序叠加，后者覆盖前者（`exclude_tools` 与 `custom_dirs` 是追加而非覆盖）。目录可用 `MIZAR_HOME` 改写。
+全局 `~/.mizar/` 与项目 `<workspace>/.mizar/` 会按目录顺序叠加，后者覆盖前者（`excludeTools`、`customDirs` 与 `disabledPlugins` 是合并/追加而非覆盖）。目录可用 `MIZAR_HOME` 改写。
 
 `settings.json`（`SettingsConfig`，camelCase，全部字段可选）：
 
@@ -187,6 +187,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `toolsPreset` | `all` / `minimal` / `read-only` | 编码工具预设，对应 `--minimal` / `--read-only` |
 | `tools` | string[] | 工具白名单（支持 `*` 通配） |
 | `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |
+| `disabledPlugins` | string[] | 声明式屏蔽内置可选 Cordis 模块 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期热启停并原子回写；受保护核心服务忽略并告警） |
 | `restrictToWorkspace` | bool | 将文件工具限制在工作区内（**默认 `false`**） |
 | `sessionDb` | string | SQLite 落盘路径；等价环境变量 `MIZAR_SESSION_DB`（`none` / `off` 关闭） |
 | `codemode` | object | `autoEnable` / `onlyMode` / `inlineBudget` / `timeoutMs` |

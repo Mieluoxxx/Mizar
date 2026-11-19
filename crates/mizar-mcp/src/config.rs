@@ -271,10 +271,7 @@ pub fn load_mcp_config(workspace: &Path) -> LoadedMcpConfig {
     load_mcp_config_with_global(workspace, resolve_global_config_dir().as_deref())
 }
 
-pub fn load_mcp_config_with_global(
-    workspace: &Path,
-    global_dir: Option<&Path>,
-) -> LoadedMcpConfig {
+pub fn load_mcp_config_with_global(workspace: &Path, global_dir: Option<&Path>) -> LoadedMcpConfig {
     let mut map: HashMap<String, LoadedMcpEntry> = HashMap::new();
     let mut errors = Vec::new();
     let mut auto_enable_codemode = true;

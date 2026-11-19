@@ -58,7 +58,7 @@ impl Plugin for XxxPlugin {
 
 - **`inject` 漏写不 panic**：`ctx.service()` 返回 `MissingInject`，插件进 `FAILED`，工具**静默消失** —— 比 panic 难查得多。
 - **副作用必须包 `ctx.effect("id", ...)`**，id 用 `"<crate>-<动作>"`。卸载时倒序自动清理，这是核心不变量。
-- 服务名：`llm` `tools` `sessions` `systemPrompt` `agentLoop` `skills` `mcp` `trajectory` `compaction`。
+- 服务名：`llm` `tools` `sessions` `systemPrompt` `agentLoop` `skills` `mcp` `trajectory` `compaction` `spinePlugins`。
   一律走 `<Name>ContextExt`（`ctx.tools()?`），不裸取。
 
 ### 工具

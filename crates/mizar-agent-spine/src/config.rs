@@ -163,6 +163,9 @@ pub struct SettingsConfig {
     pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_tools: Vec<String>,
+    /// 声明式屏蔽的内置可选 Cordis 模块 ID 列表（受保护核心模块不可禁用）。
+    #[serde(default, rename = "disabledPlugins")]
+    pub disabled_plugins: Vec<String>,
     pub restrict_to_workspace: Option<bool>,
     pub session_db: Option<PathBuf>,
     pub codemode: Option<CodemodeSettings>,
@@ -172,6 +175,18 @@ pub struct SettingsConfig {
     pub compaction: Option<CompactionSettings>,
     pub recall: Option<RecallSettings>,
     pub ui: Option<UiSettings>,
+}
+
+/// 规范化插件 ID 列表：裁剪空白、过滤空串、排序并去重。
+pub fn normalize_disabled_plugins(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 impl SettingsConfig {
@@ -202,6 +217,9 @@ impl SettingsConfig {
                 self.exclude_tools.push(pat);
             }
         }
+        self.disabled_plugins.extend(other.disabled_plugins);
+        self.disabled_plugins =
+            normalize_disabled_plugins(std::mem::take(&mut self.disabled_plugins));
         if other.restrict_to_workspace.is_some() {
             self.restrict_to_workspace = other.restrict_to_workspace;
         }
@@ -404,6 +422,14 @@ pub fn patch_settings_file(
     Ok(())
 }
 
+/// 原子回写 `settings.json` 中的 `"disabledPlugins"` 字段（自动排序去重并保留其余手写字段）。
+pub fn persist_disabled_plugins(path: &Path, disabled: &[String]) -> Result<(), String> {
+    let normalized = normalize_disabled_plugins(disabled.iter().cloned());
+    patch_settings_file(path, |root| {
+        root.insert("disabledPlugins".to_string(), serde_json::json!(normalized));
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LoadedMizarConfig {
     pub global_dir: Option<PathBuf>,
@@ -515,6 +541,11 @@ impl LoadedMizarConfig {
             if !spine.exclude_tools.contains(pat) {
                 spine.exclude_tools.push(pat.clone());
             }
+        }
+        if !self.settings.disabled_plugins.is_empty() {
+            let mut merged = std::mem::take(&mut spine.disabled_plugins);
+            merged.extend(self.settings.disabled_plugins.iter().cloned());
+            spine.disabled_plugins = normalize_disabled_plugins(merged);
         }
         if let Some(db_path) = &self.settings.session_db {
             spine.session_db_path = Some(db_path.clone());
@@ -1020,6 +1051,95 @@ mod tests {
         let ui = loaded.settings.ui.as_ref().unwrap();
         assert_eq!(ui.theme.as_deref(), Some("sakura-dark"));
         assert_eq!(ui.show_thinking, Some(false));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod disabled_plugins_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_plugins_serializes_merges_dedups_sorts_and_patches_atomically() {
+        let tmp =
+            std::env::temp_dir().join(format!("mizar_disabled_plugins_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let global = tmp.join("global");
+        let proj = tmp.join("repo");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(proj.join(".mizar")).unwrap();
+
+        std::fs::write(
+            global.join("settings.json"),
+            r#"{
+                "persona": "preserve-me",
+                "disabledPlugins": ["skills", " mcp ", "", "skills", "codemode"]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(".mizar/settings.json"),
+            r#"{
+                "disabledPlugins": ["recall", "mcp", "compaction"]
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = load_mizar_config_with_global(&proj, Some(&global));
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(
+            loaded.settings.disabled_plugins,
+            vec![
+                "codemode".to_string(),
+                "compaction".to_string(),
+                "mcp".to_string(),
+                "recall".to_string(),
+                "skills".to_string(),
+            ]
+        );
+
+        let mut spine = AgentSpineConfig::new(&proj);
+        spine.disabled_plugins = vec!["trajectory".to_string(), "mcp".to_string()];
+        loaded.apply_to_spine(&mut spine);
+        assert_eq!(
+            spine.disabled_plugins,
+            vec![
+                "codemode".to_string(),
+                "compaction".to_string(),
+                "mcp".to_string(),
+                "recall".to_string(),
+                "skills".to_string(),
+                "trajectory".to_string(),
+            ]
+        );
+
+        // 原子回写应保留原有字段，同时排序去重写入 disabledPlugins
+        let global_settings = global.join("settings.json");
+        persist_disabled_plugins(
+            &global_settings,
+            &[
+                "trajectory".to_string(),
+                "mcp".to_string(),
+                "trajectory".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&global_settings).unwrap()).unwrap();
+        assert_eq!(raw["persona"], "preserve-me");
+        assert_eq!(
+            raw["disabledPlugins"],
+            serde_json::json!(["mcp", "trajectory"])
+        );
+
+        // 空列表回写正常序列化为 []
+        persist_disabled_plugins(&global_settings, &[]).unwrap();
+        let raw_empty: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&global_settings).unwrap()).unwrap();
+        assert_eq!(raw_empty["persona"], "preserve-me");
+        assert_eq!(raw_empty["disabledPlugins"], serde_json::json!([]));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

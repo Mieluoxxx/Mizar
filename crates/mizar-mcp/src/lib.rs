@@ -7,6 +7,7 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Logger, Service};
@@ -116,6 +117,8 @@ pub struct McpManager {
     statuses: Mutex<HashMap<String, McpServerStatus>>,
     resource_cleanups: AsyncMutex<Vec<Cleanup>>,
     connect_lock: AsyncMutex<()>,
+    connect_cancel: CancellationToken,
+    closed: AtomicBool,
     ready_notify: Arc<tokio::sync::Notify>,
     initial_done: Mutex<bool>,
 }
@@ -224,10 +227,8 @@ impl McpManager {
         let mut parts = vec![intro];
         for (idx, s) in indirect.iter().take(kept).enumerate() {
             let summary = if per_server > 0 {
-                let first_line = mcp_server_summary(
-                    s.description.as_deref(),
-                    s.instructions.as_deref(),
-                );
+                let first_line =
+                    mcp_server_summary(s.description.as_deref(), s.instructions.as_deref());
                 truncate_chars(&first_line, per_server)
             } else {
                 String::new()
@@ -246,6 +247,11 @@ impl McpManager {
 
     pub async fn connect_configured(&self) {
         let _guard = self.connect_lock.lock().await;
+        if self.closed.load(Ordering::SeqCst) || self.connect_cancel.is_cancelled() {
+            *self.initial_done.lock().unwrap() = true;
+            self.ready_notify.notify_waiters();
+            return;
+        }
         let mut entries_map: HashMap<String, LoadedMcpEntry> = HashMap::new();
 
         if self.config.load_config_files {
@@ -301,10 +307,16 @@ impl McpManager {
         }
 
         for entry in entries {
+            if self.closed.load(Ordering::SeqCst) || self.connect_cancel.is_cancelled() {
+                break;
+            }
             if !entry.config.enabled {
                 continue;
             }
             if let Err(err) = self.connect_one(entry.clone()).await {
+                if self.closed.load(Ordering::SeqCst) || self.connect_cancel.is_cancelled() {
+                    break;
+                }
                 self.logger()
                     .warn(format!("MCP server `{}` failed: {err}", entry.name));
                 if let Some(st) = self.statuses.lock().unwrap().get_mut(&entry.name) {
@@ -313,13 +325,15 @@ impl McpManager {
             }
         }
 
-        self.sync_resource_tools().await;
+        if !self.closed.load(Ordering::SeqCst) && !self.connect_cancel.is_cancelled() {
+            self.sync_resource_tools().await;
+        }
         *self.initial_done.lock().unwrap() = true;
         self.ready_notify.notify_waiters();
     }
 
     async fn connect_one(&self, entry: LoadedMcpEntry) -> Result<(), String> {
-        let cancel = CancellationToken::new();
+        let cancel = self.connect_cancel.clone();
         let client = Arc::new(
             McpClient::connect(
                 &entry.name,
@@ -332,10 +346,18 @@ impl McpManager {
             .map_err(|e| e.to_string())?,
         );
 
-        let remote_tools = client
-            .list_all_tools(&cancel)
-            .await
-            .map_err(|e| e.to_string())?;
+        let remote_tools = match client.list_all_tools(&cancel).await {
+            Ok(tools) => tools,
+            Err(err) => {
+                client.close().await;
+                return Err(err.to_string());
+            }
+        };
+
+        if self.closed.load(Ordering::SeqCst) || cancel.is_cancelled() {
+            client.close().await;
+            return Err("MCP manager closed".to_string());
+        }
 
         let tools_rt = self.ctx.tools().map_err(|e| e.to_string())?;
         let ns_name = mcp_namespace(&entry.name);
@@ -443,6 +465,10 @@ impl McpManager {
     }
 
     pub async fn close_all(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.connect_cancel.cancel();
+        let _connect_guard = self.connect_lock.lock().await;
+
         let mut res = self.resource_cleanups.lock().await;
         for c in res.drain(..) {
             run_cleanup(c).await;
@@ -466,10 +492,7 @@ impl McpManager {
         let srvs = self.servers.lock().await;
         let mut list: Vec<(String, Arc<McpClient>)> = srvs
             .values()
-            .filter(|s| {
-                s.client.has_resources
-                    && filter_server.is_none_or(|f| f == s.entry.name)
-            })
+            .filter(|s| s.client.has_resources && filter_server.is_none_or(|f| f == s.entry.name))
             .map(|s| (s.entry.name.clone(), Arc::clone(&s.client)))
             .collect();
         list.sort_by(|a, b| a.0.cmp(&b.0));
@@ -514,11 +537,8 @@ fn make_mcp_tool_def(
         .clone()
         .unwrap_or_else(|| format!("MCP tool `{raw_name}`"));
 
-    let mut def = ToolDefinition::async_rich_tool(
-        full_name,
-        desc,
-        params,
-        move |args, call_ctx| {
+    let mut def =
+        ToolDefinition::async_rich_tool(full_name, desc, params, move |args, call_ctx| {
             let client = Arc::clone(&client);
             let remote_name = remote_name.clone();
             async move {
@@ -527,12 +547,11 @@ fn make_mcp_tool_def(
                     .await?;
                 format_mcp_tool_result(&res).await
             }
-        },
-    )
-    .with_exposure(exposure)
-    .with_execution_mode(exec_mode)
-    .with_annotations(annotations)
-    .with_namespace(namespace);
+        })
+        .with_exposure(exposure)
+        .with_execution_mode(exec_mode)
+        .with_annotations(annotations)
+        .with_namespace(namespace);
 
     if let Some(out_schema) = remote.output_schema.clone() {
         def = def.with_output_schema(out_schema);
@@ -769,6 +788,8 @@ impl Service for McpManager {
             statuses: Mutex::new(HashMap::new()),
             resource_cleanups: AsyncMutex::new(Vec::new()),
             connect_lock: AsyncMutex::new(()),
+            connect_cancel: CancellationToken::new(),
+            closed: AtomicBool::new(false),
             ready_notify: Arc::new(tokio::sync::Notify::new()),
             initial_done: Mutex::new(false),
         }))

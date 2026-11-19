@@ -277,6 +277,7 @@ pub enum UiEvent {
         text: String,
     },
     UserSkillsUpdated(Vec<String>),
+    ToolsUpdated,
     Log(UiLogRecord),
     RunFinished(Result<String, String>),
     LocalBashFinished {
@@ -351,6 +352,7 @@ pub enum AppAction {
     ExportTrajectory(Option<PathBuf>),
     ShowOrSwitchModel(Option<String>),
     RefreshSidePanelData,
+    RefreshSidePanelTools,
     OpenTrajectoryScene(TimelineMode),
     Quit,
 }
@@ -1017,6 +1019,7 @@ impl AppState {
             UiEvent::UserSkillsUpdated(names) => {
                 self.user_skill_names = names;
             }
+            UiEvent::ToolsUpdated => {}
             UiEvent::Log(record) => {
                 let level = match record.level {
                     UiLogLevel::Error => NoticeLevel::Error,
@@ -1367,6 +1370,16 @@ impl AppState {
                 }
             }
             OverlayAction::UpdateSetting { key, value } => {
+                if key.starts_with("plugin.") {
+                    if self.is_busy || self.is_bash_running || self.is_compacting {
+                        self.overlay.set_setting_toggle(&key, value != "true");
+                        let msg = "当前有正在执行的任务，请等待完成后再切换模块";
+                        self.push_notice(NoticeLevel::Warn, msg);
+                        self.set_flash(msg);
+                        return AppAction::None;
+                    }
+                    return AppAction::ApplySetting { key, value };
+                }
                 match key.as_str() {
                     "ui.theme" => {
                         if let Some(preset) = ThemePreset::parse(&value) {
@@ -3902,5 +3915,62 @@ mod tests {
         assert!(app.overlay.is_open());
         let _ = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.overlay.is_open());
+    }
+
+    #[test]
+    fn settings_module_toggle_dispatches_when_idle_and_blocks_while_busy() {
+        use crate::overlay::{OverlayKind, SettingEntry, SettingItemKind};
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-settings-modules",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        let entries = vec![SettingEntry {
+            key: "plugin.mcp".into(),
+            category: "模块".into(),
+            label: "MCP 客户端 (mcp)".into(),
+            description: "连接外部 MCP 服务器".into(),
+            kind: SettingItemKind::Toggle { value: true },
+        }];
+        app.overlay
+            .open_settings(entries, None, "~/.mizar/settings.json".into());
+
+        // 运行中（is_busy / is_bash_running / is_compacting）禁止切换，弹窗状态保持不变并提示中文警告
+        for case in 0..3 {
+            app.is_busy = case == 0;
+            app.is_bash_running = case == 1;
+            app.is_compacting = case == 2;
+            let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(act, AppAction::None);
+            match &app.overlay.active {
+                Some(OverlayKind::SettingsModal { items, .. }) => {
+                    assert_eq!(items[0].kind, SettingItemKind::Toggle { value: true });
+                }
+                _ => panic!("expected SettingsModal to stay open after busy rejection"),
+            }
+            assert!(app.items.iter().any(|item| matches!(
+                item,
+                ChatItem::Notice { level: NoticeLevel::Warn, text, .. }
+                    if text.contains("当前有正在执行的任务，请等待完成后再切换模块")
+            )));
+        }
+
+        // 空闲时允许切换并派发 ApplySetting
+        app.is_busy = false;
+        app.is_bash_running = false;
+        app.is_compacting = false;
+        let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            act,
+            AppAction::ApplySetting {
+                key: "plugin.mcp".into(),
+                value: "false".into(),
+            }
+        );
     }
 }

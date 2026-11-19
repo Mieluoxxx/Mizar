@@ -47,6 +47,8 @@ mizar-tools-coding = { workspace = true, optional = true }
 mizar-trajectory = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

@@ -749,6 +749,41 @@ impl OverlayState {
         });
     }
 
+    pub fn refresh_settings(&mut self, new_items: Vec<SettingEntry>) {
+        if let Some(OverlayKind::SettingsModal {
+            items,
+            query,
+            selected,
+            ..
+        }) = &mut self.active
+        {
+            let prev_key = filter_setting_indices(items, query)
+                .get(*selected)
+                .and_then(|&idx| items.get(idx))
+                .map(|entry| entry.key.clone());
+            *items = new_items;
+            let filtered = filter_setting_indices(items, query);
+            if filtered.is_empty() {
+                *selected = 0;
+            } else if let Some(prev) = prev_key
+                && let Some(pos) = filtered.iter().position(|&idx| items[idx].key == prev)
+            {
+                *selected = pos;
+            } else {
+                *selected = (*selected).min(filtered.len() - 1);
+            }
+        }
+    }
+
+    pub fn set_setting_toggle(&mut self, key: &str, new_value: bool) {
+        if let Some(OverlayKind::SettingsModal { items, .. }) = &mut self.active
+            && let Some(item) = items.iter_mut().find(|entry| entry.key == key)
+            && let SettingItemKind::Toggle { value } = &mut item.kind
+        {
+            *value = new_value;
+        }
+    }
+
     pub fn open_approval(
         &mut self,
         tool_name: String,
@@ -2253,5 +2288,114 @@ mod tests {
             !rendered.contains("  dir"),
             "unexpected dir badge in rendered overlay:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn settings_modal_renders_modules_category_and_refresh_preserves_selected_key() {
+        let mut state = OverlayState::default();
+        state.open_settings(
+            vec![
+                SettingEntry {
+                    key: "ui.showThinking".into(),
+                    category: "界面".into(),
+                    label: "显示思考过程".into(),
+                    description: "开关推理块".into(),
+                    kind: SettingItemKind::Toggle { value: true },
+                },
+                SettingEntry {
+                    key: "compaction.enabled".into(),
+                    category: "压缩".into(),
+                    label: "自动压缩".into(),
+                    description: "启用上下文压缩".into(),
+                    kind: SettingItemKind::Toggle { value: true },
+                },
+                SettingEntry {
+                    key: "plugin.mcp".into(),
+                    category: "模块".into(),
+                    label: "MCP 客户端 (mcp)".into(),
+                    description: "连接外部 MCP 服务器并暴露其工具与提示词".into(),
+                    kind: SettingItemKind::Toggle { value: true },
+                },
+                SettingEntry {
+                    key: "plugin.codemode".into(),
+                    category: "模块".into(),
+                    label: "脚本执行沙箱 (codemode)".into(),
+                    description: "通过 QuickJS 沙箱批量编排与调用工具".into(),
+                    kind: SettingItemKind::Toggle { value: false },
+                },
+            ],
+            None,
+            "~/.mizar/settings.json".into(),
+        );
+        if let Some(OverlayKind::SettingsModal { selected, .. }) = &mut state.active {
+            *selected = 2; // 指向 plugin.mcp
+        }
+
+        let theme = Theme::from_preset(ThemePreset::Auto, None);
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_overlay(
+                    frame,
+                    Rect::new(0, 0, 90, 20),
+                    Rect::new(0, 15, 90, 5),
+                    &mut state,
+                    &[],
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        let compact = rendered.replace(' ', "");
+        assert!(
+            compact.contains("[模块]MCP客户端(mcp)") && rendered.contains("● ON"),
+            "rendered:\n{rendered}"
+        );
+        assert!(
+            compact.contains("[模块]脚本执行沙箱(codemode)") && rendered.contains("○ OFF"),
+            "rendered:\n{rendered}"
+        );
+
+        // set_setting_toggle 回退某一项
+        state.set_setting_toggle("plugin.mcp", false);
+        // refresh_settings 删除 compaction.enabled 后光标应仍锚定到 plugin.mcp（新索引 1）
+        state.refresh_settings(vec![
+            SettingEntry {
+                key: "ui.showThinking".into(),
+                category: "界面".into(),
+                label: "显示思考过程".into(),
+                description: "开关推理块".into(),
+                kind: SettingItemKind::Toggle { value: true },
+            },
+            SettingEntry {
+                key: "plugin.mcp".into(),
+                category: "模块".into(),
+                label: "MCP 客户端 (mcp)".into(),
+                description: "连接外部 MCP 服务器并暴露其工具与提示词".into(),
+                kind: SettingItemKind::Toggle { value: false },
+            },
+        ]);
+        match &state.active {
+            Some(OverlayKind::SettingsModal {
+                items, selected, ..
+            }) => {
+                assert_eq!(*selected, 1);
+                assert_eq!(items[*selected].key, "plugin.mcp");
+                assert_eq!(
+                    items[*selected].kind,
+                    SettingItemKind::Toggle { value: false }
+                );
+            }
+            _ => panic!("expected SettingsModal after refresh_settings"),
+        }
     }
 }

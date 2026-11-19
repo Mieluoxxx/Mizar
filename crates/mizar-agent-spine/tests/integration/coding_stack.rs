@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordis::{Context, CordisError, PluginDef};
-use mizar_agent_loop::{AgentLoopContextExt, EVENT_AGENT_TOOL_RESULT, AgentToolResultEvent};
+use futures::channel::mpsc;
+use mizar_agent_loop::{AgentLoopContextExt, AgentToolResultEvent, EVENT_AGENT_TOOL_RESULT};
 use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
@@ -15,7 +16,6 @@ use mizar_llm::{
 use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_mcp::{McpExposure, McpManager, McpServerConfig};
 use mizar_session::SessionContextExt;
-use futures::channel::mpsc;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -260,7 +260,11 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     let reply = app
         .agent_loop()
         .unwrap()
-        .run(Arc::clone(&session), "verify full stack", CancellationToken::new())
+        .run(
+            Arc::clone(&session),
+            "verify full stack",
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(reply, "all_mechanisms_verified");
@@ -268,12 +272,24 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     // 校验所有工具全部执行成功且无报错
     {
         let recorded = results_log.lock().unwrap();
-        assert_eq!(recorded.len(), 9, "expected 9 tool executions: {recorded:?}");
+        assert_eq!(
+            recorded.len(),
+            9,
+            "expected 9 tool executions: {recorded:?}"
+        );
         for (name, is_err, content) in recorded.iter() {
             assert!(!*is_err, "tool `{name}` returned error: {content}");
         }
-        assert!(recorded.iter().any(|(n, _, c)| n == "codemode" && c.contains("src/app.rs")));
-        assert!(recorded.iter().any(|(n, _, c)| n == "mcp__fff__find_files" && c.contains("fff:find_files")));
+        assert!(
+            recorded
+                .iter()
+                .any(|(n, _, c)| n == "codemode" && c.contains("src/app.rs"))
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(n, _, c)| n == "mcp__fff__find_files" && c.contains("fff:find_files"))
+        );
     }
 
     // 校验工具可见性演化：step1 有 tool_search/codemode 而无 mcp__fff__*；step2 多出 mcp__fff__find_files 且始终没有 multi_grep

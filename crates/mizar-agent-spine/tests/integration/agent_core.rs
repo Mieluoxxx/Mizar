@@ -26,7 +26,9 @@ use mizar_tools::{
     EVENT_TOOLS_PRE_EXECUTE, EVENT_TOOLS_RESULT, PreExecuteDecision, ToolExecution,
     ToolResultEvent, ToolsContextExt,
 };
-use mizar_trajectory::{EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime};
+use mizar_trajectory::{
+    EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime,
+};
 use tokio_util::sync::CancellationToken;
 
 async fn tick(ms: u64) {
@@ -380,9 +382,15 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
     let app = Context::new();
     let anomalies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let anomalies_cb = Arc::clone(&anomalies);
-    app.on(EVENT_TRAJECTORY_ANOMALY, move |ev: &TrajectoryAnomalyEvent| {
-        anomalies_cb.lock().unwrap().push(ev.finding.rule_id.clone());
-    })
+    app.on(
+        EVENT_TRAJECTORY_ANOMALY,
+        move |ev: &TrajectoryAnomalyEvent| {
+            anomalies_cb
+                .lock()
+                .unwrap()
+                .push(ev.finding.rule_id.clone());
+        },
+    )
     .unwrap();
 
     app.plugin(

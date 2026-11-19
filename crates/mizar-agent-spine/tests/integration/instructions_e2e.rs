@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{Context, CordisError, PluginDef};
+use futures::channel::mpsc;
 use mizar_agent_loop::AgentLoopContextExt;
 use mizar_agent_spine::{
     AgentInstructions, AgentSpineConfig, AgentSpinePlugin, AgentToolsMode,
@@ -14,7 +15,6 @@ use mizar_llm::{
     StreamChunk, ToolCall,
 };
 use mizar_session::SessionContextExt;
-use futures::channel::mpsc;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 

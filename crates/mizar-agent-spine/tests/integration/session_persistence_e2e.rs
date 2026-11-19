@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{Context, CordisError, PluginDef};
+use futures::channel::mpsc;
 use mizar_agent_loop::AgentLoopContextExt;
 use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin};
 use mizar_llm::{
@@ -12,7 +13,6 @@ use mizar_llm::{
 };
 use mizar_session::{SessionContextExt, SessionListQuery};
 use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
-use futures::channel::mpsc;
 use tokio_util::sync::CancellationToken;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -90,7 +90,11 @@ impl LlmAdapter for TwoTurnAdapter {
     }
 }
 
-async fn mount_spine_with_db(db_path: &PathBuf, ws: &PathBuf, adapter: Arc<TwoTurnAdapter>) -> Context {
+async fn mount_spine_with_db(
+    db_path: &PathBuf,
+    ws: &PathBuf,
+    adapter: Arc<TwoTurnAdapter>,
+) -> Context {
     let app = Context::new();
     let spine_fiber = app.plugin(
         AgentSpinePlugin,
@@ -139,11 +143,18 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     let reply1 = app1
         .agent_loop()
         .unwrap()
-        .run(Arc::clone(&s1), "帮我看看现在几点", CancellationToken::new())
+        .run(
+            Arc::clone(&s1),
+            "帮我看看现在几点",
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     assert_eq!(reply1, "第一轮已完成");
-    assert_eq!(s1.header().cwd.as_deref(), Some(ws.to_string_lossy().as_ref()));
+    assert_eq!(
+        s1.header().cwd.as_deref(),
+        Some(ws.to_string_lossy().as_ref())
+    );
     assert_eq!(s1.header().title.as_deref(), Some("帮我看看现在几点"));
     app1.fiber().dispose().await;
 
@@ -184,7 +195,9 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     assert_eq!(reply2, "重启后恢复续聊成功");
     assert_eq!(*seen2.lock().unwrap(), vec![6]);
 
-    let report2 = traj2.inspect("e2e-session", TimelineMode::Sequence).unwrap();
+    let report2 = traj2
+        .inspect("e2e-session", TimelineMode::Sequence)
+        .unwrap();
     assert_eq!(report2.snapshot.stats.turns, 2);
     assert_eq!(report2.snapshot.stats.steps, 3);
     assert_eq!(report2.snapshot.stats.tool_calls, 1);

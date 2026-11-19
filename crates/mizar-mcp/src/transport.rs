@@ -337,7 +337,9 @@ impl HttpTransport {
         }
         self.post_json(&body, Some(id), timeout, cancel)
             .await?
-            .ok_or_else(|| McpError::Transport("empty HTTP response body for JSON-RPC request".into()))
+            .ok_or_else(|| {
+                McpError::Transport("empty HTTP response body for JSON-RPC request".into())
+            })
     }
 
     async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
@@ -349,7 +351,12 @@ impl HttpTransport {
             body.as_object_mut().unwrap().insert("params".into(), p);
         }
         let _ = self
-            .post_json(&body, None, Duration::from_secs(10), &CancellationToken::new())
+            .post_json(
+                &body,
+                None,
+                Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
             .await?;
         Ok(())
     }

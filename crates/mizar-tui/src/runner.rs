@@ -23,8 +23,8 @@ use mizar_agent_loop::{
 use mizar_agent_spine::{
     CompactionContextExt, CompactionEndEvent, CompactionError, CompactionProgressEvent,
     CompactionStartEvent, CompactionTrigger, EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS,
-    EVENT_COMPACTION_START, ManualCompactOptions, patch_settings_file,
-    resolve_global_settings_path, strip_summary_wrapper,
+    EVENT_COMPACTION_START, ManualCompactOptions, SpinePluginsContextExt, patch_settings_file,
+    persist_disabled_plugins, resolve_global_settings_path, strip_summary_wrapper,
 };
 use mizar_instructions::AgentInstructions;
 use mizar_llm::{ContentBlock, LlmContextExt, ReasoningEffort};
@@ -36,7 +36,8 @@ use mizar_session::{
 use mizar_skills::{EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillRegistry};
 use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_tools::{
-    EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolExposure, ToolRuntime,
+    EVENT_TOOLS_CHANGE, EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolExposure,
+    ToolRuntime,
 };
 use mizar_tools_coding::bash::execute_bash_process;
 use mizar_trajectory::{
@@ -740,7 +741,7 @@ pub async fn run_tui_with_summary(
 
     let mut active_session = Arc::clone(&initial_session);
     let active_sid = Arc::new(std::sync::RwLock::new(active_session.id.clone()));
-    let handles = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone())?;
+    let mut handles = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone())?;
 
     let mut app = AppState::new(
         config.workspace.clone(),
@@ -758,29 +759,31 @@ pub async fn run_tui_with_summary(
         app.push_notice(lvl, msg);
     }
     app.user_skill_names = collect_user_skill_names(&ctx, &config.workspace).await;
-    if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
-        let tx_skills = ui_tx.clone();
+    {
+        // 不在启动阶段缓存旧 `Arc<SkillRegistry>`，确保即使启动屏蔽或运行期重挂 `skills` 也能动态感知最新列表
+        let ctx_skills = ctx.clone();
         let ws_skills = config.workspace.clone();
-        let reg_skills = Arc::clone(&reg);
-        let _ = ctx.on_signal(EVENT_SKILLS_CHANGE, move || {
-            let tx = tx_skills.clone();
+        let tx_skills = ui_tx.clone();
+        handles.push(ctx.on_signal(EVENT_SKILLS_CHANGE, move || {
+            let ctx_inner = ctx_skills.clone();
             let ws = ws_skills.clone();
-            let reg = Arc::clone(&reg_skills);
+            let tx = tx_skills.clone();
             tokio::spawn(async move {
-                let list = reg
-                    .list(SkillLookupOptions {
-                        cwd: Some(ws),
-                        cancel: CancellationToken::new(),
-                    })
-                    .await;
-                let names: Vec<String> = list
-                    .into_iter()
-                    .filter(|s| s.is_user_invocable())
-                    .map(|s| s.name)
-                    .collect();
+                let names = collect_user_skill_names(&ctx_inner, &ws).await;
                 let _ = tx.send(UiEvent::UserSkillsUpdated(names));
             });
-        });
+        })?);
+    }
+    {
+        let tx_tools = ui_tx.clone();
+        handles.push(ctx.on_signal(EVENT_TOOLS_CHANGE, move || {
+            let _ = tx_tools.send(UiEvent::ToolsUpdated);
+        })?);
+    }
+    if let Ok(plugins) = ctx.spine_plugins() {
+        for err_msg in plugins.startup_errors() {
+            app.push_notice(NoticeLevel::Warn, err_msg);
+        }
     }
     for (level, msg) in &config.startup_notices {
         app.push_notice(*level, msg.clone());
@@ -1059,6 +1062,10 @@ fn process_ui_event(
     user_cancelled: &mut bool,
     event: UiEvent,
 ) -> AppAction {
+    if matches!(event, UiEvent::ToolsUpdated) {
+        return AppAction::RefreshSidePanelTools;
+    }
+
     if matches!(event, UiEvent::LocalBashFinished { .. }) {
         *active_cancel = None;
         *user_cancelled = false;
@@ -1665,6 +1672,9 @@ async fn handle_action(
         AppAction::RefreshSidePanelData => {
             populate_side_panel_data(ctx, app).await;
         }
+        AppAction::RefreshSidePanelTools => {
+            populate_tools_and_mcps(ctx, app);
+        }
         AppAction::OpenTrajectoryScene(mode) => {
             let report = ctx
                 .get::<TrajectoryRuntime>("trajectory")
@@ -1682,6 +1692,18 @@ async fn handle_action(
             app.overlay.open_settings(items, initial_query, save_hint);
         }
         AppAction::ApplySetting { key, value } => {
+            if let Some(plugin_id) = key.strip_prefix("plugin.") {
+                let settings_path = resolve_global_settings_path();
+                apply_module_toggle_setting(
+                    ctx,
+                    app,
+                    settings_path.as_deref(),
+                    plugin_id,
+                    value == "true",
+                )
+                .await;
+                return;
+            }
             apply_host_setting_change(ctx, app, terminal, &key, &value).await;
             if let Err(err) = persist_setting_change(&key, &value) {
                 app.push_notice(
@@ -2035,7 +2057,90 @@ fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry> {
         ]);
     }
 
+    if let Ok(plugins) = ctx.spine_plugins() {
+        for module in plugins.optional_modules() {
+            items.push(SettingEntry {
+                key: format!("plugin.{}", module.id),
+                category: "模块".into(),
+                label: format!("{} ({})", module.label, module.id),
+                description: module.description,
+                kind: SettingItemKind::Toggle {
+                    value: module.enabled,
+                },
+            });
+        }
+    }
+
     items
+}
+
+async fn apply_module_toggle_setting(
+    ctx: &Context,
+    app: &mut AppState,
+    settings_path: Option<&Path>,
+    plugin_id: &str,
+    enabled: bool,
+) {
+    if app.is_busy || app.is_bash_running || app.is_compacting {
+        app.overlay
+            .set_setting_toggle(&format!("plugin.{plugin_id}"), !enabled);
+        let msg = "当前有正在执行的任务，请等待完成后再切换模块";
+        app.push_notice(NoticeLevel::Warn, msg);
+        app.set_flash(msg);
+        app.overlay
+            .refresh_settings(build_settings_entries(ctx, app));
+        return;
+    }
+
+    let Ok(plugins) = ctx.spine_plugins() else {
+        app.push_notice(NoticeLevel::Error, "spinePlugins 控制器服务不可用");
+        app.overlay
+            .refresh_settings(build_settings_entries(ctx, app));
+        return;
+    };
+
+    let label = plugins
+        .get(plugin_id)
+        .map(|m| format!("{} ({})", m.label, m.id))
+        .unwrap_or_else(|| plugin_id.to_string());
+
+    match plugins.set_enabled(plugin_id, enabled).await {
+        Ok(_) => {
+            let disabled = plugins.disabled_ids();
+            if let Some(path) = settings_path {
+                if let Err(err) = persist_disabled_plugins(path, &disabled) {
+                    app.push_notice(
+                        NoticeLevel::Warn,
+                        format!("模块 `{plugin_id}` 已实时切换，但写入 settings.json 失败：{err}"),
+                    );
+                }
+            } else {
+                app.push_notice(
+                    NoticeLevel::Warn,
+                    format!(
+                        "模块 `{plugin_id}` 已实时切换，但无法解析 ~/.mizar/settings.json 路径"
+                    ),
+                );
+            }
+            app.user_skill_names = collect_user_skill_names(ctx, &app.workspace).await;
+            populate_side_panel_data(ctx, app).await;
+            app.overlay
+                .refresh_settings(build_settings_entries(ctx, app));
+            let state_word = if enabled { "启用" } else { "禁用" };
+            let msg = format!("已{state_word}模块 {label}");
+            app.set_flash(format!("✓ {msg}"));
+            app.push_notice(NoticeLevel::Info, msg);
+        }
+        Err(err) => {
+            app.overlay
+                .refresh_settings(build_settings_entries(ctx, app));
+            app.push_notice(
+                NoticeLevel::Error,
+                format!("切换模块 `{plugin_id}` 失败：{err}"),
+            );
+            app.set_flash(format!("切换模块 `{plugin_id}` 失败"));
+        }
+    }
 }
 
 async fn apply_host_setting_change(
@@ -2188,27 +2293,7 @@ fn persist_setting_change(key: &str, value: &str) -> Result<(), String> {
     })
 }
 
-async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
-    app.refresh_context_breakdown();
-    app.side_panel_data.files = app.touched_files.clone();
-    if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
-        let report = inst.probe_report(Some(&app.session_id));
-        app.side_panel_data.instructions = report
-            .scopes
-            .into_iter()
-            .map(|s| InstructionSummaryRow {
-                path: s.display_path,
-                scope: s.scope_kind.as_str().to_string(),
-                bytes: s.bytes,
-                truncated: s.truncated,
-                omitted: s.omitted,
-            })
-            .collect();
-    }
-    let (git_changes, git_diff_stat) = collect_git_summary(&app.workspace).await;
-    app.side_panel_data.git_changes = git_changes;
-    app.side_panel_data.git_diff_stat = git_diff_stat;
-
+fn populate_tools_and_mcps(ctx: &Context, app: &mut AppState) {
     if let Some(rt) = ctx.get::<ToolRuntime>("tools") {
         let declared: HashSet<String> = rt
             .list_declared(Some(&app.session_id))
@@ -2235,6 +2320,8 @@ async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
                 }
             })
             .collect();
+    } else {
+        app.side_panel_data.tools.clear();
     }
 
     if let Some(mgr) = ctx.get::<McpManager>("mcp") {
@@ -2264,7 +2351,35 @@ async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
                 }
             })
             .collect();
+    } else {
+        app.side_panel_data.mcps.clear();
     }
+}
+
+async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
+    app.refresh_context_breakdown();
+    app.side_panel_data.files = app.touched_files.clone();
+    if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
+        let report = inst.probe_report(Some(&app.session_id));
+        app.side_panel_data.instructions = report
+            .scopes
+            .into_iter()
+            .map(|s| InstructionSummaryRow {
+                path: s.display_path,
+                scope: s.scope_kind.as_str().to_string(),
+                bytes: s.bytes,
+                truncated: s.truncated,
+                omitted: s.omitted,
+            })
+            .collect();
+    } else {
+        app.side_panel_data.instructions.clear();
+    }
+    let (git_changes, git_diff_stat) = collect_git_summary(&app.workspace).await;
+    app.side_panel_data.git_changes = git_changes;
+    app.side_panel_data.git_diff_stat = git_diff_stat;
+
+    populate_tools_and_mcps(ctx, app);
 
     let mut findings = app.anomalies.clone();
     if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory")
@@ -2686,5 +2801,129 @@ mod tests {
         super::flush_inline_scrollback(&mut terminal, &mut app);
         assert!(app.inline_welcome_committed);
         assert_eq!(app.inline_committed_items, 1);
+    }
+
+    #[tokio::test]
+    async fn settings_module_entries_toggle_persists_disabled_plugins_and_refreshes_runtime_state()
+    {
+        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, CompactionContextExt};
+        use mizar_session::SessionContextExt;
+        use mizar_tui_ui::overlay::{OverlayKind, SettingItemKind};
+
+        let tmp = std::env::temp_dir().join(format!("mizar_tui_modules_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(ws.join(".agents/skills/tui-demo")).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "# TUI Rule\nKeep clean\n").unwrap();
+        std::fs::write(
+            ws.join(".agents/skills/tui-demo/SKILL.md"),
+            "---\nname: tui-demo\ndescription: TUI demo skill\n---\nDEMO\n",
+        )
+        .unwrap();
+        let settings_path = tmp.join(".mizar/settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, r#"{"defaultModel":"gpt-4o"}"#).unwrap();
+
+        let ctx = cordis::Context::new();
+        let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
+        if let mizar_agent_spine::AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
+            mcp.global_config_dir = Some(tmp.join(".mizar"));
+        }
+        ctx.plugin(AgentSpinePlugin, cfg).await.unwrap();
+        super::wait_for_services(&ctx).await.unwrap();
+
+        let session = ctx.sessions().unwrap().create(None);
+        let mut app = AppState::new(ws.clone(), session.id.clone(), Vec::new(), None, None, None);
+        app.user_skill_names = super::collect_user_skill_names(&ctx, &ws).await;
+        assert!(app.user_skill_names.contains(&"tui-demo".to_string()));
+        super::populate_side_panel_data(&ctx, &mut app).await;
+        assert!(!app.side_panel_data.instructions.is_empty());
+        assert!(!app.side_panel_data.tools.is_empty());
+
+        // 启动时 compaction 被屏蔽：/settings 中不含 [压缩] 配置项，且 plugin.compaction 为 false
+        let initial_entries = super::build_settings_entries(&ctx, &app);
+        assert!(
+            !initial_entries.iter().any(|e| e.category == "压缩"),
+            "compaction entries must be omitted while module is disabled"
+        );
+        let module_keys: Vec<String> = initial_entries
+            .iter()
+            .filter(|e| e.category == "模块")
+            .map(|e| e.key.clone())
+            .collect();
+        assert!(module_keys.contains(&"plugin.compaction".to_string()));
+        assert!(module_keys.contains(&"plugin.skills".to_string()));
+        assert!(module_keys.contains(&"plugin.instructions".to_string()));
+        app.overlay
+            .open_settings(initial_entries, None, settings_path.display().to_string());
+
+        // 1. 运行期启用 compaction -> 服务上线 + 弹窗自动包含 [压缩] + 写入 disabledPlugins: []
+        super::apply_module_toggle_setting(
+            &ctx,
+            &mut app,
+            Some(&settings_path),
+            "compaction",
+            true,
+        )
+        .await;
+        assert!(ctx.compaction().is_ok());
+        match &app.overlay.active {
+            Some(OverlayKind::SettingsModal { items, .. }) => {
+                assert!(items.iter().any(|e| e.key == "compaction.enabled"));
+                let entry = items.iter().find(|e| e.key == "plugin.compaction").unwrap();
+                assert_eq!(entry.kind, SettingItemKind::Toggle { value: true });
+            }
+            _ => panic!("expected SettingsModal open after module toggle"),
+        }
+        let persisted_1: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(persisted_1["defaultModel"], "gpt-4o");
+        assert_eq!(persisted_1["disabledPlugins"], serde_json::json!([]));
+
+        // 2. 禁用 skills / instructions / compaction -> skills 补全清空、侧栏指令清空、[压缩] 移除、排序去重落盘
+        for id in ["skills", "instructions", "compaction"] {
+            super::apply_module_toggle_setting(&ctx, &mut app, Some(&settings_path), id, false)
+                .await;
+        }
+        assert!(app.user_skill_names.is_empty());
+        assert!(app.side_panel_data.instructions.is_empty());
+        assert!(ctx.compaction().is_err());
+        let after_disable_entries = super::build_settings_entries(&ctx, &app);
+        assert!(!after_disable_entries.iter().any(|e| e.category == "压缩"));
+        let persisted_2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted_2["disabledPlugins"],
+            serde_json::json!(["compaction", "instructions", "skills"])
+        );
+
+        // 3. 运行期繁忙保护：is_compacting 时拒绝启用 skills，状态与 settings.json 保持不变
+        app.is_compacting = true;
+        super::apply_module_toggle_setting(&ctx, &mut app, Some(&settings_path), "skills", true)
+            .await;
+        assert!(ctx.get::<mizar_skills::SkillRegistry>("skills").is_none());
+        let persisted_3: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted_3["disabledPlugins"],
+            serde_json::json!(["compaction", "instructions", "skills"])
+        );
+
+        // 4. process_ui_event 收到 ToolsUpdated 应触发 RefreshSidePanelTools
+        let mut active_cancel = None;
+        let mut pending_steer = None;
+        let mut user_cancelled = false;
+        let act = process_ui_event(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::ToolsUpdated,
+        );
+        assert_eq!(act, AppAction::RefreshSidePanelTools);
+
+        ctx.fiber().dispose().await;
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

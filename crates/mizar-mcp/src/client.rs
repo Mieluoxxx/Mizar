@@ -129,7 +129,10 @@ impl McpClient {
         })
     }
 
-    pub async fn list_all_tools(&self, cancel: &CancellationToken) -> Result<Vec<McpRemoteTool>, McpError> {
+    pub async fn list_all_tools(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<McpRemoteTool>, McpError> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
@@ -194,7 +197,11 @@ impl McpClient {
             .await
     }
 
-    pub async fn read_resource(&self, uri: &str, cancel: &CancellationToken) -> Result<Value, McpError> {
+    pub async fn read_resource(
+        &self,
+        uri: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value, McpError> {
         self.transport
             .request(
                 "resources/read",
