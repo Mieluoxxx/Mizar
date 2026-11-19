@@ -18,7 +18,8 @@ use crate::app::{
 use crate::editor::{char_width, display_width};
 use crate::emphasis::EmphasisConfig;
 use crate::markdown::{
-    RenderedLine, parse_inline_rich, render_diff_rich, render_markdown_rich, wrap_styled_spans_rich,
+    RenderedLine, parse_inline_rich, render_diff_rich, render_markdown_rich, wrap_styled_spans,
+    wrap_styled_spans_rich,
 };
 use crate::overlay::render_overlay;
 use crate::reveal::RevealSlot;
@@ -203,10 +204,27 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let rule_w = (area.width.saturating_sub(4) as usize).min(64);
     let sep = "─".repeat(rule_w);
 
-    let mut lines = Vec::new();
-    let top_pad = if area.height >= 14 { 2 } else { 0 };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let show_banner = area.width >= 46 && area.height >= 16;
+    let top_pad = if show_banner {
+        if area.height >= 20 {
+            2
+        } else if area.height >= 18 {
+            1
+        } else {
+            0
+        }
+    } else if area.height >= 14 {
+        2
+    } else {
+        0
+    };
     for _ in 0..top_pad {
         lines.push(Line::raw(""));
+    }
+
+    if show_banner {
+        append_welcome_banner(&mut lines, theme);
     }
 
     lines.push(Line::from(vec![
@@ -231,57 +249,119 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         Span::styled("  工作区  ", Style::default().fg(theme.text_dim)),
         Span::styled(ws_str, Style::default().fg(theme.text)),
     ]));
-    lines.push(Line::from(vec![
+    let wrap_w = area.width as usize;
+    push_welcome_wrapped(
+        &mut lines,
         Span::styled("  模型    ", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            model_label,
-            Style::default()
-                .fg(theme.success)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("[effort: {effort_str}]"),
-            Style::default().fg(effort_col),
-        ),
-    ]));
-    lines.push(Line::from(vec![
+        vec![
+            Span::styled(
+                model_label,
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("[effort: {effort_str}]"),
+                Style::default().fg(effort_col),
+            ),
+        ],
+        wrap_w,
+    );
+    push_welcome_wrapped(
+        &mut lines,
         Span::styled("  会话    ", Style::default().fg(theme.text_dim)),
-        Span::styled(
-            short_id(&app.session_id),
-            Style::default().fg(theme.text_muted),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!("approval: {}", app.approval_mode.as_str()),
-            Style::default().fg(theme.text_dim),
-        ),
-    ]));
+        vec![
+            Span::styled(
+                short_id(&app.session_id).to_string(),
+                Style::default().fg(theme.text_muted),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("approval: {}", app.approval_mode.as_str()),
+                Style::default().fg(theme.text_dim),
+            ),
+        ],
+        wrap_w,
+    );
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
+    push_welcome_wrapped(
+        &mut lines,
         Span::styled("  操作    ", Style::default().fg(theme.text_dim)),
-        Span::styled("Enter", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 发送/排队  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("Tab", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 思考  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("Ctrl+L", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 模型  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("Ctrl+B", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 侧栏", Style::default().fg(theme.text_muted)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("          ", Style::default().fg(theme.text_dim)),
-        Span::styled("Esc", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 暂停  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("/", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 命令  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("@", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 文件  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("Ctrl+T", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 轨迹  ·  ", Style::default().fg(theme.text_muted)),
-        Span::styled("?", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(" 帮助", Style::default().fg(theme.text_muted)),
-    ]));
+        vec![
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 发送/排队  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 思考  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "Ctrl+L",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 模型  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "Ctrl+B",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 侧栏", Style::default().fg(theme.text_muted)),
+        ],
+        wrap_w,
+    );
+    push_welcome_wrapped(
+        &mut lines,
+        Span::raw("          "),
+        vec![
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 暂停  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 命令  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "@",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 文件  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "Ctrl+T",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 轨迹  ·  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "?",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" 帮助", Style::default().fg(theme.text_muted)),
+        ],
+        wrap_w,
+    );
 
     if area.height >= 12 && area.width >= 56 {
         let chip_y = area.y + (lines.len() as u16) + 1;
@@ -317,6 +397,114 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// 将欢迎页带标签前导的元数据/快捷键行按视口宽度折行并保持 10 列悬挂缩进，确保 `lines.len()` 与真实行数一致。
+fn push_welcome_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    prefix_first: Span<'static>,
+    spans: Vec<Span<'static>>,
+    width: usize,
+) {
+    lines.extend(wrap_styled_spans(
+        spans,
+        Some(prefix_first),
+        Some(Span::raw("          ")),
+        width,
+    ));
+}
+
+/// 欢迎页使用的 MIZAR ANSI Shadow 立体艺术字（固定 6 行、最大显示宽度 42 列）。
+const WELCOME_ASCII_LOGO: [&str; 6] = [
+    "███╗   ███╗ ██╗ ███████╗  █████╗  ██████╗",
+    "████╗ ████║ ██║ ╚══███╔╝ ██╔══██╗ ██╔══██╗",
+    "██╔████╔██║ ██║   ███╔╝  ███████║ ██████╔╝",
+    "██║╚██╔╝██║ ██║  ███╔╝   ██╔══██║ ██╔══██╗",
+    "██║ ╚═╝ ██║ ██║ ███████╗ ██║  ██║ ██║  ██║",
+    "╚═╝     ╚═╝ ╚═╝ ╚══════╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BannerGlyphKind {
+    Face,
+    Shadow,
+    Space,
+}
+
+fn classify_banner_char(ch: char) -> BannerGlyphKind {
+    match ch {
+        '█' => BannerGlyphKind::Face,
+        ' ' => BannerGlyphKind::Space,
+        _ => BannerGlyphKind::Shadow,
+    }
+}
+
+fn welcome_banner_face_color(theme: &Theme, row_idx: usize, total_rows: usize) -> Color {
+    if !theme.truecolor {
+        return theme.accent;
+    }
+    match (color_to_rgb8(theme.link), color_to_rgb8(theme.accent)) {
+        (Some(top), Some(bottom)) => {
+            let denom = total_rows.saturating_sub(1).max(1) as f64;
+            let t = row_idx as f64 / denom;
+            mix_oklab(top, bottom, t).to_color()
+        }
+        _ => theme.accent,
+    }
+}
+
+fn push_banner_run(
+    spans: &mut Vec<Span<'static>>,
+    kind: BannerGlyphKind,
+    text: String,
+    face_style: Style,
+    shadow_style: Style,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let span = match kind {
+        BannerGlyphKind::Face => Span::styled(text, face_style),
+        BannerGlyphKind::Shadow => Span::styled(text, shadow_style),
+        BannerGlyphKind::Space => Span::raw(text),
+    };
+    spans.push(span);
+}
+
+/// 将双色调 ANSI Shadow 艺术字逐行写入欢迎页（实心主面在 OKLab 空间从 `link` 渐变至 `accent`，立体阴影复用 `accent_soft`）。
+fn append_welcome_banner<'a>(lines: &mut Vec<Line<'a>>, theme: &Theme) {
+    let face_base = Style::default().add_modifier(Modifier::BOLD);
+    let shadow_style = Style::default().fg(theme.accent_soft);
+    let total_rows = WELCOME_ASCII_LOGO.len();
+
+    for (row_idx, raw_row) in WELCOME_ASCII_LOGO.iter().enumerate() {
+        let face_style = face_base.fg(welcome_banner_face_color(theme, row_idx, total_rows));
+        let mut spans = vec![Span::raw("  ")];
+        let mut cur_kind: Option<BannerGlyphKind> = None;
+        let mut buf = String::new();
+
+        for ch in raw_row.chars() {
+            let kind = classify_banner_char(ch);
+            if cur_kind != Some(kind) {
+                if let Some(prev_kind) = cur_kind {
+                    push_banner_run(
+                        &mut spans,
+                        prev_kind,
+                        std::mem::take(&mut buf),
+                        face_style,
+                        shadow_style,
+                    );
+                }
+                cur_kind = Some(kind);
+            }
+            buf.push(ch);
+        }
+        if let Some(last_kind) = cur_kind {
+            push_banner_run(&mut spans, last_kind, buf, face_style, shadow_style);
+        }
+
+        lines.push(Line::from(spans));
+    }
 }
 
 /// 将单条已稳定完成的对话项渲染为可推送至 Inline 原生 scrollback 的行序列。
@@ -2036,6 +2224,142 @@ mod tests {
             rows.push(row.trim_end().to_string());
         }
         rows.join("\n")
+    }
+
+    #[test]
+    fn welcome_screen_renders_ansi_shadow_banner_and_falls_back_on_small_terminals() {
+        assert_eq!(WELCOME_ASCII_LOGO.len(), 6);
+        for (idx, row) in WELCOME_ASCII_LOGO.iter().enumerate() {
+            let w = display_width(row);
+            assert!(
+                (40..=42).contains(&w),
+                "banner row {idx} unexpected width {w}: {row:?}"
+            );
+        }
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-welcome",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        let wide = render_buffer_text(&mut app, 120, 30);
+        for row in WELCOME_ASCII_LOGO {
+            assert!(wide.contains(row), "missing banner row {row:?}:\n{wide}");
+        }
+        assert!(wide.contains("◆ Mizar"), "missing title:\n{wide}");
+        assert!(wide.contains("[模型]"), "missing quick chips:\n{wide}");
+
+        let wide_lines: Vec<&str> = wide.lines().collect();
+        assert!(!app.launchpad_hit_rects.is_empty());
+        for (_, rect) in &app.launchpad_hit_rects {
+            assert!(rect.y < 30, "hit rect out of frame: {rect:?}");
+            let row_txt = wide_lines.get(rect.y as usize).copied().unwrap_or("");
+            assert!(
+                row_txt.contains('['),
+                "expected quick chip at y={}, got: {row_txt:?}\n{wide}",
+                rect.y
+            );
+        }
+
+        // 标准 80x24 终端（transcript 高度 20）完整展示艺术字与快捷入口
+        let std80 = render_buffer_text(&mut app, 80, 24);
+        for row in WELCOME_ASCII_LOGO {
+            assert!(
+                std80.contains(row),
+                "80x24 missing banner row {row:?}:\n{std80}"
+            );
+        }
+        assert!(
+            std80.contains("[模型]"),
+            "80x24 missing quick chips:\n{std80}"
+        );
+
+        // 58x28 中窄终端下长模型名与操作栏折行后，快捷入口命中坐标依然与渲染行精确对齐
+        app.provider = Some("magpie".into());
+        app.model = Some("mayoru-responses/deepseek-flash-long".into());
+        let wrapped = render_buffer_text(&mut app, 58, 28);
+        for row in WELCOME_ASCII_LOGO {
+            assert!(
+                wrapped.contains(row),
+                "58x28 missing banner row {row:?}:\n{wrapped}"
+            );
+        }
+        let wrapped_lines: Vec<&str> = wrapped.lines().collect();
+        assert!(!app.launchpad_hit_rects.is_empty());
+        for (_, rect) in &app.launchpad_hit_rects {
+            assert!(rect.y < 28, "wrapped hit rect out of frame: {rect:?}");
+            let row_txt = wrapped_lines.get(rect.y as usize).copied().unwrap_or("");
+            assert!(
+                row_txt.contains('['),
+                "expected wrapped quick chip at y={}, got: {row_txt:?}\n{wrapped}",
+                rect.y
+            );
+        }
+
+        // 46x20 下界（transcript_area 恰好为 46x16）仍可正常展示 6 行艺术字
+        let boundary = render_buffer_text(&mut app, 46, 20);
+        for row in WELCOME_ASCII_LOGO {
+            assert!(
+                boundary.contains(row),
+                "46x20 missing banner row {row:?}:\n{boundary}"
+            );
+        }
+
+        let narrow_w = render_buffer_text(&mut app, 44, 28);
+        assert!(
+            !narrow_w.contains("███╗   ███╗"),
+            "should fall back on narrow width:\n{narrow_w}"
+        );
+        assert!(narrow_w.contains("◆ Mizar"), "narrow fallback:\n{narrow_w}");
+
+        let short = render_buffer_text(&mut app, 100, 15);
+        assert!(
+            !short.contains("███╗   ███╗"),
+            "should fall back on short height:\n{short}"
+        );
+        assert!(short.contains("◆ Mizar"), "short fallback:\n{short}");
+
+        let tiny = render_buffer_text(&mut app, 20, 8);
+        assert!(tiny.contains("Mizar"), "tiny fallback:\n{tiny}");
+
+        for preset_theme in [
+            Theme::mist_dark(),
+            Theme::mist_light(),
+            Theme::sakura_dark(),
+        ] {
+            let mut banner_lines = Vec::new();
+            append_welcome_banner(&mut banner_lines, &preset_theme);
+            assert_eq!(banner_lines.len(), 6);
+            let top_fg = welcome_banner_face_color(&preset_theme, 0, 6);
+            let bot_fg = welcome_banner_face_color(&preset_theme, 5, 6);
+            assert_ne!(
+                top_fg, bot_fg,
+                "expected vertical OKLab gradient on {}",
+                preset_theme.id
+            );
+            assert!(
+                banner_lines[0]
+                    .spans
+                    .iter()
+                    .any(|s| s.style.fg == Some(preset_theme.accent_soft)),
+                "expected accent_soft shadow on {}",
+                preset_theme.id
+            );
+        }
+
+        app.theme = Theme::ansi16();
+        assert_eq!(
+            welcome_banner_face_color(&app.theme, 0, 6),
+            app.theme.accent
+        );
+        let ansi = render_buffer_text(&mut app, 120, 30);
+        for row in WELCOME_ASCII_LOGO {
+            assert!(ansi.contains(row), "ansi16 missing row {row:?}:\n{ansi}");
+        }
     }
 
     #[test]
