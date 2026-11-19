@@ -11,7 +11,7 @@ license = "MIT"
 [workspace.dependencies]
 axum = "0.8"
 chrono = "0.4"
-crossterm = "0.28"
+crossterm = "0.29"
 dirs = "7"
 futures = "0.3"
 globset = "0.4"
