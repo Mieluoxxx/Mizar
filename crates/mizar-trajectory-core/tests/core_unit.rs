@@ -193,3 +193,155 @@ fn folds_stats_timeline_and_detects_all_rules() {
     assert!(ids.contains(&"R05_UNCLOSED_BOUNDARY"), "ids={ids:?}");
     assert!(ids.contains(&"R06_HIGH_LATENCY"), "ids={ids:?}");
 }
+
+fn latency_trace(ttft_ms: u128, llm_ms: u128, tool_ms: u128) -> Vec<TraceEvent> {
+    let base = 1_000;
+    vec![
+        ev(1, base, TraceEventKind::TurnStart { turn: 1 }),
+        ev(
+            2,
+            base,
+            TraceEventKind::UserMessage {
+                text: "run cargo test".into(),
+            },
+        ),
+        ev(
+            3,
+            base,
+            TraceEventKind::StepStart {
+                turn: 1,
+                step: 1,
+                system_prompt_chars: 120,
+                tools_count: 1,
+            },
+        ),
+        ev(
+            4,
+            base + ttft_ms,
+            TraceEventKind::FirstToken { turn: 1, step: 1 },
+        ),
+        ev(
+            5,
+            base + llm_ms,
+            TraceEventKind::AssistantMessage {
+                text: String::new(),
+                reasoning: "thinking".into(),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+        ),
+        ev(
+            6,
+            base + llm_ms,
+            TraceEventKind::StepEnd {
+                turn: 1,
+                step: 1,
+                outcome: "tool_calls".into(),
+                usage: None,
+            },
+        ),
+        ev(
+            7,
+            base + llm_ms,
+            TraceEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+            },
+        ),
+        ev(
+            8,
+            base + llm_ms + tool_ms,
+            TraceEventKind::ToolResult {
+                tool_call_id: "c1".into(),
+                name: "bash".into(),
+                content: "ok".into(),
+                is_error: false,
+                blocked: false,
+            },
+        ),
+        ev(
+            9,
+            base + llm_ms + tool_ms,
+            TraceEventKind::TurnEnd {
+                turn: 1,
+                reason: "stop".into(),
+            },
+        ),
+    ]
+}
+
+#[test]
+fn detector_config_defaults_use_relaxed_latency_thresholds() {
+    let cfg = DetectorConfig::default();
+    assert_eq!(cfg.slow_step_ms, 60_000);
+    assert_eq!(cfg.slow_tool_ms, 30_000);
+    assert_eq!(cfg.slow_ttft_ms, 15_000);
+}
+
+#[test]
+fn r06_high_latency_respects_relaxed_default_thresholds() {
+    let cfg = DetectorConfig::default();
+
+    // 旧阈值之上、新阈值之内的正常耗时不触发 R06_HIGH_LATENCY
+    let normal_events = latency_trace(14_000, 50_000, 25_000);
+    let normal_snap = fold_trajectory("s1", &normal_events);
+    assert_eq!(normal_snap.stats.ttft_ms, 14_000);
+    assert_eq!(normal_snap.stats.llm_ms, 50_000);
+    assert_eq!(normal_snap.stats.tool_ms, 25_000);
+    let normal_findings = detect_anomalies(&normal_events, &normal_snap, &cfg);
+    assert!(
+        !normal_findings
+            .iter()
+            .any(|f| f.rule_id == "R06_HIGH_LATENCY"),
+        "unexpected R06 findings: {normal_findings:?}"
+    );
+
+    // 刚好等于新阈值也不触发（判定条件为严格大于）
+    let boundary_events = latency_trace(15_000, 60_000, 30_000);
+    let boundary_snap = fold_trajectory("s1", &boundary_events);
+    let boundary_findings = detect_anomalies(&boundary_events, &boundary_snap, &cfg);
+    assert!(
+        !boundary_findings
+            .iter()
+            .any(|f| f.rule_id == "R06_HIGH_LATENCY"),
+        "unexpected R06 findings at boundary: {boundary_findings:?}"
+    );
+
+    // 超过新阈值时触发对应 3 条 R06_HIGH_LATENCY 告警
+    let slow_events = latency_trace(16_000, 65_000, 35_000);
+    let slow_snap = fold_trajectory("s1", &slow_events);
+    assert_eq!(slow_snap.stats.ttft_ms, 16_000);
+    assert_eq!(slow_snap.stats.llm_ms, 65_000);
+    assert_eq!(slow_snap.stats.tool_ms, 35_000);
+    let slow_findings = detect_anomalies(&slow_events, &slow_snap, &cfg);
+    let r06: Vec<_> = slow_findings
+        .iter()
+        .filter(|f| f.rule_id == "R06_HIGH_LATENCY")
+        .collect();
+    assert_eq!(r06.len(), 3, "r06={r06:?}");
+
+    let llm = r06
+        .iter()
+        .find(|f| f.evidence["kind"] == "llm")
+        .expect("missing llm R06 finding");
+    assert_eq!(llm.evidence["durationMs"], 65_000);
+    assert_eq!(llm.evidence["thresholdMs"], 60_000);
+
+    let ttft = r06
+        .iter()
+        .find(|f| f.evidence["kind"] == "ttft")
+        .expect("missing ttft R06 finding");
+    assert_eq!(ttft.evidence["ttftMs"], 16_000);
+    assert_eq!(ttft.evidence["thresholdMs"], 15_000);
+
+    let tool = r06
+        .iter()
+        .find(|f| f.evidence["kind"] == "tool")
+        .expect("missing tool R06 finding");
+    assert_eq!(tool.evidence["tool"], "bash");
+    assert_eq!(tool.evidence["durationMs"], 35_000);
+    assert_eq!(tool.evidence["thresholdMs"], 30_000);
+}

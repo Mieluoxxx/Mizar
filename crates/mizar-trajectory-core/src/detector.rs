@@ -14,11 +14,11 @@ pub struct DetectorConfig {
     pub repeat_threshold: usize,
     /// 连续工具报错告警阈值（默认 3）。
     pub consecutive_error_threshold: usize,
-    /// 单步 LLM 耗时告警阈值（毫秒，默认 15_000）。
+    /// 单步 LLM 耗时告警阈值（毫秒，默认 60_000）。
     pub slow_step_ms: u64,
-    /// 单次工具耗时告警阈值（毫秒，默认 10_000）。
+    /// 单次工具耗时告警阈值（毫秒，默认 30_000）。
     pub slow_tool_ms: u64,
-    /// 首 token 延迟告警阈值（毫秒，默认 5_000）。
+    /// 首 token 延迟告警阈值（毫秒，默认 15_000）。
     pub slow_ttft_ms: u64,
 }
 
@@ -27,9 +27,9 @@ impl Default for DetectorConfig {
         Self {
             repeat_threshold: 3,
             consecutive_error_threshold: 3,
-            slow_step_ms: 15_000,
-            slow_tool_ms: 10_000,
-            slow_ttft_ms: 5_000,
+            slow_step_ms: 60_000,
+            slow_tool_ms: 30_000,
+            slow_ttft_ms: 15_000,
         }
     }
 }
