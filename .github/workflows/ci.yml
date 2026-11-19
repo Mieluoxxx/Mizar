@@ -16,7 +16,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read Rust toolchain version
         id: rust-version
@@ -38,7 +38,7 @@ jobs:
         run: command -v rg >/dev/null 2>&1 || brew install ripgrep
 
       - name: Configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
