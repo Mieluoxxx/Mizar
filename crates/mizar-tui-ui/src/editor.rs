@@ -157,6 +157,17 @@ impl TextInput {
         self.pastes.clear();
     }
 
+    /// 用队列内容替换草稿，并清空撤销栈：被换下的草稿已经停放到队列尾部，
+    /// 留着撤销点会让 `Ctrl+Z` 把同一段文字同时还原进输入框，造成重复发送。
+    pub fn replace_draft_from_queue(&mut self, value: &str) {
+        self.text = value.to_string();
+        self.cursor = self.text.len();
+        self.history_idx = None;
+        self.draft_before_history.clear();
+        self.undo_stack.clear();
+        self.pastes.clear();
+    }
+
     pub fn insert_char(&mut self, ch: char) {
         let normalized = if ch == '\r' { '\n' } else { ch };
         // 在词边界或换行前记录撤销点，避免单字母打字塞满撤销栈

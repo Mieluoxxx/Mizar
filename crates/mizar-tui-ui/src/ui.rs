@@ -90,11 +90,15 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
 
     let status_h = 1u16;
     let avail_h = chat_area.height.saturating_sub(status_h);
-    let queued_h = if !app.queued_prompts.is_empty() && avail_h >= 6 {
-        1
-    } else {
+    // 队列条：默认 1 行摘要；选择器打开时逐条展开（最多 3 行），不再因终端矮而直接隐藏。
+    let queued_h = if app.queued_prompts.is_empty() {
         0
-    };
+    } else if app.queue_selected.is_some() {
+        (app.queued_prompts.len().min(3) as u16) + 1
+    } else {
+        1
+    }
+    .min(avail_h.saturating_sub(3));
     let max_input_h = avail_h.saturating_sub(queued_h + 1).max(3).min(avail_h);
     let input_h = ((input_layout.lines.len() as u16) + 2)
         .clamp(3, 8)
@@ -1902,25 +1906,79 @@ fn build_notice_lines(
 fn render_queued_strip(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let theme = &app.theme;
     let count = app.queued_prompts.len();
-    let preview = app
-        .queued_prompts
-        .first()
-        .map(|s| s.replace('\n', " "))
-        .unwrap_or_default();
-    let avail = area.width.saturating_sub(20) as usize;
-    let snippet = truncate_display(&preview, avail);
-    let spans = vec![
-        Span::styled(
-            format!(" ↳ 队列({count}): "),
+    let selected = app.queue_selected;
+    let one_line = |text: &str| text.replace('\n', " ");
+
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(area.height as usize);
+    if selected.is_none() {
+        let hint = truncate_display(&one_line(&app.queued_prompts[0].text), avail_of(area, 16));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" ↳ 队列({count}) "),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{hint}  ↑ 选择 · Alt+↑ 直接撤回"),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]));
+    } else {
+        let marker = format!(" ↳ 队列({count}) ");
+        let help = " ↑↓ 选择 · ⏎ 编辑 · Alt+↑ 直接撤 · Del 丢弃 · Esc 关闭 ";
+        let mut header = vec![Span::styled(
+            marker.clone(),
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(snippet, Style::default().fg(theme.text_muted)),
-    ];
-    frame
-        .buffer_mut()
-        .set_line(area.x, area.y, &Line::from(spans), area.width);
+        )];
+        if area.width as usize > marker.chars().count() + help.chars().count() {
+            header.push(Span::styled(help, Style::default().fg(theme.text_dim)));
+        }
+        lines.push(Line::from(header));
+
+        // 最多展示 3 条；选中项尽量落在可见窗口内。
+        let visible = area.height.saturating_sub(1).min(3) as usize;
+        let sel_index = app
+            .queued_prompts
+            .iter()
+            .position(|item| Some(item.id) == selected)
+            .unwrap_or(0);
+        let start = sel_index.saturating_sub(visible.saturating_sub(1));
+        let end = (start + visible).min(count);
+        for (offset, item) in app.queued_prompts[start..end].iter().enumerate() {
+            let index = start + offset;
+            let is_current = Some(item.id) == selected;
+            let marker = if is_current { " ❯ " } else { "   " };
+            let prefix = format!("{marker}{}. ", index + 1);
+            let body = truncate_display(
+                &one_line(&item.text),
+                avail_of(area, prefix.chars().count() + 1),
+            );
+            let style = if is_current {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_muted)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(body, style),
+            ]));
+        }
+    }
+
+    let buf = frame.buffer_mut();
+    for (row, line) in lines.iter().enumerate().take(area.height as usize) {
+        buf.set_line(area.x, area.y + row as u16, line, area.width);
+    }
+}
+
+/// 队列条一行内除标记外可用的显示列数。
+fn avail_of(area: Rect, reserved: usize) -> usize {
+    (area.width as usize).saturating_sub(reserved)
 }
 
 fn render_input_box(
@@ -3254,5 +3312,61 @@ mod tests {
         app.reset_for_new_session("sess-inline-next", None);
         assert!(!app.inline_welcome_committed);
         assert_eq!(app.inline_committed_items, 0);
+    }
+
+    #[test]
+    fn queued_strip_lists_items_with_marker_when_selector_is_open() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-queued",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.is_busy = true;
+        for text in ["第一条排队消息", "第二条排队消息"] {
+            app.input.insert_str(text);
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        // 选择器关闭：单行摘要，且必须给出「↑ 选择」的可发现性提示。
+        let closed = render_buffer_text(&mut app, 100, 20);
+        assert!(closed.contains("队列(2)"), "screen:\n{closed}");
+        assert!(closed.contains("第一条排队消息"), "screen:\n{closed}");
+        assert!(!closed.contains('❯'), "screen:\n{closed}");
+
+        // 选择器打开：逐条列出，选中项带 ❯ 标记。
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let opened = render_buffer_text(&mut app, 100, 20);
+        assert!(opened.contains('❯'), "screen:\n{opened}");
+        assert!(opened.contains("第二条排队消息"), "screen:\n{opened}");
+        assert!(opened.contains("第一条排队消息"), "screen:\n{opened}");
+    }
+
+    #[test]
+    fn queued_strip_stays_visible_on_short_terminals() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-short",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.is_busy = true;
+        app.input.insert_str("queued on short terminal");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        // 12 行高以前会被 avail_h >= 6 的门槛整行吞掉。
+        let screen = render_buffer_text(&mut app, 80, 12);
+        assert!(screen.contains("队列(1)"), "screen:\n{screen}");
     }
 }

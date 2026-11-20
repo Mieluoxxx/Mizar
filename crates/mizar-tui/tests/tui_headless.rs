@@ -821,7 +821,14 @@ async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_inst
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         AppAction::None
     );
-    assert_eq!(state.queued_prompts, vec!["follow up".to_string()]);
+    assert_eq!(
+        state
+            .queued_prompts
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["follow up"]
+    );
     state.input.insert_str("steer now");
     assert_eq!(
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
