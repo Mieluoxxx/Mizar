@@ -8,13 +8,13 @@ pub mod projection;
 pub mod timeline;
 
 pub use detector::{
-    DetectorConfig, canonicalize_args_str, canonicalize_json, detect_anomalies, preview_chars,
-    sort_json_value, wildcard_matches,
+    DetectorConfig, IncrementalDetector, canonicalize_args_str, canonicalize_json,
+    detect_anomalies, preview_chars, sort_json_value, wildcard_matches,
 };
 pub use model::{
     RecordKind, SessionStats, Severity, TimelineMode, TimelineModel, TimelineSpan,
     TimelineTurnBoundary, TraceEvent, TraceEventKind, TrajectoryFinding, TrajectoryRecord,
     TrajectoryReport, TrajectorySnapshot, TrajectoryStep, TrajectorySummary, TrajectoryTurn,
 };
-pub use projection::fold_trajectory;
+pub use projection::{IncrementalFolder, fold_trajectory};
 pub use timeline::derive_timeline;

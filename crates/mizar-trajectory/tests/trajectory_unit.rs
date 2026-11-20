@@ -198,3 +198,86 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
         report.findings
     );
 }
+
+#[tokio::test]
+async fn incremental_anomaly_eval_emits_new_findings_without_duplicating_old_ones() {
+    use mizar_trajectory::EVENT_TRAJECTORY_ANOMALY;
+    use mizar_trajectory::TrajectoryAnomalyEvent;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let app = Context::new();
+    let anomalies = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<u64>)>::new()));
+    let anomalies_sink = Arc::clone(&anomalies);
+    app.on(
+        EVENT_TRAJECTORY_ANOMALY,
+        move |ev: &TrajectoryAnomalyEvent| {
+            anomalies_sink
+                .lock()
+                .unwrap()
+                .push((ev.finding.rule_id.clone(), ev.finding.seq));
+        },
+    )
+    .unwrap();
+
+    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app.plugin(
+        TrajectoryRuntime::plugin(),
+        TrajectoryConfig {
+            detector: mizar_trajectory_core::DetectorConfig {
+                repeat_threshold: 10,
+                consecutive_error_threshold: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let tools = app.tools().unwrap();
+    app.effect("reg.failing", || {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = tools
+            .register(ToolDefinition::sync_tool(
+                "boom",
+                "failing test tool",
+                json!({}),
+                move |_, _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    Err::<String, cordis::BoxError>(format!("err #{n}").into())
+                },
+            ))
+            .unwrap();
+        Ok::<_, CordisError>(Some(cordis::Cleanup::sync(move || drop(c1))))
+    })
+    .unwrap();
+
+    for i in 1..=3 {
+        let res = tools
+            .execute(ToolExecution {
+                name: "boom".into(),
+                args: json!({ "n": i }),
+                session_id: Some("sess-err-inc".into()),
+            })
+            .await;
+        assert!(res.is_error);
+    }
+
+    let emitted = anomalies.lock().unwrap().clone();
+    let r02_seqs: Vec<Option<u64>> = emitted
+        .iter()
+        .filter(|(id, _)| id == "R02_CONSECUTIVE_TOOL_ERRORS")
+        .map(|(_, s)| *s)
+        .collect();
+    // 第 2 次失败发射一次 R02，第 3 次失败发射新的 seq，但第 2 次的 seq 绝不能重复发射
+    assert_eq!(r02_seqs.len(), 2, "emitted={emitted:?}");
+    assert_ne!(r02_seqs[0], r02_seqs[1]);
+
+    let rt = app.service::<TrajectoryRuntime>("trajectory").unwrap();
+    let report = rt.inspect("sess-err-inc", TimelineMode::Sequence).unwrap();
+    let events = rt.events("sess-err-inc");
+    let offline = rt.inspect_events("sess-err-inc", &events, TimelineMode::Sequence);
+    assert_eq!(report.snapshot.stats, offline.snapshot.stats);
+    assert_eq!(report.findings, offline.findings);
+}

@@ -13,7 +13,7 @@ use mizar_llm::{
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
-    spawn_sse_stream, trim_base_url,
+    shared_http_client, spawn_sse_stream, trim_base_url,
 };
 use serde_json::{Value, json};
 
@@ -582,6 +582,10 @@ pub struct ResponsesAdapter {
 
 impl ResponsesAdapter {
     pub fn new(config: ResponsesConfig) -> Self {
+        Self::with_client(config, shared_http_client())
+    }
+
+    pub fn with_client(config: ResponsesConfig, client: reqwest::Client) -> Self {
         let base_url = config
             .base_url
             .clone()
@@ -591,7 +595,7 @@ impl ResponsesAdapter {
             config,
             base_url,
             model,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

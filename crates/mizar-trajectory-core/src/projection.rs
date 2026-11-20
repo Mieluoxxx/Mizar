@@ -9,6 +9,7 @@ use crate::model::{
     TrajectorySnapshot, TrajectoryStep, TrajectoryTurn,
 };
 
+#[derive(Clone)]
 struct OpenStep {
     turn: u64,
     step: usize,
@@ -17,6 +18,7 @@ struct OpenStep {
     step_vec_idx: usize,
 }
 
+#[derive(Clone)]
 struct PendingToolCall {
     rec_idx: usize,
     started_at_ms: u128,
@@ -37,47 +39,78 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// 将有序 `TraceEvent` 流纯折叠为结构化的 `TrajectorySnapshot`。
-pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySnapshot {
-    let mut stats = SessionStats::default();
-    let mut turns_map: BTreeMap<u64, TrajectoryTurn> = BTreeMap::new();
-    let mut records: Vec<TrajectoryRecord> = Vec::new();
-    let mut open_step: Option<OpenStep> = None;
-    let mut pending_calls: HashMap<String, PendingToolCall> = HashMap::new();
-    let mut current_turn: Option<u64> = None;
-    let mut current_step: Option<usize> = None;
-    let mut last_counted_turn: Option<u64> = None;
+/// 增量轨迹折叠器：每次仅消费新增 `TraceEvent`，避免在长会话评估时重复重扫全量事件历史。
+#[derive(Clone)]
+pub struct IncrementalFolder {
+    session_id: String,
+    stats: SessionStats,
+    turns_map: BTreeMap<u64, TrajectoryTurn>,
+    records: Vec<TrajectoryRecord>,
+    open_step: Option<OpenStep>,
+    pending_calls: HashMap<String, PendingToolCall>,
+    current_turn: Option<u64>,
+    current_step: Option<usize>,
+    last_counted_turn: Option<u64>,
+}
 
-    for ev in events {
+impl IncrementalFolder {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            stats: SessionStats::default(),
+            turns_map: BTreeMap::new(),
+            records: Vec::new(),
+            open_step: None,
+            pending_calls: HashMap::new(),
+            current_turn: None,
+            current_step: None,
+            last_counted_turn: None,
+        }
+    }
+
+    pub fn records(&self) -> &[TrajectoryRecord] {
+        &self.records
+    }
+
+    pub fn stats(&self) -> &SessionStats {
+        &self.stats
+    }
+
+    pub fn push_event(&mut self, ev: &TraceEvent) {
         match &ev.kind {
             TraceEventKind::TurnStart { turn } => {
-                current_turn = Some(*turn);
-                current_step = None;
-                turns_map.entry(*turn).or_insert_with(|| TrajectoryTurn {
-                    turn: *turn,
-                    started_at_ms: Some(ev.ts_ms),
-                    ended_at_ms: None,
-                    duration_ms: None,
-                    reason: None,
-                    steps: Vec::new(),
-                });
+                self.current_turn = Some(*turn);
+                self.current_step = None;
+                self.turns_map
+                    .entry(*turn)
+                    .or_insert_with(|| TrajectoryTurn {
+                        turn: *turn,
+                        started_at_ms: Some(ev.ts_ms),
+                        ended_at_ms: None,
+                        duration_ms: None,
+                        reason: None,
+                        steps: Vec::new(),
+                    });
             }
             TraceEventKind::TurnEnd { turn, reason } => {
-                let entry = turns_map.entry(*turn).or_insert_with(|| TrajectoryTurn {
-                    turn: *turn,
-                    started_at_ms: None,
-                    ended_at_ms: None,
-                    duration_ms: None,
-                    reason: None,
-                    steps: Vec::new(),
-                });
+                let entry = self
+                    .turns_map
+                    .entry(*turn)
+                    .or_insert_with(|| TrajectoryTurn {
+                        turn: *turn,
+                        started_at_ms: None,
+                        ended_at_ms: None,
+                        duration_ms: None,
+                        reason: None,
+                        steps: Vec::new(),
+                    });
                 entry.ended_at_ms = Some(ev.ts_ms);
                 entry.reason = Some(reason.clone());
                 if let Some(start) = entry.started_at_ms {
                     entry.duration_ms = Some(ev.ts_ms.saturating_sub(start) as u64);
                 }
-                if current_turn == Some(*turn) {
-                    current_step = None;
+                if self.current_turn == Some(*turn) {
+                    self.current_step = None;
                 }
             }
             TraceEventKind::StepStart {
@@ -86,16 +119,19 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 system_prompt_chars,
                 tools_count,
             } => {
-                current_turn = Some(*turn);
-                current_step = Some(*step);
-                let turn_entry = turns_map.entry(*turn).or_insert_with(|| TrajectoryTurn {
-                    turn: *turn,
-                    started_at_ms: Some(ev.ts_ms),
-                    ended_at_ms: None,
-                    duration_ms: None,
-                    reason: None,
-                    steps: Vec::new(),
-                });
+                self.current_turn = Some(*turn);
+                self.current_step = Some(*step);
+                let turn_entry = self
+                    .turns_map
+                    .entry(*turn)
+                    .or_insert_with(|| TrajectoryTurn {
+                        turn: *turn,
+                        started_at_ms: Some(ev.ts_ms),
+                        ended_at_ms: None,
+                        duration_ms: None,
+                        reason: None,
+                        steps: Vec::new(),
+                    });
                 let step_vec_idx = turn_entry.steps.len();
                 turn_entry.steps.push(TrajectoryStep {
                     step: *step,
@@ -108,7 +144,7 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                     tools_count: *tools_count,
                     usage: None,
                 });
-                open_step = Some(OpenStep {
+                self.open_step = Some(OpenStep {
                     turn: *turn,
                     step: *step,
                     started_at_ms: ev.ts_ms,
@@ -117,7 +153,7 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 });
             }
             TraceEventKind::FirstToken { turn, step } => {
-                if let Some(open) = &mut open_step
+                if let Some(open) = &mut self.open_step
                     && open.turn == *turn
                     && open.step == *step
                     && open.first_token_ms.is_none()
@@ -131,16 +167,16 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 outcome,
                 usage,
             } => {
-                stats.steps += 1;
-                if last_counted_turn != Some(*turn) {
-                    last_counted_turn = Some(*turn);
-                    stats.turns += 1;
+                self.stats.steps += 1;
+                if self.last_counted_turn != Some(*turn) {
+                    self.last_counted_turn = Some(*turn);
+                    self.stats.turns += 1;
                 }
                 if outcome == "cancelled" || outcome == "max_tokens" || outcome.starts_with("error")
                 {
-                    stats.interrupted_steps += 1;
+                    self.stats.interrupted_steps += 1;
                 }
-                if let Some(turn_entry) = turns_map.get_mut(turn)
+                if let Some(turn_entry) = self.turns_map.get_mut(turn)
                     && let Some(step_entry) =
                         turn_entry.steps.iter_mut().rev().find(|s| s.step == *step)
                 {
@@ -155,20 +191,21 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                         step_entry.duration_ms = Some(ev.ts_ms.saturating_sub(start) as u64);
                     }
                 }
-                if open_step
+                if self
+                    .open_step
                     .as_ref()
                     .is_some_and(|o| o.turn == *turn && o.step == *step)
                 {
-                    open_step = None;
+                    self.open_step = None;
                 }
             }
             TraceEventKind::UserMessage { text } => {
                 let preview = preview_text(text, 80);
-                let index = records.len() + 1;
-                records.push(TrajectoryRecord {
+                let index = self.records.len() + 1;
+                self.records.push(TrajectoryRecord {
                     index,
                     seq: ev.seq,
-                    turn: current_turn,
+                    turn: self.current_turn,
                     step: None,
                     kind: RecordKind::User,
                     label: if preview.is_empty() {
@@ -192,12 +229,12 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
             }
             TraceEventKind::ContextNotice { source, text } => {
                 let preview = preview_text(text, 80);
-                let index = records.len() + 1;
-                records.push(TrajectoryRecord {
+                let index = self.records.len() + 1;
+                self.records.push(TrajectoryRecord {
                     index,
                     seq: ev.seq,
-                    turn: current_turn,
-                    step: current_step,
+                    turn: self.current_turn,
+                    step: self.current_step,
                     kind: RecordKind::Context,
                     label: format!("[{source}] {preview}"),
                     source: Some(source.clone()),
@@ -224,25 +261,25 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 let mut duration_ms = None;
                 let mut ttft_ms = None;
 
-                if let Some(open) = &open_step {
+                if let Some(open) = &self.open_step {
                     started_at_ms = Some(open.started_at_ms);
                     let llm_dur = ev.ts_ms.saturating_sub(open.started_at_ms) as u64;
                     duration_ms = Some(llm_dur);
-                    stats.llm_ms += llm_dur;
+                    self.stats.llm_ms += llm_dur;
 
                     if let Some(ft) = open.first_token_ms {
                         let ttft = ft.saturating_sub(open.started_at_ms) as u64;
                         ttft_ms = Some(ttft);
-                        stats.ttft_ms += ttft;
-                        stats.ttft_steps += 1;
+                        self.stats.ttft_ms += ttft;
+                        self.stats.ttft_steps += 1;
                         if let Some(u) = usage {
                             let decode = ev.ts_ms.saturating_sub(ft) as u64;
-                            stats.decode_ms += decode;
-                            stats.decode_tokens += u.output_tokens;
+                            self.stats.decode_ms += decode;
+                            self.stats.decode_tokens += u.output_tokens;
                         }
                     }
 
-                    if let Some(turn_entry) = turns_map.get_mut(&open.turn)
+                    if let Some(turn_entry) = self.turns_map.get_mut(&open.turn)
                         && let Some(step_entry) = turn_entry.steps.get_mut(open.step_vec_idx)
                     {
                         step_entry.duration_ms = duration_ms;
@@ -252,9 +289,9 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 }
 
                 if let Some(u) = usage {
-                    stats.input_tokens += u.input_tokens;
-                    stats.output_tokens += u.output_tokens;
-                    stats.cache_read_tokens += u.cache_read_tokens.unwrap_or(0);
+                    self.stats.input_tokens += u.input_tokens;
+                    self.stats.output_tokens += u.output_tokens;
+                    self.stats.cache_read_tokens += u.cache_read_tokens.unwrap_or(0);
                 }
 
                 let preview = preview_text(text, 80);
@@ -269,12 +306,20 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                     "助手空回复".to_string()
                 };
 
-                let index = records.len() + 1;
-                records.push(TrajectoryRecord {
+                let index = self.records.len() + 1;
+                self.records.push(TrajectoryRecord {
                     index,
                     seq: ev.seq,
-                    turn: open_step.as_ref().map(|o| o.turn).or(current_turn),
-                    step: open_step.as_ref().map(|o| o.step).or(current_step),
+                    turn: self
+                        .open_step
+                        .as_ref()
+                        .map(|o| o.turn)
+                        .or(self.current_turn),
+                    step: self
+                        .open_step
+                        .as_ref()
+                        .map(|o| o.step)
+                        .or(self.current_step),
                     kind: RecordKind::Assistant,
                     label,
                     source: Some("assistant".to_string()),
@@ -298,16 +343,16 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 name,
                 arguments,
             } => {
-                stats.tool_calls += 1;
-                let index = records.len() + 1;
-                let rec_idx = records.len();
+                self.stats.tool_calls += 1;
+                let index = self.records.len() + 1;
+                let rec_idx = self.records.len();
                 let preview = preview_text(arguments, 60);
                 let label = if preview.is_empty() || preview == "{}" {
                     name.clone()
                 } else {
                     format!("{name} {preview}")
                 };
-                records.push(TrajectoryRecord {
+                self.records.push(TrajectoryRecord {
                     index,
                     seq: ev.seq,
                     turn: Some(*turn),
@@ -328,7 +373,7 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                     blocked: false,
                     usage: None,
                 });
-                pending_calls.insert(
+                self.pending_calls.insert(
                     call_id.clone(),
                     PendingToolCall {
                         rec_idx,
@@ -344,27 +389,27 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 blocked,
             } => {
                 if *is_error {
-                    stats.tool_errors += 1;
+                    self.stats.tool_errors += 1;
                 }
                 if *blocked {
-                    stats.blocked_calls += 1;
+                    self.stats.blocked_calls += 1;
                 }
-                if let Some(pending) = pending_calls.remove(tool_call_id) {
+                if let Some(pending) = self.pending_calls.remove(tool_call_id) {
                     let dur = ev.ts_ms.saturating_sub(pending.started_at_ms) as u64;
-                    stats.tool_ms += dur;
-                    if let Some(rec) = records.get_mut(pending.rec_idx) {
+                    self.stats.tool_ms += dur;
+                    if let Some(rec) = self.records.get_mut(pending.rec_idx) {
                         rec.output_detail = Some(content.clone());
                         rec.duration_ms = Some(dur);
                         rec.is_error = *is_error;
                         rec.blocked = *blocked;
                     }
                 } else {
-                    let index = records.len() + 1;
-                    records.push(TrajectoryRecord {
+                    let index = self.records.len() + 1;
+                    self.records.push(TrajectoryRecord {
                         index,
                         seq: ev.seq,
-                        turn: current_turn,
-                        step: current_step,
+                        turn: self.current_turn,
+                        step: self.current_step,
                         kind: RecordKind::Tool,
                         label: name.clone(),
                         source: Some("tool".to_string()),
@@ -390,12 +435,12 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                 summary,
                 evidence,
             } => {
-                let index = records.len() + 1;
-                records.push(TrajectoryRecord {
+                let index = self.records.len() + 1;
+                self.records.push(TrajectoryRecord {
                     index,
                     seq: ev.seq,
-                    turn: (*turn).or(current_turn),
-                    step: (*step).or(current_step),
+                    turn: (*turn).or(self.current_turn),
+                    step: (*step).or(self.current_step),
                     kind: RecordKind::Anomaly,
                     label: format!("[{rule_id}] {summary}"),
                     source: Some(rule_id.clone()),
@@ -415,10 +460,30 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
         }
     }
 
-    TrajectorySnapshot {
-        session_id: session_id.to_string(),
-        stats,
-        turns: turns_map.into_values().collect(),
-        records,
+    pub fn snapshot(&self) -> TrajectorySnapshot {
+        TrajectorySnapshot {
+            session_id: self.session_id.clone(),
+            stats: self.stats.clone(),
+            turns: self.turns_map.values().cloned().collect(),
+            records: self.records.clone(),
+        }
     }
+
+    pub fn into_snapshot(self) -> TrajectorySnapshot {
+        TrajectorySnapshot {
+            session_id: self.session_id,
+            stats: self.stats,
+            turns: self.turns_map.into_values().collect(),
+            records: self.records,
+        }
+    }
+}
+
+/// 将有序 `TraceEvent` 流纯折叠为结构化的 `TrajectorySnapshot`。
+pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySnapshot {
+    let mut folder = IncrementalFolder::new(session_id);
+    for ev in events {
+        folder.push_event(ev);
+    }
+    folder.into_snapshot()
 }

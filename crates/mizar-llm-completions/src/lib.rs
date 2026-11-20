@@ -16,7 +16,7 @@ use mizar_llm::{
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
-    spawn_sse_stream, trim_base_url,
+    shared_http_client, spawn_sse_stream, trim_base_url,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -636,10 +636,11 @@ pub struct CompletionsAdapter {
 
 impl CompletionsAdapter {
     pub fn new(config: CompletionsConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        Self::with_client(config, shared_http_client())
+    }
+
+    pub fn with_client(config: CompletionsConfig, client: reqwest::Client) -> Self {
+        Self { config, client }
     }
 
     fn resolve_api_key(&self) -> Result<Option<String>, LlmError> {

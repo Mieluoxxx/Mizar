@@ -10,7 +10,7 @@ use chrono::{DateTime, Local};
 use cordis::{
     BoxFuture, Cleanup, Context, CordisError, DisposableHandle, LogLevel, LogRecord, LogSink, Next,
 };
-use crossterm::event::{Event as TermEvent, EventStream};
+use crossterm::event::{Event as TermEvent, EventStream, KeyEventKind, MouseEventKind};
 use futures::StreamExt;
 use mizar_agent_loop::{
     AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent,
@@ -49,7 +49,7 @@ use mizar_trajectory::{
     EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime,
 };
 use mizar_tui_ui::app::{
-    AppAction, AppState, ApprovalMode, LocalBashOutput, NoticeLevel, SessionReplayItem,
+    AppAction, AppState, ApprovalMode, ChatItem, LocalBashOutput, NoticeLevel, SessionReplayItem,
     SessionSelection, SessionViewData, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord,
     UiStepOutcome, UiTurnEndReason, abbreviate_home_path, format_tokens, short_id,
     truncate_display,
@@ -63,9 +63,9 @@ use mizar_tui_ui::side_panel::{
     FileTouchRow, InstructionSummaryRow, McpSummaryRow, ToolSummaryRow,
 };
 use mizar_tui_ui::terminal::{
-    ProgramStatusState, ScreenMode, TerminalGuard, apply_terminal_modes, emit_program_status,
-    resume_after_external_editor, set_mouse_capture_enabled, suspend_for_external_editor,
-    write_begin_sync, write_end_sync,
+    BEGIN_SYNCHRONIZED_OUTPUT, END_SYNCHRONIZED_OUTPUT, ProgramStatusState, ScreenMode,
+    TerminalGuard, apply_terminal_modes, emit_program_status, resume_after_external_editor,
+    set_mouse_capture_enabled, suspend_for_external_editor,
 };
 use mizar_tui_ui::theme::ThemePreset;
 use mizar_tui_ui::ui::{
@@ -79,11 +79,149 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{clipboard, images, mentions};
 
+/// 把单帧 `BSU + ratatui 差分序列 + ESU` 压进同一个缓冲 Writer 并阻止中间提前 flush，
+/// 让终端整帧通过单次底层 `write()` 系统调用原子落盘，减少切帧闪烁与 syscall 开销。
+struct SyncWriterInner<W: std::io::Write> {
+    inner: W,
+    defer_flush: bool,
+}
+
+impl<W: std::io::Write> SyncWriterInner<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            defer_flush: false,
+        }
+    }
+
+    fn begin_sync_frame(&mut self) -> std::io::Result<()> {
+        self.defer_flush = true;
+        self.inner.write_all(BEGIN_SYNCHRONIZED_OUTPUT.as_bytes())
+    }
+
+    fn end_sync_frame(&mut self) -> std::io::Result<()> {
+        self.defer_flush = false;
+        self.inner.write_all(END_SYNCHRONIZED_OUTPUT.as_bytes())?;
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for SyncWriterInner<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.defer_flush {
+            return Ok(());
+        }
+        self.inner.flush()
+    }
+}
+
+#[derive(Clone)]
+struct SharedSyncWriter {
+    inner: Arc<Mutex<SyncWriterInner<std::io::BufWriter<std::io::Stdout>>>>,
+}
+
+impl std::io::Write for SharedSyncWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
+
+struct ManagedTerminal {
+    terminal: Terminal<CrosstermBackend<SharedSyncWriter>>,
+    sync: SharedSyncWriter,
+}
+
+impl ManagedTerminal {
+    fn draw_synced<F>(&mut self, render_cb: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut ratatui::Frame<'_>),
+    {
+        let _ = self.sync.inner.lock().unwrap().begin_sync_frame();
+        let draw_res = self.terminal.draw(render_cb);
+        let end_res = self.sync.inner.lock().unwrap().end_sync_frame();
+        draw_res?;
+        end_res
+    }
+}
+
+type BufferedTerminal = ManagedTerminal;
+
 async fn poll_term_event(stream: Option<&mut EventStream>) -> Option<std::io::Result<TermEvent>> {
     match stream {
         Some(s) => s.next().await,
         None => std::future::pending().await,
     }
+}
+
+fn handle_term_event_dirty(app: &mut AppState, ev: TermEvent) -> (AppAction, bool) {
+    match ev {
+        TermEvent::Key(key) => {
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                return (AppAction::None, false);
+            }
+            (app.handle_key(key), true)
+        }
+        TermEvent::Mouse(mouse) => {
+            if matches!(mouse.kind, MouseEventKind::Moved) {
+                let prev = (app.side_panel.hovered_divider, app.hovered_rail_row);
+                let act = app.handle_mouse(mouse);
+                let dirty = act != AppAction::None
+                    || app.overlay.is_open()
+                    || app.trajectory_scene.open
+                    || (app.side_panel.hovered_divider, app.hovered_rail_row) != prev;
+                return (act, dirty);
+            }
+            (app.handle_mouse(mouse), true)
+        }
+        TermEvent::Paste(data) => {
+            app.handle_paste(&data);
+            (AppAction::None, true)
+        }
+        TermEvent::Resize(_, _) => (AppAction::None, true),
+        TermEvent::FocusGained => {
+            app.terminal_focused = true;
+            (AppAction::None, false)
+        }
+        TermEvent::FocusLost => {
+            app.terminal_focused = false;
+            (AppAction::None, false)
+        }
+    }
+}
+
+fn process_ui_event_dirty(
+    app: &mut AppState,
+    active_cancel: &mut Option<CancellationToken>,
+    pending_steer: &mut Option<PendingPrompt>,
+    user_cancelled: &mut bool,
+    event: UiEvent,
+) -> (AppAction, bool) {
+    let is_delta = matches!(
+        event,
+        UiEvent::TextDelta { .. } | UiEvent::ReasoningDelta { .. }
+    );
+    let had_assistant = matches!(app.items.last(), Some(ChatItem::Assistant { .. }));
+    let prev_reveal_gen = app.reveal.generation();
+
+    let action = process_ui_event(app, active_cancel, pending_steer, user_cancelled, event);
+    if action != AppAction::None {
+        return (action, true);
+    }
+
+    let can_defer_to_reveal = is_delta
+        && app.reveal.enabled
+        && app.is_busy
+        && had_assistant
+        && app.reveal.generation() == prev_reveal_gen;
+    (AppAction::None, !can_defer_to_reveal)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1547,7 +1685,9 @@ pub async fn run_tui_with_summary(
     if let Some(preset) = config.theme_preset {
         app.set_theme_preset(preset);
     }
-    populate_side_panel_data(&ctx, &mut app).await;
+    if app.side_panel.open {
+        populate_side_panel_data(&ctx, &mut app).await;
+    }
 
     // 进入终端 raw mode（Fullscreen / Inline 双模支持），并注入 OSC 10/11/4 + DA1 探测到的终端自适应色板
     let _terminal_guard =
@@ -1565,6 +1705,7 @@ pub async fn run_tui_with_summary(
     let mut active_cancel: Option<CancellationToken> = None;
     let mut pending_steer: Option<PendingPrompt> = None;
     let mut user_cancelled = false;
+    let mut needs_redraw = true;
 
     let update_check_task = if config.check_for_updates {
         let tx_update = ui_tx.clone();
@@ -1582,42 +1723,56 @@ pub async fn run_tui_with_summary(
 
     while !app.should_quit {
         if app.screen_mode == ScreenMode::Inline && !app.is_busy && !app.is_bash_running {
-            flush_inline_scrollback(&mut terminal, &mut app);
+            flush_inline_scrollback(&mut terminal.terminal, &mut app);
         }
-        write_begin_sync();
-        let draw_res = terminal.draw(|frame| render(frame, &mut app));
-        write_end_sync();
-        draw_res?;
+        if needs_redraw {
+            terminal.draw_synced(|frame| render(frame, &mut app))?;
+            needs_redraw = false;
+        }
 
-        let action = tokio::select! {
+        let (action, step_dirty) = tokio::select! {
             maybe_term = poll_term_event(term_stream.as_mut()) => {
                 match maybe_term {
-                    Some(Ok(TermEvent::Key(key))) => app.handle_key(key),
-                    Some(Ok(TermEvent::Mouse(mouse))) => app.handle_mouse(mouse),
-                    Some(Ok(TermEvent::Paste(data))) => {
-                        app.handle_paste(&data);
-                        AppAction::None
-                    }
-                    Some(Ok(TermEvent::Resize(_, _))) => AppAction::None,
-                    Some(Ok(TermEvent::FocusGained)) => {
-                        app.terminal_focused = true;
-                        AppAction::None
-                    }
-                    Some(Ok(TermEvent::FocusLost)) => {
-                        app.terminal_focused = false;
-                        AppAction::None
+                    Some(Ok(ev)) => {
+                        let (mut next_action, mut dirty) = handle_term_event_dirty(&mut app, ev);
+                        // 使用非阻塞 poll(0)+read() 排空底层就绪的连发键盘/滚动/鼠标事件，
+                        // 绝不向 EventStream 注入 noop_waker（否则会占住后台 wake_task 导致后续输入失活）。
+                        while next_action == AppAction::None
+                            && term_stream.is_some()
+                            && matches!(crossterm::event::poll(Duration::ZERO), Ok(true))
+                        {
+                            match crossterm::event::read() {
+                                Ok(more) => {
+                                    let (act, ev_dirty) = handle_term_event_dirty(&mut app, more);
+                                    dirty |= ev_dirty;
+                                    if act != AppAction::None {
+                                        next_action = act;
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    app.push_notice(
+                                        NoticeLevel::Error,
+                                        format!("终端事件读取失败：{err}"),
+                                    );
+                                    dirty = true;
+                                    break;
+                                }
+                            }
+                        }
+                        (next_action, dirty)
                     }
                     Some(Err(err)) => {
                         app.push_notice(NoticeLevel::Error, format!("终端事件读取失败：{err}"));
-                        AppAction::None
+                        (AppAction::None, true)
                     }
-                    None => AppAction::Quit,
+                    None => (AppAction::Quit, true),
                 }
             }
             maybe_ui = ui_rx.recv() => {
                 match maybe_ui {
                     Some(ev) => {
-                        let mut next_action = process_ui_event(
+                        let (mut next_action, mut dirty) = process_ui_event_dirty(
                             &mut app,
                             &mut active_cancel,
                             &mut pending_steer,
@@ -1627,38 +1782,43 @@ pub async fn run_tui_with_summary(
                         // 把缓冲区积压的 delta 一次性排空，降低高并发流式输出时的重绘次数
                         if next_action == AppAction::None {
                             while let Ok(more) = ui_rx.try_recv() {
-                                let act = process_ui_event(
+                                let (act, ev_dirty) = process_ui_event_dirty(
                                     &mut app,
                                     &mut active_cancel,
                                     &mut pending_steer,
                                     &mut user_cancelled,
                                     more,
                                 );
+                                dirty |= ev_dirty;
                                 if act != AppAction::None {
                                     next_action = act;
                                     break;
                                 }
                             }
                         }
-                        next_action
+                        (next_action, dirty)
                     }
-                    None => AppAction::Quit,
+                    None => (AppAction::Quit, true),
                 }
             }
             _ = reveal_tick.tick(), if app.terminal_focused && (app.reveal.has_pending() || app.effort_ignition_at.is_some()) => {
-                app.reveal.tick();
-                AppAction::None
+                let ticked = app.reveal.tick();
+                (AppAction::None, ticked || app.effort_ignition_at.is_some())
             }
             _ = spinner_tick.tick(), if app.is_busy || app.is_bash_running || (!app.terminal_focused && (app.reveal.has_pending() || app.effort_ignition_at.is_some())) => {
+                let mut dirty = false;
                 if app.is_busy || app.is_bash_running {
                     app.spinner_tick = app.spinner_tick.wrapping_add(1);
+                    dirty = true;
                 }
                 if !app.terminal_focused {
-                    app.reveal.tick();
+                    dirty |= app.reveal.tick() || app.effort_ignition_at.is_some();
                 }
-                AppAction::None
+                (AppAction::None, dirty)
             }
         };
+
+        needs_redraw |= step_dirty || action != AppAction::None;
 
         handle_action(
             &ctx,
@@ -2118,15 +2278,18 @@ fn spawn_local_bash_run(
     });
 }
 
-fn create_terminal(
-    mode: ScreenMode,
-) -> Result<Terminal<CrosstermBackend<std::io::Stdout>>, std::io::Error> {
-    let backend = CrosstermBackend::new(std::io::stdout());
-    match mode {
+fn create_terminal(mode: ScreenMode) -> Result<BufferedTerminal, std::io::Error> {
+    let sync = SharedSyncWriter {
+        inner: Arc::new(Mutex::new(SyncWriterInner::new(
+            std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout()),
+        ))),
+    };
+    let backend = CrosstermBackend::new(sync.clone());
+    let terminal = match mode {
         ScreenMode::Fullscreen => {
             let mut t = Terminal::new(backend)?;
             t.clear()?;
-            Ok(t)
+            t
         }
         ScreenMode::Inline => {
             let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -2136,9 +2299,10 @@ fn create_terminal(
                 TerminalOptions {
                     viewport: Viewport::Inline(viewport_h),
                 },
-            )
+            )?
         }
-    }
+    };
+    Ok(ManagedTerminal { terminal, sync })
 }
 
 fn insert_scrollback_lines<B: ratatui::backend::Backend>(
@@ -2204,7 +2368,7 @@ async fn handle_action(
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &mut Arc<Session>,
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut BufferedTerminal,
     term_stream: &mut Option<EventStream>,
     active_sid: &Arc<std::sync::RwLock<String>>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
@@ -2293,7 +2457,9 @@ async fn handle_action(
                 *active_sid.write().unwrap() = next.id.clone();
                 app.reset_for_new_session(next.id.clone(), title);
                 *active_session = next;
-                populate_side_panel_data(ctx, app).await;
+                if app.side_panel.open {
+                    populate_side_panel_data(ctx, app).await;
+                }
             }
         }
         AppAction::OpenSessionPicker => {
@@ -2720,10 +2886,14 @@ async fn handle_action(
             }
         }
         AppAction::RefreshSidePanelData => {
-            populate_side_panel_data(ctx, app).await;
+            if app.side_panel.open {
+                populate_side_panel_data(ctx, app).await;
+            }
         }
         AppAction::RefreshSidePanelTools => {
-            populate_tools_and_mcps(ctx, app);
+            if app.side_panel.open {
+                populate_tools_and_mcps(ctx, app);
+            }
         }
         AppAction::OpenTrajectoryScene(mode) => {
             let report = ctx
@@ -2800,7 +2970,9 @@ async fn handle_action(
                         *active_sid.write().unwrap() = next.id.clone();
                         app.restore_session_view(project_fork_view(&next, target_seq));
                         *active_session = next;
-                        populate_side_panel_data(ctx, app).await;
+                        if app.side_panel.open {
+                            populate_side_panel_data(ctx, app).await;
+                        }
                     }
                     Err(err) => {
                         app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
@@ -2934,7 +3106,9 @@ pub async fn resume_session_into_app(
 
     app.restore_session_view(project_resume_view(&next));
     *active_session = next;
-    populate_side_panel_data(ctx, app).await;
+    if app.side_panel.open {
+        populate_side_panel_data(ctx, app).await;
+    }
     app.set_flash(format!("✓ 已恢复会话 ({})", short_id(target_id)));
     true
 }
@@ -3278,7 +3452,7 @@ async fn apply_module_toggle_setting(
 async fn apply_host_setting_change(
     ctx: &Context,
     app: &mut AppState,
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut BufferedTerminal,
     key: &str,
     value: &str,
 ) {
@@ -4733,5 +4907,151 @@ mod tests {
         );
 
         ctx.fiber().dispose().await;
+    }
+
+    #[test]
+    fn dirty_gate_skips_key_release_focus_and_noop_mouse_move() {
+        use crossterm::event::{
+            Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+            MouseButton, MouseEvent, MouseEventKind,
+        };
+        use mizar_tui_ui::reveal::RevealSlot;
+
+        let mut app = AppState::new(PathBuf::from("."), "s-dirty", Vec::new(), None, None, None);
+
+        // 1. KeyEventKind::Release 与 Focus 事件不触发重绘
+        let release = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(
+            super::handle_term_event_dirty(&mut app, TermEvent::Key(release)),
+            (AppAction::None, false)
+        );
+        assert_eq!(
+            super::handle_term_event_dirty(&mut app, TermEvent::FocusLost),
+            (AppAction::None, false)
+        );
+        assert!(!app.terminal_focused);
+        assert_eq!(
+            super::handle_term_event_dirty(&mut app, TermEvent::FocusGained),
+            (AppAction::None, false)
+        );
+        assert!(app.terminal_focused);
+
+        // 2. KeyEventKind::Press 触发重绘
+        let press = KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+        let (_, dirty_press) = super::handle_term_event_dirty(&mut app, TermEvent::Key(press));
+        assert!(dirty_press);
+
+        // 3. MouseEventKind::Moved 在未改变悬停分割线或时间轴行时不触发重绘
+        app.side_panel.divider_col = Some(40);
+        let move_noop = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            super::handle_term_event_dirty(&mut app, TermEvent::Mouse(move_noop)),
+            (AppAction::None, false)
+        );
+        let move_hit_divider = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 40,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            super::handle_term_event_dirty(&mut app, TermEvent::Mouse(move_hit_divider)),
+            (AppAction::None, true)
+        );
+        // 在同一分割线列内垂直移动时 hovered_divider 保持 true，不重复重绘
+        let move_same_divider = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 40,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            super::handle_term_event_dirty(&mut app, TermEvent::Mouse(move_same_divider)),
+            (AppAction::None, false)
+        );
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::handle_term_event_dirty(&mut app, TermEvent::Mouse(down)).1);
+
+        // 4. reveal 节流开启且已有活跃 Assistant 槽位时，高频 TextDelta 延后给 reveal_tick (30fps)
+        app.reveal.enabled = true;
+        let mut active_cancel = None;
+        let mut pending_steer = None;
+        let mut user_cancelled = false;
+        let (_, d_start) = super::process_ui_event_dirty(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::TurnStart { turn: 1 },
+        );
+        assert!(d_start);
+        // 首个 TextDelta 创建 Assistant 条目，先触发首帧展示
+        let (_, d_first) = super::process_ui_event_dirty(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::TextDelta {
+                text: "Hello".into(),
+                ts_ms: 1,
+            },
+        );
+        assert!(d_first);
+        let item_idx = app.items.len() - 1;
+        app.reveal
+            .observe(RevealSlot::AssistantText(item_idx), 5, true);
+        // 后续紧邻 TextDelta 仅推进 target_bytes，不立即同步重绘
+        let (act2, d_next) = super::process_ui_event_dirty(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::TextDelta {
+                text: " world".into(),
+                ts_ms: 2,
+            },
+        );
+        assert_eq!(act2, AppAction::None);
+        assert!(!d_next);
+        assert!(app.reveal.has_pending());
+    }
+
+    #[test]
+    fn sync_buf_writer_holds_flush_until_end_sync_frame() {
+        use std::io::Write;
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut w = super::SyncWriterInner::new(std::io::BufWriter::new(&mut buf));
+            w.begin_sync_frame().unwrap();
+            w.write_all(b"FRAME_PAYLOAD").unwrap();
+            // defer_flush 期间 flush 保持缓冲不落底层 sink
+            w.flush().unwrap();
+            w.end_sync_frame().unwrap();
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with(mizar_tui_ui::terminal::BEGIN_SYNCHRONIZED_OUTPUT));
+        assert!(s.contains("FRAME_PAYLOAD"));
+        assert!(s.ends_with(mizar_tui_ui::terminal::END_SYNCHRONIZED_OUTPUT));
     }
 }

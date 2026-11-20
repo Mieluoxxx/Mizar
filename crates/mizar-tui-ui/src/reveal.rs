@@ -23,6 +23,7 @@ pub struct RevealController {
     pub enabled: bool,
     cursors: HashMap<RevealSlot, RevealCursor>,
     completed: HashSet<RevealSlot>,
+    generation: u64,
 }
 
 impl RevealController {
@@ -31,12 +32,18 @@ impl RevealController {
             enabled,
             cursors: HashMap::new(),
             completed: HashSet::new(),
+            generation: 0,
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn clear(&mut self) {
         self.cursors.clear();
         self.completed.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn has_pending(&self) -> bool {
@@ -48,12 +55,14 @@ impl RevealController {
     }
 
     /// 注册或更新流式条目长度；若尚未追踪且处于激活流式阶段则从当前进度开始平滑推进。
-    pub fn observe(&mut self, slot: RevealSlot, full_text: &str, active: bool) {
-        let total = full_text.len();
+    pub fn observe(&mut self, slot: RevealSlot, total_bytes: usize, active: bool) {
         if !self.enabled || !active {
-            self.cursors.remove(&slot);
-            if total > 0 {
+            let removed = self.cursors.remove(&slot).is_some();
+            if total_bytes > 0 {
                 self.completed.insert(slot);
+            }
+            if removed {
+                self.generation = self.generation.wrapping_add(1);
             }
             return;
         }
@@ -63,24 +72,29 @@ impl RevealController {
         self.cursors
             .entry(slot)
             .and_modify(|c| {
-                c.total_bytes = total;
-                if c.revealed_bytes > total {
-                    c.revealed_bytes = total;
+                c.total_bytes = total_bytes;
+                if c.revealed_bytes > total_bytes {
+                    c.revealed_bytes = total_bytes;
+                    self.generation = self.generation.wrapping_add(1);
                 }
             })
             .or_insert(RevealCursor {
-                total_bytes: total,
+                total_bytes,
                 revealed_bytes: 0,
             });
     }
 
     /// 立即对齐所有未完成槽位（例如取消、切换会话或关闭平滑吐字）。
     pub fn snap_all(&mut self) {
+        if self.cursors.is_empty() {
+            return;
+        }
         for (slot, c) in self.cursors.drain() {
             if c.total_bytes > 0 {
                 self.completed.insert(slot);
             }
         }
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// 推进一帧动画；返回是否有可见进度发生变化。
@@ -106,6 +120,9 @@ impl RevealController {
         for slot in finished {
             self.cursors.remove(&slot);
             self.completed.insert(slot);
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
         }
         changed
     }
@@ -143,7 +160,7 @@ mod tests {
         let mut ctrl = RevealController::new(true);
         let text = "你好世界，这是一段测试文本，用来验证平滑吐字不会切碎多字节UTF-8字符。";
         let slot = RevealSlot::AssistantText(0);
-        ctrl.observe(slot, text, true);
+        ctrl.observe(slot, text.len(), true);
         assert_eq!(ctrl.visible_slice(slot, text), "");
 
         let mut steps = 0;

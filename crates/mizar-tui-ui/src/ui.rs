@@ -1,9 +1,11 @@
 //! TUI 布局与渲染引擎：双栏工作台、时间轴导轨、虚拟化流式视图、`pi-emphasis` 语法、词级 Diff 与浮层叠加。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mizar_llm_types::ReasoningEffort;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -35,6 +37,18 @@ use crate::trajectory_scene::render_trajectory_scene;
 const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const IGNITION_DURATION_MS: u128 = 1200;
 
+/// 复用上一帧 `Buffer` 的底层 `Vec<Cell>` 堆内存，仅在区域尺寸变更时重新分配。
+fn snapshot_buffer(dst: &mut Option<Buffer>, src: &Buffer) {
+    match dst {
+        Some(prev) if prev.area == src.area => {
+            prev.content.clone_from(&src.content);
+        }
+        _ => {
+            *dst = Some(src.clone());
+        }
+    }
+}
+
 /// 渲染主入口：每帧同步重建选区几何、点击命中矩形、导轨快照与虚实视图。
 pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let area = frame.area();
@@ -58,7 +72,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     // 1. 全屏轨迹分析场景接管整个视口
     if app.trajectory_scene.open {
         render_trajectory_scene(frame, area, &mut app.trajectory_scene, &app.theme);
-        app.last_buffer = Some(frame.buffer_mut().clone());
+        snapshot_buffer(&mut app.last_buffer, frame.buffer_mut());
         return;
     }
 
@@ -86,7 +100,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
 
     // 3. 对话区垂直切分：transcript + queued strip + input + status bar
     let input_inner_w = chat_area.width.saturating_sub(2).max(1);
-    let input_layout = app.input.layout(input_inner_w);
+    let input_line_count = app.input.layout_cached(input_inner_w).lines.len();
 
     let status_h = 1u16;
     let avail_h = chat_area.height.saturating_sub(status_h);
@@ -100,9 +114,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     }
     .min(avail_h.saturating_sub(3));
     let max_input_h = avail_h.saturating_sub(queued_h + 1).max(3).min(avail_h);
-    let input_h = ((input_layout.lines.len() as u16) + 2)
-        .clamp(3, 8)
-        .min(max_input_h);
+    let input_h = ((input_line_count as u16) + 2).clamp(3, 8).min(max_input_h);
     let transcript_h = avail_h.saturating_sub(queued_h + input_h);
 
     let transcript_area = Rect::new(chat_area.x, chat_area.y, chat_area.width, transcript_h);
@@ -138,7 +150,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     }
 
     // 6. 渲染输入区（含 Effort 点火扫描光效与折叠粘贴块高亮）
-    render_input_box(frame, input_area, &input_layout, app);
+    render_input_box(frame, input_area, input_inner_w, app);
 
     // 7. 渲染底部状态栏
     render_status_bar(frame, status_area, app);
@@ -162,7 +174,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
 
     // 9. 应用级高亮选区叠绘 + 快照缓冲供拖拽/双击取词与 Ctrl+C 复制使用
     paint_selection_overlay(frame.buffer_mut(), &app.selection, &app.theme);
-    app.last_buffer = Some(frame.buffer_mut().clone());
+    snapshot_buffer(&mut app.last_buffer, frame.buffer_mut());
 }
 
 /// Launchpad 快捷操作芯片在欢迎页行内的水平跨度元数据。
@@ -675,6 +687,87 @@ pub fn build_item_lines_for_scrollback_at(
     rendered.into_iter().map(|rl| rl.line).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_transcript_item_lines(
+    items: &[ChatItem],
+    start_item: usize,
+    idx: usize,
+    tool_extras: &HashMap<String, ToolExtraMeta>,
+    reveal: &crate::reveal::RevealController,
+    cache: &mut crate::app::TranscriptRenderCache,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    is_busy: bool,
+    show_thinking: bool,
+    verbose_expanded: bool,
+    spinner_tick: usize,
+    width: usize,
+) -> Vec<RenderedLine> {
+    let is_last_active = is_busy && idx + 1 == items.len();
+    match &items[idx] {
+        ChatItem::User { text } => build_user_lines(text, width, theme),
+        ChatItem::Assistant { reasoning, text } => {
+            let vis_reasoning = if show_thinking {
+                reveal.visible_slice(RevealSlot::AssistantReasoning(idx), reasoning)
+            } else {
+                ""
+            };
+            let vis_text = reveal.visible_slice(RevealSlot::AssistantText(idx), text);
+            build_assistant_lines_cached(
+                reasoning,
+                vis_reasoning,
+                vis_text,
+                show_thinking,
+                width,
+                theme,
+                emphasis,
+                cache,
+                idx,
+                is_last_active,
+            )
+        }
+        ChatItem::ToolCall {
+            id,
+            name,
+            args_summary,
+            status,
+            output_preview,
+        } => {
+            let extra = tool_extras.get(id);
+            let group_ctx = compute_tool_group_ctx_cached(
+                items,
+                start_item,
+                idx,
+                tool_extras,
+                cache,
+                verbose_expanded,
+                width,
+                theme,
+            );
+            let spin_key = if matches!(status, ToolState::Running) {
+                spinner_tick % BRAILLE_SPINNER.len()
+            } else {
+                0
+            };
+            build_tool_lines(
+                name,
+                args_summary,
+                *status,
+                output_preview,
+                extra,
+                verbose_expanded,
+                group_ctx,
+                spin_key,
+                width,
+                theme,
+            )
+        }
+        ChatItem::Notice { level, text } => {
+            build_notice_lines(*level, text, width, theme, emphasis)
+        }
+    }
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let total_items = app.items.len();
     let start_item = if app.screen_mode == ScreenMode::Inline {
@@ -701,11 +794,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
 
     let width_usize = content_area.width.max(1) as usize;
 
-    let mut all_lines: Vec<RenderedLine> = Vec::with_capacity((total_items - start_item) * 4);
-    let mut turns: Vec<TimelineTurn> = Vec::with_capacity(user_turn_count);
-
-    // 借用拆分：先收集各 item 的只读引用数据并按需更新 reveal 与 item_cache
-    let theme = app.theme.clone();
     let emphasis = app.emphasis;
     let is_busy = app.is_busy;
     let show_thinking = app.show_thinking;
@@ -716,9 +804,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         let hint = Line::from(vec![
             Span::styled(
                 " ↑ 历史回复已归档至终端原生滚动区 ",
-                Style::default().fg(theme.text_dim),
+                Style::default().fg(app.theme.text_dim),
             ),
-            Span::styled("│ F3 切回全屏", Style::default().fg(theme.accent)),
+            Span::styled("│ F3 切回全屏", Style::default().fg(app.theme.accent)),
         ]);
         frame.buffer_mut().set_line(
             content_area.x,
@@ -730,195 +818,203 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     }
 
     // 全屏模式始终在顶部保留欢迎页序言；Inline 模式仅在空会话时于视口内渲染欢迎页
-    let mut welcome_chips: Option<(usize, Vec<WelcomeChipSpan>)> = None;
-    if app.screen_mode == ScreenMode::Fullscreen || app.items.is_empty() {
-        let welcome = build_welcome_section(
-            app,
-            content_area.width as usize,
-            content_area.height as usize,
-        );
-        all_lines.extend(welcome.lines);
-        if let Some(chip_line_idx) = welcome.chips_line_idx {
-            welcome_chips = Some((chip_line_idx, welcome.chip_spans));
-        }
-        if start_item < total_items {
-            all_lines.push(RenderedLine::hard(Line::raw("")));
-        }
+    let (welcome_lines, welcome_chips, welcome_total_lines) =
+        if app.screen_mode == ScreenMode::Fullscreen || app.items.is_empty() {
+            let welcome = build_welcome_section(
+                app,
+                content_area.width as usize,
+                content_area.height as usize,
+            );
+            let chips = welcome
+                .chips_line_idx
+                .map(|chip_line_idx| (chip_line_idx, welcome.chip_spans));
+            let mut total = welcome.lines.len();
+            if start_item < total_items {
+                total += 1;
+            }
+            (welcome.lines, chips, total)
+        } else {
+            (Vec::new(), None, 0)
+        };
+
+    // Pass 1：利用轻量高度缓存 + 局部失效只对必要条目求行数并收集时间轴转折点
+    let mut turns: Vec<TimelineTurn> = Vec::with_capacity(user_turn_count);
+    let mut spans = std::mem::take(&mut app.item_cache.span_scratch);
+    spans.clear();
+    let item_count = total_items - start_item;
+    if spans.capacity() < item_count {
+        spans.reserve(item_count - spans.capacity());
     }
 
-    for idx in start_item..total_items {
-        let start_line = all_lines.len();
-        let is_last_active = is_busy && idx + 1 == total_items;
+    let mut cur_line = welcome_total_lines;
+    let auto_scroll = app.auto_scroll;
+    let fixed_scroll_bottom =
+        (app.scroll_from_top as usize).saturating_add(content_area.height as usize + 32);
 
-        match &app.items[idx] {
-            ChatItem::User { text } => {
-                let preview = text
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or(text.as_str())
-                    .to_string();
-                turns.push(TimelineTurn {
-                    item_index: idx,
-                    top_line: start_line,
-                    preview,
-                });
+    {
+        let items = &app.items;
+        let tool_extras = &app.tool_extras;
+        let reveal = &mut app.reveal;
+        let cache = &mut app.item_cache;
+        let theme = &app.theme;
 
-                let key = ItemRenderKey {
-                    width: width_usize,
-                    theme_id: theme.id,
-                    emphasis_enabled: emphasis.enabled,
-                    round_caps: emphasis.round_caps,
-                    expanded: verbose_expanded,
-                    status_code: 0,
-                    reasoning_len: 0,
-                    text_len: text.len(),
-                    preview_len: 0,
-                };
-                let lines = get_or_build_cached(&mut app.item_cache, idx, key, || {
-                    build_user_lines(text, width_usize, &theme)
-                });
-                all_lines.extend(lines);
-            }
-            ChatItem::Assistant { reasoning, text } => {
-                app.reveal.observe(
-                    RevealSlot::AssistantReasoning(idx),
-                    reasoning,
-                    is_last_active,
-                );
-                app.reveal
-                    .observe(RevealSlot::AssistantText(idx), text, is_last_active);
+        for idx in start_item..total_items {
+            let start_line = cur_line;
+            let is_last_active = is_busy && idx + 1 == total_items;
 
-                let vis_reasoning = if show_thinking {
-                    app.reveal
-                        .visible_slice(RevealSlot::AssistantReasoning(idx), reasoning)
-                } else {
-                    ""
-                };
-                let vis_text = app
-                    .reveal
-                    .visible_slice(RevealSlot::AssistantText(idx), text);
+            let key = match &items[idx] {
+                ChatItem::User { text } => {
+                    let preview = text
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or(text.as_str())
+                        .to_string();
+                    turns.push(TimelineTurn {
+                        item_index: idx,
+                        top_line: start_line,
+                        preview,
+                    });
+                    ItemRenderKey {
+                        width: width_usize,
+                        theme_id: theme.id,
+                        emphasis_enabled: emphasis.enabled,
+                        round_caps: emphasis.round_caps,
+                        expanded: verbose_expanded,
+                        status_code: 0,
+                        reasoning_len: 0,
+                        text_len: text.len(),
+                        preview_len: 0,
+                    }
+                }
+                ChatItem::Assistant { reasoning, text } => {
+                    reveal.observe(
+                        RevealSlot::AssistantReasoning(idx),
+                        reasoning.len(),
+                        is_last_active,
+                    );
+                    reveal.observe(RevealSlot::AssistantText(idx), text.len(), is_last_active);
 
-                // 当思考被折叠且确实存在思考内容时，用 status_code=1 区分缓存
-                let collapsed_marker = if !show_thinking && !reasoning.is_empty() {
-                    1
-                } else {
-                    0
-                };
-                let key = ItemRenderKey {
-                    width: width_usize,
-                    theme_id: theme.id,
-                    emphasis_enabled: emphasis.enabled,
-                    round_caps: emphasis.round_caps,
-                    expanded: verbose_expanded,
-                    status_code: collapsed_marker,
-                    reasoning_len: vis_reasoning.len(),
-                    text_len: vis_text.len(),
-                    preview_len: if show_thinking { 0 } else { reasoning.len() },
-                };
-                let lines = get_or_build_cached(&mut app.item_cache, idx, key, || {
-                    build_assistant_lines(
-                        reasoning,
-                        vis_reasoning,
-                        vis_text,
-                        show_thinking,
+                    let vis_reasoning_len = if show_thinking {
+                        reveal
+                            .visible_slice(RevealSlot::AssistantReasoning(idx), reasoning)
+                            .len()
+                    } else {
+                        0
+                    };
+                    let vis_text_len = reveal
+                        .visible_slice(RevealSlot::AssistantText(idx), text)
+                        .len();
+                    let collapsed_marker = if !show_thinking && !reasoning.is_empty() {
+                        1
+                    } else {
+                        0
+                    };
+                    ItemRenderKey {
+                        width: width_usize,
+                        theme_id: theme.id,
+                        emphasis_enabled: emphasis.enabled,
+                        round_caps: emphasis.round_caps,
+                        expanded: verbose_expanded,
+                        status_code: collapsed_marker,
+                        reasoning_len: vis_reasoning_len,
+                        text_len: vis_text_len,
+                        preview_len: if show_thinking { 0 } else { reasoning.len() },
+                    }
+                }
+                ChatItem::ToolCall {
+                    id,
+                    name,
+                    args_summary,
+                    status,
+                    output_preview,
+                } => {
+                    let extra = tool_extras.get(id);
+                    let group_ctx = compute_tool_group_ctx_cached(
+                        items,
+                        start_item,
+                        idx,
+                        tool_extras,
+                        cache,
+                        verbose_expanded,
                         width_usize,
-                        &theme,
-                        &emphasis,
-                    )
-                });
-                all_lines.extend(lines);
-            }
-            ChatItem::ToolCall {
-                id,
-                name,
-                args_summary,
-                status,
-                output_preview,
-            } => {
-                let extra = app.tool_extras.get(id).cloned();
-                let expanded = verbose_expanded;
-                let group_ctx = compute_tool_group_ctx(
-                    &app.items,
+                        theme,
+                    );
+                    let extra_len = tool_extra_len(extra);
+                    let status_code = tool_base_status_code(*status)
+                        | if group_ctx.is_group_end { 4 } else { 0 }
+                        | if group_ctx.show_expand_hint { 8 } else { 0 };
+                    let spin_key = if matches!(status, ToolState::Running) {
+                        spinner_tick % BRAILLE_SPINNER.len()
+                    } else {
+                        0
+                    };
+                    ItemRenderKey {
+                        width: width_usize,
+                        theme_id: theme.id,
+                        emphasis_enabled: emphasis.enabled,
+                        round_caps: emphasis.round_caps,
+                        expanded: verbose_expanded,
+                        status_code,
+                        reasoning_len: spin_key,
+                        text_len: extra_len,
+                        preview_len: args_summary.len() + output_preview.len() + name.len(),
+                    }
+                }
+                ChatItem::Notice { level, text } => {
+                    let level_code = match level {
+                        NoticeLevel::Info => 0,
+                        NoticeLevel::Warn => 1,
+                        NoticeLevel::Error => 2,
+                    };
+                    ItemRenderKey {
+                        width: width_usize,
+                        theme_id: theme.id,
+                        emphasis_enabled: emphasis.enabled,
+                        round_caps: emphasis.round_caps,
+                        expanded: verbose_expanded,
+                        status_code: level_code,
+                        reasoning_len: 0,
+                        text_len: text.len(),
+                        preview_len: 0,
+                    }
+                }
+            };
+
+            let line_count = if let Some(h) = cache.get_height(idx, &key) {
+                h
+            } else {
+                let built = Arc::new(build_transcript_item_lines(
+                    items,
                     start_item,
                     idx,
-                    &app.tool_extras,
-                    expanded,
+                    tool_extras,
+                    reveal,
+                    cache,
+                    theme,
+                    &emphasis,
+                    is_busy,
+                    show_thinking,
+                    verbose_expanded,
+                    spinner_tick,
                     width_usize,
-                    &theme,
-                );
-                let extra_len = extra.as_ref().map_or(0, |e| {
-                    e.full_content.len()
-                        + e.diff_raw.as_ref().map_or(0, String::len)
-                        + e.full_args.len()
-                        + e.inline_meta.as_ref().map_or(0, String::len)
-                });
-                let base_status = match status {
-                    ToolState::Running => 0u8,
-                    ToolState::Done => 1u8,
-                    ToolState::Error => 2u8,
-                    ToolState::Blocked => 3u8,
-                };
-                let status_code = base_status
-                    | if group_ctx.is_group_end { 4 } else { 0 }
-                    | if group_ctx.show_expand_hint { 8 } else { 0 };
-                let spin_key = if matches!(status, ToolState::Running) {
-                    spinner_tick % BRAILLE_SPINNER.len()
+                ));
+                let len = built.len();
+                let far_below_fixed_viewport = !auto_scroll && start_line >= fixed_scroll_bottom;
+                if far_below_fixed_viewport {
+                    cache.record_height_only(idx, key.clone(), len);
                 } else {
-                    0
-                };
-                let key = ItemRenderKey {
-                    width: width_usize,
-                    theme_id: theme.id,
-                    emphasis_enabled: emphasis.enabled,
-                    round_caps: emphasis.round_caps,
-                    expanded,
-                    status_code,
-                    reasoning_len: spin_key,
-                    text_len: extra_len,
-                    preview_len: args_summary.len() + output_preview.len() + name.len(),
-                };
-                let lines = get_or_build_cached(&mut app.item_cache, idx, key, || {
-                    build_tool_lines(
-                        name,
-                        args_summary,
-                        *status,
-                        output_preview,
-                        extra.as_ref(),
-                        expanded,
-                        group_ctx,
-                        spin_key,
-                        width_usize,
-                        &theme,
-                    )
-                });
-                all_lines.extend(lines);
-            }
-            ChatItem::Notice { level, text } => {
-                let level_code = match level {
-                    NoticeLevel::Info => 0,
-                    NoticeLevel::Warn => 1,
-                    NoticeLevel::Error => 2,
-                };
-                let key = ItemRenderKey {
-                    width: width_usize,
-                    theme_id: theme.id,
-                    emphasis_enabled: emphasis.enabled,
-                    round_caps: emphasis.round_caps,
-                    expanded: verbose_expanded,
-                    status_code: level_code,
-                    reasoning_len: 0,
-                    text_len: text.len(),
-                    preview_len: 0,
-                };
-                let lines = get_or_build_cached(&mut app.item_cache, idx, key, || {
-                    build_notice_lines(*level, text, width_usize, &theme, &emphasis)
-                });
-                all_lines.extend(lines);
-            }
+                    cache.insert_lines(idx, key.clone(), built);
+                }
+                len
+            };
+
+            spans.push((start_line, line_count, key));
+            cur_line += line_count;
         }
     }
 
-    let total_lines_u16 = all_lines.len().min(u16::MAX as usize) as u16;
+    let total_lines = cur_line;
+    let total_lines_u16 = total_lines.min(u16::MAX as usize) as u16;
     let scroll_top = if app.items.is_empty() && app.auto_scroll {
         app.last_viewport_height = content_area.height;
         app.last_total_lines = total_lines_u16;
@@ -933,7 +1029,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     // 顶部吸顶轮次条（仅当活动 turn 首行已滚出视口上方且视口足够高时显示）
     let show_sticky = content_area.height >= 6
         && app.timeline_snap.pinned_idx.is_some()
-        && all_lines.len() > content_area.height as usize;
+        && total_lines > content_area.height as usize;
 
     let buf = frame.buffer_mut();
     let sticky_rows: usize = if show_sticky {
@@ -941,8 +1037,8 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             && let Some(turn) = app.timeline_snap.turns.get(pinned_idx)
         {
             let sticky_rect = Rect::new(content_area.x, content_area.y, content_area.width, 1);
-            let sticky_bg = if theme.card_bg != Color::Reset {
-                theme.card_bg
+            let sticky_bg = if app.theme.card_bg != Color::Reset {
+                app.theme.card_bg
             } else {
                 Color::DarkGray
             };
@@ -961,7 +1057,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 label,
                 content_area.width as usize,
                 Style::default()
-                    .fg(theme.accent)
+                    .fg(app.theme.accent)
                     .bg(sticky_bg)
                     .add_modifier(Modifier::BOLD),
             );
@@ -971,25 +1067,95 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         0
     };
 
-    // 逐行绘入 Buffer 并登记软换行选区行跨度
+    // Pass 2：二分定位仅取样/物化命中当前可见视口 `[vis_line_start .. vis_line_end)` 的条目
     let view_h = content_area.height as usize;
-    for row_off in sticky_rows..view_h {
-        let line_idx = scroll_top + row_off;
-        let y = content_area.y + row_off as u16;
-        let Some(rl) = all_lines.get(line_idx) else {
-            break;
-        };
-        buf.set_line(content_area.x, y, &rl.line, content_area.width);
-        let lw = (rl.line.width() as u16).min(content_area.width);
-        let col_end = content_area.x + lw.max(1).min(content_area.width);
-        app.selection_geom.push_row(
-            SelectionPane::Chat,
-            y,
-            content_area.x,
-            col_end,
-            rl.soft_wrapped,
-        );
+    let vis_line_start = scroll_top + sticky_rows;
+    let vis_line_end = scroll_top + view_h;
+    let mut row_off = sticky_rows;
+
+    if vis_line_start < welcome_total_lines {
+        let empty_rl = RenderedLine::hard(Line::raw(""));
+        for line_idx in vis_line_start..welcome_total_lines.min(vis_line_end) {
+            if row_off >= view_h {
+                break;
+            }
+            let y = content_area.y + row_off as u16;
+            let rl = welcome_lines.get(line_idx).unwrap_or(&empty_rl);
+            buf.set_line(content_area.x, y, &rl.line, content_area.width);
+            let lw = (rl.line.width() as u16).min(content_area.width);
+            let col_end = content_area.x + lw.max(1).min(content_area.width);
+            app.selection_geom.push_row(
+                SelectionPane::Chat,
+                y,
+                content_area.x,
+                col_end,
+                rl.soft_wrapped,
+            );
+            row_off += 1;
+        }
     }
+
+    let first_span_idx =
+        spans.partition_point(|&(start, count, _)| start.saturating_add(count) <= vis_line_start);
+
+    {
+        let items = &app.items;
+        let tool_extras = &app.tool_extras;
+        let reveal = &app.reveal;
+        let cache = &mut app.item_cache;
+        let theme = &app.theme;
+        let selection_geom = &mut app.selection_geom;
+
+        for (k, &(item_start, _item_len, ref key)) in spans.iter().enumerate().skip(first_span_idx)
+        {
+            if item_start >= vis_line_end || row_off >= view_h {
+                break;
+            }
+            let item_idx = start_item + k;
+            let lines = if let Some(cached) = cache.get_lines(item_idx, key) {
+                cached
+            } else {
+                let built = Arc::new(build_transcript_item_lines(
+                    items,
+                    start_item,
+                    item_idx,
+                    tool_extras,
+                    reveal,
+                    cache,
+                    theme,
+                    &emphasis,
+                    is_busy,
+                    show_thinking,
+                    verbose_expanded,
+                    spinner_tick,
+                    width_usize,
+                ));
+                cache.insert_lines(item_idx, key.clone(), Arc::clone(&built));
+                built
+            };
+
+            let local_start = vis_line_start.saturating_sub(item_start);
+            let local_end = (vis_line_end.saturating_sub(item_start)).min(lines.len());
+            for rl in &lines[local_start..local_end] {
+                if row_off >= view_h {
+                    break;
+                }
+                let y = content_area.y + row_off as u16;
+                buf.set_line(content_area.x, y, &rl.line, content_area.width);
+                let lw = (rl.line.width() as u16).min(content_area.width);
+                let col_end = content_area.x + lw.max(1).min(content_area.width);
+                selection_geom.push_row(
+                    SelectionPane::Chat,
+                    y,
+                    content_area.x,
+                    col_end,
+                    rl.soft_wrapped,
+                );
+                row_off += 1;
+            }
+        }
+    }
+    app.item_cache.span_scratch = spans;
 
     // 仅当快捷操作行落在可视区间 `[sticky_rows..view_h)` 内时动态投影命中矩形
     if let Some((chip_line_idx, chip_spans)) = welcome_chips
@@ -1025,31 +1191,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             app.rail_geo = Some(geo);
         }
     }
-}
-
-fn get_or_build_cached<F>(
-    cache: &mut std::collections::HashMap<usize, crate::app::CachedItemLines>,
-    idx: usize,
-    key: ItemRenderKey,
-    builder: F,
-) -> Vec<RenderedLine>
-where
-    F: FnOnce() -> Vec<RenderedLine>,
-{
-    if let Some(hit) = cache.get(&idx)
-        && hit.key == key
-    {
-        return hit.lines.clone();
-    }
-    let lines = builder();
-    cache.insert(
-        idx,
-        crate::app::CachedItemLines {
-            key,
-            lines: lines.clone(),
-        },
-    );
-    lines
 }
 
 fn build_user_lines(text: &str, width: usize, theme: &Theme) -> Vec<RenderedLine> {
@@ -1088,6 +1229,153 @@ fn build_user_lines(text: &str, width: usize, theme: &Theme) -> Vec<RenderedLine
     out
 }
 
+fn find_streaming_markdown_split(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut fence: Option<(char, usize)> = None;
+    let mut tree_possibly_active = false;
+    let mut pos = 0usize;
+    let mut last_safe: Option<usize> = None;
+
+    while pos < bytes.len() {
+        let rel_nl = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|r| pos + r);
+        let line_end = rel_nl.unwrap_or(bytes.len());
+        let line = &text[pos..line_end];
+        let trimmed = line.trim_start();
+
+        let in_fence_line = if let Some((fc, flen)) = fence {
+            let close_len = trimmed.bytes().take_while(|&b| b == fc as u8).count();
+            if close_len >= flen && trimmed[close_len..].trim().is_empty() {
+                fence = None;
+            }
+            true
+        } else if trimmed.starts_with("```") {
+            let flen = trimmed.bytes().take_while(|&b| b == b'`').count();
+            fence = Some(('`', flen));
+            true
+        } else if trimmed.starts_with("~~~") {
+            let flen = trimmed.bytes().take_while(|&b| b == b'~').count();
+            fence = Some(('~', flen));
+            true
+        } else {
+            false
+        };
+
+        if in_fence_line {
+            tree_possibly_active = false;
+        } else if line.is_empty() && rel_nl.is_some() {
+            let tail_start = line_end + 1;
+            let next_end = bytes[tail_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |r| tail_start + r);
+            let next_line = &text[tail_start..next_end];
+            let nt = next_line.trim_start();
+            let indent = next_line.len() - nt.len();
+            let is_ordered = nt.find(". ").is_some_and(|dot| {
+                (1..=4).contains(&dot) && nt[..dot].bytes().all(|b| b.is_ascii_digit())
+            });
+            let safe_next = !nt.is_empty()
+                && indent < 2
+                && !nt.starts_with("- ")
+                && !nt.starts_with("* ")
+                && !is_ordered
+                && !next_line.contains('├')
+                && !next_line.contains('└')
+                && !next_line.contains('│');
+            if !tree_possibly_active || safe_next {
+                tree_possibly_active = false;
+                // 在空白行结束的 `\n` 处切分：前段含尾部单个 `\n`，后段从下一行起点开始
+                last_safe = Some(line_end);
+            }
+        } else if line.contains('├') || line.contains('└') || line.contains('│') {
+            tree_possibly_active = true;
+        } else {
+            let indent = line.len() - trimmed.len();
+            let is_ordered = trimmed.find(". ").is_some_and(|dot| {
+                (1..=4).contains(&dot) && trimmed[..dot].bytes().all(|b| b.is_ascii_digit())
+            });
+            if indent < 2
+                && !trimmed.is_empty()
+                && !trimmed.starts_with("- ")
+                && !trimmed.starts_with("* ")
+                && !is_ordered
+            {
+                tree_possibly_active = false;
+            }
+        }
+
+        match rel_nl {
+            Some(nl) => pos = nl + 1,
+            None => break,
+        }
+    }
+
+    last_safe
+}
+
+fn render_markdown_streaming_cached(
+    cache: &mut crate::app::TranscriptRenderCache,
+    item_idx: usize,
+    vis_text: &str,
+    width: usize,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    allow_cache: bool,
+) -> Vec<RenderedLine> {
+    if !allow_cache || vis_text.len() <= 1500 {
+        return render_markdown_rich(vis_text, width, theme, emphasis);
+    }
+    let Some(split_idx) = find_streaming_markdown_split(vis_text) else {
+        return render_markdown_rich(vis_text, width, theme, emphasis);
+    };
+    let new_prefix = &vis_text[..split_idx];
+    let tail = &vis_text[split_idx + 1..];
+
+    if let Some(cached) = cache.streaming_prefix.as_mut()
+        && cached.item_idx == item_idx
+        && cached.width == width
+        && cached.theme_id == theme.id
+        && cached.emphasis_enabled == emphasis.enabled
+        && cached.round_caps == emphasis.round_caps
+    {
+        if new_prefix == cached.prefix_text {
+            let mut out = cached.lines.clone();
+            out.extend(render_markdown_rich(tail, width, theme, emphasis));
+            return out;
+        }
+        if new_prefix.len() > cached.prefix_text.len()
+            && new_prefix.starts_with(&cached.prefix_text)
+            && new_prefix.as_bytes().get(cached.prefix_text.len()) == Some(&b'\n')
+        {
+            let delta_prefix = &new_prefix[cached.prefix_text.len() + 1..];
+            cached
+                .lines
+                .extend(render_markdown_rich(delta_prefix, width, theme, emphasis));
+            cached.prefix_text = new_prefix.to_string();
+            let mut out = cached.lines.clone();
+            out.extend(render_markdown_rich(tail, width, theme, emphasis));
+            return out;
+        }
+    }
+
+    let prefix_lines = render_markdown_rich(new_prefix, width, theme, emphasis);
+    cache.streaming_prefix = Some(crate::app::StreamingMarkdownPrefixCache {
+        item_idx,
+        width,
+        theme_id: theme.id,
+        emphasis_enabled: emphasis.enabled,
+        round_caps: emphasis.round_caps,
+        prefix_text: new_prefix.to_string(),
+        lines: prefix_lines.clone(),
+    });
+    let mut out = prefix_lines;
+    out.extend(render_markdown_rich(tail, width, theme, emphasis));
+    out
+}
+
 fn build_assistant_lines(
     full_reasoning: &str,
     vis_reasoning: &str,
@@ -1096,6 +1384,60 @@ fn build_assistant_lines(
     width: usize,
     theme: &Theme,
     emphasis: &EmphasisConfig,
+) -> Vec<RenderedLine> {
+    build_assistant_lines_with_cache(
+        full_reasoning,
+        vis_reasoning,
+        vis_text,
+        show_thinking,
+        width,
+        theme,
+        emphasis,
+        None,
+        0,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_assistant_lines_cached(
+    full_reasoning: &str,
+    vis_reasoning: &str,
+    vis_text: &str,
+    show_thinking: bool,
+    width: usize,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    cache: &mut crate::app::TranscriptRenderCache,
+    item_idx: usize,
+    is_last_active: bool,
+) -> Vec<RenderedLine> {
+    build_assistant_lines_with_cache(
+        full_reasoning,
+        vis_reasoning,
+        vis_text,
+        show_thinking,
+        width,
+        theme,
+        emphasis,
+        Some(cache),
+        item_idx,
+        is_last_active,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_assistant_lines_with_cache(
+    full_reasoning: &str,
+    vis_reasoning: &str,
+    vis_text: &str,
+    show_thinking: bool,
+    width: usize,
+    theme: &Theme,
+    emphasis: &EmphasisConfig,
+    cache: Option<&mut crate::app::TranscriptRenderCache>,
+    item_idx: usize,
+    is_last_active: bool,
 ) -> Vec<RenderedLine> {
     let mut out = Vec::new();
 
@@ -1142,7 +1484,19 @@ fn build_assistant_lines(
         if emitted_reasoning {
             out.push(RenderedLine::hard(Line::raw("")));
         }
-        let md_lines = render_markdown_rich(vis_text, width, theme, emphasis);
+        let md_lines = if let Some(c) = cache {
+            render_markdown_streaming_cached(
+                c,
+                item_idx,
+                vis_text,
+                width,
+                theme,
+                emphasis,
+                is_last_active,
+            )
+        } else {
+            render_markdown_rich(vis_text, width, theme, emphasis)
+        };
         out.extend(md_lines);
     } else if full_reasoning.is_empty() {
         out.push(RenderedLine::hard(Line::from(Span::styled(
@@ -1163,11 +1517,76 @@ struct ToolGroupCtx {
 
 const EXPAND_HINT_INLINE: &str = " (Ctrl+O 展开)";
 
+fn tool_extra_len(extra: Option<&ToolExtraMeta>) -> usize {
+    extra.map_or(0, |e| {
+        e.full_content.len()
+            + e.diff_raw.as_ref().map_or(0, String::len)
+            + e.full_args.len()
+            + e.inline_meta.as_ref().map_or(0, String::len)
+    })
+}
+
+fn tool_base_status_code(status: ToolState) -> u8 {
+    match status {
+        ToolState::Running => 0,
+        ToolState::Done => 1,
+        ToolState::Error => 2,
+        ToolState::Blocked => 3,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_tool_group_ctx(
     items: &[ChatItem],
     start_item: usize,
     idx: usize,
     tool_extras: &HashMap<String, ToolExtraMeta>,
+    expanded: bool,
+    width: usize,
+    theme: &Theme,
+) -> ToolGroupCtx {
+    compute_tool_group_ctx_with_cache(
+        items,
+        start_item,
+        idx,
+        tool_extras,
+        None,
+        expanded,
+        width,
+        theme,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_tool_group_ctx_cached(
+    items: &[ChatItem],
+    start_item: usize,
+    idx: usize,
+    tool_extras: &HashMap<String, ToolExtraMeta>,
+    cache: &mut crate::app::TranscriptRenderCache,
+    expanded: bool,
+    width: usize,
+    theme: &Theme,
+) -> ToolGroupCtx {
+    compute_tool_group_ctx_with_cache(
+        items,
+        start_item,
+        idx,
+        tool_extras,
+        Some(cache),
+        expanded,
+        width,
+        theme,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_tool_group_ctx_with_cache(
+    items: &[ChatItem],
+    start_item: usize,
+    idx: usize,
+    tool_extras: &HashMap<String, ToolExtraMeta>,
+    mut cache: Option<&mut crate::app::TranscriptRenderCache>,
     expanded: bool,
     width: usize,
     theme: &Theme,
@@ -1183,8 +1602,31 @@ fn compute_tool_group_ctx(
 
     let mut show_expand_hint = false;
     let mut j = idx;
-    while let ChatItem::ToolCall { id, .. } = &items[j] {
-        if is_tool_expandable(&items[j], tool_extras.get(id), width, theme) {
+    while let ChatItem::ToolCall {
+        id,
+        name,
+        args_summary,
+        status,
+        output_preview,
+    } = &items[j]
+    {
+        let extra = tool_extras.get(id);
+        let status_code = tool_base_status_code(*status);
+        let extra_len = tool_extra_len(extra);
+        let preview_len = args_summary.len() + output_preview.len() + name.len();
+        let expandable = if let Some(cached) = cache
+            .as_deref()
+            .and_then(|c| c.get_expandable(j, width, status_code, extra_len, preview_len))
+        {
+            cached
+        } else {
+            let computed = is_tool_expandable(&items[j], extra, width, theme);
+            if let Some(c) = cache.as_deref_mut() {
+                c.insert_expandable(j, width, status_code, extra_len, preview_len, computed);
+            }
+            computed
+        };
+        if expandable {
             show_expand_hint = true;
             break;
         }
@@ -1992,30 +2434,23 @@ fn avail_of(area: Rect, reserved: usize) -> usize {
     (area.width as usize).saturating_sub(reserved)
 }
 
-fn render_input_box(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    layout: &crate::editor::InputLayout,
-    app: &mut AppState,
-) {
+fn render_input_box(frame: &mut Frame<'_>, area: Rect, inner_w: u16, app: &mut AppState) {
     if area.width < 3 || area.height < 3 {
         return;
     }
-    let theme = &app.theme;
-
     let bash_mode = app.bash_mode();
-    let effort_col = effort_color(theme, app.reasoning_effort);
+    let effort_col = effort_color(&app.theme, app.reasoning_effort);
     let mut base_border_color = if let Some(mode) = bash_mode {
         match mode {
-            BashInputMode::Context => theme.success,
-            BashInputMode::NoContext => theme.text_muted,
+            BashInputMode::Context => app.theme.success,
+            BashInputMode::NoContext => app.theme.text_muted,
         }
     } else if app.is_busy || app.is_bash_running {
-        theme.border_busy
+        app.theme.border_busy
     } else if app.reasoning_effort.is_some() {
         effort_col
     } else {
-        theme.border_focus
+        app.theme.border_focus
     };
 
     // High/XHigh/Max 推理强度切换点火扫描波（1.2s 内沿边框做 OKLab 色彩脉冲）
@@ -2027,9 +2462,10 @@ fn render_input_box(
         if elapsed_ms < IGNITION_DURATION_MS {
             let p = elapsed_ms as f64 / IGNITION_DURATION_MS as f64;
             ignition_progress = Some(p);
-            if theme.truecolor {
+            if app.theme.truecolor {
                 let wave = (1.0 - (p * 2.0 - 1.0).abs()).clamp(0.0, 1.0);
-                if let (Some(a), Some(b)) = (color_to_rgb8(effort_col), color_to_rgb8(theme.accent))
+                if let (Some(a), Some(b)) =
+                    (color_to_rgb8(effort_col), color_to_rgb8(app.theme.accent))
                 {
                     base_border_color = mix_oklab(a, b, wave).to_color();
                 }
@@ -2043,42 +2479,42 @@ fn render_input_box(
         Some(BashInputMode::Context) => (
             " Bash (! · 载入上下文 · Enter 执行 · Esc 退出) ".to_string(),
             Style::default()
-                .fg(theme.success)
+                .fg(app.theme.success)
                 .add_modifier(Modifier::BOLD),
         ),
         Some(BashInputMode::NoContext) => (
             " Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出) ".to_string(),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
         None if app.is_busy => (
             " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) ".to_string(),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
         None if app.is_bash_running => (
             " 输入 (Bash 命令执行中 · Esc 取消) ".to_string(),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
         None if app.input.has_collapsed_pastes() && app.input.has_images() => (
             format!(
                 " 输入 (Enter 发送 · 已附 {} 张图片 · 含折叠粘贴块，Ctrl+E 展开) ",
                 app.input.image_count()
             ),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
         None if app.input.has_collapsed_pastes() => (
             " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) ".to_string(),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
         None if app.input.has_images() => (
             format!(
                 " 输入 (Enter / Ctrl+Enter 发送 · 已附 {} 张图片 · Ctrl+V 粘贴 · ? 帮助) ",
                 app.input.image_count()
             ),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
         None => (
             " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) ".to_string(),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(app.theme.text_muted),
         ),
     };
 
@@ -2092,7 +2528,7 @@ fn render_input_box(
 
     // 若处于点火扫描窗口内且终端支持真彩色，在顶边与底边绘制流动高亮扫描段
     if let Some(p) = ignition_progress
-        && theme.truecolor
+        && app.theme.truecolor
         && area.width > 6
     {
         let span_len = (area.width / 5).max(3);
@@ -2103,12 +2539,18 @@ fn render_input_box(
             let pos = head.saturating_sub(dx);
             if pos >= 1 && pos < area.width.saturating_sub(1) {
                 let x = area.x + pos;
-                buf[(x, area.y)]
-                    .set_style(Style::default().fg(theme.text).add_modifier(Modifier::BOLD));
+                buf[(x, area.y)].set_style(
+                    Style::default()
+                        .fg(app.theme.text)
+                        .add_modifier(Modifier::BOLD),
+                );
                 let by = area.y + area.height - 1;
                 let mirror_x = area.x + area.width - 1 - pos;
-                buf[(mirror_x, by)]
-                    .set_style(Style::default().fg(theme.text).add_modifier(Modifier::BOLD));
+                buf[(mirror_x, by)].set_style(
+                    Style::default()
+                        .fg(app.theme.text)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
         }
     }
@@ -2117,12 +2559,17 @@ fn render_input_box(
         return;
     }
 
+    let is_overlay_modal = app.overlay.is_modal();
+    let is_empty = app.input.is_empty();
+    let theme = &app.theme;
+    let selection_geom = &mut app.selection_geom;
+    let layout = app.input.layout_cached(inner_w);
     let scroll_y = layout
         .cursor_row
         .saturating_sub(inner.height.saturating_sub(1));
     let buf = frame.buffer_mut();
 
-    if app.input.is_empty() {
+    if is_empty {
         let placeholder = truncate_display("输入消息、/ 命令或 @ 文件引用…", inner.width as usize);
         buf.set_stringn(
             inner.x,
@@ -2142,13 +2589,12 @@ fn render_input_box(
             buf.set_line(inner.x, y, &line, inner.width);
             let lw = (display_width(line_str) as u16).min(inner.width);
             let col_end = inner.x + lw.max(1).min(inner.width);
-            app.selection_geom
-                .push_row(SelectionPane::Input, y, inner.x, col_end, false);
+            selection_geom.push_row(SelectionPane::Input, y, inner.x, col_end, false);
         }
     }
 
     // 居中模态浮层打开时不把物理光标抢回到输入框
-    if !app.overlay.is_modal() {
+    if !is_overlay_modal {
         let rel_row = layout.cursor_row.saturating_sub(scroll_y);
         if rel_row < inner.height {
             let cursor_x = inner.x + layout.cursor_col.min(inner.width.saturating_sub(1));
@@ -3561,5 +4007,74 @@ mod tests {
             screen.contains("0402｜FEA｜会话标题展示"),
             "screen:\n{screen}"
         );
+    }
+
+    #[test]
+    fn transcript_render_cache_caps_lru_entries_and_retains_heights() {
+        let mut app = AppState::new(PathBuf::from("."), "sess-lru", Vec::new(), None, None, None);
+        for i in 0..140 {
+            app.items.push(ChatItem::User {
+                text: format!("user prompt line #{i}"),
+            });
+            app.items.push(ChatItem::Assistant {
+                reasoning: String::new(),
+                text: format!("assistant reply paragraph #{i}\n\n- bullet {i}"),
+            });
+        }
+
+        let _ = render_buffer_text(&mut app, 100, 32);
+        assert_eq!(app.item_cache.height_count(), app.items.len());
+        assert!(
+            app.item_cache.len() <= crate::app::MAX_CACHED_RENDER_ITEMS,
+            "cache entries {} should be capped at {}",
+            app.item_cache.len(),
+            crate::app::MAX_CACHED_RENDER_ITEMS
+        );
+
+        // 向上滚回顶部后，只重新生成并置换顶部视口工作集，总量仍受 LRU 上限控制
+        app.auto_scroll = false;
+        app.scroll_from_top = 0;
+        let top_screen = render_buffer_text(&mut app, 100, 32);
+        assert!(
+            app.item_cache.len() <= crate::app::MAX_CACHED_RENDER_ITEMS,
+            "top scroll entries {} exceeded cap",
+            app.item_cache.len()
+        );
+        assert!(top_screen.contains("user prompt line #0"));
+    }
+
+    #[test]
+    fn streaming_markdown_prefix_cache_matches_full_render() {
+        let theme = Theme::mist_dark();
+        let emphasis = EmphasisConfig::default();
+        let long_prefix: String = (0..30)
+            .map(|i| {
+                format!(
+                    "## Section {i}\n\nParagraph {i} with **bold** and `code_{i}`.\n\n```rust\nlet x_{i} = {i};\n```\n\n"
+                )
+            })
+            .collect();
+        let stages = [
+            format!("{long_prefix}Tail stage one"),
+            format!("{long_prefix}Tail stage one\n\nTail stage two with - list"),
+            format!("{long_prefix}Tail stage one\n\nTail stage two\n\nFinal paragraph."),
+        ];
+
+        let mut cache = crate::app::TranscriptRenderCache::default();
+        for stage in &stages {
+            let cached_lines =
+                render_markdown_streaming_cached(&mut cache, 7, stage, 84, &theme, &emphasis, true);
+            let full_lines = render_markdown_rich(stage, 84, &theme, &emphasis);
+            let cached_cmp: Vec<(bool, &_)> = cached_lines
+                .iter()
+                .map(|l| (l.soft_wrapped, &l.line))
+                .collect();
+            let full_cmp: Vec<(bool, &_)> = full_lines
+                .iter()
+                .map(|l| (l.soft_wrapped, &l.line))
+                .collect();
+            assert_eq!(cached_cmp, full_cmp);
+        }
+        assert!(cache.streaming_prefix.is_some());
     }
 }

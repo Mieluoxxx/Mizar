@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -11,6 +12,29 @@ use mizar_llm::{
 };
 
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn build_shared_http_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    for env_key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"] {
+        if let Ok(path) = std::env::var(env_key)
+            && !path.trim().is_empty()
+            && let Ok(pem) = std::fs::read(&path)
+            && let Ok(certs) = reqwest::Certificate::from_pem_bundle(&pem)
+        {
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+            break;
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 返回进程级共享的 `reqwest::Client`，复用底层连接池、TLS 配置与系统代理状态。
+pub fn shared_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(build_shared_http_client).clone()
+}
 
 /// 协议流式解码器接口，由各个具体协议适配器实现（纯解析逻辑，便于单元测试）。
 pub trait SseStreamDecoder: Send + 'static {
