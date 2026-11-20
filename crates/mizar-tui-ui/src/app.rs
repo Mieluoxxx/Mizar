@@ -256,7 +256,7 @@ pub enum SessionReplayItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionViewData {
     pub session_id: String,
     pub session_title: Option<String>,
@@ -265,6 +265,10 @@ pub struct SessionViewData {
     /// 该会话最后记录的模型 / 推理强度快照；`None` 表示日志里没有（旧会话）。
     /// 仅作数据携带——是否采用、如何叠加进优先级链由宿主层决定，本层不参与决策。
     pub selection: Option<SessionSelection>,
+    /// 该会话累计的 Token 用量（来自 `SessionEvent::Assistant.usage` 累加）。
+    pub total_usage: TokenUsage,
+    /// 该会话最近一次实测（或压缩后）上下文 token 数，供跨 resume 恢复占用估算。
+    pub last_prompt_tokens: Option<u64>,
 }
 
 /// 会话内记录的模型与推理强度选择（`mizar-tui-ui` 侧的纯数据形态）。
@@ -403,6 +407,7 @@ pub enum AppAction {
     CompactSession(Option<String>),
     NewSession,
     ShowStats,
+    ShowSessionInfo,
     ShowTools,
     ShowMcp,
     ShowSkills,
@@ -1295,6 +1300,11 @@ impl AppState {
                 self.is_compacting = false;
                 self.compaction_status = None;
                 // 遵循 dsh-TUI 原则：total_usage 计费读数永不随压缩回退，仅刷新上下文占用视图
+                if matches!(outcome.as_str(), "compacted" | "pruned-only")
+                    && let Some(after) = tokens_after.filter(|&v| v > 0)
+                {
+                    self.last_prompt_tokens = Some(after);
+                }
                 self.refresh_context_breakdown();
 
                 match outcome.as_str() {
@@ -1377,7 +1387,11 @@ impl AppState {
         {
             self.dismissed_mention = None;
             let selected = match &self.overlay.active {
-                Some(OverlayKind::SlashComplete { selected, .. }) => *selected,
+                Some(OverlayKind::SlashComplete {
+                    query: prev_query,
+                    selected,
+                    ..
+                }) if prev_query == &query => *selected,
                 _ => 0,
             };
             self.overlay.active = Some(OverlayKind::SlashComplete {
@@ -2225,6 +2239,8 @@ impl AppState {
         self.reset_for_new_session(view.session_id, view.session_title);
         // 清理 reset 推送的默认欢迎通知，由真实历史替代
         self.items.clear();
+        self.total_usage = view.total_usage;
+        self.last_prompt_tokens = view.last_prompt_tokens;
 
         for item in view.items {
             match item {
@@ -2638,7 +2654,7 @@ impl AppState {
                 .is_some_and(|c| {
                     matches!(
                         c.to_ascii_lowercase().as_str(),
-                        "exit" | "quit" | "q" | "help" | "h" | "view" | "mouse"
+                        "exit" | "quit" | "q" | "help" | "h" | "view" | "mouse" | "session"
                     )
                 });
             if !is_safe_slash {
@@ -2871,6 +2887,7 @@ impl AppState {
                 }
             },
             "stats" => AppAction::ShowStats,
+            "session" => AppAction::ShowSessionInfo,
             "compact" => {
                 if self.is_busy || self.is_bash_running || self.is_compacting {
                     self.push_notice(
@@ -2908,6 +2925,7 @@ fn is_builtin_slash_cmd(cmd: &str) -> bool {
             | "model"
             | "effort"
             | "stats"
+            | "session"
             | "compact"
             | "export"
             | "trace"
@@ -5259,6 +5277,7 @@ mod tests {
             }],
             finish_notice: "已恢复".into(),
             selection: None,
+            ..Default::default()
         });
         assert!(app.items.iter().any(|item| matches!(
             item,
@@ -5267,5 +5286,130 @@ mod tests {
                 text,
             } if text == "Reached max steps (max_steps=2)"
         )));
+    }
+
+    #[test]
+    fn session_slash_command_dispatches_in_idle_busy_and_local_bash() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-cmd-test",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        assert!(is_builtin_slash_cmd("session"));
+        assert!(!is_builtin_slash_cmd("not_a_builtin"));
+
+        // 1. 未知 /xxx 仍作为普通消息发给模型（不拦截）
+        app.input.set_text_end("/not_a_builtin arg");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::SubmitPrompt("/not_a_builtin arg".into())
+        );
+
+        // 2. 空闲时 `/session` -> ShowSessionInfo，且不写入 User 聊天项
+        let items_before = app.items.len();
+        app.input.set_text_end("/session");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::ShowSessionInfo
+        );
+        assert_eq!(app.items.len(), items_before);
+
+        // 3. 运行中（is_busy）仍即时触发，不进入排队队列
+        app.is_busy = true;
+        app.input.set_text_end("/session");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::ShowSessionInfo
+        );
+        assert!(app.queued_prompts.is_empty());
+        app.is_busy = false;
+
+        // 4. 本地 bash 运行中（is_bash_running）在 is_safe_slash 白名单内放行
+        app.is_bash_running = true;
+        app.input.set_text_end("/session");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::ShowSessionInfo
+        );
+        app.is_bash_running = false;
+
+        // 5. 交互补全：`/` 下移多项再继续输入过滤不会越界，`/ses` 直接回车立即执行
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for ch in ['s', 'e', 's'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::SlashComplete { selected: 0, .. })
+        ));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::ShowSessionInfo
+        );
+        assert!(!app.overlay.is_open());
+    }
+
+    #[test]
+    fn restore_session_view_preserves_usage_and_compaction_updates_context_tokens() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-empty",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let restored_usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            total_tokens: Some(12_500),
+            cache_read_tokens: Some(9_000),
+            cache_write_tokens: Some(2_000),
+            reasoning_tokens: None,
+        };
+        app.restore_session_view(SessionViewData {
+            session_id: "sess-resumed".into(),
+            session_title: Some("Resumed".into()),
+            items: vec![
+                SessionReplayItem::User {
+                    text: "hello".into(),
+                },
+                SessionReplayItem::Assistant {
+                    blocks: vec![ContentBlock::Text {
+                        text: "world".into(),
+                    }],
+                },
+            ],
+            finish_notice: "已恢复历史会话".into(),
+            selection: None,
+            total_usage: restored_usage,
+            last_prompt_tokens: Some(12_000),
+        });
+
+        assert_eq!(app.total_usage, restored_usage);
+        assert_eq!(app.last_prompt_tokens, Some(12_000));
+        assert_eq!(app.side_panel_data.context.total_tokens, 12_500);
+        assert_eq!(app.side_panel_data.context.last_prompt_tokens, Some(12_000));
+
+        // 压缩完成后，累计计费不变，最近上下文体积更新为 tokens_after
+        app.apply_ui_event(UiEvent::CompactionFinished {
+            outcome: "compacted".into(),
+            tokens_before: Some(12_000),
+            tokens_after: Some(2_400),
+            pruned_count: 0,
+            first_kept_seq: Some(2),
+            summary_preview: None,
+            message: None,
+            is_manual: false,
+        });
+        assert_eq!(app.total_usage, restored_usage);
+        assert_eq!(app.last_prompt_tokens, Some(2_400));
+        assert_eq!(app.side_panel_data.context.last_prompt_tokens, Some(2_400));
     }
 }

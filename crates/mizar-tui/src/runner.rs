@@ -1,10 +1,10 @@
 //! 异步运行循环：将 Cordis / AgentLoop / Trajectory 事件接入终端界面。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cordis::{
     BoxFuture, Cleanup, Context, CordisError, DisposableHandle, LogLevel, LogRecord, LogSink, Next,
@@ -28,7 +28,7 @@ use mizar_agent_spine::{
     persist_disabled_plugins, resolve_global_settings_path, strip_summary_wrapper,
 };
 use mizar_instructions::AgentInstructions;
-use mizar_llm::{ContentBlock, ImageAttachment, LlmContextExt, ReasoningEffort};
+use mizar_llm::{ContentBlock, ImageAttachment, LlmContextExt, ReasoningEffort, TokenUsage};
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_session::{
     Session, SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
@@ -47,7 +47,8 @@ use mizar_trajectory::{
 use mizar_tui_ui::app::{
     AppAction, AppState, ApprovalMode, LocalBashOutput, NoticeLevel, SessionReplayItem,
     SessionSelection, SessionViewData, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord,
-    UiStepOutcome, UiTurnEndReason, short_id, truncate_display,
+    UiStepOutcome, UiTurnEndReason, abbreviate_home_path, format_tokens, short_id,
+    truncate_display,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{
@@ -173,6 +174,7 @@ pub struct TuiConfig {
     pub side_panel_open: Option<bool>,
     pub mouse_capture: Option<bool>,
     pub resume_session: Option<ResumeTarget>,
+    pub session_db_path: Option<PathBuf>,
     pub restrict_to_workspace: bool,
     pub check_for_updates: bool,
     pub startup_notices: Vec<(NoticeLevel, String)>,
@@ -197,6 +199,7 @@ impl TuiConfig {
             side_panel_open: None,
             mouse_capture: None,
             resume_session: None,
+            session_db_path: None,
             restrict_to_workspace: false,
             check_for_updates: false,
             startup_notices: Vec::new(),
@@ -382,16 +385,379 @@ pub fn latest_workspace_selection(
     sessions.peek_selection(&latest.id)
 }
 
+fn accumulate_usage(acc: &mut TokenUsage, usage: &TokenUsage) {
+    acc.input_tokens = acc.input_tokens.saturating_add(usage.input_tokens);
+    acc.output_tokens = acc.output_tokens.saturating_add(usage.output_tokens);
+    if let Some(cr) = usage.cache_read_tokens {
+        acc.cache_read_tokens = Some(acc.cache_read_tokens.unwrap_or(0).saturating_add(cr));
+    }
+    if let Some(cw) = usage.cache_write_tokens {
+        acc.cache_write_tokens = Some(acc.cache_write_tokens.unwrap_or(0).saturating_add(cw));
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn format_local_datetime_ms(ts_ms: u128) -> String {
+    if ts_ms == 0 {
+        return "未知".to_string();
+    }
+    let Ok(ms) = i64::try_from(ts_ms) else {
+        return "未知".to_string();
+    };
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "未知".to_string())
+}
+
+fn format_relative_activity(updated_at_ms: u128, now_ms: u128) -> String {
+    if updated_at_ms == 0 {
+        return "未知".to_string();
+    }
+    let elapsed_secs = now_ms.saturating_sub(updated_at_ms) / 1_000;
+    if elapsed_secs < 60 {
+        "刚刚".to_string()
+    } else if elapsed_secs < 3_600 {
+        format!("{} 分钟前", elapsed_secs / 60)
+    } else if elapsed_secs < 86_400 {
+        format!("{} 小时前", elapsed_secs / 3_600)
+    } else {
+        format!("{} 天前", elapsed_secs / 86_400)
+    }
+}
+
+fn format_context_window(window: u64) -> String {
+    if window >= 1_000_000 && window.is_multiple_of(1_000_000) {
+        format!("{}M", window / 1_000_000)
+    } else if (1_000..1_000_000).contains(&window) && window.is_multiple_of(1_000) {
+        format!("{}k", window / 1_000)
+    } else {
+        format_tokens(window)
+    }
+}
+
+fn join_mid_dot(parts: &[String]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        if !out.is_empty() {
+            if out.ends_with('）') {
+                out.push_str("· ");
+            } else {
+                out.push_str(" · ");
+            }
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// 构造 `/session` 命令的只读会话身份与账目报告。
+pub fn build_session_info_report(
+    ctx: &Context,
+    config: &TuiConfig,
+    session: &Session,
+    app: &AppState,
+) -> String {
+    build_session_info_report_at(
+        session,
+        app,
+        ctx.session_persistence().is_some(),
+        config.session_db_path.as_deref(),
+        now_millis(),
+    )
+}
+
+/// 以显式持久化标记、路径与当前时间戳构造 `/session` 报告（便于确定性测试）。
+pub fn build_session_info_report_at(
+    session: &Session,
+    app: &AppState,
+    persisted: bool,
+    session_db_path: Option<&Path>,
+    now_ms: u128,
+) -> String {
+    let header = session.header();
+
+    let mut total_events = 0u64;
+    let mut surface_events = 0u64;
+    let mut user_count = 0u64;
+    let mut assistant_count = 0u64;
+    let mut tool_result_count = 0u64;
+    let mut tool_error_count = 0u64;
+    let mut bash_count = 0u64;
+    let mut bash_local_count = 0u64;
+    let mut pruned_seqs = HashSet::<u64>::new();
+    let mut injection_counts = HashMap::<String, u64>::new();
+    let mut compaction_count = 0u64;
+    let mut latest_compaction: Option<(u64, Option<u64>, Option<u64>)> = None;
+    let mut total_usage = TokenUsage::default();
+    let mut latest_context_tokens: Option<u64> = None;
+    let mut saw_prune_after_last_context = false;
+
+    session.with_all_entries(|entries| {
+        total_events = entries.len() as u64;
+        for entry in entries {
+            if entry.is_surface() {
+                surface_events += 1;
+            }
+            match &entry.event {
+                SessionEvent::User { .. } => user_count += 1,
+                SessionEvent::ContextNotice { source, .. } => {
+                    *injection_counts.entry(source.clone()).or_insert(0) += 1;
+                }
+                SessionEvent::Assistant { usage, .. } => {
+                    assistant_count += 1;
+                    if let Some(u) = usage {
+                        accumulate_usage(&mut total_usage, u);
+                        let prompt = u.prompt_tokens();
+                        if prompt > 0 {
+                            latest_context_tokens = Some(prompt);
+                            saw_prune_after_last_context = false;
+                        }
+                    }
+                }
+                SessionEvent::ToolResult { is_error, .. } => {
+                    tool_result_count += 1;
+                    if *is_error {
+                        tool_error_count += 1;
+                    }
+                }
+                SessionEvent::Compaction {
+                    first_kept_seq,
+                    tokens_before,
+                    tokens_after,
+                    ..
+                } => {
+                    compaction_count += 1;
+                    latest_compaction = Some((*first_kept_seq, *tokens_before, *tokens_after));
+                    if let Some(after) = tokens_after.filter(|&v| v > 0) {
+                        latest_context_tokens = Some(after);
+                        saw_prune_after_last_context = false;
+                    }
+                }
+                SessionEvent::ToolResultPrune { pruned } => {
+                    for item in pruned {
+                        pruned_seqs.insert(item.target_seq);
+                    }
+                    saw_prune_after_last_context = true;
+                }
+                SessionEvent::BashExecution {
+                    exclude_from_context,
+                    ..
+                } => {
+                    bash_count += 1;
+                    if *exclude_from_context {
+                        bash_local_count += 1;
+                    }
+                }
+                SessionEvent::Trace { .. } | SessionEvent::Selection { .. } => {}
+            }
+        }
+    });
+
+    let log_only_events = total_events.saturating_sub(surface_events);
+    let title = header
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（未命名）");
+    let cwd = header
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("（未记录）");
+    let created_str = format_local_datetime_ms(header.created_at_ms);
+    let activity_str = format_relative_activity(header.updated_at_ms, now_ms);
+
+    let mut lines = vec![
+        "会话信息".to_string(),
+        String::new(),
+        format!("ID       {}", header.id),
+        format!("标题     {title}"),
+        format!("工作区   {cwd}"),
+        format!("创建     {created_str}  ·  最后活动 {activity_str}"),
+    ];
+
+    if let Some(parent_id) = header.parent_id.as_deref().filter(|s| !s.is_empty()) {
+        let lineage = match header.fork_seq {
+            Some(seq) => format!("分叉自 {} @ #{seq}", short_id(parent_id)),
+            None => format!("分叉自 {}", short_id(parent_id)),
+        };
+        lines.push(format!("谱系     {lineage}"));
+    }
+
+    lines.push(String::new());
+
+    let storage = if persisted {
+        match session_db_path {
+            Some(path) => {
+                format!(
+                    "SQLite · {}",
+                    abbreviate_home_path(&path.display().to_string())
+                )
+            }
+            None => "SQLite（已持久化）".to_string(),
+        }
+    } else {
+        "仅内存（未持久化）".to_string()
+    };
+    lines.push(format!("存储     {storage}"));
+    lines.push(format!(
+        "事件     {total_events} 条（surface {surface_events} / log-only {log_only_events}）"
+    ));
+    lines.push(format!(
+        "对话     user {user_count}  ·  assistant {assistant_count}"
+    ));
+
+    let mut tool_parts = Vec::new();
+    if tool_error_count > 0 {
+        tool_parts.push(format!(
+            "tool-result {tool_result_count}（err {tool_error_count}）"
+        ));
+    } else {
+        tool_parts.push(format!("tool-result {tool_result_count}"));
+    }
+    if bash_count > 0 {
+        if bash_local_count > 0 {
+            tool_parts.push(format!("bash {bash_count}（本地 {bash_local_count}）"));
+        } else {
+            tool_parts.push(format!("bash {bash_count}"));
+        }
+    }
+    if !pruned_seqs.is_empty() {
+        tool_parts.push(format!("prune {}", pruned_seqs.len()));
+    }
+    lines.push(format!("工具     {}", join_mid_dot(&tool_parts)));
+
+    const KNOWN_INJECTION_SOURCES: [(&str, &str); 5] = [
+        ("agent-instructions", "instructions"),
+        ("skill-catalog", "skill-catalog"),
+        ("skill-invocation", "skill-invocation"),
+        ("file-mentions", "file-mentions"),
+        ("repeat-tool-reminder", "repeat-tool-reminder"),
+    ];
+    let mut inj_parts = Vec::new();
+    for (raw_src, label) in KNOWN_INJECTION_SOURCES {
+        if let Some(count) = injection_counts.remove(raw_src)
+            && count > 0
+        {
+            inj_parts.push(format!("{label} {count}"));
+        }
+    }
+    let mut extra_sources: Vec<(String, u64)> = injection_counts
+        .into_iter()
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    extra_sources.sort_by(|a, b| a.0.cmp(&b.0));
+    for (src, count) in extra_sources {
+        inj_parts.push(format!("{src} {count}"));
+    }
+    let inj_summary = if inj_parts.is_empty() {
+        "无".to_string()
+    } else {
+        inj_parts.join(" · ")
+    };
+    lines.push(format!("注入     {inj_summary}"));
+
+    if let Some((first_kept_seq, tokens_before, tokens_after)) = latest_compaction {
+        let mut comp_parts = vec![
+            format!("{compaction_count} 次"),
+            format!("最新保留自 #{first_kept_seq}"),
+        ];
+        match (tokens_before, tokens_after) {
+            (Some(before), Some(after)) => comp_parts.push(format!(
+                "最近 {} → {}",
+                format_tokens(before),
+                format_tokens(after)
+            )),
+            (Some(before), None) => comp_parts.push(format!("压前 {}", format_tokens(before))),
+            _ => {}
+        }
+        lines.push(format!("压缩     {}", comp_parts.join(" · ")));
+    }
+
+    let prompt_total = total_usage.prompt_tokens();
+    let cache_read = total_usage.cache_read_tokens.unwrap_or(0);
+    let cache_write = total_usage.cache_write_tokens.unwrap_or(0);
+    let cache_str = match (cache_read, cache_write) {
+        (0, 0) => String::new(),
+        (cr, 0) => format!("（cache {}）", format_tokens(cr)),
+        (0, cw) => format!("（cache {} 写）", format_tokens(cw)),
+        (cr, cw) => format!(
+            "（cache {} 读 / {} 写）",
+            format_tokens(cr),
+            format_tokens(cw)
+        ),
+    };
+    lines.push(format!(
+        "Token    累计 ↑{}{}↓{}",
+        format_tokens(prompt_total),
+        if cache_str.is_empty() {
+            " "
+        } else {
+            &cache_str
+        },
+        format_tokens(total_usage.output_tokens),
+    ));
+
+    let window = app.active_context_window().max(1);
+    let effective_measured = if saw_prune_after_last_context {
+        app.last_prompt_tokens.or(latest_context_tokens)
+    } else {
+        latest_context_tokens.or(app.last_prompt_tokens)
+    };
+    let ctx_summary = if let Some(measured) = effective_measured {
+        let pct = (measured as f64 / window as f64) * 100.0;
+        format!(
+            "{} / {}（{pct:.1}%）",
+            format_tokens(measured),
+            format_context_window(window)
+        )
+    } else if surface_events == 0 {
+        format!("0 / {}（0.0%）", format_context_window(window))
+    } else {
+        let est = app
+            .side_panel_data
+            .context
+            .system_tokens
+            .saturating_add(app.side_panel_data.context.user_tokens)
+            .saturating_add(app.side_panel_data.context.assistant_tokens)
+            .saturating_add(app.side_panel_data.context.reasoning_tokens)
+            .saturating_add(app.side_panel_data.context.tool_tokens);
+        let pct = (est as f64 / window as f64) * 100.0;
+        format!(
+            "~{} / {}（{pct:.1}%）",
+            format_tokens(est),
+            format_context_window(window)
+        )
+    };
+    lines.push(format!("上下文   {ctx_summary}"));
+
+    lines.join("\n")
+}
+
 /// 将持久化会话日志投影为纯 UI 可重放的 `SessionViewData`（含 `!` 与 `!!` 本地命令记录）。
 pub fn project_session_view(
     session: &Session,
     finish_notice: impl Into<String>,
 ) -> SessionViewData {
     let header = session.header();
-    let items = session
-        .all_entries()
-        .into_iter()
-        .filter_map(|entry| match entry.event {
+    let mut total_usage = TokenUsage::default();
+    let mut saw_usage = false;
+    let mut last_prompt_tokens: Option<u64> = None;
+    let mut items = Vec::new();
+    for entry in session.all_entries() {
+        match entry.event {
             SessionEvent::User { text, images } => {
                 let display = if !images.is_empty() && !text.contains("[Image #") {
                     if text.is_empty() {
@@ -402,7 +768,7 @@ pub fn project_session_view(
                 } else {
                     text
                 };
-                Some(SessionReplayItem::User { text: display })
+                items.push(SessionReplayItem::User { text: display });
             }
             SessionEvent::ContextNotice {
                 source,
@@ -414,26 +780,42 @@ pub fn project_session_view(
                 } else {
                     text
                 };
-                Some(SessionReplayItem::ContextNotice {
+                items.push(SessionReplayItem::ContextNotice {
                     source,
                     text: display,
-                })
+                });
             }
             SessionEvent::Compaction {
                 summary,
                 first_kept_seq,
+                tokens_after,
                 ..
-            } => Some(SessionReplayItem::Compaction {
-                summary: strip_summary_wrapper(&summary),
-                first_kept_seq,
-            }),
-            SessionEvent::Assistant { blocks, .. } => Some(SessionReplayItem::Assistant { blocks }),
+            } => {
+                if let Some(after) = tokens_after.filter(|&v| v > 0) {
+                    last_prompt_tokens = Some(after);
+                }
+                items.push(SessionReplayItem::Compaction {
+                    summary: strip_summary_wrapper(&summary),
+                    first_kept_seq,
+                });
+            }
+            SessionEvent::Assistant { blocks, usage, .. } => {
+                if let Some(u) = usage {
+                    saw_usage = true;
+                    accumulate_usage(&mut total_usage, &u);
+                    let prompt = u.prompt_tokens();
+                    if prompt > 0 {
+                        last_prompt_tokens = Some(prompt);
+                    }
+                }
+                items.push(SessionReplayItem::Assistant { blocks });
+            }
             SessionEvent::ToolResult {
                 tool_call_id,
                 content,
                 is_error,
                 ..
-            } => Some(SessionReplayItem::ToolResult {
+            } => items.push(SessionReplayItem::ToolResult {
                 tool_call_id,
                 content,
                 is_error,
@@ -444,7 +826,7 @@ pub fn project_session_view(
                 exit_code,
                 cancelled,
                 exclude_from_context,
-            } => Some(SessionReplayItem::BashExecution {
+            } => items.push(SessionReplayItem::BashExecution {
                 command,
                 output,
                 exit_code,
@@ -458,19 +840,22 @@ pub fn project_session_view(
                         TraceSeverity::Warn => NoticeLevel::Warn,
                         TraceSeverity::Error => NoticeLevel::Error,
                     };
-                    Some(SessionReplayItem::Notice { level, text })
+                    items.push(SessionReplayItem::Notice { level, text });
                 }
                 SessionTraceEvent::TurnEnd { reason, .. } if reason == "truncated" => {
-                    Some(SessionReplayItem::Notice {
+                    items.push(SessionReplayItem::Notice {
                         level: NoticeLevel::Warn,
                         text: "输出因达到 max_tokens 上限被截断，回复可能不完整".to_string(),
-                    })
+                    });
                 }
-                _ => None,
+                _ => {}
             },
-            SessionEvent::ToolResultPrune { .. } | SessionEvent::Selection { .. } => None,
-        })
-        .collect();
+            SessionEvent::ToolResultPrune { .. } | SessionEvent::Selection { .. } => {}
+        }
+    }
+    if saw_usage {
+        total_usage.total_tokens = Some(total_usage.grand_total());
+    }
     SessionViewData {
         session_id: session.id.clone(),
         session_title: header.title,
@@ -481,6 +866,8 @@ pub fn project_session_view(
             model: sel.model,
             reasoning_effort: sel.reasoning_effort,
         }),
+        total_usage,
+        last_prompt_tokens,
     }
 }
 
@@ -1961,6 +2348,10 @@ async fn handle_action(
             } else {
                 app.push_notice(NoticeLevel::Warn, "trajectory 服务未启用");
             }
+        }
+        AppAction::ShowSessionInfo => {
+            let report = build_session_info_report(ctx, config, active_session, app);
+            app.push_notice(NoticeLevel::Info, report);
         }
         AppAction::ShowTools => {
             if let Some(rt) = ctx.get::<ToolRuntime>("tools") {
@@ -3795,6 +4186,263 @@ mod tests {
                 text,
             } if text.contains("max_tokens")
         )));
+
+        ctx.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn build_session_info_report_covers_full_identity_ledger_and_empty_omissions() {
+        use cordis::Service;
+        use mizar_session::{
+            CompactionDigest, PrunedToolResult, SessionContextExt, SessionCreateOptions,
+            SessionEvent, SessionStore, SessionTraceEvent,
+        };
+
+        let ctx = cordis::Context::new();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let store = ctx.sessions().unwrap();
+
+        // 1. 全要素会话：分叉 + 多种表面/审计事件 + 剪枝 + 压缩 + cache_read/cache_write 用量
+        let parent = store.create_with(SessionCreateOptions {
+            id: Some("3a91c2de-1111-4222-8333-444455556666".into()),
+            cwd: Some("/Users/moguw/workspace/dsh-space/mizar".into()),
+            ..Default::default()
+        });
+        parent.append(SessionEvent::user("parent turn"));
+
+        let child_id = "6f3d2c1a-8b4e-4f2a-9c71-2e5d8a0b4f13";
+        let child = store
+            .fork(
+                &parent.id,
+                1,
+                SessionCreateOptions {
+                    id: Some(child_id.into()),
+                    cwd: Some("/Users/moguw/workspace/dsh-space/mizar".into()),
+                    title: Some("feat(session): 新增 /session 命令".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        child.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
+        child.record_selection(Some("mock".into()), Some("mock-v1".into()), None);
+        child.append(SessionEvent::context_notice(
+            "agent-instructions",
+            "AGENTS.md",
+        ));
+        child.append(SessionEvent::context_notice("skill-catalog", "skills"));
+        child.append(SessionEvent::context_notice("file-mentions", "src/lib.rs"));
+        child.append(SessionEvent::Assistant {
+            blocks: vec![mizar_llm::ContentBlock::Text {
+                text: "step 1".into(),
+            }],
+            replay: None,
+            usage: Some(mizar_llm::TokenUsage {
+                input_tokens: 10_000,
+                output_tokens: 8_700,
+                cache_read_tokens: Some(40_000),
+                cache_write_tokens: Some(2_000),
+                ..Default::default()
+            }),
+        });
+        child.append(SessionEvent::ToolResult {
+            tool_call_id: "t1".into(),
+            name: "read".into(),
+            content: "ok".into(),
+            is_error: false,
+        });
+        child.append(SessionEvent::ToolResult {
+            tool_call_id: "t2".into(),
+            name: "bash".into(),
+            content: "boom".into(),
+            is_error: true,
+        });
+        child.append(SessionEvent::BashExecution {
+            command: "cargo check".into(),
+            output: "ok".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            exclude_from_context: false,
+        });
+        child.append(SessionEvent::BashExecution {
+            command: "git status".into(),
+            output: "clean".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            exclude_from_context: true,
+        });
+        child.append_prune(vec![
+            PrunedToolResult {
+                target_seq: 6,
+                replacement: "pruned".into(),
+                original_chars: 9000,
+            },
+            PrunedToolResult {
+                target_seq: 7,
+                replacement: "pruned".into(),
+                original_chars: 9000,
+            },
+        ]);
+        child.compact_at(
+            "checkpoint summary",
+            6,
+            Some(42_100),
+            Some(6_800),
+            CompactionDigest::default(),
+        );
+        child.append(SessionEvent::Assistant {
+            blocks: vec![mizar_llm::ContentBlock::Text {
+                text: "step 2".into(),
+            }],
+            replay: None,
+            usage: Some(mizar_llm::TokenUsage {
+                input_tokens: 14_300,
+                output_tokens: 10_000,
+                cache_read_tokens: Some(10_000),
+                ..Default::default()
+            }),
+        });
+
+        // 刻意把 app.workspace 设成不同路径，验证工作区展示的是会话自身 cwd 而非 app.workspace
+        let app = AppState::new(
+            PathBuf::from("/completely/different/workspace"),
+            &child.id,
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        // 测试前快照：只读查询不能改写会话头或条目数
+        let entries_before = child.all_entries().len();
+        let header_before = child.header();
+
+        let home_dir = std::env::var_os("HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let fake_db = home_dir
+            .as_ref()
+            .map(|h| h.join(".mizar/sessions.sqlite"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/.mizar/sessions.sqlite"));
+        let now_ms = header_before.updated_at_ms + 3 * 60 * 1_000;
+        let report =
+            super::build_session_info_report_at(&child, &app, true, Some(&fake_db), now_ms);
+
+        assert_eq!(child.all_entries().len(), entries_before);
+        assert_eq!(child.header(), header_before);
+
+        let report_lines: Vec<&str> = report.lines().collect();
+        assert_eq!(report_lines.len(), 16, "report:\n{report}");
+        assert!(report.contains(&format!("ID       {child_id}")), "{report}");
+        assert!(
+            report.contains("标题     feat(session): 新增 /session 命令"),
+            "{report}"
+        );
+        assert!(
+            report.contains("工作区   /Users/moguw/workspace/dsh-space/mizar"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("/completely/different/workspace"),
+            "should display session cwd, not app.workspace:\n{report}"
+        );
+        let expected_created = super::format_local_datetime_ms(header_before.created_at_ms);
+        assert!(
+            report.contains(&format!(
+                "创建     {expected_created}  ·  最后活动 3 分钟前"
+            )),
+            "{report}"
+        );
+        assert!(report.contains("谱系     分叉自 3a91c2de @ #1"), "{report}");
+        if home_dir.is_some() {
+            assert!(
+                report.contains("存储     SQLite · ~/.mizar/sessions.sqlite"),
+                "{report}"
+            );
+        }
+        // 14 个事件（1 fork user + 13 追加）：log-only = TurnStart + Selection + !!bash + prune = 4，surface = 10
+        assert!(
+            report.contains("事件     14 条（surface 10 / log-only 4）"),
+            "{report}"
+        );
+        assert!(
+            report.contains("对话     user 1  ·  assistant 2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("工具     tool-result 2（err 1）· bash 2（本地 1）· prune 2"),
+            "{report}"
+        );
+        assert!(
+            report.contains("注入     instructions 1 · skill-catalog 1 · file-mentions 1"),
+            "{report}"
+        );
+        assert!(
+            report.contains("压缩     1 次 · 最新保留自 #6 · 最近 42.1k → 6.8k"),
+            "{report}"
+        );
+        // prompt 累计 = (10000+40000+2000) + (14300+10000) = 76300 -> 76.3k
+        // cache_read = 50.0k, cache_write = 2.0k, output = 18.7k
+        assert!(
+            report.contains("Token    累计 ↑76.3k（cache 50.0k 读 / 2.0k 写）↓18.7k"),
+            "{report}"
+        );
+        // 最近一次请求 prompt = 14300 + 10000 = 24.3k / 128k（19.0%）
+        assert!(
+            report.contains("上下文   24.3k / 128k（19.0%）"),
+            "{report}"
+        );
+
+        // 2. 无谱系、无压缩、--no-persist 空白会话：省略「谱系」「压缩」，共 14 行
+        let fresh = store.create(None);
+        let fresh_header = fresh.header();
+        let fresh_app = AppState::new(PathBuf::from("."), &fresh.id, Vec::new(), None, None, None);
+        let fresh_report = super::build_session_info_report_at(
+            &fresh,
+            &fresh_app,
+            false,
+            None,
+            fresh_header.updated_at_ms + 5_000,
+        );
+        let fresh_lines: Vec<&str> = fresh_report.lines().collect();
+        assert_eq!(fresh_lines.len(), 14, "fresh_report:\n{fresh_report}");
+        assert!(!fresh_report.contains("谱系"), "{fresh_report}");
+        assert!(!fresh_report.contains("压缩"), "{fresh_report}");
+        assert!(
+            fresh_report.contains("标题     （未命名）"),
+            "{fresh_report}"
+        );
+        assert!(
+            fresh_report.contains("存储     仅内存（未持久化）"),
+            "{fresh_report}"
+        );
+        assert!(fresh_report.contains("注入     无"), "{fresh_report}");
+        assert!(
+            fresh_report.contains("Token    累计 ↑0 ↓0"),
+            "{fresh_report}"
+        );
+        assert!(
+            fresh_report.contains("上下文   0 / 128k（0.0%）"),
+            "{fresh_report}"
+        );
+        assert!(fresh_report.contains("最后活动 刚刚"), "{fresh_report}");
+
+        // 3. project_session_view 同样汇总 Assistant.usage，供 --resume 恢复状态栏与侧栏读数
+        let view = super::project_session_view(&child, "resumed");
+        assert_eq!(view.total_usage.input_tokens, 24_300);
+        assert_eq!(view.total_usage.output_tokens, 18_700);
+        assert_eq!(view.total_usage.cache_read_tokens, Some(50_000));
+        assert_eq!(view.total_usage.cache_write_tokens, Some(2_000));
+        assert_eq!(view.total_usage.total_tokens, Some(95_000));
+        assert_eq!(view.last_prompt_tokens, Some(24_300));
+
+        // 相对时间区间检查
+        assert_eq!(
+            super::format_relative_activity(1_000, 1_000 + 2 * 3_600_000),
+            "2 小时前"
+        );
+        assert_eq!(
+            super::format_relative_activity(1_000, 1_000 + 3 * 86_400_000),
+            "3 天前"
+        );
 
         ctx.fiber().dispose().await;
     }
