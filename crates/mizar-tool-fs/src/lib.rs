@@ -227,32 +227,28 @@ mod tests {
 
         let tools = app.tools().unwrap();
         let list_res = tools
-            .execute(ToolExecution {
-                name: "list_dir".into(),
-                args: json!({ "path": "." }),
-                session_id: None,
-            })
+            .execute(ToolExecution::new("list_dir", json!({ "path": "." }), None))
             .await;
         assert!(!list_res.is_error);
         assert_eq!(list_res.content, "hello.txt\nsub/");
 
         let read_res = tools
-            .execute(ToolExecution {
-                name: "read_file".into(),
-                args: json!({ "path": "hello.txt" }),
-                session_id: None,
-            })
+            .execute(ToolExecution::new(
+                "read_file",
+                json!({ "path": "hello.txt" }),
+                None,
+            ))
             .await;
         assert!(!read_res.is_error);
         assert!(read_res.content.starts_with("你好"));
         assert!(read_res.content.contains("只读了前 7 字节"));
 
         let escape_res = tools
-            .execute(ToolExecution {
-                name: "read_file".into(),
-                args: json!({ "path": "../outside.txt" }),
-                session_id: None,
-            })
+            .execute(ToolExecution::new(
+                "read_file",
+                json!({ "path": "../outside.txt" }),
+                None,
+            ))
             .await;
         assert!(escape_res.is_error);
         assert!(escape_res.content.contains("不允许访问根目录以外的路径"));

@@ -67,6 +67,7 @@ struct RecordedRequest {
 enum MockStep {
     CompletionsText(String),
     CompletionsTruncated(String),
+    CompletionsReasoningOnly(String),
     CompletionsToolCall {
         id: String,
         name: String,
@@ -149,6 +150,16 @@ async fn start_gateway(state: Arc<GatewayState>) -> String {
             MockStep::CompletionsTruncated(text) => {
                 let delta1 = json!({"choices":[{"delta":{"content": text}}]}).to_string();
                 let finish = json!({"choices":[{"delta":{},"finish_reason":"length"}]}).to_string();
+                let sse = format!("data: {delta1}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }
+            MockStep::CompletionsReasoningOnly(reasoning) => {
+                let delta1 =
+                    json!({"choices":[{"delta":{"reasoning_content": reasoning}}]}).to_string();
+                let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string();
                 let sse = format!("data: {delta1}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
                 Response::builder()
                     .header("content-type", "text/event-stream")
@@ -1391,4 +1402,197 @@ fn preserves_help_version_and_update_cli() {
             "args {args:?} produced empty stdout"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_supports_multi_turn_continue_resume_json_and_max_tokens() {
+    let tmp = TempRoot::new("exec_multiturn_json");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let state = GatewayState::new(vec![], MockStep::HangForever);
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+
+    // 1. 第一轮：使用 --json 开启持久化会话并获取 session_id
+    state.set_script(vec![MockStep::CompletionsText(
+        "Turn 1 acknowledged ALPHA-42".into(),
+    )]);
+    let mut c1 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "m1",
+            "--json",
+            "Remember secret ALPHA-42",
+        ],
+    );
+    c1.env("API_KEY", "sk-test");
+    let o1 = run_with_stdin(c1, None).await;
+    assert!(
+        o1.status.success(),
+        "turn 1 failed: {}",
+        String::from_utf8_lossy(&o1.stderr)
+    );
+    let v1: Value = serde_json::from_slice(&o1.stdout).expect("turn 1 stdout must be valid JSON");
+    let sid = v1["session_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .expect("missing session_id")
+        .to_string();
+    assert_eq!(v1["resumed"].as_bool(), Some(false), "{v1}");
+    assert_eq!(
+        v1["text"].as_str(),
+        Some("Turn 1 acknowledged ALPHA-42"),
+        "{v1}"
+    );
+    assert!(v1["duration_ms"].is_number(), "{v1}");
+
+    // 2. 第二轮：-c (--continue) + --output-format json 续接最近会话
+    state.set_script(vec![MockStep::CompletionsText(
+        "The code is ALPHA-42".into(),
+    )]);
+    let mut c2 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "-c",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "m1",
+            "--output-format",
+            "json",
+            "What was the code?",
+        ],
+    );
+    c2.env("API_KEY", "sk-test");
+    let o2 = run_with_stdin(c2, None).await;
+    assert!(
+        o2.status.success(),
+        "turn 2 failed: {}",
+        String::from_utf8_lossy(&o2.stderr)
+    );
+    let v2: Value = serde_json::from_slice(&o2.stdout).expect("turn 2 stdout must be valid JSON");
+    assert_eq!(v2["session_id"].as_str(), Some(sid.as_str()), "{v2}");
+    assert_eq!(v2["resumed"].as_bool(), Some(true), "{v2}");
+    assert_eq!(v2["session_turns"].as_u64(), Some(2), "{v2}");
+    assert_eq!(v2["text"].as_str(), Some("The code is ALPHA-42"), "{v2}");
+
+    // 3. 第三轮：--resume <id> + --max-tokens 256 + --json
+    state.set_script(vec![MockStep::CompletionsText("Confirmed turn 3".into())]);
+    let mut c3 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--resume",
+            &sid,
+            "--max-tokens",
+            "256",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "m1",
+            "--json",
+            "Final verification turn",
+        ],
+    );
+    c3.env("API_KEY", "sk-test");
+    let o3 = run_with_stdin(c3, None).await;
+    assert!(
+        o3.status.success(),
+        "turn 3 failed: {}",
+        String::from_utf8_lossy(&o3.stderr)
+    );
+    let v3: Value = serde_json::from_slice(&o3.stdout).expect("turn 3 stdout must be valid JSON");
+    assert_eq!(v3["session_id"].as_str(), Some(sid.as_str()), "{v3}");
+    assert_eq!(v3["resumed"].as_bool(), Some(true), "{v3}");
+    assert_eq!(v3["session_turns"].as_u64(), Some(3), "{v3}");
+    assert_eq!(v3["text"].as_str(), Some("Confirmed turn 3"), "{v3}");
+
+    {
+        let reqs = state.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        let msgs2 = reqs[1].body["messages"].to_string();
+        assert!(msgs2.contains("Remember secret ALPHA-42"), "{msgs2}");
+        assert!(msgs2.contains("Turn 1 acknowledged ALPHA-42"), "{msgs2}");
+        assert!(msgs2.contains("What was the code?"), "{msgs2}");
+
+        let max_tok = reqs[2]
+            .body
+            .get("max_completion_tokens")
+            .or_else(|| reqs[2].body.get("max_tokens"))
+            .and_then(Value::as_u64);
+        assert_eq!(max_tok, Some(256), "{}", reqs[2].body);
+        let msgs3 = reqs[2].body["messages"].to_string();
+        assert!(msgs3.contains("Remember secret ALPHA-42"), "{msgs3}");
+        assert!(msgs3.contains("The code is ALPHA-42"), "{msgs3}");
+        assert!(msgs3.contains("Final verification turn"), "{msgs3}");
+    }
+
+    // 4. 拒绝用例：exec 下的裸 -r、--no-persist 组合、--isolated 组合、不存在的会话 ID
+    for bad_args in [
+        vec!["exec", "-r", "--", "hello"],
+        vec!["exec", "-c", "--no-persist", "hello"],
+        vec!["exec", "-c", "--isolated", "hello"],
+    ] {
+        let out = run_with_stdin(clean_env_cmd(&home, &ws, &bad_args), None).await;
+        assert!(
+            !out.status.success(),
+            "args {bad_args:?} unexpectedly succeeded"
+        );
+        assert!(out.stdout.is_empty(), "args {bad_args:?} leaked stdout");
+    }
+
+    let mut c_missing = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--resume",
+            "missing-session-id-999",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "m1",
+            "hello",
+        ],
+    );
+    c_missing.env("API_KEY", "sk-test");
+    let o_missing = run_with_stdin(c_missing, None).await;
+    assert!(!o_missing.status.success());
+    assert!(o_missing.stdout.is_empty());
+
+    // 5. Reasoning-only 且无可见正文 -> 绝不能静默成功，必须返回非零并带 empty_response 诊断
+    state.set_script(vec![MockStep::CompletionsReasoningOnly(
+        "internal chain of thought without answer".into(),
+    )]);
+    let mut c_reason = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--no-persist",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "m1",
+            "answer concisely",
+        ],
+    );
+    c_reason.env("API_KEY", "sk-test");
+    let o_reason = run_with_stdin(c_reason, None).await;
+    assert!(!o_reason.status.success());
+    assert!(o_reason.stdout.is_empty());
+    let reason_err = String::from_utf8_lossy(&o_reason.stderr);
+    assert!(reason_err.contains("empty_response"), "{reason_err}");
 }

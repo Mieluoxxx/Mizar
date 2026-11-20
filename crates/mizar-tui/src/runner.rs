@@ -197,28 +197,26 @@ fn handle_term_event_dirty(app: &mut AppState, ev: TermEvent) -> (AppAction, boo
     }
 }
 
-fn process_ui_event_dirty(
+fn process_loop_ui_msg_dirty(
     app: &mut AppState,
-    active_cancel: &mut Option<CancellationToken>,
-    pending_steer: &mut Option<PendingPrompt>,
-    user_cancelled: &mut bool,
-    event: UiEvent,
+    task_state: &mut RunnerTaskState,
+    msg: LoopUiMsg,
 ) -> (AppAction, bool) {
     let is_delta = matches!(
-        event,
-        UiEvent::TextDelta { .. } | UiEvent::ReasoningDelta { .. }
+        msg,
+        LoopUiMsg::Bus(UiEvent::TextDelta { .. } | UiEvent::ReasoningDelta { .. })
     );
     let had_assistant = matches!(app.items.last(), Some(ChatItem::Assistant { .. }));
     let prev_reveal_gen = app.reveal.generation();
 
-    let action = process_ui_event(app, active_cancel, pending_steer, user_cancelled, event);
+    let action = process_loop_ui_msg(app, task_state, msg);
     if action != AppAction::None {
         return (action, true);
     }
 
     let can_defer_to_reveal = is_delta
         && app.reveal.enabled
-        && app.is_busy
+        && app.is_busy()
         && had_assistant
         && app.reveal.generation() == prev_reveal_gen;
     (AppAction::None, !can_defer_to_reveal)
@@ -1166,75 +1164,210 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
         .collect()
 }
 
+/// 事件循环内部统一 FIFO 消息信封：保证总线事件（如 `TurnEnd`）与后台任务结束事件（如 `RunFinished`）
+/// 严格按投递顺序到达，同时为本地派生任务附带 `(run_id, session_id)` 代次标识，杜绝过期任务或旧会话污染新状态。
+#[derive(Debug, Clone)]
+enum LoopUiMsg {
+    Bus(UiEvent),
+    Task {
+        run_id: u64,
+        session_id: String,
+        event: UiEvent,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTaskKind {
+    AgentRun,
+    LocalBash,
+    ManualCompaction,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveTask {
+    run_id: u64,
+    session_id: String,
+    kind: ActiveTaskKind,
+    cancel: CancellationToken,
+    pending_steer: Option<PendingPrompt>,
+    user_cancelled: bool,
+}
+
+#[derive(Debug, Default)]
+struct RunnerTaskState {
+    next_run_id: u64,
+    active: Option<ActiveTask>,
+}
+
+impl RunnerTaskState {
+    fn start(&mut self, session_id: String, kind: ActiveTaskKind) -> (u64, CancellationToken) {
+        if let Some(prev) = self.active.take() {
+            prev.cancel.cancel();
+        }
+        self.next_run_id = self.next_run_id.wrapping_add(1).max(1);
+        let run_id = self.next_run_id;
+        let cancel = CancellationToken::new();
+        self.active = Some(ActiveTask {
+            run_id,
+            session_id,
+            kind,
+            cancel: cancel.clone(),
+            pending_steer: None,
+            user_cancelled: false,
+        });
+        (run_id, cancel)
+    }
+
+    fn cancel_active(&mut self, steer: Option<PendingPrompt>) {
+        if let Some(task) = self.active.as_mut() {
+            match steer {
+                Some(prompt) => {
+                    task.pending_steer = Some(prompt);
+                    task.user_cancelled = false;
+                }
+                None => {
+                    task.pending_steer = None;
+                    task.user_cancelled = true;
+                }
+            }
+            task.cancel.cancel();
+        }
+    }
+
+    fn abort_for_session_switch(&mut self) {
+        if let Some(prev) = self.active.take() {
+            prev.cancel.cancel();
+        }
+    }
+
+    fn is_current(&self, run_id: u64, msg_session_id: &str, current_session_id: &str) -> bool {
+        self.active.as_ref().is_some_and(|cur| {
+            cur.run_id == run_id
+                && cur.session_id == msg_session_id
+                && msg_session_id == current_session_id
+        })
+    }
+
+    fn cancel_token(&self) -> Option<&CancellationToken> {
+        self.active.as_ref().map(|t| &t.cancel)
+    }
+
+    fn finish_if_current(
+        &mut self,
+        run_id: Option<u64>,
+        msg_session_id: Option<&str>,
+        current_session_id: &str,
+        expected_kind: ActiveTaskKind,
+    ) -> Option<ActiveTask> {
+        let Some(cur) = self.active.as_ref() else {
+            return (run_id.is_none()).then(|| ActiveTask {
+                run_id: 0,
+                session_id: current_session_id.to_string(),
+                kind: expected_kind,
+                cancel: CancellationToken::new(),
+                pending_steer: None,
+                user_cancelled: false,
+            });
+        };
+        if let Some(rid) = run_id
+            && cur.run_id != rid
+        {
+            return None;
+        }
+        if let Some(sid) = msg_session_id
+            && (sid != cur.session_id || sid != current_session_id)
+        {
+            return None;
+        }
+        if cur.kind != expected_kind {
+            return None;
+        }
+        self.active.take()
+    }
+}
+
 /// 订阅当前会话相关的 Agent 与轨迹事件并投递到 `tx`。
 pub fn subscribe_session_events(
     ctx: &Context,
     session_id_rx: Arc<std::sync::RwLock<String>>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<Vec<DisposableHandle>, CordisError> {
+    subscribe_session_events_into(ctx, session_id_rx, move |ev| {
+        let _ = tx.send(ev);
+    })
+}
+
+fn subscribe_session_events_into<F>(
+    ctx: &Context,
+    session_id_rx: Arc<std::sync::RwLock<String>>,
+    send: F,
+) -> Result<Vec<DisposableHandle>, CordisError>
+where
+    F: Fn(UiEvent) + Clone + Send + Sync + 'static,
+{
     let mut handles = Vec::new();
     let is_current = move |sid: &str| *session_id_rx.read().unwrap() == sid;
 
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(EVENT_AGENT_STATUS, move |ev: &AgentStatusEvent| {
             if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::Status(to_ui_status(ev.status)));
+                send(UiEvent::Status(to_ui_status(ev.status)));
             }
         })?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::TurnStart { turn: ev.turn });
+                    send(UiEvent::TurnStart { turn: ev.turn });
                 }
             })?,
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
             if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::TurnEnd {
+                send(UiEvent::TurnEnd {
                     reason: to_ui_turn_end_reason(ev.reason.clone()),
                 });
             }
         })?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::StepStart { ts_ms: ev.ts_ms });
+                    send(UiEvent::StepStart { ts_ms: ev.ts_ms });
                 }
             })?,
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_AGENT_STEP_FIRST_TOKEN,
             move |ev: &AgentStepFirstTokenEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::FirstToken { ts_ms: ev.ts_ms });
+                    send(UiEvent::FirstToken { ts_ms: ev.ts_ms });
                 }
             },
         )?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
             if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::StepEnd {
+                send(UiEvent::StepEnd {
                     step: ev.step,
                     ts_ms: ev.ts_ms,
                     outcome: to_ui_step_outcome(&ev.outcome),
@@ -1244,12 +1377,12 @@ pub fn subscribe_session_events(
         })?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::TextDelta {
+                    send(UiEvent::TextDelta {
                         text: ev.text.clone(),
                         ts_ms: ev.ts_ms,
                     });
@@ -1258,13 +1391,13 @@ pub fn subscribe_session_events(
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_AGENT_REASONING_DELTA,
             move |ev: &AgentReasoningDeltaEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::ReasoningDelta {
+                    send(UiEvent::ReasoningDelta {
                         text: ev.text.clone(),
                         ts_ms: ev.ts_ms,
                     });
@@ -1273,23 +1406,23 @@ pub fn subscribe_session_events(
         )?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::ToolCall(ev.call.clone()));
+                    send(UiEvent::ToolCall(ev.call.clone()));
                 }
             })?,
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::ToolUpdate {
+                    send(UiEvent::ToolUpdate {
                         call_id: ev.tool_call_id.clone(),
                         name: ev.name.clone(),
                         preview: ev.preview.clone(),
@@ -1299,12 +1432,12 @@ pub fn subscribe_session_events(
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::ToolResult {
+                    send(UiEvent::ToolResult {
                         call_id: ev.tool_call_id.clone(),
                         name: ev.name.clone(),
                         content: ev.content.clone(),
@@ -1317,33 +1450,33 @@ pub fn subscribe_session_events(
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(EVENT_AGENT_USAGE, move |ev: &AgentUsageEvent| {
             if check(&ev.session.id) {
-                let _ = tx.send(UiEvent::Usage(ev.usage));
+                send(UiEvent::Usage(ev.usage));
             }
         })?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_TRAJECTORY_ANOMALY,
             move |ev: &TrajectoryAnomalyEvent| {
                 if check(&ev.session_id) {
-                    let _ = tx.send(UiEvent::Anomaly(ev.finding.summary.clone()));
+                    send(UiEvent::Anomaly(ev.finding.summary.clone()));
                 }
             },
         )?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_COMPACTION_START, move |ev: &CompactionStartEvent| {
                 if check(&ev.session_id) {
-                    let _ = tx.send(UiEvent::CompactionStarted {
+                    send(UiEvent::CompactionStarted {
                         trigger: ev.trigger.as_str().to_string(),
                     });
                 }
@@ -1351,13 +1484,13 @@ pub fn subscribe_session_events(
         );
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_COMPACTION_PROGRESS,
             move |ev: &CompactionProgressEvent| {
                 if check(&ev.session_id) {
-                    let _ = tx.send(UiEvent::CompactionProgress {
+                    send(UiEvent::CompactionProgress {
                         stage: ev.stage.clone(),
                         delta_chars: ev.delta_chars,
                     });
@@ -1366,12 +1499,12 @@ pub fn subscribe_session_events(
         )?);
     }
     {
-        let tx = tx.clone();
+        let send = send.clone();
         let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_COMPACTION_END, move |ev: &CompactionEndEvent| {
                 if check(&ev.session_id) {
-                    let _ = tx.send(UiEvent::CompactionFinished {
+                    send(UiEvent::CompactionFinished {
                         outcome: ev.outcome.as_str().to_string(),
                         tokens_before: Some(ev.tokens_before),
                         tokens_after: Some(ev.tokens_after),
@@ -1386,13 +1519,13 @@ pub fn subscribe_session_events(
         );
     }
     {
-        let tx = tx.clone();
+        let send = send;
         let check = is_current;
         handles.push(ctx.on(
             EVENT_SESSION_TITLE_UPDATED,
             move |ev: &SessionTitleUpdatedPayload| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::SessionTitleUpdated(ev.title.clone()));
+                    send(UiEvent::SessionTitleUpdated(ev.title.clone()));
                 }
             },
         )?);
@@ -1546,6 +1679,7 @@ pub async fn run_tui_with_summary(
     };
     let providers = ctx.llm().map(|l| l.provider_infos()).unwrap_or_default();
 
+    let (loop_tx, mut loop_rx) = mpsc::unbounded_channel::<LoopUiMsg>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
 
     // 重定向 Cordis 日志，确保任何插件输出都不会污染终端 stdout
@@ -1559,7 +1693,12 @@ pub async fn run_tui_with_summary(
 
     let mut active_session = Arc::clone(&initial_session);
     let active_sid = Arc::new(std::sync::RwLock::new(active_session.id.clone()));
-    let mut handles = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone())?;
+    let mut handles = {
+        let bus_tx = loop_tx.clone();
+        subscribe_session_events_into(&ctx, Arc::clone(&active_sid), move |ev| {
+            let _ = bus_tx.send(LoopUiMsg::Bus(ev));
+        })?
+    };
 
     let mut app = AppState::new(
         config.workspace.clone(),
@@ -1660,7 +1799,12 @@ pub async fn run_tui_with_summary(
         mode: app.approval_mode,
         always_allowed: app.always_allowed_tools.clone(),
     }));
-    let pre_exec_handle = register_approval_hook(&ctx, ui_tx.clone(), Arc::clone(&approval_snap))?;
+    let pre_exec_handle = register_approval_hook(
+        &ctx,
+        loop_tx.clone(),
+        Arc::clone(&active_sid),
+        Arc::clone(&approval_snap),
+    )?;
     let mention_hook_handle = crate::mentions::register_mention_hook(
         &ctx,
         config.workspace.clone(),
@@ -1702,9 +1846,7 @@ pub async fn run_tui_with_summary(
     let mut reveal_tick = tokio::time::interval(Duration::from_millis(33));
     reveal_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut active_cancel: Option<CancellationToken> = None;
-    let mut pending_steer: Option<PendingPrompt> = None;
-    let mut user_cancelled = false;
+    let mut task_state = RunnerTaskState::default();
     let mut needs_redraw = true;
 
     let update_check_task = if config.check_for_updates {
@@ -1722,7 +1864,7 @@ pub async fn run_tui_with_summary(
     };
 
     while !app.should_quit {
-        if app.screen_mode == ScreenMode::Inline && !app.is_busy && !app.is_bash_running {
+        if app.screen_mode == ScreenMode::Inline && !app.is_running_activity() {
             flush_inline_scrollback(&mut terminal.terminal, &mut app);
         }
         if needs_redraw {
@@ -1769,25 +1911,48 @@ pub async fn run_tui_with_summary(
                     None => (AppAction::Quit, true),
                 }
             }
-            maybe_ui = ui_rx.recv() => {
-                match maybe_ui {
-                    Some(ev) => {
-                        let (mut next_action, mut dirty) = process_ui_event_dirty(
+            maybe_loop = loop_rx.recv() => {
+                match maybe_loop {
+                    Some(msg) => {
+                        let (mut next_action, mut dirty) = process_loop_ui_msg_dirty(
                             &mut app,
-                            &mut active_cancel,
-                            &mut pending_steer,
-                            &mut user_cancelled,
-                            ev,
+                            &mut task_state,
+                            msg,
                         );
                         // 把缓冲区积压的 delta 一次性排空，降低高并发流式输出时的重绘次数
                         if next_action == AppAction::None {
-                            while let Ok(more) = ui_rx.try_recv() {
-                                let (act, ev_dirty) = process_ui_event_dirty(
+                            while let Ok(more) = loop_rx.try_recv() {
+                                let (act, ev_dirty) = process_loop_ui_msg_dirty(
                                     &mut app,
-                                    &mut active_cancel,
-                                    &mut pending_steer,
-                                    &mut user_cancelled,
+                                    &mut task_state,
                                     more,
+                                );
+                                dirty |= ev_dirty;
+                                if act != AppAction::None {
+                                    next_action = act;
+                                    break;
+                                }
+                            }
+                        }
+                        (next_action, dirty)
+                    }
+                    None => (AppAction::Quit, true),
+                }
+            }
+            maybe_ui = ui_rx.recv() => {
+                match maybe_ui {
+                    Some(ev) => {
+                        let (mut next_action, mut dirty) = process_loop_ui_msg_dirty(
+                            &mut app,
+                            &mut task_state,
+                            LoopUiMsg::Bus(ev),
+                        );
+                        if next_action == AppAction::None {
+                            while let Ok(more) = ui_rx.try_recv() {
+                                let (act, ev_dirty) = process_loop_ui_msg_dirty(
+                                    &mut app,
+                                    &mut task_state,
+                                    LoopUiMsg::Bus(more),
                                 );
                                 dirty |= ev_dirty;
                                 if act != AppAction::None {
@@ -1805,9 +1970,9 @@ pub async fn run_tui_with_summary(
                 let ticked = app.reveal.tick();
                 (AppAction::None, ticked || app.effort_ignition_at.is_some())
             }
-            _ = spinner_tick.tick(), if app.is_busy || app.is_bash_running || (!app.terminal_focused && (app.reveal.has_pending() || app.effort_ignition_at.is_some())) => {
+            _ = spinner_tick.tick(), if app.is_running_activity() || (!app.terminal_focused && (app.reveal.has_pending() || app.effort_ignition_at.is_some())) => {
                 let mut dirty = false;
-                if app.is_busy || app.is_bash_running {
+                if app.is_running_activity() {
                     app.spinner_tick = app.spinner_tick.wrapping_add(1);
                     dirty = true;
                 }
@@ -1828,10 +1993,8 @@ pub async fn run_tui_with_summary(
             &mut terminal,
             &mut term_stream,
             &active_sid,
-            &ui_tx,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
+            &loop_tx,
+            &mut task_state,
             action,
         )
         .await;
@@ -1849,10 +2012,9 @@ pub async fn run_tui_with_summary(
     if let Some(task) = update_check_task {
         task.abort();
     }
+    app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     emit_program_status(ProgramStatusState::Idle, None, None);
-    if let Some(cancel) = active_cancel.take() {
-        cancel.cancel();
-    }
+    task_state.abort_for_session_switch();
     drop(mention_hook_handle.dispose());
     drop(pre_exec_handle.dispose());
     if let Some(cleanup) = reply_guidance {
@@ -1878,7 +2040,8 @@ struct ApprovalSnapshot {
 
 fn register_approval_hook(
     ctx: &Context,
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    loop_tx: mpsc::UnboundedSender<LoopUiMsg>,
+    active_sid: Arc<std::sync::RwLock<String>>,
     approval_snap: Arc<RwLock<ApprovalSnapshot>>,
 ) -> Result<DisposableHandle, CordisError> {
     let ctx_lookup = ctx.clone();
@@ -1886,7 +2049,8 @@ fn register_approval_hook(
         EVENT_TOOLS_PRE_EXECUTE,
         move |exec: ToolExecution,
               next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
-            let ui_tx = ui_tx.clone();
+            let loop_tx = loop_tx.clone();
+            let active_sid = Arc::clone(&active_sid);
             let snap_lock = Arc::clone(&approval_snap);
             let ctx_inner = ctx_lookup.clone();
             Box::pin(async move {
@@ -1907,16 +2071,25 @@ fn register_approval_hook(
                     return next.call(exec).await;
                 }
 
+                // 若当前工具来自已经切换走的旧会话，直接拒绝，避免弹出孤儿审批框。
+                if exec
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|sid| sid != *active_sid.read().unwrap())
+                {
+                    return PreExecuteDecision::deny("会话已切换，取消过期审批请求");
+                }
+
                 let args_preview = serde_json::to_string_pretty(&exec.args)
                     .unwrap_or_else(|_| exec.args.to_string());
                 let args_preview = truncate_display(&args_preview.replace('\n', " "), 400);
                 let (tx, rx) = futures::channel::oneshot::channel();
-                if ui_tx
-                    .send(UiEvent::ApprovalRequested {
+                if loop_tx
+                    .send(LoopUiMsg::Bus(UiEvent::ApprovalRequested {
                         tool_name: exec.name.clone(),
                         args_preview,
                         responder: Arc::new(Mutex::new(Some(tx))),
-                    })
+                    }))
                     .is_err()
                 {
                     return next.call(exec).await;
@@ -1984,35 +2157,78 @@ impl PendingPrompt {
     }
 }
 
-fn process_ui_event(
+fn process_loop_ui_msg(
     app: &mut AppState,
-    active_cancel: &mut Option<CancellationToken>,
-    pending_steer: &mut Option<PendingPrompt>,
-    user_cancelled: &mut bool,
-    event: UiEvent,
+    task_state: &mut RunnerTaskState,
+    msg: LoopUiMsg,
 ) -> AppAction {
+    let (run_id, msg_session_id, event) = match msg {
+        LoopUiMsg::Bus(event) => (None, None, event),
+        LoopUiMsg::Task {
+            run_id,
+            session_id,
+            event,
+        } => {
+            if !matches!(
+                event,
+                UiEvent::LocalBashFinished { .. }
+                    | UiEvent::CompactionFinished { .. }
+                    | UiEvent::RunFinished(_)
+            ) && !task_state.is_current(run_id, &session_id, &app.session_id)
+            {
+                return AppAction::None;
+            }
+            (Some(run_id), Some(session_id), event)
+        }
+    };
+
     if matches!(event, UiEvent::ToolsUpdated) {
         return AppAction::RefreshSidePanelTools;
     }
 
     if matches!(event, UiEvent::LocalBashFinished { .. }) {
-        *active_cancel = None;
-        *user_cancelled = false;
+        if task_state
+            .finish_if_current(
+                run_id,
+                msg_session_id.as_deref(),
+                &app.session_id,
+                ActiveTaskKind::LocalBash,
+            )
+            .is_none()
+        {
+            return AppAction::None;
+        }
         app.apply_ui_event(event);
-        return AppAction::None;
+        return AppAction::RefreshSidePanelData;
     }
 
     if let UiEvent::CompactionFinished { is_manual, .. } = event {
-        if is_manual {
-            *active_cancel = None;
-            *user_cancelled = false;
+        if is_manual
+            && task_state
+                .finish_if_current(
+                    run_id,
+                    msg_session_id.as_deref(),
+                    &app.session_id,
+                    ActiveTaskKind::ManualCompaction,
+                )
+                .is_none()
+        {
+            return AppAction::None;
         }
         app.apply_ui_event(event);
         return AppAction::RefreshSidePanelData;
     }
 
     if let UiEvent::RunFinished(ref res) = event {
-        let was_aborted = *user_cancelled
+        let Some(mut finished_task) = task_state.finish_if_current(
+            run_id,
+            msg_session_id.as_deref(),
+            &app.session_id,
+            ActiveTaskKind::AgentRun,
+        ) else {
+            return AppAction::None;
+        };
+        let was_aborted = finished_task.user_cancelled
             || res.as_ref().is_err_and(|e| e.contains("request aborted"))
             || matches!(app.last_turn_end_reason, Some(UiTurnEndReason::Cancelled));
         let is_ok = res.is_ok();
@@ -2021,11 +2237,9 @@ fn process_ui_event(
                 app.last_turn_end_reason,
                 None | Some(UiTurnEndReason::Completed)
             );
-        *active_cancel = None;
-        *user_cancelled = false;
         app.apply_ui_event(event);
 
-        if let Some(steer) = pending_steer.take() {
+        if let Some(steer) = finished_task.pending_steer.take() {
             app.push_user_message(&steer.text);
             return steer.into_action();
         }
@@ -2062,6 +2276,15 @@ fn process_ui_event(
 
     app.apply_ui_event(event);
     AppAction::None
+}
+
+#[cfg(test)]
+fn process_ui_event(
+    app: &mut AppState,
+    task_state: &mut RunnerTaskState,
+    event: UiEvent,
+) -> AppAction {
+    process_loop_ui_msg(app, task_state, LoopUiMsg::Bus(event))
 }
 
 fn format_clipboard_file_ref(workspace: &Path, path: &Path) -> String {
@@ -2166,8 +2389,8 @@ fn spawn_agent_run(
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    active_cancel: &mut Option<CancellationToken>,
+    loop_tx: &mpsc::UnboundedSender<LoopUiMsg>,
+    task_state: &mut RunnerTaskState,
     prompt: String,
     images: Vec<ImageAttachment>,
 ) {
@@ -2175,9 +2398,8 @@ fn spawn_agent_run(
         app.push_notice(NoticeLevel::Error, "agentLoop 服务未就绪");
         return;
     };
-    let cancel = CancellationToken::new();
-    *active_cancel = Some(cancel.clone());
-    app.is_busy = true;
+    let (run_id, cancel) = task_state.start(active_session.id.clone(), ActiveTaskKind::AgentRun);
+    app.set_busy_state(true);
 
     // 每次真正发请求前快照当前选择：`/model`、Ctrl+L 选择器、`/effort`、Tab、`/settings`
     // 五条路最终都汇到这里，无需在 UI 层（纯前端、无 Session 句柄）重复埋点。
@@ -2189,6 +2411,7 @@ fn spawn_agent_run(
     );
 
     let session: Arc<Session> = Arc::clone(active_session);
+    let task_session_id = session.id.clone();
     let run_opts = RunOptions {
         provider: app.provider.clone(),
         model: app.model.clone(),
@@ -2198,13 +2421,17 @@ fn spawn_agent_run(
         reasoning_effort: app.reasoning_effort,
         images,
     };
-    let tx = ui_tx.clone();
+    let tx = loop_tx.clone();
     tokio::spawn(async move {
         let res = agent_loop
             .run_with_options(session, prompt, cancel, run_opts)
             .await
             .map_err(|e| e.to_string());
-        let _ = tx.send(UiEvent::RunFinished(res));
+        let _ = tx.send(LoopUiMsg::Task {
+            run_id,
+            session_id: task_session_id,
+            event: UiEvent::RunFinished(res),
+        });
     });
 }
 
@@ -2213,38 +2440,47 @@ static LOCAL_BASH_SEQ: AtomicU64 = AtomicU64::new(1);
 fn spawn_local_bash_run(
     app: &mut AppState,
     active_session: &Arc<Session>,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    active_cancel: &mut Option<CancellationToken>,
+    loop_tx: &mpsc::UnboundedSender<LoopUiMsg>,
+    task_state: &mut RunnerTaskState,
     command: String,
     exclude_from_context: bool,
 ) {
-    if app.is_bash_running {
+    if app.is_bash_running() {
         app.set_flash("已有 Bash 命令正在运行，请先按 Esc 取消");
         return;
     }
-    if app.is_busy {
+    if app.is_busy() {
         app.set_flash("模型正在生成中，请等待回合结束或按 Esc 取消后再运行 Bash 命令");
+        return;
+    }
+    if app.is_compacting() {
+        app.set_flash("正在执行上下文压缩，请等待完成后再运行 Bash 命令");
         return;
     }
 
     let seq = LOCAL_BASH_SEQ.fetch_add(1, Ordering::Relaxed);
     let call_id = format!("local-bash-{seq}");
-    let cancel = CancellationToken::new();
-    *active_cancel = Some(cancel.clone());
+    let (run_id, cancel) = task_state.start(active_session.id.clone(), ActiveTaskKind::LocalBash);
     app.start_local_bash(&call_id, &command, exclude_from_context);
 
     let session = Arc::clone(active_session);
+    let task_session_id = session.id.clone();
+    let update_session_id = task_session_id.clone();
     let cwd = app.workspace.clone();
-    let tx = ui_tx.clone();
+    let tx = loop_tx.clone();
     let update_cid = call_id.clone();
     let update_tx = tx.clone();
 
     tokio::spawn(async move {
         let res = execute_bash_process(&command, &cwd, None, cancel, move |preview| {
-            let _ = update_tx.send(UiEvent::ToolUpdate {
-                call_id: update_cid.clone(),
-                name: "bash".to_string(),
-                preview: preview.to_string(),
+            let _ = update_tx.send(LoopUiMsg::Task {
+                run_id,
+                session_id: update_session_id.clone(),
+                event: UiEvent::ToolUpdate {
+                    call_id: update_cid.clone(),
+                    name: "bash".to_string(),
+                    preview: preview.to_string(),
+                },
             });
         })
         .await;
@@ -2269,11 +2505,15 @@ fn spawn_local_bash_run(
             timed_out: out.timed_out,
         });
 
-        let _ = tx.send(UiEvent::LocalBashFinished {
-            call_id,
-            command,
-            exclude_from_context,
-            output: payload,
+        let _ = tx.send(LoopUiMsg::Task {
+            run_id,
+            session_id: task_session_id,
+            event: UiEvent::LocalBashFinished {
+                call_id,
+                command,
+                exclude_from_context,
+                output: payload,
+            },
         });
     });
 }
@@ -2371,10 +2611,8 @@ async fn handle_action(
     terminal: &mut BufferedTerminal,
     term_stream: &mut Option<EventStream>,
     active_sid: &Arc<std::sync::RwLock<String>>,
-    ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    active_cancel: &mut Option<CancellationToken>,
-    pending_steer: &mut Option<PendingPrompt>,
-    user_cancelled: &mut bool,
+    loop_tx: &mpsc::UnboundedSender<LoopUiMsg>,
+    task_state: &mut RunnerTaskState,
     action: AppAction,
 ) {
     match action {
@@ -2395,13 +2633,17 @@ async fn handle_action(
             apply_clipboard_content(app, &config.workspace, res).await;
         }
         AppAction::CancelRun => {
-            *pending_steer = None;
-            *user_cancelled = true;
-            if let Some(cancel) = active_cancel.as_ref() {
-                cancel.cancel();
-            }
+            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+            task_state.cancel_active(None);
         }
         AppAction::CompactSession(focus) => {
+            if app.is_running_activity() {
+                app.push_notice(
+                    NoticeLevel::Warn,
+                    "当前已有运行中的任务，请等待完成后再压缩",
+                );
+                return;
+            }
             let Ok(compaction) = ctx.compaction() else {
                 app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
                 return;
@@ -2410,19 +2652,18 @@ async fn handle_action(
                 app.push_notice(NoticeLevel::Info, "上下文压缩已在配置中禁用");
                 return;
             }
-            let cancel = CancellationToken::new();
-            *active_cancel = Some(cancel.clone());
-            *user_cancelled = false;
-            app.is_compacting = true;
-            app.compaction_status = Some("手动压缩中…".to_string());
+            let (run_id, cancel) =
+                task_state.start(active_session.id.clone(), ActiveTaskKind::ManualCompaction);
+            app.set_compacting_state("手动压缩中…");
 
             let session = Arc::clone(active_session);
+            let task_session_id = session.id.clone();
             let opts = ManualCompactOptions {
                 provider: app.provider.clone(),
                 model: app.model.clone(),
                 focus,
             };
-            let tx = ui_tx.clone();
+            let tx = loop_tx.clone();
             tokio::spawn(async move {
                 match compaction.compact_now(session, opts, cancel).await {
                     Ok(_) | Err(CompactionError::Llm(_)) => {
@@ -2431,25 +2672,29 @@ async fn handle_action(
                     Err(
                         err @ (CompactionError::AlreadyRunning(_) | CompactionError::Cordis(_)),
                     ) => {
-                        let _ = tx.send(UiEvent::CompactionFinished {
-                            outcome: "failed".to_string(),
-                            tokens_before: None,
-                            tokens_after: None,
-                            pruned_count: 0,
-                            first_kept_seq: None,
-                            summary_preview: None,
-                            message: Some(err.to_string()),
-                            is_manual: true,
+                        let _ = tx.send(LoopUiMsg::Task {
+                            run_id,
+                            session_id: task_session_id,
+                            event: UiEvent::CompactionFinished {
+                                outcome: "failed".to_string(),
+                                tokens_before: None,
+                                tokens_after: None,
+                                pruned_count: 0,
+                                first_kept_seq: None,
+                                summary_preview: None,
+                                message: Some(err.to_string()),
+                                is_manual: true,
+                            },
                         });
                     }
                 }
             });
         }
         AppAction::NewSession => {
-            *pending_steer = None;
-            *user_cancelled = false;
-            if let Some(cancel) = active_cancel.take() {
-                cancel.cancel();
+            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+            task_state.abort_for_session_switch();
+            if app.is_running_activity() {
+                app.set_idle_state();
             }
             if let Ok(sessions) = ctx.sessions() {
                 let next = sessions.create(None);
@@ -2475,10 +2720,10 @@ async fn handle_action(
             }
         }
         AppAction::ResumeSession(target_id) => {
-            *pending_steer = None;
-            *user_cancelled = false;
-            if let Some(cancel) = active_cancel.take() {
-                cancel.cancel();
+            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+            task_state.abort_for_session_switch();
+            if app.is_running_activity() {
+                app.set_idle_state();
             }
             let _ =
                 resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
@@ -2504,22 +2749,24 @@ async fn handle_action(
                 let session = Arc::clone(active_session);
                 let provider = app.provider.clone();
                 let model = app.model.clone();
-                let tx = ui_tx.clone();
+                let tx = loop_tx.clone();
                 app.set_flash("正在重新生成会话标题…");
                 tokio::spawn(async move {
                     match st.regenerate_now(session, provider, model).await {
                         Ok(new_title) => {
-                            let _ = tx.send(UiEvent::Flash(format!("✓ 标题已生成：{new_title}")));
-                            let _ = tx.send(UiEvent::Notice {
+                            let _ = tx.send(LoopUiMsg::Bus(UiEvent::Flash(format!(
+                                "✓ 标题已生成：{new_title}"
+                            ))));
+                            let _ = tx.send(LoopUiMsg::Bus(UiEvent::Notice {
                                 level: NoticeLevel::Info,
                                 text: format!("会话标题已重新生成为：{new_title}"),
-                            });
+                            }));
                         }
                         Err(err) => {
-                            let _ = tx.send(UiEvent::Notice {
+                            let _ = tx.send(LoopUiMsg::Bus(UiEvent::Notice {
                                 level: NoticeLevel::Warn,
                                 text: format!("无法重新生成会话标题：{err}"),
-                            });
+                            }));
                         }
                     }
                 });
@@ -2544,8 +2791,8 @@ async fn handle_action(
                 config,
                 app,
                 active_session,
-                ui_tx,
-                active_cancel,
+                loop_tx,
+                task_state,
                 prompt,
                 Vec::new(),
             );
@@ -2560,8 +2807,8 @@ async fn handle_action(
                 config,
                 app,
                 active_session,
-                ui_tx,
-                active_cancel,
+                loop_tx,
+                task_state,
                 text,
                 images,
             );
@@ -2580,10 +2827,9 @@ async fn handle_action(
                 app.reject_unsupported_images_notice();
                 return;
             }
-            if let Some(cancel) = active_cancel.as_ref() {
-                *pending_steer = Some(PendingPrompt::text(prompt));
-                *user_cancelled = false;
-                cancel.cancel();
+            if task_state.cancel_token().is_some() {
+                app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+                task_state.cancel_active(Some(PendingPrompt::text(prompt)));
             } else {
                 app.push_user_message(&prompt);
                 spawn_agent_run(
@@ -2591,8 +2837,8 @@ async fn handle_action(
                     config,
                     app,
                     active_session,
-                    ui_tx,
-                    active_cancel,
+                    loop_tx,
+                    task_state,
                     prompt,
                     Vec::new(),
                 );
@@ -2603,10 +2849,9 @@ async fn handle_action(
                 app.reject_unsupported_images_notice();
                 return;
             }
-            if let Some(cancel) = active_cancel.as_ref() {
-                *pending_steer = Some(PendingPrompt { text, images });
-                *user_cancelled = false;
-                cancel.cancel();
+            if task_state.cancel_token().is_some() {
+                app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+                task_state.cancel_active(Some(PendingPrompt { text, images }));
             } else {
                 app.push_user_message(&text);
                 spawn_agent_run(
@@ -2614,8 +2859,8 @@ async fn handle_action(
                     config,
                     app,
                     active_session,
-                    ui_tx,
-                    active_cancel,
+                    loop_tx,
+                    task_state,
                     text,
                     images,
                 );
@@ -2628,8 +2873,8 @@ async fn handle_action(
             spawn_local_bash_run(
                 app,
                 active_session,
-                ui_tx,
-                active_cancel,
+                loop_tx,
+                task_state,
                 command,
                 exclude_from_context,
             );
@@ -2964,6 +3209,11 @@ async fn handle_action(
             }
         }
         AppAction::ForkSessionAtSeq(target_seq) => {
+            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+            task_state.abort_for_session_switch();
+            if app.is_running_activity() {
+                app.set_idle_state();
+            }
             if let Ok(sessions) = ctx.sessions() {
                 match sessions.fork(&app.session_id, target_seq, SessionCreateOptions::default()) {
                     Ok(next) => {
@@ -3387,7 +3637,7 @@ async fn apply_module_toggle_setting(
     plugin_id: &str,
     enabled: bool,
 ) {
-    if app.is_busy || app.is_bash_running || app.is_compacting {
+    if app.is_running_activity() {
         app.overlay
             .set_setting_toggle(&format!("plugin.{plugin_id}"), !enabled);
         let msg = "当前有正在执行的任务，请等待完成后再切换模块";
@@ -3465,6 +3715,9 @@ async fn apply_host_setting_change(
             };
             if next_mode != app.screen_mode {
                 app.screen_mode = next_mode;
+                app.mouse_capture_enabled = next_mode == ScreenMode::Fullscreen;
+                app.overlay
+                    .set_setting_toggle("ui.mouseCapture", app.mouse_capture_enabled);
                 app.selection.clear();
                 app.item_cache.clear();
                 let _ = apply_terminal_modes(next_mode, app.mouse_capture_enabled);
@@ -3875,8 +4128,9 @@ mod tests {
     use mizar_tui_ui::app::SessionSelection;
 
     use super::{
-        SelectionSources, TuiExitSummary, format_resume_command, process_ui_event,
-        resolve_model_switch, resolve_selection,
+        ActiveTaskKind, LoopUiMsg, RunnerTaskState, SelectionSources, TuiExitSummary,
+        format_resume_command, process_loop_ui_msg, process_ui_event, resolve_model_switch,
+        resolve_selection,
     };
 
     fn sel(provider: &str, model: &str, effort: mizar_llm::ReasoningEffort) -> SessionSelection {
@@ -4128,22 +4382,21 @@ mod tests {
             None,
             None,
         );
-        app.is_busy = true;
+        app.set_busy_state(true);
         app.queued_prompts.push(mizar_tui_ui::QueuedPrompt {
             id: 1,
             text: "queued follow-up".into(),
             images: Vec::new(),
         });
 
-        let mut active_cancel = None;
-        let mut pending_steer = Some(super::PendingPrompt::text("urgent steer"));
-        let mut user_cancelled = false;
+        let mut task_state = RunnerTaskState::default();
+        let (_rid1, cancel1) = task_state.start("sess-queue".into(), ActiveTaskKind::AgentRun);
+        task_state.cancel_active(Some(super::PendingPrompt::text("urgent steer")));
+        assert!(cancel1.is_cancelled());
 
         let act1 = process_ui_event(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
+            &mut task_state,
             UiEvent::RunFinished(Err("request aborted".into())),
         );
         assert_eq!(act1, AppAction::SubmitPrompt("urgent steer".into()));
@@ -4159,11 +4412,11 @@ mod tests {
             vec!["queued follow-up"]
         );
 
+        app.set_busy_state(true);
+        let (_rid2, _) = task_state.start("sess-queue".into(), ActiveTaskKind::AgentRun);
         let act2 = process_ui_event(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
+            &mut task_state,
             UiEvent::RunFinished(Ok("done".into())),
         );
         assert_eq!(act2, AppAction::SubmitPrompt("queued follow-up".into()));
@@ -4192,37 +4445,36 @@ mod tests {
             None,
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut active_cancel = None;
-        let mut pending_steer = None;
-        let mut user_cancelled = false;
+        let mut task_state = RunnerTaskState::default();
 
         super::spawn_local_bash_run(
             &mut app,
             &session,
             &tx,
-            &mut active_cancel,
+            &mut task_state,
             "echo RUNNER_LOCAL_OK".into(),
             false,
         );
-        assert!(app.is_bash_running);
-        assert!(active_cancel.is_some());
+        assert!(app.is_bash_running());
+        assert!(task_state.cancel_token().is_some());
 
-        while let Some(ev) = rx.recv().await {
-            let is_done = matches!(ev, UiEvent::LocalBashFinished { .. });
-            let act = process_ui_event(
-                &mut app,
-                &mut active_cancel,
-                &mut pending_steer,
-                &mut user_cancelled,
-                ev,
+        while let Some(msg) = rx.recv().await {
+            let is_done = matches!(
+                &msg,
+                LoopUiMsg::Task {
+                    event: UiEvent::LocalBashFinished { .. },
+                    ..
+                }
             );
-            assert_eq!(act, AppAction::None);
+            let act = process_loop_ui_msg(&mut app, &mut task_state, msg);
             if is_done {
+                assert_eq!(act, AppAction::RefreshSidePanelData);
                 break;
             }
+            assert_eq!(act, AppAction::None);
         }
-        assert!(!app.is_bash_running);
-        assert!(active_cancel.is_none());
+        assert!(!app.is_bash_running());
+        assert!(task_state.cancel_token().is_none());
         assert_eq!(session.log().len(), 1);
         assert!(matches!(
             &session.log()[0].event,
@@ -4235,32 +4487,32 @@ mod tests {
             } if command == "echo RUNNER_LOCAL_OK" && output.contains("RUNNER_LOCAL_OK")
         ));
 
-        // 测试 Esc 取消（active_cancel.cancel()）
+        // 测试 Esc 取消（task_state.cancel_token().cancel()）
         super::spawn_local_bash_run(
             &mut app,
             &session,
             &tx,
-            &mut active_cancel,
+            &mut task_state,
             "sleep 10".into(),
             true,
         );
-        assert!(app.is_bash_running);
-        active_cancel.as_ref().unwrap().cancel();
-        while let Some(ev) = rx.recv().await {
-            let is_done = matches!(ev, UiEvent::LocalBashFinished { .. });
-            process_ui_event(
-                &mut app,
-                &mut active_cancel,
-                &mut pending_steer,
-                &mut user_cancelled,
-                ev,
+        assert!(app.is_bash_running());
+        task_state.cancel_token().unwrap().cancel();
+        while let Some(msg) = rx.recv().await {
+            let is_done = matches!(
+                &msg,
+                LoopUiMsg::Task {
+                    event: UiEvent::LocalBashFinished { .. },
+                    ..
+                }
             );
+            process_loop_ui_msg(&mut app, &mut task_state, msg);
             if is_done {
                 break;
             }
         }
-        assert!(!app.is_bash_running);
-        assert!(active_cancel.is_none());
+        assert!(!app.is_bash_running());
+        assert!(task_state.cancel_token().is_none());
         assert_eq!(session.all_entries().len(), 2);
         assert!(matches!(
             &session.all_entries()[1].event,
@@ -4423,7 +4675,7 @@ mod tests {
         );
 
         // 3. 运行期繁忙保护：is_compacting 时拒绝启用 skills，状态与 settings.json 保持不变
-        app.is_compacting = true;
+        app.set_compacting_state("手动压缩中…");
         super::apply_module_toggle_setting(&ctx, &mut app, Some(&settings_path), "skills", true)
             .await;
         assert!(ctx.get::<mizar_skills::SkillRegistry>("skills").is_none());
@@ -4435,16 +4687,8 @@ mod tests {
         );
 
         // 4. process_ui_event 收到 ToolsUpdated 应触发 RefreshSidePanelTools
-        let mut active_cancel = None;
-        let mut pending_steer = None;
-        let mut user_cancelled = false;
-        let act = process_ui_event(
-            &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
-            UiEvent::ToolsUpdated,
-        );
+        let mut task_state = RunnerTaskState::default();
+        let act = process_ui_event(&mut app, &mut task_state, UiEvent::ToolsUpdated);
         assert_eq!(act, AppAction::RefreshSidePanelTools);
 
         ctx.fiber().dispose().await;
@@ -4482,27 +4726,17 @@ mod tests {
                 None,
                 None,
             );
-            let mut active_cancel = None;
-            let mut pending_steer = None;
-            let mut user_cancelled = false;
+            let mut task_state = RunnerTaskState::default();
 
             app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
             app.input.insert_str("next queued prompt");
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert_eq!(app.queued_prompts.len(), 1);
 
+            process_ui_event(&mut app, &mut task_state, UiEvent::StepStart { ts_ms: 10 });
             process_ui_event(
                 &mut app,
-                &mut active_cancel,
-                &mut pending_steer,
-                &mut user_cancelled,
-                UiEvent::StepStart { ts_ms: 10 },
-            );
-            process_ui_event(
-                &mut app,
-                &mut active_cancel,
-                &mut pending_steer,
-                &mut user_cancelled,
+                &mut task_state,
                 UiEvent::StepEnd {
                     step: 1,
                     ts_ms: 20,
@@ -4512,17 +4746,13 @@ mod tests {
             );
             process_ui_event(
                 &mut app,
-                &mut active_cancel,
-                &mut pending_steer,
-                &mut user_cancelled,
+                &mut task_state,
                 UiEvent::TurnEnd { reason: end_reason },
             );
 
             let action = process_ui_event(
                 &mut app,
-                &mut active_cancel,
-                &mut pending_steer,
-                &mut user_cancelled,
+                &mut task_state,
                 UiEvent::RunFinished(Ok("non-error return string".into())),
             );
             assert_eq!(action, AppAction::RefreshSidePanelData);
@@ -4546,30 +4776,127 @@ mod tests {
             None,
             None,
         );
-        let mut active_cancel = None;
-        let mut pending_steer = None;
-        let mut user_cancelled = false;
+        let mut task_state = RunnerTaskState::default();
         app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
         app.input.insert_str("auto dequeue me");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         process_ui_event(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
+            &mut task_state,
             UiEvent::TurnEnd {
                 reason: UiTurnEndReason::Completed,
             },
         );
         let action = process_ui_event(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
+            &mut task_state,
             UiEvent::RunFinished(Ok("done".into())),
         );
         assert_eq!(action, AppAction::SubmitPrompt("auto dequeue me".into()));
         assert!(app.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn process_loop_ui_msg_ignores_stale_task_events_after_run_or_session_switch() {
+        use super::*;
+
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-current",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let mut task_state = RunnerTaskState::default();
+        let (stale_run_id, stale_cancel) =
+            task_state.start("sess-current".into(), ActiveTaskKind::AgentRun);
+        let (current_run_id, current_cancel) =
+            task_state.start("sess-current".into(), ActiveTaskKind::LocalBash);
+        assert!(stale_cancel.is_cancelled());
+        assert!(!current_cancel.is_cancelled());
+        app.set_local_bash_state();
+
+        // 1. 旧 run_id 的 RunFinished / ToolUpdate 不得清空新任务的 RunnerTaskState 或更改 UI 状态
+        let stale_act = process_loop_ui_msg(
+            &mut app,
+            &mut task_state,
+            LoopUiMsg::Task {
+                run_id: stale_run_id,
+                session_id: "sess-current".into(),
+                event: UiEvent::RunFinished(Ok("stale".into())),
+            },
+        );
+        assert_eq!(stale_act, AppAction::None);
+        assert!(app.is_bash_running());
+        assert!(task_state.cancel_token().is_some());
+
+        let stale_tool = process_loop_ui_msg(
+            &mut app,
+            &mut task_state,
+            LoopUiMsg::Task {
+                run_id: stale_run_id,
+                session_id: "sess-current".into(),
+                event: UiEvent::ToolUpdate {
+                    call_id: "local-bash-999".into(),
+                    name: "bash".into(),
+                    preview: "stale output".into(),
+                },
+            },
+        );
+        assert_eq!(stale_tool, AppAction::None);
+
+        // 2. 切换会话后的过期 LocalBashFinished 不得作用于新会话
+        task_state.abort_for_session_switch();
+        app.reset_for_new_session("sess-next", None);
+        let cross_sess_act = process_loop_ui_msg(
+            &mut app,
+            &mut task_state,
+            LoopUiMsg::Task {
+                run_id: current_run_id,
+                session_id: "sess-current".into(),
+                event: UiEvent::LocalBashFinished {
+                    call_id: "local-bash-1".into(),
+                    command: "echo hi".into(),
+                    exclude_from_context: false,
+                    output: Ok(super::LocalBashOutput {
+                        display: "hi".into(),
+                        session_output: "hi".into(),
+                        exit_code: Some(0),
+                        cancelled: false,
+                        timed_out: false,
+                    }),
+                },
+            },
+        );
+        assert_eq!(cross_sess_act, AppAction::None);
+        assert!(!app.is_running_activity());
+
+        // 3. 过期 ManualCompaction 任务返回错误通知也不得污染当前空闲/新会话
+        let (compact_rid, _) =
+            task_state.start("sess-next".into(), ActiveTaskKind::ManualCompaction);
+        app.set_compacting_state("手动压缩中…");
+        task_state.abort_for_session_switch();
+        app.set_idle_state();
+        let stale_compact = process_loop_ui_msg(
+            &mut app,
+            &mut task_state,
+            LoopUiMsg::Task {
+                run_id: compact_rid,
+                session_id: "sess-next".into(),
+                event: UiEvent::CompactionFinished {
+                    outcome: "failed".into(),
+                    tokens_before: None,
+                    tokens_after: None,
+                    pruned_count: 0,
+                    first_kept_seq: None,
+                    summary_preview: None,
+                    message: Some("stale error".into()),
+                    is_manual: true,
+                },
+            },
+        );
+        assert_eq!(stale_compact, AppAction::None);
     }
 
     #[tokio::test]
@@ -4995,42 +5322,34 @@ mod tests {
 
         // 4. reveal 节流开启且已有活跃 Assistant 槽位时，高频 TextDelta 延后给 reveal_tick (30fps)
         app.reveal.enabled = true;
-        let mut active_cancel = None;
-        let mut pending_steer = None;
-        let mut user_cancelled = false;
-        let (_, d_start) = super::process_ui_event_dirty(
+        let mut task_state = super::RunnerTaskState::default();
+        let (_, d_start) = super::process_loop_ui_msg_dirty(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
-            UiEvent::TurnStart { turn: 1 },
+            &mut task_state,
+            super::LoopUiMsg::Bus(UiEvent::TurnStart { turn: 1 }),
         );
         assert!(d_start);
         // 首个 TextDelta 创建 Assistant 条目，先触发首帧展示
-        let (_, d_first) = super::process_ui_event_dirty(
+        let (_, d_first) = super::process_loop_ui_msg_dirty(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
-            UiEvent::TextDelta {
+            &mut task_state,
+            super::LoopUiMsg::Bus(UiEvent::TextDelta {
                 text: "Hello".into(),
                 ts_ms: 1,
-            },
+            }),
         );
         assert!(d_first);
         let item_idx = app.items.len() - 1;
         app.reveal
             .observe(RevealSlot::AssistantText(item_idx), 5, true);
         // 后续紧邻 TextDelta 仅推进 target_bytes，不立即同步重绘
-        let (act2, d_next) = super::process_ui_event_dirty(
+        let (act2, d_next) = super::process_loop_ui_msg_dirty(
             &mut app,
-            &mut active_cancel,
-            &mut pending_steer,
-            &mut user_cancelled,
-            UiEvent::TextDelta {
+            &mut task_state,
+            super::LoopUiMsg::Bus(UiEvent::TextDelta {
                 text: " world".into(),
                 ts_ms: 2,
-            },
+            }),
         );
         assert_eq!(act2, AppAction::None);
         assert!(!d_next);

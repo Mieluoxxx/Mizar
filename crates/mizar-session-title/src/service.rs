@@ -168,23 +168,9 @@ impl SessionTitleRuntime {
             return;
         }
 
-        let expected_title = header.title.clone();
-        {
-            let mut states = self.states.lock().unwrap();
-            let st = states.entry(session.id.clone()).or_default();
-            if st.last_triggered_turn == Some(ev.turn) {
-                return;
-            }
-            if let Some(last_auto) = &st.last_auto_title
-                && header.title.as_deref() != Some(last_auto.as_str())
-            {
-                return;
-            }
-            st.last_triggered_turn = Some(ev.turn);
-        }
-
-        let Ok(in_flight_guard) = self.try_lock_session(&session.id) else {
-            return;
+        let in_flight_guard = match self.try_lock_session(&session.id) {
+            Ok(guard) => guard,
+            Err(_) => return,
         };
 
         let Ok((provider, model)) =
@@ -205,6 +191,25 @@ impl SessionTitleRuntime {
             return;
         };
 
+        let expected_title = header.title.clone();
+        let prev_triggered_turn = {
+            let mut states = self.states.lock().unwrap();
+            let st = states.entry(session.id.clone()).or_default();
+            if st.last_triggered_turn == Some(ev.turn) {
+                drop(in_flight_guard);
+                return;
+            }
+            if let Some(last_auto) = &st.last_auto_title
+                && header.title.as_deref() != Some(last_auto.as_str())
+            {
+                drop(in_flight_guard);
+                return;
+            }
+            let prev = st.last_triggered_turn;
+            st.last_triggered_turn = Some(ev.turn);
+            prev
+        };
+
         let rt = Arc::clone(self);
         let ts_ms = if header.created_at_ms > 0 {
             header.created_at_ms
@@ -212,6 +217,8 @@ impl SessionTitleRuntime {
             ev.ts_ms
         };
         let cancel = self.dispose_token.child_token();
+        let turn_num = ev.turn;
+        let session_id_for_rollback = session.id.clone();
 
         handle.spawn(async move {
             let _guard = in_flight_guard;
@@ -229,6 +236,14 @@ impl SessionTitleRuntime {
                 })
                 .await
             {
+                {
+                    let mut states = rt.states.lock().unwrap();
+                    if let Some(st) = states.get_mut(&session_id_for_rollback)
+                        && st.last_triggered_turn == Some(turn_num)
+                    {
+                        st.last_triggered_turn = prev_triggered_turn;
+                    }
+                }
                 rt.ctx
                     .logger_named("session-title")
                     .debug(format!("后台生成会话标题未应用: {err}"));
@@ -338,29 +353,19 @@ impl SessionTitleRuntime {
             .ok_or_else(|| SessionTitleError::InvalidOutput(raw_output.trim().to_string()))?;
         let formatted = format_session_title(params.ts_ms, &parsed);
 
-        if params.respect_ownership {
-            let current = params.session.header();
-            if current.title_source == Some(TitleSource::Manual) {
-                return Ok(current.title.unwrap_or(formatted));
+        match params.session.compare_and_set_title_auto(
+            params.expected_title.as_deref(),
+            formatted.clone(),
+            params.respect_ownership,
+        ) {
+            Ok(applied) => {
+                let mut states = self.states.lock().unwrap();
+                let st = states.entry(params.session.id.clone()).or_default();
+                st.last_auto_title = Some(applied.clone());
+                Ok(applied)
             }
-            if current.title != params.expected_title {
-                return Ok(current.title.unwrap_or(formatted));
-            }
-        } else {
-            // 即便是手动触发 `/rename`，若执行期间用户又显式改名也不覆盖
-            let current = params.session.header();
-            if current.title != params.expected_title {
-                return Ok(current.title.unwrap_or(formatted));
-            }
+            Err(current) => Ok(current.unwrap_or(formatted)),
         }
-
-        params
-            .session
-            .set_title_with_source(formatted.clone(), TitleSource::Auto);
-        let mut states = self.states.lock().unwrap();
-        let st = states.entry(params.session.id.clone()).or_default();
-        st.last_auto_title = Some(formatted.clone());
-        Ok(formatted)
     }
 }
 

@@ -686,6 +686,8 @@ pub enum OverlayAction {
 #[derive(Default)]
 pub struct OverlayState {
     pub active: Option<OverlayKind>,
+    /// 排队等待处理的工具审批请求，避免后到的审批静默覆盖当前浮层并丢弃 oneshot 响应器。
+    pub approval_queue: std::collections::VecDeque<PendingApproval>,
     pub last_box: Option<Rect>,
     pub item_rects: Vec<(usize, Rect)>,
 }
@@ -711,6 +713,35 @@ impl OverlayState {
 
     pub fn is_open(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub fn has_pending_approvals(&self) -> bool {
+        matches!(self.active, Some(OverlayKind::Approval(_))) || !self.approval_queue.is_empty()
+    }
+
+    /// 若当前无激活浮层且审批队列非空，将队首审批提升为激活弹窗并返回被请求的工具名。
+    pub fn promote_next_approval(&mut self) -> Option<String> {
+        if self.active.is_some() {
+            return None;
+        }
+        let next = self.approval_queue.pop_front()?;
+        let tool = next.tool_name.clone();
+        self.active = Some(OverlayKind::Approval(next));
+        Some(tool)
+    }
+
+    /// 以指定裁决排空所有尚未响应的审批弹窗与队列（用于取消运行/切换会话/退出清理）。
+    pub fn resolve_all_approvals(&mut self, decision: ApprovalDecision) {
+        if let Some(OverlayKind::Approval(mut ap)) = self.active.take()
+            && let Some(tx) = ap.responder.take()
+        {
+            let _ = tx.send(decision.clone());
+        }
+        while let Some(mut ap) = self.approval_queue.pop_front() {
+            if let Some(tx) = ap.responder.take() {
+                let _ = tx.send(decision.clone());
+            }
+        }
     }
 
     pub fn open_model_picker(&mut self, providers: &[ProviderInfo], current_model: Option<&str>) {
@@ -889,19 +920,28 @@ impl OverlayState {
         }
     }
 
+    /// 请求工具审批；若当前已展示审批或其它模态浮层，先压入 `approval_queue` 避免丢失并发响应通道。
+    /// 返回 `true` 表示该审批立即成为当前活动弹窗；返回 `false` 表示已排队等待当前浮层关闭。
     pub fn open_approval(
         &mut self,
         tool_name: String,
         args_preview: String,
         responder: oneshot::Sender<ApprovalDecision>,
-    ) {
-        self.active = Some(OverlayKind::Approval(PendingApproval {
+    ) -> bool {
+        let req = PendingApproval {
             tool_name,
             args_preview,
             editing_reason: false,
             deny_reason: String::new(),
             responder: Some(responder),
-        }));
+        };
+        if self.is_modal() {
+            self.approval_queue.push_back(req);
+            false
+        } else {
+            self.active = Some(OverlayKind::Approval(req));
+            true
+        }
     }
 
     pub fn handle_key(
@@ -1490,14 +1530,21 @@ impl OverlayState {
                                     None
                                 }
                             }
-                            OverlayKind::Approval(_) => {
-                                let decision = match idx {
-                                    0 => ApprovalDecision::AllowOnce,
-                                    1 => ApprovalDecision::AllowAlwaysForTool,
-                                    _ => ApprovalDecision::Deny,
-                                };
-                                Some(OverlayAction::ResolveApproval { decision })
-                            }
+                            OverlayKind::Approval(ap) => match idx {
+                                0 => Some(OverlayAction::ResolveApproval {
+                                    decision: ApprovalDecision::AllowOnce,
+                                }),
+                                1 => Some(OverlayAction::ResolveApproval {
+                                    decision: ApprovalDecision::AllowAlwaysForTool,
+                                }),
+                                2 => {
+                                    ap.editing_reason = true;
+                                    Some(OverlayAction::None)
+                                }
+                                _ => Some(OverlayAction::ResolveApproval {
+                                    decision: ApprovalDecision::Deny,
+                                }),
+                            },
                             OverlayKind::SettingsModal {
                                 items,
                                 query,
@@ -2342,44 +2389,54 @@ fn render_approval_modal(
             Span::styled(format!("{deny_reason}▏"), Style::default().fg(theme.text)),
         ]));
     } else {
+        let btn0 = " [y / Enter] 允许本次 ";
+        let btn1 = " [a] 始终允许 ";
+        let btn2 = " [r] 拒绝附理由 ";
+        let btn3 = " [n/Esc] 拒绝 ";
         lines.push(Line::from(vec![
             Span::styled(
-                " [y / Enter] 允许本次 ",
+                btn0,
                 Style::default()
                     .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
-                " [a] 始终允许 ",
+                btn1,
                 Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
-                " [r] 拒绝附理由 ",
+                btn2,
                 Style::default()
                     .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
-                " [n/Esc] 拒绝 ",
+                btn3,
                 Style::default()
                     .fg(theme.error)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-    }
-    if !editing_reason && inner.height >= 4 {
-        state
-            .item_rects
-            .push((0, Rect::new(inner.x, inner.y + 3, 18, 1)));
-        state
-            .item_rects
-            .push((1, Rect::new(inner.x + 19, inner.y + 3, 15, 1)));
-        state
-            .item_rects
-            .push((2, Rect::new(inner.x + 48, inner.y + 3, 16, 1)));
+        if inner.height >= 4 {
+            let row = inner.y + 3;
+            let mut x_cursor = inner.x;
+            for (idx, label) in [btn0, btn1, btn2, btn3].into_iter().enumerate() {
+                let w = display_width(label) as u16;
+                let max_end = inner.x + inner.width;
+                if x_cursor < max_end {
+                    let clipped_w = w.min(max_end - x_cursor);
+                    if clipped_w > 0 {
+                        state
+                            .item_rects
+                            .push((idx, Rect::new(x_cursor, row, clipped_w, 1)));
+                    }
+                }
+                x_cursor = x_cursor.saturating_add(w + 1);
+            }
+        }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }

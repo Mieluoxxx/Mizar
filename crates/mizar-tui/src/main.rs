@@ -55,7 +55,7 @@ use mizar_llm_mock::MockPlugin;
 use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_tools_coding::CodingToolsPreset;
-use mizar_tui::exec::{ExecConfig, resolve_exec_prompt, run_exec_cli};
+use mizar_tui::exec::{ExecConfig, ExecOutputFormat, resolve_exec_prompt, run_exec_cli};
 use mizar_tui::update::{current_version, is_version_check_disabled, run_update_cli};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -91,7 +91,9 @@ struct CliArgs {
     base_url: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     max_steps: Option<usize>,
+    max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    output_format: Option<ExecOutputFormat>,
 }
 
 impl CliArgs {
@@ -107,7 +109,9 @@ impl CliArgs {
             || self.base_url.is_some()
             || self.reasoning_effort.is_some()
             || self.max_steps.is_some()
+            || self.max_tokens.is_some()
             || self.timeout_secs.is_some()
+            || self.output_format.is_some()
     }
 }
 
@@ -137,7 +141,10 @@ Options:
       --base-url <url>          Base URL override
       --reasoning-effort <lvl>  Reasoning effort (off, minimal, low, medium, high, xhigh, max)
       --max-steps <n>           Maximum agent loop steps (>= 1)
+      --max-tokens <n>          Maximum output tokens per model call (>= 1)
       --timeout <secs>          Total execution timeout in seconds (>= 1)
+      --output-format <fmt>     Headless output format (text, json)
+      --json                    Shorthand for --output-format json
       --isolated                Skip personal global config, MCP, skills, instructions, and DB
       --minimal                 Enable minimal coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
@@ -145,8 +152,8 @@ Options:
  -xt, --exclude-tools <a,b,...> Tool denylist (comma-separated, supports *)
       --inline                  Start in inline viewport mode (TUI only)
       --approve                 Prompt for approval on high-risk tools (TUI only)
-  -c, --continue                Resume the latest persisted session in workspace (TUI only)
-  -r, --resume [id]             Open interactive session picker, or resume by ID (TUI only)
+  -c, --continue                Resume the latest persisted session in workspace
+  -r, --resume [id]             Open picker in TUI, or resume persisted session by ID in exec
       --no-persist              Disable SQLite session persistence
       --no-instructions         Disable AGENTS.md / CLAUDE.md discovery
       --theme <preset>          Theme preset (auto, mist-dark, mist-light, sakura-dark, system, ansi16)
@@ -392,6 +399,35 @@ where
                 }
                 out.max_steps = Some(parsed);
             }
+            "--max-tokens" => {
+                let val = take_value(flag, inline, &mut args)?;
+                let parsed = val
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("无效的 --max-tokens 数值：{val}"))?;
+                if parsed == 0 {
+                    return Err("--max-tokens 必须大于等于 1".to_string());
+                }
+                out.max_tokens = Some(parsed);
+            }
+            "--output-format" => {
+                let val = take_value(flag, inline, &mut args)?;
+                out.output_format = Some(match val.trim().to_ascii_lowercase().as_str() {
+                    "text" => ExecOutputFormat::Text,
+                    "json" => ExecOutputFormat::Json,
+                    other => {
+                        return Err(format!(
+                            "无效的 --output-format \"{other}\"（可选：text, json）"
+                        ));
+                    }
+                });
+            }
+            "--json" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.output_format = Some(ExecOutputFormat::Json);
+            }
             "--timeout" => {
                 let val = take_value(flag, inline, &mut args)?;
                 let parsed = val
@@ -482,12 +518,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
-        if cli.resume_session.is_some() {
-            eprintln!(
-                "error: --continue/--resume is incompatible with non-interactive exec mode (code=invalid_request)"
-            );
-            std::process::exit(1);
-        }
         if cli.inline {
             eprintln!(
                 "error: --inline is incompatible with non-interactive exec mode (code=invalid_request)"
@@ -515,6 +545,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             base_url: cli.base_url,
             reasoning_effort: cli.reasoning_effort,
             max_steps: cli.max_steps,
+            max_tokens: cli.max_tokens,
             timeout_secs: cli.timeout_secs,
             isolated: cli.isolated,
             no_persist: cli.no_persist,
@@ -523,6 +554,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             preset: cli.preset,
             include_tools: cli.include_tools,
             exclude_tools: cli.exclude_tools,
+            resume_session: cli.resume_session,
+            output_format: cli.output_format.unwrap_or_default(),
         })
         .await;
         if code != 0 {
@@ -533,7 +566,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.has_exec_only_flags() {
         eprintln!(
-            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --timeout) require `exec`, `-p/--prompt`, or `--prompt-file`"
+            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --max-tokens, --timeout, --output-format, --json) require `exec`, `-p/--prompt`, or `--prompt-file`"
         );
         std::process::exit(1);
     }
@@ -826,5 +859,41 @@ mod tests {
         assert_eq!(default_tokio_worker_threads(4), 4);
         assert_eq!(default_tokio_worker_threads(16), 4);
         assert_eq!(default_tokio_worker_threads(64), 4);
+    }
+
+    #[test]
+    fn parse_exec_max_tokens_json_output_and_continue_flags() {
+        let parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--max-tokens".to_string(),
+            "512".to_string(),
+            "--json".to_string(),
+            "-c".to_string(),
+            "follow up".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.max_tokens, Some(512));
+        assert_eq!(parsed.output_format, Some(ExecOutputFormat::Json));
+        assert_eq!(parsed.resume_session, Some(ResumeTarget::LatestInWorkspace));
+        assert_eq!(parsed.positional_prompt.as_deref(), Some("follow up"));
+
+        let fmt_text = parse_cli_args_from([
+            "exec".to_string(),
+            "--output-format=text".to_string(),
+            "ping".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(fmt_text.output_format, Some(ExecOutputFormat::Text));
+
+        assert!(parse_cli_args_from(["exec".into(), "--max-tokens".into(), "0".into()]).is_err());
+        assert!(
+            parse_cli_args_from(["exec".into(), "--output-format".into(), "yaml".into()]).is_err()
+        );
+        assert!(parse_cli_args_from(["--json=1".into()]).is_err());
+        assert!(
+            parse_cli_args_from(["--json".into()])
+                .unwrap()
+                .has_exec_only_flags()
+        );
     }
 }

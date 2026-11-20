@@ -1699,6 +1699,7 @@ dependencies = [
  "cordis",
  "dirs",
  "mizar-llm",
+ "mizar-llm-http",
  "mizar-system-prompt",
  "mizar-tools",
  "reqwest",

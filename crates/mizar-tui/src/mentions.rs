@@ -375,8 +375,6 @@ pub fn register_mention_hook(
                     return None;
                 }
 
-                processed.lock().unwrap().insert(sid, max_seq);
-
                 if !result.images.is_empty()
                     && !model_supports_images(
                         &ctx_hook,
@@ -395,6 +393,8 @@ pub fn register_mention_hook(
                     ev.cancel.cancel();
                     return None;
                 }
+
+                processed.lock().unwrap().insert(sid, max_seq);
 
                 if existing_images + result.images.len() > MAX_IMAGES_PER_MESSAGE {
                     let allowed = MAX_IMAGES_PER_MESSAGE.saturating_sub(existing_images);
@@ -535,6 +535,101 @@ mod tests {
         assert_eq!(res.errors.len(), 1);
         assert!(res.errors[0].contains("broken.png"));
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cancelled_check_does_not_latch_processed_seq() {
+        use cordis::Service;
+        use mizar_llm::{
+            BoxChunkStream, GenerateOptions, LlmAdapter, LlmRuntime, ModelInfo, ProviderInfo,
+        };
+        use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
+        use tokio::sync::mpsc;
+
+        struct TextOnlyAdapter;
+        impl LlmAdapter for TextOnlyAdapter {
+            fn info(&self) -> Option<ProviderInfo> {
+                Some(ProviderInfo {
+                    id: "text-only-p".into(),
+                    name: "Text Only".into(),
+                    protocol: "mock".into(),
+                    models: vec![
+                        ModelInfo {
+                            id: "text-only-m".into(),
+                            name: "text-only-m".into(),
+                            context_window: Some(32_000),
+                            max_tokens: None,
+                            reasoning_efforts: Vec::new(),
+                            input: vec!["text".into()],
+                        },
+                        ModelInfo {
+                            id: "vision-m".into(),
+                            name: "vision-m".into(),
+                            context_window: Some(32_000),
+                            max_tokens: None,
+                            reasoning_efforts: Vec::new(),
+                            input: vec!["text".into(), "image".into()],
+                        },
+                    ],
+                })
+            }
+
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                unreachable!("pre-step cancel test should not invoke stream")
+            }
+        }
+
+        let tmp =
+            std::env::temp_dir().join(format!("mizar_tui_mention_cancel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("shot.png"), tiny_png(100, 100)).unwrap();
+
+        let ctx = cordis::Context::new();
+        ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let _adapter_guard = ctx
+            .llm()
+            .unwrap()
+            .register_adapter("text-only-p", Arc::new(TextOnlyAdapter))
+            .unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let _hook = register_mention_hook(&ctx, tmp.clone(), true, tx).unwrap();
+        let session = ctx.sessions().unwrap().create(None);
+        session.append(SessionEvent::user("请看 @shot.png"));
+
+        // 1. 不支持图片的模型在 pre-step 阶段触发 cancel，不应推进 processed_seq
+        let cancel1 = CancellationToken::new();
+        let ev1 = AgentPreStepEvent {
+            session: Arc::clone(&session),
+            turn: 1,
+            step: 1,
+            provider: Some("text-only-p".into()),
+            model: Some("text-only-m".into()),
+            cancel: cancel1.clone(),
+        };
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev1).await;
+        assert!(cancel1.is_cancelled());
+
+        // 2. 换用支持图片的模型重放同 seq 时仍能继续识别 @shot.png 并写入 ContextNotice
+        let cancel2 = CancellationToken::new();
+        let ev2 = AgentPreStepEvent {
+            session: Arc::clone(&session),
+            turn: 1,
+            step: 1,
+            provider: Some("text-only-p".into()),
+            model: Some("vision-m".into()),
+            cancel: cancel2.clone(),
+        };
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev2).await;
+        assert!(!cancel2.is_cancelled());
+        assert!(session.log().iter().any(|e| {
+            matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
+        }));
+
+        ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

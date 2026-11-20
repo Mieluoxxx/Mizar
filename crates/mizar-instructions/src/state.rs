@@ -19,7 +19,10 @@ use crate::files::{
     descendant_dirs_between, discover_instructions, find_project_root, read_fingerprint,
     resolve_agents_home, resolve_mizar_home, sanitize_candidates,
 };
-use crate::render::{DeltaChangeKind, DeltaItem, render_baseline_message, render_delta_message};
+use crate::render::{
+    DeltaChangeKind, DeltaItem, render_baseline_message, render_delta_message,
+    render_delta_message_detailed,
+};
 
 #[derive(Debug, Clone)]
 struct TrackedFile {
@@ -30,6 +33,7 @@ struct TrackedFile {
 
 #[derive(Debug, Default)]
 struct SessionInstructionState {
+    baseline_checked: bool,
     baseline_seq: Option<u64>,
     baseline_identity: String,
     represented: HashMap<ScopeKey, TrackedFile>,
@@ -228,6 +232,7 @@ impl AgentInstructions {
 
         let sid = session.id.clone();
         let (
+            mem_baseline_checked,
             mem_baseline_seq,
             mem_identity,
             pending_subdirs,
@@ -237,13 +242,15 @@ impl AgentInstructions {
             let guard = self.sessions.lock().unwrap();
             match guard.get(&sid) {
                 Some(st) => (
+                    st.baseline_checked,
                     st.baseline_seq,
                     st.baseline_identity.clone(),
                     st.pending_subdirs.clone(),
                     st.known_subdirs.clone(),
-                    st.watched_paths.is_empty() || Self::fingerprints_changed(&st.watched_paths),
+                    (!st.watched_paths.is_empty() || !st.pending_subdirs.is_empty())
+                        && Self::fingerprints_changed(&st.watched_paths),
                 ),
-                None => (None, String::new(), Vec::new(), Vec::new(), true),
+                None => (false, None, String::new(), Vec::new(), Vec::new(), true),
             }
         };
 
@@ -265,7 +272,7 @@ impl AgentInstructions {
         let baseline_visible = mem_baseline_seq
             .is_some_and(|seq| visible_instruction_notices.iter().any(|(s, _)| *s == seq));
 
-        if !baseline_visible {
+        if !mem_baseline_checked || (mem_baseline_seq.is_some() && !baseline_visible) {
             let mut merged_subdirs = known_subdirs;
             for sub in pending_subdirs {
                 if !merged_subdirs.contains(&sub) {
@@ -284,17 +291,19 @@ impl AgentInstructions {
             let watched = self.collect_watched_paths(&merged_subdirs);
 
             // 若刚从持久化恢复（内存态为空但日志里已存在相同基线），无需重复追加
-            let already_hydrated = mem_baseline_seq.is_none()
-                && visible_instruction_notices.len() == 1
-                && rendered
-                    .as_ref()
-                    .is_some_and(|r| r.text == visible_instruction_notices[0].1);
-
-            let mut emitted_seq = if already_hydrated {
-                Some(visible_instruction_notices[0].0)
+            let hydrated_seq = if mem_baseline_seq.is_none() {
+                rendered.as_ref().and_then(|r| {
+                    visible_instruction_notices
+                        .iter()
+                        .rfind(|(_, text)| *text == r.text)
+                        .map(|(seq, _)| *seq)
+                })
             } else {
                 None
             };
+            let already_hydrated = hydrated_seq.is_some();
+
+            let mut emitted_seq = hydrated_seq;
 
             if !already_hydrated {
                 if let Some(ref r) = rendered {
@@ -375,13 +384,15 @@ impl AgentInstructions {
 
             let mut guard = self.sessions.lock().unwrap();
             let st = guard.entry(sid).or_default();
+            st.baseline_checked = true;
             st.baseline_seq = emitted_seq;
             st.baseline_identity = identity;
             st.represented = next_rep;
             st.omitted = next_omitted;
             st.truncated = next_truncated;
             st.known_subdirs = merged_subdirs;
-            st.pending_subdirs.clear();
+            st.pending_subdirs
+                .retain(|sub| !st.known_subdirs.contains(sub));
             st.watched_paths = watched;
             st.report = SessionInstructionsReport {
                 enabled: true,
@@ -422,6 +433,8 @@ impl AgentInstructions {
                 ));
                 let new_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
                 let mut next_rep = HashMap::new();
+                let mut next_omitted = HashSet::new();
+                let mut next_truncated = HashSet::new();
                 for f in r.represented {
                     next_rep.insert(
                         f.scope.clone(),
@@ -432,14 +445,32 @@ impl AgentInstructions {
                         },
                     );
                 }
+                for s in &r.statuses {
+                    if let Some(f) = disc
+                        .global_files
+                        .iter()
+                        .chain(disc.project_files.iter())
+                        .find(|df| df.display_path == s.display_path)
+                    {
+                        if s.omitted {
+                            next_omitted.insert(f.scope.clone());
+                        }
+                        if s.truncated {
+                            next_truncated.insert(f.scope.clone());
+                        }
+                    }
+                }
                 let mut guard = self.sessions.lock().unwrap();
                 let st = guard.entry(sid).or_default();
+                st.baseline_checked = true;
                 st.baseline_seq = new_seq;
                 st.baseline_identity = identity;
                 st.represented = next_rep;
-                st.omitted.clear();
+                st.omitted = next_omitted;
+                st.truncated = next_truncated;
                 st.known_subdirs = merged_subdirs;
-                st.pending_subdirs.clear();
+                st.pending_subdirs
+                    .retain(|sub| !st.known_subdirs.contains(sub));
                 st.watched_paths = watched;
                 st.report = SessionInstructionsReport {
                     enabled: true,
@@ -460,25 +491,35 @@ impl AgentInstructions {
         let cur_map: HashMap<ScopeKey, &DiscoveredFile> =
             all_cur.iter().map(|f| (f.scope.clone(), *f)).collect();
 
-        let (prev_rep, prev_omitted, prev_truncated) = {
+        let (prev_rep, prev_omitted, prev_truncated, had_baseline) = {
             let guard = self.sessions.lock().unwrap();
             let st = guard.get(&sid).unwrap();
             (
                 st.represented.clone(),
                 st.omitted.clone(),
                 st.truncated.clone(),
+                st.baseline_seq.is_some(),
             )
         };
 
         let mut delta_items = Vec::new();
-        let mut next_rep = HashMap::new();
+        let mut delta_kinds = HashMap::new();
 
         for file in &all_cur {
             if prev_omitted.contains(&file.scope) {
+                delta_kinds.insert(file.scope.clone(), DeltaChangeKind::Added);
+                delta_items.push(DeltaItem {
+                    scope: file.scope.clone(),
+                    display_path: file.display_path.clone(),
+                    scope_dir_display: file.scope_dir_display.clone(),
+                    kind: DeltaChangeKind::Added,
+                    content: file.content.clone(),
+                });
                 continue;
             }
             match prev_rep.get(&file.scope) {
                 None => {
+                    delta_kinds.insert(file.scope.clone(), DeltaChangeKind::Added);
                     delta_items.push(DeltaItem {
                         scope: file.scope.clone(),
                         display_path: file.display_path.clone(),
@@ -488,6 +529,7 @@ impl AgentInstructions {
                     });
                 }
                 Some(old) if old.digest != file.digest => {
+                    delta_kinds.insert(file.scope.clone(), DeltaChangeKind::Updated);
                     delta_items.push(DeltaItem {
                         scope: file.scope.clone(),
                         display_path: file.display_path.clone(),
@@ -498,14 +540,6 @@ impl AgentInstructions {
                 }
                 Some(_) => {}
             }
-            next_rep.insert(
-                file.scope.clone(),
-                TrackedFile {
-                    display_path: file.display_path.clone(),
-                    scope_dir_display: file.scope_dir_display.clone(),
-                    digest: file.digest.clone(),
-                },
-            );
         }
 
         let mut removed_keys: Vec<ScopeKey> = prev_rep
@@ -525,11 +559,55 @@ impl AgentInstructions {
             });
         }
 
-        if let Some(delta_text) = render_delta_message(&delta_items, self.config.max_bytes) {
+        let rendered_delta = render_delta_message_detailed(&delta_items, self.config.max_bytes);
+        let mut emitted_delta_seq = None;
+        if let Some(ref d) = rendered_delta {
             session.append(SessionEvent::context_notice(
                 AGENT_INSTRUCTIONS_SOURCE,
-                delta_text,
+                &d.text,
             ));
+            emitted_delta_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
+        }
+
+        let mut next_rep = HashMap::new();
+        let mut next_omitted = HashSet::new();
+        let mut next_truncated = HashSet::new();
+        for file in &all_cur {
+            if delta_kinds.contains_key(&file.scope) {
+                if let Some(ref d) = rendered_delta {
+                    if d.omitted_scopes.contains(&file.scope) {
+                        next_omitted.insert(file.scope.clone());
+                        continue;
+                    }
+                    if d.represented_scopes.contains(&file.scope) {
+                        if d.truncated_scopes.contains(&file.scope) {
+                            next_truncated.insert(file.scope.clone());
+                        }
+                        next_rep.insert(
+                            file.scope.clone(),
+                            TrackedFile {
+                                display_path: file.display_path.clone(),
+                                scope_dir_display: file.scope_dir_display.clone(),
+                                digest: file.digest.clone(),
+                            },
+                        );
+                        continue;
+                    }
+                }
+                next_omitted.insert(file.scope.clone());
+            } else if prev_rep.contains_key(&file.scope) {
+                if prev_truncated.contains(&file.scope) {
+                    next_truncated.insert(file.scope.clone());
+                }
+                next_rep.insert(
+                    file.scope.clone(),
+                    TrackedFile {
+                        display_path: file.display_path.clone(),
+                        scope_dir_display: file.scope_dir_display.clone(),
+                        digest: file.digest.clone(),
+                    },
+                );
+            }
         }
 
         let next_statuses: Vec<InstructionScopeStatus> = all_cur
@@ -538,21 +616,22 @@ impl AgentInstructions {
                 display_path: f.display_path.clone(),
                 scope_kind: f.scope_kind.clone(),
                 bytes: f.bytes,
-                truncated: prev_truncated.contains(&f.scope)
-                    && prev_rep
-                        .get(&f.scope)
-                        .is_some_and(|old| old.digest == f.digest),
-                omitted: prev_omitted.contains(&f.scope),
+                truncated: next_truncated.contains(&f.scope),
+                omitted: next_omitted.contains(&f.scope),
             })
             .collect();
 
         let mut guard = self.sessions.lock().unwrap();
         let st = guard.entry(sid).or_default();
+        if !had_baseline && emitted_delta_seq.is_some() {
+            st.baseline_seq = emitted_delta_seq;
+        }
         st.represented = next_rep;
-        st.truncated
-            .retain(|k| st.represented.contains_key(k) && prev_truncated.contains(k));
+        st.omitted = next_omitted;
+        st.truncated = next_truncated;
         st.known_subdirs = merged_subdirs;
-        st.pending_subdirs.clear();
+        st.pending_subdirs
+            .retain(|sub| !st.known_subdirs.contains(sub));
         st.watched_paths = watched;
         st.report = SessionInstructionsReport {
             enabled: true,

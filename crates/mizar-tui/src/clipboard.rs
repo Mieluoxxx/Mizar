@@ -898,10 +898,10 @@ fn collect_osc5522_response(fd: i32, timeout: Duration) -> Result<Vec<u8>, Clipb
         }
     }
 
-    if saw_ok && !assembled.is_empty() {
-        Ok(assembled)
-    } else if saw_ok {
-        Err(ClipboardError::Empty)
+    if saw_ok {
+        Err(ClipboardError::CommandFailed(
+            "OSC 5522 应答未收到 DONE 结束帧（超时或数据截断）".into(),
+        ))
     } else {
         Err(ClipboardError::Osc5522Unsupported(
             "等待终端 OSC 5522 应答超时（可通过环境变量禁止或检查终端是否支持）".into(),
@@ -1062,5 +1062,22 @@ mod tests {
         let file = dir.create_secret_file("secret.png").unwrap();
         let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_osc5522_response_rejects_partial_data_without_done() {
+        use std::os::unix::net::UnixStream;
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let data_b64 = STANDARD.encode(b"partial-bytes");
+        let payload = format!(
+            "\x1b]5522;type=read:status=OK\x1b\\\x1b]5522;type=read:status=DATA;{data_b64}\x1b\\"
+        );
+        writer.write_all(payload.as_bytes()).unwrap();
+        // 关闭写端或超时后未发送 DONE：必须判为截断失败而非 Ok(partial-bytes)
+        drop(writer);
+        let err = collect_osc5522_response(reader.as_raw_fd(), Duration::from_millis(50))
+            .expect_err("missing DONE terminator must fail");
+        assert!(matches!(err, ClipboardError::CommandFailed(_)));
     }
 }

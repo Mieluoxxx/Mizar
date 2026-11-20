@@ -59,8 +59,10 @@ pub struct InternalDispatchEvent {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EventOptions {
-    /// 插到队首，而不是队尾。
+    /// 插到同优先级区段之首，而不是之尾。
     pub prepend: bool,
+    /// 调度优先级（数值越小越先执行，默认 `0`）。
+    pub priority: i32,
 }
 
 /// `parallel` 模式下收集所有失败 listener 错误的聚合错误。
@@ -123,6 +125,7 @@ pub(crate) enum HookKind {
 #[derive(Clone)]
 struct HookEntry {
     id: u64,
+    priority: i32,
     kind: HookKind,
 }
 
@@ -300,12 +303,21 @@ impl EventsService {
             {
                 let mut hooks = events.hooks.lock().unwrap();
                 let list = hooks.entry(name.clone()).or_default();
-                let entry = HookEntry { id, kind };
-                if options.prepend {
-                    list.insert(0, entry);
+                let entry = HookEntry {
+                    id,
+                    priority: options.priority,
+                    kind,
+                };
+                let insert_idx = if options.prepend {
+                    list.iter()
+                        .position(|e| e.priority >= options.priority)
+                        .unwrap_or(list.len())
                 } else {
-                    list.push(entry);
-                }
+                    list.iter()
+                        .position(|e| e.priority > options.priority)
+                        .unwrap_or(list.len())
+                };
+                list.insert(insert_idx, entry);
             }
             let events_cleanup = Arc::clone(&events);
             Ok::<_, CordisError>(Some(crate::fiber::Cleanup::sync(move || {
@@ -457,5 +469,88 @@ impl EventsService {
             Box::new(out)
         });
         self.register_hook(ctx, name_str, options, HookKind::Waterfall(cb))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn serial_hooks_respect_priority_across_reregistration_and_prepend() {
+        let ctx = Context::new();
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+
+        let push = |tag: &'static str, trace: &Arc<StdMutex<Vec<&'static str>>>| {
+            let t = Arc::clone(trace);
+            move |_p: ()| {
+                let t = Arc::clone(&t);
+                async move {
+                    t.lock().unwrap().push(tag);
+                    None::<()>
+                }
+            }
+        };
+
+        // 即使低优先级(20)先注册、高优先级(-20)后注册，仍按 priority 从小到大执行
+        let _h_recall = ctx
+            .on_serial_with(
+                "pre-step",
+                push("recall:20", &trace),
+                EventOptions {
+                    priority: 20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _h_mid1 = ctx.on_serial("pre-step", push("mid1:0", &trace)).unwrap();
+        let h_compact = ctx
+            .on_serial_with(
+                "pre-step",
+                push("compact:-20", &trace),
+                EventOptions {
+                    priority: -20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _h_mid_prepend = ctx
+            .on_serial_with(
+                "pre-step",
+                push("mid-prepend:0", &trace),
+                EventOptions {
+                    prepend: true,
+                    priority: 0,
+                },
+            )
+            .unwrap();
+
+        let _: Option<()> = ctx.events().serial("pre-step", ()).await;
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec!["compact:-20", "mid-prepend:0", "mid1:0", "recall:20"]
+        );
+
+        // 卸载后重新挂载高优先级钩子（模拟插件热重启），仍排在最前
+        h_compact.dispose().await;
+        let _h_compact2 = ctx
+            .on_serial_with(
+                "pre-step",
+                push("compact2:-20", &trace),
+                EventOptions {
+                    priority: -20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        trace.lock().unwrap().clear();
+        let _: Option<()> = ctx.events().serial("pre-step", ()).await;
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec!["compact2:-20", "mid-prepend:0", "mid1:0", "recall:20"]
+        );
+
+        ctx.fiber().dispose().await;
     }
 }

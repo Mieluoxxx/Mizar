@@ -347,6 +347,8 @@ impl Plugin for SkillsPlugin {
             // 在每步发送模型请求前：1）增量注入 <available_skills> 目录；2）展开用户 /<name> 技能手势
             let published_catalogs: Arc<Mutex<HashMap<String, PublishedCatalogRecord>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            let processed_gesture_seqs: Arc<Mutex<HashMap<String, u64>>> =
+                Arc::new(Mutex::new(HashMap::new()));
             let pre_step_ctx = ctx.clone();
             ctx.on_serial::<AgentPreStepEvent, (), _, _>(
                 EVENT_AGENT_PRE_STEP,
@@ -358,6 +360,7 @@ impl Plugin for SkillsPlugin {
                     let ws = config.workspace.clone();
                     let max_desc_len = config.catalog_description_max_length.max(3);
                     let published_map = Arc::clone(&published_catalogs);
+                    let processed_gestures = Arc::clone(&processed_gesture_seqs);
 
                     async move {
                         if cancel.is_cancelled() {
@@ -380,12 +383,15 @@ impl Plugin for SkillsPlugin {
 
                         if skill_tool_visible {
                             let snap = reg.snapshot(lookup.clone()).await;
+                            if cancel.is_cancelled() {
+                                return None;
+                            }
                             let next_state =
                                 build_catalog_state(&snap.skills, max_desc_len, !snap.complete);
 
                             let prev_record =
                                 published_map.lock().unwrap().get(&session.id).cloned();
-                            let (prev_still_visible, had_catalog_notice) = session
+                            let (prev_still_visible, latest_catalog) = session
                                 .with_visible_entries(|entries| {
                                     let still_vis = prev_record.as_ref().is_some_and(|rec| {
                                         entries.iter().any(|entry| {
@@ -397,29 +403,50 @@ impl Plugin for SkillsPlugin {
                                                 )
                                         })
                                     });
-                                    let has_any = entries.iter().any(|entry| {
-                                        matches!(
-                                            &entry.event,
-                                            SessionEvent::ContextNotice { source, .. }
-                                                if source == SKILL_CATALOG_SOURCE
-                                        )
-                                    });
-                                    (still_vis, has_any)
+                                    let latest =
+                                        entries.iter().rev().find_map(|entry| match &entry.event {
+                                            SessionEvent::ContextNotice {
+                                                source, text, ..
+                                            } if source == SKILL_CATALOG_SOURCE => {
+                                                Some((entry.seq, text.clone()))
+                                            }
+                                            _ => None,
+                                        });
+                                    (still_vis, latest)
                                 });
 
-                            let prev_state = if prev_still_visible {
-                                prev_record.as_ref().map(|r| &r.state)
+                            let mut prev_state = if prev_still_visible {
+                                prev_record.as_ref().map(|r| r.state.clone())
                             } else {
                                 None
                             };
 
+                            if prev_state.is_none()
+                                && let Some((latest_seq, ref latest_text)) = latest_catalog
+                            {
+                                let matches_initial =
+                                    *latest_text == render_catalog_message(&next_state, false);
+                                let matches_update =
+                                    *latest_text == render_catalog_message(&next_state, true);
+                                if matches_initial || matches_update {
+                                    published_map.lock().unwrap().insert(
+                                        session.id.clone(),
+                                        PublishedCatalogRecord {
+                                            seq: latest_seq,
+                                            state: next_state.clone(),
+                                        },
+                                    );
+                                    prev_state = Some(next_state.clone());
+                                }
+                            }
+
                             let should_emit = match prev_state {
-                                Some(prev) => *prev != next_state,
+                                Some(ref prev) => *prev != next_state,
                                 None => !next_state.entries.is_empty() || next_state.incomplete,
                             };
 
                             if should_emit {
-                                let is_update = prev_record.is_some() || had_catalog_notice;
+                                let is_update = prev_record.is_some() || latest_catalog.is_some();
                                 let rendered = render_catalog_message(&next_state, is_update);
                                 session.append(SessionEvent::context_notice(
                                     SKILL_CATALOG_SOURCE,
@@ -439,14 +466,27 @@ impl Plugin for SkillsPlugin {
                             }
                         }
 
-                        // 2. 扫描最近一轮用户直输消息中的 `/<name>` 手势，仅展开 user_invocable 技能且仅处理本轮末尾新增的用户消息
-                        let trailing_user_texts: Vec<String> =
+                        // 2. 扫描最近一轮用户直输消息中的 `/<name>` 手势，仅展开 user_invocable 技能且仅处理尚未处理过的新增消息
+                        let last_done_gesture_seq = processed_gestures
+                            .lock()
+                            .unwrap()
+                            .get(&session.id)
+                            .copied()
+                            .unwrap_or(0);
+                        let (trailing_user_texts, max_user_seq) =
                             session.with_visible_entries(|entries| {
                                 let mut collected = Vec::new();
+                                let mut max_seq: Option<u64> = None;
                                 for entry in entries.iter().rev() {
+                                    if entry.seq <= last_done_gesture_seq {
+                                        break;
+                                    }
                                     match &entry.event {
                                         SessionEvent::User { text, .. } => {
-                                            collected.push(text.clone())
+                                            max_seq = Some(
+                                                max_seq.map_or(entry.seq, |m| m.max(entry.seq)),
+                                            );
+                                            collected.push(text.clone());
                                         }
                                         SessionEvent::ContextNotice { source, .. }
                                             if source != SKILL_INVOCATION_SOURCE => {}
@@ -461,7 +501,7 @@ impl Plugin for SkillsPlugin {
                                     }
                                 }
                                 collected.reverse();
-                                collected
+                                (collected, max_seq)
                             });
 
                         let mut gesture_names = Vec::new();
@@ -473,17 +513,39 @@ impl Plugin for SkillsPlugin {
                             }
                         }
 
+                        let mut resolved_defs = Vec::new();
+                        let mut all_resolved = true;
                         for name in gesture_names {
                             if cancel.is_cancelled() {
+                                all_resolved = false;
                                 break;
                             }
-                            if let Ok(Some(def)) = reg.get(&name, lookup.clone()).await
-                                && def.summary.is_user_invocable()
-                            {
+                            match reg.get(&name, lookup.clone()).await {
+                                Ok(Some(def)) if def.summary.is_user_invocable() => {
+                                    resolved_defs.push(def);
+                                }
+                                Ok(_) => {}
+                                Err(_) => {
+                                    all_resolved = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if all_resolved && !cancel.is_cancelled() {
+                            for def in resolved_defs {
                                 session.append(SessionEvent::context_notice(
                                     SKILL_INVOCATION_SOURCE,
                                     render_skill_content(&def),
                                 ));
+                            }
+                            if let Some(max_seq) = max_user_seq {
+                                processed_gestures
+                                    .lock()
+                                    .unwrap()
+                                    .entry(session.id.clone())
+                                    .and_modify(|s| *s = (*s).max(max_seq))
+                                    .or_insert(max_seq);
                             }
                         }
 

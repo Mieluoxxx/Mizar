@@ -1,6 +1,7 @@
 //! QuickJS (`rquickjs`) 沙箱执行器：安全运行模型编写的多工具 JS 编排脚本。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,21 @@ pub const CODEMODE_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 pub const CODEMODE_STACK_SIZE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_CODEMODE_TIMEOUT_MS: u64 = 120_000;
 const ARGS_PREVIEW_CHARS: usize = 160;
+
+#[derive(Debug, Clone, Default)]
+enum ScriptExitSignal {
+    #[default]
+    Running,
+    Requested(Option<String>),
+}
+
+enum ScriptOutcome {
+    Completed { returned_json: Option<String> },
+    Exited { message: Option<String> },
+    Aborted,
+    TimedOut { timeout_ms: u64 },
+    Failed { message: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodemodeNestedCall {
@@ -93,7 +109,8 @@ function text(v) {
 }
 
 function exit(msg) {
-    const err = new Error(msg ? String(msg) : "__CODEMODE_EXIT__");
+    __host_exit(msg === undefined ? null : String(msg));
+    const err = new Error("__codemode_exit__");
     err.__codemodeExit = true;
     throw err;
 }
@@ -194,7 +211,10 @@ pub async fn execute_codemode_script(
     let store_state = Arc::new(Mutex::new(staging_store));
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let nested_calls = Arc::new(Mutex::new(Vec::<CodemodeNestedCall>::new()));
-    let nested_seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let nested_seq = Arc::new(AtomicUsize::new(0));
+    let exit_signal = Arc::new(Mutex::new(ScriptExitSignal::Running));
+    let script_cancel = call_ctx.cancel.child_token();
+    let timed_out_hit = Arc::new(AtomicBool::new(false));
 
     let timeout_ms = parse_timeout_override(&code, default_timeout_ms);
     let timeout = Duration::from_millis(timeout_ms);
@@ -204,7 +224,7 @@ pub async fn execute_codemode_script(
     rt.set_memory_limit(CODEMODE_MEMORY_LIMIT_BYTES).await;
     rt.set_max_stack_size(CODEMODE_STACK_SIZE_BYTES).await;
 
-    let cancel_interrupt = call_ctx.cancel.clone();
+    let cancel_interrupt = script_cancel.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
         cancel_interrupt.is_cancelled() || started.elapsed() >= timeout
     })))
@@ -225,15 +245,28 @@ pub async fn execute_codemode_script(
     let seq_host = Arc::clone(&nested_seq);
     let tools_host = Arc::clone(&tools_rt);
     let call_ctx_host = call_ctx.clone();
+    let nested_cancel = script_cancel.clone();
+    let exit_host = Arc::clone(&exit_signal);
 
-    let script_outcome: Result<Option<String>, String> = qctx
-        .async_with(async |ctx| {
+    let deadline = tokio::time::Instant::from_std(started) + timeout;
+    let script_outcome: Result<Option<String>, String> = {
+        let mut eval_fut = Box::pin(qctx.async_with(async |ctx| {
             let globals = ctx.globals();
             globals
                 .set("__ID_TO_RAW_JSON", id_to_raw_json.as_str())
                 .map_err(|e| e.to_string())?;
             globals
                 .set("__ALL_TOOLS_JSON", all_tools_json.as_str())
+                .map_err(|e| e.to_string())?;
+
+            let exit_cb = Arc::clone(&exit_host);
+            globals
+                .set(
+                    "__host_exit",
+                    Func::from(move |msg: Option<String>| {
+                        *exit_cb.lock().unwrap() = ScriptExitSignal::Requested(msg);
+                    }),
+                )
                 .map_err(|e| e.to_string())?;
 
             let logs_cb = Arc::clone(&logs_host);
@@ -380,10 +413,11 @@ pub async fn execute_codemode_script(
                 Async(move |raw_name: String, args_json: String| {
                     let tools = Arc::clone(&tools_host);
                     let parent_ctx = call_ctx_host.clone();
+                    let child_cancel = nested_cancel.clone();
                     let nested = Arc::clone(&nested_host);
                     let seq = Arc::clone(&seq_host);
                     async move {
-                        let n = seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
                         let call_id = format!("cm/{n}");
                         let parsed_args: Value =
                             serde_json::from_str(&args_json).unwrap_or_else(|_| json!({}));
@@ -409,7 +443,7 @@ pub async fn execute_codemode_script(
                                     parsed_args,
                                     parent_ctx.exec.session_id.clone(),
                                 ),
-                                parent_ctx.cancel.clone(),
+                                child_cancel,
                                 None,
                             )
                             .await;
@@ -478,37 +512,63 @@ pub async fn execute_codemode_script(
                 None
             };
             Ok(ret_str)
-        })
-        .await;
+        }));
+        tokio::select! {
+            biased;
+            res = &mut eval_fut => res,
+            _ = call_ctx.cancel.cancelled() => {
+                script_cancel.cancel();
+                Err("Script aborted".to_string())
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                timed_out_hit.store(true, Ordering::SeqCst);
+                script_cancel.cancel();
+                Err(format!("Script timed out after {timeout_ms}ms"))
+            }
+        }
+    };
 
     rt.idle().await;
 
     let calls_snapshot = nested_calls.lock().unwrap().clone();
-    let logs_snapshot = logs.lock().unwrap().clone();
+    let mut logs_snapshot = logs.lock().unwrap().clone();
+    let recorded_exit = exit_signal.lock().unwrap().clone();
 
-    let (is_error, returned_val, error_msg) = match script_outcome {
-        Ok(ret) => {
+    let outcome = if call_ctx.cancel.is_cancelled() {
+        ScriptOutcome::Aborted
+    } else if let ScriptExitSignal::Requested(message) = recorded_exit {
+        ScriptOutcome::Exited { message }
+    } else {
+        match script_outcome {
+            Ok(returned_json) => ScriptOutcome::Completed { returned_json },
+            Err(_) if timed_out_hit.load(Ordering::SeqCst) || started.elapsed() >= timeout => {
+                ScriptOutcome::TimedOut { timeout_ms }
+            }
+            Err(message) => ScriptOutcome::Failed { message },
+        }
+    };
+
+    let (is_error, returned_val, error_msg) = match outcome {
+        ScriptOutcome::Completed { returned_json } => {
             let mut guard = session_store.lock().unwrap();
             guard.insert(session_key, store_state.lock().unwrap().clone());
-            (false, ret, None)
+            (false, returned_json, None)
         }
-        Err(err) => {
-            if err.contains("__CODEMODE_EXIT__") {
-                let mut guard = session_store.lock().unwrap();
-                guard.insert(session_key, store_state.lock().unwrap().clone());
-                (false, None, None)
-            } else if call_ctx.cancel.is_cancelled() {
-                (true, None, Some("Script aborted".to_string()))
-            } else if started.elapsed() >= timeout {
-                (
-                    true,
-                    None,
-                    Some(format!("Script timed out after {timeout_ms}ms")),
-                )
-            } else {
-                (true, None, Some(err))
+        ScriptOutcome::Exited { message } => {
+            let mut guard = session_store.lock().unwrap();
+            guard.insert(session_key, store_state.lock().unwrap().clone());
+            if let Some(msg) = message.filter(|m| !m.trim().is_empty()) {
+                logs_snapshot.push(msg);
             }
+            (false, None, None)
         }
+        ScriptOutcome::Aborted => (true, None, Some("Script aborted".to_string())),
+        ScriptOutcome::TimedOut { timeout_ms } => (
+            true,
+            None,
+            Some(format!("Script timed out after {timeout_ms}ms")),
+        ),
+        ScriptOutcome::Failed { message } => (true, None, Some(message)),
     };
 
     let mut sections = Vec::new();

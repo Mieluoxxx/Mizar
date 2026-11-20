@@ -819,7 +819,7 @@ async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_inst
         Some(mizar_llm::ReasoningEffort::High)
     );
 
-    state.is_busy = true;
+    state.set_busy_state(true);
     state.input.insert_str("follow up");
     assert_eq!(
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1347,7 +1347,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
         }),
     });
     // 执行完 ! 后不应自动触发模型回复
-    assert!(!state.is_busy);
+    assert!(!state.is_busy());
     assert!(seen_messages.lock().unwrap().is_empty());
 
     // 2. 输入框 `!! echo LOCAL_HIDDEN_E2E` -> 仅本地执行，不进入上下文

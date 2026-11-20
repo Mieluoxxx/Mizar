@@ -12,7 +12,7 @@ use mizar_llm_types::ContentBlock;
 use mizar_session::{
     PersistenceResult, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionEvent,
 };
-use rusqlite::{Connection, Transaction, params, params_from_iter};
+use rusqlite::{Connection, params, params_from_iter};
 
 const MAX_INDEX_CHARS: usize = 16_384;
 const MAX_DOC_TOKENS: usize = 4_096;
@@ -272,7 +272,7 @@ fn build_fts_match_expr(groups: &[Vec<String>], join_groups_with_or: bool) -> Op
 
 /// 在当前事务内为单条 `SessionEntry` 写入（或幂等跳过）情景回溯索引。
 pub fn index_entry_in_tx(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     session_id: &str,
     entry: &SessionEntry,
 ) -> PersistenceResult<()> {
@@ -318,7 +318,10 @@ pub fn index_entry_in_tx(
 }
 
 /// 供 `exec_fork` 在复制前缀事件后批量建立子会话的情景回溯索引。
-pub fn index_session_events_in_tx(tx: &Transaction<'_>, session_id: &str) -> PersistenceResult<()> {
+pub fn index_session_events_in_tx(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+) -> PersistenceResult<()> {
     let rows: Vec<(i64, i64, String)> = {
         let mut stmt = tx
             .prepare(
@@ -446,25 +449,54 @@ fn run_fts_query(
         .filter(|s| !s.is_empty())
         .collect();
 
+    let mut payload_stmt = conn
+        .prepare_cached(
+            "SELECT payload_json
+             FROM session_events
+             WHERE session_id = ?1 AND seq = ?2",
+        )
+        .map_err(crate::schema::map_sqlite_err)?;
+
     let mut exact_hits = Vec::new();
     let mut fallback_hits = Vec::new();
     for row in rows {
         let (session_id, session_title, seq, ts_ms, kind, preview) =
             row.map_err(crate::schema::map_sqlite_err)?;
         let preview_lower = preview.to_lowercase();
-        let all_match = terms_lower
+        let mut all_match = terms_lower
             .iter()
             .all(|t| preview_lower.contains(t.as_str()));
-        let any_match = terms_lower
+        let mut any_match = terms_lower
             .iter()
             .any(|t| preview_lower.contains(t.as_str()));
+        let mut snippet_source: Option<String> = None;
+
+        // FTS5 索引覆盖前 MAX_INDEX_CHARS (16384) 字符，而 preview 仅缓存前 MAX_PREVIEW_CHARS (4000) 字符；
+        // 若截断前缀未能完整命中，回查原始事件全文以防 4001..=16384 区间命中被静默丢弃。
+        if !all_match
+            && preview.chars().count() >= MAX_PREVIEW_CHARS
+            && let Some(payload_json) = payload_stmt
+                .query_row(params![&session_id, seq], |r| r.get::<_, String>(0))
+                .ok()
+            && let Ok(event) = serde_json::from_str::<SessionEvent>(&payload_json)
+            && let Some(full_text) = extract_indexable_text(&event)
+        {
+            let full_lower = full_text.to_lowercase();
+            all_match = terms_lower.iter().all(|t| full_lower.contains(t.as_str()));
+            any_match = terms_lower.iter().any(|t| full_lower.contains(t.as_str()));
+            if any_match || all_match {
+                snippet_source = Some(full_text);
+            }
+        }
+
+        let snippet_text = snippet_source.as_deref().unwrap_or(preview.as_str());
         let hit = RecallSearchHit {
             session_id,
             session_title,
             seq: u64::try_from(seq.max(0)).unwrap_or(0),
             ts: crate::schema::i64_to_millis(ts_ms),
             kind,
-            snippet: build_snippet(&preview, &terms_lower, SNIPPET_MAX_CHARS),
+            snippet: build_snippet(snippet_text, &terms_lower, SNIPPET_MAX_CHARS),
         };
         if all_match {
             exact_hits.push(hit);

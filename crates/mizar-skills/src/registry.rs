@@ -62,6 +62,7 @@ struct IndexedCandidate {
 
 #[derive(Clone)]
 struct CachedCollect {
+    revision: u64,
     entries: HashMap<String, IndexedCandidate>,
     fingerprints: Vec<(u64, Option<u64>)>,
 }
@@ -170,8 +171,11 @@ impl SkillRegistry {
     }
 
     pub fn invalidate_cache(&self) {
-        self.revision.fetch_add(1, Ordering::SeqCst);
-        self.collect_cache.lock().unwrap().clear();
+        {
+            let mut cache = self.collect_cache.lock().unwrap();
+            self.revision.fetch_add(1, Ordering::SeqCst);
+            cache.clear();
+        }
         self.ctx.emit(EVENT_SKILLS_CHANGE, ());
     }
 
@@ -202,15 +206,16 @@ impl SkillRegistry {
     ) -> (HashMap<String, IndexedCandidate>, bool) {
         let mut attempt = 0;
         loop {
-            let rev_before = self.revision.load(Ordering::SeqCst);
+            let (rev_before, cache_hit) = {
+                let cache = self.collect_cache.lock().unwrap();
+                (
+                    self.revision.load(Ordering::SeqCst),
+                    cache.get(&options.cwd).cloned(),
+                )
+            };
             let providers = self.providers.lock().unwrap().clone();
-            let cache_hit = self
-                .collect_cache
-                .lock()
-                .unwrap()
-                .get(&options.cwd)
-                .cloned();
             if let Some(cached) = cache_hit
+                && cached.revision == rev_before
                 && self.is_cache_fresh(&cached, &providers, options).await
                 && self.revision.load(Ordering::SeqCst) == rev_before
             {
@@ -304,17 +309,16 @@ impl SkillRegistry {
                 winners.insert(name, entry);
             }
 
-            let rev_after = self.revision.load(Ordering::SeqCst);
-            if rev_after != rev_before {
-                attempt += 1;
-                if attempt < MAX_COLLECT_ATTEMPTS {
-                    continue;
-                }
-                return (winners, false);
-            }
-
             if complete {
                 let mut cache = self.collect_cache.lock().unwrap();
+                if self.revision.load(Ordering::SeqCst) != rev_before {
+                    drop(cache);
+                    attempt += 1;
+                    if attempt < MAX_COLLECT_ATTEMPTS {
+                        continue;
+                    }
+                    return (winners, false);
+                }
                 if cache.len() >= self.cache_max
                     && let Some(first_key) = cache.keys().next().cloned()
                 {
@@ -323,10 +327,20 @@ impl SkillRegistry {
                 cache.insert(
                     options.cwd.clone(),
                     CachedCollect {
+                        revision: rev_before,
                         entries: winners.clone(),
                         fingerprints,
                     },
                 );
+                return (winners, true);
+            }
+
+            if self.revision.load(Ordering::SeqCst) != rev_before {
+                attempt += 1;
+                if attempt < MAX_COLLECT_ATTEMPTS {
+                    continue;
+                }
+                return (winners, false);
             }
 
             return (winners, complete);

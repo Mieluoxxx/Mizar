@@ -122,8 +122,11 @@ pub struct SelectionState {
     pub granularity: SelectionGranularity,
     pub pane: Option<SelectionPane>,
     pub fence: Option<Rect>,
+    /// 双击选词或三击选行时锁定的原始单元边界 `[unit_start, unit_end]`，用于双向拖拽不丢首单元。
+    origin_unit: Option<(CellPoint, CellPoint)>,
     last_click_at: Option<Instant>,
     last_click_pos: Option<CellPoint>,
+    last_click_pane: Option<SelectionPane>,
     click_count: u8,
 }
 
@@ -140,6 +143,7 @@ impl SelectionState {
         self.granularity = SelectionGranularity::Char;
         self.pane = None;
         self.fence = None;
+        self.origin_unit = None;
     }
 
     pub fn start_press(
@@ -149,10 +153,20 @@ impl SelectionState {
         geom: &SelectionGeometry,
         buf: Option<&Buffer>,
     ) {
+        let Some((pane, rect)) = geom.pane_at(col, row) else {
+            self.clear();
+            self.last_click_at = None;
+            self.last_click_pos = None;
+            self.last_click_pane = None;
+            self.click_count = 0;
+            return;
+        };
+
         let now = Instant::now();
-        let same_spot = self
-            .last_click_at
-            .is_some_and(|t| now.duration_since(t) <= MULTI_CLICK_MS)
+        let same_spot = self.last_click_pane == Some(pane)
+            && self
+                .last_click_at
+                .is_some_and(|t| now.duration_since(t) <= MULTI_CLICK_MS)
             && self
                 .last_click_pos
                 .is_some_and(|p| p.row == row && p.col.abs_diff(col) <= 1);
@@ -163,28 +177,27 @@ impl SelectionState {
         };
         self.last_click_at = Some(now);
         self.last_click_pos = Some(CellPoint { col, row });
-
-        let Some((pane, rect)) = geom.pane_at(col, row) else {
-            self.clear();
-            return;
-        };
+        self.last_click_pane = Some(pane);
 
         self.pane = Some(pane);
         self.fence = Some(rect);
         self.dragging = true;
         self.moved = false;
+        self.origin_unit = None;
 
         match self.click_count {
             2 => {
                 self.granularity = SelectionGranularity::Word;
-                if let Some(b) = buf {
-                    let (start_c, end_c) = expand_word_bounds(b, rect, col, row);
-                    self.anchor = Some(CellPoint { col: start_c, row });
-                    self.focus = Some(CellPoint { col: end_c, row });
+                let (start_c, end_c) = if let Some(b) = buf {
+                    expand_word_bounds(b, rect, col, row)
                 } else {
-                    self.anchor = Some(CellPoint { col, row });
-                    self.focus = Some(CellPoint { col, row });
-                }
+                    (col, col)
+                };
+                let u_start = CellPoint { col: start_c, row };
+                let u_end = CellPoint { col: end_c, row };
+                self.origin_unit = Some((u_start, u_end));
+                self.anchor = Some(u_start);
+                self.focus = Some(u_end);
             }
             3 => {
                 self.granularity = SelectionGranularity::Line;
@@ -192,8 +205,11 @@ impl SelectionState {
                     .row_meta(pane, row)
                     .map(|m| (m.col_start, m.col_end.saturating_sub(1)))
                     .unwrap_or((rect.x, (rect.x + rect.width).saturating_sub(1)));
-                self.anchor = Some(CellPoint { col: c0, row });
-                self.focus = Some(CellPoint { col: c1, row });
+                let u_start = CellPoint { col: c0, row };
+                let u_end = CellPoint { col: c1, row };
+                self.origin_unit = Some((u_start, u_end));
+                self.anchor = Some(u_start);
+                self.focus = Some(u_end);
             }
             _ => {
                 self.granularity = SelectionGranularity::Char;
@@ -225,24 +241,51 @@ impl SelectionState {
                 });
             }
             SelectionGranularity::Word => {
-                if let Some(b) = buf {
-                    let (_, end_c) = expand_word_bounds(b, fence, clamped_col, clamped_row);
-                    self.focus = Some(CellPoint {
-                        col: end_c,
-                        row: clamped_row,
-                    });
+                let (w_start, w_end) = if let Some(b) = buf {
+                    expand_word_bounds(b, fence, clamped_col, clamped_row)
                 } else {
-                    self.focus = Some(CellPoint {
-                        col: clamped_col,
-                        row: clamped_row,
-                    });
+                    (clamped_col, clamped_col)
+                };
+                let cur_start = CellPoint {
+                    col: w_start,
+                    row: clamped_row,
+                };
+                let cur_end = CellPoint {
+                    col: w_end,
+                    row: clamped_row,
+                };
+                if let Some((orig_start, orig_end)) = self.origin_unit {
+                    if (cur_start.row, cur_start.col) < (orig_start.row, orig_start.col) {
+                        self.anchor = Some(orig_end);
+                        self.focus = Some(cur_start);
+                    } else {
+                        self.anchor = Some(orig_start);
+                        self.focus = Some(cur_end);
+                    }
+                } else {
+                    self.focus = Some(cur_end);
                 }
             }
             SelectionGranularity::Line => {
-                self.focus = Some(CellPoint {
+                let row_start = CellPoint {
+                    col: fence.x,
+                    row: clamped_row,
+                };
+                let row_end = CellPoint {
                     col: fence.x + fence.width - 1,
                     row: clamped_row,
-                });
+                };
+                if let Some((orig_start, orig_end)) = self.origin_unit {
+                    if clamped_row < orig_start.row {
+                        self.anchor = Some(orig_end);
+                        self.focus = Some(row_start);
+                    } else {
+                        self.anchor = Some(orig_start);
+                        self.focus = Some(row_end);
+                    }
+                } else {
+                    self.focus = Some(row_end);
+                }
             }
         }
     }
@@ -252,6 +295,7 @@ impl SelectionState {
             return false;
         }
         self.dragging = false;
+        self.origin_unit = None;
         if self.granularity == SelectionGranularity::Char && !self.moved {
             // 单纯点击（无拖拽）不产生单格幽灵选区
             self.clear();
@@ -585,5 +629,56 @@ mod tests {
         sel.finish_release();
         let word = extract_selected_text(&buf, &sel, &geom).unwrap();
         assert_eq!(word, "src/app.rs");
+    }
+
+    #[test]
+    fn backwards_word_and_line_drag_preserves_origin_unit() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, 3));
+        buf.set_string(0, 0, "alpha beta", Style::default());
+        buf.set_string(0, 1, "gamma delta", Style::default());
+        buf.set_string(0, 2, "epsilon zeta", Style::default());
+
+        let mut geom = SelectionGeometry {
+            chat_rect: Some(Rect::new(0, 0, 24, 3)),
+            ..Default::default()
+        };
+        geom.push_row(SelectionPane::Chat, 0, 0, 24, false);
+        geom.push_row(SelectionPane::Chat, 1, 0, 24, false);
+        geom.push_row(SelectionPane::Chat, 2, 0, 24, false);
+
+        // 双击 beta (col 7)，向左上反拖到 alpha (col 1) -> 必须完整包含 alpha 和 beta
+        let mut sel = SelectionState::default();
+        sel.start_press(7, 0, &geom, Some(&buf));
+        sel.finish_release();
+        sel.start_press(7, 0, &geom, Some(&buf));
+        sel.update_drag(1, 0, Some(&buf));
+        sel.finish_release();
+        assert_eq!(
+            extract_selected_text(&buf, &sel, &geom).as_deref(),
+            Some("alpha beta")
+        );
+
+        // 三击第 2 行 (row 2)，向上反拖到第 0 行 -> 必须完整包含第 0/1/2 行
+        let mut line_sel = SelectionState::default();
+        for _ in 0..3 {
+            line_sel.start_press(3, 2, &geom, Some(&buf));
+            if line_sel.click_count < 3 {
+                line_sel.finish_release();
+            }
+        }
+        line_sel.update_drag(2, 0, Some(&buf));
+        line_sel.finish_release();
+        assert_eq!(
+            extract_selected_text(&buf, &line_sel, &geom).as_deref(),
+            Some("alpha beta\ngamma delta\nepsilon zeta")
+        );
+
+        // 点击面板外必须重置连击计数，后续面板内点击从单击重新开始
+        let mut outside_sel = SelectionState::default();
+        outside_sel.start_press(3, 0, &geom, Some(&buf));
+        outside_sel.finish_release();
+        assert_eq!(outside_sel.click_count, 1);
+        outside_sel.start_press(3, 5, &geom, Some(&buf));
+        assert_eq!(outside_sel.click_count, 0);
     }
 }

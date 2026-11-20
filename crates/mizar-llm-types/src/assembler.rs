@@ -5,13 +5,50 @@ use crate::types::{
     ToolCall,
 };
 
-struct PartialBlock {
-    kind: ContentBlockKind,
-    text: String,
-    tool_call_id: Option<String>,
-    tool_call_name: Option<String>,
-    tool_call_arguments: String,
-    closed: Option<ContentBlock>,
+enum OpenBlockBuffer {
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    },
+}
+
+impl OpenBlockBuffer {
+    fn from_kind(kind: ContentBlockKind) -> Self {
+        match kind {
+            ContentBlockKind::Text => Self::Text(String::new()),
+            ContentBlockKind::Reasoning => Self::Reasoning(String::new()),
+            ContentBlockKind::ToolCall => Self::ToolCall {
+                id: None,
+                name: None,
+                arguments: String::new(),
+            },
+        }
+    }
+
+    fn kind(&self) -> ContentBlockKind {
+        match self {
+            Self::Text(_) => ContentBlockKind::Text,
+            Self::Reasoning(_) => ContentBlockKind::Reasoning,
+            Self::ToolCall { .. } => ContentBlockKind::ToolCall,
+        }
+    }
+}
+
+enum PartialBlock {
+    Open(OpenBlockBuffer),
+    Closed(ContentBlock),
+}
+
+impl PartialBlock {
+    fn kind(&self) -> ContentBlockKind {
+        match self {
+            Self::Open(buf) => buf.kind(),
+            Self::Closed(block) => block.kind(),
+        }
+    }
 }
 
 /// 增量流块组装器：把乱序/分片的 `StreamChunk` 组装为有序的 `ContentBlock` 列表与回放状态。
@@ -35,15 +72,17 @@ impl BlockAssembler {
                 self.ensure(index, kind);
             }
             StreamChunk::TextDelta { index, text } => {
-                let p = self.ensure(index, ContentBlockKind::Text);
-                if p.closed.is_none() {
-                    p.text.push_str(&text);
+                if let PartialBlock::Open(OpenBlockBuffer::Text(buf)) =
+                    self.ensure(index, ContentBlockKind::Text)
+                {
+                    buf.push_str(&text);
                 }
             }
             StreamChunk::ReasoningDelta { index, text } => {
-                let p = self.ensure(index, ContentBlockKind::Reasoning);
-                if p.closed.is_none() {
-                    p.text.push_str(&text);
+                if let PartialBlock::Open(OpenBlockBuffer::Reasoning(buf)) =
+                    self.ensure(index, ContentBlockKind::Reasoning)
+                {
+                    buf.push_str(&text);
                 }
             }
             StreamChunk::ToolCallDelta {
@@ -52,25 +91,29 @@ impl BlockAssembler {
                 name,
                 arguments_delta,
             } => {
-                let p = self.ensure(index, ContentBlockKind::ToolCall);
-                if p.closed.is_none() {
+                if let PartialBlock::Open(OpenBlockBuffer::ToolCall {
+                    id: cur_id,
+                    name: cur_name,
+                    arguments,
+                }) = self.ensure(index, ContentBlockKind::ToolCall)
+                {
                     if let Some(id) = id
                         && !id.is_empty()
                     {
-                        p.tool_call_id = Some(id);
+                        *cur_id = Some(id);
                     }
                     if let Some(name) = name
                         && !name.is_empty()
                     {
-                        p.tool_call_name = Some(name);
+                        *cur_name = Some(name);
                     }
-                    p.tool_call_arguments.push_str(&arguments_delta);
+                    arguments.push_str(&arguments_delta);
                 }
             }
             StreamChunk::BlockEnd { index, block } => {
-                let p = self.ensure(index, block.kind());
-                if p.closed.is_none() {
-                    p.closed = Some(block);
+                let entry = self.ensure(index, block.kind());
+                if matches!(entry, PartialBlock::Open(_)) {
+                    *entry = PartialBlock::Closed(block);
                 }
             }
             StreamChunk::Usage { usage } => {
@@ -86,51 +129,47 @@ impl BlockAssembler {
     fn ensure(&mut self, index: usize, kind: ContentBlockKind) -> &mut PartialBlock {
         if !self.partials.contains_key(&index) {
             self.order.push(index);
-            self.partials.insert(
-                index,
-                PartialBlock {
-                    kind,
-                    text: String::new(),
-                    tool_call_id: None,
-                    tool_call_name: None,
-                    tool_call_arguments: String::new(),
-                    closed: None,
-                },
-            );
+            self.partials
+                .insert(index, PartialBlock::Open(OpenBlockBuffer::from_kind(kind)));
         }
         self.partials.get_mut(&index).expect("partial inserted")
     }
 
     fn finalize_partial(index: usize, partial: &PartialBlock) -> ContentBlock {
-        if let Some(closed) = &partial.closed {
-            return closed.clone();
-        }
-        match partial.kind {
-            ContentBlockKind::Text => ContentBlock::Text {
-                text: partial.text.clone(),
-            },
-            ContentBlockKind::Reasoning => ContentBlock::Reasoning {
-                text: partial.text.clone(),
-            },
-            ContentBlockKind::ToolCall => ContentBlock::ToolCall {
-                id: partial
-                    .tool_call_id
-                    .clone()
-                    .unwrap_or_else(|| format!("call_{index}")),
-                name: partial.tool_call_name.clone().unwrap_or_default(),
-                arguments: partial.tool_call_arguments.clone(),
+        match partial {
+            PartialBlock::Closed(closed) => closed.clone(),
+            PartialBlock::Open(OpenBlockBuffer::Text(text)) => {
+                ContentBlock::Text { text: text.clone() }
+            }
+            PartialBlock::Open(OpenBlockBuffer::Reasoning(text)) => {
+                ContentBlock::Reasoning { text: text.clone() }
+            }
+            PartialBlock::Open(OpenBlockBuffer::ToolCall {
+                id,
+                name,
+                arguments,
+            }) => ContentBlock::ToolCall {
+                id: id.clone().unwrap_or_else(|| format!("call_{index}")),
+                name: name.clone().unwrap_or_default(),
+                arguments: arguments.clone(),
             },
         }
     }
 
+    fn sorted_indices(&self) -> Vec<usize> {
+        let mut indices = self.order.clone();
+        indices.sort_unstable();
+        indices
+    }
+
     fn assembled(&self) -> (Vec<ContentBlock>, Option<ReplayEnvelope>) {
-        let all: Vec<ContentBlock> = self
-            .order
+        let sorted_indices = self.sorted_indices();
+        let all: Vec<(usize, ContentBlock)> = sorted_indices
             .iter()
-            .filter_map(|idx| {
+            .filter_map(|&idx| {
                 self.partials
-                    .get(idx)
-                    .map(|p| Self::finalize_partial(*idx, p))
+                    .get(&idx)
+                    .map(|p| (idx, Self::finalize_partial(idx, p)))
             })
             .collect();
 
@@ -138,30 +177,39 @@ impl BlockAssembler {
         let drop_tool_calls = matches!(self.finish, Some(FinishReason::MaxTokens));
         let keep_mask: Vec<bool> = all
             .iter()
-            .map(|b| !drop_tool_calls || !matches!(b, ContentBlock::ToolCall { .. }))
+            .map(|(_, b)| !drop_tool_calls || !matches!(b, ContentBlock::ToolCall { .. }))
             .collect();
 
         let blocks: Vec<ContentBlock> = all
             .iter()
             .zip(keep_mask.iter())
             .filter(|&(_, keep)| *keep)
-            .map(|(b, _)| b.clone())
+            .map(|((_, b), _)| b.clone())
             .collect();
 
         let replay = self.replay.as_ref().and_then(|env| {
             if env.blocks.is_empty() {
                 return Some(env.clone());
             }
-            if env.blocks.len() != all.len() {
+            let filtered_blocks = if env.blocks.len() == all.len() {
+                env.blocks
+                    .iter()
+                    .zip(keep_mask.iter())
+                    .filter(|&(_, keep)| *keep)
+                    .map(|(v, _)| v.clone())
+                    .collect()
+            } else if all
+                .last()
+                .is_some_and(|(max_idx, _)| *max_idx < env.blocks.len())
+            {
+                all.iter()
+                    .zip(keep_mask.iter())
+                    .filter(|&(_, keep)| *keep)
+                    .map(|((idx, _), _)| env.blocks[*idx].clone())
+                    .collect()
+            } else {
                 return None;
-            }
-            let filtered_blocks: Vec<serde_json::Value> = env
-                .blocks
-                .iter()
-                .zip(keep_mask.iter())
-                .filter(|&(_, keep)| *keep)
-                .map(|(v, _)| v.clone())
-                .collect();
+            };
             Some(ReplayEnvelope {
                 protocol: env.protocol.clone(),
                 provider: env.provider.clone(),
@@ -180,15 +228,14 @@ impl BlockAssembler {
 
     /// 中断时仅保留已有非空白文本与思考内容，丢弃尚未派发的工具调用。
     pub fn interrupted_blocks(&self) -> Vec<ContentBlock> {
-        self.order
-            .iter()
+        self.sorted_indices()
+            .into_iter()
             .filter_map(|idx| {
-                let p = self.partials.get(idx)?;
-                let kind = p.closed.as_ref().map(ContentBlock::kind).unwrap_or(p.kind);
-                if kind == ContentBlockKind::ToolCall {
+                let p = self.partials.get(&idx)?;
+                if p.kind() == ContentBlockKind::ToolCall {
                     return None;
                 }
-                let block = Self::finalize_partial(*idx, p);
+                let block = Self::finalize_partial(idx, p);
                 let non_empty = match &block {
                     ContentBlock::Text { text } | ContentBlock::Reasoning { text } => {
                         !text.trim().is_empty()

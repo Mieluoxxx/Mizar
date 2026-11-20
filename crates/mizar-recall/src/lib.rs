@@ -14,8 +14,9 @@ use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
 use mizar_llm::ContentBlock;
 use mizar_session::{
-    EVENT_SESSION_EVENT, RecallSearchHit, RecallSearchQuery, Session, SessionContextExt,
-    SessionEntry, SessionEvent, SessionEventPayload, SessionListQuery, SessionStore,
+    EVENT_SESSION_CREATED, EVENT_SESSION_EVENT, EVENT_SESSION_LOADED, RecallSearchHit,
+    RecallSearchQuery, Session, SessionContextExt, SessionCreatedPayload, SessionEntry,
+    SessionEvent, SessionEventPayload, SessionListQuery, SessionLoadedPayload, SessionStore,
 };
 use mizar_tools::{
     ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput, ToolsContextExt,
@@ -201,27 +202,31 @@ fn fallback_in_memory_search(
         return Vec::new();
     }
 
-    let target_sessions: Vec<Arc<Session>> = if !query.session_ids.is_empty() {
+    let target_sessions: Vec<mizar_session::LoadedSession> = if !query.session_ids.is_empty() {
         query
             .session_ids
             .iter()
-            .filter_map(|id| store.get(id))
+            .filter_map(|id| store.inspect_readonly(id))
+            .collect()
+    } else if let Ok(headers) = store.list_headers(&SessionListQuery {
+        cwd: query.cwd.clone(),
+        limit: Some(50),
+    }) {
+        headers
+            .iter()
+            .filter_map(|h| store.inspect_readonly(&h.id))
             .collect()
     } else {
-        let mut list = store.list();
-        if let Some(ref cwd) = query.cwd {
-            list.retain(|s| s.header().cwd.as_deref() == Some(cwd.as_str()));
-        }
-        list
+        Vec::new()
     };
 
     let mut exact = Vec::new();
     let mut partial = Vec::new();
 
     for session in target_sessions {
-        let header = session.header();
-        for entry in session.all_entries() {
-            let Some(rendered) = render_entry_verbatim(&entry) else {
+        let header = session.header;
+        for entry in &session.entries {
+            let Some(rendered) = render_entry_verbatim(entry) else {
                 continue;
             };
             let lower = rendered.to_lowercase();
@@ -264,10 +269,12 @@ fn is_session_authorized(store: &SessionStore, caller_sid: Option<&str>, target_
         return true;
     }
     let caller_cwd = store
-        .get(caller_id)
-        .and_then(|s| s.header().cwd)
+        .inspect_readonly(caller_id)
+        .and_then(|s| s.header.cwd)
         .or_else(|| store.default_cwd());
-    let target_cwd = store.get(target_sid).and_then(|s| s.header().cwd);
+    let target_cwd = store
+        .inspect_readonly(target_sid)
+        .and_then(|s| s.header.cwd);
     match (caller_cwd, target_cwd) {
         (Some(a), Some(b)) => a == b,
         _ => false,
@@ -329,8 +336,8 @@ fn build_recall_search_tool(store: Arc<SessionStore>, default_limit: usize) -> T
                 "workspace" => {
                     let ws = caller_sid
                         .as_deref()
-                        .and_then(|sid| store.get(sid))
-                        .and_then(|s| s.header().cwd)
+                        .and_then(|sid| store.inspect_readonly(sid))
+                        .and_then(|s| s.header.cwd)
                         .or_else(|| store.default_cwd());
                     (Vec::new(), ws)
                 }
@@ -520,15 +527,15 @@ fn build_recall_read_tool(store: Arc<SessionStore>, default_char_limit: usize) -
             }
 
             let session = store
-                .get(&target_sid)
+                .inspect_readonly(&target_sid)
                 .ok_or_else(|| format!("未找到会话 `{target_sid}`"))?;
 
             let mut rendered_blocks = Vec::new();
-            for entry in session.all_entries() {
+            for entry in &session.entries {
                 if entry.seq < start_seq || entry.seq > end_seq {
                     continue;
                 }
-                if let Some(block) = render_entry_verbatim(&entry) {
+                if let Some(block) = render_entry_verbatim(entry) {
                     rendered_blocks.push(block);
                 }
             }
@@ -678,7 +685,61 @@ impl Plugin for RecallPlugin {
                 })?);
             }
 
+            for session in sessions.list() {
+                if should_activate_recall(&session) {
+                    tools.activate_tools(
+                        &session.id,
+                        &[
+                            RECALL_SEARCH_TOOL_NAME.to_string(),
+                            RECALL_READ_TOOL_NAME.to_string(),
+                        ],
+                    );
+                }
+            }
+
             if config.auto_activate_on_compaction {
+                let rt_created = Arc::clone(&tools);
+                let ctx_created = ctx.clone();
+                cleanups.push(ctx.effect("recall.on-session-created", move || {
+                    let h = ctx_created.on(
+                        EVENT_SESSION_CREATED,
+                        move |ev: &SessionCreatedPayload| {
+                            if should_activate_recall(&ev.session) {
+                                rt_created.activate_tools(
+                                    &ev.session.id,
+                                    &[
+                                        RECALL_SEARCH_TOOL_NAME.to_string(),
+                                        RECALL_READ_TOOL_NAME.to_string(),
+                                    ],
+                                );
+                            }
+                        },
+                    )?;
+                    Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
+                        h.dispose().await;
+                    })))
+                })?);
+
+                let rt_loaded = Arc::clone(&tools);
+                let ctx_loaded = ctx.clone();
+                cleanups.push(ctx.effect("recall.on-session-loaded", move || {
+                    let h =
+                        ctx_loaded.on(EVENT_SESSION_LOADED, move |ev: &SessionLoadedPayload| {
+                            if should_activate_recall(&ev.session) {
+                                rt_loaded.activate_tools(
+                                    &ev.session.id,
+                                    &[
+                                        RECALL_SEARCH_TOOL_NAME.to_string(),
+                                        RECALL_READ_TOOL_NAME.to_string(),
+                                    ],
+                                );
+                            }
+                        })?;
+                    Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
+                        h.dispose().await;
+                    })))
+                })?);
+
                 let rt_ev = Arc::clone(&tools);
                 let ctx_ev = ctx.clone();
                 cleanups.push(ctx.effect("recall.on-session-event", move || {
@@ -704,7 +765,7 @@ impl Plugin for RecallPlugin {
                 let rt_step = Arc::clone(&tools);
                 let ctx_step = ctx.clone();
                 cleanups.push(ctx.effect("recall.on-pre-step", move || {
-                    let h = ctx_step.on_serial::<AgentPreStepEvent, (), _, _>(
+                    let h = ctx_step.on_serial_with::<AgentPreStepEvent, (), _, _>(
                         EVENT_AGENT_PRE_STEP,
                         move |ev: AgentPreStepEvent| {
                             let rt = Arc::clone(&rt_step);
@@ -720,6 +781,10 @@ impl Plugin for RecallPlugin {
                                 }
                                 None
                             }
+                        },
+                        cordis::EventOptions {
+                            priority: 20,
+                            ..Default::default()
                         },
                     )?;
                     Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
@@ -888,5 +953,99 @@ mod tests {
         assert!(allowed.content.contains("alpha_secret"));
 
         app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn readonly_queries_do_not_hydrate_or_repair_cold_sessions_and_resume_rearms_tools() {
+        let dir = std::env::temp_dir().join(format!(
+            "mizar_recall_readonly_{}_{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("sessions.sqlite");
+
+        // 1. 首轮进程创建一个含压缩历史与悬挂工具调用的会话并落盘
+        {
+            let app1 = Context::new();
+            app1.plugin(
+                SqlitePersistencePlugin,
+                SqlitePersistenceConfig::new(&db_path),
+            )
+            .await
+            .unwrap();
+            app1.plugin(SessionStore::plugin(), ()).await.unwrap();
+            let store1 = app1.sessions().unwrap();
+            let s1 = store1.create_with(SessionCreateOptions {
+                id: Some("cold-arch".into()),
+                cwd: Some("/ws/ro".into()),
+                ..Default::default()
+            });
+            s1.append(SessionEvent::user("历史中的 secret_token_xyz"));
+            s1.append(SessionEvent::Assistant {
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "hang-call".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                replay: None,
+                usage: None,
+            });
+            s1.compact("压缩冷会话", 2, Some(100));
+            s1.flush_async().await.unwrap();
+            app1.fiber().dispose().await;
+        }
+
+        // 2. 新进程挂载 RecallPlugin：从同工作区另一会话查询 cold-arch，不得水合也不得修补落盘
+        let app2 = Context::new();
+        app2.plugin(
+            SqlitePersistencePlugin,
+            SqlitePersistenceConfig::new(&db_path),
+        )
+        .await
+        .unwrap();
+        app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+        app2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        app2.plugin(RecallPlugin, RecallConfig::default())
+            .await
+            .unwrap();
+
+        let store2 = app2.sessions().unwrap();
+        let tools2 = app2.tools().unwrap();
+        let caller = store2.create_with(SessionCreateOptions {
+            id: Some("caller-ro".into()),
+            cwd: Some("/ws/ro".into()),
+            ..Default::default()
+        });
+
+        let read_res = tools2
+            .execute(ToolExecution::new(
+                RECALL_READ_TOOL_NAME,
+                json!({ "seq": 1, "session_id": "cold-arch" }),
+                Some(caller.id.clone()),
+            ))
+            .await;
+        assert!(!read_res.is_error, "{}", read_res.content);
+        assert!(read_res.content.contains("secret_token_xyz"));
+        assert!(!store2.contains_in_memory("cold-arch"));
+        // 确认未向 cold-arch 追加第 4 条（TOOL_OUTCOME_UNKNOWN）条目
+        let cold_ro = store2.inspect_readonly("cold-arch").unwrap();
+        assert_eq!(cold_ro.entries.len(), 3);
+
+        // 3. 真正 resume (get) cold-arch 时，应在未运行任何 Turn 前立即激活 recall 工具
+        let resumed = store2.get("cold-arch").unwrap();
+        assert_eq!(resumed.log().len(), 4);
+        assert!(
+            tools2
+                .list_declared(Some("cold-arch"))
+                .iter()
+                .any(|t| t.name == RECALL_SEARCH_TOOL_NAME)
+        );
+
+        app2.fiber().dispose().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -465,3 +465,326 @@ async fn include_user_roots_false_skips_user_skills_but_keeps_project_skills() {
     ctx.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[tokio::test]
+async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_catalog() {
+    use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+    use mizar_skills::{
+        SkillCandidate, SkillDefinition, SkillProvider, SkillProviderObservation, SkillSummary,
+    };
+
+    struct SlowProvider {
+        skills: Arc<Mutex<Vec<(String, String)>>>,
+        started: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
+        block_first: std::sync::atomic::AtomicBool,
+    }
+
+    impl SkillProvider for SlowProvider {
+        fn name(&self) -> &str {
+            "slow-test"
+        }
+
+        fn fingerprint(
+            &self,
+            _options: &mizar_skills::SkillLookupOptions,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send + '_>> {
+            let count = self.skills.lock().unwrap().len() as u64;
+            Box::pin(async move { Some(count) })
+        }
+
+        fn list(
+            &self,
+            _options: mizar_skills::SkillLookupOptions,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<SkillProviderObservation, String>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let skills = Arc::clone(&self.skills);
+            let started = Arc::clone(&self.started);
+            let proceed = Arc::clone(&self.proceed);
+            let should_block = self
+                .block_first
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let initial_snap = skills.lock().unwrap().clone();
+                if should_block {
+                    started.notify_one();
+                    proceed.notified().await;
+                }
+                let candidates = initial_snap
+                    .into_iter()
+                    .map(|(n, d)| SkillCandidate {
+                        summary: SkillSummary {
+                            path: None,
+                            name: n,
+                            description: d,
+                            when_to_use: None,
+                            invocation: SkillInvocationPolicy::default(),
+                            source: SkillSource::Runtime,
+                            provider: "slow-test".to_string(),
+                            resource_base: None,
+                        },
+                        rank: 10,
+                        locator: Arc::new(()),
+                        metadata: None,
+                    })
+                    .collect();
+                Ok(SkillProviderObservation {
+                    candidates,
+                    complete: true,
+                })
+            })
+        }
+
+        fn get(
+            &self,
+            candidate: SkillCandidate,
+            _options: mizar_skills::SkillLookupOptions,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<SkillDefinition>, String>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(Some(SkillDefinition {
+                    summary: candidate.summary,
+                    content: "slow body".to_string(),
+                    metadata: None,
+                }))
+            })
+        }
+    }
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("mizar_skills_race_{}_{uniq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join(".agents/skills/alpha")).unwrap();
+    std::fs::create_dir_all(base.join(".agents/skills/beta")).unwrap();
+    std::fs::write(
+        base.join(".agents/skills/alpha/SKILL.md"),
+        "---\nname: alpha\ndescription: Alpha skill\n---\nALPHA_BODY",
+    )
+    .unwrap();
+    std::fs::write(
+        base.join(".agents/skills/beta/SKILL.md"),
+        "---\nname: beta\ndescription: Beta skill\n---\nBETA_BODY",
+    )
+    .unwrap();
+
+    // 1. 并发 invalidate_cache 与 collect 竞态：中途 revision 失效后不得将旧快照写入 cache
+    let ctx_race = Context::new();
+    ctx_race
+        .plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
+        .await
+        .unwrap();
+    let reg = ctx_race.skills().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let provider_skills = Arc::new(Mutex::new(vec![("v1-skill".into(), "V1".into())]));
+    let provider = Arc::new(SlowProvider {
+        skills: Arc::clone(&provider_skills),
+        started: Arc::clone(&started),
+        proceed: Arc::clone(&proceed),
+        block_first: std::sync::atomic::AtomicBool::new(true),
+    });
+    let _p_cleanup = reg.register_provider(provider).unwrap();
+
+    let reg_task = Arc::clone(&reg);
+    let fut = tokio::spawn(async move {
+        reg_task
+            .list(mizar_skills::SkillLookupOptions {
+                cwd: None,
+                cancel: CancellationToken::new(),
+            })
+            .await
+    });
+    started.notified().await;
+    // 在 list 返回前更新数据源并 invalidate_cache()
+    provider_skills
+        .lock()
+        .unwrap()
+        .push(("v2-skill".into(), "V2".into()));
+    reg.invalidate_cache();
+    proceed.notify_one();
+    let _first = fut.await.unwrap();
+    proceed.notify_waiters();
+
+    // 下次 list 不得命中 stale v1 cache，必须包含 v2-skill
+    let second = reg
+        .list(mizar_skills::SkillLookupOptions {
+            cwd: None,
+            cancel: CancellationToken::new(),
+        })
+        .await;
+    assert!(
+        second.iter().any(|s| s.name == "v2-skill"),
+        "expected v2-skill after concurrent invalidation, got: {:?}",
+        second.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    ctx_race.fiber().dispose().await;
+
+    // 2. 恢复会话去重 catalog + 取消的 pre-step 不锁存 gesture seq
+    let ctx1 = Context::new();
+    ctx1.plugin(mizar_session::SessionStore::plugin(), ())
+        .await
+        .unwrap();
+    ctx1.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    ctx1.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    ctx1.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
+        .await
+        .unwrap();
+    let mut cfg = SkillsConfig::new(&base);
+    cfg.include_user_roots = false;
+    ctx1.plugin(SkillsPlugin, cfg.clone()).await.unwrap();
+
+    let s = ctx1
+        .sessions()
+        .unwrap()
+        .create(Some("s-skill-resume".into()));
+    s.append(SessionEvent::user("run /alpha please"));
+    let _ = ctx1
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s),
+                turn: 1,
+                step: 1,
+                provider: None,
+                model: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+
+    // 模拟已取消的 pre-step 带有 /beta：不得推进 processed_gesture_seq
+    s.append(SessionEvent::user("and /beta too"));
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let _ = ctx1
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s),
+                turn: 2,
+                step: 1,
+                provider: None,
+                model: None,
+                cancel: cancelled,
+            },
+        )
+        .await;
+    // 下一次未取消的 pre-step 仍应成功展开 /beta，仅此一次
+    let _ = ctx1
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s),
+                turn: 2,
+                step: 1,
+                provider: None,
+                model: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let _ = ctx1
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s),
+                turn: 2,
+                step: 2,
+                provider: None,
+                model: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let beta_count = s.with_visible_entries(|entries| {
+        entries
+            .iter()
+            .filter(|e| match &e.event {
+                SessionEvent::ContextNotice { source, text, .. } => {
+                    source == SKILL_INVOCATION_SOURCE && text.contains("BETA_BODY")
+                }
+                _ => false,
+            })
+            .count()
+    });
+    assert_eq!(
+        beta_count, 1,
+        "cancelled gesture check must allow retry once and not duplicate"
+    );
+
+    let snapshot_entries = s.all_entries();
+    let snapshot_header = s.header();
+    ctx1.fiber().dispose().await;
+
+    // 恢复到新 Context（空的 published_catalogs）时不应重复追加相同 catalog
+    let ctx2 = Context::new();
+    ctx2.plugin(mizar_session::SessionStore::plugin(), ())
+        .await
+        .unwrap();
+    ctx2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    ctx2.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    ctx2.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
+        .await
+        .unwrap();
+    ctx2.plugin(SkillsPlugin, cfg).await.unwrap();
+
+    let resumed = Arc::new(mizar_session::Session::from_loaded(
+        ctx2.clone(),
+        mizar_session::LoadedSession {
+            header: snapshot_header,
+            entries: snapshot_entries,
+            max_persisted_seq: None,
+            skipped_events: 0,
+        },
+    ));
+    let before_cat = resumed.with_visible_entries(|e| {
+        e.iter()
+            .filter(|x| matches!(&x.event, SessionEvent::ContextNotice { source, .. } if source == SKILL_CATALOG_SOURCE))
+            .count()
+    });
+    assert_eq!(before_cat, 1);
+
+    let _ = ctx2
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&resumed),
+                turn: 3,
+                step: 1,
+                provider: None,
+                model: None,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    let after_cat = resumed.with_visible_entries(|e| {
+        e.iter()
+            .filter(|x| matches!(&x.event, SessionEvent::ContextNotice { source, .. } if source == SKILL_CATALOG_SOURCE))
+            .count()
+    });
+    assert_eq!(
+        after_cat, 1,
+        "resumed session must hydrate catalog state instead of duplicating SKILL_CATALOG_SOURCE"
+    );
+
+    ctx2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

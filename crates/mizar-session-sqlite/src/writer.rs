@@ -85,7 +85,13 @@ fn clone_err_res(res: &PersistenceResult<()>) -> PersistenceResult<()> {
     }
 }
 
-pub fn run_writer_loop(mut conn: Connection, rx: mpsc::Receiver<WriteCmd>) {
+pub fn run_writer_loop(
+    mut conn: Connection,
+    rx: mpsc::Receiver<WriteCmd>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let mut sticky_error: Option<String> = None;
+
     while let Ok(first) = rx.recv() {
         let mut writes = Vec::new();
         let mut flushes = Vec::new();
@@ -115,10 +121,18 @@ pub fn run_writer_loop(mut conn: Connection, rx: mpsc::Receiver<WriteCmd>) {
             }
         }
 
-        let write_res = if writes.is_empty() {
+        let write_res = if let Some(ref err_msg) = sticky_error {
+            Err(PersistenceError::Backend(err_msg.clone()))
+        } else if writes.is_empty() {
             Ok(())
         } else {
-            apply_write_batch(&mut conn, &writes)
+            let res = apply_write_batch(&mut conn, &writes);
+            if let Err(ref err) = res {
+                let msg = err.to_string();
+                sticky_error = Some(msg.clone());
+                *last_error.lock().unwrap() = Some(msg);
+            }
+            res
         };
 
         for reply in flushes {
@@ -199,10 +213,24 @@ fn apply_write_batch(conn: &mut Connection, writes: &[WriteCmd]) -> PersistenceR
 fn insert_session_header(tx: &Transaction<'_>, h: &SessionHeader) -> PersistenceResult<()> {
     let mut stmt = tx
         .prepare_cached(
-            "INSERT OR IGNORE INTO sessions (
+            "INSERT INTO sessions (
                  id, format_version, cwd, title, title_source, parent_id, fork_seq,
                  created_at_ms, updated_at_ms, event_count, surface_count, compacted_up_to_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET
+                 cwd = COALESCE(sessions.cwd, excluded.cwd),
+                 title = COALESCE(sessions.title, excluded.title),
+                 title_source = COALESCE(sessions.title_source, excluded.title_source),
+                 parent_id = COALESCE(sessions.parent_id, excluded.parent_id),
+                 fork_seq = COALESCE(sessions.fork_seq, excluded.fork_seq),
+                 created_at_ms = MIN(sessions.created_at_ms, excluded.created_at_ms),
+                 updated_at_ms = MAX(sessions.updated_at_ms, excluded.updated_at_ms),
+                 event_count = MAX(sessions.event_count, excluded.event_count),
+                 surface_count = MAX(sessions.surface_count, excluded.surface_count),
+                 compacted_up_to_seq = CASE
+                     WHEN excluded.compacted_up_to_seq IS NOT NULL THEN MAX(COALESCE(sessions.compacted_up_to_seq, 0), excluded.compacted_up_to_seq)
+                     ELSE sessions.compacted_up_to_seq
+                 END",
         )
         .map_err(map_sqlite_err)?;
 
@@ -407,12 +435,39 @@ fn exec_fork(
     )
     .map_err(map_sqlite_err)?;
 
+    let copied_compacted_up_to_seq: Option<u64> = {
+        let mut stmt = tx
+            .prepare_cached(
+                "SELECT payload_json
+                 FROM session_events
+                 WHERE session_id = ?1 AND kind = 'compaction'",
+            )
+            .map_err(map_sqlite_err)?;
+        let rows = stmt
+            .query_map([&new_header.id], |r| r.get::<_, String>(0))
+            .map_err(map_sqlite_err)?;
+        let mut max_kept: Option<u64> = None;
+        for row in rows {
+            let json = row.map_err(map_sqlite_err)?;
+            if let Ok(SessionEvent::Compaction { first_kept_seq, .. }) =
+                serde_json::from_str::<SessionEvent>(&json)
+            {
+                max_kept = Some(max_kept.map_or(first_kept_seq, |prev| prev.max(first_kept_seq)));
+            }
+        }
+        max_kept
+    };
+
     tx.execute(
         "UPDATE sessions
          SET event_count = (SELECT COUNT(*) FROM session_events WHERE session_id = ?1),
-             surface_count = (SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND visibility = 'surface')
+             surface_count = (SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND visibility = 'surface'),
+             compacted_up_to_seq = ?2
          WHERE id = ?1",
-        [&new_header.id],
+        params![
+            &new_header.id,
+            copied_compacted_up_to_seq.map(|v| v as i64)
+        ],
     )
     .map_err(map_sqlite_err)?;
 

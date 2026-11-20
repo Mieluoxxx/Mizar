@@ -3,8 +3,7 @@
 pub mod ranker;
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use mizar_tools::{
@@ -40,13 +39,33 @@ pub fn is_searchable_exposure(exposure: ToolExposure) -> bool {
     matches!(exposure, ToolExposure::Codemode | ToolExposure::Deferred)
 }
 
-fn sync_auto_enable(tools: &ToolRuntime, last_state: &AtomicBool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoEnableState {
+    Inactive,
+    Active,
+}
+
+fn sync_auto_enable(tools: &ToolRuntime, state: &Mutex<AutoEnableState>) {
     let has_searchable = tools
         .list_all()
         .into_iter()
         .any(|t| is_searchable_exposure(t.exposure));
-    if last_state.swap(has_searchable, Ordering::SeqCst) != has_searchable {
-        tools.set_global_active_override(TOOL_SEARCH_TOOL_NAME, has_searchable);
+    let next = if has_searchable {
+        AutoEnableState::Active
+    } else {
+        AutoEnableState::Inactive
+    };
+    let changed = {
+        let mut cur = state.lock().unwrap();
+        if *cur == next {
+            false
+        } else {
+            *cur = next;
+            true
+        }
+    };
+    if changed {
+        tools.set_auto_default_active(TOOL_SEARCH_TOOL_NAME, Some(has_searchable));
     }
 }
 
@@ -193,7 +212,7 @@ impl Plugin for ToolSearchPlugin {
 
             let mut handles = vec![reg];
             if config.auto_enable {
-                let last_state = Arc::new(AtomicBool::new(false));
+                let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
                 sync_auto_enable(&tools, &last_state);
                 let tools_sub = tools;
                 let last_sub = Arc::clone(&last_state);

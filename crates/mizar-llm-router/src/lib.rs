@@ -120,11 +120,34 @@ impl LlmAdapter for RoutedAdapter {
     }
 
     fn discover_models(&self) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
+        self.discover_models_with_headers(&[])
+    }
+
+    fn discover_models_with_headers(
+        &self,
+        extra_headers: &[(String, String)],
+    ) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
         if !self.model_infos.is_empty() {
             let models = self.model_infos.clone();
             return Box::pin(async move { Ok(models) });
         }
-        self.inner.discover_models()
+        let mut resolved_headers =
+            match resolve_header_map(&self.provider, &self.provider_headers, None) {
+                Ok(h) => h,
+                Err(err) => return Box::pin(async move { Err(err) }),
+            };
+        resolved_headers.extend(extra_headers.iter().cloned());
+        let out = self.ctx.waterfall(
+            EVENT_ROUTER_HEADERS,
+            RouterHeaderInput {
+                provider: self.provider.clone(),
+                protocol: self.protocol,
+                model: None,
+                headers: resolved_headers,
+            },
+            |input| input,
+        );
+        self.inner.discover_models_with_headers(&out.headers)
     }
 
     fn stream(&self, mut options: GenerateOptions) -> BoxChunkStream {
@@ -376,46 +399,59 @@ fn build_routed_adapter(
     }
 }
 
+struct RouterState {
+    config: RouterConfig,
+    active_routes: Vec<String>,
+}
+
 pub struct LlmRouter {
     ctx: Context,
-    config: Mutex<RouterConfig>,
-    active_routes: Mutex<Vec<String>>,
+    state: Mutex<RouterState>,
 }
 
 impl LlmRouter {
     pub fn config(&self) -> RouterConfig {
-        self.config.lock().unwrap().clone()
+        self.state.lock().unwrap().config.clone()
     }
 
-    /// 原子更新路由表：已存在且新配置也有的路由原地平滑替换，被移除的路由注销。
+    /// 原子更新路由表：先在单一锁下计算差量与更新 `config`，解锁后再一次性同步给 `LlmRuntime`（仅触发一次更新事件）。
     pub fn apply_config(&self, next: RouterConfig) -> Result<(), CordisError> {
         let llm = self.ctx.llm()?;
 
-        let mut active = self.active_routes.lock().unwrap();
-        for old_key in active.iter() {
-            if !next.providers.contains_key(old_key) {
-                llm.remove_adapter(old_key);
+        let (removed, upserts) = {
+            let mut state = self.state.lock().unwrap();
+            let removed: Vec<String> = state
+                .active_routes
+                .iter()
+                .filter(|old_key| !next.providers.contains_key(*old_key))
+                .cloned()
+                .collect();
+
+            let mut upserts = Vec::with_capacity(next.providers.len());
+            let mut next_active = Vec::with_capacity(next.providers.len());
+            for (provider, route) in &next.providers {
+                let adapter: Arc<dyn LlmAdapter> =
+                    Arc::new(build_routed_adapter(&self.ctx, provider, route));
+                upserts.push((provider.clone(), adapter));
+                next_active.push(provider.clone());
             }
-        }
-        active.clear();
 
-        for (provider, route) in &next.providers {
-            let adapter: Arc<dyn LlmAdapter> =
-                Arc::new(build_routed_adapter(&self.ctx, provider, route));
-            let _ = llm.upsert_adapter(provider.clone(), adapter);
-            active.push(provider.clone());
-        }
+            state.active_routes = next_active;
+            state.config = next;
+            (removed, upserts)
+        };
 
-        *self.config.lock().unwrap() = next;
+        llm.sync_adapters(&removed, upserts);
         Ok(())
     }
 
     pub fn clear(&self) {
-        let keys: Vec<String> = self.active_routes.lock().unwrap().drain(..).collect();
+        let keys = {
+            let mut state = self.state.lock().unwrap();
+            std::mem::take(&mut state.active_routes)
+        };
         if let Ok(llm) = self.ctx.llm() {
-            for k in keys {
-                llm.remove_adapter(&k);
-            }
+            llm.sync_adapters(&keys, Vec::new());
         }
     }
 }
@@ -438,8 +474,10 @@ impl Service for LlmRouter {
     fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
-            config: Mutex::new(config),
-            active_routes: Mutex::new(Vec::new()),
+            state: Mutex::new(RouterState {
+                config,
+                active_routes: Vec::new(),
+            }),
         }))
     }
 

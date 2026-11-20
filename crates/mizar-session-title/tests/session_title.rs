@@ -412,3 +412,154 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
     assert_eq!(offline_adapter.call_count.load(Ordering::SeqCst), 0);
     app2.fiber().dispose().await;
 }
+
+#[tokio::test]
+async fn failed_or_skipped_attempt_does_not_latch_turn() {
+    struct IdAdapter {
+        id: &'static str,
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        replies: Arc<Mutex<VecDeque<ScriptedReply>>>,
+    }
+
+    impl LlmAdapter for IdAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: self.id.to_string(),
+                name: self.name.to_string(),
+                protocol: "mock".to_string(),
+                models: vec![ModelInfo {
+                    id: "fast-title".to_string(),
+                    name: "Fast Title".to_string(),
+                    context_window: Some(32_768),
+                    max_tokens: Some(4096),
+                    reasoning_efforts: vec![ReasoningEffort::Low],
+                    input: Vec::new(),
+                }],
+            })
+        }
+
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ScriptedReply {
+                    text: Ok("EXP|默认响应".into()),
+                    delay_ms: 0,
+                });
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                match reply.text {
+                    Ok(text) => {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text(text)));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                    Err(err) => {
+                        let _ = tx.unbounded_send(Err(err));
+                    }
+                }
+            });
+            Box::pin(rx)
+        }
+    }
+
+    let real_calls = Arc::new(AtomicUsize::new(0));
+    let real_adapter = Arc::new(IdAdapter {
+        id: "real",
+        name: "Real",
+        calls: Arc::clone(&real_calls),
+        replies: Arc::new(Mutex::new(VecDeque::from([
+            ScriptedReply {
+                text: Err(LlmError {
+                    code: LlmErrorCode::Unknown,
+                    message: "transient".into(),
+                    status: None,
+                    retry_after_ms: None,
+                }),
+                delay_ms: 0,
+            },
+            ScriptedReply {
+                text: Ok("FIX|恢复重试成功".into()),
+                delay_ms: 0,
+            },
+        ]))),
+    });
+    let mock_adapter = Arc::new(IdAdapter {
+        id: "mock",
+        name: "Offline Mock",
+        calls: Arc::new(AtomicUsize::new(0)),
+        replies: Arc::new(Mutex::new(VecDeque::new())),
+    });
+
+    let (app, _cleanup) =
+        setup_app("real", real_adapter.clone(), SessionTitleConfig::default()).await;
+    let _mock_cleanup = app
+        .llm()
+        .unwrap()
+        .register_adapter("mock", mock_adapter)
+        .unwrap();
+    let adapter_calls = &real_calls;
+
+    let session = app.sessions().unwrap().create_with(SessionCreateOptions {
+        id: Some("s-retry-turn".into()),
+        ..Default::default()
+    });
+    session.append(SessionEvent::user("测试 turn 1 不被锁死"));
+
+    // 1. Offline mock 在 turn=1 跳过后，不应锁死 turn=1
+    app.emit(
+        EVENT_AGENT_TURN_INPUT,
+        AgentTurnInputEvent {
+            session: Arc::clone(&session),
+            turn: 1,
+            provider: Some("mock".into()),
+            model: Some("mock-v1".into()),
+            ts_ms: session.header().created_at_ms,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+    // 2. 切到真实模型但首轮调用出错，出错后也不应永久锁死 turn=1
+    app.emit(
+        EVENT_AGENT_TURN_INPUT,
+        AgentTurnInputEvent {
+            session: Arc::clone(&session),
+            turn: 1,
+            provider: Some("real".into()),
+            model: Some("fast-title".into()),
+            ts_ms: session.header().created_at_ms,
+        },
+    );
+    wait_until(|| adapter_calls.load(Ordering::SeqCst) == 1).await;
+
+    // 3. 再次触发 turn=1 仍可生成并应用标题
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    app.emit(
+        EVENT_AGENT_TURN_INPUT,
+        AgentTurnInputEvent {
+            session: Arc::clone(&session),
+            turn: 1,
+            provider: Some("real".into()),
+            model: Some("fast-title".into()),
+            ts_ms: session.header().created_at_ms,
+        },
+    );
+    wait_until(|| {
+        session
+            .header()
+            .title
+            .as_deref()
+            .is_some_and(|t| t.contains("FIX｜恢复重试成功"))
+    })
+    .await;
+    assert_eq!(adapter_calls.load(Ordering::SeqCst), 2);
+
+    app.fiber().dispose().await;
+}

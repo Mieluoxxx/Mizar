@@ -795,7 +795,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let width_usize = content_area.width.max(1) as usize;
 
     let emphasis = app.emphasis;
-    let is_busy = app.is_busy;
+    let is_busy = app.is_busy();
     let show_thinking = app.show_thinking;
     let verbose_expanded = app.verbose_expanded;
     let spinner_tick = app.spinner_tick;
@@ -2445,7 +2445,7 @@ fn render_input_box(frame: &mut Frame<'_>, area: Rect, inner_w: u16, app: &mut A
             BashInputMode::Context => app.theme.success,
             BashInputMode::NoContext => app.theme.text_muted,
         }
-    } else if app.is_busy || app.is_bash_running {
+    } else if app.is_running_activity() {
         app.theme.border_busy
     } else if app.reasoning_effort.is_some() {
         effort_col
@@ -2486,12 +2486,16 @@ fn render_input_box(frame: &mut Frame<'_>, area: Rect, inner_w: u16, app: &mut A
             " Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出) ".to_string(),
             Style::default().fg(app.theme.text_muted),
         ),
-        None if app.is_busy => (
+        None if app.is_busy() => (
             " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) ".to_string(),
             Style::default().fg(app.theme.text_muted),
         ),
-        None if app.is_bash_running => (
+        None if app.is_bash_running() => (
             " 输入 (Bash 命令执行中 · Esc 取消) ".to_string(),
+            Style::default().fg(app.theme.text_muted),
+        ),
+        None if app.is_compacting() => (
+            " 输入 (上下文压缩中 · Esc 取消) ".to_string(),
             Style::default().fg(app.theme.text_muted),
         ),
         None if app.input.has_collapsed_pastes() && app.input.has_images() => (
@@ -2676,12 +2680,12 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     }
 
     let theme = app.theme.clone();
-    let is_busy = app.is_busy;
-    let is_bash = app.is_bash_running;
-    let is_compacting = app.is_compacting;
+    let is_busy = app.is_busy();
+    let is_bash = app.is_bash_running();
+    let is_compacting = app.is_compacting();
     let spinner = BRAILLE_SPINNER[app.spinner_tick % BRAILLE_SPINNER.len()];
     let (status_text, status_color) = if is_compacting {
-        let detail = app.compaction_status.as_deref().unwrap_or("上下文压缩中…");
+        let detail = app.compaction_status().unwrap_or("上下文压缩中…");
         (format!("{spinner} {detail}"), theme.info)
     } else if is_busy {
         (format!("{spinner} 运行中"), theme.warning)
@@ -3856,7 +3860,7 @@ mod tests {
             None,
             None,
         );
-        app.is_busy = true;
+        app.set_busy_state(true);
         for text in ["第一条排队消息", "第二条排队消息"] {
             app.input.insert_str(text);
             app.handle_key(crossterm::event::KeyEvent::new(
@@ -3891,7 +3895,7 @@ mod tests {
             None,
             None,
         );
-        app.is_busy = true;
+        app.set_busy_state(true);
         app.input.insert_str("queued on short terminal");
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,

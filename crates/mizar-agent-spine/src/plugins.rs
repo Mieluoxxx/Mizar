@@ -173,6 +173,14 @@ struct ModuleSlot {
 impl ModuleSlot {
     fn is_enabled(&self) -> bool {
         !self.fibers.is_empty()
+            && self.fibers.iter().all(|f| {
+                matches!(
+                    f.state(),
+                    cordis::FiberState::Pending
+                        | cordis::FiberState::Loading
+                        | cordis::FiberState::Active
+                )
+            })
     }
 
     fn status(&self) -> SpineModuleStatus {
@@ -500,9 +508,12 @@ impl SpinePlugins {
         let _op = self.op_lock.lock().await;
 
         enum Action {
-            Noop,
+            Noop(Vec<Fiber>),
             Disable(Vec<Fiber>),
-            Enable(ModuleSpec),
+            Enable {
+                old_fibers: Vec<Fiber>,
+                spec: ModuleSpec,
+            },
         }
 
         let action = {
@@ -512,7 +523,12 @@ impl SpinePlugins {
             };
             let currently_enabled = slot.is_enabled();
             if currently_enabled == enabled {
-                Action::Noop
+                let stale = if !enabled {
+                    std::mem::take(&mut slot.fibers)
+                } else {
+                    Vec::new()
+                };
+                Action::Noop(stale)
             } else if !enabled {
                 // 卸载前同步热更新后的易变配置（如 compaction.*），避免重新启用时状态脑裂
                 #[cfg(feature = "compaction")]
@@ -529,12 +545,20 @@ impl SpinePlugins {
                 }
                 Action::Disable(std::mem::take(&mut slot.fibers))
             } else {
-                Action::Enable(slot.spec.clone())
+                Action::Enable {
+                    old_fibers: std::mem::take(&mut slot.fibers),
+                    spec: slot.spec.clone(),
+                }
             }
         };
 
         match action {
-            Action::Noop => Ok(false),
+            Action::Noop(stale) => {
+                for fiber in stale.into_iter().rev() {
+                    fiber.dispose().await;
+                }
+                Ok(false)
+            }
             Action::Disable(fibers) => {
                 for fiber in fibers.into_iter().rev() {
                     fiber.dispose().await;
@@ -548,7 +572,10 @@ impl SpinePlugins {
                 );
                 Ok(true)
             }
-            Action::Enable(spec) => {
+            Action::Enable { old_fibers, spec } => {
+                for fiber in old_fibers.into_iter().rev() {
+                    fiber.dispose().await;
+                }
                 let fibers = mount_module_and_wait(&self.ctx, id, &spec).await?;
                 {
                     let mut slots = self.slots.lock().unwrap();
@@ -685,6 +712,22 @@ mod tests {
         assert!(ctrl.set_enabled("tool-fs", true).await.unwrap());
         assert!(tools.list().iter().any(|t| t.name == "read_file"));
         assert!(ctrl.disabled_ids().is_empty());
+
+        // 若外部直接释放某可选模块的底层 Fiber，is_enabled/disabled_ids 必须实时反映为禁用且允许干净重挂
+        let slot_fiber = {
+            let slots = ctrl.slots.lock().unwrap();
+            slots
+                .iter()
+                .find(|s| s.meta.id == "tool-time")
+                .unwrap()
+                .fibers[0]
+                .clone()
+        };
+        slot_fiber.dispose().await;
+        assert!(!ctrl.is_enabled("tool-time"));
+        assert_eq!(ctrl.disabled_ids(), vec!["tool-time".to_string()]);
+        assert!(ctrl.set_enabled("tool-time", true).await.unwrap());
+        assert!(ctrl.is_enabled("tool-time"));
 
         app.fiber().dispose().await;
     }

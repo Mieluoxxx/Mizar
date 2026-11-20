@@ -7,7 +7,6 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Logger, Service};
@@ -75,6 +74,20 @@ pub enum McpConnectionState {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpManagerPhase {
+    Initializing,
+    Ready,
+    Closing,
+    Closed,
+}
+
+impl McpManagerPhase {
+    fn is_closing_or_closed(self) -> bool {
+        matches!(self, Self::Closing | Self::Closed)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpServerStatus {
     pub name: String,
@@ -89,7 +102,6 @@ pub struct McpServerStatus {
 struct ConnectedServer {
     entry: LoadedMcpEntry,
     client: Arc<McpClient>,
-    state: McpConnectionState,
     cleanups: Vec<Cleanup>,
 }
 
@@ -121,9 +133,8 @@ pub struct McpManager {
     resource_cleanups: AsyncMutex<Vec<Cleanup>>,
     connect_lock: AsyncMutex<()>,
     connect_cancel: CancellationToken,
-    closed: AtomicBool,
+    phase: Mutex<McpManagerPhase>,
     ready_notify: Arc<tokio::sync::Notify>,
-    initial_done: Mutex<bool>,
 }
 
 impl McpManager {
@@ -131,10 +142,14 @@ impl McpManager {
         self.ctx.logger_named("mcp")
     }
 
+    fn is_closing_or_closed(&self) -> bool {
+        self.phase.lock().unwrap().is_closing_or_closed() || self.connect_cancel.is_cancelled()
+    }
+
     pub async fn wait_ready(&self) {
         loop {
             let notified = self.ready_notify.notified();
-            if *self.initial_done.lock().unwrap() {
+            if *self.phase.lock().unwrap() != McpManagerPhase::Initializing {
                 return;
             }
             notified.await;
@@ -250,8 +265,7 @@ impl McpManager {
 
     pub async fn connect_configured(&self) {
         let _guard = self.connect_lock.lock().await;
-        if self.closed.load(Ordering::SeqCst) || self.connect_cancel.is_cancelled() {
-            *self.initial_done.lock().unwrap() = true;
+        if self.is_closing_or_closed() {
             self.ready_notify.notify_waiters();
             return;
         }
@@ -313,14 +327,14 @@ impl McpManager {
         }
 
         for entry in entries {
-            if self.closed.load(Ordering::SeqCst) || self.connect_cancel.is_cancelled() {
+            if self.is_closing_or_closed() {
                 break;
             }
             if !entry.config.enabled {
                 continue;
             }
             if let Err(err) = self.connect_one(entry.clone()).await {
-                if self.closed.load(Ordering::SeqCst) || self.connect_cancel.is_cancelled() {
+                if self.is_closing_or_closed() {
                     break;
                 }
                 self.logger()
@@ -331,10 +345,15 @@ impl McpManager {
             }
         }
 
-        if !self.closed.load(Ordering::SeqCst) && !self.connect_cancel.is_cancelled() {
+        if !self.is_closing_or_closed() {
             self.sync_resource_tools().await;
         }
-        *self.initial_done.lock().unwrap() = true;
+        {
+            let mut phase = self.phase.lock().unwrap();
+            if *phase == McpManagerPhase::Initializing {
+                *phase = McpManagerPhase::Ready;
+            }
+        }
         self.ready_notify.notify_waiters();
     }
 
@@ -360,7 +379,7 @@ impl McpManager {
             }
         };
 
-        if self.closed.load(Ordering::SeqCst) || cancel.is_cancelled() {
+        if self.is_closing_or_closed() {
             client.close().await;
             return Err("MCP manager closed".to_string());
         }
@@ -422,8 +441,8 @@ impl McpManager {
             has_resources: client.has_resources,
         };
         if let Some(st) = self.statuses.lock().unwrap().get_mut(&entry.name) {
-            st.state = state.clone();
-            st.registered_tools = registered_tools.clone();
+            st.state = state;
+            st.registered_tools = registered_tools;
             if st.description.is_none() {
                 st.description = ns_desc;
             }
@@ -435,7 +454,6 @@ impl McpManager {
             ConnectedServer {
                 entry,
                 client,
-                state,
                 cleanups,
             },
         );
@@ -471,8 +489,15 @@ impl McpManager {
     }
 
     pub async fn close_all(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        {
+            let mut phase = self.phase.lock().unwrap();
+            if *phase == McpManagerPhase::Closed {
+                return;
+            }
+            *phase = McpManagerPhase::Closing;
+        }
         self.connect_cancel.cancel();
+        self.ready_notify.notify_waiters();
         let _connect_guard = self.connect_lock.lock().await;
 
         let mut res = self.resource_cleanups.lock().await;
@@ -486,12 +511,24 @@ impl McpManager {
         drop(srvs);
 
         for srv in drained {
-            let _ = srv.state;
             for c in srv.cleanups {
                 run_cleanup(c).await;
             }
             srv.client.close().await;
         }
+
+        {
+            let mut st = self.statuses.lock().unwrap();
+            for s in st.values_mut() {
+                s.registered_tools.clear();
+                if !matches!(s.state, McpConnectionState::Failed(_)) {
+                    s.state = McpConnectionState::Disabled;
+                }
+            }
+        }
+
+        *self.phase.lock().unwrap() = McpManagerPhase::Closed;
+        self.ready_notify.notify_waiters();
     }
 
     async fn resource_clients(&self, filter_server: Option<&str>) -> Vec<(String, Arc<McpClient>)> {
@@ -795,9 +832,8 @@ impl Service for McpManager {
             resource_cleanups: AsyncMutex::new(Vec::new()),
             connect_lock: AsyncMutex::new(()),
             connect_cancel: CancellationToken::new(),
-            closed: AtomicBool::new(false),
+            phase: Mutex::new(McpManagerPhase::Initializing),
             ready_notify: Arc::new(tokio::sync::Notify::new()),
-            initial_done: Mutex::new(false),
         }))
     }
 
@@ -847,5 +883,47 @@ pub trait McpContextExt {
 impl McpContextExt for Context {
     fn mcp(&self) -> Result<Arc<McpManager>, CordisError> {
         self.service::<McpManager>("mcp")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mizar_tools::ToolRuntime;
+
+    #[tokio::test]
+    async fn close_all_before_connect_wakes_wait_ready_and_remains_idempotent() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let mut cfg = McpPluginConfig::new(".");
+        cfg.load_config_files = false;
+        cfg.background_connect = false;
+        app.plugin(McpManager::plugin(), cfg).await.unwrap();
+
+        let mgr = app.mcp().unwrap();
+        mgr.wait_ready().await;
+        assert_eq!(*mgr.phase.lock().unwrap(), McpManagerPhase::Ready);
+
+        // 重置回 Initializing 模拟尚未完成连接即触发 close_all
+        *mgr.phase.lock().unwrap() = McpManagerPhase::Initializing;
+        let waiter_mgr = Arc::clone(&mgr);
+        let waiter = tokio::spawn(async move {
+            waiter_mgr.wait_ready().await;
+        });
+        tokio::task::yield_now().await;
+
+        mgr.close_all().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_ready must wake when close_all starts")
+            .unwrap();
+        assert_eq!(*mgr.phase.lock().unwrap(), McpManagerPhase::Closed);
+
+        // 幂等重复关闭与闭合后 connect_configured 均不得阻塞
+        mgr.close_all().await;
+        mgr.connect_configured().await;
+        assert_eq!(*mgr.phase.lock().unwrap(), McpManagerPhase::Closed);
+
+        app.fiber().dispose().await;
     }
 }

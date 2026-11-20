@@ -22,11 +22,20 @@ use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
 use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_mcp::McpManager;
-use mizar_session::SessionContextExt;
+use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
 use mizar_tools_coding::CodingToolsPreset;
+use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
 use tokio_util::sync::CancellationToken;
 
-use crate::runner::wait_for_services;
+use crate::runner::{ResumeTarget, wait_for_services};
+
+/// 无头输出格式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecOutputFormat {
+    #[default]
+    Text,
+    Json,
+}
 
 /// 一次性无头执行配置。
 #[derive(Debug, Clone)]
@@ -39,6 +48,7 @@ pub struct ExecConfig {
     pub base_url: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_steps: Option<usize>,
+    pub max_tokens: Option<u32>,
     pub timeout_secs: Option<u64>,
     pub isolated: bool,
     pub no_persist: bool,
@@ -47,6 +57,8 @@ pub struct ExecConfig {
     pub preset: Option<CodingToolsPreset>,
     pub include_tools: Option<Vec<String>>,
     pub exclude_tools: Vec<String>,
+    pub resume_session: Option<ResumeTarget>,
+    pub output_format: ExecOutputFormat,
 }
 
 /// 解析来自命令行参数、文件或标准输入的任务文本；拒绝空白与冲突来源。
@@ -445,6 +457,20 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         );
         return 1;
     }
+    if let Some(ref target) = cfg.resume_session {
+        if matches!(target, ResumeTarget::Picker) {
+            eprintln!(
+                "error: --resume requires a session id in non-interactive exec mode (code=invalid_request)"
+            );
+            return 1;
+        }
+        if cfg.no_persist || cfg.isolated {
+            eprintln!(
+                "error: --continue/--resume is incompatible with --no-persist/--isolated (code=invalid_request)"
+            );
+            return 1;
+        }
+    }
 
     let env_override = EnvLlmOverride::from_env();
     let log_secrets = Arc::new(Mutex::new(env_override.collect_secrets()));
@@ -560,7 +586,19 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     if let Some(limit) = cfg.max_steps {
         spine_cfg.agent.max_steps = Some(limit.max(1));
     }
+    if let Some(mt) = cfg.max_tokens {
+        spine_cfg.agent.max_tokens = Some(mt.max(1));
+    }
     let configured_max_steps = spine_cfg.agent.max_steps;
+    let configured_max_tokens = spine_cfg.agent.max_tokens;
+    let has_session_db = spine_cfg.session_db_path.is_some();
+
+    if cfg.resume_session.is_some() && !has_session_db {
+        eprintln!(
+            "error: --continue/--resume requires session persistence database configuration (code=invalid_request)"
+        );
+        return 1;
+    }
 
     let app = Context::new();
     configure_exec_logger(&app, Arc::clone(&log_secrets));
@@ -589,6 +627,14 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
             wait_for_services(&app).await.map_err(|e| e.to_string())?;
+            if has_session_db && app.session_persistence().is_none() {
+                for _ in 0..25 {
+                    if app.session_persistence().is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
             if let Some(mcp) = app.get::<McpManager>("mcp") {
                 mcp.wait_ready().await;
             }
@@ -610,17 +656,83 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
     let exit_code = match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
         (Ok(sessions), Ok(agent_loop)) => {
-            let session = sessions.create(None);
+            if cfg.resume_session.is_some() && app.session_persistence().is_none() {
+                eprintln!(
+                    "error: session persistence backend is unavailable for --continue/--resume (code=storage)"
+                );
+                cleanup_exec(&app, signal_handle, timeout_handle).await;
+                return 1;
+            }
+
+            let resolved_session = match &cfg.resume_session {
+                Some(ResumeTarget::Picker) => Err(
+                    "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
+                        .to_string(),
+                ),
+                Some(ResumeTarget::Id(target_id)) => match sessions.get(target_id) {
+                    Some(found) => Ok((found, true)),
+                    None => Err(format!(
+                        "session \"{target_id}\" not found (code=invalid_request)"
+                    )),
+                },
+                Some(ResumeTarget::LatestInWorkspace) => {
+                    let ws_str = cfg.workspace.display().to_string();
+                    let latest_id = sessions
+                        .list_headers(&SessionListQuery {
+                            cwd: Some(ws_str),
+                            limit: Some(1),
+                        })
+                        .ok()
+                        .and_then(|mut list| list.drain(..).next())
+                        .map(|h| h.id);
+                    if let Some(id) = latest_id
+                        && let Some(found) = sessions.get(&id)
+                    {
+                        Ok((found, true))
+                    } else {
+                        Ok((sessions.create(None), false))
+                    }
+                }
+                None => Ok((sessions.create(None), false)),
+            };
+
+            let (session, resumed) = match resolved_session {
+                Ok(pair) => pair,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    cleanup_exec(&app, signal_handle, timeout_handle).await;
+                    return 1;
+                }
+            };
+
+            let turn_started = std::time::Instant::now();
             let opts = RunOptions {
                 provider: Some(resolved_llm.active_provider),
                 model: resolved_llm.active_model,
                 max_steps: configured_max_steps,
+                max_tokens: configured_max_tokens,
                 reasoning_effort: effective_effort,
                 ..Default::default()
             };
             let run_res = agent_loop
-                .run_with_report(session, cfg.prompt, cancel.clone(), opts)
+                .run_with_report(Arc::clone(&session), cfg.prompt, cancel.clone(), opts)
                 .await;
+            let duration_ms = turn_started.elapsed().as_millis() as u64;
+
+            if has_session_db {
+                let _ = sessions.flush_async(Some(session.id.clone())).await;
+            }
+
+            let json_meta = if cfg.output_format == ExecOutputFormat::Json {
+                Some(build_exec_json_meta(
+                    &app,
+                    &session.id,
+                    resumed,
+                    duration_ms,
+                ))
+            } else {
+                None
+            };
 
             if timed_out.load(Ordering::SeqCst) {
                 let secs = cfg.timeout_secs.unwrap_or(0);
@@ -632,7 +744,13 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                     eprintln!("error: execution interrupted by signal (code=cancelled)");
                     sig
                 } else {
-                    classify_turn_result(run_res, configured_max_steps, &log_secrets)
+                    classify_turn_result(
+                        run_res,
+                        configured_max_steps,
+                        cfg.output_format,
+                        json_meta.as_ref(),
+                        &log_secrets,
+                    )
                 }
             }
         }
@@ -644,6 +762,71 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
     cleanup_exec(&app, signal_handle, timeout_handle).await;
     exit_code
+}
+
+struct ExecJsonMeta {
+    session_id: String,
+    resumed: bool,
+    duration_ms: u64,
+    turn_llm_ms: u64,
+    turn_ttft_ms: Option<u64>,
+    turn_tool_calls: usize,
+    session_turns: u64,
+    session_steps: u64,
+    session_tool_ms: u64,
+}
+
+fn build_exec_json_meta(
+    app: &Context,
+    session_id: &str,
+    resumed: bool,
+    duration_ms: u64,
+) -> ExecJsonMeta {
+    let report = app
+        .get::<TrajectoryRuntime>("trajectory")
+        .and_then(|traj| traj.inspect(session_id, TimelineMode::Sequence));
+    if let Some(rep) = report {
+        let last_turn = rep.snapshot.turns.last();
+        let last_turn_num = last_turn.map(|t| t.turn);
+        let turn_llm_ms = last_turn
+            .map(|t| t.steps.iter().filter_map(|s| s.duration_ms).sum())
+            .unwrap_or(rep.snapshot.stats.llm_ms);
+        let turn_ttft_ms = last_turn.and_then(|t| t.steps.first().and_then(|s| s.ttft_ms));
+        let turn_tool_calls = last_turn_num
+            .map(|tnum| {
+                rep.snapshot
+                    .records
+                    .iter()
+                    .filter(|r| {
+                        r.kind == mizar_trajectory::RecordKind::Tool && r.turn == Some(tnum)
+                    })
+                    .count()
+            })
+            .unwrap_or(rep.snapshot.stats.tool_calls as usize);
+        ExecJsonMeta {
+            session_id: session_id.to_string(),
+            resumed,
+            duration_ms,
+            turn_llm_ms,
+            turn_ttft_ms,
+            turn_tool_calls,
+            session_turns: rep.snapshot.stats.turns,
+            session_steps: rep.snapshot.stats.steps,
+            session_tool_ms: rep.snapshot.stats.tool_ms,
+        }
+    } else {
+        ExecJsonMeta {
+            session_id: session_id.to_string(),
+            resumed,
+            duration_ms,
+            turn_llm_ms: 0,
+            turn_ttft_ms: None,
+            turn_tool_calls: 0,
+            session_turns: 0,
+            session_steps: 0,
+            session_tool_ms: 0,
+        }
+    }
 }
 
 fn resolve_cancel_or_error_exit(
@@ -670,6 +853,8 @@ fn resolve_cancel_or_error_exit(
 fn classify_turn_result(
     run_res: Result<mizar_agent_loop::TurnRunReport, AgentError>,
     configured_max_steps: Option<usize>,
+    output_format: ExecOutputFormat,
+    json_meta: Option<&ExecJsonMeta>,
     secrets: &Arc<Mutex<Vec<String>>>,
 ) -> i32 {
     match run_res {
@@ -684,11 +869,40 @@ fn classify_turn_result(
             }
             match report.reason {
                 TurnEndReason::Completed => {
-                    if !report.text.is_empty() {
-                        if report.text.ends_with('\n') {
-                            print!("{}", report.text);
-                        } else {
-                            println!("{}", report.text);
+                    match output_format {
+                        ExecOutputFormat::Text => {
+                            if !report.text.is_empty() {
+                                if report.text.ends_with('\n') {
+                                    print!("{}", report.text);
+                                } else {
+                                    println!("{}", report.text);
+                                }
+                            }
+                        }
+                        ExecOutputFormat::Json => {
+                            let payload = if let Some(meta) = json_meta {
+                                serde_json::json!({
+                                    "session_id": meta.session_id,
+                                    "resumed": meta.resumed,
+                                    "reason": "completed",
+                                    "steps": report.steps,
+                                    "duration_ms": meta.duration_ms,
+                                    "llm_ms": meta.turn_llm_ms,
+                                    "ttft_ms": meta.turn_ttft_ms,
+                                    "tool_ms": meta.session_tool_ms,
+                                    "tool_calls": meta.turn_tool_calls,
+                                    "session_turns": meta.session_turns,
+                                    "session_steps": meta.session_steps,
+                                    "text": report.text,
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "reason": "completed",
+                                    "steps": report.steps,
+                                    "text": report.text,
+                                })
+                            };
+                            println!("{payload}");
                         }
                     }
                     0

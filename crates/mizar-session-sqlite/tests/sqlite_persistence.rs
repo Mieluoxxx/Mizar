@@ -632,5 +632,215 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
     );
     assert_eq!(s2_reloaded.header().title_source, Some(TitleSource::Auto));
 
+    // v1->v2 迁移应自动回填旧事件至 FTS5 回溯索引
+    let v1_hits = store2
+        .search_recall(&mizar_session::RecallSearchQuery {
+            query: "legacy".into(),
+            session_ids: vec!["v1-sess".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap();
+    assert!(
+        v1_hits
+            .iter()
+            .any(|h| h.session_id == "v1-sess" && h.seq == 1),
+        "v1->v2 migration must backfill FTS5 recall docs: {v1_hits:?}"
+    );
+
     app2.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn supports_out_of_order_create_fork_compaction_deep_recall_and_writer_lifecycle() {
+    use mizar_session::{
+        PersistenceError, RecallSearchQuery, SessionEntry, SessionHeader, SessionPersistence,
+    };
+    use mizar_session_sqlite::SqliteSessionPersistence;
+
+    let db_path = temp_db_path("edge_cases");
+    let _guard = TempDbGuard(db_path.clone());
+    let persistence = SqliteSessionPersistence::open(&db_path).unwrap();
+
+    // 1. AppendEvents 先于 CreateSession 到达时，CreateSession 必须补全 cwd/title/parent 等元数据
+    persistence
+        .append_events(
+            "out-of-order",
+            &[SessionEntry {
+                seq: 1,
+                event: SessionEvent::user("先到的消息"),
+                ts: 2000,
+            }],
+        )
+        .unwrap();
+    let mut full_header = SessionHeader::new("out-of-order", 1000);
+    full_header.cwd = Some("/repo/out-of-order".into());
+    full_header.title = Some("完整元数据标题".into());
+    full_header.title_source = Some(TitleSource::Manual);
+    full_header.parent_id = Some("root-anc".into());
+    full_header.fork_seq = Some(9);
+    persistence.create_session(&full_header).unwrap();
+    let loaded_ooo = persistence.load_session("out-of-order").unwrap().unwrap();
+    assert_eq!(loaded_ooo.header.cwd.as_deref(), Some("/repo/out-of-order"));
+    assert_eq!(loaded_ooo.header.title.as_deref(), Some("完整元数据标题"));
+    assert_eq!(loaded_ooo.header.title_source, Some(TitleSource::Manual));
+    assert_eq!(loaded_ooo.header.parent_id.as_deref(), Some("root-anc"));
+    assert_eq!(loaded_ooo.header.fork_seq, Some(9));
+
+    // 2. 4001..=16384 字符截断区间的词条必须通过 FTS5 + 全文复查检索到
+    let mut deep_text = "x".repeat(5200);
+    deep_text.push_str(" DEEP_NEEDLE_98765 ");
+    persistence
+        .append_events(
+            "out-of-order",
+            &[SessionEntry {
+                seq: 2,
+                event: SessionEvent::ToolResult {
+                    tool_call_id: "tc-deep".into(),
+                    name: "read".into(),
+                    content: deep_text,
+                    is_error: false,
+                },
+                ts: 2500,
+            }],
+        )
+        .unwrap();
+    persistence
+        .append_events(
+            "out-of-order",
+            &[SessionEntry {
+                seq: 3,
+                event: SessionEvent::Compaction {
+                    summary: "compact at 3".into(),
+                    first_kept_seq: 2,
+                    tokens_before: Some(200),
+                    tokens_after: Some(50),
+                    digest: Default::default(),
+                },
+                ts: 2600,
+            }],
+        )
+        .unwrap();
+    persistence.flush(None).unwrap();
+
+    let deep_hits = persistence
+        .search_recall(&RecallSearchQuery {
+            query: "DEEP_NEEDLE_98765".into(),
+            session_ids: vec!["out-of-order".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(deep_hits.len(), 1);
+    assert_eq!(deep_hits[0].seq, 2);
+    assert!(deep_hits[0].snippet.contains("DEEP_NEEDLE_98765"));
+
+    // 3. fork 前缀若包含 Compaction，子会话 compacted_up_to_seq 必须被推导保存
+    let forked = persistence
+        .fork_session("out-of-order", 3, &SessionHeader::new("ooo-fork", 3000))
+        .unwrap();
+    assert_eq!(forked.header.compacted_up_to_seq, Some(2));
+    assert_eq!(forked.max_persisted_seq, Some(3));
+
+    // 4. shutdown 后再写必须明确返回 PersistenceError::Closed
+    persistence.shutdown().unwrap();
+    let err = persistence.flush(None).unwrap_err();
+    assert!(matches!(err, PersistenceError::Closed), "got {err:?}");
+}
+
+#[test]
+fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
+    let dir = std::env::temp_dir().join(format!(
+        "mizar_sqlite_concurrent_open_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    for round in 0..4 {
+        let db_path = dir.join(format!("race_{round}.sqlite"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let mut handles = Vec::new();
+        for idx in 0..6 {
+            let path = db_path.clone();
+            let b = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> Result<(), String> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                b.wait();
+                rt.block_on(async move {
+                    let app = Context::new();
+                    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&path));
+                    app.plugin(SessionStore::plugin(), ());
+                    app.plugin(
+                        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+                        (),
+                    )
+                    .await
+                    .map_err(|e| format!("boot failed: {e}"))?;
+
+                    let store = app
+                        .sessions()
+                        .map_err(|e| format!("sessions failed: {e}"))?;
+                    let sid = format!("s_{idx}");
+                    let s = store.create_with(SessionCreateOptions {
+                        id: Some(sid),
+                        cwd: Some("/tmp/ws".into()),
+                        ..Default::default()
+                    });
+                    s.append(SessionEvent::user(format!("hello_{idx}")));
+                    s.flush_async()
+                        .await
+                        .map_err(|e| format!("flush failed: {e}"))?;
+                    app.fiber().dispose().await;
+                    Ok(())
+                })
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("worker thread panicked")
+                .expect("concurrent cold open/write failed");
+        }
+        let headers = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let check = Context::new();
+                check.plugin(
+                    SqlitePersistencePlugin,
+                    SqlitePersistenceConfig::new(&db_path),
+                );
+                check.plugin(SessionStore::plugin(), ());
+                check
+                    .plugin(
+                        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                let headers = check
+                    .session_persistence()
+                    .unwrap()
+                    .list_sessions(&SessionListQuery {
+                        cwd: None,
+                        limit: Some(20),
+                    })
+                    .unwrap();
+                check.fiber().dispose().await;
+                headers
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(headers.len(), 6, "round={round} headers={headers:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

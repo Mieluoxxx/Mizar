@@ -66,6 +66,22 @@ fn is_visible_content_chunk(chunk: &StreamChunk) -> bool {
     )
 }
 
+enum AttemptState {
+    Buffering {
+        buffered_non_content: Vec<StreamChunk>,
+    },
+    TerminalFinishBuffered {
+        buffered_non_content: Vec<StreamChunk>,
+    },
+    StreamingThrough,
+}
+
+enum AttemptOutcome {
+    Done,
+    Retry(LlmError),
+    TerminalErr,
+}
+
 fn wrap_with_retry(
     llm: Arc<LlmRuntime>,
     cfg: RetryConfig,
@@ -78,20 +94,29 @@ fn wrap_with_retry(
         let mut current_stream = first_stream;
 
         for attempt in 0..=cfg.max_retries {
-            let mut emitted_content = false;
-            let mut saw_terminal_error = false;
-            let mut buffered_non_content: Vec<StreamChunk> = Vec::new();
-            let mut retry_err: Option<LlmError> = None;
+            let mut state = AttemptState::Buffering {
+                buffered_non_content: Vec::new(),
+            };
+            let mut outcome: Option<AttemptOutcome> = None;
 
             while let Some(item) = current_stream.next().await {
                 match item {
                     Ok(chunk) => {
                         if is_visible_content_chunk(&chunk) {
-                            emitted_content = true;
-                            for pending in buffered_non_content.drain(..) {
-                                if tx.unbounded_send(Ok(pending)).is_err() {
-                                    return;
+                            match std::mem::replace(&mut state, AttemptState::StreamingThrough) {
+                                AttemptState::Buffering {
+                                    buffered_non_content,
                                 }
+                                | AttemptState::TerminalFinishBuffered {
+                                    buffered_non_content,
+                                } => {
+                                    for pending in buffered_non_content {
+                                        if tx.unbounded_send(Ok(pending)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                AttemptState::StreamingThrough => {}
                             }
                             if tx.unbounded_send(Ok(chunk)).is_err() {
                                 return;
@@ -99,113 +124,148 @@ fn wrap_with_retry(
                             continue;
                         }
 
-                        if let StreamChunk::Finish {
-                            reason:
-                                FinishReason::Error {
-                                    code,
-                                    ref message,
-                                    status,
-                                    retry_after_ms,
-                                },
-                            ..
-                        } = chunk
-                        {
-                            if !emitted_content
-                                && attempt < cfg.max_retries
-                                && cfg.is_retryable(code)
-                            {
-                                retry_err = Some(LlmError {
-                                    code,
-                                    message: message.clone(),
-                                    status,
-                                    retry_after_ms,
-                                });
-                                break;
+                        match &mut state {
+                            AttemptState::StreamingThrough => {
+                                if tx.unbounded_send(Ok(chunk)).is_err() {
+                                    return;
+                                }
                             }
-                            saw_terminal_error = true;
-                        }
-
-                        if let StreamChunk::Finish {
-                            reason: FinishReason::Stop,
-                            ..
-                        } = chunk
-                            && cfg.retry_on_empty_response
-                            && !emitted_content
-                            && attempt < cfg.max_retries
-                        {
-                            retry_err = Some(LlmError::new(
-                                LlmErrorCode::EmptyResponse,
-                                "model returned empty response",
-                            ));
-                            break;
-                        }
-
-                        if emitted_content {
-                            if tx.unbounded_send(Ok(chunk)).is_err() {
-                                return;
+                            AttemptState::TerminalFinishBuffered {
+                                buffered_non_content,
+                            } => {
+                                buffered_non_content.push(chunk);
                             }
-                        } else {
-                            buffered_non_content.push(chunk);
+                            AttemptState::Buffering {
+                                buffered_non_content,
+                            } => {
+                                if let StreamChunk::Finish {
+                                    reason:
+                                        FinishReason::Error {
+                                            code,
+                                            ref message,
+                                            status,
+                                            retry_after_ms,
+                                        },
+                                    ..
+                                } = chunk
+                                {
+                                    if attempt < cfg.max_retries && cfg.is_retryable(code) {
+                                        outcome = Some(AttemptOutcome::Retry(LlmError {
+                                            code,
+                                            message: message.clone(),
+                                            status,
+                                            retry_after_ms,
+                                        }));
+                                        break;
+                                    }
+                                    let mut buf = std::mem::take(buffered_non_content);
+                                    buf.push(chunk);
+                                    state = AttemptState::TerminalFinishBuffered {
+                                        buffered_non_content: buf,
+                                    };
+                                    continue;
+                                }
+
+                                if let StreamChunk::Finish {
+                                    reason: FinishReason::Stop,
+                                    ..
+                                } = chunk
+                                    && cfg.retry_on_empty_response
+                                    && attempt < cfg.max_retries
+                                {
+                                    outcome = Some(AttemptOutcome::Retry(LlmError::new(
+                                        LlmErrorCode::EmptyResponse,
+                                        "model returned empty response",
+                                    )));
+                                    break;
+                                }
+
+                                buffered_non_content.push(chunk);
+                            }
                         }
                     }
                     Err(err) => {
-                        if !emitted_content
-                            && attempt < cfg.max_retries
-                            && cfg.is_retryable(err.code)
-                        {
-                            retry_err = Some(err);
-                            break;
-                        }
-                        for pending in buffered_non_content.drain(..) {
+                        let buffered = match &mut state {
+                            AttemptState::Buffering {
+                                buffered_non_content,
+                            } => {
+                                if attempt < cfg.max_retries && cfg.is_retryable(err.code) {
+                                    outcome = Some(AttemptOutcome::Retry(err));
+                                    break;
+                                }
+                                std::mem::take(buffered_non_content)
+                            }
+                            AttemptState::TerminalFinishBuffered {
+                                buffered_non_content,
+                            } => std::mem::take(buffered_non_content),
+                            AttemptState::StreamingThrough => Vec::new(),
+                        };
+                        for pending in buffered {
                             if tx.unbounded_send(Ok(pending)).is_err() {
                                 return;
                             }
                         }
                         let _ = tx.unbounded_send(Err(err));
-                        return;
+                        outcome = Some(AttemptOutcome::TerminalErr);
+                        break;
                     }
                 }
             }
 
-            if retry_err.is_none()
-                && !emitted_content
-                && !saw_terminal_error
-                && cfg.retry_on_empty_response
-                && attempt < cfg.max_retries
-            {
-                retry_err = Some(LlmError::new(
-                    LlmErrorCode::EmptyResponse,
-                    "model returned empty stream",
-                ));
-            }
+            let resolved = outcome.unwrap_or_else(|| match state {
+                AttemptState::Buffering {
+                    buffered_non_content,
+                } => {
+                    if cfg.retry_on_empty_response && attempt < cfg.max_retries {
+                        AttemptOutcome::Retry(LlmError::new(
+                            LlmErrorCode::EmptyResponse,
+                            "model returned empty stream",
+                        ))
+                    } else {
+                        for pending in buffered_non_content {
+                            if tx.unbounded_send(Ok(pending)).is_err() {
+                                return AttemptOutcome::TerminalErr;
+                            }
+                        }
+                        AttemptOutcome::Done
+                    }
+                }
+                AttemptState::TerminalFinishBuffered {
+                    buffered_non_content,
+                } => {
+                    for pending in buffered_non_content {
+                        if tx.unbounded_send(Ok(pending)).is_err() {
+                            return AttemptOutcome::TerminalErr;
+                        }
+                    }
+                    AttemptOutcome::Done
+                }
+                AttemptState::StreamingThrough => AttemptOutcome::Done,
+            });
 
-            if let Some(err) = retry_err {
-                let delay = cfg.delay_for(attempt, err.retry_after_ms);
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = options.cancel.cancelled() => {
-                        let _ = tx.unbounded_send(Err(LlmError::cancelled()));
-                        return;
+            match resolved {
+                AttemptOutcome::Retry(err) => {
+                    let delay = cfg.delay_for(attempt, err.retry_after_ms);
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = options.cancel.cancelled() => {
+                            let _ = tx.unbounded_send(Err(LlmError::cancelled()));
+                            return;
+                        }
+                    }
+                    match llm.stream_direct(options.clone()) {
+                        Ok(next_stream) => {
+                            current_stream = next_stream;
+                            continue;
+                        }
+                        Err(err) => {
+                            let _ = tx.unbounded_send(Err(err));
+                            return;
+                        }
                     }
                 }
-                match llm.stream_direct(options.clone()) {
-                    Ok(next_stream) => {
-                        current_stream = next_stream;
-                        continue;
-                    }
-                    Err(err) => {
-                        let _ = tx.unbounded_send(Err(err));
-                        return;
-                    }
-                }
+                AttemptOutcome::Done | AttemptOutcome::TerminalErr => return,
             }
-
-            for pending in buffered_non_content.drain(..) {
-                if tx.unbounded_send(Ok(pending)).is_err() {
-                    return;
-                }
-            }
-            return;
         }
     });
 

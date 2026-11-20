@@ -30,6 +30,7 @@ pub use persistence::{
 
 pub const EVENT_SESSION_EVENT: &str = "session/event";
 pub const EVENT_SESSION_CREATED: &str = "session/created";
+pub const EVENT_SESSION_LOADED: &str = "session/loaded";
 pub const EVENT_SESSION_TITLE_UPDATED: &str = "session/title-updated";
 
 #[derive(Clone)]
@@ -44,6 +45,11 @@ pub struct SessionCreatedPayload {
 }
 
 #[derive(Clone)]
+pub struct SessionLoadedPayload {
+    pub session: Arc<Session>,
+}
+
+#[derive(Clone)]
 pub struct SessionTitleUpdatedPayload {
     pub session: Arc<Session>,
     pub title: Option<String>,
@@ -53,6 +59,7 @@ pub struct SessionTitleUpdatedPayload {
 struct SessionInner {
     header: SessionHeader,
     log: Vec<SessionEntry>,
+    min_last_seq: u64,
 }
 
 pub struct Session {
@@ -207,7 +214,14 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
         return Vec::new();
     }
 
-    let base_seq = loaded.entries.last().map_or(1, |e| e.seq + 1);
+    let entries_last = loaded.entries.last().map_or(0, |e| e.seq);
+    let base_seq = if let Some(max_persisted) = loaded.max_persisted_seq {
+        max_persisted.max(entries_last) + 1
+    } else if loaded.skipped_events > 0 {
+        entries_last.saturating_add(loaded.skipped_events as u64) + 1
+    } else {
+        entries_last + 1
+    };
     let ts = now_millis();
     let mut repaired = Vec::with_capacity(pending.len());
     for (offset, (tool_call_id, name)) in pending.into_iter().enumerate() {
@@ -228,6 +242,13 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
         loaded.entries.push(entry.clone());
         repaired.push(entry);
     }
+    if let Some(last_repaired) = repaired.last() {
+        loaded.max_persisted_seq = Some(
+            loaded
+                .max_persisted_seq
+                .map_or(last_repaired.seq, |prev| prev.max(last_repaired.seq)),
+        );
+    }
     repaired
 }
 
@@ -239,17 +260,53 @@ impl Session {
     }
 
     pub fn from_loaded(ctx: Context, loaded: LoadedSession) -> Self {
-        Self::from_parts(ctx, loaded.header, loaded.entries)
+        let entries_last = loaded.entries.last().map_or(0, |e| e.seq);
+        let floor = if let Some(max_p) = loaded.max_persisted_seq {
+            max_p.max(entries_last)
+        } else if loaded.skipped_events > 0 {
+            entries_last.saturating_add(loaded.skipped_events as u64)
+        } else {
+            entries_last
+        };
+        Self::from_parts_with_floor(ctx, loaded.header, loaded.entries, floor)
     }
 
-    fn from_parts(ctx: Context, mut header: SessionHeader, log: Vec<SessionEntry>) -> Self {
+    fn from_parts(ctx: Context, header: SessionHeader, log: Vec<SessionEntry>) -> Self {
+        let floor = log.last().map_or(0, |e| e.seq);
+        Self::from_parts_with_floor(ctx, header, log, floor)
+    }
+
+    fn from_parts_with_floor(
+        ctx: Context,
+        mut header: SessionHeader,
+        log: Vec<SessionEntry>,
+        min_last_seq: u64,
+    ) -> Self {
         let id = header.id.clone();
         header.event_count = log.len() as u64;
         header.surface_count = log.iter().filter(|e| e.is_surface()).count() as u64;
+        let max_compacted = log
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::Compaction { first_kept_seq, .. } => Some(*first_kept_seq),
+                _ => None,
+            })
+            .max();
+        header.compacted_up_to_seq = match (header.compacted_up_to_seq, max_compacted) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let min_last_seq = min_last_seq.max(log.last().map_or(0, |e| e.seq));
         let turn_init = infer_turn_counter(&log);
         Self {
             id,
-            inner: Mutex::new(SessionInner { header, log }),
+            inner: Mutex::new(SessionInner {
+                header,
+                log,
+                min_last_seq,
+            }),
             turn_counter: AtomicU64::new(turn_init),
             ctx,
         }
@@ -269,7 +326,13 @@ impl Session {
         let persistence = self.ctx.session_persistence();
         let (entry, emitted_title) = {
             let mut inner = self.inner.lock().unwrap();
-            let seq = inner.log.last().map_or(1, |e| e.seq + 1);
+            let seq = inner
+                .log
+                .last()
+                .map_or(0, |e| e.seq)
+                .max(inner.min_last_seq)
+                + 1;
+            inner.min_last_seq = seq;
             let ts = now_millis();
             let entry = SessionEntry { seq, event, ts };
 
@@ -424,6 +487,76 @@ impl Session {
             },
         );
         true
+    }
+
+    /// 原子 CAS 更新自动生成的标题，避免异步生成期间用户手动或并发改名被覆盖。
+    ///
+    /// - 返回 `Ok(applied)` 表示完成写入并广播更新事件（或已等于目标值）；
+    /// - 返回 `Err(current_title)` 表示因所有权或预期旧值不匹配而跳过写入。
+    pub fn compare_and_set_title_auto(
+        self: &Arc<Self>,
+        expected_title: Option<&str>,
+        title: impl Into<String>,
+        respect_ownership: bool,
+    ) -> Result<String, Option<String>> {
+        let cleaned = title.into().replace(['\r', '\n'], " ").trim().to_string();
+        if cleaned.is_empty() {
+            return Err(self.header().title);
+        }
+        let persistence = self.ctx.session_persistence();
+        let ts = now_millis();
+        enum CasOutcome {
+            Skipped(Option<String>),
+            Unchanged,
+            Updated,
+        }
+        let outcome = {
+            let mut inner = self.inner.lock().unwrap();
+            if (respect_ownership && inner.header.title_source == Some(TitleSource::Manual))
+                || inner.header.title.as_deref() != expected_title
+            {
+                CasOutcome::Skipped(inner.header.title.clone())
+            } else if inner.header.title.as_deref() == Some(cleaned.as_str())
+                && inner.header.title_source == Some(TitleSource::Auto)
+            {
+                CasOutcome::Unchanged
+            } else {
+                inner.header.title = Some(cleaned.clone());
+                inner.header.title_source = Some(TitleSource::Auto);
+                inner.header.updated_at_ms = inner.header.updated_at_ms.max(ts);
+                if let Some(ref backend) = persistence
+                    && let Err(err) = backend.update_header(
+                        &self.id,
+                        SessionHeaderPatch {
+                            title: TitlePatch::Set(cleaned.clone()),
+                            title_source: TitleSourcePatch::Set(TitleSource::Auto),
+                            updated_at_ms: Some(ts),
+                            compacted_up_to_seq: None,
+                        },
+                    )
+                {
+                    self.ctx
+                        .logger_named("session")
+                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                }
+                CasOutcome::Updated
+            }
+        };
+        match outcome {
+            CasOutcome::Skipped(cur) => Err(cur),
+            CasOutcome::Unchanged => Ok(cleaned),
+            CasOutcome::Updated => {
+                self.ctx.emit(
+                    EVENT_SESSION_TITLE_UPDATED,
+                    SessionTitleUpdatedPayload {
+                        session: Arc::clone(self),
+                        title: Some(cleaned.clone()),
+                        title_source: Some(TitleSource::Auto),
+                    },
+                );
+                Ok(cleaned)
+            }
+        }
     }
 
     /// 清空会话标题与来源标记。
@@ -802,14 +935,29 @@ impl SessionStore {
         self.sessions.lock().unwrap().contains_key(id)
     }
 
-    /// 只读窥视某个会话最后记录的选择：不水合进内存、不触发悬挂工具调用修复（后者会写库）。
-    pub fn peek_selection(&self, session_id: &str) -> Option<SessionSelection> {
-        if let Some(existing) = self.sessions.lock().unwrap().get(session_id).cloned() {
-            return existing.latest_selection();
+    /// 只读加载或快照指定会话（不写入内存缓存，也不执行悬挂工具调用修复/落盘）。
+    pub fn inspect_readonly(&self, id: &str) -> Option<LoadedSession> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            let max_seq = inner
+                .log
+                .last()
+                .map_or(0, |e| e.seq)
+                .max(inner.min_last_seq);
+            return Some(LoadedSession {
+                header: inner.header.clone(),
+                entries: inner.log.clone(),
+                max_persisted_seq: (max_seq > 0).then_some(max_seq),
+                skipped_events: 0,
+            });
         }
         let backend = self.ctx.session_persistence()?;
-        let loaded = backend.load_session(session_id).ok().flatten()?;
-        loaded
+        backend.load_session(id).ok().flatten()
+    }
+
+    /// 只读窥视某个会话最后记录的选择：不水合进内存、不触发悬挂工具调用修复（后者会写库）。
+    pub fn peek_selection(&self, session_id: &str) -> Option<SessionSelection> {
+        self.inspect_readonly(session_id)?
             .entries
             .iter()
             .rev()
@@ -840,13 +988,24 @@ impl SessionStore {
                         .warn(format!("持久化写入崩溃恢复条目失败 (session={id}): {err}"));
                 }
                 let session = Arc::new(Session::from_loaded(self.ctx.clone(), loaded));
-                let mut guard = self.sessions.lock().unwrap();
-                Some(
-                    guard
-                        .entry(id.to_string())
-                        .or_insert_with(|| Arc::clone(&session))
-                        .clone(),
-                )
+                let (stored, inserted) = {
+                    let mut guard = self.sessions.lock().unwrap();
+                    if let Some(existing) = guard.get(id) {
+                        (Arc::clone(existing), false)
+                    } else {
+                        guard.insert(id.to_string(), Arc::clone(&session));
+                        (Arc::clone(&session), true)
+                    }
+                };
+                if inserted {
+                    self.ctx.emit(
+                        EVENT_SESSION_LOADED,
+                        SessionLoadedPayload {
+                            session: Arc::clone(&stored),
+                        },
+                    );
+                }
+                Some(stored)
             }
             Ok(None) => None,
             Err(err) => {
@@ -900,9 +1059,11 @@ impl SessionStore {
                 .into_iter()
                 .filter(|e| e.seq <= up_to_seq)
                 .collect();
+            let max_seq = entries.last().map(|e| e.seq);
             LoadedSession {
                 header: new_header,
                 entries,
+                max_persisted_seq: max_seq,
                 skipped_events: 0,
             }
         };
@@ -943,7 +1104,7 @@ impl SessionStore {
             }
             chain.push(id.clone());
             depth += 1;
-            cur = self.get(&id).and_then(|s| s.header().parent_id);
+            cur = self.inspect_readonly(&id).and_then(|s| s.header.parent_id);
         }
         chain
     }
