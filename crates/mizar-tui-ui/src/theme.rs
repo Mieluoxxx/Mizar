@@ -373,7 +373,7 @@ impl ThemePreset {
 }
 
 /// 语义化 TUI 主题色板。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub id: &'static str,
     pub is_light: bool,

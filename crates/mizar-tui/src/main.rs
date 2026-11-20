@@ -425,8 +425,22 @@ where
     Ok(out)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn default_tokio_worker_threads(parallelism: usize) -> usize {
+    parallelism.clamp(2, 4)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(default_tokio_worker_threads(workers))
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if let Some((cmd, rest)) = raw_args.split_first()
         && cmd == "update"
@@ -802,5 +816,15 @@ mod tests {
 
         let equals_empty = parse_cli_args_from(["--resume=".to_string()]).unwrap();
         assert_eq!(equals_empty.resume_session, Some(ResumeTarget::Picker));
+    }
+
+    #[test]
+    fn worker_threads_clamped_between_two_and_four() {
+        assert_eq!(default_tokio_worker_threads(1), 2);
+        assert_eq!(default_tokio_worker_threads(2), 2);
+        assert_eq!(default_tokio_worker_threads(3), 3);
+        assert_eq!(default_tokio_worker_threads(4), 4);
+        assert_eq!(default_tokio_worker_threads(16), 4);
+        assert_eq!(default_tokio_worker_threads(64), 4);
     }
 }

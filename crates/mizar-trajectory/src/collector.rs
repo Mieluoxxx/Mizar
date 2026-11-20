@@ -24,9 +24,9 @@ use mizar_tools::{EVENT_TOOLS_RESULT, ToolResultEvent};
 use serde_json::json;
 
 use mizar_trajectory_core::{
-    DetectorConfig, Severity, TimelineMode, TraceEvent, TraceEventKind, TrajectoryFinding,
-    TrajectoryReport, TrajectorySummary, derive_timeline, detect_anomalies, fold_trajectory,
-    preview_chars,
+    DetectorConfig, IncrementalDetector, IncrementalFolder, Severity, TimelineMode, TraceEvent,
+    TraceEventKind, TrajectoryFinding, TrajectoryReport, TrajectorySummary, derive_timeline,
+    detect_anomalies, fold_trajectory, preview_chars,
 };
 
 use crate::guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent};
@@ -267,12 +267,93 @@ struct SessionTraceBuffer {
     pending_tool_calls: VecDeque<(String, String)>,
     blocked_tool_calls: HashSet<String>,
     emitted_finding_keys: HashSet<(String, Option<u64>)>,
+    /// 增量折叠/检测工作区（避免每次 `evaluate_and_emit_new_findings` / `inspect` 从头重扫全会话）。
+    inc_mode_managed: bool,
+    inc_last_entry_count: usize,
+    inc_last_entry_seq: Option<u64>,
+    inc_event_count: usize,
+    inc_blocked_tool_calls: HashSet<String>,
+    inc_folder: Option<IncrementalFolder>,
+    inc_detector: Option<IncrementalDetector>,
+    standalone_synced: usize,
+    settled_event_cursor: usize,
+    settled_r06_cursor: usize,
+}
+
+impl SessionTraceBuffer {
+    fn reset_incremental(&mut self, session_id: &str, cfg: &DetectorConfig, managed: bool) {
+        self.inc_mode_managed = managed;
+        self.inc_last_entry_count = 0;
+        self.inc_last_entry_seq = None;
+        self.inc_event_count = 0;
+        self.inc_blocked_tool_calls.clear();
+        self.inc_folder = Some(IncrementalFolder::new(session_id));
+        self.inc_detector = Some(IncrementalDetector::new(cfg.clone()));
+        self.standalone_synced = 0;
+        self.settled_event_cursor = 0;
+        self.settled_r06_cursor = 0;
+    }
+
+    fn ensure_incremental(&mut self, session_id: &str, cfg: &DetectorConfig, managed: bool) {
+        if self.inc_folder.is_none()
+            || self.inc_detector.is_none()
+            || self.inc_mode_managed != managed
+        {
+            self.reset_incremental(session_id, cfg, managed);
+        }
+    }
+
+    fn sync_standalone(&mut self, session_id: &str, cfg: &DetectorConfig) {
+        if self.standalone_events.len() < self.standalone_synced {
+            self.reset_incremental(session_id, cfg, false);
+        } else {
+            self.ensure_incremental(session_id, cfg, false);
+        }
+        let folder = self.inc_folder.as_mut().expect("folder initialized");
+        let detector = self.inc_detector.as_mut().expect("detector initialized");
+        for ev in &self.standalone_events[self.standalone_synced..] {
+            folder.push_event(ev);
+            detector.push_event(ev, folder.records());
+            self.inc_event_count += 1;
+        }
+        self.standalone_synced = self.standalone_events.len();
+    }
+
+    fn drain_new_findings(&mut self, cfg: &DetectorConfig) -> Vec<TrajectoryFinding> {
+        let Some(detector) = self.inc_detector.as_ref() else {
+            return Vec::new();
+        };
+        let _ = cfg;
+        let candidates =
+            detector.collect_new_findings(self.settled_event_cursor, self.settled_r06_cursor);
+        self.settled_event_cursor = detector.settled_event_len();
+        self.settled_r06_cursor = detector.settled_r06_len();
+
+        let mut fresh = Vec::new();
+        for finding in candidates {
+            let key = (finding.rule_id.clone(), finding.seq);
+            if self.emitted_finding_keys.insert(key) {
+                fresh.push(finding);
+            }
+        }
+        fresh
+    }
 }
 
 pub struct TrajectoryRuntime {
     ctx: Context,
     config: TrajectoryConfig,
     buffers: Mutex<HashMap<String, SessionTraceBuffer>>,
+}
+
+enum ManagedDelta {
+    UpToDate,
+    Reset(Vec<SessionEntry>, Option<u64>),
+    Append {
+        start_idx: usize,
+        entries: Vec<SessionEntry>,
+        last_seq: Option<u64>,
+    },
 }
 
 impl TrajectoryRuntime {
@@ -286,6 +367,82 @@ impl TrajectoryRuntime {
         self.ctx
             .get::<SessionStore>("sessions")
             .and_then(|s| s.get(session_id))
+    }
+
+    /// 以短锁增量同步受 `Session` 管理的轨迹状态，仅复制并折叠新增条目切片。
+    fn sync_managed_session(&self, session: &Session) {
+        let (prev_count, prev_last_seq, need_init) = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let buf = buffers.entry(session.id.clone()).or_default();
+            if buf.inc_folder.is_none() || buf.inc_detector.is_none() || !buf.inc_mode_managed {
+                buf.reset_incremental(&session.id, &self.config.detector, true);
+            }
+            (
+                buf.inc_last_entry_count,
+                buf.inc_last_entry_seq,
+                buf.inc_folder.is_none(),
+            )
+        };
+        let _ = need_init;
+
+        let delta = session.with_all_entries(|entries| {
+            let valid_prefix = entries.len() >= prev_count
+                && (prev_count == 0 || entries.get(prev_count - 1).map(|e| e.seq) == prev_last_seq);
+            if valid_prefix {
+                if entries.len() == prev_count {
+                    ManagedDelta::UpToDate
+                } else {
+                    ManagedDelta::Append {
+                        start_idx: prev_count,
+                        entries: entries[prev_count..].to_vec(),
+                        last_seq: entries.last().map(|e| e.seq),
+                    }
+                }
+            } else {
+                ManagedDelta::Reset(entries.to_vec(), entries.last().map(|e| e.seq))
+            }
+        });
+
+        let (batch_start, batch, target_last_seq, is_reset) = match delta {
+            ManagedDelta::UpToDate => return,
+            ManagedDelta::Reset(all, seq) => (0, all, seq, true),
+            ManagedDelta::Append {
+                start_idx,
+                entries,
+                last_seq,
+            } => (start_idx, entries, last_seq, false),
+        };
+
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf = buffers.entry(session.id.clone()).or_default();
+        if is_reset || !buf.inc_mode_managed || buf.inc_folder.is_none() {
+            buf.reset_incremental(&session.id, &self.config.detector, true);
+        }
+        let batch_end = batch_start + batch.len();
+        if buf.inc_last_entry_count >= batch_end || buf.inc_last_entry_count < batch_start {
+            return;
+        }
+        let skip = buf.inc_last_entry_count - batch_start;
+        let SessionTraceBuffer {
+            inc_folder,
+            inc_detector,
+            inc_blocked_tool_calls,
+            inc_event_count,
+            inc_last_entry_count,
+            inc_last_entry_seq,
+            ..
+        } = buf;
+        let folder = inc_folder.as_mut().expect("folder initialized");
+        let detector = inc_detector.as_mut().expect("detector initialized");
+        for entry in &batch[skip..] {
+            if let Some(ev) = entry_to_trace_event(&session.id, entry, inc_blocked_tool_calls) {
+                folder.push_event(&ev);
+                detector.push_event(&ev, folder.records());
+                *inc_event_count += 1;
+            }
+        }
+        *inc_last_entry_count = batch_end;
+        *inc_last_entry_seq = target_last_seq;
     }
 
     fn write_export_line(&self, session_id: &str, event: &TraceEvent) {
@@ -341,20 +498,20 @@ impl TrajectoryRuntime {
     }
 
     fn evaluate_and_emit_new_findings(&self, session_id: &str) {
-        let Some(report) = self.inspect(session_id, TimelineMode::Sequence) else {
-            return;
-        };
-        let new_findings: Vec<TrajectoryFinding> = {
+        let new_findings = if let Some(session) = self.resolve_session(session_id) {
+            self.sync_managed_session(&session);
             let mut buffers = self.buffers.lock().unwrap();
-            let buf = buffers.entry(session_id.to_string()).or_default();
-            let mut fresh = Vec::new();
-            for finding in report.findings {
-                let key = (finding.rule_id.clone(), finding.seq);
-                if buf.emitted_finding_keys.insert(key) {
-                    fresh.push(finding);
-                }
-            }
-            fresh
+            let Some(buf) = buffers.get_mut(session_id) else {
+                return;
+            };
+            buf.drain_new_findings(&self.config.detector)
+        } else {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buf) = buffers.get_mut(session_id) else {
+                return;
+            };
+            buf.sync_standalone(session_id, &self.config.detector);
+            buf.drain_new_findings(&self.config.detector)
         };
         for finding in new_findings {
             self.ctx.emit(
@@ -382,14 +539,42 @@ impl TrajectoryRuntime {
     /// 对指定会话（内存激活或 SQLite 持久化历史）做一次完整轨迹折叠、时间轴投影与异常检测。
     pub fn inspect(&self, session_id: &str, mode: TimelineMode) -> Option<TrajectoryReport> {
         if let Some(session) = self.resolve_session(session_id) {
-            let events = trace_events_from_session(&session);
-            return Some(self.inspect_events(session_id, &events, mode));
+            self.sync_managed_session(&session);
+            let (snapshot, findings) = {
+                let buffers = self.buffers.lock().unwrap();
+                let buf = buffers.get(session_id)?;
+                let folder = buf.inc_folder.as_ref()?;
+                let detector = buf.inc_detector.as_ref()?;
+                (
+                    folder.snapshot(),
+                    detector.findings_with_guards(folder.records()),
+                )
+            };
+            let timeline = derive_timeline(&snapshot.records, mode);
+            return Some(TrajectoryReport {
+                snapshot,
+                timeline,
+                findings,
+            });
         }
-        let events = {
-            let buffers = self.buffers.lock().unwrap();
-            buffers.get(session_id).map(|b| b.standalone_events.clone())
-        }?;
-        Some(self.inspect_events(session_id, &events, mode))
+
+        let (snapshot, findings) = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let buf = buffers.get_mut(session_id)?;
+            buf.sync_standalone(session_id, &self.config.detector);
+            let folder = buf.inc_folder.as_ref()?;
+            let detector = buf.inc_detector.as_ref()?;
+            (
+                folder.snapshot(),
+                detector.findings_with_guards(folder.records()),
+            )
+        };
+        let timeline = derive_timeline(&snapshot.records, mode);
+        Some(TrajectoryReport {
+            snapshot,
+            timeline,
+            findings,
+        })
     }
 
     /// 纯离线分析：对任意传入的 `TraceEvent` 切片运行折叠 + 时间轴 + 异常检测。
@@ -446,27 +631,34 @@ impl TrajectoryRuntime {
         let mut summaries = Vec::new();
         let mut seen = HashSet::new();
 
-        // 1. 优先汇总内存活跃 Session
+        // 1. 优先汇总内存活跃 Session（通过增量折叠器直接汇总统计与异常，无需重算时间轴）
         if let Some(store) = self.ctx.get::<SessionStore>("sessions") {
             for s in store.list() {
                 if !seen.insert(s.id.clone()) {
                     continue;
                 }
-                let events = trace_events_from_session(&s);
-                let report = self.inspect_events(&s.id, &events, TimelineMode::Sequence);
-                let has_errors = report
-                    .findings
-                    .iter()
-                    .any(|f| f.severity == Severity::Error);
-                summaries.push(TrajectorySummary {
-                    session_id: s.id.clone(),
-                    event_count: events.len(),
-                    turns: report.snapshot.stats.turns,
-                    steps: report.snapshot.stats.steps,
-                    tool_calls: report.snapshot.stats.tool_calls,
-                    findings_count: report.findings.len(),
-                    has_errors,
-                });
+                self.sync_managed_session(&s);
+                let summary_opt = {
+                    let buffers = self.buffers.lock().unwrap();
+                    buffers.get(&s.id).and_then(|buf| {
+                        let folder = buf.inc_folder.as_ref()?;
+                        let detector = buf.inc_detector.as_ref()?;
+                        let findings = detector.findings_with_guards(folder.records());
+                        let stats = folder.stats();
+                        Some(TrajectorySummary {
+                            session_id: s.id.clone(),
+                            event_count: buf.inc_event_count,
+                            turns: stats.turns,
+                            steps: stats.steps,
+                            tool_calls: stats.tool_calls,
+                            findings_count: findings.len(),
+                            has_errors: findings.iter().any(|f| f.severity == Severity::Error),
+                        })
+                    })
+                };
+                if let Some(sum) = summary_opt {
+                    summaries.push(sum);
+                }
             }
         }
 
@@ -502,29 +694,34 @@ impl TrajectoryRuntime {
         }
 
         // 3. 补充独立事件模式缓冲
-        let standalone_ids: Vec<(String, Vec<TraceEvent>)> = {
+        let standalone_ids: Vec<String> = {
             let buffers = self.buffers.lock().unwrap();
             buffers
                 .iter()
                 .filter(|(id, b)| !seen.contains(*id) && !b.standalone_events.is_empty())
-                .map(|(id, b)| (id.clone(), b.standalone_events.clone()))
+                .map(|(id, _)| id.clone())
                 .collect()
         };
-        for (id, events) in standalone_ids {
-            let report = self.inspect_events(&id, &events, TimelineMode::Sequence);
-            let has_errors = report
-                .findings
-                .iter()
-                .any(|f| f.severity == Severity::Error);
-            summaries.push(TrajectorySummary {
-                session_id: id,
-                event_count: events.len(),
-                turns: report.snapshot.stats.turns,
-                steps: report.snapshot.stats.steps,
-                tool_calls: report.snapshot.stats.tool_calls,
-                findings_count: report.findings.len(),
-                has_errors,
-            });
+        for id in standalone_ids {
+            let mut buffers = self.buffers.lock().unwrap();
+            if let Some(buf) = buffers.get_mut(&id) {
+                buf.sync_standalone(&id, &self.config.detector);
+                if let (Some(folder), Some(detector)) =
+                    (buf.inc_folder.as_ref(), buf.inc_detector.as_ref())
+                {
+                    let findings = detector.findings_with_guards(folder.records());
+                    let stats = folder.stats();
+                    summaries.push(TrajectorySummary {
+                        session_id: id,
+                        event_count: buf.inc_event_count,
+                        turns: stats.turns,
+                        steps: stats.steps,
+                        tool_calls: stats.tool_calls,
+                        findings_count: findings.len(),
+                        has_errors: findings.iter().any(|f| f.severity == Severity::Error),
+                    });
+                }
+            }
         }
 
         summaries.sort_by(|a, b| a.session_id.cmp(&b.session_id));

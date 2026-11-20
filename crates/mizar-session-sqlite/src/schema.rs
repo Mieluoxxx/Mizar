@@ -16,7 +16,8 @@ pub fn configure_connection(conn: &Connection) -> PersistenceResult<()> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA cache_size = -512;",
     )
     .map_err(map_sqlite_err)?;
     Ok(())
@@ -25,8 +26,11 @@ pub fn configure_connection(conn: &Connection) -> PersistenceResult<()> {
 pub fn configure_reader_connection(conn: &Connection) -> PersistenceResult<()> {
     conn.busy_timeout(Duration::from_millis(5000))
         .map_err(map_sqlite_err)?;
-    conn.execute_batch("PRAGMA query_only = ON;")
-        .map_err(map_sqlite_err)?;
+    conn.execute_batch(
+        "PRAGMA query_only = ON;
+         PRAGMA cache_size = -512;",
+    )
+    .map_err(map_sqlite_err)?;
     Ok(())
 }
 
@@ -329,5 +333,35 @@ mod tests {
             rusqlite::params![seq, seq * 1000, visibility_str(visibility), payload],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn reader_and_writer_connections_cap_sqlite_cache_size() {
+        let dir = std::env::temp_dir().join(format!("mizar_sqlite_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("sessions.sqlite");
+
+        let writer = Connection::open(&db_path).unwrap();
+        init_schema(&writer).unwrap();
+        let writer_cache: i64 = writer
+            .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writer_cache, -512);
+
+        let reader = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        configure_reader_connection(&reader).unwrap();
+        let reader_cache: i64 = reader
+            .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reader_cache, -512);
+
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

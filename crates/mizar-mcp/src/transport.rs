@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use cordis::Logger;
@@ -301,11 +301,34 @@ pub struct HttpTransport {
     next_id: AtomicI64,
 }
 
+fn shared_mcp_http_client() -> Result<reqwest::Client, McpError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        let mut builder = reqwest::Client::builder();
+        for env_key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"] {
+            if let Ok(path) = std::env::var(env_key)
+                && !path.trim().is_empty()
+                && let Ok(pem) = std::fs::read(&path)
+                && let Ok(certs) = reqwest::Certificate::from_pem_bundle(&pem)
+            {
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert);
+                }
+                break;
+            }
+        }
+        builder.build().map_err(|e| e.to_string())
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(err) => Err(McpError::Transport(format!(
+            "failed to build http client: {err}"
+        ))),
+    }
+}
+
 impl HttpTransport {
     fn new(url: &str, config: &McpServerConfig) -> Result<Self, McpError> {
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| McpError::Transport(format!("failed to build http client: {e}")))?;
+        let client = shared_mcp_http_client()?;
         let mut headers = HashMap::new();
         for (k, v) in &config.headers {
             headers.insert(k.clone(), expand_env_vars(v));

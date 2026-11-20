@@ -21,7 +21,7 @@ use mizar_llm::{
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
-    resolve_credential, spawn_sse_stream,
+    resolve_credential, shared_http_client, spawn_sse_stream,
 };
 use serde_json::{Value, json};
 
@@ -771,10 +771,11 @@ pub struct MessagesAdapter {
 
 impl MessagesAdapter {
     pub fn new(config: MessagesConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        Self::with_client(config, shared_http_client())
+    }
+
+    pub fn with_client(config: MessagesConfig, client: reqwest::Client) -> Self {
+        Self { config, client }
     }
 
     fn resolve_api_key(&self) -> Result<Option<String>, LlmError> {

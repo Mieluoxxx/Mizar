@@ -423,3 +423,141 @@ fn fold_trajectory_counts_max_tokens_as_interrupted_step() {
         Some("max_tokens")
     );
 }
+
+#[test]
+fn incremental_folder_and_detector_match_batch_parity() {
+    let events = vec![
+        ev(1, 1000, TraceEventKind::TurnStart { turn: 1 }),
+        ev(
+            2,
+            1000,
+            TraceEventKind::UserMessage {
+                text: "check files".into(),
+            },
+        ),
+        ev(
+            3,
+            1010,
+            TraceEventKind::StepStart {
+                turn: 1,
+                step: 1,
+                system_prompt_chars: 100,
+                tools_count: 1,
+            },
+        ),
+        ev(4, 1040, TraceEventKind::FirstToken { turn: 1, step: 1 }),
+        ev(
+            5,
+            1200,
+            TraceEventKind::AssistantMessage {
+                text: "checking".into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+            },
+        ),
+        ev(
+            6,
+            1205,
+            TraceEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "c1".into(),
+                name: "read".into(),
+                arguments: r#"{"b":2,"a":1}"#.into(),
+            },
+        ),
+        ev(
+            7,
+            1250,
+            TraceEventKind::ToolResult {
+                tool_call_id: "c1".into(),
+                name: "read".into(),
+                content: "err1".into(),
+                is_error: true,
+                blocked: true,
+            },
+        ),
+        ev(
+            8,
+            1255,
+            TraceEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "c2".into(),
+                name: "read".into(),
+                arguments: r#"{"a":1,"b":2}"#.into(),
+            },
+        ),
+        ev(
+            9,
+            1300,
+            TraceEventKind::ToolResult {
+                tool_call_id: "c2".into(),
+                name: "read".into(),
+                content: "err2".into(),
+                is_error: true,
+                blocked: false,
+            },
+        ),
+        ev(
+            10,
+            1305,
+            TraceEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "c3".into(),
+                name: "read".into(),
+                arguments: r#"{"a":1,"b":2}"#.into(),
+            },
+        ),
+        ev(
+            11,
+            1350,
+            TraceEventKind::ToolResult {
+                tool_call_id: "c3".into(),
+                name: "read".into(),
+                content: "err3".into(),
+                is_error: true,
+                blocked: false,
+            },
+        ),
+        ev(
+            12,
+            1360,
+            TraceEventKind::TurnEnd {
+                turn: 1,
+                reason: "max_steps".into(),
+            },
+        ),
+    ];
+
+    let cfg = DetectorConfig {
+        repeat_threshold: 3,
+        consecutive_error_threshold: 3,
+        slow_step_ms: 100,
+        slow_tool_ms: 40,
+        slow_ttft_ms: 25,
+    };
+
+    let mut folder = mizar_trajectory_core::IncrementalFolder::new("s-inc");
+    let mut detector = mizar_trajectory_core::IncrementalDetector::new(cfg.clone());
+    for (idx, e) in events.iter().enumerate() {
+        folder.push_event(e);
+        detector.push_event(e, folder.records());
+
+        let inc_snap = folder.snapshot();
+        let batch_snap = fold_trajectory("s-inc", &events[..=idx]);
+        assert_eq!(inc_snap.stats, batch_snap.stats, "at idx={idx}");
+        assert_eq!(inc_snap.turns, batch_snap.turns, "at idx={idx}");
+        assert_eq!(inc_snap.records, batch_snap.records, "at idx={idx}");
+
+        let inc_findings = detector.findings(folder.records());
+        let batch_findings = detect_anomalies(&events[..=idx], &batch_snap, &cfg);
+        assert_eq!(inc_findings, batch_findings, "at idx={idx}");
+    }
+}

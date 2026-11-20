@@ -33,6 +33,14 @@ const PASTE_COLLAPSE_MIN_LINES: usize = 8;
 const PASTE_COLLAPSE_MIN_CHARS: usize = 600;
 const MAX_UNDO_STACK: usize = 100;
 
+#[derive(Debug, Clone)]
+struct CachedInputLayout {
+    text: String,
+    cursor: usize,
+    max_width: u16,
+    layout: InputLayout,
+}
+
 /// 多行文本编辑器：按 UTF-8 字符边界编辑、原子粘贴块（长文本与图片）、词级导航/撤销，并按终端显示列宽折行定位光标。
 #[derive(Debug, Default, Clone)]
 pub struct TextInput {
@@ -47,6 +55,7 @@ pub struct TextInput {
     paste_seq: usize,
     image_seq: usize,
     pastes: HashMap<String, PasteEntry>,
+    layout_cache: Option<CachedInputLayout>,
 }
 
 impl TextInput {
@@ -706,6 +715,23 @@ impl TextInput {
             cursor_row,
             cursor_col,
         }
+    }
+
+    /// 缓存版输入框排版：仅当草稿文本、光标偏移或视口宽度变化时才重新计算换行。
+    pub fn layout_cached(&mut self, max_width: u16) -> &InputLayout {
+        let hit = self.layout_cache.as_ref().is_some_and(|c| {
+            c.max_width == max_width && c.cursor == self.cursor && c.text == self.text
+        });
+        if !hit {
+            let layout = self.layout(max_width);
+            self.layout_cache = Some(CachedInputLayout {
+                text: self.text.clone(),
+                cursor: self.cursor,
+                max_width,
+                layout,
+            });
+        }
+        &self.layout_cache.as_ref().unwrap().layout
     }
 }
 

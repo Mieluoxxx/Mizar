@@ -8,7 +8,6 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use crate::editor::display_width;
 use crate::selection::{SelectionGeometry, SelectionPane};
@@ -60,7 +59,7 @@ impl SidePanelTab {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContextBreakdownSnapshot {
     pub system_tokens: u64,
     pub user_tokens: u64,
@@ -103,27 +102,27 @@ impl ContextBreakdownSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSummaryRow {
     pub name: String,
     pub exposure: String,
     pub declared: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpSummaryRow {
     pub name: String,
     pub status: String,
     pub ok: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTouchRow {
     pub path: String,
     pub op: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionSummaryRow {
     pub path: String,
     pub scope: String,
@@ -132,7 +131,7 @@ pub struct InstructionSummaryRow {
     pub omitted: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SidePanelData {
     pub context: ContextBreakdownSnapshot,
     pub instructions: Vec<InstructionSummaryRow>,
@@ -145,6 +144,15 @@ pub struct SidePanelData {
 }
 
 #[derive(Debug, Clone)]
+struct CachedSidePanelLines {
+    tab: SidePanelTab,
+    inner_w: usize,
+    data: SidePanelData,
+    theme: Theme,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SidePanelState {
     pub open: bool,
     pub width: u16,
@@ -154,6 +162,7 @@ pub struct SidePanelState {
     pub hovered_divider: bool,
     pub divider_col: Option<u16>,
     pub tab_hit_boxes: Vec<(SidePanelTab, Rect)>,
+    cached_lines: Option<CachedSidePanelLines>,
 }
 
 impl Default for SidePanelState {
@@ -167,6 +176,7 @@ impl Default for SidePanelState {
             hovered_divider: false,
             divider_col: None,
             tab_hit_boxes: Vec::new(),
+            cached_lines: None,
         }
     }
 }
@@ -300,20 +310,19 @@ pub fn render_side_panel(
         tab_spans.push(Span::styled(format!(" {text} "), style));
         x_cursor = x_cursor.saturating_add(w + 2);
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(tab_spans)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
+    let tab_line = Line::from(tab_spans);
+    frame
+        .buffer_mut()
+        .set_line(area.x, area.y, &tab_line, area.width);
 
     // Row 1: 水平连接线（与分割线 row 1 的 `├` 对齐）
-    let rule = "─".repeat(area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            rule.clone(),
-            Style::default().fg(theme.border),
-        )),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
+    let border_style = Style::default().fg(theme.border);
+    {
+        let buf = frame.buffer_mut();
+        for x in area.x..area.x + area.width {
+            buf[(x, area.y + 1)].set_symbol("─").set_style(border_style);
+        }
+    }
 
     // 主体内容区域 (row 2 .. height - 2)
     let body_y = area.y + 2;
@@ -321,50 +330,63 @@ pub fn render_side_panel(
     let body_area = Rect::new(area.x + 1, body_y, area.width.saturating_sub(2), body_h);
     let inner_w = body_area.width as usize;
 
-    let lines = match state.tab {
-        SidePanelTab::Context => {
-            build_context_lines(&data.context, &data.instructions, inner_w, theme)
-        }
-        SidePanelTab::Files => build_files_lines(
-            &data.files,
-            &data.git_changes,
-            &data.git_diff_stat,
+    let cache_hit = state.cached_lines.as_ref().is_some_and(|c| {
+        c.tab == state.tab && c.inner_w == inner_w && &c.data == data && &c.theme == theme
+    });
+    if !cache_hit {
+        let lines = match state.tab {
+            SidePanelTab::Context => {
+                build_context_lines(&data.context, &data.instructions, inner_w, theme)
+            }
+            SidePanelTab::Files => build_files_lines(
+                &data.files,
+                &data.git_changes,
+                &data.git_diff_stat,
+                inner_w,
+                theme,
+            ),
+            SidePanelTab::Tools => build_tools_lines(&data.tools, &data.mcps, inner_w, theme),
+            SidePanelTab::Stats => build_stats_lines(&data.context, &data.findings, inner_w, theme),
+        };
+        state.cached_lines = Some(CachedSidePanelLines {
+            tab: state.tab,
             inner_w,
-            theme,
-        ),
-        SidePanelTab::Tools => build_tools_lines(&data.tools, &data.mcps, inner_w, theme),
-        SidePanelTab::Stats => build_stats_lines(&data.context, &data.findings, inner_w, theme),
-    };
+            data: data.clone(),
+            theme: theme.clone(),
+            lines,
+        });
+    }
 
+    let lines = &state.cached_lines.as_ref().unwrap().lines;
     let max_scroll = lines.len().saturating_sub(body_h as usize);
     state.scroll = state.scroll.min(max_scroll);
     let visible_end = (state.scroll + body_h as usize).min(lines.len());
-    let visible_lines = lines[state.scroll..visible_end].to_vec();
-    for row_off in 0..visible_lines.len() {
+    let buf = frame.buffer_mut();
+    for (row_off, line) in lines[state.scroll..visible_end].iter().enumerate() {
+        let y = body_area.y + row_off as u16;
+        buf.set_line(body_area.x, y, line, body_area.width);
         sel_geom.push_row(
             SelectionPane::SidePanel,
-            body_area.y + row_off as u16,
+            y,
             body_area.x,
             body_area.x + body_area.width,
             false,
         );
     }
-    frame.render_widget(Paragraph::new(visible_lines), body_area);
 
     // 底部提示（与分割线 bottom_junction 对齐）
     if area.height >= 4 {
         let rule_y = area.y + area.height - 2;
         let hint_y = area.y + area.height - 1;
-        frame.render_widget(
-            Paragraph::new(Span::styled(rule, Style::default().fg(theme.border))),
-            Rect::new(area.x, rule_y, area.width, 1),
-        );
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " Ctrl+B 关/焦点 · 点页签切换 · 拖分割线调宽",
-                Style::default().fg(theme.text_dim),
-            )),
-            Rect::new(area.x, hint_y, area.width, 1),
+        for x in area.x..area.x + area.width {
+            buf[(x, rule_y)].set_symbol("─").set_style(border_style);
+        }
+        buf.set_stringn(
+            area.x,
+            hint_y,
+            " Ctrl+B 关/焦点 · 点页签切换 · 拖分割线调宽",
+            area.width as usize,
+            Style::default().fg(theme.text_dim),
         );
     }
 }

@@ -107,113 +107,225 @@ pub fn wildcard_matches(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// 对一段有序轨迹事件和折叠快照执行全量异常规则检测。
-pub fn detect_anomalies(
-    events: &[TraceEvent],
-    snapshot: &TrajectorySnapshot,
-    cfg: &DetectorConfig,
-) -> Vec<TrajectoryFinding> {
-    let mut findings = Vec::new();
+use crate::model::TrajectoryRecord;
 
-    // R01 重复工具调用链 & R02 连续工具报错 & R03 被拦截后继续重试
-    struct RepeatStreak {
-        name: String,
-        canonical_args: String,
-        count: usize,
-        turn: u64,
-        step: usize,
-        last_seq: u64,
+#[derive(Clone)]
+struct RepeatStreak {
+    name: String,
+    canonical_args: String,
+    count: usize,
+    turn: u64,
+    step: usize,
+    last_seq: u64,
+}
+
+fn repeat_streak_to_finding(s: &RepeatStreak, cfg: &DetectorConfig) -> Option<TrajectoryFinding> {
+    if s.count < cfg.repeat_threshold {
+        return None;
+    }
+    Some(TrajectoryFinding {
+        rule_id: "R01_REPEAT_TOOL_CALL".to_string(),
+        severity: if s.count >= cfg.repeat_threshold + 2 {
+            Severity::Error
+        } else {
+            Severity::Warn
+        },
+        title: format!("检测到连续重复调用 {}", s.name),
+        summary: format!(
+            "工具 {} 使用相同参数连续调用了 {} 次（阈值 {}）",
+            s.name, s.count, cfg.repeat_threshold
+        ),
+        turn: Some(s.turn),
+        step: Some(s.step),
+        seq: Some(s.last_seq),
+        evidence: json!({
+            "tool": s.name,
+            "count": s.count,
+            "arguments": preview_chars(&s.canonical_args, 240),
+        }),
+    })
+}
+
+fn error_streak_to_finding(
+    cnt: usize,
+    info: &(Option<u64>, Option<usize>, u64, String),
+    cfg: &DetectorConfig,
+) -> Option<TrajectoryFinding> {
+    if cnt < cfg.consecutive_error_threshold {
+        return None;
+    }
+    let (turn, step, seq, last_tool) = info;
+    Some(TrajectoryFinding {
+        rule_id: "R02_CONSECUTIVE_TOOL_ERRORS".to_string(),
+        severity: Severity::Error,
+        title: "工具连续报错空转".to_string(),
+        summary: format!("连续 {cnt} 次工具执行失败（最近一次：{last_tool}）"),
+        turn: *turn,
+        step: *step,
+        seq: Some(*seq),
+        evidence: json!({ "consecutiveErrors": cnt, "lastTool": last_tool }),
+    })
+}
+
+fn push_r06_for_record(
+    rec: &TrajectoryRecord,
+    cfg: &DetectorConfig,
+    out: &mut Vec<TrajectoryFinding>,
+) {
+    match rec.kind {
+        RecordKind::Assistant => {
+            if let Some(dur) = rec.duration_ms
+                && dur > cfg.slow_step_ms
+            {
+                out.push(TrajectoryFinding {
+                    rule_id: "R06_HIGH_LATENCY".to_string(),
+                    severity: Severity::Warn,
+                    title: "模型单步响应耗时过长".to_string(),
+                    summary: format!("模型响应耗时 {} ms，超过阈值 {} ms", dur, cfg.slow_step_ms),
+                    turn: rec.turn,
+                    step: rec.step,
+                    seq: Some(rec.seq),
+                    evidence: json!({ "kind": "llm", "durationMs": dur, "thresholdMs": cfg.slow_step_ms }),
+                });
+            }
+            if let Some(ttft) = rec.ttft_ms
+                && ttft > cfg.slow_ttft_ms
+            {
+                out.push(TrajectoryFinding {
+                    rule_id: "R06_HIGH_LATENCY".to_string(),
+                    severity: Severity::Warn,
+                    title: "首 token 延迟过高".to_string(),
+                    summary: format!("TTFT 为 {} ms，超过阈值 {} ms", ttft, cfg.slow_ttft_ms),
+                    turn: rec.turn,
+                    step: rec.step,
+                    seq: Some(rec.seq),
+                    evidence: json!({ "kind": "ttft", "ttftMs": ttft, "thresholdMs": cfg.slow_ttft_ms }),
+                });
+            }
+        }
+        RecordKind::Tool => {
+            if let Some(dur) = rec.duration_ms
+                && dur > cfg.slow_tool_ms
+            {
+                out.push(TrajectoryFinding {
+                    rule_id: "R06_HIGH_LATENCY".to_string(),
+                    severity: Severity::Warn,
+                    title: format!(
+                        "工具 {} 执行耗时过长",
+                        rec.tool_name.as_deref().unwrap_or("unknown")
+                    ),
+                    summary: format!("工具执行耗时 {} ms，超过阈值 {} ms", dur, cfg.slow_tool_ms),
+                    turn: rec.turn,
+                    step: rec.step,
+                    seq: Some(rec.seq),
+                    evidence: json!({
+                        "kind": "tool",
+                        "tool": rec.tool_name,
+                        "durationMs": dur,
+                        "thresholdMs": cfg.slow_tool_ms,
+                    }),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 增量轨迹异常检测器：按事件逐条维护 R01..R05 状态机，并对新完成的记录增量执行 R06 检测。
+pub struct IncrementalDetector {
+    cfg: DetectorConfig,
+    repeat_streak: Option<RepeatStreak>,
+    error_streak: usize,
+    error_last_info: Option<(Option<u64>, Option<usize>, u64, String)>,
+    call_meta: HashMap<String, (u64, usize, String, String)>,
+    denied_keys: HashSet<(String, String)>,
+    open_steps: HashMap<(u64, usize), u64>,
+    open_tools: HashMap<String, (u64, usize, u64, String)>,
+    current_turn: Option<u64>,
+    settled_event_findings: Vec<TrajectoryFinding>,
+    settled_r06_findings: Vec<TrajectoryFinding>,
+    next_r06_record_idx: usize,
+    settled_r01_seqs: HashSet<u64>,
+    guard_anomalies: Vec<TrajectoryFinding>,
+}
+
+impl IncrementalDetector {
+    pub fn new(cfg: DetectorConfig) -> Self {
+        Self {
+            cfg,
+            repeat_streak: None,
+            error_streak: 0,
+            error_last_info: None,
+            call_meta: HashMap::new(),
+            denied_keys: HashSet::new(),
+            open_steps: HashMap::new(),
+            open_tools: HashMap::new(),
+            current_turn: None,
+            settled_event_findings: Vec::new(),
+            settled_r06_findings: Vec::new(),
+            next_r06_record_idx: 0,
+            settled_r01_seqs: HashSet::new(),
+            guard_anomalies: Vec::new(),
+        }
     }
 
-    let mut repeat_streak: Option<RepeatStreak> = None;
-    let flush_repeat = |streak: &mut Option<RepeatStreak>, out: &mut Vec<TrajectoryFinding>| {
-        if let Some(s) = streak.take()
-            && s.count >= cfg.repeat_threshold
+    fn flush_repeat(&mut self) {
+        if let Some(s) = self.repeat_streak.take()
+            && let Some(f) = repeat_streak_to_finding(&s, &self.cfg)
         {
-            out.push(TrajectoryFinding {
-                rule_id: "R01_REPEAT_TOOL_CALL".to_string(),
-                severity: if s.count >= cfg.repeat_threshold + 2 {
-                    Severity::Error
-                } else {
-                    Severity::Warn
-                },
-                title: format!("检测到连续重复调用 {}", s.name),
-                summary: format!(
-                    "工具 {} 使用相同参数连续调用了 {} 次（阈值 {}）",
-                    s.name, s.count, cfg.repeat_threshold
-                ),
-                turn: Some(s.turn),
-                step: Some(s.step),
-                seq: Some(s.last_seq),
-                evidence: json!({
-                    "tool": s.name,
-                    "count": s.count,
-                    "arguments": preview_chars(&s.canonical_args, 240),
-                }),
-            });
+            if let Some(seq) = f.seq {
+                self.settled_r01_seqs.insert(seq);
+            }
+            self.settled_event_findings.push(f);
         }
-    };
+    }
 
-    let mut error_streak: usize = 0;
-    let mut error_last_info: Option<(Option<u64>, Option<usize>, u64, String)> = None;
-    let flush_errors = |cnt: &mut usize,
-                        info: &mut Option<(Option<u64>, Option<usize>, u64, String)>,
-                        out: &mut Vec<TrajectoryFinding>| {
-        if *cnt >= cfg.consecutive_error_threshold
-            && let Some((turn, step, seq, last_tool)) = info.take()
+    fn flush_errors(&mut self) {
+        let cnt = std::mem::take(&mut self.error_streak);
+        if let Some(info) = self.error_last_info.take()
+            && let Some(f) = error_streak_to_finding(cnt, &info, &self.cfg)
         {
-            out.push(TrajectoryFinding {
-                rule_id: "R02_CONSECUTIVE_TOOL_ERRORS".to_string(),
-                severity: Severity::Error,
-                title: "工具连续报错空转".to_string(),
-                summary: format!("连续 {} 次工具执行失败（最近一次：{}）", *cnt, last_tool),
-                turn,
-                step,
-                seq: Some(seq),
-                evidence: json!({ "consecutiveErrors": *cnt, "lastTool": last_tool }),
-            });
+            self.settled_event_findings.push(f);
         }
-        *cnt = 0;
-        *info = None;
-    };
+    }
 
-    let mut call_meta: HashMap<String, (u64, usize, String, String)> = HashMap::new();
-    let mut denied_keys: HashSet<(String, String)> = HashSet::new();
-    let mut open_steps: HashMap<(u64, usize), u64> = HashMap::new();
-    let mut open_tools: HashMap<String, (u64, usize, u64, String)> = HashMap::new();
-    let mut current_turn: Option<u64> = None;
-
-    for ev in events {
+    /// 推进单条事件并同步消费所有连续已决（耗时确定）的折叠记录用于 R06 检测。
+    pub fn push_event(&mut self, ev: &TraceEvent, records: &[TrajectoryRecord]) {
         match &ev.kind {
             TraceEventKind::TurnStart { turn } => {
                 // 如果上一个 turn 还留有未闭合的 step/tool，记为 R05
-                if let Some(prev_turn) = current_turn
+                if let Some(prev_turn) = self.current_turn
                     && prev_turn != *turn
                 {
                     report_unclosed_for_turn(
                         prev_turn,
-                        &mut open_steps,
-                        &mut open_tools,
-                        &mut findings,
+                        &mut self.open_steps,
+                        &mut self.open_tools,
+                        &mut self.settled_event_findings,
                     );
                 }
-                current_turn = Some(*turn);
+                self.current_turn = Some(*turn);
             }
             TraceEventKind::UserMessage { .. } => {
-                flush_repeat(&mut repeat_streak, &mut findings);
-                flush_errors(&mut error_streak, &mut error_last_info, &mut findings);
-                denied_keys.clear();
+                self.flush_repeat();
+                self.flush_errors();
+                self.denied_keys.clear();
             }
             TraceEventKind::StepStart { turn, step, .. } => {
-                open_steps.insert((*turn, *step), ev.seq);
+                self.open_steps.insert((*turn, *step), ev.seq);
             }
             TraceEventKind::StepEnd { turn, step, .. } => {
-                open_steps.remove(&(*turn, *step));
+                self.open_steps.remove(&(*turn, *step));
             }
             TraceEventKind::TurnEnd { turn, reason } => {
-                report_unclosed_for_turn(*turn, &mut open_steps, &mut open_tools, &mut findings);
+                report_unclosed_for_turn(
+                    *turn,
+                    &mut self.open_steps,
+                    &mut self.open_tools,
+                    &mut self.settled_event_findings,
+                );
                 if reason == "max_steps" {
-                    findings.push(TrajectoryFinding {
+                    self.settled_event_findings.push(TrajectoryFinding {
                         rule_id: "R04_MAX_STEPS_EXHAUSTED".to_string(),
                         severity: Severity::Error,
                         title: "达到最大步数上限".to_string(),
@@ -235,12 +347,14 @@ pub fn detect_anomalies(
                 arguments,
             } => {
                 let canon = canonicalize_args_str(arguments);
-                call_meta.insert(call_id.clone(), (*turn, *step, name.clone(), canon.clone()));
-                open_tools.insert(call_id.clone(), (*turn, *step, ev.seq, name.clone()));
+                self.call_meta
+                    .insert(call_id.clone(), (*turn, *step, name.clone(), canon.clone()));
+                self.open_tools
+                    .insert(call_id.clone(), (*turn, *step, ev.seq, name.clone()));
 
                 // R03：如果同工具同参数之前被拦截过仍重试
-                if denied_keys.contains(&(name.clone(), canon.clone())) {
-                    findings.push(TrajectoryFinding {
+                if self.denied_keys.contains(&(name.clone(), canon.clone())) {
+                    self.settled_event_findings.push(TrajectoryFinding {
                         rule_id: "R03_RETRY_AFTER_DENIED".to_string(),
                         severity: Severity::Warn,
                         title: format!("重复尝试被拦截的工具 {}", name),
@@ -259,7 +373,7 @@ pub fn detect_anomalies(
                 }
 
                 // R01：连续相同调用统计
-                match &mut repeat_streak {
+                match &mut self.repeat_streak {
                     Some(s) if s.name == *name && s.canonical_args == canon => {
                         s.count += 1;
                         s.turn = *turn;
@@ -267,8 +381,8 @@ pub fn detect_anomalies(
                         s.last_seq = ev.seq;
                     }
                     _ => {
-                        flush_repeat(&mut repeat_streak, &mut findings);
-                        repeat_streak = Some(RepeatStreak {
+                        self.flush_repeat();
+                        self.repeat_streak = Some(RepeatStreak {
                             name: name.clone(),
                             canonical_args: canon,
                             count: 1,
@@ -286,94 +400,147 @@ pub fn detect_anomalies(
                 blocked,
                 ..
             } => {
-                open_tools.remove(tool_call_id);
-                let meta = call_meta.get(tool_call_id);
-                let turn = meta.map(|m| m.0).or(current_turn);
+                self.open_tools.remove(tool_call_id);
+                let meta = self.call_meta.get(tool_call_id);
+                let turn = meta.map(|m| m.0).or(self.current_turn);
                 let step = meta.map(|m| m.1);
 
                 if *blocked && let Some((_, _, orig_name, canon)) = meta {
-                    denied_keys.insert((orig_name.clone(), canon.clone()));
+                    self.denied_keys.insert((orig_name.clone(), canon.clone()));
                 }
 
                 if *is_error {
-                    error_streak += 1;
-                    error_last_info = Some((turn, step, ev.seq, name.clone()));
+                    self.error_streak += 1;
+                    self.error_last_info = Some((turn, step, ev.seq, name.clone()));
                 } else {
-                    flush_errors(&mut error_streak, &mut error_last_info, &mut findings);
+                    self.flush_errors();
                 }
+            }
+            TraceEventKind::Anomaly {
+                rule_id,
+                severity,
+                turn,
+                step,
+                summary,
+                evidence,
+            } => {
+                self.guard_anomalies.push(TrajectoryFinding {
+                    rule_id: rule_id.clone(),
+                    severity: *severity,
+                    title: format!("守卫告警 ({rule_id})"),
+                    summary: summary.clone(),
+                    turn: *turn,
+                    step: *step,
+                    seq: Some(ev.seq),
+                    evidence: evidence.clone(),
+                });
             }
             _ => {}
         }
-    }
 
-    flush_repeat(&mut repeat_streak, &mut findings);
-    flush_errors(&mut error_streak, &mut error_last_info, &mut findings);
-
-    // R06：基于折叠后的耗时记录检测高延迟
-    for rec in &snapshot.records {
-        match rec.kind {
-            RecordKind::Assistant => {
-                if let Some(dur) = rec.duration_ms
-                    && dur > cfg.slow_step_ms
-                {
-                    findings.push(TrajectoryFinding {
-                        rule_id: "R06_HIGH_LATENCY".to_string(),
-                        severity: Severity::Warn,
-                        title: "模型单步响应耗时过长".to_string(),
-                        summary: format!("模型响应耗时 {} ms，超过阈值 {} ms", dur, cfg.slow_step_ms),
-                        turn: rec.turn,
-                        step: rec.step,
-                        seq: Some(rec.seq),
-                        evidence: json!({ "kind": "llm", "durationMs": dur, "thresholdMs": cfg.slow_step_ms }),
-                    });
-                }
-                if let Some(ttft) = rec.ttft_ms
-                    && ttft > cfg.slow_ttft_ms
-                {
-                    findings.push(TrajectoryFinding {
-                        rule_id: "R06_HIGH_LATENCY".to_string(),
-                        severity: Severity::Warn,
-                        title: "首 token 延迟过高".to_string(),
-                        summary: format!("TTFT 为 {} ms，超过阈值 {} ms", ttft, cfg.slow_ttft_ms),
-                        turn: rec.turn,
-                        step: rec.step,
-                        seq: Some(rec.seq),
-                        evidence: json!({ "kind": "ttft", "ttftMs": ttft, "thresholdMs": cfg.slow_ttft_ms }),
-                    });
-                }
+        // 前置记录未闭合 ToolResult 时停住，保证 R06 输出严格保持 records 顺序
+        while let Some(rec) = records.get(self.next_r06_record_idx) {
+            if rec.kind == RecordKind::Tool
+                && rec.duration_ms.is_none()
+                && rec
+                    .call_id
+                    .as_ref()
+                    .is_some_and(|cid| self.open_tools.contains_key(cid))
+            {
+                break;
             }
-            RecordKind::Tool => {
-                if let Some(dur) = rec.duration_ms
-                    && dur > cfg.slow_tool_ms
-                {
-                    findings.push(TrajectoryFinding {
-                        rule_id: "R06_HIGH_LATENCY".to_string(),
-                        severity: Severity::Warn,
-                        title: format!(
-                            "工具 {} 执行耗时过长",
-                            rec.tool_name.as_deref().unwrap_or("unknown")
-                        ),
-                        summary: format!(
-                            "工具执行耗时 {} ms，超过阈值 {} ms",
-                            dur, cfg.slow_tool_ms
-                        ),
-                        turn: rec.turn,
-                        step: rec.step,
-                        seq: Some(rec.seq),
-                        evidence: json!({
-                            "kind": "tool",
-                            "tool": rec.tool_name,
-                            "durationMs": dur,
-                            "thresholdMs": cfg.slow_tool_ms,
-                        }),
-                    });
-                }
-            }
-            _ => {}
+            push_r06_for_record(rec, &self.cfg, &mut self.settled_r06_findings);
+            self.next_r06_record_idx += 1;
         }
     }
 
-    findings
+    pub fn settled_event_len(&self) -> usize {
+        self.settled_event_findings.len()
+    }
+
+    pub fn settled_r06_len(&self) -> usize {
+        self.settled_r06_findings.len()
+    }
+
+    /// 收集仅自上次增量游标以来的新增告警（含末尾尚未换段但已越过阈值的 R01/R02 尾链）。
+    pub fn collect_new_findings(
+        &self,
+        event_cursor: usize,
+        r06_cursor: usize,
+    ) -> Vec<TrajectoryFinding> {
+        let mut out = Vec::new();
+        out.extend(self.settled_event_findings[event_cursor..].iter().cloned());
+        if let Some(f) = self
+            .repeat_streak
+            .as_ref()
+            .and_then(|s| repeat_streak_to_finding(s, &self.cfg))
+        {
+            out.push(f);
+        }
+        if let Some(info) = &self.error_last_info
+            && let Some(f) = error_streak_to_finding(self.error_streak, info, &self.cfg)
+        {
+            out.push(f);
+        }
+        out.extend(self.settled_r06_findings[r06_cursor..].iter().cloned());
+        out
+    }
+
+    /// 输出与全量 `detect_anomalies` 完全等价的当前告警列表（不改变未闭合尾链状态）。
+    pub fn findings(&self, records: &[TrajectoryRecord]) -> Vec<TrajectoryFinding> {
+        let mut out = self.settled_event_findings.clone();
+        if let Some(f) = self
+            .repeat_streak
+            .as_ref()
+            .and_then(|s| repeat_streak_to_finding(s, &self.cfg))
+        {
+            out.push(f);
+        }
+        if let Some(info) = &self.error_last_info
+            && let Some(f) = error_streak_to_finding(self.error_streak, info, &self.cfg)
+        {
+            out.push(f);
+        }
+        out.extend(self.settled_r06_findings.iter().cloned());
+        for rec in records.iter().skip(self.next_r06_record_idx) {
+            push_r06_for_record(rec, &self.cfg, &mut out);
+        }
+        out
+    }
+
+    /// 包含在线守卫直接记录的 `Anomaly` 事件（对 `GUARD_REPEAT_TOOL` 与 R01 同 seq 去重）。
+    pub fn findings_with_guards(&self, records: &[TrajectoryRecord]) -> Vec<TrajectoryFinding> {
+        let mut out = self.findings(records);
+        let tail_r01_seq = self
+            .repeat_streak
+            .as_ref()
+            .and_then(|s| repeat_streak_to_finding(s, &self.cfg))
+            .and_then(|f| f.seq);
+
+        for g in &self.guard_anomalies {
+            if g.rule_id == "GUARD_REPEAT_TOOL"
+                && let Some(seq) = g.seq
+                && (self.settled_r01_seqs.contains(&seq) || tail_r01_seq == Some(seq))
+            {
+                continue;
+            }
+            out.push(g.clone());
+        }
+        out
+    }
+}
+
+/// 对一段有序轨迹事件和折叠快照执行全量异常规则检测。
+pub fn detect_anomalies(
+    events: &[TraceEvent],
+    snapshot: &TrajectorySnapshot,
+    cfg: &DetectorConfig,
+) -> Vec<TrajectoryFinding> {
+    let mut detector = IncrementalDetector::new(cfg.clone());
+    for ev in events {
+        detector.push_event(ev, &snapshot.records);
+    }
+    detector.findings(&snapshot.records)
 }
 
 fn report_unclosed_for_turn(

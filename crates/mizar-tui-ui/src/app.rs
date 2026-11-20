@@ -165,10 +165,199 @@ pub struct ItemRenderKey {
     pub preview_len: usize,
 }
 
+pub const MAX_CACHED_RENDER_ITEMS: usize = 96;
+
 #[derive(Debug, Clone)]
 pub struct CachedItemLines {
     pub key: ItemRenderKey,
+    pub lines: Arc<Vec<RenderedLine>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedItemHeight {
+    key: ItemRenderKey,
+    line_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedToolExpandable {
+    width: usize,
+    status_code: u8,
+    extra_len: usize,
+    preview_len: usize,
+    expandable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LruRenderEntry {
+    item: CachedItemLines,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamingMarkdownPrefixCache {
+    pub item_idx: usize,
+    pub width: usize,
+    pub theme_id: &'static str,
+    pub emphasis_enabled: bool,
+    pub round_caps: bool,
+    pub prefix_text: String,
     pub lines: Vec<RenderedLine>,
+}
+
+/// 对话渲染双层缓存：
+/// - `heights` 仅保存每个条目的渲染行数（轻量常驻），支撑 O(N) 整数扫描与视口裁剪；
+/// - `entries` 用 LRU 上限仅缓存视口工作集附近的完整 `Arc<Vec<RenderedLine>>` 高亮结果；
+/// - `expandable` 缓存工具卡展开性判定，避免跨帧重复反序列化 JSON 与渲染 Diff。
+#[derive(Debug, Default, Clone)]
+pub struct TranscriptRenderCache {
+    heights: HashMap<usize, CachedItemHeight>,
+    entries: HashMap<usize, LruRenderEntry>,
+    expandable: HashMap<usize, CachedToolExpandable>,
+    pub(crate) span_scratch: Vec<(usize, usize, ItemRenderKey)>,
+    pub(crate) streaming_prefix: Option<StreamingMarkdownPrefixCache>,
+    clock: u64,
+}
+
+impl TranscriptRenderCache {
+    pub fn clear(&mut self) {
+        self.heights.clear();
+        self.entries.clear();
+        self.expandable.clear();
+        self.streaming_prefix = None;
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.heights.is_empty()
+    }
+
+    pub fn height_count(&self) -> usize {
+        self.heights.len()
+    }
+
+    /// 局部失效指定条目（及其相邻工具组），替代全表 `clear()`。
+    pub fn invalidate_item(&mut self, idx: usize) {
+        self.heights.remove(&idx);
+        self.entries.remove(&idx);
+        self.expandable.remove(&idx);
+        if self
+            .streaming_prefix
+            .as_ref()
+            .is_some_and(|p| p.item_idx == idx)
+        {
+            self.streaming_prefix = None;
+        }
+    }
+
+    pub fn invalidate_tool_neighborhood(&mut self, items: &[ChatItem], idx: usize) {
+        self.invalidate_item(idx);
+        // 向前失效同一连续工具组（前驱的 `is_group_end` / `show_expand_hint` 可能变化）
+        let mut cur = idx;
+        while cur > 0 {
+            cur -= 1;
+            if matches!(items.get(cur), Some(ChatItem::ToolCall { .. })) {
+                self.invalidate_item(cur);
+            } else {
+                break;
+            }
+        }
+        // 向后失效同一连续工具组（后续卡片可能是 group_end，受当前展开性变化影响）
+        let mut next = idx + 1;
+        while matches!(items.get(next), Some(ChatItem::ToolCall { .. })) {
+            self.invalidate_item(next);
+            next += 1;
+        }
+    }
+
+    pub fn get_height(&self, idx: usize, key: &ItemRenderKey) -> Option<usize> {
+        self.heights
+            .get(&idx)
+            .filter(|h| &h.key == key)
+            .map(|h| h.line_count)
+    }
+
+    pub fn get_lines(&mut self, idx: usize, key: &ItemRenderKey) -> Option<Arc<Vec<RenderedLine>>> {
+        let matched = self.entries.get(&idx).is_some_and(|e| &e.item.key == key);
+        if !matched {
+            return None;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        let entry = self.entries.get_mut(&idx)?;
+        entry.last_used = stamp;
+        Some(Arc::clone(&entry.item.lines))
+    }
+
+    pub fn record_height_only(&mut self, idx: usize, key: ItemRenderKey, line_count: usize) {
+        self.heights
+            .insert(idx, CachedItemHeight { key, line_count });
+    }
+
+    pub fn insert_lines(&mut self, idx: usize, key: ItemRenderKey, lines: Arc<Vec<RenderedLine>>) {
+        self.heights.insert(
+            idx,
+            CachedItemHeight {
+                key: key.clone(),
+                line_count: lines.len(),
+            },
+        );
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        self.entries.insert(
+            idx,
+            LruRenderEntry {
+                item: CachedItemLines { key, lines },
+                last_used: stamp,
+            },
+        );
+        if self.entries.len() > MAX_CACHED_RENDER_ITEMS
+            && let Some((&evict_idx, _)) = self.entries.iter().min_by_key(|(_, e)| e.last_used)
+        {
+            self.entries.remove(&evict_idx);
+        }
+    }
+
+    pub fn get_expandable(
+        &self,
+        idx: usize,
+        width: usize,
+        status_code: u8,
+        extra_len: usize,
+        preview_len: usize,
+    ) -> Option<bool> {
+        self.expandable.get(&idx).and_then(|c| {
+            (c.width == width
+                && c.status_code == status_code
+                && c.extra_len == extra_len
+                && c.preview_len == preview_len)
+                .then_some(c.expandable)
+        })
+    }
+
+    pub fn insert_expandable(
+        &mut self,
+        idx: usize,
+        width: usize,
+        status_code: u8,
+        extra_len: usize,
+        preview_len: usize,
+        expandable: bool,
+    ) {
+        self.expandable.insert(
+            idx,
+            CachedToolExpandable {
+                width,
+                status_code,
+                extra_len,
+                preview_len,
+                expandable,
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,7 +640,7 @@ pub struct AppState {
     pub session_title: Option<String>,
     pub items: Vec<ChatItem>,
     pub tool_extras: HashMap<String, ToolExtraMeta>,
-    pub item_cache: HashMap<usize, CachedItemLines>,
+    pub item_cache: TranscriptRenderCache,
 
     pub input: TextInput,
     pub queued_prompts: Vec<QueuedPrompt>,
@@ -556,7 +745,7 @@ impl AppState {
             session_title: None,
             items: Vec::new(),
             tool_extras: HashMap::new(),
-            item_cache: HashMap::new(),
+            item_cache: TranscriptRenderCache::default(),
             input: TextInput::new(),
             queued_prompts: Vec::new(),
             queue_selected: None,
@@ -784,7 +973,9 @@ impl AppState {
             status: ToolState::Running,
             output_preview: String::new(),
         });
-        self.item_cache.clear();
+        let idx = self.items.len() - 1;
+        self.item_cache
+            .invalidate_tool_neighborhood(&self.items, idx);
         self.scroll_to_bottom();
     }
 
@@ -796,19 +987,23 @@ impl AppState {
         display: String,
         status: ToolState,
         inline_meta: String,
-    ) {
+    ) -> usize {
         let failed = !matches!(status, ToolState::Done);
         let preview = summarize_tool_result("bash", &display, None, failed);
-        if let Some(ChatItem::ToolCall {
-            status: st,
-            output_preview,
-            ..
-        }) = self.items.iter_mut().rev().find(|item| match item {
+        let idx = if let Some(pos) = self.items.iter().rposition(|item| match item {
             ChatItem::ToolCall { id, .. } => id == &call_id,
             _ => false,
         }) {
-            *st = status;
-            *output_preview = preview;
+            if let ChatItem::ToolCall {
+                status: st,
+                output_preview,
+                ..
+            } = &mut self.items[pos]
+            {
+                *st = status;
+                *output_preview = preview;
+            }
+            pos
         } else {
             let args_json = serde_json::json!({ "command": command }).to_string();
             let args_summary = summarize_tool_args(&args_json);
@@ -826,11 +1021,13 @@ impl AppState {
                 status,
                 output_preview: preview,
             });
-        }
+            self.items.len() - 1
+        };
         let ext = self.tool_extras.entry(call_id).or_default();
         ext.full_content = display;
         ext.inline_meta = Some(inline_meta);
         ext.exclude_from_context = exclude_from_context;
+        idx
     }
 
     pub fn open_model_selector(&mut self) -> AppAction {
@@ -1026,23 +1223,27 @@ impl AppState {
             UiEvent::ReasoningDelta { text, ts_ms } => {
                 let busy = self.is_busy;
                 let (idx, item) = self.ensure_open_assistant();
-                if let ChatItem::Assistant { reasoning, .. } = item {
+                let len = if let ChatItem::Assistant { reasoning, .. } = item {
                     reasoning.push_str(&text);
-                    let snapshot = reasoning.clone();
-                    self.reveal
-                        .observe(RevealSlot::AssistantReasoning(idx), &snapshot, busy);
-                }
+                    reasoning.len()
+                } else {
+                    0
+                };
+                self.reveal
+                    .observe(RevealSlot::AssistantReasoning(idx), len, busy);
                 self.tps.on_token_delta(&text, ts_ms);
             }
             UiEvent::TextDelta { text, ts_ms } => {
                 let busy = self.is_busy;
                 let (idx, item) = self.ensure_open_assistant();
-                if let ChatItem::Assistant { text: body, .. } = item {
+                let len = if let ChatItem::Assistant { text: body, .. } = item {
                     body.push_str(&text);
-                    let snapshot = body.clone();
-                    self.reveal
-                        .observe(RevealSlot::AssistantText(idx), &snapshot, busy);
-                }
+                    body.len()
+                } else {
+                    0
+                };
+                self.reveal
+                    .observe(RevealSlot::AssistantText(idx), len, busy);
                 self.tps.on_token_delta(&text, ts_ms);
             }
             UiEvent::ToolCall(call) => {
@@ -1080,6 +1281,9 @@ impl AppState {
                     status: ToolState::Running,
                     output_preview: String::new(),
                 });
+                let idx = self.items.len() - 1;
+                self.item_cache
+                    .invalidate_tool_neighborhood(&self.items, idx);
             }
             UiEvent::ToolUpdate {
                 call_id, preview, ..
@@ -1087,13 +1291,15 @@ impl AppState {
                 if let Some(ext) = self.tool_extras.get_mut(&call_id) {
                     ext.full_content = preview.clone();
                 }
-                if let Some(ChatItem::ToolCall { output_preview, .. }) =
-                    self.items.iter_mut().rev().find(|item| match item {
-                        ChatItem::ToolCall { id, .. } => id == &call_id,
-                        _ => false,
-                    })
-                {
-                    *output_preview = summarize_live_preview(&preview);
+                if let Some(pos) = self.items.iter().rposition(|item| match item {
+                    ChatItem::ToolCall { id, .. } => id == &call_id,
+                    _ => false,
+                }) {
+                    if let ChatItem::ToolCall { output_preview, .. } = &mut self.items[pos] {
+                        *output_preview = summarize_live_preview(&preview);
+                    }
+                    self.item_cache
+                        .invalidate_tool_neighborhood(&self.items, pos);
                 }
             }
             UiEvent::ToolResult {
@@ -1129,16 +1335,20 @@ impl AppState {
                     extra.inline_meta = inline_meta;
                 }
                 let preview = summarize_tool_result(&name, &content, details.as_ref(), failed);
-                if let Some(ChatItem::ToolCall {
-                    status: st,
-                    output_preview,
-                    ..
-                }) = self.items.iter_mut().rev().find(|item| match item {
+                let idx = if let Some(pos) = self.items.iter().rposition(|item| match item {
                     ChatItem::ToolCall { id, .. } => id == &call_id,
                     _ => false,
                 }) {
-                    *st = status;
-                    *output_preview = preview;
+                    if let ChatItem::ToolCall {
+                        status: st,
+                        output_preview,
+                        ..
+                    } = &mut self.items[pos]
+                    {
+                        *st = status;
+                        *output_preview = preview;
+                    }
+                    pos
                 } else {
                     self.items.push(ChatItem::ToolCall {
                         id: call_id,
@@ -1147,7 +1357,10 @@ impl AppState {
                         status,
                         output_preview: preview,
                     });
-                }
+                    self.items.len() - 1
+                };
+                self.item_cache
+                    .invalidate_tool_neighborhood(&self.items, idx);
             }
             UiEvent::Usage(usage) => {
                 self.total_usage.input_tokens = self
@@ -1236,7 +1449,7 @@ impl AppState {
                 output,
             } => {
                 self.is_bash_running = false;
-                match output {
+                let idx = match output {
                     Ok(out) => {
                         let status = if out.cancelled {
                             ToolState::Blocked
@@ -1254,7 +1467,7 @@ impl AppState {
                             out.display,
                             status,
                             inline_meta,
-                        );
+                        )
                     }
                     Err(err) => {
                         let inline_meta =
@@ -1266,10 +1479,11 @@ impl AppState {
                             err,
                             ToolState::Error,
                             inline_meta,
-                        );
+                        )
                     }
-                }
-                self.item_cache.clear();
+                };
+                self.item_cache
+                    .invalidate_tool_neighborhood(&self.items, idx);
                 self.refresh_context_breakdown();
             }
             UiEvent::ApprovalRequested {
@@ -2177,7 +2391,6 @@ impl AppState {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.side_panel.dragging_divider {
                     self.side_panel.set_width_from_divider_col(total_w, col);
-                    self.item_cache.clear();
                     return AppAction::None;
                 }
                 self.selection
