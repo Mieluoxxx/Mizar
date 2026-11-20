@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://mieluoxxx.github.io/Mizar/en/">Docs</a> · <a href="https://mieluoxxx.github.io/Mizar/">中文文档</a> · <a href="https://github.com/Mieluoxxx/Mizar/releases">Releases</a> · <a href="docs/plugins.md">Architecture</a> · <a href="AGENTS.md">Contributing</a>
+  <a href="https://mieluoxxx.github.io/Mizar/en/">Docs</a> · <a href="https://mieluoxxx.github.io/Mizar/">中文文档</a> · <a href="https://github.com/Mieluoxxx/Mizar/releases">Releases</a> · <a href="docs/plugins.md">Architecture</a> · <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 ---
@@ -64,7 +64,7 @@ cargo install --path crates/mizar-tui
   pnpm --dir site dev
   ```
 - **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (30 workspace crates built on `cordis`)
-- **Agent & Contributor Rules**: [`AGENTS.md`](AGENTS.md)
+- **Contributing**: [`CONTRIBUTING.md`](CONTRIBUTING.md) · **Repository Rules**: [`AGENTS.md`](AGENTS.md)
 
 ### License
 
