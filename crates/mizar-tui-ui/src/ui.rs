@@ -2147,7 +2147,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let total_tok = app
         .total_usage
         .total_tokens
-        .unwrap_or(app.total_usage.input_tokens + app.total_usage.output_tokens);
+        .unwrap_or_else(|| app.total_usage.grand_total());
     let tokens_str = format_tokens(total_tok);
     let auto_scroll = app.auto_scroll;
     let approval_mode = app.approval_mode;

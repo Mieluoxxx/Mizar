@@ -267,6 +267,27 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u64>,
 }
 
+impl TokenUsage {
+    /// 一次请求的完整 prompt 体积：未命中缓存的净输入 + 缓存读取 + 缓存写入。
+    ///
+    /// 三种协议解析时都把命中量从 `input_tokens` 里扣了出去（分别落在
+    /// `cache_read_tokens` / `cache_write_tokens`），所以直接用 `input_tokens`
+    /// 会严重低估真实 prompt 体积。
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_write_tokens.unwrap_or(0))
+    }
+
+    /// 一次请求四个分量的总和。
+    ///
+    /// 刻意不用 provider 上报的 `total_tokens`：各家口径不一致，且可以缺省；
+    /// 四项相加在口径正确的 provider 上与其 `total_tokens` 恒等，口径缺失时仍然可算。
+    pub fn grand_total(&self) -> u64 {
+        self.prompt_tokens().saturating_add(self.output_tokens)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum FinishReason {
@@ -365,4 +386,61 @@ pub struct ProviderInfo {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_tokens_folds_cache_read_and_write_back_into_input() {
+        // 归一化后的典型 Anthropic usage：input 是扣掉缓存后的净额
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            cache_read_tokens: Some(9_000),
+            cache_write_tokens: Some(2_000),
+            output_tokens: 500,
+            ..Default::default()
+        };
+        assert_eq!(usage.prompt_tokens(), 12_000);
+        assert_eq!(usage.grand_total(), 12_500);
+    }
+
+    #[test]
+    fn prompt_tokens_without_cache_equals_input() {
+        let usage = TokenUsage {
+            input_tokens: 800,
+            output_tokens: 200,
+            ..Default::default()
+        };
+        assert_eq!(usage.prompt_tokens(), 800);
+        assert_eq!(usage.grand_total(), 1_000);
+    }
+
+    #[test]
+    fn grand_total_ignores_provider_reported_total_tokens() {
+        // provider 报了个自相矛盾的 total，四项相加仍应是权威值
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cache_read_tokens: Some(300),
+            cache_write_tokens: None,
+            output_tokens: 50,
+            total_tokens: Some(9_999),
+            ..Default::default()
+        };
+        assert_eq!(usage.grand_total(), 450);
+    }
+
+    #[test]
+    fn prompt_tokens_saturates_instead_of_overflowing() {
+        let usage = TokenUsage {
+            input_tokens: u64::MAX,
+            cache_read_tokens: Some(1),
+            cache_write_tokens: Some(1),
+            output_tokens: 1,
+            ..Default::default()
+        };
+        assert_eq!(usage.prompt_tokens(), u64::MAX);
+        assert_eq!(usage.grand_total(), u64::MAX);
+    }
 }
