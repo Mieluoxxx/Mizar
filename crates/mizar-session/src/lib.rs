@@ -13,14 +13,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
-use mizar_llm::{ContentBlock, Message};
+use mizar_llm::{ContentBlock, Message, ReasoningEffort};
 use uuid::Uuid;
 
 pub use model::{
     CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
     RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionTraceEvent,
-    TraceSeverity, derive_session_title,
+    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionSelection,
+    SessionTraceEvent, TraceSeverity, derive_session_title,
 };
 pub use persistence::{
     PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionPersistence,
@@ -189,6 +189,7 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
             SessionEvent::ContextNotice { .. }
             | SessionEvent::BashExecution { .. }
             | SessionEvent::ToolResultPrune { .. }
+            | SessionEvent::Selection { .. }
             | SessionEvent::Trace { .. } => {}
         }
     }
@@ -340,6 +341,36 @@ impl Session {
     /// 便捷追加一条仅用于审计/轨迹回放的 `LogOnly` 边界事件。
     pub fn append_trace(self: &Arc<Self>, detail: SessionTraceEvent) {
         self.append(SessionEvent::Trace { detail });
+    }
+
+    /// 最新一条 `Selection` 快照（含 `LogOnly`）。
+    pub fn latest_selection(&self) -> Option<SessionSelection> {
+        let inner = self.inner.lock().unwrap();
+        inner.log.iter().rev().find_map(|e| e.event.as_selection())
+    }
+
+    /// 记录当前模型与推理强度快照。与最新一条完全相同时不写，避免每轮都追加。
+    /// 返回是否真的追加了一条。
+    pub fn record_selection(
+        self: &Arc<Self>,
+        provider: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> bool {
+        let next = SessionSelection {
+            provider,
+            model,
+            reasoning_effort,
+        };
+        if self.latest_selection().as_ref() == Some(&next) {
+            return false;
+        }
+        self.append(SessionEvent::Selection {
+            provider: next.provider,
+            model: next.model,
+            reasoning_effort: next.reasoning_effort,
+        });
+        true
     }
 
     /// 折叠较早的表面历史为一条 `Compaction` 摘要，保留最近 `keep_recent_surface` 条表面事件。
@@ -566,7 +597,9 @@ impl Session {
                         messages.push(Message::User { content });
                     }
                 }
-                SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => {}
+                SessionEvent::ToolResultPrune { .. }
+                | SessionEvent::Selection { .. }
+                | SessionEvent::Trace { .. } => {}
             }
         }
         messages
@@ -636,6 +669,20 @@ impl SessionStore {
         self.sessions.lock().unwrap().contains_key(id)
     }
 
+    /// 只读窥视某个会话最后记录的选择：不水合进内存、不触发悬挂工具调用修复（后者会写库）。
+    pub fn peek_selection(&self, session_id: &str) -> Option<SessionSelection> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(session_id).cloned() {
+            return existing.latest_selection();
+        }
+        let backend = self.ctx.session_persistence()?;
+        let loaded = backend.load_session(session_id).ok().flatten()?;
+        loaded
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.event.as_selection())
+    }
+
     /// 优先从内存返回；若内存中不存在且挂载了持久化后端，则自动从后端水合重建（包含悬挂工具调用自愈）。
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
         if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
@@ -645,6 +692,12 @@ impl SessionStore {
         let backend = self.ctx.session_persistence()?;
         match backend.load_session(id) {
             Ok(Some(mut loaded)) => {
+                if loaded.skipped_events > 0 {
+                    self.ctx.logger_named("session").warn(format!(
+                        "会话 {id} 有 {} 条事件无法解析已跳过（常见于旧版二进制读新版写入的会话），其余历史已正常载入",
+                        loaded.skipped_events
+                    ));
+                }
                 let repaired = repair_dangling_tool_calls(&mut loaded);
                 if !repaired.is_empty()
                     && let Err(err) = backend.append_events(id, &repaired)
@@ -716,6 +769,7 @@ impl SessionStore {
             LoadedSession {
                 header: new_header,
                 entries,
+                skipped_events: 0,
             }
         };
 

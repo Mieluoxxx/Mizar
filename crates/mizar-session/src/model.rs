@@ -1,6 +1,6 @@
 //! 会话事件日志的数据模型、头信息与可见性定义。
 
-use mizar_llm::{ContentBlock, ReplayEnvelope, TokenUsage};
+use mizar_llm::{ContentBlock, ReasoningEffort, ReplayEnvelope, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -204,6 +204,24 @@ pub enum SessionEvent {
     Trace {
         detail: SessionTraceEvent,
     },
+    /// 当前模型与推理强度的选择快照（`EntryVisibility::LogOnly`）：
+    /// 不进模型上下文、不占压缩预算，仅供恢复会话与跨会话沿用上次选择时读取。
+    Selection {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
+}
+
+/// 一次 `Selection` 事件的只读投影。三个字段各自可缺省，`None` 表示「当时未指定」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSelection {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl SessionEvent {
@@ -223,7 +241,9 @@ impl SessionEvent {
 
     pub fn visibility(&self) -> EntryVisibility {
         match self {
-            Self::Trace { .. } | Self::ToolResultPrune { .. } => EntryVisibility::LogOnly,
+            Self::Trace { .. } | Self::ToolResultPrune { .. } | Self::Selection { .. } => {
+                EntryVisibility::LogOnly
+            }
             Self::BashExecution {
                 exclude_from_context,
                 ..
@@ -246,6 +266,22 @@ impl SessionEvent {
         self.visibility() == EntryVisibility::Surface
     }
 
+    /// 若本事件是 `Selection` 快照，投影为 `SessionSelection`。
+    pub fn as_selection(&self) -> Option<SessionSelection> {
+        match self {
+            Self::Selection {
+                provider,
+                model,
+                reasoning_effort,
+            } => Some(SessionSelection {
+                provider: provider.clone(),
+                model: model.clone(),
+                reasoning_effort: *reasoning_effort,
+            }),
+            _ => None,
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::User { .. } => "user",
@@ -256,6 +292,7 @@ impl SessionEvent {
             Self::ToolResultPrune { .. } => "tool-result-prune",
             Self::BashExecution { .. } => "bash-execution",
             Self::Trace { detail } => detail.kind_name(),
+            Self::Selection { .. } => "selection",
         }
     }
 }
@@ -376,6 +413,9 @@ pub struct RecallSearchHit {
 pub struct LoadedSession {
     pub header: SessionHeader,
     pub entries: Vec<SessionEntry>,
+    /// 读取时因无法反序列化而跳过的条目数（例如用旧版二进制打开新版写入的会话）。
+    /// `> 0` 时调用方应告警：历史并未丢，仅本次水合并未载入这些条目。
+    pub skipped_events: usize,
 }
 
 /// 从首条用户输入提取简短单行会话标题（超过 72 字符自动截断）。

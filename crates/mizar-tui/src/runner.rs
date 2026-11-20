@@ -46,8 +46,8 @@ use mizar_trajectory::{
 };
 use mizar_tui_ui::app::{
     AppAction, AppState, ApprovalMode, LocalBashOutput, NoticeLevel, SessionReplayItem,
-    SessionViewData, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason, short_id,
-    truncate_display,
+    SessionSelection, SessionViewData, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord,
+    UiTurnEndReason, short_id, truncate_display,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{
@@ -150,6 +150,12 @@ pub struct TuiConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// 模型是否由环境变量 `MODEL` 显式指定（优先级最高，会压过会话记录）。
+    pub model_from_env: bool,
+    /// 模型是否由 `settings.json` 的 `defaultModel` 指定（优先级低于会话记录）。
+    pub model_from_settings: bool,
+    /// 强度是否由 `settings.json` 的 `reasoningEffort` 指定（优先级低于会话记录）。
+    pub reasoning_effort_from_settings: bool,
     pub approval_mode: ApprovalMode,
     pub theme_preset: Option<ThemePreset>,
     pub screen_mode: ScreenMode,
@@ -171,6 +177,9 @@ impl TuiConfig {
             provider: None,
             model: None,
             reasoning_effort: None,
+            model_from_env: false,
+            model_from_settings: false,
+            reasoning_effort_from_settings: false,
             approval_mode: ApprovalMode::Auto,
             theme_preset: None,
             screen_mode: ScreenMode::Fullscreen,
@@ -246,6 +255,111 @@ pub fn to_ui_log_record(record: &LogRecord) -> UiLogRecord {
     }
 }
 
+/// 选择解析的输入：各来源的值与「是否显式指定」标记。
+///
+/// 优先级链（高的先，逐字段独立判定）：
+/// ```text
+/// 1. 环境变量 MODEL            → 压过一切，包括会话记录
+/// 2. 会话记录（仅 resume）     → 恢复语义：会话当时的模型优先于全局配置
+/// 3. settings.json 的默认值
+/// 4. 最近一个会话的记录（仅冷启动）  → 「沿用上次」
+/// 5. 现有推导（models.json 字典序 + models[0]）
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct SelectionSources {
+    /// 环境变量是否指定了模型。
+    pub model_from_env: bool,
+    /// `settings.json` 是否写了 `defaultModel`。
+    pub model_from_settings: bool,
+    /// `settings.json` 是否写了 `reasoningEffort`。
+    pub reasoning_effort_from_settings: bool,
+    /// 启动时已解析出的默认选择（来自 `models.json` 推导或 settings）。
+    pub startup: SessionSelection,
+    /// resume 时该会话自己的记录。
+    pub session: Option<SessionSelection>,
+    /// 当前工作区最近一个会话的记录（冷启动用）。
+    pub latest_workspace: Option<SessionSelection>,
+}
+
+/// 按文档化的优先级链算出应采用的模型与思考强度。
+///
+/// 返回 `None` 表示启动值已经是最优解，调用方无需覆盖。
+/// 返回 `Some` 时三个字段各自可能为 `None` —— 表示该字段本次没有更高优先级的来源。
+pub fn resolve_selection(sources: &SelectionSources, resumed: bool) -> Option<SessionSelection> {
+    // 环境变量压过一切，直接不覆盖
+    if sources.model_from_env {
+        return None;
+    }
+
+    // resume：会话记录优先于 settings；冷启动：settings 优先于最近会话记录
+    let session = resumed.then_some(sources.session.as_ref()).flatten();
+    let latest = (!resumed)
+        .then_some(sources.latest_workspace.as_ref())
+        .flatten();
+
+    let model = session
+        .and_then(|s| s.model.clone())
+        .or_else(|| {
+            (!sources.model_from_settings)
+                .then(|| latest.and_then(|s| s.model.clone()))
+                .flatten()
+        })
+        .or_else(|| sources.startup.model.clone());
+    // provider 与 model 同源优先级，避免 provider/model 交错
+    let provider = session
+        .and_then(|s| s.provider.clone())
+        .or_else(|| {
+            (!sources.model_from_settings)
+                .then(|| latest.and_then(|s| s.provider.clone()))
+                .flatten()
+        })
+        .or_else(|| sources.startup.provider.clone());
+    let effort = session
+        .and_then(|s| s.reasoning_effort)
+        .or_else(|| {
+            (!sources.reasoning_effort_from_settings)
+                .then(|| latest.and_then(|s| s.reasoning_effort))
+                .flatten()
+        })
+        .or(sources.startup.reasoning_effort);
+
+    let resolved = SessionSelection {
+        provider,
+        model,
+        reasoning_effort: effort,
+    };
+    (resolved != sources.startup).then_some(resolved)
+}
+
+/// 把会话层的选择投影为 UI 层形态。两个 crate 互不依赖（`mizar-tui-ui` 禁止依赖 `mizar-session`），
+/// 所以转换只能放在宿主层。
+fn to_ui_selection(sel: mizar_session::SessionSelection) -> SessionSelection {
+    SessionSelection {
+        provider: sel.provider,
+        model: sel.model,
+        reasoning_effort: sel.reasoning_effort,
+    }
+}
+
+/// 取当前工作区最近一个会话记录的选择。
+///
+/// 只在 `settings.json` 未指定模型时使用，且任务本就是「跨会话沿用上次」而不是「跨工作区」，
+/// 所以按 `cwd` 过滤（`idx_sessions_cwd_updated` 索引直出）。
+pub fn latest_workspace_selection(
+    sessions: &mizar_session::SessionStore,
+    workspace: &Path,
+) -> Option<mizar_session::SessionSelection> {
+    let latest = sessions
+        .list_headers(&SessionListQuery {
+            cwd: Some(workspace.display().to_string()),
+            limit: Some(1),
+        })
+        .ok()?
+        .into_iter()
+        .next()?;
+    sessions.peek_selection(&latest.id)
+}
+
 /// 将持久化会话日志投影为纯 UI 可重放的 `SessionViewData`（含 `!` 与 `!!` 本地命令记录）。
 pub fn project_session_view(
     session: &Session,
@@ -292,7 +406,9 @@ pub fn project_session_view(
                 cancelled,
                 exclude_from_context,
             }),
-            SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => None,
+            SessionEvent::ToolResultPrune { .. }
+            | SessionEvent::Selection { .. }
+            | SessionEvent::Trace { .. } => None,
         })
         .collect();
     SessionViewData {
@@ -300,6 +416,11 @@ pub fn project_session_view(
         session_title: header.title,
         items,
         finish_notice: finish_notice.into(),
+        selection: session.latest_selection().map(|sel| SessionSelection {
+            provider: sel.provider,
+            model: sel.model,
+            reasoning_effort: sel.reasoning_effort,
+        }),
     }
 }
 
@@ -440,7 +561,9 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
                     can_fork: true,
                 })
             }
-            SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => None,
+            SessionEvent::ToolResultPrune { .. }
+            | SessionEvent::Selection { .. }
+            | SessionEvent::Trace { .. } => None,
         })
         .collect()
 }
@@ -773,6 +896,44 @@ pub async fn run_tui_with_summary(
         config.reasoning_effort,
     );
     app.session_title = active_session.header().title;
+
+    let sources = SelectionSources {
+        model_from_env: config.model_from_env,
+        model_from_settings: config.model_from_settings,
+        reasoning_effort_from_settings: config.reasoning_effort_from_settings,
+        startup: SessionSelection {
+            provider: app.provider.clone(),
+            model: app.model.clone(),
+            reasoning_effort: app.reasoning_effort,
+        },
+        session: resumed
+            .then(|| active_session.latest_selection())
+            .flatten()
+            .map(to_ui_selection),
+        latest_workspace: if resumed {
+            None
+        } else {
+            latest_workspace_selection(&sessions, &config.workspace).map(to_ui_selection)
+        },
+    };
+    if let Some(resolved) = resolve_selection(&sources, resumed) {
+        app.provider = resolved.provider;
+        app.model = resolved.model;
+        app.reasoning_effort = resolved.reasoning_effort;
+        app.push_notice(
+            NoticeLevel::Info,
+            format!(
+                "已沿用{}的模型与思考强度：{}",
+                if resumed {
+                    "本会话记录"
+                } else {
+                    "上次会话"
+                },
+                app.active_model_label()
+            ),
+        );
+    }
+
     if resumed {
         app.restore_session_view(project_resume_view(&active_session));
     }
@@ -1171,6 +1332,15 @@ fn spawn_agent_run(
     let cancel = CancellationToken::new();
     *active_cancel = Some(cancel.clone());
     app.is_busy = true;
+
+    // 每次真正发请求前快照当前选择：`/model`、Ctrl+L 选择器、`/effort`、Tab、`/settings`
+    // 五条路最终都汇到这里，无需在 UI 层（纯前端、无 Session 句柄）重复埋点。
+    // `record_selection` 内部去重，与最新一条相同时不写。
+    active_session.record_selection(
+        app.provider.clone(),
+        app.model.clone(),
+        app.reasoning_effort,
+    );
 
     let session: Arc<Session> = Arc::clone(active_session);
     let run_opts = RunOptions {
@@ -2550,7 +2720,157 @@ mod tests {
     use mizar_llm::{ModelInfo, ProviderInfo};
     use mizar_tui_ui::app::{AppAction, AppState, ChatItem, UiEvent};
 
-    use super::{TuiExitSummary, format_resume_command, process_ui_event, resolve_model_switch};
+    use mizar_tui_ui::app::SessionSelection;
+
+    use super::{
+        SelectionSources, TuiExitSummary, format_resume_command, process_ui_event,
+        resolve_model_switch, resolve_selection,
+    };
+
+    fn sel(provider: &str, model: &str, effort: mizar_llm::ReasoningEffort) -> SessionSelection {
+        SessionSelection {
+            provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
+            reasoning_effort: Some(effort),
+        }
+    }
+
+    /// 环境变量 MODEL 压过一切来源，包括 resume 的会话记录。
+    #[test]
+    fn resolve_selection_env_wins_over_everything() {
+        let sources = SelectionSources {
+            model_from_env: true,
+            model_from_settings: true,
+            reasoning_effort_from_settings: true,
+            startup: sel("magpie", "from-env", mizar_llm::ReasoningEffort::High),
+            session: Some(sel(
+                "magpie",
+                "from-session",
+                mizar_llm::ReasoningEffort::Max,
+            )),
+            latest_workspace: Some(sel(
+                "magpie",
+                "from-latest",
+                mizar_llm::ReasoningEffort::Low,
+            )),
+        };
+        assert_eq!(resolve_selection(&sources, true), None);
+        assert_eq!(resolve_selection(&sources, false), None);
+    }
+
+    /// resume 时会话记录压过 settings（方案甲）。
+    #[test]
+    fn resolve_selection_resume_prefers_session_over_settings() {
+        let sources = SelectionSources {
+            model_from_settings: true,
+            reasoning_effort_from_settings: true,
+            startup: sel("magpie", "settings-model", mizar_llm::ReasoningEffort::Low),
+            session: Some(sel(
+                "isok",
+                "session-model",
+                mizar_llm::ReasoningEffort::Max,
+            )),
+            latest_workspace: Some(sel(
+                "magpie",
+                "latest-model",
+                mizar_llm::ReasoningEffort::Medium,
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_selection(&sources, true),
+            Some(sel(
+                "isok",
+                "session-model",
+                mizar_llm::ReasoningEffort::Max
+            ))
+        );
+    }
+
+    /// 冷启动时 settings 优先于最近会话记录（settings 是企业级配置，会话只是遗留状态）。
+    #[test]
+    fn resolve_selection_cold_start_prefers_settings_over_latest() {
+        let sources = SelectionSources {
+            model_from_settings: true,
+            reasoning_effort_from_settings: true,
+            startup: sel("magpie", "settings-model", mizar_llm::ReasoningEffort::Low),
+            session: None,
+            latest_workspace: Some(sel("isok", "latest-model", mizar_llm::ReasoningEffort::Max)),
+            ..Default::default()
+        };
+        assert_eq!(resolve_selection(&sources, false), None);
+    }
+
+    /// 冷启动且 settings 没写模型时，沿用最近会话的记录。
+    #[test]
+    fn resolve_selection_cold_start_carries_over_latest_when_settings_silent() {
+        let sources = SelectionSources {
+            startup: sel(
+                "magpie",
+                "derived-models[0]",
+                mizar_llm::ReasoningEffort::Medium,
+            ),
+            latest_workspace: Some(sel("isok", "last-used", mizar_llm::ReasoningEffort::Max)),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_selection(&sources, false),
+            Some(sel("isok", "last-used", mizar_llm::ReasoningEffort::Max))
+        );
+    }
+
+    /// 三层都没有更高优先级来源时返回 None，说明启动值已是最优。
+    #[test]
+    fn resolve_selection_returns_none_when_startup_already_wins() {
+        let startup = sel("magpie", "derived", mizar_llm::ReasoningEffort::Medium);
+        let sources = SelectionSources {
+            startup: startup.clone(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_selection(&sources, false), None);
+        assert_eq!(resolve_selection(&sources, true), None);
+
+        // 即便有会话记录，只要与启动值一致也不应产生覆盖
+        let same = SelectionSources {
+            startup: startup.clone(),
+            session: Some(startup.clone()),
+            latest_workspace: Some(startup),
+            ..Default::default()
+        };
+        assert_eq!(resolve_selection(&same, true), None);
+        assert_eq!(resolve_selection(&same, false), None);
+    }
+
+    /// 强度被 settings 显式钉住时，冷启动不被最近会话覆盖；resume 仍可覆盖。
+    #[test]
+    fn resolve_selection_effort_pinned_by_settings_except_on_resume() {
+        let sources = SelectionSources {
+            reasoning_effort_from_settings: true,
+            startup: sel("magpie", "settings-model", mizar_llm::ReasoningEffort::Low),
+            latest_workspace: Some(SessionSelection {
+                provider: None,
+                model: None,
+                reasoning_effort: Some(mizar_llm::ReasoningEffort::Max),
+            }),
+            ..Default::default()
+        };
+        // 冷启动：模型来自 settings 且与启动一致，强度被钉住 → 无变化
+        assert_eq!(resolve_selection(&sources, false), None);
+
+        // resume：会话里有强度记录时会覆盖 settings
+        let resumed = SelectionSources {
+            session: Some(SessionSelection {
+                provider: None,
+                model: None,
+                reasoning_effort: Some(mizar_llm::ReasoningEffort::Max),
+            }),
+            ..sources
+        };
+        assert_eq!(
+            resolve_selection(&resumed, true).map(|s| s.reasoning_effort),
+            Some(Some(mizar_llm::ReasoningEffort::Max))
+        );
+    }
 
     #[test]
     fn resolve_model_switch_handles_slashes_in_model_ids() {

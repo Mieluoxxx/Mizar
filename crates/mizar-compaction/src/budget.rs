@@ -155,7 +155,9 @@ pub fn estimate_entry_tokens(entry: &SessionEntry, pruned_replacement: Option<&s
                 base + estimate_text_tokens(command) + estimate_text_tokens(output)
             }
         }
-        SessionEvent::ToolResultPrune { .. } | SessionEvent::Trace { .. } => 0,
+        SessionEvent::ToolResultPrune { .. }
+        | SessionEvent::Selection { .. }
+        | SessionEvent::Trace { .. } => 0,
     }
 }
 

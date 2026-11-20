@@ -236,6 +236,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tui_cfg = TuiConfig::new(workspace);
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
+    // 记录强度来源：settings.json 显式指定时才算「配置的默认」，否则留给会话记录覆盖
+    tui_cfg.reasoning_effort_from_settings = loaded_cfg.settings.reasoning_effort.is_some();
+    // 模型来源：环境变量 MODEL 压过一切；settings.json 的 defaultModel 次之；
+    // 两者都没有时 `model` 仍可能是 `models.json` 推导出来的，那不算显式指定。
+    tui_cfg.model_from_env = env_non_empty("MODEL").is_some();
+    tui_cfg.model_from_settings = loaded_cfg.settings.default_model.is_some();
     if let Some(ui) = &loaded_cfg.settings.ui {
         if let Some(ref theme_name) = ui.theme {
             tui_cfg.theme_preset = mizar_tui_ui::theme::ThemePreset::parse(theme_name);

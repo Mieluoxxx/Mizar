@@ -255,6 +255,7 @@ pub fn register_mention_hook(
                                 | SessionEvent::Compaction { .. }
                                 | SessionEvent::ToolResultPrune { .. }
                                 | SessionEvent::BashExecution { .. }
+                                | SessionEvent::Selection { .. }
                                 | SessionEvent::Trace { .. } => break,
                             }
                         }

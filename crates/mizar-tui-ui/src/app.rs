@@ -236,8 +236,18 @@ pub struct SessionViewData {
     pub session_title: Option<String>,
     pub items: Vec<SessionReplayItem>,
     pub finish_notice: String,
+    /// 该会话最后记录的模型 / 推理强度快照；`None` 表示日志里没有（旧会话）。
+    /// 仅作数据携带——是否采用、如何叠加进优先级链由宿主层决定，本层不参与决策。
+    pub selection: Option<SessionSelection>,
 }
 
+/// 会话内记录的模型与推理强度选择（`mizar-tui-ui` 侧的纯数据形态）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSelection {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
 /// 由后端异步事件与终端外部状态投递给 UI 主循环的消息。
 #[derive(Debug, Clone)]
 pub enum UiEvent {
