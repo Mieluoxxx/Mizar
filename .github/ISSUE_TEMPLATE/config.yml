@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Mizar documentation
+    url: https://mieluoxxx.github.io/Mizar/en/
+    about: Installation, usage, configuration, and developer guides.
+  - name: Mizar 中文文档
+    url: https://mieluoxxx.github.io/Mizar/
+    about: 安装、使用、配置与开发指南。

@@ -1,0 +1,53 @@
+name: Bug report
+description: Report something in Mizar that does not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use a title that describes what you observed, not the suspected cause. 中文报告也欢迎。
+        This issue is public. Remove API keys, private URLs, and personal data. Do not attach `models.json` or `sessions.sqlite`.
+  - type: input
+    id: version
+    attributes:
+      label: Mizar version
+      description: Paste the output of `mizar --version`. For a source build, include the commit SHA if known.
+      placeholder: mizar 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: macOS 15.6 / arm64, or Ubuntu 24.04 / x86_64
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest set of commands, inputs, or settings that triggers the bug.
+      placeholder: |
+        1. Run `mizar ...`.
+        2. …
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened? Include the exact error message if available.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context or logs
+      description: If relevant, include terminal and viewport mode (Fullscreen or `--inline`), provider/model, or a short redacted log excerpt.
