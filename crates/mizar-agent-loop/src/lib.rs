@@ -14,7 +14,7 @@ use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmContextExt, LlmError,
     LlmErrorCode, Message, ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
 };
-use mizar_session::{Session, SessionEvent, SessionTraceEvent};
+use mizar_session::{Session, SessionEvent, SessionTraceEvent, TraceSeverity};
 use mizar_system_prompt::SystemPromptContextExt;
 use mizar_tools::{
     ToolExecution, ToolExecutionMode, ToolResult, ToolRuntime, ToolUpdate, ToolUpdateCallback,
@@ -58,6 +58,7 @@ pub enum AgentStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnEndReason {
     Completed,
+    Truncated,
     MaxSteps,
     Cancelled,
     Error { message: String },
@@ -67,6 +68,7 @@ impl TurnEndReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::Truncated => "truncated",
             Self::MaxSteps => "max_steps",
             Self::Cancelled => "cancelled",
             Self::Error { .. } => "error",
@@ -476,14 +478,14 @@ impl AgentLoop {
         let mut consecutive_short_cutoffs = 0usize;
         loop {
             step += 1;
+            if cancel.is_cancelled() {
+                turn_guard.set_reason(TurnEndReason::Cancelled);
+                return Err(AgentError::Llm(LlmError::cancelled()));
+            }
             if let Some(limit) = max_steps
                 && step > limit
             {
                 break;
-            }
-            if cancel.is_cancelled() {
-                turn_guard.set_reason(TurnEndReason::Cancelled);
-                return Err(AgentError::Llm(LlmError::cancelled()));
             }
             let _ = self
                 .ctx
@@ -596,14 +598,19 @@ impl AgentLoop {
                             continue;
                         }
                     }
-                    let msg = err.to_string();
-                    step_guard.finish(
-                        StepOutcome::Error {
-                            message: msg.clone(),
-                        },
-                        None,
-                    );
-                    turn_guard.set_reason(TurnEndReason::Error { message: msg });
+                    if err.code == LlmErrorCode::Cancelled {
+                        step_guard.finish(StepOutcome::Cancelled, None);
+                        turn_guard.set_reason(TurnEndReason::Cancelled);
+                    } else {
+                        let msg = err.to_string();
+                        step_guard.finish(
+                            StepOutcome::Error {
+                                message: msg.clone(),
+                            },
+                            None,
+                        );
+                        turn_guard.set_reason(TurnEndReason::Error { message: msg });
+                    }
                     return Err(AgentError::Llm(err));
                 }
             };
@@ -891,9 +898,10 @@ impl AgentLoop {
                 usage,
             });
 
+            let is_truncated = matches!(finish_reason, FinishReason::MaxTokens);
             let step_outcome = if !calls.is_empty() {
                 StepOutcome::ToolCalls
-            } else if matches!(finish_reason, FinishReason::MaxTokens) {
+            } else if is_truncated {
                 StepOutcome::MaxTokens
             } else {
                 StepOutcome::Completed
@@ -902,7 +910,12 @@ impl AgentLoop {
             drop(step_guard);
 
             if calls.is_empty() {
-                turn_guard.set_reason(TurnEndReason::Completed);
+                let reason = if is_truncated {
+                    TurnEndReason::Truncated
+                } else {
+                    TurnEndReason::Completed
+                };
+                turn_guard.set_reason(reason);
                 return Ok(text);
             }
 
@@ -1026,7 +1039,11 @@ impl AgentLoop {
             "（已达到 max_steps={} 上限并停止，当前进度已保留，发送「继续」即可接着执行）",
             max_steps.unwrap_or(step.saturating_sub(1))
         );
-        session.append(SessionEvent::assistant_text(msg.clone()));
+        session.append_trace(SessionTraceEvent::TurnNotice {
+            turn,
+            severity: TraceSeverity::Warn,
+            text: msg.clone(),
+        });
         Ok(msg)
     }
 }
@@ -1426,6 +1443,116 @@ mod tests {
         assert_eq!(
             end_reasons.lock().unwrap().last(),
             Some(&TurnEndReason::MaxSteps)
+        );
+        // 步数上限提示不得写入表面日志（session.log()）或污染模型上下文
+        assert!(s2.log().iter().all(|e| match &e.event {
+            SessionEvent::Assistant { blocks, .. } => {
+                !blocks
+                    .iter()
+                    .any(|b| b.as_text().is_some_and(|t| t.contains("max_steps=2")))
+            }
+            SessionEvent::ContextNotice { text, .. } => !text.contains("max_steps=2"),
+            _ => true,
+        }));
+        assert!(
+            s2.derive_messages()
+                .iter()
+                .all(|m| !format!("{m:?}").contains("max_steps=2"))
+        );
+        assert!(s2.all_entries().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Trace {
+                detail: SessionTraceEvent::TurnNotice { text, .. }
+            } if text.contains("max_steps=2")
+        )));
+        assert!(s2.all_entries().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Trace {
+                detail: SessionTraceEvent::TurnEnd { reason, .. }
+            } if reason == "max_steps"
+        )));
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn max_tokens_truncation_sets_truncated_turn_end_reason() {
+        struct TruncatedAdapter(AtomicUsize);
+        impl LlmAdapter for TruncatedAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let idx = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if idx == 0 {
+                        let _ =
+                            tx.unbounded_send(Ok(StreamChunk::text("这是一段被截断的半截回答")));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::ReasoningDelta {
+                            index: 0,
+                            text: "思考耗尽了输出预算".into(),
+                        }));
+                    }
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::MaxTokens,
+                        replay: None,
+                    }));
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(TruncatedAdapter(AtomicUsize::new(0))).await;
+        let step_outcomes = Arc::new(Mutex::new(Vec::<StepOutcome>::new()));
+        let end_reasons = Arc::new(Mutex::new(Vec::<TurnEndReason>::new()));
+
+        let so_sub = Arc::clone(&step_outcomes);
+        app.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
+            so_sub.lock().unwrap().push(ev.outcome.clone());
+        })
+        .unwrap();
+
+        let tr_sub = Arc::clone(&end_reasons);
+        app.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
+            tr_sub.lock().unwrap().push(ev.reason.clone());
+        })
+        .unwrap();
+
+        // 1. 文本在 FinishReason::MaxTokens 下截断：步级为 MaxTokens，轮级必须为 Truncated 而非 Completed
+        let s1 = app.sessions().unwrap().create(None);
+        let reply1 = app
+            .agent_loop()
+            .unwrap()
+            .run(Arc::clone(&s1), "请写长文", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(reply1, "这是一段被截断的半截回答");
+        assert_eq!(
+            step_outcomes.lock().unwrap().as_slice(),
+            &[StepOutcome::MaxTokens]
+        );
+        assert_eq!(
+            end_reasons.lock().unwrap().as_slice(),
+            &[TurnEndReason::Truncated]
+        );
+        assert!(s1.all_entries().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Trace {
+                detail: SessionTraceEvent::TurnEnd { reason, .. }
+            } if reason == "truncated"
+        )));
+
+        // 2. 仅思考耗尽预算、无正文的 MaxTokens 截断：同样不得记成 Completed
+        let s2 = app.sessions().unwrap().create(None);
+        let reply2 = app
+            .agent_loop()
+            .unwrap()
+            .run(Arc::clone(&s2), "深度推理", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(reply2, "");
+        assert_eq!(
+            end_reasons.lock().unwrap().last(),
+            Some(&TurnEndReason::Truncated)
         );
 
         app.fiber().dispose().await;

@@ -91,6 +91,12 @@ pub enum SessionTraceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_after: Option<u64>,
     },
+    /// 仅用于日志留存与 UI 回放的轮次级提示（`LogOnly`，不进入 `session.log()` 与模型上下文）。
+    TurnNotice {
+        turn: u64,
+        severity: TraceSeverity,
+        text: String,
+    },
 }
 
 impl SessionTraceEvent {
@@ -106,6 +112,7 @@ impl SessionTraceEvent {
             Self::Anomaly { .. } => "anomaly",
             Self::CompactionStart { .. } => "compaction-start",
             Self::CompactionEnd { .. } => "compaction-end",
+            Self::TurnNotice { .. } => "turn-notice",
         }
     }
 }

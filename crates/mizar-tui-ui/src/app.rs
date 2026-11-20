@@ -180,9 +180,30 @@ pub enum UiAgentStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiTurnEndReason {
     Completed,
+    Truncated,
     MaxSteps,
     Cancelled,
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiStepOutcome {
+    Completed,
+    ToolCalls,
+    MaxTokens,
+    Cancelled,
+    Error { message: String },
+}
+
+/// 将 UI 轮次终态映射为 OSC 7501 终端程序状态与说明，保证非正常收敛不误标为 `Done`。
+pub fn turn_end_program_status(reason: &UiTurnEndReason) -> (ProgramStatusState, &'static str) {
+    match reason {
+        UiTurnEndReason::Completed => (ProgramStatusState::Done, "Turn completed"),
+        UiTurnEndReason::Truncated => (ProgramStatusState::Idle, "Output truncated"),
+        UiTurnEndReason::MaxSteps => (ProgramStatusState::Idle, "Max steps reached"),
+        UiTurnEndReason::Cancelled => (ProgramStatusState::Idle, "Cancelled"),
+        UiTurnEndReason::Error { .. } => (ProgramStatusState::Error, "Request failed"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +229,10 @@ pub enum SessionReplayItem {
     },
     ContextNotice {
         source: String,
+        text: String,
+    },
+    Notice {
+        level: NoticeLevel,
         text: String,
     },
     Compaction {
@@ -263,7 +288,9 @@ pub enum UiEvent {
         ts_ms: u128,
     },
     StepEnd {
+        step: usize,
         ts_ms: u128,
+        outcome: UiStepOutcome,
         usage: Option<TokenUsage>,
     },
     FirstToken {
@@ -483,6 +510,12 @@ pub struct AppState {
     pub terminal_focused: bool,
     last_ctrl_c_at: Option<Instant>,
     pub pending_exit_status: Option<(ProgramStatusState, Option<String>)>,
+    /// 最近一次回合结束原因，供状态栏与排队消息调度区分完成/截断/步数上限/中断/失败。
+    pub last_turn_end_reason: Option<UiTurnEndReason>,
+    /// 最近一次 step 结束编号与结果，用于截断提示定位具体步骤。
+    pub last_step_outcome: Option<(usize, UiStepOutcome)>,
+    /// 最近一次上报的终端 ProgramStatus，用于测试直接断言非 Completed 终态不产生 Done。
+    pub last_program_status: Option<(ProgramStatusState, Option<String>)>,
 }
 
 impl AppState {
@@ -570,7 +603,21 @@ impl AppState {
             terminal_focused: true,
             last_ctrl_c_at: None,
             pending_exit_status: None,
+            last_turn_end_reason: None,
+            last_step_outcome: None,
+            last_program_status: None,
         }
+    }
+
+    /// 记录并向终端发送 ProgramStatus（供无头测试与状态栏统一观察）。
+    fn record_program_status(
+        &mut self,
+        state: ProgramStatusState,
+        kind: Option<&str>,
+        message: Option<&str>,
+    ) {
+        self.last_program_status = Some((state, message.map(str::to_string)));
+        emit_program_status(state, kind, message);
     }
 
     pub fn apply_terminal_colors(&mut self, probed: TerminalColors) {
@@ -881,21 +928,47 @@ impl AppState {
                 self.is_busy = true;
                 self.streaming_assistant_open = false;
                 self.auto_scroll = true;
+                self.last_turn_end_reason = None;
+                self.last_step_outcome = None;
                 self.tps.on_turn_start();
                 emit_terminal_progress(true);
-                emit_program_status(ProgramStatusState::Working, None, Some("Generating"));
+                self.record_program_status(ProgramStatusState::Working, None, Some("Generating"));
             }
             UiEvent::TurnEnd { reason } => {
                 self.is_busy = false;
                 self.streaming_assistant_open = false;
                 self.reveal.snap_all();
                 emit_terminal_progress(false);
-                if matches!(reason, UiTurnEndReason::Cancelled) {
-                    self.push_notice(NoticeLevel::Info, "已中断本轮生成");
-                    emit_program_status(ProgramStatusState::Idle, None, Some("Cancelled"));
-                } else {
-                    emit_program_status(ProgramStatusState::Done, None, Some("Turn completed"));
+                let (program_state, program_msg) = turn_end_program_status(&reason);
+                self.record_program_status(program_state, None, Some(program_msg));
+                match &reason {
+                    UiTurnEndReason::Completed => {}
+                    UiTurnEndReason::Truncated => {
+                        if let Some((step, UiStepOutcome::MaxTokens)) = self.last_step_outcome
+                            && step > 0
+                        {
+                            self.push_notice(
+                                NoticeLevel::Warn,
+                                format!(
+                                    "第 {step} 步输出因达到 max_tokens 上限被截断，回复可能不完整"
+                                ),
+                            );
+                        } else {
+                            self.push_notice(
+                                NoticeLevel::Warn,
+                                "输出因达到 max_tokens 上限被截断，回复可能不完整",
+                            );
+                        }
+                    }
+                    UiTurnEndReason::MaxSteps => {
+                        self.push_notice(NoticeLevel::Warn, "已达到最大执行步数上限，本轮提前结束");
+                    }
+                    UiTurnEndReason::Cancelled => {
+                        self.push_notice(NoticeLevel::Info, "已中断本轮生成");
+                    }
+                    UiTurnEndReason::Error { .. } => {}
                 }
+                self.last_turn_end_reason = Some(reason);
                 if let Some(tps) = self.tps.on_turn_end() {
                     self.tps_history.push(tps);
                     if self.tps_history.len() > 32 {
@@ -908,7 +981,13 @@ impl AppState {
                 self.last_step_start_ms = Some(ts_ms);
                 self.tps.on_step_start();
             }
-            UiEvent::StepEnd { ts_ms, usage } => {
+            UiEvent::StepEnd {
+                step,
+                ts_ms,
+                outcome,
+                usage,
+            } => {
+                self.last_step_outcome = Some((step, outcome));
                 self.tps.on_step_end(ts_ms, usage);
             }
             UiEvent::FirstToken { ts_ms } => {
@@ -1114,7 +1193,14 @@ impl AppState {
                     && !err.contains("request aborted")
                 {
                     self.push_notice(NoticeLevel::Error, format!("请求失败：{err}"));
-                    emit_program_status(ProgramStatusState::Error, None, Some("Request failed"));
+                    self.record_program_status(
+                        ProgramStatusState::Error,
+                        None,
+                        Some("Request failed"),
+                    );
+                    if self.last_turn_end_reason.is_none() {
+                        self.last_turn_end_reason = Some(UiTurnEndReason::Error { message: err });
+                    }
                 }
                 self.refresh_context_breakdown();
             }
@@ -1167,7 +1253,7 @@ impl AppState {
                 responder,
             } => {
                 if let Some(tx) = responder.lock().unwrap().take() {
-                    emit_program_status(
+                    self.record_program_status(
                         ProgramStatusState::Blocked,
                         Some("permission"),
                         Some(&format!("Approve {tool_name}")),
@@ -1505,7 +1591,7 @@ impl AppState {
                     if let Some(tx) = ap.responder.take() {
                         let _ = tx.send(decision);
                     }
-                    emit_program_status(
+                    self.record_program_status(
                         if self.is_busy {
                             ProgramStatusState::Working
                         } else {
@@ -2124,6 +2210,9 @@ impl AppState {
         self.auto_scroll = true;
         self.streaming_assistant_open = false;
         self.dismissed_mention = None;
+        self.last_turn_end_reason = None;
+        self.last_step_outcome = None;
+        self.last_program_status = None;
         self.refresh_context_breakdown();
         self.push_notice(
             NoticeLevel::Info,
@@ -2147,6 +2236,9 @@ impl AppState {
                         level: NoticeLevel::Info,
                         text: summarize_context_notice_for_replay(&source, &text),
                     });
+                }
+                SessionReplayItem::Notice { level, text } => {
+                    self.items.push(ChatItem::Notice { level, text });
                 }
                 SessionReplayItem::Compaction {
                     summary,
@@ -3633,7 +3725,9 @@ mod tests {
             ts_ms: 500,
         });
         app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
             ts_ms: 1_000,
+            outcome: UiStepOutcome::ToolCalls,
             usage: Some(TokenUsage {
                 output_tokens: 100,
                 ..TokenUsage::default()
@@ -3649,7 +3743,9 @@ mod tests {
             ts_ms: 52_500,
         });
         app.apply_ui_event(UiEvent::StepEnd {
+            step: 2,
             ts_ms: 55_000,
+            outcome: UiStepOutcome::Completed,
             usage: Some(TokenUsage {
                 output_tokens: 300,
                 ..TokenUsage::default()
@@ -3678,7 +3774,9 @@ mod tests {
             ts_ms: 1_000,
         });
         app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
             ts_ms: 2_000,
+            outcome: UiStepOutcome::Completed,
             usage: None,
         });
         let rate = app.tps.rate().expect("CJK 输出必须有读数");
@@ -3714,7 +3812,9 @@ mod tests {
         );
 
         app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
             ts_ms: 1_600,
+            outcome: UiStepOutcome::Completed,
             usage: Some(TokenUsage {
                 output_tokens: 800,
                 ..TokenUsage::default()
@@ -3736,7 +3836,9 @@ mod tests {
             ts_ms: 600,
         });
         app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
             ts_ms: 2_000,
+            outcome: UiStepOutcome::Completed,
             usage: Some(TokenUsage {
                 output_tokens: 100,
                 ..TokenUsage::default()
@@ -3751,7 +3853,9 @@ mod tests {
         app.apply_ui_event(UiEvent::TurnStart { turn: 2 });
         app.apply_ui_event(UiEvent::StepStart { ts_ms: 10_000 });
         app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
             ts_ms: 10_100,
+            outcome: UiStepOutcome::Cancelled,
             usage: None,
         });
         app.apply_ui_event(UiEvent::TurnEnd {
@@ -5001,5 +5105,167 @@ mod tests {
                 images: vec![img],
             }
         );
+    }
+
+    #[test]
+    fn turn_end_reasons_distinguish_program_status_notices_and_replay() {
+        let mut app = queued_app(&[]);
+
+        // 1. Completed -> ProgramStatus::Done，不追加警告 notice
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 10 });
+        app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
+            ts_ms: 100,
+            outcome: UiStepOutcome::Completed,
+            usage: None,
+        });
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Completed,
+        });
+        assert_eq!(
+            app.last_program_status,
+            Some((ProgramStatusState::Done, Some("Turn completed".to_string())))
+        );
+        assert_eq!(app.last_turn_end_reason, Some(UiTurnEndReason::Completed));
+        assert!(
+            !app.items
+                .iter()
+                .any(|item| matches!(item, ChatItem::Notice { .. })),
+            "正常 Completed 不应写入 Notice"
+        );
+
+        // 2. Truncated -> 绝不产生 Done，必须给出定位到 step 的 Warn notice
+        app.apply_ui_event(UiEvent::TurnStart { turn: 2 });
+        assert_eq!(app.last_turn_end_reason, None);
+        assert_eq!(app.last_step_outcome, None);
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 200 });
+        app.apply_ui_event(UiEvent::StepEnd {
+            step: 2,
+            ts_ms: 300,
+            outcome: UiStepOutcome::MaxTokens,
+            usage: None,
+        });
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Truncated,
+        });
+        assert_eq!(app.last_turn_end_reason, Some(UiTurnEndReason::Truncated));
+        assert_eq!(app.last_step_outcome, Some((2, UiStepOutcome::MaxTokens)));
+        assert_ne!(
+            app.last_program_status.as_ref().map(|(s, _)| *s),
+            Some(ProgramStatusState::Done)
+        );
+        assert_eq!(
+            app.last_program_status,
+            Some((
+                ProgramStatusState::Idle,
+                Some("Output truncated".to_string())
+            ))
+        );
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            }) if text.contains("第 2 步") && text.contains("max_tokens")
+        ));
+
+        // 3. MaxSteps -> 绝不产生 Done，给出步数上限 Warn notice
+        app.apply_ui_event(UiEvent::TurnStart { turn: 3 });
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 400 });
+        app.apply_ui_event(UiEvent::StepEnd {
+            step: 3,
+            ts_ms: 500,
+            outcome: UiStepOutcome::ToolCalls,
+            usage: None,
+        });
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::MaxSteps,
+        });
+        assert_eq!(app.last_turn_end_reason, Some(UiTurnEndReason::MaxSteps));
+        assert_ne!(
+            app.last_program_status.as_ref().map(|(s, _)| *s),
+            Some(ProgramStatusState::Done)
+        );
+        assert_eq!(
+            app.last_program_status,
+            Some((
+                ProgramStatusState::Idle,
+                Some("Max steps reached".to_string())
+            ))
+        );
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            }) if text.contains("步数上限")
+        ));
+
+        // 4. Error -> TurnEnd 不重复写入 Notice，由 RunFinished(Err) 统一提示一次
+        let before_err_notices = app
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    ChatItem::Notice {
+                        level: NoticeLevel::Error,
+                        ..
+                    }
+                )
+            })
+            .count();
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Error {
+                message: "upstream 500".into(),
+            },
+        });
+        assert_eq!(
+            app.last_program_status,
+            Some((
+                ProgramStatusState::Error,
+                Some("Request failed".to_string())
+            ))
+        );
+        app.apply_ui_event(UiEvent::RunFinished(Err("upstream 500".into())));
+        let after_err_notices = app
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    ChatItem::Notice {
+                        level: NoticeLevel::Error,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(after_err_notices, before_err_notices + 1);
+
+        // 5. reset_for_new_session 清空终态字段，restore_session_view 支持 SessionReplayItem::Notice
+        app.reset_for_new_session("sess-next", None);
+        assert_eq!(app.last_turn_end_reason, None);
+        assert_eq!(app.last_step_outcome, None);
+        assert_eq!(app.last_program_status, None);
+
+        app.restore_session_view(SessionViewData {
+            session_id: "sess-replay".into(),
+            session_title: None,
+            items: vec![SessionReplayItem::Notice {
+                level: NoticeLevel::Warn,
+                text: "Reached max steps (max_steps=2)".into(),
+            }],
+            finish_notice: "已恢复".into(),
+            selection: None,
+        });
+        assert!(app.items.iter().any(|item| matches!(
+            item,
+            ChatItem::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            } if text == "Reached max steps (max_steps=2)"
+        )));
     }
 }

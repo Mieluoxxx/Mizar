@@ -21,7 +21,8 @@ pub mod ui;
 pub use app::{
     AppAction, AppState, ApprovalMode, BashInputMode, ChatItem, LaunchpadQuickAction,
     LocalBashOutput, NoticeLevel, QueuedPrompt, SessionReplayItem, SessionSelection,
-    SessionViewData, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason,
+    SessionViewData, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiStepOutcome,
+    UiTurnEndReason, turn_end_program_status,
 };
 pub use emphasis::EmphasisConfig;
 pub use terminal::ScreenMode;
