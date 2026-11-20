@@ -23,7 +23,7 @@ const SNIPPET_MAX_CHARS: usize = 240;
 /// 从 `SessionEntry` 提取参与情景回溯索引的纯文本（跳过 `thinking`、`Trace` 与合成通知噪音）。
 pub fn extract_indexable_text(event: &SessionEvent) -> Option<String> {
     let raw = match event {
-        SessionEvent::User { text } => text.clone(),
+        SessionEvent::User { text, .. } => text.clone(),
         SessionEvent::Assistant { blocks, .. } => {
             let mut parts = Vec::new();
             for block in blocks {

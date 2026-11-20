@@ -87,7 +87,7 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
                 .iter()
                 .map(|m| match m {
                     Message::System { content } => format!("SYS:{content}"),
-                    Message::User { content } => format!("USR:{content}"),
+                    Message::User { content, .. } => format!("USR:{content}"),
                     Message::Assistant { .. } => "ASST".to_string(),
                     Message::Tool { content, .. } => format!("TOOL:{content}"),
                 })

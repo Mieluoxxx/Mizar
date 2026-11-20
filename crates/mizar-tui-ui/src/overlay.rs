@@ -2131,6 +2131,10 @@ fn render_help_modal(
             "打开全屏三泳道轨迹分析器（WaveBand + Timeline + Hotspots）",
         ),
         (
+            "Ctrl+V",
+            "粘贴剪贴板图片、文件路径或文本（SSH 下支持 OSC 5522）",
+        ),
+        (
             "Ctrl+G / Ctrl+E",
             "Ctrl+G 调用 $EDITOR 编辑草稿；Ctrl+E 展开折叠粘贴块",
         ),

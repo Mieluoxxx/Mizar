@@ -272,7 +272,7 @@ impl Session {
 
             let mut title_patch: Option<SessionHeaderPatch> = None;
             match &entry.event {
-                SessionEvent::User { text } if inner.header.title.is_none() => {
+                SessionEvent::User { text, .. } if inner.header.title.is_none() => {
                     if let Some(title) = derive_session_title(text) {
                         inner.header.title = Some(title.clone());
                         title_patch = Some(SessionHeaderPatch {
@@ -533,11 +533,13 @@ impl Session {
         for idx in indices {
             let entry = &inner.log[idx];
             match &entry.event {
-                SessionEvent::User { text } => messages.push(Message::User {
+                SessionEvent::User { text, images } => messages.push(Message::User {
                     content: text.clone(),
+                    images: images.clone(),
                 }),
-                SessionEvent::ContextNotice { text, .. } => messages.push(Message::User {
+                SessionEvent::ContextNotice { text, images, .. } => messages.push(Message::User {
                     content: text.clone(),
+                    images: images.clone(),
                 }),
                 SessionEvent::Assistant { blocks, replay, .. } => {
                     messages.push(Message::Assistant {
@@ -564,9 +566,7 @@ impl Session {
                 SessionEvent::Compaction {
                     summary, digest, ..
                 } => {
-                    messages.push(Message::User {
-                        content: render_compaction_message(summary, digest),
-                    });
+                    messages.push(Message::user(render_compaction_message(summary, digest)));
                 }
                 SessionEvent::BashExecution {
                     command,
@@ -594,7 +594,7 @@ impl Session {
                         {
                             content.push_str(&format!("\n\nCommand exited with code {code}"));
                         }
-                        messages.push(Message::User { content });
+                        messages.push(Message::user(content));
                     }
                 }
                 SessionEvent::ToolResultPrune { .. }

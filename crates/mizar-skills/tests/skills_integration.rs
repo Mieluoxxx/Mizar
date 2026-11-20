@@ -271,7 +271,7 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
         let step1_text: String = calls[0]
             .iter()
             .filter_map(|m| match m {
-                Message::User { content } => Some(content.as_str()),
+                Message::User { content, .. } => Some(content.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -356,7 +356,7 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
     let catalog_msgs: Vec<&str> = log_after_update
         .iter()
         .filter_map(|e| match &e.event {
-            SessionEvent::ContextNotice { source, text } if source == SKILL_CATALOG_SOURCE => {
+            SessionEvent::ContextNotice { source, text, .. } if source == SKILL_CATALOG_SOURCE => {
                 Some(text.as_str())
             }
             _ => None,

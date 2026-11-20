@@ -531,13 +531,11 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     let ws = crate_root();
     let app_ctx = boot_mock_ctx(ws.clone()).await;
     let session = app_ctx.sessions().unwrap().create(None);
-    session.append(SessionEvent::User {
-        text: "first step investigate_very_long_identifier_for_horizontal_panning".into(),
-    });
+    session.append(SessionEvent::user(
+        "first step investigate_very_long_identifier_for_horizontal_panning",
+    ));
     session.append(SessionEvent::assistant_text("first answer"));
-    session.append(SessionEvent::User {
-        text: "second step should not be forked".into(),
-    });
+    session.append(SessionEvent::user("second step should not be forked"));
 
     let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
 
@@ -710,9 +708,7 @@ async fn resumes_session_with_compaction_and_trace_entries_cleanly() {
     let store = app_ctx.sessions().unwrap();
     let session = store.create(None);
     session.append_trace(mizar_session::SessionTraceEvent::TurnStart { turn: 1 });
-    session.append(SessionEvent::User {
-        text: "历史提问".into(),
-    });
+    session.append(SessionEvent::user("历史提问"));
     session.append(SessionEvent::assistant_text("历史回答"));
     session.compact("早期讨论摘要", 2, Some(256));
 
@@ -738,17 +734,15 @@ async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_inst
     let app_ctx = boot_mock_ctx(ws.clone()).await;
     let store = app_ctx.sessions().unwrap();
     let session = store.create(None);
-    session.append(SessionEvent::User {
-        text: "测试问题".into(),
-    });
-    session.append(SessionEvent::ContextNotice {
-        source: "agent-instructions".into(),
-        text: "<system-reminder>\nInstructions from: AGENTS.md\n\nSECRET_RAW_BODY_DO_NOT_DUMP\n\nInstructions from: CLAUDE.md\n\nMORE_RAW\n</system-reminder>".into(),
-    });
-    session.append(SessionEvent::ContextNotice {
-        source: "skill-catalog".into(),
-        text: "<system-reminder>\n<available_skills>\n- `foo`: raw\n</available_skills>\n</system-reminder>".into(),
-    });
+    session.append(SessionEvent::user("测试问题"));
+    session.append(SessionEvent::context_notice(
+        "agent-instructions",
+        "<system-reminder>\nInstructions from: AGENTS.md\n\nSECRET_RAW_BODY_DO_NOT_DUMP\n\nInstructions from: CLAUDE.md\n\nMORE_RAW\n</system-reminder>",
+    ));
+    session.append(SessionEvent::context_notice(
+        "skill-catalog",
+        "<system-reminder>\n<available_skills>\n- `foo`: raw\n</available_skills>\n</system-reminder>",
+    ));
     session.append(SessionEvent::assistant_text("测试回答"));
 
     let empty = store.create(None);
@@ -797,6 +791,7 @@ async fn folds_instruction_context_notices_on_resume_and_renders_side_panel_inst
                 mizar_llm::ReasoningEffort::Low,
                 mizar_llm::ReasoningEffort::High,
             ],
+            input: Vec::new(),
         }],
     }];
     state.providers = providers;
@@ -883,8 +878,8 @@ async fn expands_at_mentions_via_pre_step_and_folds_on_resume() {
         let mut notices = Vec::new();
         for e in entries {
             match &e.event {
-                SessionEvent::User { text } => users.push(text.clone()),
-                SessionEvent::ContextNotice { source, text } if source == "file-mentions" => {
+                SessionEvent::User { text, .. } => users.push(text.clone()),
+                SessionEvent::ContextNotice { source, text, .. } if source == "file-mentions" => {
                     notices.push(text.clone());
                 }
                 _ => {}
@@ -1216,6 +1211,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
                     context_window: Some(32_768),
                     max_tokens: Some(4096),
                     reasoning_efforts: Vec::new(),
+                    input: Vec::new(),
                 }],
             })
         }
@@ -1542,6 +1538,7 @@ fn appends_notices_and_turns_after_welcome_with_scroll_and_hit_rect_projection()
                 context_window: Some(32_768),
                 max_tokens: Some(4096),
                 reasoning_efforts: Vec::new(),
+                input: Vec::new(),
             },
             mizar_llm::ModelInfo {
                 id: "mock-v2".into(),
@@ -1549,6 +1546,7 @@ fn appends_notices_and_turns_after_welcome_with_scroll_and_hit_rect_projection()
                 context_window: Some(64_000),
                 max_tokens: Some(4096),
                 reasoning_efforts: Vec::new(),
+                input: Vec::new(),
             },
         ],
     }];
@@ -1943,9 +1941,7 @@ async fn resume_view_without_selection_keeps_startup_defaults() {
     wait_for_services(&ctx).await.unwrap();
 
     let session = ctx.sessions().unwrap().create(None);
-    session.append(SessionEvent::User {
-        text: "只有消息，没有选择记录".into(),
-    });
+    session.append(SessionEvent::user("只有消息，没有选择记录"));
 
     let view = project_resume_view(&session);
     assert_eq!(view.selection, None);
@@ -1970,4 +1966,254 @@ async fn resume_view_without_selection_keeps_startup_defaults() {
     );
 
     ctx.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn clipboard_paste_scales_images_handles_file_list_and_reports_errors() {
+    use std::io::Cursor;
+
+    let tmp = std::env::temp_dir().join(format!("mizar_tui_clip_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 生成一张 2800×1400 PNG 图片文件与一个普通源码文件
+    let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+        2800,
+        1400,
+        image::Rgba([12, 80, 200, 255]),
+    ));
+    let mut png_bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .unwrap();
+    let img_path = tmp.join("wide.png");
+    let rs_path = tmp.join("lib.rs");
+    std::fs::write(&img_path, &png_bytes).unwrap();
+    std::fs::write(&rs_path, "pub fn ok() {}").unwrap();
+
+    let mut state = AppState::new(tmp.clone(), "sess-clip", Vec::new(), None, None, None);
+
+    // 1. Files 优先级混合：普通文件转 `@lib.rs`，图片文件缩放为原子图片块 `[Image #1 · 2800×1400 → 2048×1024]`
+    mizar_tui::runner::apply_clipboard_content(
+        &mut state,
+        &tmp,
+        Ok(mizar_tui::clipboard::ClipboardContent::Files(vec![
+            rs_path, img_path,
+        ])),
+    )
+    .await;
+
+    assert!(
+        state.input.text().contains("@lib.rs"),
+        "{}",
+        state.input.text()
+    );
+    assert!(
+        state
+            .input
+            .text()
+            .contains("[Image #1 · 2800×1400 → 2048×1024]"),
+        "{}",
+        state.input.text()
+    );
+    assert_eq!(state.input.image_count(), 1);
+
+    // 2. 损坏的剪贴板图片必须明确弹窗报错，绝不静默吞掉
+    mizar_tui::runner::apply_clipboard_content(
+        &mut state,
+        &tmp,
+        Ok(mizar_tui::clipboard::ClipboardContent::Image {
+            bytes: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0],
+            source_label: "test-bad-png".into(),
+        }),
+    )
+    .await;
+    assert!(matches!(
+        state.items.last(),
+        Some(ChatItem::Notice { level: mizar_tui::NoticeLevel::Error, text }) if text.contains("图片")
+    ));
+
+    // 3. 提交后携带缩放后的 ImageAttachment（2048×1024）
+    let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match action {
+        AppAction::SubmitPromptWithImages { text, images } => {
+            assert!(text.contains("@lib.rs"));
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].media_type, "image/png");
+            assert_eq!(images[0].width, Some(2048));
+            assert_eq!(images[0].height, Some(1024));
+        }
+        other => panic!("expected SubmitPromptWithImages, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn mention_image_respects_model_input_capability_and_delivers_multimodal_payload() {
+    use futures::channel::mpsc as futures_mpsc;
+    use mizar_llm::{
+        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, Message,
+        ModelInfo, ProviderInfo, StreamChunk,
+    };
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    struct VisionSpyAdapter {
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl LlmAdapter for VisionSpyAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "spy".into(),
+                name: "Spy".into(),
+                protocol: "mock".into(),
+                models: vec![
+                    ModelInfo {
+                        id: "text-only".into(),
+                        name: "Text Only".into(),
+                        context_window: Some(32_768),
+                        max_tokens: Some(4096),
+                        reasoning_efforts: Vec::new(),
+                        input: vec!["text".into()],
+                    },
+                    ModelInfo {
+                        id: "vision-ok".into(),
+                        name: "Vision OK".into(),
+                        context_window: Some(32_768),
+                        max_tokens: Some(4096),
+                        reasoning_efforts: Vec::new(),
+                        input: vec!["text".into(), "image".into()],
+                    },
+                ],
+            })
+        }
+
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            self.seen.lock().unwrap().push(options.messages);
+            let (tx, rx) = futures_mpsc::unbounded();
+            let _ = tx.unbounded_send(Ok(StreamChunk::text("已分析图片")));
+            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                reason: FinishReason::Stop,
+                replay: None,
+            }));
+            Box::pin(rx)
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("mizar_tui_mention_vis_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+        64,
+        48,
+        image::Rgba([255, 128, 0, 255]),
+    ));
+    let mut png_bytes = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(tmp.join("shot.png"), &png_bytes).unwrap();
+
+    let ctx = Context::new();
+    ctx.logger().set_silent();
+    let mut cfg = AgentSpineConfig::coding(tmp.clone());
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx.plugin(AgentSpinePlugin, cfg);
+    wait_for_services(&ctx).await.unwrap();
+
+    let spy = Arc::new(VisionSpyAdapter {
+        seen: Mutex::new(Vec::new()),
+    });
+    let _spy_handle = ctx
+        .llm()
+        .unwrap()
+        .register_adapter("spy", spy.clone())
+        .unwrap();
+
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+    let _mention_guard =
+        mizar_tui::mentions::register_mention_hook(&ctx, tmp.clone(), true, ui_tx).unwrap();
+
+    let session = ctx.sessions().unwrap().create(None);
+    let agent = ctx.agent_loop().unwrap();
+
+    // 1. 使用仅声明 input=["text"] 的模型时，@shot.png 应在发出模型请求前被明确取消并提示错误
+    let blocked = agent
+        .run_with_options(
+            Arc::clone(&session),
+            "看下 @shot.png",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("spy".into()),
+                model: Some("text-only".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(blocked.is_err());
+    assert!(
+        spy.seen.lock().unwrap().is_empty(),
+        "text-only model must not receive request"
+    );
+    let mut notices = Vec::new();
+    while let Ok(ev) = ui_rx.try_recv() {
+        if let UiEvent::Notice { level, text } = ev {
+            notices.push((level, text));
+        }
+    }
+    assert!(
+        notices
+            .iter()
+            .any(|(lvl, txt)| *lvl == mizar_tui::NoticeLevel::Error
+                && txt.contains("不支持图片输入")),
+        "expected error notice for unsupported model, got {notices:?}"
+    );
+
+    // 2. 换用声明了 image 能力的模型，@shot.png 作为图片附件送达适配器，绝不落成 <attached-file>
+    let reply = agent
+        .run_with_options(
+            Arc::clone(&session),
+            "再看一次 @shot.png",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("spy".into()),
+                model: Some("vision-ok".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "已分析图片");
+
+    {
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let img_msg = seen[0]
+            .iter()
+            .find(|m| !m.images().is_empty())
+            .expect("should contain user/context message with image attachment");
+        assert_eq!(img_msg.images().len(), 1);
+        assert_eq!(img_msg.images()[0].media_type, "image/png");
+        assert_eq!(img_msg.images()[0].width, Some(64));
+        assert_eq!(img_msg.images()[0].height, Some(48));
+        assert!(
+            img_msg
+                .text_content()
+                .contains("<attached-image path=\"shot.png\" />")
+        );
+        assert!(!img_msg.text_content().contains("<attached-file"));
+    }
+
+    ctx.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&tmp);
 }

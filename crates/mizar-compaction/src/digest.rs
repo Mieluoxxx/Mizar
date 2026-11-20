@@ -198,7 +198,7 @@ fn detect_split_turn_pinned_inputs(
     else {
         return Vec::new();
     };
-    let SessionEvent::User { text } = &last_user.event else {
+    let SessionEvent::User { text, .. } = &last_user.event else {
         return Vec::new();
     };
     let trimmed = text.trim();
@@ -371,12 +371,7 @@ mod tests {
     #[test]
     fn extracts_deterministic_digest_and_pins_split_turn_user_input() {
         let entries = vec![
-            mk(
-                1,
-                SessionEvent::User {
-                    text: "实现任务 A".into(),
-                },
-            ),
+            mk(1, SessionEvent::user("实现任务 A")),
             mk(
                 2,
                 SessionEvent::Assistant {

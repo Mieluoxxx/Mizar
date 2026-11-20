@@ -252,7 +252,7 @@ impl AgentInstructions {
                 entries
                     .iter()
                     .filter_map(|e| match &e.event {
-                        SessionEvent::ContextNotice { source, text }
+                        SessionEvent::ContextNotice { source, text, .. }
                             if source == AGENT_INSTRUCTIONS_SOURCE =>
                         {
                             Some((e.seq, text.clone()))
@@ -298,10 +298,10 @@ impl AgentInstructions {
 
             if !already_hydrated {
                 if let Some(ref r) = rendered {
-                    session.append(SessionEvent::ContextNotice {
-                        source: AGENT_INSTRUCTIONS_SOURCE.to_string(),
-                        text: r.text.clone(),
-                    });
+                    session.append(SessionEvent::context_notice(
+                        AGENT_INSTRUCTIONS_SOURCE,
+                        &r.text,
+                    ));
                     emitted_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
                 } else if !visible_instruction_notices.is_empty() {
                     // 以前加载过指令，现在文件全被删空且恢复后身份发生变化，发送清理通知
@@ -324,17 +324,17 @@ impl AgentInstructions {
                             .unwrap_or_default()
                     };
                     if let Some(delta_text) = render_delta_message(&items, self.config.max_bytes) {
-                        session.append(SessionEvent::ContextNotice {
-                            source: AGENT_INSTRUCTIONS_SOURCE.to_string(),
-                            text: delta_text,
-                        });
+                        session.append(SessionEvent::context_notice(
+                            AGENT_INSTRUCTIONS_SOURCE,
+                            delta_text,
+                        ));
                         emitted_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
                     } else if mem_baseline_seq.is_none() {
                         // 离线恢复时此前有基线，但本地指令文件已全部删除
-                        session.append(SessionEvent::ContextNotice {
-                            source: AGENT_INSTRUCTIONS_SOURCE.to_string(),
-                            text: "<system-reminder>\nInstructions removed: previously loaded instruction files are no longer present.\n</system-reminder>".to_string(),
-                        });
+                        session.append(SessionEvent::context_notice(
+                            AGENT_INSTRUCTIONS_SOURCE,
+                            "<system-reminder>\nInstructions removed: previously loaded instruction files are no longer present.\n</system-reminder>",
+                        ));
                         emitted_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
                     }
                 }
@@ -416,10 +416,10 @@ impl AgentInstructions {
                 &disc.project_files,
                 self.config.max_bytes,
             ) {
-                session.append(SessionEvent::ContextNotice {
-                    source: AGENT_INSTRUCTIONS_SOURCE.to_string(),
-                    text: r.text.clone(),
-                });
+                session.append(SessionEvent::context_notice(
+                    AGENT_INSTRUCTIONS_SOURCE,
+                    &r.text,
+                ));
                 let new_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
                 let mut next_rep = HashMap::new();
                 for f in r.represented {
@@ -526,10 +526,10 @@ impl AgentInstructions {
         }
 
         if let Some(delta_text) = render_delta_message(&delta_items, self.config.max_bytes) {
-            session.append(SessionEvent::ContextNotice {
-                source: AGENT_INSTRUCTIONS_SOURCE.to_string(),
-                text: delta_text,
-            });
+            session.append(SessionEvent::context_notice(
+                AGENT_INSTRUCTIONS_SOURCE,
+                delta_text,
+            ));
         }
 
         let next_statuses: Vec<InstructionScopeStatus> = all_cur

@@ -57,9 +57,7 @@ async fn persists_and_hydrates_sessions_across_restarts() {
         ..Default::default()
     });
     s1.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
-    s1.append(SessionEvent::User {
-        text: "帮我检查会话持久化\n第二行详细说明".into(),
-    });
+    s1.append(SessionEvent::user("帮我检查会话持久化\n第二行详细说明"));
     s1.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::Text {
             text: "没问题".into(),
@@ -163,9 +161,9 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
         cwd: Some("/repo/b".into()),
         ..Default::default()
     });
-    parent.append(SessionEvent::User { text: "Q1".into() });
+    parent.append(SessionEvent::user("Q1"));
     parent.append(SessionEvent::assistant_text("A1"));
-    parent.append(SessionEvent::User { text: "Q2".into() });
+    parent.append(SessionEvent::user("Q2"));
     parent.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
             id: "c_hang".into(),
@@ -202,7 +200,7 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
 
     // 子会话继续压缩并追加不会影响父会话
     child.compact("summary", 1, Some(1000));
-    child.append(SessionEvent::User { text: "Q3".into() });
+    child.append(SessionEvent::user("Q3"));
     child.flush_async().await.unwrap();
 
     assert_eq!(parent.log().len(), 4);
@@ -254,9 +252,7 @@ async fn works_with_in_memory_sqlite_config() {
         cwd: Some("/mem".into()),
         ..Default::default()
     });
-    s.append(SessionEvent::User {
-        text: "hello memory sqlite".into(),
-    });
+    s.append(SessionEvent::user("hello memory sqlite"));
     s.flush_async().await.unwrap();
 
     // 清空 SessionStore 内存表后再通过 get 从 :memory: SQLite 读回
@@ -302,9 +298,7 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
             cancelled: false,
             exclude_from_context: true,
         });
-        s.append(SessionEvent::User {
-            text: "请总结".into(),
-        });
+        s.append(SessionEvent::user("请总结"));
         s.flush_async().await.unwrap();
         app.fiber().dispose().await;
     }
@@ -345,7 +339,7 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
     assert_eq!(msgs.len(), 2);
     assert!(matches!(
         &msgs[0],
-        mizar_llm::Message::User { content } if content.contains("ctx_ok")
+        mizar_llm::Message::User { content, .. } if content.contains("ctx_ok")
     ));
     assert!(!format!("{msgs:?}").contains("secret_local"));
 
@@ -375,12 +369,12 @@ async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
         cwd: Some("/ws/alpha".into()),
         ..Default::default()
     });
-    s1.append(SessionEvent::User {
-        text: "早期决策：使用 compacted_up_to_seq 追踪历史压缩水位".into(),
-    });
-    s1.append(SessionEvent::User {
-        text: "我们来排查 Ryugi 画板与任务看板的双向状态同步问题".into(),
-    });
+    s1.append(SessionEvent::user(
+        "早期决策：使用 compacted_up_to_seq 追踪历史压缩水位",
+    ));
+    s1.append(SessionEvent::user(
+        "我们来排查 Ryugi 画板与任务看板的双向状态同步问题",
+    ));
     s1.append(SessionEvent::ToolResult {
         tool_call_id: "tc-1".into(),
         name: "read".into(),
@@ -445,4 +439,63 @@ async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
     );
 
     app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn persists_and_derives_user_images_through_sqlite() {
+    use mizar_llm::ImageAttachment;
+
+    let db = temp_db_path("user_images");
+    let _guard = TempDbGuard(db.clone());
+    let img = ImageAttachment {
+        media_type: "image/jpeg".into(),
+        data: "/9j/4AAQSkZJRg==".into(),
+        width: Some(800),
+        height: Some(600),
+    };
+
+    {
+        let app = Context::new();
+        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+        app.plugin(SessionStore::plugin(), ());
+        app.plugin(
+            cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+            (),
+        )
+        .await
+        .unwrap();
+
+        let store = app.sessions().unwrap();
+        let s = store.create_with(SessionCreateOptions {
+            id: Some("img-db-1".into()),
+            ..Default::default()
+        });
+        s.append(SessionEvent::user_with_images(
+            "看图定位异常",
+            vec![img.clone()],
+        ));
+        s.flush_async().await.unwrap();
+        app.fiber().dispose().await;
+    }
+
+    let app2 = Context::new();
+    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+    app2.plugin(SessionStore::plugin(), ());
+    app2.plugin(
+        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let store2 = app2.sessions().unwrap();
+    let reloaded = store2
+        .get("img-db-1")
+        .expect("should reload image session from sqlite");
+    let msgs = reloaded.derive_messages();
+    assert_eq!(
+        msgs,
+        vec![Message::user_with_images("看图定位异常", vec![img])]
+    );
+    app2.fiber().dispose().await;
 }

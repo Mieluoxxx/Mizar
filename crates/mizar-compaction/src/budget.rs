@@ -3,7 +3,7 @@
 //! 综合 `dim`（窗口扣除输出预留 + `<= 0.5*B` 压后上限 + `0.25*B` regrowth 防抖）、
 //! `DS-Bot`（`380_000` 软顶防止超大窗口失掉缓存与注意力）与 `pi`（最近有效 usage 校准 + 冷缓存窗口）。
 
-use mizar_llm::{ContentBlock, Message};
+use mizar_llm::{ContentBlock, ImageAttachment, Message};
 use mizar_session::{Session, SessionEntry, SessionEvent};
 
 use crate::CompactionConfig;
@@ -85,11 +85,23 @@ pub fn estimate_text_tokens(text: &str) -> u64 {
     non_ascii_chars + ascii_bytes.div_ceil(4)
 }
 
+/// 估算单张图片占据的上下文 token（按像素面积近似，不直接将 base64 字符长度除以 4）。
+pub fn estimate_image_tokens(image: &ImageAttachment) -> u64 {
+    match (image.width, image.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            ((u64::from(w) * u64::from(h)).div_ceil(750)).max(85)
+        }
+        _ => (image.data.len() as u64 / 512).max(1_024),
+    }
+}
+
 pub fn estimate_message_tokens(msg: &Message) -> u64 {
     let base = 8u64;
     match msg {
-        Message::System { content } | Message::User { content } => {
-            base + estimate_text_tokens(content)
+        Message::System { content } => base + estimate_text_tokens(content),
+        Message::User { content, images } => {
+            let img_tokens: u64 = images.iter().map(estimate_image_tokens).sum();
+            base + estimate_text_tokens(content) + img_tokens
         }
         Message::Assistant { blocks, .. } => {
             let mut sum = base;
@@ -114,8 +126,9 @@ pub fn estimate_message_tokens(msg: &Message) -> u64 {
 pub fn estimate_entry_tokens(entry: &SessionEntry, pruned_replacement: Option<&str>) -> u64 {
     let base = 8u64;
     match &entry.event {
-        SessionEvent::User { text } | SessionEvent::ContextNotice { text, .. } => {
-            base + estimate_text_tokens(text)
+        SessionEvent::User { text, images } | SessionEvent::ContextNotice { text, images, .. } => {
+            let img_tokens: u64 = images.iter().map(estimate_image_tokens).sum();
+            base + estimate_text_tokens(text) + img_tokens
         }
         SessionEvent::Assistant { blocks, .. } => {
             let mut sum = base;
@@ -242,5 +255,32 @@ mod tests {
         assert!((7..=12).contains(&ascii), "ascii={ascii}");
         let cjk = estimate_text_tokens("压缩与无损情景记忆");
         assert_eq!(cjk, 9);
+    }
+
+    #[test]
+    fn image_attachment_increases_message_and_entry_token_estimates() {
+        let text_only = Message::user("看图");
+        let img = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "A".repeat(400_000),
+            width: Some(1536),
+            height: Some(1024),
+        };
+        let with_image = Message::user_with_images("看图", vec![img.clone()]);
+        assert!(estimate_message_tokens(&with_image) > estimate_message_tokens(&text_only));
+        // 像素估算应在千级 token，而非直接把 400k base64 除 4 得到 100k token
+        assert!(estimate_message_tokens(&with_image) < 10_000);
+
+        let entry_text = SessionEntry {
+            seq: 1,
+            ts: 0,
+            event: SessionEvent::user("看图"),
+        };
+        let entry_img = SessionEntry {
+            seq: 2,
+            ts: 0,
+            event: SessionEvent::user_with_images("看图", vec![img]),
+        };
+        assert!(estimate_entry_tokens(&entry_img, None) > estimate_entry_tokens(&entry_text, None));
     }
 }

@@ -9,7 +9,8 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use mizar_llm_types::{
-    ContentBlock, ModelInfo, ProviderInfo, ReasoningEffort, TokenUsage, ToolCall,
+    ContentBlock, ImageAttachment, MAX_IMAGES_PER_MESSAGE, ModelInfo, ProviderInfo,
+    ReasoningEffort, TokenUsage, ToolCall,
 };
 use mizar_trajectory_core::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
@@ -349,14 +350,24 @@ pub enum LaunchpadQuickAction {
 pub struct QueuedPrompt {
     pub id: u64,
     pub text: String,
+    pub images: Vec<(String, ImageAttachment)>,
 }
 
 /// UI 层处理按键/提交后需要 Runner 执行的外部动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
     None,
+    PasteClipboard,
     SubmitPrompt(String),
+    SubmitPromptWithImages {
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     SteerPrompt(String),
+    SteerPromptWithImages {
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     RunLocalBash {
         command: String,
         exclude_from_context: bool,
@@ -621,6 +632,30 @@ impl AppState {
             }
         }
         None
+    }
+
+    pub fn active_model_supports_images(&self) -> bool {
+        self.active_model_info()
+            .is_none_or(ModelInfo::supports_images)
+    }
+
+    pub fn insert_pasted_image(
+        &mut self,
+        summary_suffix: Option<&str>,
+        image: ImageAttachment,
+    ) -> Option<String> {
+        if self.input.image_count() >= MAX_IMAGES_PER_MESSAGE {
+            let msg = format!(
+                "单条消息最多附加 {MAX_IMAGES_PER_MESSAGE} 张图片（已达上限，无法继续添加）"
+            );
+            self.set_flash(msg.clone());
+            self.push_notice(NoticeLevel::Warn, msg);
+            return None;
+        }
+        let token = self.input.insert_image(summary_suffix, image);
+        self.sync_input_completion_overlay();
+        self.set_flash(format!("已插入图片 {token}"));
+        Some(token)
     }
 
     pub fn active_context_window(&self) -> u64 {
@@ -1698,6 +1733,9 @@ impl AppState {
             KeyCode::Char('l') if ctrl => {
                 return self.open_model_selector();
             }
+            KeyCode::Char('v' | 'V') if ctrl && !alt => {
+                return AppAction::PasteClipboard;
+            }
             KeyCode::Esc => {
                 if self.selection.is_active() {
                     self.selection.clear();
@@ -2236,15 +2274,32 @@ impl AppState {
     }
 
     /// 入队并把选择器自动定位到新条目：消息一旦入队，就能立即用 ↑ 撤回编辑。
-    fn enqueue_prompt(&mut self, prompt: String) {
+    fn enqueue_prompt_with_images(
+        &mut self,
+        prompt: String,
+        images: Vec<(String, ImageAttachment)>,
+    ) {
         let id = self.next_queue_id;
         self.next_queue_id = self.next_queue_id.wrapping_add(1);
-        self.queued_prompts.push(QueuedPrompt { id, text: prompt });
+        self.queued_prompts.push(QueuedPrompt {
+            id,
+            text: prompt,
+            images,
+        });
         self.queue_selected = None;
         self.set_flash(format!(
             "已加入队列 (共 {} 条待发)，↑ 可撤回编辑",
             self.queued_prompts.len()
         ));
+    }
+
+    pub fn reject_unsupported_images_notice(&mut self) {
+        let model = self.active_model_label();
+        let msg = format!(
+            "当前模型 {model} 不支持图片输入，请按 Ctrl+L 切换支持视觉的模型或删除图片占位符后重试"
+        );
+        self.set_flash(msg.clone());
+        self.push_notice(NoticeLevel::Error, msg);
     }
 
     /// 出队唯一入口：`prepare_submit`、选择器与 `runner` 的自动续发都走这里，
@@ -2277,18 +2332,22 @@ impl AppState {
         let Some(item) = self.dequeue_prompt(id) else {
             return false;
         };
-        let draft = self.input.text().trim().to_string();
-        if draft.is_empty() {
-            self.input.replace_draft_from_queue(&item.text);
+        if self.input.text().trim().is_empty() {
+            self.input
+                .replace_draft_from_queue_with_images(&item.text, &item.images);
             self.set_flash("已撤回队列项，Enter 重新发送");
         } else {
+            let (draft_raw, draft_images) = self.input.take_with_images();
+            let draft = draft_raw.trim().to_string();
             let swap_id = self.next_queue_id;
             self.next_queue_id = self.next_queue_id.wrapping_add(1);
             self.queued_prompts.push(QueuedPrompt {
                 id: swap_id,
                 text: draft,
+                images: draft_images,
             });
-            self.input.replace_draft_from_queue(&item.text);
+            self.input
+                .replace_draft_from_queue_with_images(&item.text, &item.images);
             self.set_flash("已交换：草稿已存入队尾");
         }
         self.sync_input_completion_overlay();
@@ -2309,8 +2368,21 @@ impl AppState {
         let Some(item) = self.dequeue_next() else {
             return AppAction::None;
         };
+        if !item.images.is_empty() && !self.active_model_supports_images() {
+            self.input
+                .replace_draft_from_queue_with_images(&item.text, &item.images);
+            self.reject_unsupported_images_notice();
+            return AppAction::None;
+        }
         self.set_flash("⚡ 正在中断当前回合并立即发送队列消息…");
-        AppAction::SteerPrompt(item.text)
+        if item.images.is_empty() {
+            AppAction::SteerPrompt(item.text)
+        } else {
+            AppAction::SteerPromptWithImages {
+                text: item.text,
+                images: item.images.into_iter().map(|(_, img)| img).collect(),
+            }
+        }
     }
 
     /// 空闲时把队首当作普通消息发出（唤醒中断后滞留的队列）。
@@ -2318,8 +2390,21 @@ impl AppState {
         let Some(item) = self.dequeue_next() else {
             return AppAction::None;
         };
+        if !item.images.is_empty() && !self.active_model_supports_images() {
+            self.input
+                .replace_draft_from_queue_with_images(&item.text, &item.images);
+            self.reject_unsupported_images_notice();
+            return AppAction::None;
+        }
         self.push_user_message(&item.text);
-        AppAction::SubmitPrompt(item.text)
+        if item.images.is_empty() {
+            AppAction::SubmitPrompt(item.text)
+        } else {
+            AppAction::SubmitPromptWithImages {
+                text: item.text,
+                images: item.images.into_iter().map(|(_, img)| img).collect(),
+            }
+        }
     }
 
     /// 队列选择器的按键处理：↑↓ 移动，⏎ 撤回，Ctrl/Alt+⏎ 撤回并立即发送，Del 丢弃，Esc 关闭。
@@ -2364,8 +2449,22 @@ impl AppState {
             }
             KeyCode::Enter if ctrl || alt => {
                 let item = self.dequeue_prompt(selected)?;
+                if !item.images.is_empty() && !self.active_model_supports_images() {
+                    self.queue_selected = None;
+                    self.input
+                        .replace_draft_from_queue_with_images(&item.text, &item.images);
+                    self.reject_unsupported_images_notice();
+                    return Some(AppAction::None);
+                }
                 self.set_flash("⚡ 已撤回队列项并立即发送…");
-                Some(AppAction::SteerPrompt(item.text))
+                if item.images.is_empty() {
+                    Some(AppAction::SteerPrompt(item.text))
+                } else {
+                    Some(AppAction::SteerPromptWithImages {
+                        text: item.text,
+                        images: item.images.into_iter().map(|(_, img)| img).collect(),
+                    })
+                }
             }
             KeyCode::Enter if !shift => {
                 self.retract_queued(selected);
@@ -2456,7 +2555,28 @@ impl AppState {
             }
         }
 
-        let raw = self.input.take();
+        let is_builtin_cmd = preview
+            .strip_prefix('/')
+            .map(str::trim)
+            .and_then(|s| s.split_whitespace().next())
+            .is_some_and(|first| is_builtin_slash_cmd(&first.to_ascii_lowercase()));
+
+        if !is_builtin_cmd && self.input.has_images() {
+            if self.input.image_count() > MAX_IMAGES_PER_MESSAGE {
+                let msg = format!(
+                    "单条消息最多附加 {MAX_IMAGES_PER_MESSAGE} 张图片，请先删减多余图片后再发送"
+                );
+                self.set_flash(msg.clone());
+                self.push_notice(NoticeLevel::Warn, msg);
+                return AppAction::None;
+            }
+            if !self.active_model_supports_images() {
+                self.reject_unsupported_images_notice();
+                return AppAction::None;
+            }
+        }
+
+        let (raw, images) = self.input.take_with_images();
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return AppAction::None;
@@ -2476,18 +2596,32 @@ impl AppState {
             }
         }
 
+        let raw_images: Vec<ImageAttachment> = images.iter().map(|(_, img)| img.clone()).collect();
         if self.is_busy {
             let prompt = trimmed.to_string();
             if immediate {
                 self.set_flash("⚡ 正在中断当前回合并立即发送…");
-                return AppAction::SteerPrompt(prompt);
+                if raw_images.is_empty() {
+                    return AppAction::SteerPrompt(prompt);
+                }
+                return AppAction::SteerPromptWithImages {
+                    text: prompt,
+                    images: raw_images,
+                };
             }
-            self.enqueue_prompt(prompt);
+            self.enqueue_prompt_with_images(prompt, images);
             return AppAction::None;
         }
 
         self.push_user_message(trimmed);
-        AppAction::SubmitPrompt(trimmed.to_string())
+        if raw_images.is_empty() {
+            AppAction::SubmitPrompt(trimmed.to_string())
+        } else {
+            AppAction::SubmitPromptWithImages {
+                text: trimmed.to_string(),
+                images: raw_images,
+            }
+        }
     }
 
     fn handle_slash_command(&mut self, cmd_line: &str) -> AppAction {
@@ -2703,7 +2837,8 @@ fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
         for line in text.lines() {
             let trimmed = line.trim();
             if (trimmed.starts_with("<attached-file ")
-                || trimmed.starts_with("<attached-directory "))
+                || trimmed.starts_with("<attached-directory ")
+                || trimmed.starts_with("<attached-image "))
                 && let Some(p_start) = trimmed.find("path=\"")
             {
                 let after = &trimmed[p_start + 6..];
@@ -3788,6 +3923,7 @@ mod tests {
                         ReasoningEffort::Medium,
                         ReasoningEffort::High,
                     ],
+                    input: Vec::new(),
                 },
                 ModelInfo {
                     id: "model-all".into(),
@@ -3795,6 +3931,7 @@ mod tests {
                     context_window: Some(128_000),
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
+                    input: Vec::new(),
                 },
             ],
         }];
@@ -4715,5 +4852,154 @@ mod tests {
         assert_eq!(app.queue_selected, None);
         assert_eq!(app.input.text(), "h");
         assert_eq!(queued_texts(&app), vec!["item"]);
+    }
+
+    #[test]
+    fn ctrl_v_triggers_clipboard_action_and_enforces_20_image_limit() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-img-limit",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            AppAction::PasteClipboard
+        );
+
+        let sample = ImageAttachment::new("image/png", "iVBORw==").with_dimensions(64, 64);
+        for _ in 0..MAX_IMAGES_PER_MESSAGE {
+            app.insert_pasted_image(None, sample.clone())
+                .expect("should allow up to 20 images");
+        }
+        assert_eq!(app.input.image_count(), MAX_IMAGES_PER_MESSAGE);
+
+        // 第 21 张必须明确失败并保留已插入的 20 张及提示用户
+        assert!(app.insert_pasted_image(None, sample.clone()).is_none());
+        assert_eq!(app.input.image_count(), MAX_IMAGES_PER_MESSAGE);
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::Notice { level: NoticeLevel::Warn, text }) if text.contains("20")
+        ));
+
+        // 删掉一张占位符后应允许再贴一张
+        app.input.backspace();
+        assert_eq!(app.input.image_count(), MAX_IMAGES_PER_MESSAGE - 1);
+        assert!(app.insert_pasted_image(None, sample).is_some());
+        assert_eq!(app.input.image_count(), MAX_IMAGES_PER_MESSAGE);
+    }
+
+    #[test]
+    fn model_input_capability_rejects_images_without_clearing_draft() {
+        let providers = vec![ProviderInfo {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            protocol: "openai-responses".into(),
+            models: vec![
+                ModelInfo {
+                    id: "text-only".into(),
+                    name: "Text Only".into(),
+                    context_window: Some(64_000),
+                    max_tokens: None,
+                    reasoning_efforts: Vec::new(),
+                    input: vec!["text".into()],
+                },
+                ModelInfo {
+                    id: "vision".into(),
+                    name: "Vision".into(),
+                    context_window: Some(128_000),
+                    max_tokens: None,
+                    reasoning_efforts: Vec::new(),
+                    input: vec!["text".into(), "image".into()],
+                },
+            ],
+        }];
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-vision",
+            providers,
+            Some("openai".into()),
+            Some("text-only".into()),
+            None,
+        );
+        let img = ImageAttachment::new("image/png", "QUFB").with_dimensions(100, 100);
+        let tok = app.insert_pasted_image(None, img.clone()).unwrap();
+        app.input.insert_str(" 请帮我分析");
+
+        // 不支持图片的模型禁止发送，且不能清空用户草稿
+        assert!(!app.active_model_supports_images());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.input.image_count(), 1);
+        assert!(app.input.text().contains(&tok));
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::Notice { level: NoticeLevel::Error, text }) if text.contains("不支持图片输入")
+        ));
+
+        // 切到支持图片的模型后立刻允许提交，且图片负载完整送出
+        app.provider = Some("openai".into());
+        app.model = Some("vision".into());
+        assert!(app.active_model_supports_images());
+        let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            act,
+            AppAction::SubmitPromptWithImages {
+                text: format!("{tok} 请帮我分析"),
+                images: vec![img],
+            }
+        );
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn queued_prompt_with_images_retracts_and_resubmits_intact() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-queue-img",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.is_busy = true;
+        let img = ImageAttachment::new("image/jpeg", "QkJC").with_dimensions(800, 600);
+        let tok = app
+            .insert_pasted_image(Some("image/png → image/jpeg"), img.clone())
+            .unwrap();
+        app.input.insert_str(" 看下");
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.queued_prompts.len(), 1);
+        assert_eq!(
+            app.queued_prompts[0].images,
+            vec![(tok.clone(), img.clone())]
+        );
+
+        // Alt+↑ 撤回后应恢复原子占位符与图片附件
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            AppAction::None
+        );
+        assert!(app.queued_prompts.is_empty());
+        assert_eq!(app.input.image_count(), 1);
+
+        // 单次 Backspace 不应因内部空格破坏整个占位符
+        app.input.move_left(); // cursor before "看下"
+        app.is_busy = false;
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::SubmitPromptWithImages {
+                text: format!("{tok} 看下"),
+                images: vec![img],
+            }
+        );
     }
 }

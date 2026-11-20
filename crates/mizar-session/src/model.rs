@@ -1,6 +1,6 @@
 //! 会话事件日志的数据模型、头信息与可见性定义。
 
-use mizar_llm::{ContentBlock, ReasoningEffort, ReplayEnvelope, TokenUsage};
+use mizar_llm::{ContentBlock, ImageAttachment, ReasoningEffort, ReplayEnvelope, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -154,11 +154,15 @@ pub struct PrunedToolResult {
 pub enum SessionEvent {
     User {
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
     },
     /// 插件注入的合成上下文消息（例如重复工具提醒），对模型可见但在轨迹视图中区分归属。
     ContextNotice {
         source: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
     },
     Assistant {
         blocks: Vec<ContentBlock>,
@@ -186,9 +190,7 @@ pub enum SessionEvent {
     },
     /// 零模型投影层批量剪枝记录（`EntryVisibility::LogOnly`）：
     /// 一次性锁存较早 `ToolResult` 的紧凑预览，原文仍完整保留在日志中供 `recall` 查阅。
-    ToolResultPrune {
-        pruned: Vec<PrunedToolResult>,
-    },
+    ToolResultPrune { pruned: Vec<PrunedToolResult> },
     /// 本地执行的 Shell 命令（`!` 载入上下文 / `!!` 仅本地审计不载入上下文）。
     BashExecution {
         command: String,
@@ -201,9 +203,7 @@ pub enum SessionEvent {
         exclude_from_context: bool,
     },
     /// 内部审计 / 轨迹边界事件（`EntryVisibility::LogOnly`）。
-    Trace {
-        detail: SessionTraceEvent,
-    },
+    Trace { detail: SessionTraceEvent },
     /// 当前模型与推理强度的选择快照（`EntryVisibility::LogOnly`）：
     /// 不进模型上下文、不占压缩预算，仅供恢复会话与跨会话沿用上次选择时读取。
     Selection {
@@ -225,6 +225,28 @@ pub struct SessionSelection {
 }
 
 impl SessionEvent {
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self::User {
+            text: text.into(),
+            images,
+        }
+    }
+
+    pub fn context_notice(source: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::ContextNotice {
+            source: source.into(),
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
     pub fn assistant_text(text: impl Into<String>) -> Self {
         let text = text.into();
         let blocks = if text.is_empty() {

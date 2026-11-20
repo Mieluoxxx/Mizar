@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use cordis::{Context, CordisError, DisposableHandle};
 use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_llm::{ImageAttachment, LlmContextExt, MAX_IMAGES_PER_MESSAGE};
 use mizar_session::SessionEvent;
 use mizar_tools_coding::path_utils::resolve_read_path;
 use mizar_tui_ui::app::{NoticeLevel, UiEvent};
 use mizar_tui_ui::mentions::{FILE_MENTIONS_SOURCE, extract_mentions};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -23,14 +25,19 @@ pub const MENTION_MAX_FILE_CHARS: usize = 50_000;
 pub const MENTION_MAX_TOTAL_CHARS: usize = 200_000;
 /// 目录列举最大条目数。
 pub const MENTION_MAX_DIR_ENTRIES: usize = 200;
-/// 单文件读取上限（16 MiB），避免超大二进制文件引发内存膨胀。
+/// 单文本文件读取上限（16 MiB），避免超大二进制文件引发内存膨胀。
 const MENTION_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+/// 单张待解码 `@` 图片文件读取上限（32 MiB）。
+const MENTION_MAX_IMAGE_READ_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MentionExpansionResult {
     pub blocks: Vec<String>,
+    pub images: Vec<ImageAttachment>,
+    pub image_paths: Vec<String>,
     pub attached: Vec<String>,
     pub missing: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 fn escape_xml_attr(s: &str) -> String {
@@ -60,7 +67,39 @@ async fn try_resolve_mention(
     Some((path, meta))
 }
 
-/// 解析用户文本中的所有 `@` 引用，按出现顺序生成 `<attached-file>` / `<attached-directory>` 块。
+/// 快速探测文本中的 `@` 引用是否包含受支持的魔数图片文件（用于在不支持视觉的模型上预检拦截）。
+pub async fn mentions_resolve_any_image(
+    workspace: &Path,
+    restrict_to_workspace: bool,
+    text: &str,
+) -> bool {
+    for mention in extract_mentions(text) {
+        let mut resolved =
+            try_resolve_mention(workspace, &mention.path, restrict_to_workspace).await;
+        if resolved.is_none()
+            && let Some(lit) = &mention.literal
+        {
+            resolved = try_resolve_mention(workspace, lit, restrict_to_workspace).await;
+        }
+        let Some((target, meta)) = resolved else {
+            continue;
+        };
+        if meta.is_file() {
+            let Ok(mut file) = tokio::fs::File::open(&target).await else {
+                continue;
+            };
+            let mut head = [0u8; 16];
+            if let Ok(n) = file.read(&mut head).await
+                && crate::images::sniff_image_format(&head[..n]).is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 解析用户文本中的所有 `@` 引用，按出现顺序生成 `<attached-file>` / `<attached-directory>` 块及图片附件。
 pub async fn expand_text_mentions(
     workspace: &Path,
     restrict_to_workspace: bool,
@@ -111,14 +150,48 @@ pub async fn expand_text_mentions(
         let shown_attr = escape_xml_attr(&shown_path);
 
         if meta.is_file() {
-            if meta.len() > MENTION_MAX_READ_BYTES {
-                out.missing.push(display);
+            if meta.len() > MENTION_MAX_IMAGE_READ_BYTES {
+                // 先读 16 字节区分是超大图片还是超大普通文件
+                let is_img_header = match tokio::fs::File::open(&target).await {
+                    Ok(mut f) => {
+                        let mut head = [0u8; 16];
+                        matches!(f.read(&mut head).await, Ok(n) if crate::images::sniff_image_format(&head[..n]).is_some())
+                    }
+                    Err(_) => false,
+                };
+                if is_img_header {
+                    out.errors
+                        .push(format!("{display}（图片文件超过 32 MiB 读取上限）"));
+                } else {
+                    out.missing.push(display);
+                }
                 continue;
             }
+
             let Ok(bytes) = tokio::fs::read(&target).await else {
                 out.missing.push(display);
                 continue;
             };
+
+            // 在 String::from_utf8 之前按魔数识别 PNG/JPEG/WebP/GIF，命中的走图片缩放与重编管线，不再落 <attached-file>
+            if crate::images::sniff_image_format(&bytes).is_some() {
+                match crate::images::process_image_bytes(&bytes) {
+                    Ok(processed) => {
+                        out.images.push(processed.attachment);
+                        out.image_paths.push(shown_path);
+                        out.attached.push(display);
+                    }
+                    Err(err) => {
+                        out.errors.push(format!("{display}（{err}）"));
+                    }
+                }
+                continue;
+            }
+
+            if (bytes.len() as u64) > MENTION_MAX_READ_BYTES {
+                out.missing.push(display);
+                continue;
+            }
             let Ok(raw_text) = String::from_utf8(bytes) else {
                 out.missing.push(display);
                 continue;
@@ -212,6 +285,23 @@ pub async fn expand_text_mentions(
     out
 }
 
+fn model_supports_images(ctx: &Context, provider: Option<&str>, model: Option<&str>) -> bool {
+    let Ok(llm) = ctx.llm() else {
+        return true;
+    };
+    for prov in llm.provider_infos() {
+        if provider.is_some_and(|pid| pid != prov.id) {
+            continue;
+        }
+        for info in &prov.models {
+            if model.is_none() || model == Some(info.id.as_str()) {
+                return info.supports_images();
+            }
+        }
+    }
+    true
+}
+
 /// 挂载 `agent/pre-step` 监听器：在每轮首次请求模型前，自动展开最新用户消息中的 `@` 引用。
 pub fn register_mention_hook(
     ctx: &Context,
@@ -221,6 +311,7 @@ pub fn register_mention_hook(
 ) -> Result<DisposableHandle, CordisError> {
     let processed_seq_by_session: Arc<Mutex<HashMap<String, u64>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let ctx_hook = ctx.clone();
 
     ctx.on_serial::<AgentPreStepEvent, (), _, _>(
         EVENT_AGENT_PRE_STEP,
@@ -228,6 +319,7 @@ pub fn register_mention_hook(
             let ws = workspace.clone();
             let ui_tx = ui_tx.clone();
             let processed = Arc::clone(&processed_seq_by_session);
+            let ctx_hook = ctx_hook.clone();
             async move {
                 if ev.cancel.is_cancelled() {
                     return None;
@@ -236,7 +328,7 @@ pub fn register_mention_hook(
                 let sid = ev.session.id.clone();
                 let last_done_seq = processed.lock().unwrap().get(&sid).copied().unwrap_or(0);
 
-                let trailing_users: Vec<(u64, String)> =
+                let trailing_users: Vec<(u64, String, usize)> =
                     ev.session.with_visible_entries(|entries| {
                         let mut collected = Vec::new();
                         for entry in entries.iter().rev() {
@@ -244,8 +336,8 @@ pub fn register_mention_hook(
                                 break;
                             }
                             match &entry.event {
-                                SessionEvent::User { text } => {
-                                    collected.push((entry.seq, text.clone()))
+                                SessionEvent::User { text, images } => {
+                                    collected.push((entry.seq, text.clone(), images.len()))
                                 }
                                 SessionEvent::ContextNotice { source, .. }
                                     if source != FILE_MENTIONS_SOURCE => {}
@@ -267,14 +359,15 @@ pub fn register_mention_hook(
                     return None;
                 }
 
-                let max_seq = trailing_users.iter().map(|(s, _)| *s).max().unwrap_or(0);
+                let max_seq = trailing_users.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
+                let existing_images: usize = trailing_users.iter().map(|(_, _, n)| *n).sum();
                 let combined_text = trailing_users
                     .iter()
-                    .map(|(_, t)| t.as_str())
+                    .map(|(_, t, _)| t.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                let result =
+                let mut result =
                     expand_text_mentions(&ws, restrict_to_workspace, &combined_text, &ev.cancel)
                         .await;
 
@@ -284,10 +377,51 @@ pub fn register_mention_hook(
 
                 processed.lock().unwrap().insert(sid, max_seq);
 
-                if !result.blocks.is_empty() {
+                if !result.images.is_empty()
+                    && !model_supports_images(
+                        &ctx_hook,
+                        ev.provider.as_deref(),
+                        ev.model.as_deref(),
+                    )
+                {
+                    let model_name = ev.model.as_deref().unwrap_or("当前模型");
+                    let _ = ui_tx.send(UiEvent::Notice {
+                        level: NoticeLevel::Error,
+                        text: format!(
+                            "当前模型 {model_name} 不支持图片输入，已取消 `@` 图片发送（{}）",
+                            result.image_paths.join(", ")
+                        ),
+                    });
+                    ev.cancel.cancel();
+                    return None;
+                }
+
+                if existing_images + result.images.len() > MAX_IMAGES_PER_MESSAGE {
+                    let allowed = MAX_IMAGES_PER_MESSAGE.saturating_sub(existing_images);
+                    let skipped = result.images.len() - allowed;
+                    result.images.truncate(allowed);
+                    result.image_paths.truncate(allowed);
+                    let _ = ui_tx.send(UiEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!(
+                            "单条消息最多附加 {MAX_IMAGES_PER_MESSAGE} 张图片，已跳过超出上限的 {skipped} 张 `@` 图片"
+                        ),
+                    });
+                }
+
+                let mut notice_sections = result.blocks;
+                for path in &result.image_paths {
+                    notice_sections.push(format!(
+                        "<attached-image path=\"{}\" />",
+                        escape_xml_attr(path)
+                    ));
+                }
+
+                if !notice_sections.is_empty() || !result.images.is_empty() {
                     ev.session.append(SessionEvent::ContextNotice {
                         source: FILE_MENTIONS_SOURCE.to_string(),
-                        text: result.blocks.join("\n\n"),
+                        text: notice_sections.join("\n\n"),
+                        images: result.images,
                     });
                 }
 
@@ -296,6 +430,12 @@ pub fn register_mention_hook(
                         "✓ 已附加 {} 个 @ 引用",
                         result.attached.len()
                     )));
+                }
+                if !result.errors.is_empty() {
+                    let _ = ui_tx.send(UiEvent::Notice {
+                        level: NoticeLevel::Error,
+                        text: format!("@ 图片处理失败：{}", result.errors.join("; ")),
+                    });
                 }
                 if !result.missing.is_empty() {
                     let _ = ui_tx.send(UiEvent::Notice {
@@ -313,6 +453,19 @@ pub fn register_mention_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    fn tiny_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
+            width,
+            height,
+            image::Rgba([30, 144, 255, 255]),
+        ));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
 
     #[tokio::test]
     async fn expands_files_line_ranges_directories_and_missing_mentions() {
@@ -342,6 +495,45 @@ mod tests {
         assert!(res.blocks[2].contains("<attached-directory path=\"src/sub\">"));
         assert!(res.blocks[2].contains("b.rs"));
         assert!(res.blocks[3].contains("literal file"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn expands_image_mentions_into_attachments_without_attached_file_text() {
+        let tmp =
+            std::env::temp_dir().join(format!("mizar_tui_mention_images_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("shot.png"), tiny_png(3000, 1500)).unwrap();
+        std::fs::write(tmp.join("note.txt"), "plain text").unwrap();
+        // 坏掉的图片魔数文件走 error，不静默成 missing
+        std::fs::write(
+            tmp.join("broken.png"),
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0],
+        )
+        .unwrap();
+
+        let res = expand_text_mentions(
+            &tmp,
+            true,
+            "检查 @shot.png @note.txt @broken.png",
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(res.images.len(), 1);
+        assert_eq!(res.images[0].media_type, "image/png");
+        assert_eq!(res.images[0].width, Some(2048));
+        assert_eq!(res.images[0].height, Some(1024));
+        assert_eq!(res.image_paths, vec!["shot.png".to_string()]);
+        // 图片绝不落进 <attached-file>
+        assert_eq!(res.blocks.len(), 1);
+        assert!(res.blocks[0].contains("plain text"));
+        assert!(!res.blocks.iter().any(|b| b.contains("shot.png")));
+        assert!(res.missing.is_empty());
+        assert_eq!(res.errors.len(), 1);
+        assert!(res.errors[0].contains("broken.png"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

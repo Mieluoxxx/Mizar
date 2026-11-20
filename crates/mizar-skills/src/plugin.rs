@@ -417,10 +417,10 @@ impl Plugin for SkillsPlugin {
                             if should_emit {
                                 let is_update = prev_record.is_some() || had_catalog_notice;
                                 let rendered = render_catalog_message(&next_state, is_update);
-                                session.append(SessionEvent::ContextNotice {
-                                    source: SKILL_CATALOG_SOURCE.to_string(),
-                                    text: rendered,
-                                });
+                                session.append(SessionEvent::context_notice(
+                                    SKILL_CATALOG_SOURCE,
+                                    rendered,
+                                ));
                                 if let Some(last_seq) =
                                     session.with_visible_entries(|e| e.last().map(|x| x.seq))
                                 {
@@ -441,7 +441,9 @@ impl Plugin for SkillsPlugin {
                                 let mut collected = Vec::new();
                                 for entry in entries.iter().rev() {
                                     match &entry.event {
-                                        SessionEvent::User { text } => collected.push(text.clone()),
+                                        SessionEvent::User { text, .. } => {
+                                            collected.push(text.clone())
+                                        }
                                         SessionEvent::ContextNotice { source, .. }
                                             if source != SKILL_INVOCATION_SOURCE => {}
                                         SessionEvent::ContextNotice { .. }
@@ -474,10 +476,10 @@ impl Plugin for SkillsPlugin {
                             if let Ok(Some(def)) = reg.get(&name, lookup.clone()).await
                                 && def.summary.is_user_invocable()
                             {
-                                session.append(SessionEvent::ContextNotice {
-                                    source: SKILL_INVOCATION_SOURCE.to_string(),
-                                    text: render_skill_content(&def),
-                                });
+                                session.append(SessionEvent::context_notice(
+                                    SKILL_INVOCATION_SOURCE,
+                                    render_skill_content(&def),
+                                ));
                             }
                         }
 

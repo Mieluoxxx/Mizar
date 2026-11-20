@@ -88,9 +88,7 @@ async fn discovers_global_ancestor_workspace_subdir_hot_reload_and_compaction() 
     app.plugin(AgentInstructions::plugin(), cfg).await.unwrap();
 
     let session = app.sessions().unwrap().create(None);
-    session.append(SessionEvent::User {
-        text: "hello".into(),
-    });
+    session.append(SessionEvent::user("hello"));
 
     // 1. 第 1 步：注入全量基线（不含未触及的 src/）
     emit_pre_step(&app, &session, 1).await;
@@ -98,7 +96,7 @@ async fn discovers_global_ancestor_workspace_subdir_hot_reload_and_compaction() 
     let msgs1 = session.derive_messages();
     assert_eq!(msgs1.len(), 2);
     let baseline_text = match &msgs1[1] {
-        mizar_llm::Message::User { content } => content.clone(),
+        mizar_llm::Message::User { content, .. } => content.clone(),
         other => panic!("expected user ContextNotice, got {other:?}"),
     };
     assert!(baseline_text.contains("<system-reminder>"));
@@ -129,7 +127,7 @@ async fn discovers_global_ancestor_workspace_subdir_hot_reload_and_compaction() 
     let msgs3 = session.derive_messages();
     assert_eq!(msgs3.len(), 3);
     let delta_sub = match &msgs3[2] {
-        mizar_llm::Message::User { content } => content.clone(),
+        mizar_llm::Message::User { content, .. } => content.clone(),
         other => panic!("expected delta ContextNotice, got {other:?}"),
     };
     assert!(delta_sub.contains("Additional instructions from: src/AGENTS.md"));
@@ -144,7 +142,7 @@ async fn discovers_global_ancestor_workspace_subdir_hot_reload_and_compaction() 
     let msgs4 = session.derive_messages();
     assert_eq!(msgs4.len(), 4);
     let delta_mod = match &msgs4[3] {
-        mizar_llm::Message::User { content } => content.clone(),
+        mizar_llm::Message::User { content, .. } => content.clone(),
         other => panic!("expected update ContextNotice, got {other:?}"),
     };
     assert!(delta_mod.contains("Updated instructions from: CLAUDE.md"));
@@ -152,14 +150,12 @@ async fn discovers_global_ancestor_workspace_subdir_hot_reload_and_compaction() 
     assert!(delta_mod.contains("Instructions removed: CLAUDE.local.md"));
 
     // 5. Compaction 把旧基线折叠出可见窗口 -> 下一步应自动重建全量基线
-    session.append(SessionEvent::User {
-        text: "after compact".into(),
-    });
+    session.append(SessionEvent::user("after compact"));
     session.compact("早期摘要", 1, None);
     emit_pre_step(&app, &session, 5).await;
     let msgs5 = session.derive_messages();
     let last_msg = match msgs5.last().unwrap() {
-        mizar_llm::Message::User { content } => content.clone(),
+        mizar_llm::Message::User { content, .. } => content.clone(),
         other => panic!("expected rebuilt baseline, got {other:?}"),
     };
     assert!(last_msg.contains("Instructions from:"));
@@ -199,7 +195,7 @@ async fn disabled_instructions_skips_injection() {
     app.plugin(AgentInstructions::plugin(), cfg).await.unwrap();
 
     let session = app.sessions().unwrap().create(None);
-    session.append(SessionEvent::User { text: "hi".into() });
+    session.append(SessionEvent::user("hi"));
     emit_pre_step(&app, &session, 1).await;
 
     assert_eq!(session.derive_messages().len(), 1);

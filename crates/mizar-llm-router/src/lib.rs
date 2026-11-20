@@ -750,6 +750,13 @@ mod tests {
         assert_eq!(infos[0].id, "magpie");
         assert_eq!(infos[0].models.len(), 2);
         assert_eq!(
+            infos[0].models[0].input,
+            vec!["text".to_string(), "image".to_string()]
+        );
+        assert!(infos[0].models[0].supports_images());
+        assert!(infos[0].models[1].input.is_empty());
+        assert!(infos[0].models[1].supports_images());
+        assert_eq!(
             infos[0].models[0].reasoning_efforts,
             vec![
                 mizar_llm::ReasoningEffort::Low,

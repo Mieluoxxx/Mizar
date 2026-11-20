@@ -61,6 +61,7 @@ impl LlmAdapter for SimpleReplyAdapter {
                 context_window: Some(32_000),
                 max_tokens: Some(1_024),
                 reasoning_efforts: vec![],
+                input: Vec::new(),
             }],
         })
     }
@@ -310,9 +311,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
 
     // 触发一次 pre-step，验证 instructions 与 skills 监听器均正常向会话注入上下文
     let session = sessions.create(None);
-    session.append(SessionEvent::User {
-        text: "hello".into(),
-    });
+    session.append(SessionEvent::user("hello"));
     let _ = app
         .serial::<AgentPreStepEvent, ()>(
             EVENT_AGENT_PRE_STEP,
@@ -358,9 +357,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
 
     // 确认 instructions 与 skills 监听器已被卸载：新建会话不再收到对应 ContextNotice
     let session_after_unload = sessions.create(None);
-    session_after_unload.append(SessionEvent::User {
-        text: "after unload".into(),
-    });
+    session_after_unload.append(SessionEvent::user("after unload"));
     let _ = app
         .serial::<AgentPreStepEvent, ()>(
             EVENT_AGENT_PRE_STEP,
