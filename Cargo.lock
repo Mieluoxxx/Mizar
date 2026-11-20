@@ -1507,6 +1507,7 @@ dependencies = [
  "mizar-recall",
  "mizar-session",
  "mizar-session-sqlite",
+ "mizar-session-title",
  "mizar-skills",
  "mizar-system-prompt",
  "mizar-tool-fs",
@@ -1752,6 +1753,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mizar-session-title"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cordis",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "mizar-skills"
 version = "0.1.0"
 dependencies = [
@@ -1888,6 +1905,7 @@ dependencies = [
  "mizar-llm-router",
  "mizar-mcp",
  "mizar-session",
+ "mizar-session-title",
  "mizar-skills",
  "mizar-system-prompt",
  "mizar-tools",

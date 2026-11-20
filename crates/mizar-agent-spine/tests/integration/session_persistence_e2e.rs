@@ -98,7 +98,9 @@ async fn mount_spine_with_db(
     let app = Context::new();
     let spine_fiber = app.plugin(
         AgentSpinePlugin,
-        AgentSpineConfig::new(ws).with_session_db(db_path),
+        AgentSpineConfig::new(ws)
+            .with_session_db(db_path)
+            .with_disabled_plugins(["session-title"]),
     );
     app.plugin(
         PluginDef::sync("test-llm", move |ctx, ()| {

@@ -8,5 +8,10 @@ mod compaction_recall_e2e;
 mod instructions_e2e;
 #[cfg(all(feature = "legacy", feature = "sqlite", feature = "trajectory"))]
 mod session_persistence_e2e;
-#[cfg(all(feature = "coding", feature = "compaction", feature = "trajectory"))]
+#[cfg(all(
+    feature = "coding",
+    feature = "compaction",
+    feature = "session-title",
+    feature = "trajectory"
+))]
 mod spine_plugins;

@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cordis::{Context, Service};
 use mizar_llm::{ContentBlock, Message, ReplayEnvelope, TokenUsage};
 use mizar_session::{
-    SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery, SessionStore,
-    SessionTraceEvent, TraceSeverity,
+    SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
+    SessionPersistenceContextExt, SessionStore, SessionTraceEvent, TitleSource, TraceSeverity,
 };
 use mizar_session_sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
 
@@ -497,5 +497,140 @@ async fn persists_and_derives_user_images_through_sqlite() {
         msgs,
         vec![Message::user_with_images("看图定位异常", vec![img])]
     );
+    app2.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
+    let db_path = temp_db_path("v1_to_v2");
+    let _guard = TempDbGuard(db_path.clone());
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+    // 1. 用旧版 v1 schema 手动建表（不含 title_source 列）并写入一条记录
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 format_version INTEGER NOT NULL,
+                 cwd TEXT,
+                 title TEXT,
+                 parent_id TEXT,
+                 fork_seq INTEGER,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 event_count INTEGER NOT NULL DEFAULT 0,
+                 surface_count INTEGER NOT NULL DEFAULT 0,
+                 compacted_up_to_seq INTEGER
+             );
+             CREATE TABLE session_events (
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 visibility TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 PRIMARY KEY (session_id, seq)
+             );
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, format_version, cwd, title, created_at_ms, updated_at_ms, event_count, surface_count)
+             VALUES ('v1-sess', 1, '/work/legacy', 'legacy title', 1000, 1000, 1, 1);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events (session_id, seq, ts_ms, visibility, kind, payload_json)
+             VALUES ('v1-sess', 1, 1000, 'surface', 'user', '{\"type\":\"user\",\"text\":\"legacy\"}');",
+            [],
+        )
+        .unwrap();
+    }
+
+    // 2. 启动插件触发迁移，验证 user_version=2 与 title_source 读写
+    let app1 = Context::new();
+    app1.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app1.plugin(SessionStore::plugin(), ());
+    app1.plugin(
+        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+        (),
+    )
+    .await
+    .unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let ver: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 2);
+    }
+
+    let store1 = app1.sessions().unwrap();
+    let migrated = store1.get("v1-sess").unwrap();
+    assert_eq!(migrated.header().title.as_deref(), Some("legacy title"));
+    assert_eq!(migrated.header().title_source, None);
+
+    assert!(migrated.set_title("0320｜FIX｜人工修改标题"));
+    assert!(migrated.clear_title());
+    assert_eq!(migrated.header().title, None);
+    assert_eq!(migrated.header().title_source, None);
+
+    let forked = store1
+        .fork(
+            "v1-sess",
+            1,
+            SessionCreateOptions {
+                id: Some("fork-child".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(forked.header().title, None);
+
+    // 创建一个新会话，设置 Auto 标题并保留到重启后验证
+    let s2 = store1.create_with(SessionCreateOptions {
+        id: Some("s2-title".into()),
+        ..Default::default()
+    });
+    assert!(s2.set_title_with_source("0320｜FEA｜自动生成标题", TitleSource::Auto));
+    app1.session_persistence()
+        .unwrap()
+        .flush_async(None)
+        .await
+        .unwrap();
+    app1.fiber().dispose().await;
+
+    // 3. 重启后确认 Clear 与 Auto title_source 均被正确持久化
+    let app2 = Context::new();
+    app2.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app2.plugin(SessionStore::plugin(), ());
+    app2.plugin(
+        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let store2 = app2.sessions().unwrap();
+    let v1_reloaded = store2.get("v1-sess").unwrap();
+    assert_eq!(v1_reloaded.header().title, None);
+    assert_eq!(v1_reloaded.header().title_source, None);
+
+    let s2_reloaded = store2.get("s2-title").unwrap();
+    assert_eq!(
+        s2_reloaded.header().title.as_deref(),
+        Some("0320｜FEA｜自动生成标题")
+    );
+    assert_eq!(s2_reloaded.header().title_source, Some(TitleSource::Auto));
+
     app2.fiber().dispose().await;
 }

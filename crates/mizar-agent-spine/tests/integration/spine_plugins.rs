@@ -11,8 +11,8 @@ use futures::channel::mpsc;
 use mizar_agent_loop::{AgentLoopContextExt, AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
 use mizar_agent_spine::{
     AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CompactionContextExt,
-    EVENT_SPINE_PLUGINS_CHANGE, RECALL_SEARCH_TOOL_NAME, SpinePluginError, SpinePluginsChangeEvent,
-    SpinePluginsContextExt,
+    EVENT_SPINE_PLUGINS_CHANGE, RECALL_SEARCH_TOOL_NAME, SessionTitleContextExt,
+    SessionTitleRuntime, SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
 };
 use mizar_compaction::CompactionRuntime;
 use mizar_llm::{
@@ -192,6 +192,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         "skills",
         "instructions",
         "recall",
+        "session-title",
         "trajectory",
         "repeat-guard",
     ]);
@@ -245,9 +246,10 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let sessions = app.sessions().unwrap();
 
     // 1. 启动阶段全部可选模块均已跳过，工具与可选服务均未挂载
-    assert_eq!(ctrl.disabled_ids().len(), 10);
+    assert_eq!(ctrl.disabled_ids().len(), 11);
     for svc in [
         "compaction",
+        "sessionTitle",
         "mcp",
         "skills",
         "agentInstructions",
@@ -255,6 +257,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     ] {
         assert!(
             app.get::<CompactionRuntime>(svc).is_none()
+                && app.get::<SessionTitleRuntime>(svc).is_none()
                 && app.get::<McpManager>(svc).is_none()
                 && app.get::<SkillRegistry>(svc).is_none()
                 && app.get::<AgentInstructions>(svc).is_none()
@@ -417,6 +420,21 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         !comp_reloaded.config().auto_compact,
         "re-enabled compaction must preserve prior runtime config mutations"
     );
+
+    // 5b. session-title：热挂载 + 易变配置热更新 + 热卸载 + 再热挂载保留最新配置
+    assert!(ctrl.set_enabled("session-title", true).await.unwrap());
+    let st = app.session_title().unwrap();
+    st.update_config(|c| {
+        c.enabled = false;
+        c.model = Some("fast-title".into());
+    });
+    assert!(ctrl.set_enabled("session-title", false).await.unwrap());
+    assert!(app.get::<SessionTitleRuntime>("sessionTitle").is_none());
+    assert!(ctrl.set_enabled("session-title", true).await.unwrap());
+    let st_reloaded = app.session_title().unwrap();
+    assert!(!st_reloaded.config().enabled);
+    assert_eq!(st_reloaded.config().model.as_deref(), Some("fast-title"));
+    assert!(ctrl.set_enabled("session-title", false).await.unwrap());
 
     // 6. trajectory & repeat-guard：waterfall 钩子与服务卸载及恢复
     assert!(ctrl.set_enabled("trajectory", true).await.unwrap());

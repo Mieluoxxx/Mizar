@@ -26,6 +26,7 @@ mizar-llm-retry = { workspace = true }
 mizar-llm-router = { workspace = true }
 mizar-mcp = { workspace = true }
 mizar-session = { workspace = true }
+mizar-session-title = { workspace = true }
 mizar-skills = { workspace = true }
 mizar-system-prompt = { workspace = true }
 mizar-tools = { workspace = true }

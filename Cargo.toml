@@ -45,6 +45,7 @@ mizar-llm-retry = { path = "crates/mizar-llm-retry" }
 mizar-llm-router = { path = "crates/mizar-llm-router" }
 mizar-session = { path = "crates/mizar-session" }
 mizar-session-sqlite = { path = "crates/mizar-session-sqlite" }
+mizar-session-title = { path = "crates/mizar-session-title" }
 mizar-tools = { path = "crates/mizar-tools" }
 mizar-tools-coding = { path = "crates/mizar-tools-coding" }
 mizar-codemode = { path = "crates/mizar-codemode" }

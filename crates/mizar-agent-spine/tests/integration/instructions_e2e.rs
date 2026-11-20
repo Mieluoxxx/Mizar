@@ -127,7 +127,9 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
     let build_cfg = || {
         let loaded = load_mizar_config_with_global(&ws, Some(&global_dir));
         assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
-        let mut cfg = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
+        let mut cfg = AgentSpineConfig::coding(&ws)
+            .with_session_db(&db_path)
+            .with_disabled_plugins(["session-title"]);
         loaded.apply_to_spine(&mut cfg);
         if let AgentToolsMode::Coding {
             ref mut mcp,

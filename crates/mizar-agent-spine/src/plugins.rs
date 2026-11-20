@@ -6,7 +6,12 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-#[cfg(any(feature = "coding", feature = "compaction", feature = "trajectory"))]
+#[cfg(any(
+    feature = "coding",
+    feature = "compaction",
+    feature = "session-title",
+    feature = "trajectory"
+))]
 use cordis::Service;
 use cordis::{Context, CordisError, Fiber};
 use thiserror::Error;
@@ -22,6 +27,8 @@ use mizar_instructions::{AgentInstructions, InstructionsConfig};
 use mizar_mcp::{McpManager, McpPluginConfig};
 #[cfg(feature = "compaction")]
 use mizar_recall::{RecallConfig, RecallPlugin};
+#[cfg(feature = "session-title")]
+use mizar_session_title::{SessionTitleConfig, SessionTitleRuntime};
 #[cfg(feature = "coding")]
 use mizar_skills::{SkillRegistry, SkillRegistryConfig, SkillsConfig, SkillsPlugin};
 #[cfg(feature = "legacy")]
@@ -88,6 +95,7 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "instructions",
     "compaction",
     "recall",
+    "session-title",
     "trajectory",
     "repeat-guard",
 ];
@@ -148,6 +156,8 @@ pub(crate) enum ModuleSpec {
     Compaction(CompactionConfig),
     #[cfg(feature = "compaction")]
     Recall(RecallConfig),
+    #[cfg(feature = "session-title")]
+    SessionTitle(SessionTitleConfig),
     #[cfg(feature = "trajectory")]
     Trajectory(TrajectoryConfig),
     #[cfg(feature = "trajectory")]
@@ -224,6 +234,10 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         ]),
         #[cfg(feature = "compaction")]
         ModuleSpec::Recall(ref cfg) => Ok(vec![ctx.try_plugin(RecallPlugin, cfg.clone())?]),
+        #[cfg(feature = "session-title")]
+        ModuleSpec::SessionTitle(ref cfg) => Ok(vec![
+            ctx.try_plugin(SessionTitleRuntime::plugin(), cfg.clone())?,
+        ]),
         #[cfg(feature = "trajectory")]
         ModuleSpec::Trajectory(ref cfg) => Ok(vec![
             ctx.try_plugin(TrajectoryRuntime::plugin(), cfg.clone())?,
@@ -240,6 +254,7 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         feature = "legacy",
         feature = "coding",
         feature = "compaction",
+        feature = "session-title",
         feature = "trajectory"
     )),
     allow(dead_code)
@@ -329,6 +344,10 @@ async fn mount_module_and_wait(
         #[cfg(feature = "compaction")]
         ModuleSpec::Recall(ref cfg) => {
             mount_single_and_wait(ctx, id, RecallPlugin, cfg.clone()).await
+        }
+        #[cfg(feature = "session-title")]
+        ModuleSpec::SessionTitle(ref cfg) => {
+            mount_single_and_wait(ctx, id, SessionTitleRuntime::plugin(), cfg.clone()).await
         }
         #[cfg(feature = "trajectory")]
         ModuleSpec::Trajectory(ref cfg) => {
@@ -501,6 +520,12 @@ impl SpinePlugins {
                     && let Some(comp) = self.ctx.get::<CompactionRuntime>("compaction")
                 {
                     slot.spec = ModuleSpec::Compaction(comp.config());
+                }
+                #[cfg(feature = "session-title")]
+                if id == "session-title"
+                    && let Some(st) = self.ctx.get::<SessionTitleRuntime>("sessionTitle")
+                {
+                    slot.spec = ModuleSpec::SessionTitle(st.config());
                 }
                 Action::Disable(std::mem::take(&mut slot.fibers))
             } else {

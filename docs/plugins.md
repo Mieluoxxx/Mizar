@@ -1,6 +1,6 @@
 # Mizar 插件与模块清单
 
-本文档介绍 `crates/` 下共 **30 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
+本文档介绍 `crates/` 下共 **31 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
 
 目前仓库为纯 Virtual Workspace，唯一的终端入口为 `crates/mizar-tui/src/main.rs`（`mizar-tui`），通过 `mizar-agent-spine` 按需装配 Agent 能力并由纯前端工作台 `mizar-tui-ui` 渲染界面。**纯模型/纯 UI 层**与**异步插件宿主层**已彻底解耦。
 
@@ -111,11 +111,12 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 ---
 
-## 五、会话持久化
+## 五、会话持久化与标题管理
 
-| Crate | 插件结构体 | 插件名 | 提供服务名 | 作用 | 内部 Crate 依赖 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-session-sqlite`** | `SqlitePersistencePlugin` | `"session-persistence-sqlite"` | `"sessionPersistence"` | **嵌入式 SQLite 持久化 + FTS5 情景索引**：WAL 模式 + `busy_timeout`，独占 **Single-Writer 后台线程**通过批量事务提交把写入隔离在 Tokio 调度器外；只读连接加 `query_only`；内建无内容 FTS5 1..=3 Unicode scalar n-gram 索引（`session_recall_docs` + `session_recall_fts`），供 `mizar-recall` 毫秒级穿透检索中英文与代码标识符；支持关闭 `bundled` feature 以链接系统 SQLite。默认路径 `~/.mizar/sessions.sqlite`（`MIZAR_SESSION_DB` 可覆盖，设为 `none`/`off` 关闭落盘） | `cordis`、`mizar-llm-types`、`mizar-session` |
+| Crate | 插件结构体 | 插件名 | 提供服务名 | `inject` | 作用 | 内部 Crate 依赖 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`mizar-session-sqlite`** | `SqlitePersistencePlugin` | `"session-persistence-sqlite"` | `"sessionPersistence"` | 无 | **嵌入式 SQLite 持久化 + FTS5 情景索引**：WAL 模式 + `busy_timeout`，独占 **Single-Writer 后台线程**通过批量事务提交把写入隔离在 Tokio 调度器外；只读连接加 `query_only`；内建无内容 FTS5 1..=3 Unicode scalar n-gram 索引（`session_recall_docs` + `session_recall_fts`），供 `mizar-recall` 毫秒级穿透检索中英文与代码标识符；支持关闭 `bundled` feature 以链接系统 SQLite。默认路径 `~/.mizar/sessions.sqlite`（`MIZAR_SESSION_DB` 可覆盖，设为 `none`/`off` 关闭落盘） | `cordis`、`mizar-llm-types`、`mizar-session` |
+| **`mizar-session-title`** | `SessionTitleRuntime` | `"session-title"` | `"sessionTitle"` | `["llm", "sessions"]` | **后台异步会话标题自动生成**：订阅 `agent/turn-input`（仅提取 `SessionEvent::User` 消息），首轮输入及每隔 `refresh_interval_turns`（默认 20）轮异步生成 `MMDD｜TYPE｜Topic` 标题（`FEA/DES/FIX/OPT/REL/EXP/DOC/RES`）；自动跳过 `Offline Mock` 并尊重人工 `/rename` 所有权（`TitleSource::Manual`）与并发改名保护；失败静默不重试并保留 `derive_session_title` 兜底清洗标题；提供 `regenerate_now` 供 `/rename` 无参手动重生成 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session` |
 
 ---
 
@@ -132,8 +133,8 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理 12 个内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用）。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写配置 | 无（自身负责装配与控制） | `thiserror`、`tokio` 及按 Cargo features 选配的后端 crate |
-| **`mizar-tui`** | 可执行文件 `mizar` | 终端与无头 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，同时提供交互式 TUI 与非交互无头单次执行（`mizar exec` / `-p` / `--prompt-file`）。TUI 模式桥接 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样至纯前端 `mizar-tui-ui`；无头 `exec` 模式复用同套装配，支持 `--provider` / `--model` / `--protocol`（`--api-format`）/ `--base-url` / `--reasoning-effort` / `--max-steps` / `--timeout` / `--isolated`，严格校验路由与凭据且仅在 `stdout` 输出最终答案。CLI 同时支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r`、`--no-persist`、`--no-instructions`、`--theme` 与 `mizar update` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测，按需访问 `"spinePlugins"`、`compaction`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理 13 个内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用）。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写配置 | 无（自身负责装配与控制） | `thiserror`、`tokio` 及按 Cargo features 选配的后端 crate |
+| **`mizar-tui`** | 可执行文件 `mizar` | 终端与无头 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，同时提供交互式 TUI 与非交互无头单次执行（`mizar exec` / `-p` / `--prompt-file`）。TUI 模式桥接 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样至纯前端 `mizar-tui-ui`，支持欢迎画布、`!` / `!!` 本地 Bash 模式、可取消的 `/compact [focus]` 进度压缩、`/resume` 交互式会话选择器与 `/rename [title]` 改名/重生成，以及 `/settings`（`/config`）的 `[界面]` / `[运行]` / `[压缩]` / `[会话标题]` / `[模块]` 实时切换并原子回写 `~/.mizar/settings.json`；无头 `exec` 模式复用同套装配，支持 `--provider` / `--model` / `--protocol`（`--api-format`）/ `--base-url` / `--reasoning-effort` / `--max-steps` / `--timeout` / `--isolated`，严格校验路由与凭据且仅在 `stdout` 输出最终答案。CLI 同时支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r [id]`、`--no-persist`、`--no-instructions`、`--theme` 与 `mizar update` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测，按需访问 `"spinePlugins"`、`compaction`、`sessionTitle`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
 ---
 
@@ -149,7 +150,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 ┌─ 编排与观测层 ─────────────────────────────────────────────────────────────┐
 │  mizar-agent-loop      mizar-trajectory ──► mizar-trajectory-core          │
 │  (agentLoop)         (trajectory + repeat-tool-guard)                      │
-│  mizar-session-sqlite  (sessionPersistence)                                │
+│  mizar-session-sqlite (sessionPersistence) │ mizar-session-title (sessionTitle) │
 └───────────────────────────────┬────────────────────────────────────────────┘
                                 v
 ┌─ 工具与上下文管理插件层 ───────────────────────────────────────────────────┐
@@ -196,6 +197,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` / `followSubdirs` |
 | `compaction` | object | `enabled` / `autoCompact` / `autoPrune` / `softWindowCap`（默认 `380000`）/ `triggerRatio`（默认 `0.80`）/ `pruneThresholdChars`（默认 `6000`）/ `coldCacheIdleSecs`（默认 `300`）/ `reusePrefixCache` / `disableSummaryReasoning` / `enableReadDedup` / `enableWriteAfterCompactGuard` |
 | `recall` | object | `enabled` / `autoActivateOnCompaction` / `defaultSearchLimit`（默认 `8`）/ `readCharLimit`（默认 `6000`） |
+| `sessionTitle` | object | `enabled`（默认 `true`）/ `model`（可选 `provider/model`，省略则跟随当前会话模型）/ `thinkingLevel`（默认 `"low"`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 
 `models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/mizar-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，并额外支持每个 Server 的 `exposure` 与 `toolExposure`。

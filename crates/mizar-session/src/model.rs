@@ -348,6 +348,46 @@ fn default_format_version() -> u32 {
     SESSION_FORMAT_VERSION
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TitleSource {
+    Auto,
+    Manual,
+}
+
+impl TitleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TitlePatch {
+    #[default]
+    Keep,
+    Set(String),
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TitleSourcePatch {
+    #[default]
+    Keep,
+    Set(TitleSource),
+    Clear,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
@@ -358,6 +398,8 @@ pub struct SessionHeader {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<TitleSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -379,6 +421,7 @@ impl SessionHeader {
             format_version: SESSION_FORMAT_VERSION,
             cwd: None,
             title: None,
+            title_source: None,
             parent_id: None,
             fork_seq: None,
             created_at_ms: now_ms,
@@ -401,7 +444,8 @@ pub struct SessionCreateOptions {
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionHeaderPatch {
-    pub title: Option<String>,
+    pub title: TitlePatch,
+    pub title_source: TitleSourcePatch,
     pub updated_at_ms: Option<u128>,
     pub compacted_up_to_seq: Option<u64>,
 }
@@ -447,10 +491,259 @@ pub struct LoadedSession {
     pub skipped_events: usize,
 }
 
-/// 从首条用户输入提取简短单行会话标题（超过 72 字符自动截断）。
+fn is_mizar_bin_token(tok: &str) -> bool {
+    let trimmed = tok.trim_matches(|c| c == '"' || c == '\'');
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    base == "mizar" || base == "mizar.exe"
+}
+
+fn strip_mizar_resume_prefix(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let next_token = |start: usize| -> Option<(usize, usize, &str)> {
+        let mut i = start;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let quote = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let q = bytes[i];
+            i += 1;
+            Some(q)
+        } else {
+            None
+        };
+        let tok_start = if quote.is_some() { i - 1 } else { i };
+        while i < bytes.len() {
+            if let Some(q) = quote {
+                if bytes[i] == q {
+                    i += 1;
+                    break;
+                }
+            } else if bytes[i].is_ascii_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        Some((tok_start, i, &line[tok_start..i]))
+    };
+
+    let Some((_, mut cursor, first_tok)) = next_token(0) else {
+        return line;
+    };
+    if !is_mizar_bin_token(first_tok) {
+        return line;
+    }
+
+    let mut saw_resume = false;
+    while let Some((_, tok_end, tok)) = next_token(cursor) {
+        match tok {
+            "--resume" | "-r" => {
+                saw_resume = true;
+                cursor = tok_end;
+                if let Some((_, id_end, id_tok)) = next_token(cursor)
+                    && !id_tok.starts_with('-')
+                {
+                    cursor = id_end;
+                }
+                break;
+            }
+            t if t.starts_with("--resume=") => {
+                saw_resume = true;
+                cursor = tok_end;
+                break;
+            }
+            "-C" | "--workspace" | "-t" | "--tools" | "-xt" | "--exclude-tools" | "--theme" => {
+                cursor = tok_end;
+                if let Some((_, val_end, _)) = next_token(cursor) {
+                    cursor = val_end;
+                } else {
+                    break;
+                }
+            }
+            t if t.starts_with('-') => {
+                cursor = tok_end;
+            }
+            _ => break,
+        }
+    }
+
+    if saw_resume {
+        line[cursor..].trim_start()
+    } else {
+        line
+    }
+}
+
+fn is_abs_path_prefix_boundary(prev: char) -> bool {
+    prev.is_whitespace()
+        || matches!(
+            prev,
+            '(' | '[' | '{' | '<' | '"' | '\'' | '`' | ',' | '=' | ';'
+        )
+        || !prev.is_ascii()
+}
+
+fn is_path_stop_char(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '"' | '\''
+                | '`'
+                | ')'
+                | ']'
+                | '}'
+                | '>'
+                | ','
+                | ';'
+                | '，'
+                | '。'
+                | '；'
+                | '：'
+                | '、'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+        )
+}
+
+fn shorten_absolute_paths(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    let bytes = input.as_bytes();
+
+    while i < input.len() {
+        let ch = input[i..].chars().next().unwrap();
+        let prev_char = if i == 0 {
+            None
+        } else {
+            input[..i].chars().next_back()
+        };
+
+        // Unix 绝对路径：`/a/b/c`（排除 URL `://` 与根下只有 1~2 段的 `/settings`、`/tmp/x`）
+        if ch == '/'
+            && prev_char.is_none_or(is_abs_path_prefix_boundary)
+            && !input[i + 1..].starts_with('/')
+        {
+            let mut end = i + 1;
+            while end < input.len() {
+                let next_ch = input[end..].chars().next().unwrap();
+                if is_path_stop_char(next_ch) {
+                    break;
+                }
+                end += next_ch.len_utf8();
+            }
+            let raw_path = &input[i..end];
+            let trimmed_path = raw_path.trim_end_matches('/');
+            let segs: Vec<&str> = trimmed_path.split('/').filter(|s| !s.is_empty()).collect();
+            if segs.len() >= 3 {
+                out.push_str(segs[segs.len() - 2]);
+                out.push('/');
+                out.push_str(segs[segs.len() - 1]);
+                i = end;
+                continue;
+            }
+        }
+
+        // Windows 驱动器绝对路径：`C:\a\b\c`
+        if ch.is_ascii_alphabetic()
+            && prev_char.is_none_or(is_abs_path_prefix_boundary)
+            && bytes.get(i + 1) == Some(&b':')
+            && bytes.get(i + 2) == Some(&b'\\')
+        {
+            let mut end = i + 3;
+            while end < input.len() {
+                let next_ch = input[end..].chars().next().unwrap();
+                if is_path_stop_char(next_ch) {
+                    break;
+                }
+                end += next_ch.len_utf8();
+            }
+            let raw_path = &input[i + 3..end];
+            let segs: Vec<&str> = raw_path
+                .trim_end_matches('\\')
+                .split('\\')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if segs.len() >= 3 {
+                out.push_str(segs[segs.len() - 2]);
+                out.push('\\');
+                out.push_str(segs[segs.len() - 1]);
+                i = end;
+                continue;
+            }
+        }
+
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn is_uuid_boundary_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+fn looks_like_uuid_at(bytes: &[u8], idx: usize) -> bool {
+    if idx + 36 > bytes.len() {
+        return false;
+    }
+    if idx > 0 && is_uuid_boundary_char(bytes[idx - 1]) {
+        return false;
+    }
+    if idx + 36 < bytes.len() && is_uuid_boundary_char(bytes[idx + 36]) {
+        return false;
+    }
+    for (offset, &b) in bytes[idx..idx + 36].iter().enumerate() {
+        if matches!(offset, 8 | 13 | 18 | 23) {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn shorten_uuids(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        if looks_like_uuid_at(bytes, i) {
+            out.push_str(&input[i..i + 8]);
+            i += 36;
+        } else {
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// 从首条用户输入提取简短单行会话标题（剥离 `mizar --resume` 前缀、缩窄绝对路径与 UUID，超 72 字符截断）。
 pub fn derive_session_title(input: &str) -> Option<String> {
-    let first_line = input.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first_line = input
+        .lines()
+        .map(str::trim)
+        .map(strip_mizar_resume_prefix)
+        .find(|line| !line.is_empty())?;
+    let paths_cleaned = shorten_absolute_paths(first_line);
+    let uuid_cleaned = shorten_uuids(&paths_cleaned);
+    let collapsed = uuid_cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if collapsed.is_empty() {
         return None;
     }

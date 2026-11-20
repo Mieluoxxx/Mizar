@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use mizar_session::{
     LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
     SESSION_FORMAT_VERSION, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
-    SessionListQuery,
+    SessionListQuery, TitlePatch, TitleSource, TitleSourcePatch,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::oneshot;
@@ -200,9 +200,9 @@ fn insert_session_header(tx: &Transaction<'_>, h: &SessionHeader) -> Persistence
     let mut stmt = tx
         .prepare_cached(
             "INSERT OR IGNORE INTO sessions (
-                 id, format_version, cwd, title, parent_id, fork_seq,
+                 id, format_version, cwd, title, title_source, parent_id, fork_seq,
                  created_at_ms, updated_at_ms, event_count, surface_count, compacted_up_to_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .map_err(map_sqlite_err)?;
 
@@ -211,6 +211,7 @@ fn insert_session_header(tx: &Transaction<'_>, h: &SessionHeader) -> Persistence
         i64::from(h.format_version),
         h.cwd,
         h.title,
+        h.title_source.map(TitleSource::as_str),
         h.parent_id,
         h.fork_seq.map(|v| v as i64),
         millis_to_i64(h.created_at_ms),
@@ -325,16 +326,33 @@ fn update_header_in_tx(
     session_id: &str,
     patch: &SessionHeaderPatch,
 ) -> PersistenceResult<()> {
+    let (apply_title, title_val): (i64, Option<&str>) = match &patch.title {
+        TitlePatch::Keep => (0, None),
+        TitlePatch::Set(v) => (1, Some(v.as_str())),
+        TitlePatch::Clear => (1, None),
+    };
+    let (apply_source, source_val): (i64, Option<&str>) = match patch.title_source {
+        TitleSourcePatch::Keep => (0, None),
+        TitleSourcePatch::Set(s) => (1, Some(s.as_str())),
+        TitleSourcePatch::Clear => (1, None),
+    };
     let mut stmt = tx
         .prepare_cached(
             "UPDATE sessions
-             SET title = COALESCE(?2, title),
+             SET title = CASE
+                     WHEN ?2 != 0 THEN ?3
+                     ELSE title
+                 END,
+                 title_source = CASE
+                     WHEN ?4 != 0 THEN ?5
+                     ELSE title_source
+                 END,
                  updated_at_ms = CASE
-                     WHEN ?3 IS NOT NULL THEN MAX(updated_at_ms, ?3)
+                     WHEN ?6 IS NOT NULL THEN MAX(updated_at_ms, ?6)
                      ELSE updated_at_ms
                  END,
                  compacted_up_to_seq = CASE
-                     WHEN ?4 IS NOT NULL THEN MAX(COALESCE(compacted_up_to_seq, 0), ?4)
+                     WHEN ?7 IS NOT NULL THEN MAX(COALESCE(compacted_up_to_seq, 0), ?7)
                      ELSE compacted_up_to_seq
                  END
              WHERE id = ?1",
@@ -342,7 +360,10 @@ fn update_header_in_tx(
         .map_err(map_sqlite_err)?;
     stmt.execute(params![
         session_id,
-        patch.title,
+        apply_title,
+        title_val,
+        apply_source,
+        source_val,
         patch.updated_at_ms.map(millis_to_i64),
         patch.compacted_up_to_seq.map(|v| v as i64),
     ])

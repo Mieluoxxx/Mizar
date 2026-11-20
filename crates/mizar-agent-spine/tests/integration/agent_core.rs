@@ -425,7 +425,8 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
 
     app.plugin(
         AgentSpinePlugin,
-        AgentSpineConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        AgentSpineConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .with_disabled_plugins(["session-title"]),
     );
     app.plugin(
         PluginDef::sync("looping-adapter", |ctx, ()| {

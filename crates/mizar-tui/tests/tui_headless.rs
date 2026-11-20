@@ -5,23 +5,31 @@ use std::time::Duration;
 use cordis::{Cleanup, Context, LogLevel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use mizar_agent_loop::{AgentLoopContextExt, RunOptions};
-use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+use mizar_agent_spine::{
+    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, SessionTitleContextExt,
+    load_mizar_config_with_global,
+};
+use mizar_llm::{
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, ModelInfo,
+    ProviderInfo, ReasoningEffort, StreamChunk,
+};
 use mizar_llm_mock::MockPlugin;
-use mizar_session::{SessionContextExt, SessionEvent};
+use mizar_session::{SessionContextExt, SessionCreateOptions, SessionEvent, TitleSource};
 use mizar_system_prompt::SystemPromptContextExt;
 use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
 use mizar_tui::app::ToolExtraMeta;
 use mizar_tui::editor::display_width;
 use mizar_tui::emphasis::mount_reply_guidance_section;
-use mizar_tui::overlay::{ApprovalDecision, SkillPickerItem};
+use mizar_tui::overlay::{ApprovalDecision, OverlayKind, SkillPickerItem};
 use mizar_tui::selection::extract_selected_text;
 use mizar_tui::side_panel::{FileTouchRow, ToolSummaryRow};
 use mizar_tui::{
     AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, ScreenMode,
-    SessionReplayItem, SessionViewData, UiEvent, build_item_lines_for_scrollback,
-    build_welcome_lines_for_scrollback, latest_workspace_selection, project_fork_view,
-    project_resume_view, project_session_tree, render, subscribe_session_events, to_ui_log_record,
-    wait_for_services,
+    SessionReplayItem, SessionViewData, TuiConfig, UiEvent, apply_runtime_setting_change,
+    build_item_lines_for_scrollback, build_settings_entries, build_welcome_lines_for_scrollback,
+    collect_session_picker_items, latest_workspace_selection, persist_setting_change_to,
+    project_fork_view, project_resume_view, project_session_tree, render, resume_session_into_app,
+    subscribe_session_events, to_ui_log_record, wait_for_services,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1240,7 +1248,9 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
     let boot_ctx = |root: PathBuf, db: PathBuf| async move {
         let ctx = Context::new();
         ctx.logger().set_silent();
-        let mut spine_cfg = AgentSpineConfig::coding(root).with_session_db(db);
+        let mut spine_cfg = AgentSpineConfig::coding(root)
+            .with_session_db(db)
+            .with_disabled_plugins(["session-title"]);
         if let AgentToolsMode::Coding {
             ref mut mcp,
             ref mut skills,
@@ -2118,7 +2128,7 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
 
     let ctx = Context::new();
     ctx.logger().set_silent();
-    let mut cfg = AgentSpineConfig::coding(tmp.clone());
+    let mut cfg = AgentSpineConfig::coding(tmp.clone()).with_disabled_plugins(["session-title"]);
     if let AgentToolsMode::Coding {
         ref mut mcp,
         ref mut skills,
@@ -2272,7 +2282,8 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
     let app_ctx = Context::new();
     app_ctx.logger().set_silent();
 
-    let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        .with_disabled_plugins(["session-title"]);
     if let AgentToolsMode::Coding {
         ref mut mcp,
         ref mut skills,
@@ -2583,4 +2594,391 @@ async fn session_command_survives_sqlite_resume_restores_usage_and_renders_reado
 
     ctx2.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&tmp_root);
+}
+
+#[tokio::test]
+async fn session_title_settings_model_picker_persists_and_reloads_on_restart() {
+    let tmp =
+        std::env::temp_dir().join(format!("mizar_tui_st_settings_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let global_dir = tmp.join("global");
+    let proj_dir = tmp.join("workspace");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let settings_path = global_dir.join("settings.json");
+
+    let providers = vec![ProviderInfo {
+        id: "openai".into(),
+        name: "OpenAI".into(),
+        protocol: "openai-responses".into(),
+        models: vec![
+            ModelInfo {
+                id: "gpt-5".into(),
+                name: "GPT-5".into(),
+                context_window: Some(128_000),
+                max_tokens: Some(16_384),
+                reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                input: Vec::new(),
+            },
+            ModelInfo {
+                id: "gpt-4o-mini".into(),
+                name: "GPT-4o Mini".into(),
+                context_window: Some(128_000),
+                max_tokens: Some(4_096),
+                reasoning_efforts: vec![ReasoningEffort::Low],
+                input: Vec::new(),
+            },
+        ],
+    }];
+
+    // 1. 启动宿主装配 Spine，确认 build_settings_entries 暴露 [会话标题] 三项配置
+    let ctx1 = Context::new();
+    ctx1.logger().set_silent();
+    let mut cfg1 = AgentSpineConfig::coding(&proj_dir);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg1.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx1.plugin(AgentSpinePlugin, cfg1);
+    wait_for_services(&ctx1).await.unwrap();
+
+    let s1 = ctx1.sessions().unwrap().create(None);
+    let mut app = AppState::new(
+        proj_dir.clone(),
+        s1.id.clone(),
+        providers,
+        Some("openai".into()),
+        Some("gpt-5".into()),
+        Some(ReasoningEffort::High),
+    );
+    let entries = build_settings_entries(&ctx1, &app);
+    let model_idx = entries
+        .iter()
+        .position(|e| e.key == "sessionTitle.model")
+        .expect("sessionTitle.model setting must exist");
+    assert_eq!(entries[model_idx].display_value(), "跟随会话模型");
+    let thinking_entry = entries
+        .iter()
+        .find(|e| e.key == "sessionTitle.thinkingLevel")
+        .unwrap();
+    assert_eq!(thinking_entry.display_value(), "◂ low ▸");
+
+    // 2. 在 /settings 中选到 sessionTitle.model -> Enter -> 选择 openai/gpt-4o-mini
+    app.overlay
+        .open_settings(entries, None, settings_path.display().to_string());
+    for _ in 0..model_idx {
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        AppAction::None
+    );
+    assert!(matches!(
+        app.overlay.active,
+        Some(OverlayKind::ModelPicker { .. })
+    ));
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let pick_act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        pick_act,
+        AppAction::ApplySetting {
+            key: "sessionTitle.model".into(),
+            value: "openai/gpt-4o-mini".into(),
+        }
+    );
+    // 确认不会改变当前会话自身活跃模型
+    assert_eq!(app.provider.as_deref(), Some("openai"));
+    assert_eq!(app.model.as_deref(), Some("gpt-5"));
+
+    // 3. 热生效 + 原子持久化写入 settings.json
+    apply_runtime_setting_change(&ctx1, "sessionTitle.model", "openai/gpt-4o-mini");
+    persist_setting_change_to(&settings_path, "sessionTitle.model", "openai/gpt-4o-mini").unwrap();
+    apply_runtime_setting_change(&ctx1, "sessionTitle.thinkingLevel", "medium");
+    persist_setting_change_to(&settings_path, "sessionTitle.thinkingLevel", "medium").unwrap();
+    apply_runtime_setting_change(&ctx1, "sessionTitle.enabled", "false");
+    persist_setting_change_to(&settings_path, "sessionTitle.enabled", "false").unwrap();
+
+    let st_rt = ctx1.session_title().unwrap();
+    assert!(!st_rt.config().enabled);
+    assert_eq!(st_rt.config().provider.as_deref(), Some("openai"));
+    assert_eq!(st_rt.config().model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(
+        st_rt.config().reasoning_effort,
+        Some(ReasoningEffort::Medium)
+    );
+    ctx1.fiber().dispose().await;
+
+    // 4. 模拟重启后从 settings.json 重新加载并验证配置恢复
+    let loaded = load_mizar_config_with_global(&proj_dir, Some(&global_dir));
+    assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+    let mut cfg2 = AgentSpineConfig::coding(&proj_dir);
+    loaded.apply_to_spine(&mut cfg2);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg2.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    let ctx2 = Context::new();
+    ctx2.logger().set_silent();
+    ctx2.plugin(AgentSpinePlugin, cfg2);
+    wait_for_services(&ctx2).await.unwrap();
+
+    let st2 = ctx2.session_title().unwrap();
+    assert!(!st2.config().enabled);
+    assert_eq!(st2.config().provider.as_deref(), Some("openai"));
+    assert_eq!(st2.config().model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(st2.config().reasoning_effort, Some(ReasoningEffort::Medium));
+
+    // 清空 model 应从 settings.json 移除 model 键并恢复为 跟随会话模型
+    persist_setting_change_to(&settings_path, "sessionTitle.model", "").unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert!(raw["sessionTitle"].get("model").is_none());
+
+    ctx2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picker() {
+    use std::sync::Mutex;
+
+    struct TitleAwareAdapter {
+        calls: Arc<Mutex<Vec<GenerateOptions>>>,
+    }
+
+    impl LlmAdapter for TitleAwareAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "fake".into(),
+                name: "FakeCloud".into(),
+                protocol: "mock".into(),
+                models: vec![ModelInfo {
+                    id: "smart-1".into(),
+                    name: "Smart 1".into(),
+                    context_window: Some(64_000),
+                    max_tokens: Some(4096),
+                    reasoning_efforts: vec![ReasoningEffort::Low],
+                    input: Vec::new(),
+                }],
+            })
+        }
+
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            self.calls.lock().unwrap().push(options.clone());
+            let is_title_prompt = options
+                .messages
+                .first()
+                .map(|m| m.text_content().contains("TYPE｜Topic"))
+                .unwrap_or(false);
+            let reply = if is_title_prompt {
+                "FEA｜终端会话标题与恢复"
+            } else {
+                "收到，已处理完成"
+            };
+            let chunks = vec![
+                Ok(StreamChunk::text(reply)),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }),
+            ];
+            Box::pin(futures::stream::iter(chunks))
+        }
+    }
+
+    let tmp =
+        std::env::temp_dir().join(format!("mizar_tui_title_resume_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let ws = tmp.join("my-repo");
+    std::fs::create_dir_all(&ws).unwrap();
+    let db_path = tmp.join("sessions.sqlite");
+
+    let recorded_calls = Arc::new(Mutex::new(Vec::new()));
+    let adapter = Arc::new(TitleAwareAdapter {
+        calls: Arc::clone(&recorded_calls),
+    });
+
+    let ctx = Context::new();
+    ctx.logger().set_silent();
+    let mut cfg = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
+    cfg.agent.provider = Some("fake".into());
+    cfg.agent.model = Some("smart-1".into());
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx.plugin(AgentSpinePlugin, cfg);
+    wait_for_services(&ctx).await.unwrap();
+    let _llm_handle = ctx
+        .llm()
+        .unwrap()
+        .register_adapter("fake", adapter)
+        .unwrap();
+
+    // 1. 创建一个空会话（event_count == 0）与一个真实对话会话
+    let empty_sess = ctx.sessions().unwrap().create_with(SessionCreateOptions {
+        id: Some("sess-empty".into()),
+        cwd: Some(ws.display().to_string()),
+        ..Default::default()
+    });
+    assert_eq!(empty_sess.header().event_count, 0);
+
+    let mut active_session = ctx.sessions().unwrap().create_with(SessionCreateOptions {
+        id: Some("sess-target".into()),
+        cwd: Some(ws.display().to_string()),
+        ..Default::default()
+    });
+    let active_sid = Arc::new(RwLock::new(active_session.id.clone()));
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+    let _subs = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone()).unwrap();
+
+    let mut app = AppState::new(
+        ws.clone(),
+        active_session.id.clone(),
+        ctx.llm().unwrap().provider_infos(),
+        Some("fake".into()),
+        Some("smart-1".into()),
+        Some(ReasoningEffort::Medium),
+    );
+
+    // 2. 跑一轮真实 AgentLoop：首轮异步触发标题生成，回写并经由事件流更新 app.session_title
+    let reply = ctx
+        .agent_loop()
+        .unwrap()
+        .run(
+            Arc::clone(&active_session),
+            "mizar --resume 12345678-1234-1234-1234-123456789abc 实现会话标题生成",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "收到，已处理完成");
+
+    let mut generated_title = None;
+    for _ in 0..80 {
+        while let Ok(ev) = ui_rx.try_recv() {
+            app.apply_ui_event(ev);
+        }
+        if active_session
+            .header()
+            .title
+            .as_deref()
+            .is_some_and(|t| t.contains("｜FEA｜终端会话标题与恢复"))
+        {
+            generated_title = active_session.header().title.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    while let Ok(ev) = ui_rx.try_recv() {
+        app.apply_ui_event(ev);
+    }
+    let generated_title = generated_title.expect("background title must update session header");
+    assert_eq!(app.session_title.as_deref(), Some(generated_title.as_str()));
+    assert_eq!(
+        active_session.header().title_source,
+        Some(TitleSource::Auto)
+    );
+
+    // 3. collect_session_picker_items 过滤空会话（仅留 sess-target），开启新会话后通过选择器切换回来
+    let picker_items = collect_session_picker_items(&ctx.sessions().unwrap());
+    assert_eq!(picker_items.len(), 1);
+    assert_eq!(picker_items[0].session_id, "sess-target");
+    assert_eq!(picker_items[0].title, generated_title);
+    assert_eq!(picker_items[0].cwd_tail, "my-repo");
+
+    // 切到一个新会话，再从 SessionPicker 选回 sess-target
+    let fresh = ctx.sessions().unwrap().create_with(SessionCreateOptions {
+        id: Some("sess-fresh".into()),
+        cwd: Some(ws.display().to_string()),
+        ..Default::default()
+    });
+    *active_sid.write().unwrap() = fresh.id.clone();
+    app.reset_for_new_session(fresh.id.clone(), None);
+    active_session = fresh;
+
+    app.overlay.open_session_picker(picker_items);
+    let select_act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(select_act, AppAction::ResumeSession("sess-target".into()));
+
+    let tui_cfg = TuiConfig::new(&ws);
+    assert!(
+        resume_session_into_app(
+            &ctx,
+            &tui_cfg,
+            &mut app,
+            &mut active_session,
+            &active_sid,
+            "sess-target",
+        )
+        .await
+    );
+    assert_eq!(app.session_id, "sess-target");
+    assert_eq!(app.session_title.as_deref(), Some(generated_title.as_str()));
+
+    // 4. 手工 /rename 后标题及 Manual 所有权应落盘，重启 SQLite 仍可读取
+    assert!(active_session.set_title("0402｜FIX｜手工修订标题"));
+    while let Ok(ev) = ui_rx.try_recv() {
+        app.apply_ui_event(ev);
+    }
+    assert_eq!(
+        app.session_title.as_deref(),
+        Some("0402｜FIX｜手工修订标题")
+    );
+    active_session.flush_async().await.unwrap();
+    ctx.fiber().dispose().await;
+
+    let ctx_restarted = Context::new();
+    ctx_restarted.logger().set_silent();
+    let mut cfg_r = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg_r.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx_restarted.plugin(AgentSpinePlugin, cfg_r);
+    wait_for_services(&ctx_restarted).await.unwrap();
+
+    let reloaded = ctx_restarted
+        .sessions()
+        .unwrap()
+        .get("sess-target")
+        .unwrap();
+    assert_eq!(
+        reloaded.header().title.as_deref(),
+        Some("0402｜FIX｜手工修订标题")
+    );
+    assert_eq!(reloaded.header().title_source, Some(TitleSource::Manual));
+
+    ctx_restarted.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&tmp);
 }

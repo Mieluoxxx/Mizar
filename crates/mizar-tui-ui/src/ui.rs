@@ -293,20 +293,31 @@ fn build_welcome_section(app: &AppState, width: usize, height: usize) -> Welcome
         ],
         width,
     );
+    let mut session_spans = vec![Span::styled(
+        short_id(&app.session_id).to_string(),
+        Style::default().fg(theme.text_muted),
+    )];
+    if let Some(title) = app
+        .session_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        session_spans.push(Span::styled(" · ", Style::default().fg(theme.border)));
+        session_spans.push(Span::styled(
+            truncate_display(title, width.saturating_sub(36).max(16)),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ));
+    }
+    session_spans.push(Span::raw("   "));
+    session_spans.push(Span::styled(
+        format!("approval: {}", app.approval_mode.as_str()),
+        Style::default().fg(theme.text_dim),
+    ));
     push_welcome_wrapped(
         &mut lines,
         Span::styled("  会话    ", Style::default().fg(theme.text_dim)),
-        vec![
-            Span::styled(
-                short_id(&app.session_id).to_string(),
-                Style::default().fg(theme.text_muted),
-            ),
-            Span::raw("   "),
-            Span::styled(
-                format!("approval: {}", app.approval_mode.as_str()),
-                Style::default().fg(theme.text_dim),
-            ),
-        ],
+        session_spans,
         width,
     );
     lines.push(RenderedLine::hard(Line::raw("")));
@@ -2345,16 +2356,40 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
                 .fg(theme.success)
                 .add_modifier(Modifier::BOLD),
         ));
-    } else if avail >= 96 {
-        let toggle_hint = if app.verbose_expanded {
-            "Ctrl+O 收起"
+    } else {
+        if let Some(title) = app
+            .session_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && avail >= 64
+        {
+            spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
+            spans.push(Span::styled(
+                truncate_display(title, 28),
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+        let hint_min_avail = if app
+            .session_title
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            120
         } else {
-            "Ctrl+O 展开"
+            96
         };
-        spans.push(Span::styled(
-            format!(" │ {toggle_hint} · Ctrl+B 侧栏 · Ctrl+T 轨迹 · ? 帮助"),
-            Style::default().fg(theme.text_dim),
-        ));
+        if avail >= hint_min_avail {
+            let toggle_hint = if app.verbose_expanded {
+                "Ctrl+O 收起"
+            } else {
+                "Ctrl+O 展开"
+            };
+            spans.push(Span::styled(
+                format!(" │ {toggle_hint} · Ctrl+B 侧栏 · Ctrl+T 轨迹 · ? 帮助"),
+                Style::default().fg(theme.text_dim),
+            ));
+        }
     }
 
     frame
@@ -3507,6 +3542,24 @@ mod tests {
         assert!(
             !busy.contains("✗ 请求失败"),
             "busy should clear prior error:\n{busy}"
+        );
+    }
+
+    #[test]
+    fn renders_session_title_in_status_bar_and_welcome_card() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-title-vis",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.session_title = Some("0402｜FEA｜会话标题展示".into());
+        let screen = render_buffer_text(&mut app, 110, 28);
+        assert!(
+            screen.contains("0402｜FEA｜会话标题展示"),
+            "screen:\n{screen}"
         );
     }
 }

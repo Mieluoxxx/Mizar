@@ -20,7 +20,8 @@ pub use model::{
     CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
     RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
     SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionSelection,
-    SessionTraceEvent, TraceSeverity, derive_session_title,
+    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
+    derive_session_title,
 };
 pub use persistence::{
     PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionPersistence,
@@ -29,6 +30,7 @@ pub use persistence::{
 
 pub const EVENT_SESSION_EVENT: &str = "session/event";
 pub const EVENT_SESSION_CREATED: &str = "session/created";
+pub const EVENT_SESSION_TITLE_UPDATED: &str = "session/title-updated";
 
 #[derive(Clone)]
 pub struct SessionEventPayload {
@@ -39,6 +41,13 @@ pub struct SessionEventPayload {
 #[derive(Clone)]
 pub struct SessionCreatedPayload {
     pub session: Arc<Session>,
+}
+
+#[derive(Clone)]
+pub struct SessionTitleUpdatedPayload {
+    pub session: Arc<Session>,
+    pub title: Option<String>,
+    pub title_source: Option<TitleSource>,
 }
 
 struct SessionInner {
@@ -258,7 +267,7 @@ impl Session {
     /// 追加一条事件（`Surface` 或 `LogOnly`），同步写入可选持久化队列，并广播 `session/event`。
     pub fn append(self: &Arc<Self>, event: SessionEvent) {
         let persistence = self.ctx.session_persistence();
-        let entry = {
+        let (entry, emitted_title) = {
             let mut inner = self.inner.lock().unwrap();
             let seq = inner.log.last().map_or(1, |e| e.seq + 1);
             let ts = now_millis();
@@ -271,26 +280,33 @@ impl Session {
             }
 
             let mut title_patch: Option<SessionHeaderPatch> = None;
+            let mut emitted_title: Option<(Option<String>, Option<TitleSource>)> = None;
             match &entry.event {
                 SessionEvent::User { text, .. } if inner.header.title.is_none() => {
                     if let Some(title) = derive_session_title(text) {
                         inner.header.title = Some(title.clone());
+                        inner.header.title_source = Some(TitleSource::Auto);
                         title_patch = Some(SessionHeaderPatch {
-                            title: Some(title),
+                            title: TitlePatch::Set(title.clone()),
+                            title_source: TitleSourcePatch::Set(TitleSource::Auto),
                             updated_at_ms: Some(ts),
                             compacted_up_to_seq: None,
                         });
+                        emitted_title = Some((Some(title), Some(TitleSource::Auto)));
                     }
                 }
                 SessionEvent::BashExecution { command, .. } if inner.header.title.is_none() => {
                     let cmd_title = format!("! {command}");
                     if let Some(title) = derive_session_title(&cmd_title) {
                         inner.header.title = Some(title.clone());
+                        inner.header.title_source = Some(TitleSource::Auto);
                         title_patch = Some(SessionHeaderPatch {
-                            title: Some(title),
+                            title: TitlePatch::Set(title.clone()),
+                            title_source: TitleSourcePatch::Set(TitleSource::Auto),
                             updated_at_ms: Some(ts),
                             compacted_up_to_seq: None,
                         });
+                        emitted_title = Some((Some(title), Some(TitleSource::Auto)));
                     }
                 }
                 SessionEvent::Compaction { first_kept_seq, .. } => {
@@ -301,7 +317,8 @@ impl Session {
                             .map_or(*first_kept_seq, |prev| prev.max(*first_kept_seq)),
                     );
                     title_patch = Some(SessionHeaderPatch {
-                        title: None,
+                        title: TitlePatch::Keep,
+                        title_source: TitleSourcePatch::Keep,
                         updated_at_ms: Some(ts),
                         compacted_up_to_seq: inner.header.compacted_up_to_seq,
                     });
@@ -326,7 +343,7 @@ impl Session {
                 }
             }
 
-            entry
+            (entry, emitted_title)
         };
 
         self.ctx.emit(
@@ -336,6 +353,121 @@ impl Session {
                 entry,
             },
         );
+        if let Some((title, title_source)) = emitted_title {
+            self.ctx.emit(
+                EVENT_SESSION_TITLE_UPDATED,
+                SessionTitleUpdatedPayload {
+                    session: Arc::clone(self),
+                    title,
+                    title_source,
+                },
+            );
+        }
+    }
+
+    /// 设置会话标题（标记为人工设置 `TitleSource::Manual`）。
+    /// 空标题返回 `false` 且不做修改。
+    pub fn set_title(self: &Arc<Self>, title: impl Into<String>) -> bool {
+        self.set_title_with_source(title, TitleSource::Manual)
+    }
+
+    /// 设置会话标题及来源（`Auto` / `Manual`）。
+    /// 空标题或与当前完全一致时返回 `false`。
+    pub fn set_title_with_source(
+        self: &Arc<Self>,
+        title: impl Into<String>,
+        source: TitleSource,
+    ) -> bool {
+        let cleaned = title.into().replace(['\r', '\n'], " ").trim().to_string();
+        if cleaned.is_empty() {
+            return false;
+        }
+        let persistence = self.ctx.session_persistence();
+        let ts = now_millis();
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.header.title.as_deref() == Some(cleaned.as_str())
+                && inner.header.title_source == Some(source)
+            {
+                false
+            } else {
+                inner.header.title = Some(cleaned.clone());
+                inner.header.title_source = Some(source);
+                inner.header.updated_at_ms = inner.header.updated_at_ms.max(ts);
+                if let Some(ref backend) = persistence
+                    && let Err(err) = backend.update_header(
+                        &self.id,
+                        SessionHeaderPatch {
+                            title: TitlePatch::Set(cleaned.clone()),
+                            title_source: TitleSourcePatch::Set(source),
+                            updated_at_ms: Some(ts),
+                            compacted_up_to_seq: None,
+                        },
+                    )
+                {
+                    self.ctx
+                        .logger_named("session")
+                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                }
+                true
+            }
+        };
+        if !changed {
+            return false;
+        }
+        self.ctx.emit(
+            EVENT_SESSION_TITLE_UPDATED,
+            SessionTitleUpdatedPayload {
+                session: Arc::clone(self),
+                title: Some(cleaned),
+                title_source: Some(source),
+            },
+        );
+        true
+    }
+
+    /// 清空会话标题与来源标记。
+    pub fn clear_title(self: &Arc<Self>) -> bool {
+        let persistence = self.ctx.session_persistence();
+        let ts = now_millis();
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.header.title.is_none() && inner.header.title_source.is_none() {
+                false
+            } else {
+                inner.header.title = None;
+                inner.header.title_source = None;
+                inner.header.updated_at_ms = inner.header.updated_at_ms.max(ts);
+                if let Some(ref backend) = persistence
+                    && let Err(err) = backend.update_header(
+                        &self.id,
+                        SessionHeaderPatch {
+                            title: TitlePatch::Clear,
+                            title_source: TitleSourcePatch::Clear,
+                            updated_at_ms: Some(ts),
+                            compacted_up_to_seq: None,
+                        },
+                    )
+                {
+                    self.ctx
+                        .logger_named("session")
+                        .warn(format!("持久化清空标题失败 (session={}): {err}", self.id));
+                }
+                true
+            }
+        };
+        if !changed {
+            return false;
+        }
+        self.ctx.emit(
+            EVENT_SESSION_TITLE_UPDATED,
+            SessionTitleUpdatedPayload {
+                session: Arc::clone(self),
+                title: None,
+                title_source: None,
+            },
+        );
+        true
     }
 
     /// 便捷追加一条仅用于审计/轨迹回放的 `LogOnly` 边界事件。
@@ -634,6 +766,7 @@ impl SessionStore {
         let mut header = SessionHeader::new(id.clone(), now);
         header.cwd = opts.cwd.or_else(|| self.default_cwd());
         header.title = opts.title;
+        header.title_source = header.title.as_ref().map(|_| TitleSource::Manual);
         header.parent_id = opts.parent_id;
         header.fork_seq = opts.fork_seq;
 
@@ -754,7 +887,8 @@ impl SessionStore {
             .cwd
             .or(parent_header.cwd)
             .or_else(|| self.default_cwd());
-        new_header.title = opts.title.or(parent_header.title);
+        new_header.title = opts.title;
+        new_header.title_source = new_header.title.as_ref().map(|_| TitleSource::Manual);
         new_header.parent_id = Some(from_session_id.to_string());
         new_header.fork_seq = Some(up_to_seq);
 
