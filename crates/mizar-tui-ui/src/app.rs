@@ -400,6 +400,8 @@ pub struct AppState {
 
     // 用量与性能仪表
     pub total_usage: TokenUsage,
+    /// 最近一次完成步骤的完整 prompt 体积（含缓存命中/写入），用于上下文占用估算。
+    pub last_prompt_tokens: Option<u64>,
     pub last_step_start_ms: Option<u128>,
     pub last_ttft_ms: Option<u64>,
     pub ttft_history: Vec<u64>,
@@ -488,6 +490,7 @@ impl AppState {
             last_viewport_height: 0,
             last_total_lines: 0,
             total_usage: TokenUsage::default(),
+            last_prompt_tokens: None,
             last_step_start_ms: None,
             last_ttft_ms: None,
             ttft_history: Vec::new(),
@@ -751,14 +754,18 @@ impl AppState {
         let est = |chars: usize| -> u64 { (chars as u64).div_ceil(4) };
         let used_est =
             (est(user_chars) + est(asst_chars) + est(reason_chars) + est(tool_chars)).max(1);
-        let measured = self.total_usage.input_tokens + self.total_usage.output_tokens;
-        let scale = if measured > 0 {
-            measured as f64 / used_est as f64
-        } else {
-            1.0
+        // 上下文占用优先用最近一次请求的实测 prompt 全量（含缓存命中与写入），
+        // 缺失时才以字符估算为基准；`scale` 仅用于把各段字符比例拉回字数。
+        let measured = self.last_prompt_tokens.filter(|v| *v > 0);
+        let scale = match measured {
+            Some(v) => v as f64 / used_est as f64,
+            None => 1.0,
         };
         self.side_panel_data.context = ContextBreakdownSnapshot {
-            system_tokens: (measured / 10).max(512),
+            system_tokens: match measured {
+                Some(v) => (v / 10).max(512),
+                None => 512,
+            },
             user_tokens: ((est(user_chars) as f64) * scale).round() as u64,
             assistant_tokens: ((est(asst_chars) as f64) * scale).round() as u64,
             reasoning_tokens: ((est(reason_chars) as f64) * scale).round() as u64,
@@ -769,8 +776,11 @@ impl AppState {
             tps_history: self.tps_history.clone(),
             ttft_history: self.ttft_history.clone(),
             cache_read_tokens: self.total_usage.cache_read_tokens.unwrap_or(0),
+            cache_write_tokens: self.total_usage.cache_write_tokens.unwrap_or(0),
             input_tokens: self.total_usage.input_tokens,
             output_tokens: self.total_usage.output_tokens,
+            total_tokens: self.total_usage.grand_total(),
+            last_prompt_tokens: measured,
         };
         self.side_panel_data.files = self.touched_files.clone();
         self.side_panel_data.findings = self.anomalies.clone();
@@ -995,11 +1005,22 @@ impl AppState {
                             .saturating_add(cr),
                     );
                 }
-                self.total_usage.total_tokens = Some(
-                    self.total_usage
-                        .input_tokens
-                        .saturating_add(self.total_usage.output_tokens),
-                );
+                if let Some(cw) = usage.cache_write_tokens {
+                    self.total_usage.cache_write_tokens = Some(
+                        self.total_usage
+                            .cache_write_tokens
+                            .unwrap_or(0)
+                            .saturating_add(cw),
+                    );
+                }
+                // 口径统一由 `TokenUsage::grand_total` 定义：input 只是缓存未命中的净额，
+                // 漏掉 cache_read / cache_write 会把开了 prompt cache 的会话读成个位数百分比。
+                self.total_usage.total_tokens = Some(self.total_usage.grand_total());
+                // 上下文占用估算用「最近一次请求」的 prompt 全量，而不是累计值。
+                let last = usage.prompt_tokens();
+                if last > 0 {
+                    self.last_prompt_tokens = Some(last);
+                }
                 self.refresh_context_breakdown();
             }
             UiEvent::Anomaly(summary) => {
@@ -1978,6 +1999,7 @@ impl AppState {
         self.reveal.clear();
         self.selection.clear();
         self.total_usage = TokenUsage::default();
+        self.last_prompt_tokens = None;
         self.last_step_start_ms = None;
         self.last_ttft_ms = None;
         self.ttft_history.clear();
@@ -3362,6 +3384,84 @@ mod tests {
         });
         assert_eq!(app.tps.rate(), Some(50.0));
         assert_eq!(app.tps_history, vec![50.0]);
+    }
+
+    #[test]
+    fn usage_totals_fold_cache_read_and_write_into_both_status_bar_and_side_panel() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-cache-usage",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        // 模拟 Anthropic：prompt 共 10000，命中缓存 9000，写入缓存 2000，输出 500。
+        // 解析层已把命中量从 input 里扣掉，所以 input 只剩未命中的 1000。
+        app.apply_ui_event(UiEvent::Usage(TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_tokens: Some(9_000),
+            cache_write_tokens: Some(2_000),
+            ..Default::default()
+        }));
+
+        // 累计四项相加，不能用 input + output（那是 1500，低估 87%）。
+        assert_eq!(app.total_usage.total_tokens, Some(12_500));
+        assert_eq!(app.total_usage.grand_total(), 12_500);
+        // cache_write 必须被累加，否则 Anthropic 写缓存量整体丢失。
+        assert_eq!(app.total_usage.cache_write_tokens, Some(2_000));
+
+        let ctx = &app.side_panel_data.context;
+        assert_eq!(ctx.total_tokens, 12_500);
+        assert_eq!(ctx.cumulative_prompt_tokens(), 12_000);
+        assert_eq!(ctx.cache_write_tokens, 2_000);
+        // 命中率分母是 prompt 全量（12000），而不是净输入（1000）——否则会算出 900%。
+        assert!(
+            (ctx.cache_hit_rate() - 75.0).abs() < 1e-9,
+            "{}",
+            ctx.cache_hit_rate()
+        );
+        // 上下文占用用最近一次请求的 prompt 全量，而不是累计 12000。
+        assert_eq!(app.last_prompt_tokens, Some(12_000));
+        assert_eq!(ctx.last_prompt_tokens, Some(12_000));
+
+        // 第二次请求：只有纯 input，无缓存。累计与最近一次各自独立推进。
+        app.apply_ui_event(UiEvent::Usage(TokenUsage {
+            input_tokens: 500,
+            output_tokens: 100,
+            ..Default::default()
+        }));
+        assert_eq!(app.total_usage.total_tokens, Some(13_100));
+        assert_eq!(app.last_prompt_tokens, Some(500));
+        assert_eq!(app.side_panel_data.context.last_prompt_tokens, Some(500));
+    }
+
+    #[test]
+    fn new_session_resets_usage_totals_and_last_prompt() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-reset-usage",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::Usage(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: Some(85),
+            ..Default::default()
+        }));
+        assert_eq!(app.total_usage.total_tokens, Some(100));
+        assert_eq!(app.last_prompt_tokens, Some(95));
+
+        app.reset_for_new_session("sess-next", None);
+        assert_eq!(app.total_usage.total_tokens, None);
+        assert_eq!(app.total_usage.cache_read_tokens, None);
+        assert_eq!(app.last_prompt_tokens, None);
+        assert_eq!(app.side_panel_data.context.total_tokens, 0);
     }
 
     #[test]

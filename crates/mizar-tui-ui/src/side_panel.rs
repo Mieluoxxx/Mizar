@@ -72,9 +72,35 @@ pub struct ContextBreakdownSnapshot {
     pub ttft_ms: Option<u64>,
     pub tps_history: Vec<f64>,
     pub ttft_history: Vec<u64>,
+    /// 累计缓存读取量（provider 命中缓存、未计入 `input_tokens` 的部分）。
     pub cache_read_tokens: u64,
+    /// 累计缓存写入量（Anthropic `cache_creation_input_tokens`）。
+    pub cache_write_tokens: u64,
+    /// 累计净输入（未命中缓存的部分）。**不是** prompt 全量。
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 累计四项总和（`input + cache_read + cache_write + output`）。
+    pub total_tokens: u64,
+    /// 最近一次请求的完整 prompt 体积，用于估算当前上下文占用；无用量时回退到字符估算。
+    pub last_prompt_tokens: Option<u64>,
+}
+
+impl ContextBreakdownSnapshot {
+    /// 累计请求过的 prompt 总量（含命中与写入缓存的部分）。
+    pub fn cumulative_prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    /// 累计缓存命中率（`0.0..=100.0`）。分母是 prompt 全量，不是净输入。
+    pub fn cache_hit_rate(&self) -> f64 {
+        let prompt = self.cumulative_prompt_tokens();
+        if prompt == 0 {
+            return 0.0;
+        }
+        (self.cache_read_tokens as f64 / prompt as f64) * 100.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -470,15 +496,19 @@ fn build_context_lines(
             Span::styled(spark, Style::default().fg(theme.info)),
         ]));
     }
-    let cache_rate = if ctx.input_tokens > 0 {
-        (ctx.cache_read_tokens as f64 / ctx.input_tokens as f64) * 100.0
+    let cache_rate = ctx.cache_hit_rate();
+    let cache_detail = if ctx.cache_write_tokens > 0 {
+        format!(
+            "{} 读 / {} 写",
+            ctx.cache_read_tokens, ctx.cache_write_tokens
+        )
     } else {
-        0.0
+        format!("{}", ctx.cache_read_tokens)
     };
     out.push(Line::from(vec![
         Span::styled("缓存命中: ", Style::default().fg(theme.text_muted)),
         Span::styled(
-            format!("{cache_rate:.1}% ({})", ctx.cache_read_tokens),
+            format!("{cache_rate:.1}% ({cache_detail})"),
             Style::default().fg(theme.success),
         ),
     ]));
@@ -669,7 +699,7 @@ fn build_stats_lines(
         Line::from(vec![
             Span::styled("Input:  ", Style::default().fg(theme.text_muted)),
             Span::styled(
-                format!("{}", ctx.input_tokens),
+                format!("{}", ctx.cumulative_prompt_tokens()),
                 Style::default().fg(theme.text),
             ),
         ]),
@@ -678,6 +708,13 @@ fn build_stats_lines(
             Span::styled(
                 format!("{}", ctx.output_tokens),
                 Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Total:  ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("{}", ctx.total_tokens),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::default(),
@@ -707,6 +744,7 @@ fn build_stats_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemePreset;
 
     #[test]
     fn context_bar_largest_remainder_matches_total() {
@@ -717,5 +755,75 @@ mod tests {
 
         let spark = unicode_sparkline(&[10.0, 30.0, 60.0], 8);
         assert_eq!(spark.chars().count(), 3);
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn cache_hit_rate_uses_prompt_total_as_denominator() {
+        // input 只是未命中的净额；分母必须把 cache_read / cache_write 算进去，否则会超过 100%
+        let ctx = ContextBreakdownSnapshot {
+            input_tokens: 1_000,
+            cache_read_tokens: 9_000,
+            cache_write_tokens: 2_000,
+            output_tokens: 500,
+            total_tokens: 12_500,
+            ..Default::default()
+        };
+        assert_eq!(ctx.cumulative_prompt_tokens(), 12_000);
+        assert!((ctx.cache_hit_rate() - 75.0).abs() < 1e-9);
+
+        // 零输入也不能除零
+        assert_eq!(ContextBreakdownSnapshot::default().cache_hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn context_panel_renders_cache_rate_and_write_volume() {
+        let theme = Theme::from_preset(ThemePreset::Auto, None);
+        let ctx = ContextBreakdownSnapshot {
+            system_tokens: 1_000,
+            input_tokens: 1_000,
+            cache_read_tokens: 9_000,
+            cache_write_tokens: 2_000,
+            output_tokens: 500,
+            total_tokens: 12_500,
+            context_window: 128_000,
+            ..Default::default()
+        };
+        let lines: Vec<String> = build_context_lines(&ctx, &[], 60, &theme)
+            .iter()
+            .map(line_text)
+            .collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("75.0%"), "{joined}");
+        assert!(joined.contains("9000 读 / 2000 写"), "{joined}");
+    }
+
+    #[test]
+    fn stats_panel_reports_prompt_total_and_grand_total() {
+        let theme = Theme::from_preset(ThemePreset::Auto, None);
+        let ctx = ContextBreakdownSnapshot {
+            input_tokens: 1_000,
+            cache_read_tokens: 9_000,
+            cache_write_tokens: 2_000,
+            output_tokens: 500,
+            total_tokens: 12_500,
+            ..Default::default()
+        };
+        let lines: Vec<String> = build_stats_lines(&ctx, &[], 60, &theme)
+            .iter()
+            .map(line_text)
+            .collect();
+        let joined = lines.join("\n");
+        // Input 行展示的是 prompt 全量（含缓存），不是净输入 1000
+        assert!(joined.contains("Input:  12000"), "{joined}");
+        assert!(joined.contains("Output: 500"), "{joined}");
+        assert!(joined.contains("Total:  12500"), "{joined}");
+        assert!(!joined.contains("Input:  1000"), "{joined}");
     }
 }
