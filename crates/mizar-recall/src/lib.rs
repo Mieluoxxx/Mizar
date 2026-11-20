@@ -61,7 +61,18 @@ fn should_activate_recall(session: &Session) -> bool {
 
 fn render_entry_verbatim(entry: &SessionEntry) -> Option<String> {
     match &entry.event {
-        SessionEvent::User { text } => Some(format!("[seq #{} | user]\n{}", entry.seq, text)),
+        SessionEvent::User { text, images } => {
+            if images.is_empty() {
+                Some(format!("[seq #{} | user]\n{}", entry.seq, text))
+            } else {
+                Some(format!(
+                    "[seq #{} | user]\n[图片 {} 张]\n{}",
+                    entry.seq,
+                    images.len(),
+                    text
+                ))
+            }
+        }
         SessionEvent::Assistant { blocks, .. } => {
             let mut parts = Vec::new();
             for block in blocks {
@@ -766,9 +777,7 @@ mod tests {
                 .any(|t| t.name == RECALL_SEARCH_TOOL_NAME)
         );
 
-        s.append(SessionEvent::User {
-            text: "请确认数据库连接池上限与回溯策略".into(),
-        });
+        s.append(SessionEvent::user("请确认数据库连接池上限与回溯策略"));
         s.append(SessionEvent::ToolResult {
             tool_call_id: "tc-1".into(),
             name: "read".into(),
@@ -845,9 +854,7 @@ mod tests {
             cwd: Some("/ws/a".into()),
             ..Default::default()
         });
-        parent.append(SessionEvent::User {
-            text: "父会话的原始需求 alpha_secret".into(),
-        });
+        parent.append(SessionEvent::user("父会话的原始需求 alpha_secret"));
         let child = store
             .fork("parent-s", 1, SessionCreateOptions::default())
             .unwrap();
@@ -857,9 +864,7 @@ mod tests {
             cwd: Some("/ws/b".into()),
             ..Default::default()
         });
-        other.append(SessionEvent::User {
-            text: "另一个工作区的机密内容".into(),
-        });
+        other.append(SessionEvent::user("另一个工作区的机密内容"));
 
         // 跨工作区读取应被拒绝
         let denied = tools

@@ -437,6 +437,7 @@ impl RouterModelConfig {
             context_window: self.context_window,
             max_tokens: self.max_tokens,
             reasoning_efforts: self.supported_efforts(),
+            input: self.input.clone(),
         }
     }
 }

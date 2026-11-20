@@ -150,11 +150,33 @@ pub fn build_request_body(
     for msg in &options.messages {
         match msg {
             Message::System { .. } => {}
-            Message::User { content } => {
-                push_user_block(
-                    &mut wire_messages,
-                    json!({ "type": "text", "text": content }),
-                );
+            Message::User { content, images } => {
+                if images.is_empty() {
+                    push_user_block(
+                        &mut wire_messages,
+                        json!({ "type": "text", "text": content }),
+                    );
+                } else {
+                    for img in images {
+                        push_user_block(
+                            &mut wire_messages,
+                            json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": img.media_type,
+                                    "data": img.data,
+                                },
+                            }),
+                        );
+                    }
+                    if !content.is_empty() {
+                        push_user_block(
+                            &mut wire_messages,
+                            json!({ "type": "text", "text": content }),
+                        );
+                    }
+                }
             }
             Message::Tool {
                 content,
@@ -1089,5 +1111,91 @@ mod tests {
         }
         assert_eq!(asm.text(), "Hello Claude");
         assert_eq!(asm.finish(), FinishReason::Stop);
+    }
+
+    #[test]
+    fn user_images_wire_shape_and_prefix_digest_identity() {
+        use mizar_llm::ImageAttachment;
+
+        let cfg = MessagesConfig {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-5".into(),
+            ..Default::default()
+        };
+
+        let opts_plain = GenerateOptions {
+            system: Some("sys v1".into()),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let (body_plain, digest_plain) = build_request_body(&cfg, &opts_plain, "claude-sonnet-4-5");
+        let legacy_messages = vec![json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "hi" }],
+        })];
+        let legacy_digest = prefix_digest(&json!({
+            "system": "sys v1",
+            "tools": [],
+            "messages": &legacy_messages,
+        }));
+        assert_eq!(digest_plain, legacy_digest);
+        assert_eq!(
+            serde_json::to_string(&body_plain["messages"]).unwrap(),
+            serde_json::to_string(&legacy_messages).unwrap()
+        );
+
+        let opts_img = GenerateOptions {
+            system: Some("sys v1".into()),
+            messages: vec![Message::user_with_images(
+                "describe",
+                vec![ImageAttachment::new("image/png", "AQID")],
+            )],
+            ..Default::default()
+        };
+        let (body_img, _) = build_request_body(&cfg, &opts_img, "claude-sonnet-4-5");
+        assert_eq!(
+            body_img["messages"],
+            json!([{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AQID"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "describe"
+                    }
+                ]
+            }])
+        );
+
+        // 纯图片无文字时不发送空 text 块（Anthropic API 会拒绝空 text）
+        let opts_img_only = GenerateOptions {
+            messages: vec![Message::user_with_images(
+                "",
+                vec![ImageAttachment::new("image/webp", "UklGRg==")],
+            )],
+            ..Default::default()
+        };
+        let (body_img_only, _) = build_request_body(&cfg, &opts_img_only, "claude-sonnet-4-5");
+        assert_eq!(
+            body_img_only["messages"],
+            json!([{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/webp",
+                        "data": "UklGRg=="
+                    }
+                }]
+            }])
+        );
     }
 }

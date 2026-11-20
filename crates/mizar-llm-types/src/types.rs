@@ -105,6 +105,46 @@ impl ReplayEnvelope {
     }
 }
 
+/// 单条消息允许附带的图片上限（与 `dim` `MAX_IMAGES` 对齐，兼顾 SQLite 体积硬约束）。
+pub const MAX_IMAGES_PER_MESSAGE: usize = 20;
+
+/// 用户消息附带的图片负载（base64 编码 + MIME 类型及可选尺寸）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    /// 标准 MIME 类型，如 `"image/png"` / `"image/jpeg"` / `"image/webp"` / `"image/gif"`。
+    pub media_type: String,
+    /// 不含 `data:` 前缀的纯 base64 编码字节。
+    pub data: String,
+    /// 最终像素宽度（用于上下文预算估算与回放展示）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// 最终像素高度。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl ImageAttachment {
+    pub fn new(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            media_type: media_type.into(),
+            data: data.into(),
+            width: None,
+            height: None,
+        }
+    }
+
+    pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.width = Some(width);
+        self.height = Some(height);
+        self
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
+
 fn is_false(v: &bool) -> bool {
     !*v
 }
@@ -117,6 +157,8 @@ pub enum Message {
     },
     User {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
     },
     Assistant {
         #[serde(default)]
@@ -143,6 +185,14 @@ impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self::User {
             content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self::User {
+            content: content.into(),
+            images,
         }
     }
 
@@ -197,7 +247,7 @@ impl Message {
     /// 提取可见文本内容。
     pub fn text_content(&self) -> String {
         match self {
-            Self::System { content } | Self::User { content } | Self::Tool { content, .. } => {
+            Self::System { content } | Self::User { content, .. } | Self::Tool { content, .. } => {
                 content.clone()
             }
             Self::Assistant { blocks, .. } => blocks
@@ -205,6 +255,14 @@ impl Message {
                 .filter_map(ContentBlock::as_text)
                 .collect::<Vec<_>>()
                 .join(""),
+        }
+    }
+
+    /// 提取用户消息附带的图片列表。
+    pub fn images(&self) -> &[ImageAttachment] {
+        match self {
+            Self::User { images, .. } => images,
+            _ => &[],
         }
     }
 
@@ -376,6 +434,15 @@ pub struct ModelInfo {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
+}
+
+impl ModelInfo {
+    /// 模型是否支持接收图片输入（未声明 `input` 能力列表时默认放行，显式声明且不含 `"image"` 时拒绝）。
+    pub fn supports_images(&self) -> bool {
+        self.input.is_empty() || self.input.iter().any(|k| k.eq_ignore_ascii_case("image"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,5 +509,49 @@ mod tests {
         };
         assert_eq!(usage.prompt_tokens(), u64::MAX);
         assert_eq!(usage.grand_total(), u64::MAX);
+    }
+
+    #[test]
+    fn message_user_omits_empty_images_and_deserializes_legacy_json() {
+        let plain = Message::user("hello");
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(json, r#"{"role":"user","content":"hello"}"#);
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), plain);
+
+        let with_img = Message::user_with_images(
+            "look",
+            vec![ImageAttachment::new("image/png", "AQID").with_dimensions(10, 20)],
+        );
+        let img_json = serde_json::to_string(&with_img).unwrap();
+        assert!(img_json.contains("\"images\""), "{img_json}");
+        assert_eq!(
+            serde_json::from_str::<Message>(&img_json).unwrap(),
+            with_img
+        );
+    }
+
+    #[test]
+    fn model_info_supports_images_respects_declared_input() {
+        let undeclared = ModelInfo {
+            id: "m1".into(),
+            name: "M1".into(),
+            context_window: None,
+            max_tokens: None,
+            reasoning_efforts: Vec::new(),
+            input: Vec::new(),
+        };
+        assert!(undeclared.supports_images());
+
+        let text_only = ModelInfo {
+            input: vec!["text".into()],
+            ..undeclared.clone()
+        };
+        assert!(!text_only.supports_images());
+
+        let vision = ModelInfo {
+            input: vec!["text".into(), "image".into()],
+            ..undeclared
+        };
+        assert!(vision.supports_images());
     }
 }

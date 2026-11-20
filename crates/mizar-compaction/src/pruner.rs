@@ -104,9 +104,7 @@ mod tests {
     fn prunes_old_large_tool_results_and_protects_recent_tail() {
         let ctx = Context::new();
         let s = Arc::new(Session::new(ctx, "prune-1"));
-        s.append(SessionEvent::User {
-            text: "inspect big file".into(),
-        });
+        s.append(SessionEvent::user("inspect big file"));
         s.append(SessionEvent::ToolResult {
             tool_call_id: "c1".into(),
             name: "read".into(),
@@ -115,9 +113,7 @@ mod tests {
         });
         // 保护尾部的 4 条表面消息
         for i in 0..4 {
-            s.append(SessionEvent::User {
-                text: format!("follow-up {i}"),
-            });
+            s.append(SessionEvent::user(format!("follow-up {i}")));
         }
         // 最新一条也是超大 ToolResult，但在保护尾区内不应被剪
         s.append(SessionEvent::ToolResult {

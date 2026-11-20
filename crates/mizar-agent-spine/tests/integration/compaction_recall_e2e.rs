@@ -32,6 +32,7 @@ impl LlmAdapter for SummaryMockAdapter {
                 context_window: Some(64_000),
                 max_tokens: Some(4_096),
                 reasoning_efforts: vec![],
+                input: Vec::new(),
             }],
         })
     }
@@ -114,9 +115,7 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
     );
 
     // 2. 首步 pre-step 应注入 AGENTS.md
-    session.append(SessionEvent::User {
-        text: "早期关键约束：暗号为 星尘压缩密钥_2026".into(),
-    });
+    session.append(SessionEvent::user("早期关键约束：暗号为 星尘压缩密钥_2026"));
     let _ = app
         .serial::<AgentPreStepEvent, ()>(
             EVENT_AGENT_PRE_STEP,
@@ -139,9 +138,7 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
     );
 
     session.append(SessionEvent::assistant_text("已收到早期约束"));
-    session.append(SessionEvent::User {
-        text: "继续执行下一阶段任务".into(),
-    });
+    session.append(SessionEvent::user("继续执行下一阶段任务"));
 
     // 3. 手动压缩：应产出检查点并自动激活 recall 工具
     let report = compaction

@@ -37,6 +37,7 @@ impl LlmAdapter for MockAdapter {
                 context_window: Some(32_768),
                 max_tokens: Some(4096),
                 reasoning_efforts: Vec::new(),
+                input: Vec::new(),
             }],
         })
     }
@@ -50,12 +51,19 @@ impl LlmAdapter for MockAdapter {
                     "工具返回了结果：\n\n{content}\n\n（这是离线假模型的回答。设置环境变量 API_KEY 后会改用真实模型。）"
                 ),
                 Some(msg) => {
+                    let image_count: usize = options
+                        .messages
+                        .iter()
+                        .rev()
+                        .take_while(|m| matches!(m, Message::User { .. }))
+                        .map(|m| m.images().len())
+                        .sum();
                     let content = options
                         .messages
                         .iter()
                         .rev()
                         .find_map(|m| match m {
-                            Message::User { content }
+                            Message::User { content, .. }
                                 if !content.trim_start().starts_with("<system-reminder>")
                                     && !content.trim_start().starts_with("<skill_content")
                                     && !content.trim_start().starts_with("<attached-") =>
@@ -125,7 +133,11 @@ impl LlmAdapter for MockAdapter {
                         }));
                         return;
                     }
-                    if has("find") || has("grep") || has("read") {
+                    if image_count > 0 {
+                        format!(
+                            "已收到 {image_count} 张图片（当前为离线假模型，无法真实识图；设置环境变量 API_KEY 后会改用真实模型）。"
+                        )
+                    } else if has("find") || has("grep") || has("read") {
                         "你好，我是离线假模型。当前环境已挂载编码工具，可以试试：\n- 问我「项目里有哪些文件」（触发 `find`）\n- 问我「搜索 Cargo」（触发 `grep`）\n\n设置环境变量 API_KEY 后，就会换成真正的模型。".to_string()
                     } else {
                         "你好，我是离线假模型，只会两件事：\n- 问我「现在几点」，我会调用 get_time\n- 问我「项目里有哪些文件」，我会调用 list_dir\n\n设置环境变量 API_KEY 后，就会换成真正的模型。".to_string()

@@ -96,11 +96,34 @@ pub fn to_wire(message: &Message) -> Vec<Value> {
             }
             items
         }
-        Message::User { content } => vec![json!({
-            "type": "message",
-            "role": "user",
-            "content": content,
-        })],
+        Message::User { content, images } => {
+            if images.is_empty() {
+                vec![json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                })]
+            } else {
+                let mut parts = Vec::with_capacity(images.len() + 1);
+                if !content.is_empty() {
+                    parts.push(json!({
+                        "type": "input_text",
+                        "text": content,
+                    }));
+                }
+                for img in images {
+                    parts.push(json!({
+                        "type": "input_image",
+                        "image_url": img.data_url(),
+                    }));
+                }
+                vec![json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": parts,
+                })]
+            }
+        }
         Message::System { content } => vec![json!({
             "type": "message",
             "role": "system",
@@ -821,5 +844,48 @@ mod tests {
         }
         assert_eq!(asm.text(), "Hi Responses");
         assert_eq!(asm.finish(), FinishReason::Stop);
+    }
+
+    #[test]
+    fn user_images_wire_shape_and_empty_string_identity() {
+        use mizar_llm::ImageAttachment;
+
+        let plain = to_wire(&Message::user("hi"));
+        let expected_plain = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": "hi",
+        })];
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&expected_plain).unwrap()
+        );
+
+        let with_img =
+            Message::user_with_images("describe", vec![ImageAttachment::new("image/png", "AQID")]);
+        assert_eq!(
+            to_wire(&with_img),
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "describe" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,AQID" },
+                ]
+            })]
+        );
+
+        let img_only =
+            Message::user_with_images("", vec![ImageAttachment::new("image/jpeg", "/9j/4A==")]);
+        assert_eq!(
+            to_wire(&img_only),
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "data:image/jpeg;base64,/9j/4A==" },
+                ]
+            })]
+        );
     }
 }

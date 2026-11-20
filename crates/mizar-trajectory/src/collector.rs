@@ -82,8 +82,8 @@ fn entry_to_trace_event(
     blocked_ids: &mut HashSet<String>,
 ) -> Option<TraceEvent> {
     let kind = match &entry.event {
-        SessionEvent::User { text } => TraceEventKind::UserMessage { text: text.clone() },
-        SessionEvent::ContextNotice { source, text } => TraceEventKind::ContextNotice {
+        SessionEvent::User { text, .. } => TraceEventKind::UserMessage { text: text.clone() },
+        SessionEvent::ContextNotice { source, text, .. } => TraceEventKind::ContextNotice {
             source: source.clone(),
             text: text.clone(),
         },

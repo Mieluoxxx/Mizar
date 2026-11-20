@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use mizar_llm_types::ImageAttachment;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::BashInputMode;
@@ -25,13 +26,14 @@ struct UndoEntry {
 struct PasteEntry {
     token: String,
     raw: String,
+    image: Option<ImageAttachment>,
 }
 
 const PASTE_COLLAPSE_MIN_LINES: usize = 8;
 const PASTE_COLLAPSE_MIN_CHARS: usize = 600;
 const MAX_UNDO_STACK: usize = 100;
 
-/// 多行文本编辑器：按 UTF-8 字符边界编辑、原子粘贴块、词级导航/撤销，并按终端显示列宽折行定位光标。
+/// 多行文本编辑器：按 UTF-8 字符边界编辑、原子粘贴块（长文本与图片）、词级导航/撤销，并按终端显示列宽折行定位光标。
 #[derive(Debug, Default, Clone)]
 pub struct TextInput {
     text: String,
@@ -43,6 +45,7 @@ pub struct TextInput {
     undo_stack: Vec<UndoEntry>,
     kill_ring: String,
     paste_seq: usize,
+    image_seq: usize,
     pastes: HashMap<String, PasteEntry>,
 }
 
@@ -68,7 +71,36 @@ impl TextInput {
     }
 
     pub fn has_collapsed_pastes(&self) -> bool {
-        !self.pastes.is_empty() && self.pastes.keys().any(|t| self.text.contains(t))
+        !self.pastes.is_empty()
+            && self
+                .pastes
+                .values()
+                .any(|entry| entry.image.is_none() && self.text.contains(&entry.token))
+    }
+
+    pub fn active_images(&self) -> Vec<(String, ImageAttachment)> {
+        let mut positioned: Vec<(usize, String, ImageAttachment)> = Vec::new();
+        for entry in self.pastes.values() {
+            let Some(img) = entry.image.as_ref() else {
+                continue;
+            };
+            for (pos, _) in self.text.match_indices(&entry.token) {
+                positioned.push((pos, entry.token.clone(), img.clone()));
+            }
+        }
+        positioned.sort_by_key(|(pos, _, _)| *pos);
+        positioned
+            .into_iter()
+            .map(|(_, token, img)| (token, img))
+            .collect()
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.active_images().len()
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.image_count() > 0
     }
 
     fn push_undo(&mut self) {
@@ -105,18 +137,21 @@ impl TextInput {
         self.cursor = 0;
         self.history_idx = None;
         self.pastes.clear();
+        self.image_seq = 0;
     }
 
-    /// 展开所有原子粘贴令牌为原始文本（在提交或展开草稿编辑器时调用）。
+    /// 展开所有原子文本粘贴令牌为原始文本（图片令牌保留在正文中）。
     pub fn expand_text(&self) -> String {
         let mut out = self.text.clone();
         for entry in self.pastes.values() {
-            out = out.replace(&entry.token, &entry.raw);
+            if entry.image.is_none() {
+                out = out.replace(&entry.token, &entry.raw);
+            }
         }
         out
     }
 
-    /// 将编辑器内的折叠粘贴块就地展开为可编辑文本。
+    /// 将编辑器内的折叠文本粘贴块就地展开为可编辑文本（保留图片原子块）。
     pub fn expand_pastes_in_place(&mut self) -> bool {
         if !self.has_collapsed_pastes() {
             return false;
@@ -124,11 +159,17 @@ impl TextInput {
         self.push_undo();
         self.text = self.expand_text();
         self.cursor = self.text.len();
-        self.pastes.clear();
+        self.pastes.retain(|_, entry| entry.image.is_some());
         true
     }
 
     pub fn take(&mut self) -> String {
+        self.take_with_images().0
+    }
+
+    /// 提取展开后的文本与当前编辑器内按顺序排列的所有有效图片附件，随后清空草稿状态。
+    pub fn take_with_images(&mut self) -> (String, Vec<(String, ImageAttachment)>) {
+        let images = self.active_images();
         let out = self.expand_text();
         self.text.clear();
         self.cursor = 0;
@@ -136,7 +177,8 @@ impl TextInput {
         self.draft_before_history.clear();
         self.undo_stack.clear();
         self.pastes.clear();
-        out
+        self.image_seq = 0;
+        (out, images)
     }
 
     pub fn push_history(&mut self, entry: &str) {
@@ -155,17 +197,38 @@ impl TextInput {
         self.cursor = self.text.len();
         self.history_idx = None;
         self.pastes.clear();
+        self.image_seq = 0;
     }
 
     /// 用队列内容替换草稿，并清空撤销栈：被换下的草稿已经停放到队列尾部，
     /// 留着撤销点会让 `Ctrl+Z` 把同一段文字同时还原进输入框，造成重复发送。
     pub fn replace_draft_from_queue(&mut self, value: &str) {
+        self.replace_draft_from_queue_with_images(value, &[]);
+    }
+
+    /// 用包含图片的队列内容替换草稿，重新注册图片原子令牌以便继续整块编辑或删除。
+    pub fn replace_draft_from_queue_with_images(
+        &mut self,
+        value: &str,
+        images: &[(String, ImageAttachment)],
+    ) {
         self.text = value.to_string();
         self.cursor = self.text.len();
         self.history_idx = None;
         self.draft_before_history.clear();
         self.undo_stack.clear();
         self.pastes.clear();
+        self.image_seq = images.len();
+        for (token, image) in images {
+            self.pastes.insert(
+                token.clone(),
+                PasteEntry {
+                    token: token.clone(),
+                    raw: String::new(),
+                    image: Some(image.clone()),
+                },
+            );
+        }
     }
 
     pub fn insert_char(&mut self, ch: char) {
@@ -190,6 +253,33 @@ impl TextInput {
         self.cursor += normalized.len();
     }
 
+    /// 插入剪贴板或 `@` 图片原子占位符（如 `[Image #1]` 或 `[Image #1 · 4032×3024 → 2048×1536]`）。
+    pub fn insert_image(&mut self, summary_suffix: Option<&str>, image: ImageAttachment) -> String {
+        self.push_undo();
+        self.history_idx = None;
+        let token = loop {
+            self.image_seq += 1;
+            let candidate = match summary_suffix.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => format!("[Image #{} · {s}]", self.image_seq),
+                None => format!("[Image #{}]", self.image_seq),
+            };
+            if !self.pastes.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        self.pastes.insert(
+            token.clone(),
+            PasteEntry {
+                token: token.clone(),
+                raw: String::new(),
+                image: Some(image),
+            },
+        );
+        self.text.insert_str(self.cursor, &token);
+        self.cursor += token.len();
+        token
+    }
+
     /// 处理终端 Bracketed Paste：超过阈值自动折叠为 `[paste #N +X lines]` 原子令牌。
     pub fn insert_paste(&mut self, raw: &str) {
         if raw.is_empty() {
@@ -212,6 +302,7 @@ impl TextInput {
                 PasteEntry {
                     token: token.clone(),
                     raw: normalized,
+                    image: None,
                 },
             );
             self.text.insert_str(self.cursor, &token);
@@ -273,9 +364,7 @@ impl TextInput {
         }
         self.push_undo();
         self.history_idx = None;
-        if let Some((start, end)) = self.paste_span_containing(self.cursor)
-            && self.cursor == end
-        {
+        if let Some((start, end)) = self.paste_span_containing(self.cursor) {
             self.text.replace_range(start..end, "");
             self.cursor = start;
             return;
@@ -352,9 +441,7 @@ impl TextInput {
         if self.cursor == 0 {
             return;
         }
-        if let Some((start, end)) = self.paste_span_containing(self.cursor)
-            && self.cursor == end
-        {
+        if let Some((start, _)) = self.paste_span_containing(self.cursor) {
             self.cursor = start;
             return;
         }
@@ -380,6 +467,9 @@ impl TextInput {
         if self.cursor == 0 {
             return 0;
         }
+        if let Some((start, _)) = self.paste_span_containing(self.cursor) {
+            return start;
+        }
         let prefix = &self.text[..self.cursor];
         let mut iter = prefix.char_indices().rev().peekable();
         while let Some(&(_, ch)) = iter.peek() {
@@ -396,12 +486,18 @@ impl TextInput {
             }
             target = idx;
         }
+        if let Some((start, _)) = self.paste_span_containing(target) {
+            return start;
+        }
         target
     }
 
     fn find_word_right(&self) -> usize {
         if self.cursor >= self.text.len() {
             return self.text.len();
+        }
+        if let Some((_, end)) = self.paste_span_starting_at(self.cursor) {
+            return end;
         }
         let suffix = &self.text[self.cursor..];
         let mut iter = suffix.char_indices().peekable();
@@ -416,7 +512,13 @@ impl TextInput {
             if ch.is_whitespace() {
                 iter.next();
             } else {
-                return self.cursor + idx;
+                let target = self.cursor + idx;
+                if let Some((_, end)) = self.paste_span_containing(target)
+                    && target < end
+                {
+                    return end;
+                }
+                return target;
             }
         }
         self.text.len()
@@ -462,7 +564,13 @@ impl TextInput {
             .rfind('\n')
             .map(|p| p + 1)
             .unwrap_or(0);
-        self.cursor = prev_start + offset_at_width(&self.text[prev_start..prev_end], target_col);
+        let mut next = prev_start + offset_at_width(&self.text[prev_start..prev_end], target_col);
+        if let Some((start, end)) = self.paste_span_containing(next)
+            && next < end
+        {
+            next = start;
+        }
+        self.cursor = next;
     }
 
     /// 向下移动一行；若已在末行且处于历史回溯中则向下恢复。
@@ -481,7 +589,13 @@ impl TextInput {
             .find('\n')
             .map(|p| next_start + p)
             .unwrap_or(self.text.len());
-        self.cursor = next_start + offset_at_width(&self.text[next_start..next_end], target_col);
+        let mut next = next_start + offset_at_width(&self.text[next_start..next_end], target_col);
+        if let Some((start, end)) = self.paste_span_containing(next)
+            && next < end
+        {
+            next = start;
+        }
+        self.cursor = next;
     }
 
     fn recall_prev_history(&mut self) {
@@ -697,5 +811,72 @@ mod tests {
         assert_eq!(input.text(), "read ");
         assert!(input.undo());
         assert_eq!(input.text(), "read @src/ap");
+    }
+
+    #[test]
+    fn image_markers_are_atomic_across_cursor_delete_and_expand() {
+        let img1 = ImageAttachment::new("image/png", "QUFB").with_dimensions(2048, 1536);
+        let img2 = ImageAttachment::new("image/jpeg", "QkJC").with_dimensions(800, 600);
+        let mut input = TextInput::new();
+        input.insert_str("看下 ");
+        let tok1 = input.insert_image(Some("4032×3024 → 2048×1536"), img1.clone());
+        assert_eq!(tok1, "[Image #1 · 4032×3024 → 2048×1536]");
+        assert_eq!(input.image_count(), 1);
+        assert!(!input.has_collapsed_pastes());
+
+        // 单次 Left / Right 必须跳过整个图片占位符，不能进入内部字符
+        let after_prefix = "看下 ".len();
+        input.move_left();
+        assert_eq!(input.cursor_byte(), after_prefix);
+        input.move_right();
+        assert_eq!(input.cursor_byte(), input.text().len());
+
+        // Ctrl+W（delete_word_backward）也不能将 `[Image #1 · ...]` 从空格处撕碎
+        input.delete_word_backward();
+        assert_eq!(input.text(), "看下 ");
+        assert_eq!(input.image_count(), 0);
+        assert!(input.undo());
+        assert_eq!(input.text(), format!("看下 {tok1}"));
+        assert_eq!(input.image_count(), 1);
+
+        // 单次 Backspace 整块删除图片占位符
+        input.backspace();
+        assert_eq!(input.text(), "看下 ");
+        assert_eq!(input.image_count(), 0);
+        assert!(input.undo());
+        assert_eq!(input.image_count(), 1);
+
+        // 跳到占位符起始位置按 Delete 也整块删除
+        input.move_left();
+        assert_eq!(input.cursor_byte(), after_prefix);
+        input.delete();
+        assert_eq!(input.text(), "看下 ");
+        assert_eq!(input.image_count(), 0);
+        assert!(input.undo());
+
+        // 混用折叠文本 paste + Ctrl+E 就地展开：只展开文本粘贴，图片占位符保持原样和有效附件
+        input.move_end();
+        input.insert_str(" ");
+        let big = (1..=10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.insert_paste(&big);
+        let tok2 = input.insert_image(None, img2.clone());
+        assert!(input.has_collapsed_pastes());
+        assert_eq!(input.image_count(), 2);
+        assert!(input.expand_pastes_in_place());
+        assert!(!input.has_collapsed_pastes());
+        assert_eq!(input.image_count(), 2);
+        assert!(input.text().contains(&tok1));
+        assert!(input.text().contains(&tok2));
+
+        let (sent_text, sent_images) = input.take_with_images();
+        assert!(sent_text.contains("l10"));
+        assert!(sent_text.contains(&tok1));
+        assert!(sent_text.contains(&tok2));
+        assert_eq!(sent_images, vec![(tok1, img1), (tok2, img2)]);
+        assert!(input.is_empty());
+        assert_eq!(input.image_count(), 0);
     }
 }

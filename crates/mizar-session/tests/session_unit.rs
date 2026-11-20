@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxFuture, Context, Service};
-use mizar_llm::{ContentBlock, Message, TokenUsage};
+use mizar_llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 use mizar_session::{
     EntryVisibility, LoadedSession, PersistenceError, PersistenceResult,
     SERVICE_SESSION_PERSISTENCE, SessionContextExt, SessionCreateOptions, SessionEntry,
@@ -160,9 +160,7 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
     });
 
     s.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
-    s.append(SessionEvent::User {
-        text: "  第一行标题\n第二行补充  ".into(),
-    });
+    s.append(SessionEvent::user("  第一行标题\n第二行补充  "));
     s.append(SessionEvent::assistant_text("收到 1"));
     s.append_trace(SessionTraceEvent::TurnEnd {
         turn: 1,
@@ -170,9 +168,7 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
     });
 
     s.append_trace(SessionTraceEvent::TurnStart { turn: 2 });
-    s.append(SessionEvent::User {
-        text: "继续".into(),
-    });
+    s.append(SessionEvent::user("继续"));
     s.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
             id: "c1".into(),
@@ -214,7 +210,7 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
 
     let msgs = s.derive_messages();
     assert_eq!(msgs.len(), 4);
-    assert!(matches!(&msgs[0], Message::User { content } if content.contains("前情：")));
+    assert!(matches!(&msgs[0], Message::User { content, .. } if content.contains("前情：")));
 
     // 序列化 round-trip 验证
     for entry in s.all_entries() {
@@ -252,9 +248,7 @@ async fn hydrates_repairs_dangling_tools_and_forks_via_seam() {
         ..Default::default()
     });
     s1.append_trace(SessionTraceEvent::TurnStart { turn: 3 });
-    s1.append(SessionEvent::User {
-        text: "帮我跑测试".into(),
-    });
+    s1.append(SessionEvent::user("帮我跑测试"));
     s1.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
             id: "call_hang".into(),
@@ -396,9 +390,7 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
     s.append(local_ev);
     s.append(err_ev);
     s.append(cancel_ev);
-    s.append(SessionEvent::User {
-        text: "分析以上命令输出".into(),
-    });
+    s.append(SessionEvent::user("分析以上命令输出"));
 
     // 首条事件为 BashExecution 时自动派生标题
     assert_eq!(s.header().title.as_deref(), Some("! echo hello"));
@@ -411,14 +403,14 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
     let msgs = s.derive_messages();
     assert_eq!(msgs.len(), 4);
     match &msgs[0] {
-        Message::User { content } => {
+        Message::User { content, .. } => {
             assert!(content.contains("Ran `echo hello`"), "{content}");
             assert!(content.contains("hello"), "{content}");
         }
         other => panic!("unexpected msg[0]: {other:?}"),
     }
     match &msgs[1] {
-        Message::User { content } => {
+        Message::User { content, .. } => {
             assert!(content.contains("Ran `false`"), "{content}");
             assert!(content.contains("(no output)"), "{content}");
             assert!(content.contains("Command exited with code 2"), "{content}");
@@ -426,7 +418,7 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
         other => panic!("unexpected msg[1]: {other:?}"),
     }
     match &msgs[2] {
-        Message::User { content } => {
+        Message::User { content, .. } => {
             assert!(content.contains("Ran `sleep 10`"), "{content}");
             assert!(content.contains("partial"), "{content}");
             assert!(content.contains("(command cancelled)"), "{content}");
@@ -434,7 +426,7 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
         other => panic!("unexpected msg[2]: {other:?}"),
     }
     for m in &msgs {
-        if let Message::User { content } = m {
+        if let Message::User { content, .. } = m {
             assert!(!content.contains("SECRET_LOCAL_ONLY"), "{content}");
             assert!(!content.contains("secret.txt"), "{content}");
         }
@@ -451,7 +443,7 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
     s.compact("summary", 1, None);
     let after_compact = s.derive_messages();
     assert!(after_compact.iter().all(|m| match m {
-        Message::User { content } => {
+        Message::User { content, .. } => {
             !content.contains("SECRET_LOCAL_ONLY") && !content.contains("PRIVATE_AFTER_COMPACT")
         }
         _ => true,
@@ -522,4 +514,59 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert_eq!(s.all_entries().len(), 2);
 
     app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn user_with_images_persists_through_backend_and_restores_via_derive_messages() {
+    let backend = Arc::new(InMemoryMockBackend::default());
+    let img = ImageAttachment {
+        media_type: "image/png".into(),
+        data: "iVBORw0KGgo=".into(),
+        width: Some(640),
+        height: Some(480),
+    };
+
+    let app1 = Context::new();
+    app1.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend.clone())),
+    )
+    .unwrap();
+    app1.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store1 = app1.sessions().unwrap();
+    let s1 = store1.create_with(SessionCreateOptions {
+        id: Some("sess-images".into()),
+        ..Default::default()
+    });
+    s1.append(SessionEvent::user_with_images(
+        "请分析这张截图里的报错",
+        vec![img.clone()],
+    ));
+    s1.flush_async().await.unwrap();
+    app1.fiber().dispose().await;
+
+    let app2 = Context::new();
+    app2.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend)),
+    )
+    .unwrap();
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store2 = app2.sessions().unwrap();
+    let reloaded = store2
+        .get("sess-images")
+        .expect("reloaded session should exist");
+
+    assert_eq!(
+        reloaded.header().title.as_deref(),
+        Some("请分析这张截图里的报错")
+    );
+    let msgs = reloaded.derive_messages();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(
+        msgs[0],
+        Message::user_with_images("请分析这张截图里的报错", vec![img])
+    );
+
+    app2.fiber().dispose().await;
 }

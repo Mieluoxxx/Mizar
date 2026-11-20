@@ -13,6 +13,7 @@ pub use error::{
 };
 pub use sse::{SseEvent, SseParser, prefix_digest};
 pub use types::{
-    ContentBlock, ContentBlockKind, FinishReason, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, StreamChunk, TokenUsage, ToolCall, ToolSchema,
+    ContentBlock, ContentBlockKind, FinishReason, ImageAttachment, MAX_IMAGES_PER_MESSAGE, Message,
+    ModelInfo, ProviderInfo, ReasoningEffort, ReplayEnvelope, StreamChunk, TokenUsage, ToolCall,
+    ToolSchema,
 };

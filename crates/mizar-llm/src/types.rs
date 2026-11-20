@@ -1,6 +1,7 @@
 pub use mizar_llm_types::{
-    ContentBlock, ContentBlockKind, FinishReason, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, StreamChunk, TokenUsage, ToolCall, ToolSchema,
+    ContentBlock, ContentBlockKind, FinishReason, ImageAttachment, MAX_IMAGES_PER_MESSAGE, Message,
+    ModelInfo, ProviderInfo, ReasoningEffort, ReplayEnvelope, StreamChunk, TokenUsage, ToolCall,
+    ToolSchema,
 };
 use tokio_util::sync::CancellationToken;
 

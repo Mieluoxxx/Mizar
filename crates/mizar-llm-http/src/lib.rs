@@ -394,12 +394,23 @@ pub fn parse_models_payload(payload: &Value) -> Vec<ModelInfo> {
                     .or_else(|| item.get("max_output_tokens"))
                     .and_then(Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok());
+                let input = item
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(ModelInfo {
                     id,
                     name,
                     context_window,
                     max_tokens,
                     reasoning_efforts: Vec::new(),
+                    input,
                 })
             })
             .collect();
@@ -432,12 +443,23 @@ pub fn parse_models_payload(payload: &Value) -> Vec<ModelInfo> {
                     .or_else(|| item.get("max_tokens"))
                     .and_then(Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok());
+                let input = item
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(ModelInfo {
                     id,
                     name,
                     context_window,
                     max_tokens,
                     reasoning_efforts: Vec::new(),
+                    input,
                 })
             })
             .collect();

@@ -117,7 +117,25 @@ impl CompletionsConfig {
 pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
     match message {
         Message::System { content } => json!({ "role": "system", "content": content }),
-        Message::User { content } => json!({ "role": "user", "content": content }),
+        Message::User { content, images } => {
+            if images.is_empty() {
+                json!({ "role": "user", "content": content })
+            } else {
+                let mut parts = Vec::with_capacity(images.len() + 1);
+                if !content.is_empty() {
+                    parts.push(json!({ "type": "text", "text": content }));
+                }
+                for img in images {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": img.data_url(),
+                        },
+                    }));
+                }
+                json!({ "role": "user", "content": parts })
+            }
+        }
         Message::Tool {
             content,
             tool_call_id,
@@ -841,5 +859,44 @@ mod tests {
         }
         assert_eq!(asm.text(), "Hello Rust");
         assert_eq!(asm.finish(), FinishReason::Stop);
+    }
+
+    #[test]
+    fn user_images_wire_shape_and_empty_string_identity() {
+        use mizar_llm::ImageAttachment;
+
+        let plain = to_wire(&Message::user("hi"), "completions", "gpt-4o");
+        let expected_plain = json!({ "role": "user", "content": "hi" });
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&expected_plain).unwrap()
+        );
+
+        let with_img =
+            Message::user_with_images("describe", vec![ImageAttachment::new("image/png", "AQID")]);
+        let wire = to_wire(&with_img, "completions", "gpt-4o");
+        assert_eq!(
+            wire,
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AQID" } },
+                ]
+            })
+        );
+
+        let img_only =
+            Message::user_with_images("", vec![ImageAttachment::new("image/jpeg", "/9j/4A==")]);
+        let wire_only = to_wire(&img_only, "completions", "gpt-4o");
+        assert_eq!(
+            wire_only,
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/4A==" } },
+                ]
+            })
+        );
     }
 }

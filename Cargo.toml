@@ -10,12 +10,14 @@ license = "MIT"
 
 [workspace.dependencies]
 axum = "0.8"
+base64 = "0.22"
 chrono = "0.4"
 crossterm = "0.29"
 dirs = "7"
 futures = "0.3"
 globset = "0.4"
 ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 libc = "0.2"
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }

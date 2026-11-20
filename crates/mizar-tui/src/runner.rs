@@ -28,7 +28,7 @@ use mizar_agent_spine::{
     persist_disabled_plugins, resolve_global_settings_path, strip_summary_wrapper,
 };
 use mizar_instructions::AgentInstructions;
-use mizar_llm::{ContentBlock, LlmContextExt, ReasoningEffort};
+use mizar_llm::{ContentBlock, ImageAttachment, LlmContextExt, ReasoningEffort};
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_session::{
     Session, SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
@@ -70,6 +70,15 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
+
+use crate::{clipboard, images, mentions};
+
+async fn poll_term_event(stream: Option<&mut EventStream>) -> Option<std::io::Result<TermEvent>> {
+    match stream {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeTarget {
@@ -370,9 +379,32 @@ pub fn project_session_view(
         .all_entries()
         .into_iter()
         .filter_map(|entry| match entry.event {
-            SessionEvent::User { text } => Some(SessionReplayItem::User { text }),
-            SessionEvent::ContextNotice { source, text } => {
-                Some(SessionReplayItem::ContextNotice { source, text })
+            SessionEvent::User { text, images } => {
+                let display = if !images.is_empty() && !text.contains("[Image #") {
+                    if text.is_empty() {
+                        format!("[图片 {} 张]", images.len())
+                    } else {
+                        format!("[图片 {} 张]\n{text}", images.len())
+                    }
+                } else {
+                    text
+                };
+                Some(SessionReplayItem::User { text: display })
+            }
+            SessionEvent::ContextNotice {
+                source,
+                text,
+                images,
+            } => {
+                let display = if !images.is_empty() && text.is_empty() {
+                    format!("<attached-image count=\"{}\" />", images.len())
+                } else {
+                    text
+                };
+                Some(SessionReplayItem::ContextNotice {
+                    source,
+                    text: display,
+                })
             }
             SessionEvent::Compaction {
                 summary,
@@ -456,14 +488,21 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
         .all_entries()
         .into_iter()
         .filter_map(|entry| match entry.event {
-            SessionEvent::User { text } => Some(SessionTreeEntry {
-                seq: entry.seq,
-                kind_tag: "USER".to_string(),
-                summary: truncate_display(&text.replace('\n', " "), 72),
-                depth: 0,
-                can_fork: true,
-            }),
-            SessionEvent::ContextNotice { source, text } => Some(SessionTreeEntry {
+            SessionEvent::User { text, images } => {
+                let prefix = if images.is_empty() {
+                    String::new()
+                } else {
+                    format!("[图×{}] ", images.len())
+                };
+                Some(SessionTreeEntry {
+                    seq: entry.seq,
+                    kind_tag: "USER".to_string(),
+                    summary: format!("{prefix}{}", truncate_display(&text.replace('\n', " "), 64)),
+                    depth: 0,
+                    can_fork: true,
+                })
+            }
+            SessionEvent::ContextNotice { source, text, .. } => Some(SessionTreeEntry {
                 seq: entry.seq,
                 kind_tag: "CTX ".to_string(),
                 summary: format!(
@@ -1013,14 +1052,14 @@ pub async fn run_tui_with_summary(
 
     let mut terminal = create_terminal(app.screen_mode)?;
 
-    let mut term_stream = EventStream::new();
+    let mut term_stream = Some(EventStream::new());
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(90));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut reveal_tick = tokio::time::interval(Duration::from_millis(33));
     reveal_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut active_cancel: Option<CancellationToken> = None;
-    let mut pending_steer: Option<String> = None;
+    let mut pending_steer: Option<PendingPrompt> = None;
     let mut user_cancelled = false;
 
     let update_check_task = if config.check_for_updates {
@@ -1047,7 +1086,7 @@ pub async fn run_tui_with_summary(
         draw_res?;
 
         let action = tokio::select! {
-            maybe_term = term_stream.next() => {
+            maybe_term = poll_term_event(term_stream.as_mut()) => {
                 match maybe_term {
                     Some(Ok(TermEvent::Key(key))) => app.handle_key(key),
                     Some(Ok(TermEvent::Mouse(mouse))) => app.handle_mouse(mouse),
@@ -1123,6 +1162,7 @@ pub async fn run_tui_with_summary(
             &mut app,
             &mut active_session,
             &mut terminal,
+            &mut term_stream,
             &active_sid,
             &ui_tx,
             &mut active_cancel,
@@ -1254,10 +1294,36 @@ fn tool_needs_approval(ctx: &Context, tool_name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPrompt {
+    text: String,
+    images: Vec<ImageAttachment>,
+}
+
+impl PendingPrompt {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    fn into_action(self) -> AppAction {
+        if self.images.is_empty() {
+            AppAction::SubmitPrompt(self.text)
+        } else {
+            AppAction::SubmitPromptWithImages {
+                text: self.text,
+                images: self.images,
+            }
+        }
+    }
+}
+
 fn process_ui_event(
     app: &mut AppState,
     active_cancel: &mut Option<CancellationToken>,
-    pending_steer: &mut Option<String>,
+    pending_steer: &mut Option<PendingPrompt>,
     user_cancelled: &mut bool,
     event: UiEvent,
 ) -> AppAction {
@@ -1290,15 +1356,27 @@ fn process_ui_event(
         app.apply_ui_event(event);
 
         if let Some(steer) = pending_steer.take() {
-            app.push_user_message(&steer);
-            return AppAction::SubmitPrompt(steer);
+            app.push_user_message(&steer.text);
+            return steer.into_action();
         }
         if !was_aborted
             && is_ok
             && let Some(next) = app.dequeue_next()
         {
+            if !next.images.is_empty() && !app.active_model_supports_images() {
+                app.input
+                    .replace_draft_from_queue_with_images(&next.text, &next.images);
+                app.reject_unsupported_images_notice();
+                return AppAction::RefreshSidePanelData;
+            }
             app.push_user_message(&next.text);
-            return AppAction::SubmitPrompt(next.text);
+            if next.images.is_empty() {
+                return AppAction::SubmitPrompt(next.text);
+            }
+            return AppAction::SubmitPromptWithImages {
+                text: next.text,
+                images: next.images.into_iter().map(|(_, img)| img).collect(),
+            };
         }
         if !was_aborted && !is_ok && !app.queued_prompts.is_empty() {
             app.push_notice(
@@ -1316,6 +1394,103 @@ fn process_ui_event(
     AppAction::None
 }
 
+fn format_clipboard_file_ref(workspace: &Path, path: &Path) -> String {
+    let display = if let Ok(rel) = path.strip_prefix(workspace) {
+        let rel_str = rel.display().to_string();
+        if rel_str.is_empty() {
+            path.display().to_string()
+        } else {
+            rel_str
+        }
+    } else {
+        path.display().to_string()
+    };
+    if display.chars().any(char::is_whitespace) {
+        format!("@\"{display}\"")
+    } else {
+        format!("@{display}")
+    }
+}
+
+pub async fn apply_clipboard_content(
+    app: &mut AppState,
+    workspace: &Path,
+    result: Result<clipboard::ClipboardContent, clipboard::ClipboardError>,
+) {
+    match result {
+        Err(clipboard::ClipboardError::Empty) => {
+            app.set_flash("剪贴板为空，或没有可粘贴的图片/文本");
+        }
+        Err(err) => {
+            let msg = format!("剪贴板读取失败：{err}");
+            app.set_flash(msg.clone());
+            app.push_notice(NoticeLevel::Warn, msg);
+        }
+        Ok(clipboard::ClipboardContent::Text(text)) => {
+            app.handle_paste(&text);
+        }
+        Ok(clipboard::ClipboardContent::Image {
+            bytes,
+            source_label,
+        }) => match images::process_image_bytes(&bytes) {
+            Ok(processed) => {
+                let suffix = processed.marker_suffix();
+                let _ = app.insert_pasted_image(suffix.as_deref(), processed.attachment);
+            }
+            Err(err) => {
+                let msg = format!("剪贴板图片处理失败（{source_label}）：{err}");
+                app.set_flash(msg.clone());
+                app.push_notice(NoticeLevel::Error, msg);
+            }
+        },
+        Ok(clipboard::ClipboardContent::Files(paths)) => {
+            let mut text_refs = Vec::new();
+            for path in paths {
+                let Ok(meta) = tokio::fs::metadata(&path).await else {
+                    text_refs.push(format_clipboard_file_ref(workspace, &path));
+                    continue;
+                };
+                if meta.is_file()
+                    && meta.len() <= 32 * 1024 * 1024
+                    && let Ok(bytes) = tokio::fs::read(&path).await
+                    && images::sniff_image_format(&bytes).is_some()
+                {
+                    match images::process_image_bytes(&bytes) {
+                        Ok(processed) => {
+                            let suffix = processed.marker_suffix();
+                            if app
+                                .insert_pasted_image(suffix.as_deref(), processed.attachment)
+                                .is_none()
+                            {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let msg = format!("图片 `{}` 处理失败：{err}", path.display());
+                            app.set_flash(msg.clone());
+                            app.push_notice(NoticeLevel::Error, msg);
+                        }
+                    }
+                    continue;
+                }
+                text_refs.push(format_clipboard_file_ref(workspace, &path));
+            }
+            if !text_refs.is_empty() {
+                let joined = text_refs.join(" ");
+                let needs_sep =
+                    !app.input.is_empty() && !app.input.text().ends_with(char::is_whitespace);
+                if needs_sep {
+                    app.input.insert_char(' ');
+                }
+                app.input.insert_paste(&joined);
+                app.input.insert_char(' ');
+                app.sync_input_completion_overlay();
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_run(
     ctx: &Context,
     config: &TuiConfig,
@@ -1324,6 +1499,7 @@ fn spawn_agent_run(
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     active_cancel: &mut Option<CancellationToken>,
     prompt: String,
+    images: Vec<ImageAttachment>,
 ) {
     let Ok(agent_loop) = ctx.agent_loop() else {
         app.push_notice(NoticeLevel::Error, "agentLoop 服务未就绪");
@@ -1350,6 +1526,7 @@ fn spawn_agent_run(
         max_tokens: None,
         temperature: None,
         reasoning_effort: app.reasoning_effort,
+        images,
     };
     let tx = ui_tx.clone();
     tokio::spawn(async move {
@@ -1518,10 +1695,11 @@ async fn handle_action(
     app: &mut AppState,
     active_session: &mut Arc<Session>,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    term_stream: &mut Option<EventStream>,
     active_sid: &Arc<std::sync::RwLock<String>>,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     active_cancel: &mut Option<CancellationToken>,
-    pending_steer: &mut Option<String>,
+    pending_steer: &mut Option<PendingPrompt>,
     user_cancelled: &mut bool,
     action: AppAction,
 ) {
@@ -1529,6 +1707,18 @@ async fn handle_action(
         AppAction::None => {}
         AppAction::Quit => {
             app.should_quit = true;
+        }
+        AppAction::PasteClipboard => {
+            let res = clipboard::read_clipboard_with_osc5522_hook(|| async {
+                *term_stream = None;
+                let osc_res = tokio::task::spawn_blocking(clipboard::read_osc5522_from_tty)
+                    .await
+                    .map_err(|e| clipboard::ClipboardError::CommandFailed(e.to_string()))?;
+                *term_stream = Some(EventStream::new());
+                osc_res
+            })
+            .await;
+            apply_clipboard_content(app, &config.workspace, res).await;
         }
         AppAction::CancelRun => {
             *pending_steer = None;
@@ -1597,6 +1787,19 @@ async fn handle_action(
             }
         }
         AppAction::SubmitPrompt(prompt) => {
+            if prompt.contains('@')
+                && !app.active_model_supports_images()
+                && mentions::mentions_resolve_any_image(
+                    &config.workspace,
+                    config.restrict_to_workspace,
+                    &prompt,
+                )
+                .await
+            {
+                app.input.set_text_end(&prompt);
+                app.reject_unsupported_images_notice();
+                return;
+            }
             spawn_agent_run(
                 ctx,
                 config,
@@ -1605,11 +1808,41 @@ async fn handle_action(
                 ui_tx,
                 active_cancel,
                 prompt,
+                Vec::new(),
+            );
+        }
+        AppAction::SubmitPromptWithImages { text, images } => {
+            if !app.active_model_supports_images() {
+                app.reject_unsupported_images_notice();
+                return;
+            }
+            spawn_agent_run(
+                ctx,
+                config,
+                app,
+                active_session,
+                ui_tx,
+                active_cancel,
+                text,
+                images,
             );
         }
         AppAction::SteerPrompt(prompt) => {
+            if prompt.contains('@')
+                && !app.active_model_supports_images()
+                && mentions::mentions_resolve_any_image(
+                    &config.workspace,
+                    config.restrict_to_workspace,
+                    &prompt,
+                )
+                .await
+            {
+                app.input.set_text_end(&prompt);
+                app.reject_unsupported_images_notice();
+                return;
+            }
             if let Some(cancel) = active_cancel.as_ref() {
-                *pending_steer = Some(prompt);
+                *pending_steer = Some(PendingPrompt::text(prompt));
                 *user_cancelled = false;
                 cancel.cancel();
             } else {
@@ -1622,6 +1855,30 @@ async fn handle_action(
                     ui_tx,
                     active_cancel,
                     prompt,
+                    Vec::new(),
+                );
+            }
+        }
+        AppAction::SteerPromptWithImages { text, images } => {
+            if !app.active_model_supports_images() {
+                app.reject_unsupported_images_notice();
+                return;
+            }
+            if let Some(cancel) = active_cancel.as_ref() {
+                *pending_steer = Some(PendingPrompt { text, images });
+                *user_cancelled = false;
+                cancel.cancel();
+            } else {
+                app.push_user_message(&text);
+                spawn_agent_run(
+                    ctx,
+                    config,
+                    app,
+                    active_session,
+                    ui_tx,
+                    active_cancel,
+                    text,
+                    images,
                 );
             }
         }
@@ -2885,6 +3142,7 @@ mod tests {
                     context_window: None,
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
+                    input: Vec::new(),
                 },
                 ModelInfo {
                     id: "mayoru-messages/claude-sonnet-5-5".to_string(),
@@ -2892,6 +3150,7 @@ mod tests {
                     context_window: None,
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
+                    input: Vec::new(),
                 },
             ],
         }];
@@ -2978,10 +3237,11 @@ mod tests {
         app.queued_prompts.push(mizar_tui_ui::QueuedPrompt {
             id: 1,
             text: "queued follow-up".into(),
+            images: Vec::new(),
         });
 
         let mut active_cancel = None;
-        let mut pending_steer = Some("urgent steer".into());
+        let mut pending_steer = Some(super::PendingPrompt::text("urgent steer"));
         let mut user_cancelled = false;
 
         let act1 = process_ui_event(

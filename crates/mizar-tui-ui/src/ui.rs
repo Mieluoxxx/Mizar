@@ -1044,6 +1044,10 @@ where
 fn build_user_lines(text: &str, width: usize, theme: &Theme) -> Vec<RenderedLine> {
     let mut out = Vec::new();
     let user_style = Style::default().fg(theme.text).bg(theme.user_bg);
+    let image_pill_style = Style::default()
+        .fg(theme.info)
+        .bg(theme.user_bg)
+        .add_modifier(Modifier::BOLD);
     let prefix_first = Span::styled(
         "❯ ",
         Style::default()
@@ -1065,12 +1069,8 @@ fn build_user_lines(text: &str, width: usize, theme: &Theme) -> Vec<RenderedLine
         } else {
             Some(prefix_cont.clone())
         };
-        let wrapped = wrap_styled_spans_rich(
-            vec![Span::styled((*line).to_string(), user_style)],
-            pf,
-            Some(prefix_cont.clone()),
-            width,
-        );
+        let spans = render_inline_pills(line, user_style, image_pill_style, false);
+        let wrapped = wrap_styled_spans_rich(spans, pf, Some(prefix_cont.clone()), width);
         out.extend(wrapped);
     }
     out.push(RenderedLine::hard(Line::raw("")));
@@ -2030,29 +2030,43 @@ fn render_input_box(
 
     let (title, title_style) = match bash_mode {
         Some(BashInputMode::Context) => (
-            " Bash (! · 载入上下文 · Enter 执行 · Esc 退出) ",
+            " Bash (! · 载入上下文 · Enter 执行 · Esc 退出) ".to_string(),
             Style::default()
                 .fg(theme.success)
                 .add_modifier(Modifier::BOLD),
         ),
         Some(BashInputMode::NoContext) => (
-            " Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出) ",
+            " Bash (!! · 不载入上下文 · Enter 执行 · Esc 退出) ".to_string(),
             Style::default().fg(theme.text_muted),
         ),
         None if app.is_busy => (
-            " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) ",
+            " 输入 (Enter 排队 · Ctrl+Enter 立即发送 · Tab 思考 · Esc 暂停) ".to_string(),
             Style::default().fg(theme.text_muted),
         ),
         None if app.is_bash_running => (
-            " 输入 (Bash 命令执行中 · Esc 取消) ",
+            " 输入 (Bash 命令执行中 · Esc 取消) ".to_string(),
+            Style::default().fg(theme.text_muted),
+        ),
+        None if app.input.has_collapsed_pastes() && app.input.has_images() => (
+            format!(
+                " 输入 (Enter 发送 · 已附 {} 张图片 · 含折叠粘贴块，Ctrl+E 展开) ",
+                app.input.image_count()
+            ),
             Style::default().fg(theme.text_muted),
         ),
         None if app.input.has_collapsed_pastes() => (
-            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) ",
+            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) ".to_string(),
+            Style::default().fg(theme.text_muted),
+        ),
+        None if app.input.has_images() => (
+            format!(
+                " 输入 (Enter / Ctrl+Enter 发送 · 已附 {} 张图片 · Ctrl+V 粘贴 · ? 帮助) ",
+                app.input.image_count()
+            ),
             Style::default().fg(theme.text_muted),
         ),
         None => (
-            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) ",
+            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) ".to_string(),
             Style::default().fg(theme.text_muted),
         ),
     };
@@ -2133,42 +2147,70 @@ fn render_input_box(
     }
 }
 
-fn render_input_line_with_paste_pills(line_str: &str, theme: &Theme) -> Line<'static> {
-    let base_style = Style::default().fg(theme.text);
+fn render_inline_pills(
+    text: &str,
+    base_style: Style,
+    pill_style: Style,
+    highlight_paste: bool,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let mut rest = line_str;
+    let mut rest = text;
 
-    while let Some(start) = rest.find("[paste #") {
+    while !rest.is_empty() {
+        let next_image = rest.find("[Image #").map(|i| (i, false));
+        let next_paste = if highlight_paste {
+            rest.find("[paste #").map(|i| (i, true))
+        } else {
+            None
+        };
+        let next = match (next_image, next_paste) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some((start, is_paste)) = next else {
+            spans.push(Span::styled(rest.to_string(), base_style));
+            break;
+        };
         if start > 0 {
             spans.push(Span::styled(rest[..start].to_string(), base_style));
         }
         let after = &rest[start..];
+        let prefix_len = 8; // "[Image #" 与 "[paste #" 同为 8 字节
         if let Some(end_rel) = after.find(']') {
             let token = &after[..=end_rel];
-            if token.contains("lines") {
-                spans.push(Span::styled(
-                    token.to_string(),
-                    Style::default()
-                        .fg(theme.info)
-                        .bg(theme.card_bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
+            let valid = if is_paste {
+                token.contains("lines") || token.contains("chars")
+            } else {
+                token[prefix_len..end_rel]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            };
+            if valid {
+                spans.push(Span::styled(token.to_string(), pill_style));
                 rest = &after[end_rel + 1..];
                 continue;
             }
         }
-        spans.push(Span::styled("[paste #".to_string(), base_style));
-        rest = &rest[start + 8..];
+        spans.push(Span::styled(after[..prefix_len].to_string(), base_style));
+        rest = &after[prefix_len..];
     }
 
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_string(), base_style));
-    }
     if spans.is_empty() {
-        Line::raw("")
-    } else {
-        Line::from(spans)
+        spans.push(Span::raw(""));
     }
+    spans
+}
+
+fn render_input_line_with_paste_pills(line_str: &str, theme: &Theme) -> Line<'static> {
+    let base_style = Style::default().fg(theme.text);
+    let pill_style = Style::default()
+        .fg(theme.info)
+        .bg(theme.card_bg)
+        .add_modifier(Modifier::BOLD);
+    Line::from(render_inline_pills(line_str, base_style, pill_style, true))
 }
 
 fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {

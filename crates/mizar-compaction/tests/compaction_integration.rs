@@ -55,6 +55,7 @@ impl LlmAdapter for RecordingAdapter {
                 context_window: Some(self.context_window),
                 max_tokens: Some(4_096),
                 reasoning_efforts: vec![ReasoningEffort::Off, ReasoningEffort::Medium],
+                input: Vec::new(),
             }],
         })
     }
@@ -167,9 +168,7 @@ async fn l1_pruner_handles_pressure_without_llm_call() {
     let agent = app.agent_loop().unwrap();
 
     let s = store.create(Some("l1-prune".into()));
-    s.append(SessionEvent::User {
-        text: "读一下超大日志".into(),
-    });
+    s.append(SessionEvent::user("读一下超大日志"));
     // 约 9_000 tokens 的旧 ToolResult（超过 16k 窗口的 70% 触发线，但剪完后远低于 55%）
     s.append(SessionEvent::ToolResult {
         tool_call_id: "c1".into(),
@@ -239,9 +238,7 @@ async fn l2_manual_compaction_builds_digest_disables_reasoning_and_resets_sessio
             .any(|t| t.name == "extra_deferred")
     );
 
-    s.append(SessionEvent::User {
-        text: "请改造 parser 并跑测试".into(),
-    });
+    s.append(SessionEvent::user("请改造 parser 并跑测试"));
     s.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
             id: "c1".into(),
@@ -272,9 +269,7 @@ async fn l2_manual_compaction_builds_digest_disables_reasoning_and_resets_sessio
         content: "all passed".into(),
         is_error: false,
     });
-    s.append(SessionEvent::User {
-        text: "继续处理下一步 ".repeat(300),
-    });
+    s.append(SessionEvent::user("继续处理下一步 ".repeat(300)));
 
     let report = compaction
         .compact_now(
@@ -353,9 +348,7 @@ async fn l3_overflow_recovery_automatically_compacts_and_retries_turn() {
     let agent = app.agent_loop().unwrap();
 
     let s = store.create(Some("l3-overflow".into()));
-    s.append(SessionEvent::User {
-        text: "历史消息 1 ".repeat(100),
-    });
+    s.append(SessionEvent::user("历史消息 1 ".repeat(100)));
     s.append(SessionEvent::assistant_text("历史回复 1 ".repeat(100)));
 
     let res = agent
@@ -425,9 +418,7 @@ async fn post_compaction_guards_enforce_read_dedup_and_block_stale_write_while_a
     );
 
     // 3. 发生 Compaction 把之前的 read 压出上下文
-    s.append(SessionEvent::User {
-        text: "后续问题".into(),
-    });
+    s.append(SessionEvent::user("后续问题"));
     s.compact("早期摘要", 1, Some(500));
 
     // 4. 压后对已存在文件直接整文件 write -> 应被 FileReads 守卫拦截！

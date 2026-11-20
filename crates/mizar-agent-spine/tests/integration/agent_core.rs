@@ -301,9 +301,7 @@ async fn agent_switches_across_completions_responses_and_messages_in_one_session
     assert_eq!(comp_calls.load(Ordering::SeqCst), 2);
     assert_eq!(asm1.tool_calls().len(), 1);
 
-    session.append(mizar_session::SessionEvent::User {
-        text: "现在几点".into(),
-    });
+    session.append(mizar_session::SessionEvent::user("现在几点"));
     session.append(mizar_session::SessionEvent::Assistant {
         blocks: asm1.blocks(),
         replay: asm1.replay(),
@@ -366,7 +364,7 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
         fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
             let step_idx = self.0.fetch_add(1, Ordering::SeqCst);
             let saw_reminder = options.messages.iter().any(|m| match m {
-                Message::User { content } => content.contains("Carefully analyze"),
+                Message::User { content, .. } => content.contains("Carefully analyze"),
                 _ => false,
             });
             let (tx, rx) = futures::channel::mpsc::unbounded();

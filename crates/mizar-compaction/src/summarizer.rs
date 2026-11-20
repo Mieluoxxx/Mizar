@@ -151,9 +151,7 @@ where
          {SUMMARY_SECTIONS_GUIDE}{focus_block}\n\n\
          Output ONLY the markdown summary text (no tool calls)."
     );
-    messages.push(Message::User {
-        content: instruction,
-    });
+    messages.push(Message::user(instruction));
 
     let opts = GenerateOptions {
         messages,
@@ -199,7 +197,7 @@ where
             Message::System {
                 content: "You are a precise technical context-compaction assistant for a coding agent. Never fabricate verified facts.".to_string(),
             },
-            Message::User { content: prompt },
+            Message::user(prompt),
         ],
         tools: Vec::new(),
         model: params.model.clone(),
@@ -326,7 +324,17 @@ pub fn serialize_transcript_for_summary(cut: &CutPlan) -> String {
 
 fn format_entry_for_transcript(entry: &SessionEntry) -> Option<String> {
     match &entry.event {
-        SessionEvent::User { text } => Some(format!("[seq #{} | User]\n{text}", entry.seq)),
+        SessionEvent::User { text, images } => {
+            if images.is_empty() {
+                Some(format!("[seq #{} | User]\n{text}", entry.seq))
+            } else {
+                Some(format!(
+                    "[seq #{} | User]\n[图片 {} 张]\n{text}",
+                    entry.seq,
+                    images.len()
+                ))
+            }
+        }
         SessionEvent::Assistant { blocks, .. } => {
             let mut parts = Vec::new();
             for b in blocks {
@@ -398,4 +406,34 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
     let head: String = s.chars().take(max_chars).collect();
     format!("{head}\n[... truncated {} chars ...]", count - max_chars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mizar_llm::ImageAttachment;
+
+    #[test]
+    fn transcript_summarizes_image_count_without_base64() {
+        let entry = SessionEntry {
+            seq: 1,
+            ts: 0,
+            event: SessionEvent::user_with_images(
+                "看看这个报错",
+                vec![ImageAttachment {
+                    media_type: "image/png".into(),
+                    data: "UNIQUE_BASE64_PAYLOAD_XYZ".into(),
+                    width: Some(100),
+                    height: Some(100),
+                }],
+            ),
+        };
+        let rendered = format_entry_for_transcript(&entry).expect("user entry should render");
+        assert!(rendered.contains("[图片 1 张]"), "{rendered}");
+        assert!(rendered.contains("看看这个报错"), "{rendered}");
+        assert!(
+            !rendered.contains("UNIQUE_BASE64_PAYLOAD_XYZ"),
+            "{rendered}"
+        );
+    }
 }

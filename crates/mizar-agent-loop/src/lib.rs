@@ -11,8 +11,8 @@ use cordis::{Context, CordisError, Inject, Service};
 use futures::StreamExt;
 use futures::future::join_all;
 use mizar_llm::{
-    BlockAssembler, FinishReason, GenerateOptions, LlmContextExt, LlmError, LlmErrorCode, Message,
-    ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
+    BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmContextExt, LlmError,
+    LlmErrorCode, Message, ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
 };
 use mizar_session::{Session, SessionEvent, SessionTraceEvent};
 use mizar_system_prompt::SystemPromptContextExt;
@@ -242,6 +242,7 @@ pub struct RunOptions {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Debug, Error)]
@@ -455,7 +456,7 @@ impl AgentLoop {
                 ts_ms: now_millis(),
             },
         );
-        session.append(SessionEvent::User { text: input.into() });
+        session.append(SessionEvent::user_with_images(input, options.images));
         self.ctx.emit(
             EVENT_AGENT_STATUS,
             AgentStatusEvent {
@@ -1014,10 +1015,7 @@ impl AgentLoop {
                         is_error: result.is_error,
                     });
                     for note in extra_contexts {
-                        session.append(SessionEvent::ContextNotice {
-                            source: note.source,
-                            text: note.text,
-                        });
+                        session.append(SessionEvent::context_notice(note.source, note.text));
                     }
                 }
             }
