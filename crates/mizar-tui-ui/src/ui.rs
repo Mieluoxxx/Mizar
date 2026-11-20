@@ -1920,13 +1920,13 @@ fn render_queued_strip(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{hint}  ↑ 选择 · Ctrl+⏎ 发送"),
+                format!("{hint}  ↑ 选择 · Alt+↑ 直接撤回"),
                 Style::default().fg(theme.text_muted),
             ),
         ]));
     } else {
         let marker = format!(" ↳ 队列({count}) ");
-        let help = " ↑↓ 选择 · ⏎ 编辑 · Ctrl/Alt+⏎ 立即发 · Del 丢弃 · Esc 关闭 ";
+        let help = " ↑↓ 选择 · ⏎ 编辑 · Alt+↑ 直接撤 · Del 丢弃 · Esc 关闭 ";
         let mut header = vec![Span::styled(
             marker.clone(),
             Style::default()

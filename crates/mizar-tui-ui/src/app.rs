@@ -1771,10 +1771,26 @@ impl AppState {
                 self.sync_input_completion_overlay();
                 return AppAction::None;
             }
+            KeyCode::Up if alt && !ctrl && !shift => {
+                // Alt+↑：一步把队尾撤回输入框直接编辑，不用先进选择器再按 ⏎。
+                // 草稿非空时与草稿交换（草稿进队尾），不会丢字。
+                //
+                // 终端兼容性：kitty / xterm modifyOtherKeys / Ghostty / iTerm2 发的是
+                // CSI 1;3A，解析为 Up+ALT，走这条路；少数开启 altSendsEscape 的终端
+                // 发的是 ESC ESC [ A，crossterm 会拆成 Esc + 字面 "[A"，
+                // 那种终端请用 ↑ 进选择器（实测见 issue #15）。
+                if let Some(last) = self.queued_prompts.last().map(|item| item.id)
+                    && !self.is_bash_running
+                {
+                    self.retract_queued(last);
+                    return AppAction::None;
+                }
+                self.input.move_up();
+                self.sync_input_completion_overlay();
+                return AppAction::None;
+            }
             KeyCode::Up => {
                 // 草稿空且队列非空时，↑ 进入队列选择器（优先于历史回溯）。
-                // 这里刻意不支持 Alt+↑：终端对它的两种编码里，ESC 前缀式（ESC ESC [ A）
-                // 会被 crossterm 拆成 Esc + 字面 "[A"，反而触发 CancelRun。
                 if self.input.is_empty()
                     && !self.queued_prompts.is_empty()
                     && !self.overlay.is_open()
@@ -4561,22 +4577,58 @@ mod tests {
     }
 
     #[test]
-    fn esc_prefixed_alt_up_must_not_be_the_only_way_into_the_selector() {
-        // 终端对 Alt+↑ 有两种编码：kitty 的 CSI 1;3A 会到达这里并正常打开选择器；
-        // 但 ESC 前缀式（ESC ESC [ A）会被 crossterm 拆成 Esc + 字面 "[A"，
-        // 反而触发 CancelRun。所以撤回必须只依赖普通 ↑，不能依赖 Alt+↑。
-        let mut app = queued_app(&["tail item"]);
+    fn alt_up_retracts_queue_tail_straight_into_the_composer() {
+        // Alt+↑ 一步撤回队尾直接编辑，不需要再进选择器按 ⏎。
+        let mut app = queued_app(&["first", "tail item"]);
+        assert!(app.input.is_empty());
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
             AppAction::None
         );
+        assert_eq!(app.input.text(), "tail item");
+        // 撤回即出队：队列里不能留副本，选择器也不该被打开。
+        assert_eq!(queued_texts(&app), vec!["first"]);
+        assert_eq!(app.queue_selected, None);
+    }
+
+    #[test]
+    fn alt_up_swaps_when_a_draft_is_already_present() {
+        let mut app = queued_app(&["queued item"]);
+        app.input.insert_str("draft");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            AppAction::None
+        );
+        assert_eq!(app.input.text(), "queued item");
+        assert_eq!(queued_texts(&app), vec!["draft"]);
+    }
+
+    #[test]
+    fn alt_up_without_queue_falls_back_to_history_recall() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-noqueue",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.input.push_history("older prompt");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            AppAction::None
+        );
+        assert_eq!(app.input.text(), "older prompt");
+    }
+
+    #[test]
+    fn plain_up_still_opens_the_selector_as_the_zero_protocol_path() {
+        // ESC 前缀式 Alt+↑（ESC ESC [ A）在部分终端会被拆成 Esc + "[A"，
+        // 那种环境下必须还能靠普通 ↑ 进选择器撤回。
+        let mut app = queued_app(&["tail item"]);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert!(app.queue_selected.is_some());
         assert_eq!(queued_texts(&app), vec!["tail item"]);
-
-        // 关键保证：普通 ↑（零协议依赖）同样能进选择器。
-        let mut plain = queued_app(&["tail item"]);
-        plain.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert!(plain.queue_selected.is_some());
     }
 
     #[test]
