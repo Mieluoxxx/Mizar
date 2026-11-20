@@ -23,8 +23,9 @@ pub use mizar_tui_ui::{
     trajectory_scene, ui,
 };
 pub use runner::{
-    ResumeTarget, SelectionSources, TuiConfig, TuiExitSummary, format_resume_command,
-    latest_workspace_selection, mount_reply_guidance_section, project_fork_view,
-    project_resume_view, project_session_tree, project_session_view, resolve_selection, run_tui,
-    run_tui_with_summary, subscribe_session_events, to_ui_log_record, wait_for_services,
+    ResumeTarget, SelectionSources, TuiConfig, TuiExitSummary, build_session_info_report,
+    build_session_info_report_at, format_resume_command, latest_workspace_selection,
+    mount_reply_guidance_section, project_fork_view, project_resume_view, project_session_tree,
+    project_session_view, resolve_selection, run_tui, run_tui_with_summary,
+    subscribe_session_events, to_ui_log_record, wait_for_services,
 };

@@ -235,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tui_cfg = TuiConfig::new(workspace);
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
+    tui_cfg.session_db_path = spine_cfg.session_db_path.clone();
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
     // 记录强度来源：settings.json 显式指定时才算「配置的默认」，否则留给会话记录覆盖
     tui_cfg.reasoning_effort_from_settings = loaded_cfg.settings.reasoning_effort.is_some();

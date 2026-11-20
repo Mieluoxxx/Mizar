@@ -58,6 +58,11 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
             takes_arg: true,
         },
         SlashEntry {
+            command: "session".into(),
+            description: "查看当前会话 ID、存储、事件构成与压缩边界".into(),
+            takes_arg: false,
+        },
+        SlashEntry {
             command: "theme".into(),
             description: "切换 Oklab / 自适应主题".into(),
             takes_arg: true,
@@ -835,7 +840,7 @@ impl OverlayState {
                     KeyCode::Enter
                         if key.modifiers == KeyModifiers::NONE && !entries.is_empty() =>
                     {
-                        let chosen = &entries[*selected];
+                        let chosen = &entries[(*selected).min(entries.len() - 1)];
                         Some(OverlayAction::CompleteSlash {
                             token_start: *token_start,
                             command: chosen.command.clone(),
@@ -2147,6 +2152,10 @@ fn render_help_modal(
             "打开交互式设置面板（即时生效并持久化）/ 手动压缩上下文",
         ),
         (
+            "/session /stats",
+            "查看当前会话完整 ID、存储与事件账目 / 会话运行统计",
+        ),
+        (
             "/tree /skills /view",
             "会话分支树回溯 / 交互技能选择 / Fullscreen↔Inline 视图热切",
         ),
@@ -2409,5 +2418,101 @@ mod tests {
             }
             _ => panic!("expected SettingsModal after refresh_settings"),
         }
+    }
+
+    #[test]
+    fn slash_completion_and_help_modal_include_session() {
+        // 1. 空查询前 8 条（浮层可视窗口）必须包含 /session，不能沉在 take(10) 截断线之后
+        let entries = filter_slash(&[], "");
+        assert!(
+            entries.iter().take(8).any(|e| e.command == "session"),
+            "expected /session inside top 8 slash entries, got: {:?}",
+            entries.iter().map(|e| &e.command).collect::<Vec<_>>()
+        );
+
+        // 2. 空输入框敲 `/` 渲染出的浮层文本直接可见 `/session`
+        let mut state = OverlayState {
+            active: Some(OverlayKind::SlashComplete {
+                token_start: 0,
+                query: String::new(),
+                selected: 0,
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::from_preset(ThemePreset::Auto, None);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        term.draw(|frame| {
+            render_overlay(
+                frame,
+                Rect::new(0, 0, 80, 20),
+                Rect::new(0, 15, 80, 5),
+                &mut state,
+                &[],
+                &theme,
+            );
+        })
+        .unwrap();
+        let popup_buf = term.backend().buffer();
+        let mut popup_text = String::new();
+        for y in 0..popup_buf.area.height {
+            for x in 0..popup_buf.area.width {
+                popup_text.push_str(popup_buf[(x, y)].symbol());
+            }
+            popup_text.push('\n');
+        }
+        assert!(
+            popup_text.contains("/session"),
+            "expected /session visible in initial slash popup:\n{popup_text}"
+        );
+
+        // 3. `/ses` 过滤后选第 0 项按 Enter 应立即执行（takes_arg == false），且越界索引不 panic
+        let mut filtered_state = OverlayState {
+            active: Some(OverlayKind::SlashComplete {
+                token_start: 0,
+                query: "ses".into(),
+                selected: 99,
+            }),
+            ..Default::default()
+        };
+        let act =
+            filtered_state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &[], &[]);
+        assert!(matches!(
+            act,
+            Some(OverlayAction::CompleteSlash {
+                command,
+                execute_now: true,
+                ..
+            }) if command == "session"
+        ));
+
+        // 4. 帮助面板包含 `/session`
+        let mut help_state = OverlayState::default();
+        help_state.open_help();
+        let mut help_term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(84, 24)).unwrap();
+        help_term
+            .draw(|frame| {
+                render_overlay(
+                    frame,
+                    Rect::new(0, 0, 84, 24),
+                    Rect::new(0, 19, 84, 5),
+                    &mut help_state,
+                    &[],
+                    &theme,
+                );
+            })
+            .unwrap();
+        let help_buf = help_term.backend().buffer();
+        let mut help_text = String::new();
+        for y in 0..help_buf.area.height {
+            for x in 0..help_buf.area.width {
+                help_text.push_str(help_buf[(x, y)].symbol());
+            }
+            help_text.push('\n');
+        }
+        assert!(
+            help_text.contains("/session"),
+            "expected /session in help modal:\n{help_text}"
+        );
     }
 }

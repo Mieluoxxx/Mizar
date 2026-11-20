@@ -1517,6 +1517,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
         }],
         finish_notice: "ok".into(),
         selection: None,
+        ..Default::default()
     });
     assert_eq!(only_local_state.side_panel_data.context.tool_tokens, 0);
 
@@ -1667,6 +1668,7 @@ fn appends_notices_and_turns_after_welcome_with_scroll_and_hit_rect_projection()
         items: long_items,
         finish_notice: "已恢复历史会话".into(),
         selection: None,
+        ..Default::default()
     });
     assert!(state.auto_scroll);
     small_term.draw(|f| render(f, &mut state)).unwrap();
@@ -2452,4 +2454,133 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
     drop(_handles);
     drop(_adapter_cleanup);
     app_ctx.fiber().dispose().await;
+}
+
+/// 端到端验证 `/session` 与缺陷 A 修复：
+/// - SQLite 持久化写入包含多轮用量与压缩的会话后重启恢复（`--resume` 语义）
+/// - `restore_session_view` 不再把累计用量归零（状态栏 `tok` 与侧栏命中率同步恢复）
+/// - 输入 `/session` 零副作用打印完整会话 ID、存储路径、事件构成、压缩边界与账目
+#[tokio::test]
+async fn session_command_survives_sqlite_resume_restores_usage_and_renders_readonly_notice() {
+    let tmp_root = std::env::temp_dir().join(format!("mizar_tui_sess_info_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_root);
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let db_path = tmp_root.join("custom.sqlite");
+
+    let boot = |root: PathBuf, db: PathBuf| async move {
+        let ctx = Context::new();
+        ctx.logger().set_silent();
+        let mut cfg = AgentSpineConfig::coding(root).with_session_db(db);
+        if let AgentToolsMode::Coding {
+            ref mut mcp,
+            ref mut skills,
+            ref mut instructions,
+            ..
+        } = cfg.tools_mode
+        {
+            mcp.load_config_files = false;
+            skills.include_default_roots = false;
+            instructions.include_default_global = false;
+        }
+        ctx.plugin(AgentSpinePlugin, cfg);
+        wait_for_services(&ctx).await.unwrap();
+        ctx
+    };
+
+    let full_id = "6f3d2c1a-8b4e-4f2a-9c71-2e5d8a0b4f13";
+    let ctx1 = boot(tmp_root.clone(), db_path.clone()).await;
+    let s1 = ctx1
+        .sessions()
+        .unwrap()
+        .create_with(mizar_session::SessionCreateOptions {
+            id: Some(full_id.into()),
+            cwd: Some(tmp_root.display().to_string()),
+            ..Default::default()
+        });
+    s1.append(SessionEvent::user("请审计会话状态"));
+    s1.append(SessionEvent::Assistant {
+        blocks: vec![mizar_llm::ContentBlock::Text {
+            text: "收到，已完成。".into(),
+        }],
+        replay: None,
+        usage: Some(mizar_llm::TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_tokens: Some(9_000),
+            cache_write_tokens: Some(2_000),
+            ..Default::default()
+        }),
+    });
+    s1.compact_at(
+        "已核对上下文",
+        2,
+        Some(12_000),
+        Some(3_600),
+        mizar_session::CompactionDigest::default(),
+    );
+    s1.flush_async().await.unwrap();
+    ctx1.fiber().dispose().await;
+
+    // 重启恢复会话
+    let ctx2 = boot(tmp_root.clone(), db_path.clone()).await;
+    let reloaded = ctx2
+        .sessions()
+        .unwrap()
+        .get(full_id)
+        .expect("resumed session from sqlite");
+    let entries_before = reloaded.all_entries().len();
+
+    let mut state = AppState::new(
+        tmp_root.clone(),
+        &reloaded.id,
+        Vec::new(),
+        Some("mock".into()),
+        Some("mock-v1".into()),
+        None,
+    );
+    state.restore_session_view(project_resume_view(&reloaded));
+
+    // 缺陷 A 验证：恢复后累计用量与状态栏读数非零且按四项口径一致（1000+9000+2000+500 = 12500）
+    assert_eq!(state.total_usage.grand_total(), 12_500);
+    assert_eq!(state.total_usage.total_tokens, Some(12_500));
+    assert_eq!(state.last_prompt_tokens, Some(3_600));
+    assert_eq!(state.side_panel_data.context.total_tokens, 12_500);
+
+    // 运行 `/session` 命令
+    state.input.set_text_end("/session");
+    let act = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(act, AppAction::ShowSessionInfo);
+
+    let mut tui_cfg = mizar_tui::TuiConfig::new(&tmp_root);
+    tui_cfg.session_db_path = Some(db_path.clone());
+    let report = mizar_tui::build_session_info_report(&ctx2, &tui_cfg, &reloaded, &state);
+    state.push_notice(mizar_tui::NoticeLevel::Info, report);
+
+    // 零副作用：不写入会话日志，也不影响上下文估算
+    assert_eq!(reloaded.all_entries().len(), entries_before);
+    state.refresh_context_breakdown();
+    assert_eq!(
+        state.side_panel_data.context.last_prompt_tokens,
+        Some(3_600)
+    );
+
+    let backend = TestBackend::new(110, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let screen = buffer_text(terminal.backend());
+
+    assert!(screen.contains("tok 12.5k"), "status bar:\n{screen}");
+    assert!(screen.contains(full_id), "full session id:\n{screen}");
+    assert!(screen.contains("SQLite ·"), "storage line:\n{screen}");
+    assert!(screen.contains("custom.sqlite"), "db path:\n{screen}");
+    assert!(screen.contains("user 1"), "dialog counts:\n{screen}");
+    assert!(screen.contains("assistant 1"), "dialog counts:\n{screen}");
+    assert!(
+        screen.contains("1 次 · 最新保留自 #2"),
+        "compaction:\n{screen}"
+    );
+    assert!(screen.contains("3.6k / 128k"), "context:\n{screen}");
+
+    ctx2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&tmp_root);
 }
