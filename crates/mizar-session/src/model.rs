@@ -486,6 +486,8 @@ pub struct RecallSearchHit {
 pub struct LoadedSession {
     pub header: SessionHeader,
     pub entries: Vec<SessionEntry>,
+    /// 持久化存储中实际见到的最大事件 seq（含被跳过的未知事件）。
+    pub max_persisted_seq: Option<u64>,
     /// 读取时因无法反序列化而跳过的条目数（例如用旧版二进制打开新版写入的会话）。
     /// `> 0` 时调用方应告警：历史并未丢，仅本次水合并未载入这些条目。
     pub skipped_events: usize,

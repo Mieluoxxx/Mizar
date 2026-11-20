@@ -327,6 +327,9 @@ impl RouterModelConfig {
     }
 
     pub fn supported_efforts(&self) -> Vec<ReasoningEffort> {
+        if self.reasoning == Some(false) {
+            return Vec::new();
+        }
         if !self.reasoning_efforts.is_empty() {
             return self.reasoning_efforts.clone();
         }
@@ -337,7 +340,9 @@ impl RouterModelConfig {
                 .filter(|eff| {
                     let key = effort_to_key(*eff);
                     match self.thinking_level_map.get(key) {
-                        Some(Some(_)) => true,
+                        Some(Some(mapped)) => {
+                            parse_effort_key(mapped) != Some(ReasoningEffort::Off)
+                        }
                         Some(None) => false,
                         // Pi 规则：未在 thinkingLevelMap 映射的档位默认到 high 为止可用
                         None => !matches!(eff, ReasoningEffort::XHigh | ReasoningEffort::Max),
@@ -356,24 +361,33 @@ impl RouterModelConfig {
         Vec::new()
     }
 
-    /// 按 Pi 的 `thinkingLevelMap` 与 `reasoning` 能力裁剪/映射推理档位。
+    /// 按 Pi 的 `thinkingLevelMap`、`reasoningEfforts` 与 `reasoning` 能力裁剪/映射推理档位。
     pub fn resolve_thinking_level(&self, requested: ReasoningEffort) -> Option<ReasoningEffort> {
         if self.reasoning == Some(false) {
             return None;
         }
-        if self.thinking_level_map.is_empty() {
+        if requested == ReasoningEffort::Off {
+            if !self.thinking_level_map.is_empty() {
+                return match self.thinking_level_map.get("off") {
+                    Some(Some(mapped)) => parse_effort_key(mapped),
+                    Some(None) => None,
+                    None => Some(ReasoningEffort::Off),
+                };
+            }
+            return Some(ReasoningEffort::Off);
+        }
+
+        if self.thinking_level_map.is_empty() && self.reasoning_efforts.is_empty() {
             return Some(requested);
         }
 
-        if requested == ReasoningEffort::Off {
-            return match self.thinking_level_map.get("off") {
-                Some(Some(mapped)) => parse_effort_key(mapped),
-                Some(None) => None,
-                None => Some(ReasoningEffort::Off),
-            };
-        }
-
         let is_supported = |eff: ReasoningEffort| -> Option<ReasoningEffort> {
+            if !self.reasoning_efforts.is_empty() && !self.reasoning_efforts.contains(&eff) {
+                return None;
+            }
+            if self.thinking_level_map.is_empty() {
+                return Some(eff);
+            }
             let key = effort_to_key(eff);
             match self.thinking_level_map.get(key) {
                 Some(Some(mapped)) => match parse_effort_key(mapped) {

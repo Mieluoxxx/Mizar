@@ -336,13 +336,31 @@ struct ChunkFunctionDelta {
     arguments: Option<String>,
 }
 
+enum CompletionsBlockKind {
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+    },
+}
+
 struct OpenBlock {
     index: usize,
-    kind: ContentBlockKind,
-    text: String,
-    tool_id: String,
-    tool_name: String,
-    tool_args: String,
+    kind: CompletionsBlockKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionsEventPhase {
+    Streaming,
+    Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionsFinishPhase {
+    Pending,
+    Emitted,
 }
 
 /// OpenAI Chat Completions SSE 解码器。
@@ -358,7 +376,8 @@ pub struct CompletionsSseDecoder {
     blocks: Vec<OpenBlock>,
     usage: Option<TokenUsage>,
     finish_reason: Option<String>,
-    finished_emitted: bool,
+    event_phase: CompletionsEventPhase,
+    finish_phase: CompletionsFinishPhase,
 }
 
 impl CompletionsSseDecoder {
@@ -375,7 +394,8 @@ impl CompletionsSseDecoder {
             blocks: Vec::new(),
             usage: None,
             finish_reason: None,
-            finished_emitted: false,
+            event_phase: CompletionsEventPhase::Streaming,
+            finish_phase: CompletionsFinishPhase::Pending,
         }
     }
 
@@ -386,13 +406,18 @@ impl CompletionsSseDecoder {
     ) -> Option<usize> {
         let idx = self.next_index;
         self.next_index += 1;
+        let state = match kind {
+            ContentBlockKind::Text => CompletionsBlockKind::Text(String::new()),
+            ContentBlockKind::Reasoning => CompletionsBlockKind::Reasoning(String::new()),
+            ContentBlockKind::ToolCall => CompletionsBlockKind::ToolCall {
+                id: String::new(),
+                name: String::new(),
+                args: String::new(),
+            },
+        };
         self.blocks.push(OpenBlock {
             index: idx,
-            kind,
-            text: String::new(),
-            tool_id: String::new(),
-            tool_name: String::new(),
-            tool_args: String::new(),
+            kind: state,
         });
         if !emit(StreamChunk::BlockStart { index: idx, kind }) {
             return None;
@@ -414,7 +439,7 @@ impl CompletionsSseDecoder {
                 if self
                     .blocks
                     .iter()
-                    .any(|b| b.kind == ContentBlockKind::ToolCall)
+                    .any(|b| matches!(b.kind, CompletionsBlockKind::ToolCall { .. }))
                 {
                     FinishReason::ToolCalls
                 } else {
@@ -431,11 +456,15 @@ impl SseStreamDecoder for CompletionsSseDecoder {
         event: SseEvent,
         emit: &mut dyn FnMut(StreamChunk) -> bool,
     ) -> Result<bool, LlmError> {
+        if self.event_phase == CompletionsEventPhase::Done {
+            return Ok(true);
+        }
         let data = event.data.trim();
         if data.is_empty() {
             return Ok(false);
         }
         if data == "[DONE]" {
+            self.event_phase = CompletionsEventPhase::Done;
             return Ok(true);
         }
 
@@ -504,7 +533,9 @@ impl SseStreamDecoder for CompletionsSseDecoder {
                     i
                 }
             };
-            self.blocks[idx].text.push_str(&reasoning);
+            if let CompletionsBlockKind::Reasoning(ref mut buf) = self.blocks[idx].kind {
+                buf.push_str(&reasoning);
+            }
             if !emit(StreamChunk::ReasoningDelta {
                 index: idx,
                 text: reasoning,
@@ -526,7 +557,9 @@ impl SseStreamDecoder for CompletionsSseDecoder {
                     i
                 }
             };
-            self.blocks[idx].text.push_str(&text);
+            if let CompletionsBlockKind::Text(ref mut buf) = self.blocks[idx].kind {
+                buf.push_str(&text);
+            }
             if !emit(StreamChunk::TextDelta { index: idx, text }) {
                 return Ok(true);
             }
@@ -546,22 +579,28 @@ impl SseStreamDecoder for CompletionsSseDecoder {
             let id_delta = part.id.clone();
             let mut name_delta = None;
             let mut args_delta = String::new();
-            let block = &mut self.blocks[idx];
-            if let Some(id) = part.id
-                && !id.is_empty()
+            if let CompletionsBlockKind::ToolCall {
+                id: ref mut tool_id,
+                name: ref mut tool_name,
+                args: ref mut tool_args,
+            } = self.blocks[idx].kind
             {
-                block.tool_id = id;
-            }
-            if let Some(func) = part.function {
-                if let Some(name) = func.name
-                    && !name.is_empty()
+                if let Some(id) = part.id
+                    && !id.is_empty()
                 {
-                    block.tool_name.push_str(&name);
-                    name_delta = Some(name);
+                    *tool_id = id;
                 }
-                if let Some(args) = func.arguments {
-                    block.tool_args.push_str(&args);
-                    args_delta = args;
+                if let Some(func) = part.function {
+                    if let Some(name) = func.name
+                        && !name.is_empty()
+                    {
+                        tool_name.push_str(&name);
+                        name_delta = Some(name);
+                    }
+                    if let Some(args) = func.arguments {
+                        tool_args.push_str(&args);
+                        args_delta = args;
+                    }
                 }
             }
             if !emit(StreamChunk::ToolCallDelta {
@@ -577,24 +616,32 @@ impl SseStreamDecoder for CompletionsSseDecoder {
         Ok(false)
     }
 
+    fn on_eof_without_done(&self) -> Result<(), LlmError> {
+        if self.finish_reason.is_some() {
+            Ok(())
+        } else {
+            Err(LlmError::malformed(
+                "completions SSE stream truncated before [DONE] or finish_reason",
+            ))
+        }
+    }
+
     fn on_finish(&mut self, emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
-        if self.finished_emitted {
+        if self.finish_phase == CompletionsFinishPhase::Emitted {
             return Ok(());
         }
-        self.finished_emitted = true;
+        self.finish_phase = CompletionsFinishPhase::Emitted;
 
         for b in &self.blocks {
-            let block = match b.kind {
-                ContentBlockKind::Text => ContentBlock::Text {
-                    text: b.text.clone(),
-                },
-                ContentBlockKind::Reasoning => ContentBlock::Reasoning {
-                    text: b.text.clone(),
-                },
-                ContentBlockKind::ToolCall => ContentBlock::ToolCall {
-                    id: b.tool_id.clone(),
-                    name: b.tool_name.clone(),
-                    arguments: b.tool_args.clone(),
+            let block = match &b.kind {
+                CompletionsBlockKind::Text(text) => ContentBlock::Text { text: text.clone() },
+                CompletionsBlockKind::Reasoning(text) => {
+                    ContentBlock::Reasoning { text: text.clone() }
+                }
+                CompletionsBlockKind::ToolCall { id, name, args } => ContentBlock::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: args.clone(),
                 },
             };
             if !emit(StreamChunk::BlockEnd {
@@ -681,6 +728,13 @@ impl LlmAdapter for CompletionsAdapter {
     }
 
     fn discover_models(&self) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
+        self.discover_models_with_headers(&[])
+    }
+
+    fn discover_models_with_headers(
+        &self,
+        extra_headers: &[(String, String)],
+    ) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
         if !self.config.models.is_empty() {
             let models = self.config.models.clone();
             return Box::pin(async move { Ok(models) });
@@ -690,7 +744,7 @@ impl LlmAdapter for CompletionsAdapter {
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = format!("{}/models", trim_base_url(&self.config.base_url));
-        let headers = self.build_headers(api_key.as_deref(), &[]);
+        let headers = self.build_headers(api_key.as_deref(), extra_headers);
         let client = self.client.clone();
         Box::pin(async move { discover_models_http(&client, &url, &headers).await })
     }

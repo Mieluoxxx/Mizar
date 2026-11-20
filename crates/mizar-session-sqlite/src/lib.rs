@@ -38,10 +38,17 @@ impl SqlitePersistenceConfig {
     }
 }
 
+enum WriterLifecycle {
+    Open(JoinHandle<()>),
+    Closing,
+    Closed,
+}
+
 pub struct SqliteSessionPersistence {
     tx: mpsc::Sender<WriteCmd>,
     reader: Option<Mutex<Connection>>,
-    writer_thread: Mutex<Option<JoinHandle<()>>>,
+    lifecycle: Mutex<WriterLifecycle>,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl SqliteSessionPersistence {
@@ -76,35 +83,56 @@ impl SqliteSessionPersistence {
         };
 
         let (tx, rx) = mpsc::channel();
+        let last_error = Arc::new(Mutex::new(None));
+        let last_error_writer = Arc::clone(&last_error);
         let handle = std::thread::Builder::new()
             .name("mizar-sqlite-writer".to_string())
-            .spawn(move || run_writer_loop(writer_conn, rx))?;
+            .spawn(move || run_writer_loop(writer_conn, rx, last_error_writer))?;
 
         Ok(Arc::new(Self {
             tx,
             reader,
-            writer_thread: Mutex::new(Some(handle)),
+            lifecycle: Mutex::new(WriterLifecycle::Open(handle)),
+            last_error,
         }))
     }
 
     pub fn shutdown(&self) -> PersistenceResult<()> {
-        let mut guard = self.writer_thread.lock().unwrap();
-        let Some(handle) = guard.take() else {
-            return Ok(());
+        let handle = {
+            let mut guard = self.lifecycle.lock().unwrap();
+            match std::mem::replace(&mut *guard, WriterLifecycle::Closing) {
+                WriterLifecycle::Open(h) => h,
+                WriterLifecycle::Closing | WriterLifecycle::Closed => {
+                    // 若未接手过 Handle（并发或二次关闭），保留既定 Closing/Closed 状态并幂等返回
+                    if !matches!(*guard, WriterLifecycle::Closing) {
+                        *guard = WriterLifecycle::Closed;
+                    }
+                    return Ok(());
+                }
+            }
         };
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let send_res = self.tx.send(WriteCmd::Shutdown(reply_tx));
-        drop(guard);
         let res = if send_res.is_ok() {
             reply_rx.recv().unwrap_or(Err(PersistenceError::Closed))
         } else {
             Ok(())
         };
         let _ = handle.join();
+        *self.lifecycle.lock().unwrap() = WriterLifecycle::Closed;
         res
     }
 
     fn send_cmd(&self, cmd: WriteCmd) -> PersistenceResult<()> {
+        {
+            let guard = self.lifecycle.lock().unwrap();
+            if !matches!(*guard, WriterLifecycle::Open(_)) {
+                return Err(PersistenceError::Closed);
+            }
+        }
+        if let Some(ref err_msg) = *self.last_error.lock().unwrap() {
+            return Err(PersistenceError::Backend(err_msg.clone()));
+        }
         self.tx.send(cmd).map_err(|_| PersistenceError::Closed)
     }
 }

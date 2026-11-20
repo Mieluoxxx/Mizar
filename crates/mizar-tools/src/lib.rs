@@ -89,11 +89,15 @@ impl ToolNamespace {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolExecution {
     pub name: String,
     pub args: Value,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub call_id: String,
+    #[serde(default)]
+    pub nested: bool,
 }
 
 impl ToolExecution {
@@ -102,7 +106,19 @@ impl ToolExecution {
             name: name.into(),
             args,
             session_id,
+            call_id: String::new(),
+            nested: false,
         }
+    }
+
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = call_id.into();
+        self
+    }
+
+    pub fn with_nested(mut self, nested: bool) -> Self {
+        self.nested = nested;
+        self
     }
 }
 
@@ -549,19 +565,26 @@ pub fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
     true
 }
 
+/// 单个会话的工具激活策略：与「默认继承 + 增量激活」和「显式指定工具集」互斥。
+#[derive(Debug, Clone)]
+enum SessionToolPolicy {
+    IncrementalAdded(Vec<String>),
+    Explicit(Vec<String>),
+}
+
 #[derive(Default)]
 struct ToolState {
     tools: Vec<ToolDefinition>,
-    /// 全局默认激活覆盖（例如连接了 MCP server 后自动开启 `codemode` / `tool_search`）。
+    /// 显式全局覆盖（例如手动覆盖默认激活或无会话上下文下动态启用）。
     global_active_overrides: HashMap<String, bool>,
+    /// 插件按需自动启用状态（如 `codemode` / `tool_search`），不绕过显式 `include_patterns`。
+    auto_default_active: HashMap<String, bool>,
     /// 若设置了 `Some(patterns)`，默认只激活匹配这些模式且未关闭的工具。
     include_patterns: Option<Vec<String>>,
     /// 屏蔽规则（即使注册或尝试激活也不对外暴露）。
     exclude_patterns: Vec<String>,
-    /// 按会话增量激活的工具列表（如 `tool_search` 动态加载）。
-    session_added: HashMap<String, Vec<String>>,
-    /// 按会话显式替换过的激活集合。
-    session_explicit: HashMap<String, Vec<String>>,
+    /// 按会话管理的工具激活策略。
+    session_policies: HashMap<String, SessionToolPolicy>,
 }
 
 impl ToolState {
@@ -585,10 +608,30 @@ impl ToolState {
         if let Some(include) = &self.include_patterns {
             return include.iter().any(|p| wildcard_matches(p, &tool.name));
         }
+        if let Some(&auto_active) = self.auto_default_active.get(&tool.name) {
+            return auto_active;
+        }
         tool.default_active.unwrap_or(matches!(
             tool.exposure,
             ToolExposure::Direct | ToolExposure::ModelOnly
         ))
+    }
+
+    fn is_tool_active_for_session(&self, session_id: Option<&str>, tool: &ToolDefinition) -> bool {
+        if !Self::is_activatable(tool, self.is_excluded(&tool.name)) {
+            return false;
+        }
+        if let Some(sid) = session_id
+            && let Some(policy) = self.session_policies.get(sid)
+        {
+            return match policy {
+                SessionToolPolicy::Explicit(names) => names.iter().any(|n| n == &tool.name),
+                SessionToolPolicy::IncrementalAdded(added) => {
+                    self.is_default_active(tool) || added.iter().any(|n| n == &tool.name)
+                }
+            };
+        }
+        self.is_default_active(tool)
     }
 
     fn resolve_active_defs(&self, session_id: Option<&str>) -> Vec<ToolDefinition> {
@@ -598,7 +641,7 @@ impl ToolState {
         }
 
         if let Some(sid) = session_id
-            && let Some(explicit) = self.session_explicit.get(sid)
+            && let Some(SessionToolPolicy::Explicit(explicit)) = self.session_policies.get(sid)
         {
             let mut out = Vec::new();
             let mut seen = HashSet::new();
@@ -621,7 +664,7 @@ impl ToolState {
             }
         }
         if let Some(sid) = session_id
-            && let Some(added) = self.session_added.get(sid)
+            && let Some(SessionToolPolicy::IncrementalAdded(added)) = self.session_policies.get(sid)
         {
             for name in added {
                 if seen.insert(name.as_str())
@@ -654,7 +697,6 @@ impl ToolState {
     }
 
     fn is_callable_in_sandbox(&self, session_id: Option<&str>, tool_name: &str) -> bool {
-        let active_defs = self.resolve_active_defs(session_id);
         let Some(tool) = self.tools.iter().find(|t| t.name == tool_name) else {
             return false;
         };
@@ -662,7 +704,7 @@ impl ToolState {
             return false;
         }
         match tool.exposure {
-            ToolExposure::Direct => active_defs.iter().any(|t| t.name == tool_name),
+            ToolExposure::Direct => self.is_tool_active_for_session(session_id, tool),
             ToolExposure::Codemode | ToolExposure::Deferred => true,
             ToolExposure::ModelOnly | ToolExposure::Hidden => false,
         }
@@ -696,11 +738,14 @@ impl ToolRuntime {
                         st.tools.remove(idx);
                     }
                     st.global_active_overrides.remove(&tool_name);
-                    for list in st.session_added.values_mut() {
-                        list.retain(|n| n != &tool_name);
-                    }
-                    for list in st.session_explicit.values_mut() {
-                        list.retain(|n| n != &tool_name);
+                    st.auto_default_active.remove(&tool_name);
+                    for policy in st.session_policies.values_mut() {
+                        match policy {
+                            SessionToolPolicy::IncrementalAdded(list)
+                            | SessionToolPolicy::Explicit(list) => {
+                                list.retain(|n| n != &tool_name);
+                            }
+                        }
                     }
                 }
                 rt.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -710,21 +755,42 @@ impl ToolRuntime {
 
     /// 配置全局工具选择（白名单模式列表 + 黑名单屏蔽模式列表）。
     pub fn set_tool_selection(&self, include: Option<Vec<String>>, exclude: Vec<String>) {
-        {
+        let changed = {
             let mut st = self.state.lock().unwrap();
+            let same = st.include_patterns == include && st.exclude_patterns == exclude;
             st.include_patterns = include;
             st.exclude_patterns = exclude;
+            !same
+        };
+        if changed {
+            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
         }
-        self.ctx.emit(EVENT_TOOLS_CHANGE, ());
     }
 
-    /// 全局覆盖某个工具的默认激活状态（例如接入 MCP server 后自动打开 `codemode` / `tool_search`）。
+    /// 全局覆盖某个工具的激活状态（优先级高于 `include_patterns` 与 `auto_default_active`）。
     pub fn set_global_active_override(&self, name: &str, active: bool) {
-        {
+        let changed = {
             let mut st = self.state.lock().unwrap();
-            st.global_active_overrides.insert(name.to_string(), active);
+            st.global_active_overrides.insert(name.to_string(), active) != Some(active)
+        };
+        if changed {
+            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
         }
-        self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+    }
+
+    /// 更新插件的按需自动默认启用状态（不绕过显式 `include_patterns` 白名单）。
+    pub fn set_auto_default_active(&self, name: &str, active: Option<bool>) {
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            let prev = match active {
+                Some(v) => st.auto_default_active.insert(name.to_string(), v),
+                None => st.auto_default_active.remove(name),
+            };
+            prev != active
+        };
+        if changed {
+            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        }
     }
 
     /// 获取某会话当前激活的工具名列表（含默认激活工具与动态激活工具）。
@@ -765,9 +831,10 @@ impl ToolRuntime {
                         .is_some_and(|t| ToolState::is_activatable(t, st.is_excluded(n)))
                 })
                 .collect();
-            st.session_explicit
-                .insert(session_id.to_string(), valid.clone());
-            st.session_added.remove(session_id);
+            st.session_policies.insert(
+                session_id.to_string(),
+                SessionToolPolicy::Explicit(valid.clone()),
+            );
             valid
         };
         self.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -798,13 +865,15 @@ impl ToolRuntime {
                 }
             }
             if !newly_added.is_empty() {
-                if let Some(explicit) = st.session_explicit.get_mut(session_id) {
-                    explicit.extend(newly_added.iter().cloned());
-                } else {
-                    st.session_added
-                        .entry(session_id.to_string())
-                        .or_default()
-                        .extend(newly_added.iter().cloned());
+                let policy = st
+                    .session_policies
+                    .entry(session_id.to_string())
+                    .or_insert_with(|| SessionToolPolicy::IncrementalAdded(Vec::new()));
+                match policy {
+                    SessionToolPolicy::Explicit(list)
+                    | SessionToolPolicy::IncrementalAdded(list) => {
+                        list.extend(newly_added.iter().cloned());
+                    }
                 }
             }
             newly_added
@@ -820,9 +889,7 @@ impl ToolRuntime {
     pub fn reset_session_activations(&self, session_id: &str) -> bool {
         let changed = {
             let mut st = self.state.lock().unwrap();
-            let a = st.session_added.remove(session_id).is_some();
-            let b = st.session_explicit.remove(session_id).is_some();
-            a || b
+            st.session_policies.remove(session_id).is_some()
         };
         if changed {
             self.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -955,11 +1022,13 @@ impl ToolRuntime {
 
     async fn execute_internal(
         self: &Arc<Self>,
-        exec: ToolExecution,
+        mut exec: ToolExecution,
         cancel: CancellationToken,
         on_update: Option<ToolUpdateCallback>,
         nested: bool,
     ) -> ToolResult {
+        let is_nested = nested || exec.nested;
+        exec.nested = is_nested;
         let decision: PreExecuteDecision = self
             .ctx
             .waterfall(
@@ -977,7 +1046,7 @@ impl ToolRuntime {
                 decision.reason.as_deref().unwrap_or("不允许调用"),
                 exec.name
             ))
-        } else if nested && !self.can_call_nested(exec.session_id.as_deref(), &exec.name) {
+        } else if is_nested && !self.can_call_nested(exec.session_id.as_deref(), &exec.name) {
             ToolResult::err(format!("沙箱脚本无权调用工具：{}", exec.name))
         } else {
             let runtime = Arc::clone(self);
@@ -1163,5 +1232,67 @@ mod tests {
             )
             .await;
         assert!(nested_denied.is_error);
+    }
+
+    #[tokio::test]
+    async fn session_tool_policy_transitions_and_auto_default_precedence() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = app.tools().unwrap();
+
+        let _r = tools
+            .register(ToolDefinition::sync_tool(
+                "read",
+                "read",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _w = tools
+            .register(ToolDefinition::sync_tool(
+                "write",
+                "write",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _cm = tools
+            .register(
+                ToolDefinition::sync_tool("codemode", "run js", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly)
+                .with_default_active(false),
+            )
+            .unwrap();
+
+        // auto_default_active 在未设 include 白名单时生效
+        tools.set_auto_default_active("codemode", Some(true));
+        assert_eq!(
+            tools.get_active_tools("s1"),
+            vec!["read", "write", "codemode"]
+        );
+
+        // 显式 --tools 白名单优先级高于 auto_default_active，不被绕过
+        tools.set_tool_selection(Some(vec!["read".into()]), Vec::new());
+        assert_eq!(tools.get_active_tools("s1"), vec!["read"]);
+
+        // 恢复默认后继续测试 Explicit -> activate_tools -> reset 状态迁移
+        tools.set_tool_selection(None, Vec::new());
+        assert_eq!(
+            tools.set_active_tools("s1", &["write".into()]),
+            vec!["write"]
+        );
+        assert_eq!(
+            tools.activate_tools("s1", &["read".into(), "write".into()]),
+            vec!["read"]
+        );
+        assert_eq!(tools.get_active_tools("s1"), vec!["write", "read"]);
+        assert!(tools.reset_session_activations("s1"));
+        assert!(!tools.reset_session_activations("s1"));
+        assert_eq!(
+            tools.get_active_tools("s1"),
+            vec!["read", "write", "codemode"]
+        );
     }
 }

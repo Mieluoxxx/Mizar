@@ -20,6 +20,9 @@ pub struct InputLayout {
 struct UndoEntry {
     text: String,
     cursor: usize,
+    pastes: HashMap<String, PasteEntry>,
+    paste_seq: usize,
+    image_seq: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,20 @@ struct CachedInputLayout {
     layout: InputLayout,
 }
 
+#[derive(Debug, Clone, Default)]
+enum HistoryNavState {
+    #[default]
+    Inactive,
+    Recalling {
+        index: usize,
+        draft_text: String,
+        draft_cursor: usize,
+        draft_pastes: HashMap<String, PasteEntry>,
+        draft_paste_seq: usize,
+        draft_image_seq: usize,
+    },
+}
+
 /// 多行文本编辑器：按 UTF-8 字符边界编辑、原子粘贴块（长文本与图片）、词级导航/撤销，并按终端显示列宽折行定位光标。
 #[derive(Debug, Default, Clone)]
 pub struct TextInput {
@@ -48,8 +65,7 @@ pub struct TextInput {
     /// 当前光标在 `text` 中的 UTF-8 字节偏移。
     cursor: usize,
     history: Vec<String>,
-    history_idx: Option<usize>,
-    draft_before_history: String,
+    history_nav: HistoryNavState,
     undo_stack: Vec<UndoEntry>,
     kill_ring: String,
     paste_seq: usize,
@@ -116,6 +132,9 @@ impl TextInput {
         if let Some(last) = self.undo_stack.last()
             && last.text == self.text
             && last.cursor == self.cursor
+            && last.pastes.len() == self.pastes.len()
+            && last.paste_seq == self.paste_seq
+            && last.image_seq == self.image_seq
         {
             return;
         }
@@ -125,6 +144,9 @@ impl TextInput {
         self.undo_stack.push(UndoEntry {
             text: self.text.clone(),
             cursor: self.cursor,
+            pastes: self.pastes.clone(),
+            paste_seq: self.paste_seq,
+            image_seq: self.image_seq,
         });
     }
 
@@ -134,17 +156,20 @@ impl TextInput {
         };
         self.text = prev.text;
         self.cursor = prev.cursor.min(self.text.len());
-        self.history_idx = None;
+        self.pastes = prev.pastes;
+        self.paste_seq = self.paste_seq.max(prev.paste_seq);
+        self.image_seq = self.image_seq.max(prev.image_seq);
+        self.history_nav = HistoryNavState::Inactive;
         true
     }
 
     pub fn clear(&mut self) {
-        if !self.text.is_empty() {
+        if !self.text.is_empty() || !self.pastes.is_empty() {
             self.push_undo();
         }
         self.text.clear();
         self.cursor = 0;
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         self.pastes.clear();
         self.image_seq = 0;
     }
@@ -182,8 +207,7 @@ impl TextInput {
         let out = self.expand_text();
         self.text.clear();
         self.cursor = 0;
-        self.history_idx = None;
-        self.draft_before_history.clear();
+        self.history_nav = HistoryNavState::Inactive;
         self.undo_stack.clear();
         self.pastes.clear();
         self.image_seq = 0;
@@ -204,7 +228,7 @@ impl TextInput {
         self.push_undo();
         self.text = value.to_string();
         self.cursor = self.text.len();
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         self.pastes.clear();
         self.image_seq = 0;
     }
@@ -223,8 +247,7 @@ impl TextInput {
     ) {
         self.text = value.to_string();
         self.cursor = self.text.len();
-        self.history_idx = None;
-        self.draft_before_history.clear();
+        self.history_nav = HistoryNavState::Inactive;
         self.undo_stack.clear();
         self.pastes.clear();
         self.image_seq = images.len();
@@ -246,7 +269,7 @@ impl TextInput {
         if normalized.is_whitespace() || self.undo_stack.is_empty() {
             self.push_undo();
         }
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         self.text.insert(self.cursor, normalized);
         self.cursor += normalized.len_utf8();
     }
@@ -256,7 +279,7 @@ impl TextInput {
             return;
         }
         self.push_undo();
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
         self.text.insert_str(self.cursor, &normalized);
         self.cursor += normalized.len();
@@ -265,7 +288,7 @@ impl TextInput {
     /// 插入剪贴板或 `@` 图片原子占位符（如 `[Image #1]` 或 `[Image #1 · 4032×3024 → 2048×1536]`）。
     pub fn insert_image(&mut self, summary_suffix: Option<&str>, image: ImageAttachment) -> String {
         self.push_undo();
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         let token = loop {
             self.image_seq += 1;
             let candidate = match summary_suffix.map(str::trim).filter(|s| !s.is_empty()) {
@@ -299,7 +322,7 @@ impl TextInput {
         let char_count = normalized.chars().count();
         if line_count > PASTE_COLLAPSE_MIN_LINES || char_count > PASTE_COLLAPSE_MIN_CHARS {
             self.push_undo();
-            self.history_idx = None;
+            self.history_nav = HistoryNavState::Inactive;
             self.paste_seq += 1;
             let token = if line_count > 1 {
                 format!("[paste #{} +{} lines]", self.paste_seq, line_count)
@@ -333,7 +356,7 @@ impl TextInput {
             return;
         }
         self.push_undo();
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         self.text.replace_range(start..end, replacement);
         self.cursor = start + cursor_offset.min(replacement.len());
     }
@@ -372,7 +395,7 @@ impl TextInput {
             return;
         }
         self.push_undo();
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         if let Some((start, end)) = self.paste_span_containing(self.cursor) {
             self.text.replace_range(start..end, "");
             self.cursor = start;
@@ -389,7 +412,7 @@ impl TextInput {
             return;
         }
         self.push_undo();
-        self.history_idx = None;
+        self.history_nav = HistoryNavState::Inactive;
         if let Some((start, end)) = self.paste_span_starting_at(self.cursor) {
             self.text.replace_range(start..end, "");
             return;
@@ -405,6 +428,7 @@ impl TextInput {
             return;
         }
         self.push_undo();
+        self.history_nav = HistoryNavState::Inactive;
         let target = self.find_word_left();
         self.kill_ring = self.text[target..self.cursor].to_string();
         self.text.replace_range(target..self.cursor, "");
@@ -418,6 +442,7 @@ impl TextInput {
             .unwrap_or(0);
         if line_start < self.cursor {
             self.push_undo();
+            self.history_nav = HistoryNavState::Inactive;
             self.kill_ring = self.text[line_start..self.cursor].to_string();
             self.text.replace_range(line_start..self.cursor, "");
             self.cursor = line_start;
@@ -431,6 +456,7 @@ impl TextInput {
             .unwrap_or(self.text.len());
         if self.cursor < line_end {
             self.push_undo();
+            self.history_nav = HistoryNavState::Inactive;
             self.kill_ring = self.text[self.cursor..line_end].to_string();
             self.text.replace_range(self.cursor..line_end, "");
         }
@@ -611,32 +637,59 @@ impl TextInput {
         if self.history.is_empty() {
             return;
         }
-        let next_idx = match self.history_idx {
-            None => {
-                self.draft_before_history = self.text.clone();
-                self.history.len() - 1
+        let next_idx = match &mut self.history_nav {
+            HistoryNavState::Inactive => {
+                let idx = self.history.len() - 1;
+                self.history_nav = HistoryNavState::Recalling {
+                    index: idx,
+                    draft_text: std::mem::take(&mut self.text),
+                    draft_cursor: self.cursor,
+                    draft_pastes: std::mem::take(&mut self.pastes),
+                    draft_paste_seq: self.paste_seq,
+                    draft_image_seq: self.image_seq,
+                };
+                self.image_seq = 0;
+                idx
             }
-            Some(0) => 0,
-            Some(i) => i - 1,
+            HistoryNavState::Recalling { index, .. } => {
+                *index = index.saturating_sub(1);
+                *index
+            }
         };
-        self.history_idx = Some(next_idx);
         self.text = self.history[next_idx].clone();
         self.cursor = self.text.len();
     }
 
     fn recall_next_history(&mut self) {
-        let Some(idx) = self.history_idx else {
-            return;
-        };
-        if idx + 1 < self.history.len() {
-            let next_idx = idx + 1;
-            self.history_idx = Some(next_idx);
-            self.text = self.history[next_idx].clone();
-        } else {
-            self.history_idx = None;
-            self.text = std::mem::take(&mut self.draft_before_history);
+        let len = self.history.len();
+        match &self.history_nav {
+            HistoryNavState::Inactive => return,
+            HistoryNavState::Recalling { index, .. } if index + 1 < len => {
+                let next_idx = index + 1;
+                if let HistoryNavState::Recalling { index, .. } = &mut self.history_nav {
+                    *index = next_idx;
+                }
+                self.text = self.history[next_idx].clone();
+                self.cursor = self.text.len();
+                return;
+            }
+            HistoryNavState::Recalling { .. } => {}
         }
-        self.cursor = self.text.len();
+        if let HistoryNavState::Recalling {
+            draft_text,
+            draft_cursor,
+            draft_pastes,
+            draft_paste_seq,
+            draft_image_seq,
+            ..
+        } = std::mem::take(&mut self.history_nav)
+        {
+            self.text = draft_text;
+            self.cursor = draft_cursor.min(self.text.len());
+            self.pastes = draft_pastes;
+            self.paste_seq = self.paste_seq.max(draft_paste_seq);
+            self.image_seq = draft_image_seq;
+        }
     }
 
     pub fn bash_mode(&self) -> Option<BashInputMode> {
@@ -904,5 +957,58 @@ mod tests {
         assert_eq!(sent_images, vec![(tok1, img1), (tok2, img2)]);
         assert!(input.is_empty());
         assert_eq!(input.image_count(), 0);
+    }
+
+    #[test]
+    fn undo_and_history_navigation_preserve_pastes_and_images() {
+        let mut input = TextInput::new();
+        let big = (1..=10)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let img = ImageAttachment::new("image/png", "AAAA").with_dimensions(640, 480);
+
+        // 1. 折叠粘贴 + 图片后 clear / set_text_end，Ctrl+Z 必须完整还原 pastes 与 image_seq
+        input.insert_paste(&big);
+        input.insert_str(" ");
+        let img_tok = input.insert_image(Some("640×480"), img.clone());
+        assert!(input.has_collapsed_pastes());
+        assert_eq!(input.image_count(), 1);
+
+        input.clear();
+        assert!(input.is_empty());
+        assert_eq!(input.image_count(), 0);
+
+        assert!(input.undo());
+        assert!(input.has_collapsed_pastes());
+        assert_eq!(input.image_count(), 1);
+        assert!(input.expand_text().contains("line-10"));
+
+        input.set_text_end("replaced draft");
+        assert_eq!(input.image_count(), 0);
+        assert!(input.undo());
+        assert_eq!(input.image_count(), 1);
+        assert!(input.text().contains(&img_tok));
+
+        // 2. 历史翻阅期间原草稿中的粘贴/图片与光标位置完全隔离保存，下翻恢复时精确还原
+        input.push_history("older prompt");
+        input.push_history("latest prompt");
+        input.move_left();
+        let saved_cursor = input.cursor_byte();
+
+        input.move_up();
+        assert_eq!(input.text(), "latest prompt");
+        assert_eq!(input.image_count(), 0);
+        assert!(!input.has_collapsed_pastes());
+
+        input.move_up();
+        assert_eq!(input.text(), "older prompt");
+
+        input.move_down();
+        assert_eq!(input.text(), "latest prompt");
+        input.move_down();
+        assert!(input.has_collapsed_pastes());
+        assert_eq!(input.image_count(), 1);
+        assert_eq!(input.cursor_byte(), saved_cursor);
     }
 }

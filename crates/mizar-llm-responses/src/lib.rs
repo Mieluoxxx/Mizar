@@ -209,6 +209,18 @@ pub fn build_request_body(
     body
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponsesEventPhase {
+    Streaming,
+    Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponsesFinishPhase {
+    Pending,
+    Emitted,
+}
+
 struct PendingCall {
     stream_idx: usize,
     call_id: String,
@@ -225,10 +237,12 @@ pub struct ResponsesSseDecoder {
     text_idx: Option<usize>,
     reasoning_idx: Option<usize>,
     pending_calls: HashMap<String, PendingCall>,
+    completed_items: std::collections::HashSet<String>,
     has_tool_calls: bool,
     usage: Option<TokenUsage>,
     finish_reason: Option<FinishReason>,
-    finished_emitted: bool,
+    event_phase: ResponsesEventPhase,
+    finish_phase: ResponsesFinishPhase,
 }
 
 impl ResponsesSseDecoder {
@@ -241,10 +255,12 @@ impl ResponsesSseDecoder {
             text_idx: None,
             reasoning_idx: None,
             pending_calls: HashMap::new(),
+            completed_items: std::collections::HashSet::new(),
             has_tool_calls: false,
             usage: None,
             finish_reason: None,
-            finished_emitted: false,
+            event_phase: ResponsesEventPhase::Streaming,
+            finish_phase: ResponsesFinishPhase::Pending,
         }
     }
 
@@ -283,11 +299,15 @@ impl SseStreamDecoder for ResponsesSseDecoder {
         event: SseEvent,
         emit: &mut dyn FnMut(StreamChunk) -> bool,
     ) -> Result<bool, LlmError> {
+        if self.event_phase == ResponsesEventPhase::Done {
+            return Ok(true);
+        }
         let data = event.data.trim();
         if data.is_empty() {
             return Ok(false);
         }
         if data == "[DONE]" {
+            self.event_phase = ResponsesEventPhase::Done;
             return Ok(true);
         }
 
@@ -361,6 +381,8 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                 if let Some(item) = payload.get("item")
                     && item.get("type").and_then(Value::as_str) == Some("function_call")
                     && let Some(item_id) = item.get("id").and_then(Value::as_str)
+                    && !self.completed_items.contains(item_id)
+                    && !self.pending_calls.contains_key(item_id)
                 {
                     let stream_idx = self.alloc_index();
                     let call_id = item
@@ -409,6 +431,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
             }
             "response.function_call_arguments.delta" => {
                 if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
+                    && !self.completed_items.contains(item_id)
                     && let Some(delta) = payload.get("delta").and_then(Value::as_str)
                 {
                     let entry = if let Some(existing) = self.pending_calls.get_mut(item_id) {
@@ -449,6 +472,9 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                     && item.get("type").and_then(Value::as_str) == Some("function_call")
                 {
                     let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                    if !item_id.is_empty() && !self.completed_items.insert(item_id.to_string()) {
+                        return Ok(false);
+                    }
                     let mut pending =
                         self.pending_calls
                             .remove(item_id)
@@ -503,6 +529,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                         self.finish_reason = Some(FinishReason::MaxTokens);
                     }
                 }
+                self.event_phase = ResponsesEventPhase::Done;
                 return Ok(true);
             }
             "response.failed" | "error" => {
@@ -525,12 +552,14 @@ impl SseStreamDecoder for ResponsesSseDecoder {
     }
 
     fn on_finish(&mut self, emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
-        if self.finished_emitted {
+        if self.finish_phase == ResponsesFinishPhase::Emitted {
             return Ok(());
         }
-        self.finished_emitted = true;
+        self.finish_phase = ResponsesFinishPhase::Emitted;
 
-        for (_, pending) in self.pending_calls.drain() {
+        let mut remaining: Vec<PendingCall> = self.pending_calls.drain().map(|(_, p)| p).collect();
+        remaining.sort_by_key(|p| p.stream_idx);
+        for pending in remaining {
             self.has_tool_calls = true;
             if !emit(StreamChunk::BlockEnd {
                 index: pending.stream_idx,
@@ -639,6 +668,13 @@ impl LlmAdapter for ResponsesAdapter {
     }
 
     fn discover_models(&self) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
+        self.discover_models_with_headers(&[])
+    }
+
+    fn discover_models_with_headers(
+        &self,
+        extra_headers: &[(String, String)],
+    ) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
         if !self.config.models.is_empty() {
             let models = self.config.models.clone();
             return Box::pin(async move { Ok(models) });
@@ -648,7 +684,7 @@ impl LlmAdapter for ResponsesAdapter {
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = format!("{}/models", trim_base_url(&self.base_url));
-        let headers = self.build_headers(api_key.as_deref(), &[]);
+        let headers = self.build_headers(api_key.as_deref(), extra_headers);
         let client = self.client.clone();
         Box::pin(async move { discover_models_http(&client, &url, &headers).await })
     }

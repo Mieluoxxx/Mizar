@@ -6,7 +6,6 @@ pub mod sandbox;
 pub mod schema_ts;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
@@ -46,13 +45,33 @@ impl Default for CodemodeConfig {
     }
 }
 
-fn sync_auto_enable(tools: &ToolRuntime, last_state: &AtomicBool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoEnableState {
+    Inactive,
+    Active,
+}
+
+fn sync_auto_enable(tools: &ToolRuntime, state: &Mutex<AutoEnableState>) {
     let has_codemode_tools = tools
         .list_all()
         .into_iter()
         .any(|t| t.exposure == ToolExposure::Codemode);
-    if last_state.swap(has_codemode_tools, Ordering::SeqCst) != has_codemode_tools {
-        tools.set_global_active_override(CODEMODE_TOOL_NAME, has_codemode_tools);
+    let next = if has_codemode_tools {
+        AutoEnableState::Active
+    } else {
+        AutoEnableState::Inactive
+    };
+    let changed = {
+        let mut cur = state.lock().unwrap();
+        if *cur == next {
+            false
+        } else {
+            *cur = next;
+            true
+        }
+    };
+    if changed {
+        tools.set_auto_default_active(CODEMODE_TOOL_NAME, Some(has_codemode_tools));
     }
 }
 
@@ -142,7 +161,7 @@ impl Plugin for CodemodePlugin {
 
             let mut handles = vec![reg];
             if config.auto_enable {
-                let last_state = Arc::new(AtomicBool::new(false));
+                let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
                 sync_auto_enable(&tools, &last_state);
                 let tools_sub = tools;
                 let last_sub = Arc::clone(&last_state);
@@ -273,6 +292,98 @@ mod tests {
                 || res_timeout.content.contains("interrupted"),
             "unexpected timeout msg: {}",
             res_timeout.content
+        );
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn handles_exit_with_message_unspoofable_errors_and_async_host_timeout() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        app.plugin(CodemodePlugin, CodemodeConfig::default())
+            .await
+            .unwrap();
+
+        let tools = app.tools().unwrap();
+        let nested_cancelled = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&nested_cancelled);
+        let _slow = tools
+            .register(
+                ToolDefinition::async_rich_tool(
+                    "mcp__demo__slow",
+                    "Sleeps until cancelled",
+                    json!({"type": "object", "properties": {}}),
+                    move |_, call_ctx| {
+                        let cancelled = Arc::clone(&flag);
+                        async move {
+                            tokio::select! {
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => Ok(ToolOutput::text("done")),
+                                _ = call_ctx.cancel.cancelled() => {
+                                    *cancelled.lock().unwrap() = true;
+                                    Err("cancelled".into())
+                                }
+                            }
+                        }
+                    },
+                )
+                .with_exposure(ToolExposure::Codemode),
+            )
+            .unwrap();
+
+        // 1. exit("early done") 应正常成功退出并持久化 store、保留消息
+        let exit_ok = tools
+            .execute(ToolExecution::new(
+                "codemode",
+                json!({ "code": "store('k', 99); exit('early done');" }),
+                Some("s_exit".into()),
+            ))
+            .await;
+        assert!(!exit_ok.is_error, "exit failed: {}", exit_ok.content);
+        assert!(
+            exit_ok.content.contains("early done"),
+            "{}",
+            exit_ok.content
+        );
+
+        let verify_store = tools
+            .execute(ToolExecution::new(
+                "codemode",
+                json!({ "code": "return load('k');" }),
+                Some("s_exit".into()),
+            ))
+            .await;
+        assert_eq!(verify_store.structured_content, Some(json!(99)));
+
+        // 2. 手动抛出含哨兵字符串的普通 Error 仍必须按失败处理，不可伪造 exit
+        let spoof_err = tools
+            .execute(ToolExecution::new(
+                "codemode",
+                json!({ "code": "throw new Error('__CODEMODE_EXIT__');" }),
+                Some("s_exit".into()),
+            ))
+            .await;
+        assert!(spoof_err.is_error);
+
+        // 3. await 慢速宿主异步工具超出 timeoutMs 时必须及时超时并向子调用传播 cancel
+        let async_timeout = tools
+            .execute(ToolExecution::new(
+                "codemode",
+                json!({
+                    "code": "// @options: {\"timeoutMs\": 120}\nawait tools.mcp__demo__slow({});"
+                }),
+                Some("s_exit".into()),
+            ))
+            .await;
+        assert!(async_timeout.is_error);
+        assert!(
+            async_timeout.content.contains("timed out"),
+            "{}",
+            async_timeout.content
+        );
+        assert!(
+            *nested_cancelled.lock().unwrap(),
+            "script timeout must cancel in-flight nested host tool call"
         );
 
         app.fiber().dispose().await;

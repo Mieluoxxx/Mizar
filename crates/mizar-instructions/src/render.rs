@@ -278,6 +278,21 @@ pub fn render_baseline_message(
 }
 
 pub fn render_delta_message(items: &[DeltaItem], max_bytes: usize) -> Option<String> {
+    render_delta_message_detailed(items, max_bytes).map(|r| r.text)
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedDelta {
+    pub text: String,
+    pub represented_scopes: std::collections::HashSet<ScopeKey>,
+    pub omitted_scopes: std::collections::HashSet<ScopeKey>,
+    pub truncated_scopes: std::collections::HashSet<ScopeKey>,
+}
+
+pub fn render_delta_message_detailed(
+    items: &[DeltaItem],
+    max_bytes: usize,
+) -> Option<RenderedDelta> {
     if items.is_empty() {
         return None;
     }
@@ -285,9 +300,10 @@ pub fn render_delta_message(items: &[DeltaItem], max_bytes: usize) -> Option<Str
     let total_budget = max_bytes.saturating_mul(2).max(256);
     let per_item_cap = (total_budget / items.len().max(1)).max(128);
     let mut blocks = Vec::with_capacity(items.len());
+    let mut item_truncated = Vec::with_capacity(items.len());
 
     for item in items {
-        let block = match item.kind {
+        let (block, was_truncated) = match item.kind {
             DeltaChangeKind::Added => {
                 let header = if item.scope_dir_display == "." {
                     format!("Additional instructions from: {}", item.display_path)
@@ -300,40 +316,95 @@ pub fn render_delta_message(items: &[DeltaItem], max_bytes: usize) -> Option<Str
                 let body = escape_system_reminder_body(item.content.trim());
                 let raw = format!("{header}\n\n{body}");
                 if raw.len() <= per_item_cap {
-                    raw
+                    (raw, false)
                 } else {
-                    truncate_body_to_fit(&item.display_path, &item.content, per_item_cap)
+                    (
+                        truncate_body_to_fit(&item.display_path, &item.content, per_item_cap),
+                        true,
+                    )
                 }
             }
             DeltaChangeKind::Updated => {
                 let body = escape_system_reminder_body(item.content.trim());
                 let raw = format!("Updated instructions from: {}\n\n{body}", item.display_path);
                 if raw.len() <= per_item_cap {
-                    raw
+                    (raw, false)
                 } else {
-                    truncate_body_to_fit(&item.display_path, &item.content, per_item_cap)
+                    (
+                        truncate_body_to_fit(&item.display_path, &item.content, per_item_cap),
+                        true,
+                    )
                 }
             }
-            DeltaChangeKind::Removed => {
+            DeltaChangeKind::Removed => (
                 format!(
                     "Instructions removed: {} (file deleted, emptied, or superseded by a higher-priority identical file)",
                     item.display_path
-                )
-            }
+                ),
+                false,
+            ),
         };
         blocks.push(block);
+        item_truncated.push(was_truncated);
+    }
+
+    let mut offsets = Vec::with_capacity(blocks.len());
+    let mut cursor = 0usize;
+    for (idx, block) in blocks.iter().enumerate() {
+        if idx > 0 {
+            cursor += 2;
+        }
+        let start = cursor;
+        let end = cursor + block.len();
+        offsets.push((start, end));
+        cursor = end;
     }
 
     let joined = blocks.join("\n\n");
     let frame = format!("<system-reminder>\n{joined}\n</system-reminder>");
-    if frame.len() <= total_budget || items.iter().all(|i| i.kind == DeltaChangeKind::Removed) {
-        Some(frame)
+    let mut represented_scopes = std::collections::HashSet::new();
+    let mut omitted_scopes = std::collections::HashSet::new();
+    let mut truncated_scopes = std::collections::HashSet::new();
+
+    let text = if frame.len() <= total_budget
+        || items.iter().all(|i| i.kind == DeltaChangeKind::Removed)
+    {
+        for (idx, item) in items.iter().enumerate() {
+            if matches!(item.kind, DeltaChangeKind::Added | DeltaChangeKind::Updated) {
+                represented_scopes.insert(item.scope.clone());
+                if item_truncated[idx] {
+                    truncated_scopes.insert(item.scope.clone());
+                }
+            }
+        }
+        frame
     } else {
         let head = truncate_utf8_prefix(&joined, total_budget.saturating_sub(64));
-        Some(format!(
+        let head_len = head.len();
+        for (idx, item) in items.iter().enumerate() {
+            if matches!(item.kind, DeltaChangeKind::Added | DeltaChangeKind::Updated) {
+                let (start, end) = offsets[idx];
+                if start >= head_len {
+                    omitted_scopes.insert(item.scope.clone());
+                } else {
+                    represented_scopes.insert(item.scope.clone());
+                    if item_truncated[idx] || end > head_len {
+                        truncated_scopes.insert(item.scope.clone());
+                    }
+                }
+            }
+        }
+        format!(
             "<system-reminder>\n{head}\n[... truncated delta instructions ...]\n</system-reminder>"
-        ))
-    }
+        )
+    };
+
+    Some(RenderedDelta {
+        text,
+        represented_scopes,
+        omitted_scopes,
+        truncated_scopes,
+    })
 }
 
 pub fn chain_kind_of(file: &DiscoveredFile) -> ChainKind {

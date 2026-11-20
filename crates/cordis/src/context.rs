@@ -265,6 +265,21 @@ impl Context {
             .on_serial(self, name, listener, EventOptions::default())
     }
 
+    pub fn on_serial_with<P, R, Fut, F>(
+        &self,
+        name: impl Into<String>,
+        listener: F,
+        options: EventOptions,
+    ) -> Result<DisposableHandle, CordisError>
+    where
+        P: Clone + Send + Sync + 'static,
+        R: Send + 'static,
+        Fut: Future<Output = Option<R>> + Send + 'static,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+    {
+        self.root.events.on_serial(self, name, listener, options)
+    }
+
     pub fn on_parallel<P, E, Fut, F>(
         &self,
         name: impl Into<String>,

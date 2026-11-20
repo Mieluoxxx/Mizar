@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use mizar_session::SessionStore;
+use mizar_llm::ContentBlock;
+use mizar_session::{Session, SessionEvent, SessionStore};
 use mizar_tools::{PreExecuteDecision, ToolExecution, ToolResult};
 use serde_json::Value;
 
@@ -34,12 +35,22 @@ struct ReadDedupRecord {
     end_line: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingFileOp {
+    canon: PathBuf,
+    dedup_key: Option<ReadRangeKey>,
+}
+
 #[derive(Debug, Default)]
 struct SessionFileGuardState {
-    /// 每个规范路径最近一次成功 `read` / `write` 的事件序号。
+    /// 是否已从会话历史重建过（覆盖 resume / fork 冷加载场景）。
+    initialized: bool,
+    /// 每个规范路径最近一次成功 `read` / `write` / `edit` 的事件序号。
     last_read_seq: HashMap<PathBuf, u64>,
     /// 同一压缩代次内的重复读去重记录。
     dedup: HashMap<ReadRangeKey, ReadDedupRecord>,
+    /// 待与 `EVENT_SESSION_EVENT` 实际落盘序号对齐的近期工具调用。
+    pending_calls: HashMap<String, PendingFileOp>,
 }
 
 #[derive(Debug, Default)]
@@ -78,19 +89,89 @@ fn extract_raw_path(args: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+fn ensure_session_initialized(
+    st: &mut SessionFileGuardState,
+    session: &Session,
+    workspace: Option<&str>,
+) {
+    if st.initialized {
+        return;
+    }
+    st.initialized = true;
+
+    let mut pending_paths: HashMap<String, PathBuf> = HashMap::new();
+    for entry in session.all_entries() {
+        match &entry.event {
+            SessionEvent::Assistant { blocks, .. } => {
+                for block in blocks {
+                    if let ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } = block
+                        && matches!(name.as_str(), "read" | "write" | "edit")
+                        && let Ok(args) = serde_json::from_str::<Value>(arguments)
+                        && let Some(raw_path) = extract_raw_path(&args)
+                    {
+                        pending_paths.insert(id.clone(), normalize_tool_path(workspace, raw_path));
+                    }
+                }
+            }
+            SessionEvent::ToolResult {
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                if let Some(canon) = pending_paths.remove(tool_call_id)
+                    && !is_error
+                {
+                    st.last_read_seq
+                        .entry(canon)
+                        .and_modify(|prev| *prev = (*prev).max(entry.seq))
+                        .or_insert(entry.seq);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl FileGuardTracker {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// `tools/pre-execute`：压后拦截对已被压出上下文的已存在文件执行整文件 `write`（`edit` 始终放行）。
+    /// 由 `EVENT_SESSION_EVENT` 将工具写入会话后的真实 `Entry.seq` 回填至 `last_read_seq` 与 `dedup`。
+    pub fn reconcile_tool_result_seq(&self, session_id: &str, tool_call_id: &str, actual_seq: u64) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        let mut guard = self.sessions.lock().unwrap();
+        let Some(st) = guard.get_mut(session_id) else {
+            return;
+        };
+        let Some(op) = st.pending_calls.remove(tool_call_id) else {
+            return;
+        };
+        st.last_read_seq
+            .entry(op.canon)
+            .and_modify(|prev| *prev = (*prev).max(actual_seq))
+            .or_insert(actual_seq);
+        if let Some(key) = op.dedup_key
+            && let Some(rec) = st.dedup.get_mut(&key)
+        {
+            rec.approx_seq = actual_seq;
+        }
+    }
+
+    /// `tools/pre-execute`：压后/L1剪枝后拦截对正文已不再可见的已存在文件执行整文件 `write`（`edit` 与嵌套脚本调用放行）。
     pub fn check_pre_execute(
         &self,
         exec: &ToolExecution,
         sessions: &SessionStore,
         enable_write_guard: bool,
     ) -> PreExecuteDecision {
-        if !enable_write_guard || exec.name != "write" {
+        if exec.nested || !enable_write_guard || exec.name != "write" {
             return PreExecuteDecision::allow();
         }
         let Some(sid) = exec.session_id.as_deref() else {
@@ -102,27 +183,38 @@ impl FileGuardTracker {
         let Some(session) = sessions.get(sid) else {
             return PreExecuteDecision::allow();
         };
-        let Some(compacted_up_to) = session.header().compacted_up_to_seq else {
-            return PreExecuteDecision::allow();
-        };
 
-        let ws = session.header().cwd.or_else(|| sessions.default_cwd());
+        let header = session.header();
+        let ws = header.cwd.clone().or_else(|| sessions.default_cwd());
         let canon = normalize_tool_path(ws.as_deref(), raw_path);
         // 新建不存在的文件始终放行，只保护已存在文件的整文件覆写
         if !canon.exists() {
             return PreExecuteDecision::allow();
         }
 
-        let guard = self.sessions.lock().unwrap();
-        let Some(st) = guard.get(sid) else {
-            return PreExecuteDecision::allow();
-        };
-        if let Some(&last_seq) = st.last_read_seq.get(&canon)
-            && last_seq < compacted_up_to
-        {
-            return PreExecuteDecision::deny(format!(
-                "Refused whole-file overwrite on '{raw_path}': your earlier read (seq #{last_seq}) was compacted out of context (compacted_up_to_seq #{compacted_up_to}). Please call `read` on '{raw_path}' first before using `write`, or use `edit` for targeted replacements."
-            ));
+        let compacted_up_to = header.compacted_up_to_seq;
+        let pruned_map = session.pruned_map();
+
+        let mut guard = self.sessions.lock().unwrap();
+        let st = guard.entry(sid.to_string()).or_default();
+        ensure_session_initialized(st, &session, ws.as_deref());
+
+        if let Some(&last_seq) = st.last_read_seq.get(&canon) {
+            let is_compacted = compacted_up_to.is_some_and(|c| last_seq < c);
+            let is_pruned = pruned_map.contains_key(&last_seq);
+            if is_compacted || is_pruned {
+                let reason = if is_compacted {
+                    format!(
+                        "compacted out of context (compacted_up_to_seq #{})",
+                        compacted_up_to.unwrap_or(0)
+                    )
+                } else {
+                    "pruned out of active context".to_string()
+                };
+                return PreExecuteDecision::deny(format!(
+                    "Refused whole-file overwrite on '{raw_path}': your earlier read (seq #{last_seq}) was {reason}. Please call `read` on '{raw_path}' first before using `write`, or use `edit` for targeted replacements."
+                ));
+            }
         }
 
         PreExecuteDecision::allow()
@@ -136,7 +228,7 @@ impl FileGuardTracker {
         sessions: &SessionStore,
         enable_read_dedup: bool,
     ) -> ToolResult {
-        if result.is_error || result.blocked {
+        if exec.nested || result.is_error || result.blocked {
             return result;
         }
         let Some(sid) = exec.session_id.as_deref() else {
@@ -149,18 +241,32 @@ impl FileGuardTracker {
             return result;
         };
 
-        let ws = session.header().cwd.or_else(|| sessions.default_cwd());
+        let header = session.header();
+        let ws = header.cwd.clone().or_else(|| sessions.default_cwd());
         let canon = normalize_tool_path(ws.as_deref(), raw_path);
         let approx_seq = session.last_seq().saturating_add(1);
-        let compaction_epoch = session.header().compacted_up_to_seq;
+        let compaction_epoch = header.compacted_up_to_seq;
 
         match exec.name.as_str() {
             "write" | "edit" => {
                 let mut guard = self.sessions.lock().unwrap();
                 let st = guard.entry(sid.to_string()).or_default();
+                ensure_session_initialized(st, &session, ws.as_deref());
                 // 成功覆写/编辑后，该路径在当前上下文中处于已知状态，同时失效所有旧 read-dedup 缓存
                 st.last_read_seq.insert(canon.clone(), approx_seq);
                 st.dedup.retain(|k, _| k.path != canon);
+                if !exec.call_id.is_empty() {
+                    if st.pending_calls.len() >= 128 {
+                        st.pending_calls.clear();
+                    }
+                    st.pending_calls.insert(
+                        exec.call_id.clone(),
+                        PendingFileOp {
+                            canon,
+                            dedup_key: None,
+                        },
+                    );
+                }
                 result
             }
             "read" => {
@@ -185,6 +291,7 @@ impl FileGuardTracker {
 
                 let mut guard = self.sessions.lock().unwrap();
                 let st = guard.entry(sid.to_string()).or_default();
+                ensure_session_initialized(st, &session, ws.as_deref());
 
                 if enable_read_dedup
                     && result.content.len() >= MIN_DEDUP_BYTES
@@ -208,7 +315,7 @@ impl FileGuardTracker {
                     }
                 }
 
-                st.last_read_seq.insert(canon, approx_seq);
+                st.last_read_seq.insert(canon.clone(), approx_seq);
 
                 let start_line = result
                     .structured_content
@@ -227,7 +334,7 @@ impl FileGuardTracker {
                     st.dedup.clear();
                 }
                 st.dedup.insert(
-                    key,
+                    key.clone(),
                     ReadDedupRecord {
                         content_hash,
                         compaction_epoch,
@@ -237,6 +344,18 @@ impl FileGuardTracker {
                         end_line,
                     },
                 );
+                if !exec.call_id.is_empty() {
+                    if st.pending_calls.len() >= 128 {
+                        st.pending_calls.clear();
+                    }
+                    st.pending_calls.insert(
+                        exec.call_id.clone(),
+                        PendingFileOp {
+                            canon,
+                            dedup_key: Some(key),
+                        },
+                    );
+                }
                 result
             }
             _ => result,

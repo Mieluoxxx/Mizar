@@ -328,15 +328,16 @@ pub fn build_request_body(
     (body, request_prefix_digest)
 }
 
-enum BlockState {
+enum BlockKindState {
     Text {
         text: String,
     },
     Thinking {
         text: String,
         signature: String,
-        redacted: bool,
-        redacted_data: String,
+    },
+    RedactedThinking {
+        data: String,
     },
     ToolUse {
         id: String,
@@ -346,6 +347,70 @@ enum BlockState {
     },
 }
 
+impl BlockKindState {
+    fn to_content_block(&self) -> ContentBlock {
+        match self {
+            Self::Text { text } => ContentBlock::Text { text: text.clone() },
+            Self::Thinking { text, .. } => ContentBlock::Reasoning { text: text.clone() },
+            Self::RedactedThinking { .. } => ContentBlock::Reasoning {
+                text: String::new(),
+            },
+            Self::ToolUse {
+                id,
+                name,
+                fallback_input,
+                partial_json,
+            } => {
+                let arguments = if partial_json.trim().is_empty() {
+                    serde_json::to_string(fallback_input).unwrap_or_else(|_| "{}".to_string())
+                } else {
+                    partial_json.clone()
+                };
+                ContentBlock::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments,
+                }
+            }
+        }
+    }
+
+    fn replay_meta(&self) -> Value {
+        match self {
+            Self::RedactedThinking { data } => json!({ "redacted": true, "data": data }),
+            Self::Thinking { signature, .. } if !signature.is_empty() => {
+                json!({ "signature": signature })
+            }
+            _ => json!({}),
+        }
+    }
+}
+
+enum BlockEntry {
+    Open(BlockKindState),
+    Closed(BlockKindState),
+}
+
+impl BlockEntry {
+    fn state(&self) -> &BlockKindState {
+        match self {
+            Self::Open(s) | Self::Closed(s) => s,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventPhase {
+    Streaming,
+    Stopped,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinishPhase {
+    Pending,
+    Emitted,
+}
+
 /// Anthropic Messages SSE 状态机解码器。
 pub struct MessagesSseDecoder {
     provider: String,
@@ -353,11 +418,12 @@ pub struct MessagesSseDecoder {
     prefix_digest: String,
     response_id: Option<String>,
     response_model: Option<String>,
-    blocks: BTreeMap<usize, BlockState>,
+    blocks: BTreeMap<usize, BlockEntry>,
     usage: TokenUsage,
     has_usage: bool,
     stop_reason: Option<String>,
-    finished_emitted: bool,
+    event_phase: EventPhase,
+    finish_phase: FinishPhase,
 }
 
 impl MessagesSseDecoder {
@@ -376,7 +442,8 @@ impl MessagesSseDecoder {
             usage: TokenUsage::default(),
             has_usage: false,
             stop_reason: None,
-            finished_emitted: false,
+            event_phase: EventPhase::Streaming,
+            finish_phase: FinishPhase::Pending,
         }
     }
 
@@ -419,7 +486,7 @@ impl MessagesSseDecoder {
                 if self
                     .blocks
                     .values()
-                    .any(|b| matches!(b, BlockState::ToolUse { .. }))
+                    .any(|b| matches!(b.state(), BlockKindState::ToolUse { .. }))
                 {
                     FinishReason::ToolCalls
                 } else {
@@ -436,6 +503,9 @@ impl SseStreamDecoder for MessagesSseDecoder {
         event: SseEvent,
         emit: &mut dyn FnMut(StreamChunk) -> bool,
     ) -> Result<bool, LlmError> {
+        if self.event_phase == EventPhase::Stopped {
+            return Ok(true);
+        }
         let data = event.data.trim();
         if data.is_empty() {
             return Ok(false);
@@ -481,6 +551,9 @@ impl SseStreamDecoder for MessagesSseDecoder {
                     .and_then(Value::as_u64)
                     .and_then(|v| usize::try_from(v).ok())
                     .ok_or_else(|| LlmError::malformed("messages SSE missing block index"))?;
+                if self.blocks.contains_key(&index) {
+                    return Ok(false);
+                }
                 let cb = payload
                     .get("content_block")
                     .ok_or_else(|| LlmError::malformed("messages SSE missing content_block"))?;
@@ -505,9 +578,9 @@ impl SseStreamDecoder for MessagesSseDecoder {
                         }
                         self.blocks.insert(
                             index,
-                            BlockState::Text {
+                            BlockEntry::Open(BlockKindState::Text {
                                 text: init_text.to_string(),
-                            },
+                            }),
                         );
                     }
                     "thinking" => {
@@ -529,12 +602,10 @@ impl SseStreamDecoder for MessagesSseDecoder {
                         }
                         self.blocks.insert(
                             index,
-                            BlockState::Thinking {
+                            BlockEntry::Open(BlockKindState::Thinking {
                                 text: init_think.to_string(),
                                 signature: init_sig.to_string(),
-                                redacted: false,
-                                redacted_data: String::new(),
-                            },
+                            }),
                         );
                     }
                     "redacted_thinking" => {
@@ -547,12 +618,9 @@ impl SseStreamDecoder for MessagesSseDecoder {
                         }
                         self.blocks.insert(
                             index,
-                            BlockState::Thinking {
-                                text: String::new(),
-                                signature: String::new(),
-                                redacted: true,
-                                redacted_data: rdata.to_string(),
-                            },
+                            BlockEntry::Open(BlockKindState::RedactedThinking {
+                                data: rdata.to_string(),
+                            }),
                         );
                     }
                     "tool_use" => {
@@ -583,12 +651,12 @@ impl SseStreamDecoder for MessagesSseDecoder {
                         }
                         self.blocks.insert(
                             index,
-                            BlockState::ToolUse {
+                            BlockEntry::Open(BlockKindState::ToolUse {
                                 id,
                                 name,
                                 fallback_input,
                                 partial_json: String::new(),
-                            },
+                            }),
                         );
                     }
                     _ => {}
@@ -605,9 +673,9 @@ impl SseStreamDecoder for MessagesSseDecoder {
                     .ok_or_else(|| LlmError::malformed("messages SSE missing delta"))?;
                 let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
 
-                if let Some(block) = self.blocks.get_mut(&index) {
+                if let Some(BlockEntry::Open(block)) = self.blocks.get_mut(&index) {
                     match (delta_type, block) {
-                        ("text_delta", BlockState::Text { text }) => {
+                        ("text_delta", BlockKindState::Text { text }) => {
                             if let Some(t) = delta.get("text").and_then(Value::as_str)
                                 && !t.is_empty()
                             {
@@ -620,7 +688,7 @@ impl SseStreamDecoder for MessagesSseDecoder {
                                 }
                             }
                         }
-                        ("thinking_delta", BlockState::Thinking { text, .. }) => {
+                        ("thinking_delta", BlockKindState::Thinking { text, .. }) => {
                             if let Some(t) = delta.get("thinking").and_then(Value::as_str)
                                 && !t.is_empty()
                             {
@@ -633,12 +701,12 @@ impl SseStreamDecoder for MessagesSseDecoder {
                                 }
                             }
                         }
-                        ("signature_delta", BlockState::Thinking { signature, .. }) => {
+                        ("signature_delta", BlockKindState::Thinking { signature, .. }) => {
                             if let Some(s) = delta.get("signature").and_then(Value::as_str) {
                                 signature.push_str(s);
                             }
                         }
-                        ("input_json_delta", BlockState::ToolUse { partial_json, .. }) => {
+                        ("input_json_delta", BlockKindState::ToolUse { partial_json, .. }) => {
                             if let Some(pj) = delta.get("partial_json").and_then(Value::as_str)
                                 && !pj.is_empty()
                             {
@@ -664,31 +732,19 @@ impl SseStreamDecoder for MessagesSseDecoder {
                     .and_then(|v| usize::try_from(v).ok())
                     .ok_or_else(|| LlmError::malformed("messages SSE missing stop index"))?;
 
-                if let Some(state) = self.blocks.get(&index) {
-                    let block = match state {
-                        BlockState::Text { text } => ContentBlock::Text { text: text.clone() },
-                        BlockState::Thinking { text, .. } => {
-                            ContentBlock::Reasoning { text: text.clone() }
-                        }
-                        BlockState::ToolUse {
-                            id,
-                            name,
-                            fallback_input,
-                            partial_json,
-                        } => {
-                            let arguments = if partial_json.trim().is_empty() {
-                                serde_json::to_string(fallback_input)
-                                    .unwrap_or_else(|_| "{}".to_string())
-                            } else {
-                                partial_json.clone()
-                            };
-                            ContentBlock::ToolCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                arguments,
-                            }
-                        }
+                if let Some(entry) = self.blocks.get_mut(&index)
+                    && matches!(entry, BlockEntry::Open(_))
+                {
+                    let inner = match std::mem::replace(
+                        entry,
+                        BlockEntry::Closed(BlockKindState::Text {
+                            text: String::new(),
+                        }),
+                    ) {
+                        BlockEntry::Open(s) | BlockEntry::Closed(s) => s,
                     };
+                    let block = inner.to_content_block();
+                    *entry = BlockEntry::Closed(inner);
                     if !emit(StreamChunk::BlockEnd { index, block }) {
                         return Ok(true);
                     }
@@ -705,7 +761,10 @@ impl SseStreamDecoder for MessagesSseDecoder {
                     self.update_usage(u);
                 }
             }
-            "message_stop" => return Ok(true),
+            "message_stop" => {
+                self.event_phase = EventPhase::Stopped;
+                return Ok(true);
+            }
             _ => {}
         }
 
@@ -713,10 +772,10 @@ impl SseStreamDecoder for MessagesSseDecoder {
     }
 
     fn on_finish(&mut self, emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
-        if self.finished_emitted {
+        if self.finish_phase == FinishPhase::Emitted {
             return Ok(());
         }
-        self.finished_emitted = true;
+        self.finish_phase = FinishPhase::Emitted;
 
         if self.has_usage && !emit(StreamChunk::Usage { usage: self.usage }) {
             return Ok(());
@@ -725,23 +784,7 @@ impl SseStreamDecoder for MessagesSseDecoder {
         let replay_blocks: Vec<Value> = self
             .blocks
             .values()
-            .map(|b| match b {
-                BlockState::Thinking {
-                    signature,
-                    redacted,
-                    redacted_data,
-                    ..
-                } => {
-                    if *redacted {
-                        json!({ "redacted": true, "data": redacted_data })
-                    } else if !signature.is_empty() {
-                        json!({ "signature": signature })
-                    } else {
-                        json!({})
-                    }
-                }
-                _ => json!({}),
-            })
+            .map(|entry| entry.state().replay_meta())
             .collect();
 
         let replay = ReplayEnvelope {
@@ -823,6 +866,13 @@ impl LlmAdapter for MessagesAdapter {
     }
 
     fn discover_models(&self) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
+        self.discover_models_with_headers(&[])
+    }
+
+    fn discover_models_with_headers(
+        &self,
+        extra_headers: &[(String, String)],
+    ) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
         if !self.config.models.is_empty() {
             let models = self.config.models.clone();
             return Box::pin(async move { Ok(models) });
@@ -835,7 +885,7 @@ impl LlmAdapter for MessagesAdapter {
             "{}/models?limit=1000",
             ensure_v1_root(&self.config.base_url)
         );
-        let headers = self.build_headers(api_key.as_deref(), &[]);
+        let headers = self.build_headers(api_key.as_deref(), extra_headers);
         let client = self.client.clone();
         Box::pin(async move { discover_models_http(&client, &url, &headers).await })
     }

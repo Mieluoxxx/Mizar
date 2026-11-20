@@ -68,9 +68,11 @@ impl SessionPersistence for InMemoryMockBackend {
             .get(session_id)
             .cloned()
             .unwrap_or_default();
+        let max_seq = entries.last().map(|e| e.seq);
         Ok(Some(LoadedSession {
             header,
             entries,
+            max_persisted_seq: max_seq,
             skipped_events: 0,
         }))
     }
@@ -150,9 +152,11 @@ impl SessionPersistence for InMemoryMockBackend {
             .lock()
             .unwrap()
             .insert(header.id.clone(), entries.clone());
+        let max_seq = entries.last().map(|e| e.seq);
         Ok(LoadedSession {
             header,
             entries,
+            max_persisted_seq: max_seq,
             skipped_events: 0,
         })
     }
@@ -344,6 +348,7 @@ fn repair_helper_noop_when_tool_already_resolved() {
                 ts: 2,
             },
         ],
+        max_persisted_seq: Some(2),
         skipped_events: 0,
     };
     let repaired = repair_dangling_tool_calls(&mut loaded);
@@ -730,6 +735,155 @@ async fn set_title_clear_title_emit_event_and_fork_does_not_copy_parent_title() 
                 Some(TitleSource::Manual)
             ),
         ]
+    );
+
+    app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn repair_skips_past_unparsed_tail_seq_and_inspect_readonly_does_not_mutate_or_cache() {
+    use mizar_session::PersistenceError;
+    use std::collections::HashMap;
+
+    struct SkippedTailBackend {
+        headers: Mutex<HashMap<String, SessionHeader>>,
+        raw_max_seq: u64,
+        entries: Vec<SessionEntry>,
+        appended: Arc<Mutex<Vec<SessionEntry>>>,
+    }
+
+    impl SessionPersistence for SkippedTailBackend {
+        fn create_session(&self, header: &SessionHeader) -> PersistenceResult<()> {
+            self.headers
+                .lock()
+                .unwrap()
+                .insert(header.id.clone(), header.clone());
+            Ok(())
+        }
+
+        fn update_header(&self, _: &str, _: SessionHeaderPatch) -> PersistenceResult<()> {
+            Ok(())
+        }
+
+        fn load_session(&self, session_id: &str) -> PersistenceResult<Option<LoadedSession>> {
+            let Some(header) = self.headers.lock().unwrap().get(session_id).cloned() else {
+                return Ok(None);
+            };
+            Ok(Some(LoadedSession {
+                header,
+                entries: self.entries.clone(),
+                max_persisted_seq: Some(self.raw_max_seq),
+                skipped_events: 1,
+            }))
+        }
+
+        fn list_sessions(&self, _: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+            Ok(self.headers.lock().unwrap().values().cloned().collect())
+        }
+
+        fn append_events(&self, _: &str, entries: &[SessionEntry]) -> PersistenceResult<()> {
+            self.appended
+                .lock()
+                .unwrap()
+                .extend(entries.iter().cloned());
+            Ok(())
+        }
+
+        fn flush(&self, _: Option<&str>) -> PersistenceResult<()> {
+            Ok(())
+        }
+
+        fn flush_async(&self, _: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fork_session(
+            &self,
+            from_session_id: &str,
+            _: u64,
+            _: &SessionHeader,
+        ) -> PersistenceResult<LoadedSession> {
+            Err(PersistenceError::NotFound(from_session_id.to_string()))
+        }
+    }
+
+    let appended = Arc::new(Mutex::new(Vec::new()));
+    let mut header = SessionHeader::new("cold-parent", 10);
+    header.parent_id = Some("cold-grand".into());
+    header.compacted_up_to_seq = None;
+
+    let mut headers = HashMap::new();
+    headers.insert("cold-parent".into(), header);
+    headers.insert("cold-grand".into(), SessionHeader::new("cold-grand", 5));
+
+    let backend = Arc::new(SkippedTailBackend {
+        headers: Mutex::new(headers),
+        raw_max_seq: 5, // 例如 seq=5 是未来版本写出的未知事件，被跳过了
+        entries: vec![
+            SessionEntry {
+                seq: 1,
+                event: SessionEvent::Compaction {
+                    summary: "earlier".into(),
+                    first_kept_seq: 2,
+                    tokens_before: Some(100),
+                    tokens_after: Some(20),
+                    digest: Default::default(),
+                },
+                ts: 11,
+            },
+            SessionEntry {
+                seq: 2,
+                event: SessionEvent::Assistant {
+                    blocks: vec![ContentBlock::ToolCall {
+                        id: "hang-1".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                    }],
+                    replay: None,
+                    usage: None,
+                },
+                ts: 12,
+            },
+        ],
+        appended: Arc::clone(&appended),
+    });
+
+    let app = Context::new();
+    app.provide(
+        mizar_session::SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend)),
+    )
+    .unwrap();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+
+    // 1. 只读遍历 lineage / inspect_readonly 不应写入修复事件，也不应水合缓存
+    let chain = store.lineage_session_ids("cold-parent");
+    assert_eq!(chain, vec!["cold-parent", "cold-grand"]);
+    assert!(appended.lock().unwrap().is_empty());
+    assert!(!store.contains_in_memory("cold-parent"));
+
+    let snapshot = store.inspect_readonly("cold-parent").unwrap();
+    assert_eq!(snapshot.skipped_events, 1);
+    assert_eq!(snapshot.max_persisted_seq, Some(5));
+    assert!(appended.lock().unwrap().is_empty());
+
+    // 2. 真正 get() 触发修复时，reparied entry seq 必须跳过 max_persisted_seq=5，且 header.compacted_up_to_seq 被推导
+    let loaded_sess = store.get("cold-parent").unwrap();
+    assert_eq!(loaded_sess.header().compacted_up_to_seq, Some(2));
+    let written = appended.lock().unwrap().clone();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].seq, 6);
+
+    // 3. 原子 compare_and_set_title_auto 应拒绝并发手动/不同旧值的覆盖
+    assert_eq!(
+        loaded_sess.compare_and_set_title_auto(None, "auto-one", true),
+        Ok("auto-one".into())
+    );
+    assert!(loaded_sess.set_title("manual-override"));
+    assert_eq!(
+        loaded_sess.compare_and_set_title_auto(Some("auto-one"), "stale-auto", true),
+        Err(Some("manual-override".into()))
     );
 
     app.fiber().dispose().await;

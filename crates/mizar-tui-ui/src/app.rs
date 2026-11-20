@@ -46,6 +46,23 @@ pub enum ToolState {
     Blocked,
 }
 
+/// 主界面前后台运行状态机：替代原分散的 `is_busy` / `is_bash_running` / `is_compacting` /
+/// `compaction_status` / `streaming_assistant_open` 五个状态字段，消除状态组合失效与互相踩踏。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ActivityState {
+    #[default]
+    Idle,
+    /// Agent 对话回合运行中；自动压缩作为子阶段内嵌于此状态中，不会遮蔽 `is_busy()` 语义。
+    Agent {
+        streaming_assistant_open: bool,
+        compaction_status: Option<String>,
+    },
+    /// 用户触发 `!` / `!!` 本地 Bash 命令执行中。
+    LocalBash,
+    /// 独立触发的 `/compact` 手动上下文压缩进行中。
+    Compacting { status: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
     Info,
@@ -647,10 +664,7 @@ pub struct AppState {
     /// 队列选择器当前高亮的条目 id；`None` 表示选择器关闭。
     pub queue_selected: Option<u64>,
     next_queue_id: u64,
-    pub is_busy: bool,
-    pub is_bash_running: bool,
-    pub is_compacting: bool,
-    pub compaction_status: Option<String>,
+    pub activity: ActivityState,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub providers: Vec<ProviderInfo>,
@@ -678,7 +692,6 @@ pub struct AppState {
     pub tps_history: Vec<f64>,
     pub spinner_tick: usize,
     pub should_quit: bool,
-    streaming_assistant_open: bool,
 
     // 双模视图与鼠标开关
     pub screen_mode: ScreenMode,
@@ -718,7 +731,6 @@ pub struct AppState {
     // 确认退出 / 终端状态记忆
     pub terminal_focused: bool,
     last_ctrl_c_at: Option<Instant>,
-    pub pending_exit_status: Option<(ProgramStatusState, Option<String>)>,
     /// 最近一次回合结束原因，供状态栏与排队消息调度区分完成/截断/步数上限/中断/失败。
     pub last_turn_end_reason: Option<UiTurnEndReason>,
     /// 最近一次 step 结束编号与结果，用于截断提示定位具体步骤。
@@ -750,10 +762,7 @@ impl AppState {
             queued_prompts: Vec::new(),
             queue_selected: None,
             next_queue_id: 1,
-            is_busy: false,
-            is_bash_running: false,
-            is_compacting: false,
-            compaction_status: None,
+            activity: ActivityState::Idle,
             provider,
             model,
             providers,
@@ -776,7 +785,6 @@ impl AppState {
             tps_history: Vec::new(),
             spinner_tick: 0,
             should_quit: false,
-            streaming_assistant_open: false,
             screen_mode: ScreenMode::Fullscreen,
             inline_committed_items: 0,
             inline_welcome_committed: false,
@@ -812,10 +820,114 @@ impl AppState {
             dismissed_mention: None,
             terminal_focused: true,
             last_ctrl_c_at: None,
-            pending_exit_status: None,
             last_turn_end_reason: None,
             last_step_outcome: None,
             last_program_status: None,
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        matches!(self.activity, ActivityState::Agent { .. })
+    }
+
+    pub fn is_bash_running(&self) -> bool {
+        matches!(self.activity, ActivityState::LocalBash)
+    }
+
+    pub fn is_compacting(&self) -> bool {
+        matches!(
+            self.activity,
+            ActivityState::Compacting { .. }
+                | ActivityState::Agent {
+                    compaction_status: Some(_),
+                    ..
+                }
+        )
+    }
+
+    pub fn is_running_activity(&self) -> bool {
+        !matches!(self.activity, ActivityState::Idle)
+    }
+
+    pub fn compaction_status(&self) -> Option<&str> {
+        match &self.activity {
+            ActivityState::Compacting { status } => Some(status.as_str()),
+            ActivityState::Agent {
+                compaction_status: Some(status),
+                ..
+            } => Some(status.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn set_busy_state(&mut self, busy: bool) {
+        if busy {
+            if !matches!(self.activity, ActivityState::Agent { .. }) {
+                self.activity = ActivityState::Agent {
+                    streaming_assistant_open: false,
+                    compaction_status: None,
+                };
+            }
+        } else if matches!(self.activity, ActivityState::Agent { .. }) {
+            self.activity = ActivityState::Idle;
+        }
+    }
+
+    pub fn set_local_bash_state(&mut self) {
+        self.activity = ActivityState::LocalBash;
+    }
+
+    pub fn set_compacting_state(&mut self, status: impl Into<String>) {
+        let status = status.into();
+        match &mut self.activity {
+            ActivityState::Agent {
+                compaction_status, ..
+            } => *compaction_status = Some(status),
+            _ => self.activity = ActivityState::Compacting { status },
+        }
+    }
+
+    pub fn set_idle_state(&mut self) {
+        self.activity = ActivityState::Idle;
+    }
+
+    fn close_streaming_assistant(&mut self) {
+        if let ActivityState::Agent {
+            streaming_assistant_open,
+            ..
+        } = &mut self.activity
+        {
+            *streaming_assistant_open = false;
+        }
+    }
+
+    fn promote_next_approval(&mut self) -> bool {
+        if let Some(tool_name) = self.overlay.promote_next_approval() {
+            self.record_program_status(
+                ProgramStatusState::Blocked,
+                Some("permission"),
+                Some(&format!("Approve {tool_name}")),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_touched_file(&mut self, name: &str, arguments: &str) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(arguments)
+            && let Some(p) = map
+                .get("path")
+                .or_else(|| map.get("file"))
+                .and_then(Value::as_str)
+        {
+            let op = name.to_string();
+            if !self.touched_files.iter().any(|f| f.path == p && f.op == op) {
+                self.touched_files.push(FileTouchRow {
+                    path: p.to_string(),
+                    op,
+                });
+            }
         }
     }
 
@@ -938,7 +1050,7 @@ impl AppState {
         self.items.push(ChatItem::User {
             text: text.to_string(),
         });
-        self.streaming_assistant_open = false;
+        self.close_streaming_assistant();
         self.scroll_to_bottom();
     }
 
@@ -950,8 +1062,7 @@ impl AppState {
         exclude_from_context: bool,
     ) {
         let call_id = call_id.into();
-        self.is_bash_running = true;
-        self.streaming_assistant_open = false;
+        self.activity = ActivityState::LocalBash;
         self.reveal.snap_all();
         let args_json = serde_json::json!({ "command": command }).to_string();
         let args_summary = summarize_tool_args(&args_json);
@@ -1117,18 +1228,29 @@ impl AppState {
             level,
             text: text.into(),
         });
-        self.streaming_assistant_open = false;
+        self.close_streaming_assistant();
     }
 
     fn ensure_open_assistant(&mut self) -> (usize, &mut ChatItem) {
-        if !self.streaming_assistant_open
-            || !matches!(self.items.last(), Some(ChatItem::Assistant { .. }))
-        {
+        let already_open = match &self.activity {
+            ActivityState::Agent {
+                streaming_assistant_open,
+                ..
+            } => *streaming_assistant_open,
+            _ => true,
+        } && matches!(self.items.last(), Some(ChatItem::Assistant { .. }));
+        if !already_open {
             self.items.push(ChatItem::Assistant {
                 reasoning: String::new(),
                 text: String::new(),
             });
-            self.streaming_assistant_open = true;
+            if let ActivityState::Agent {
+                streaming_assistant_open,
+                ..
+            } = &mut self.activity
+            {
+                *streaming_assistant_open = true;
+            }
         }
         let idx = self.items.len() - 1;
         (idx, &mut self.items[idx])
@@ -1136,16 +1258,33 @@ impl AppState {
 
     pub fn apply_ui_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Status(status) => {
-                self.is_busy = status == UiAgentStatus::Busy;
-                if !self.is_busy {
-                    self.streaming_assistant_open = false;
-                    self.reveal.snap_all();
+            UiEvent::Status(status) => match status {
+                UiAgentStatus::Busy => {
+                    if !matches!(self.activity, ActivityState::Agent { .. }) {
+                        self.activity = ActivityState::Agent {
+                            streaming_assistant_open: false,
+                            compaction_status: None,
+                        };
+                    }
                 }
-            }
+                UiAgentStatus::Idle => {
+                    if matches!(self.activity, ActivityState::Agent { .. }) {
+                        self.activity = ActivityState::Idle;
+                        self.reveal.snap_all();
+                    }
+                }
+            },
             UiEvent::TurnStart { .. } => {
-                self.is_busy = true;
-                self.streaming_assistant_open = false;
+                let preserved_compaction = match &mut self.activity {
+                    ActivityState::Agent {
+                        compaction_status, ..
+                    } => compaction_status.take(),
+                    _ => None,
+                };
+                self.activity = ActivityState::Agent {
+                    streaming_assistant_open: false,
+                    compaction_status: preserved_compaction,
+                };
                 self.auto_scroll = true;
                 self.last_turn_end_reason = None;
                 self.last_step_outcome = None;
@@ -1154,8 +1293,7 @@ impl AppState {
                 self.record_program_status(ProgramStatusState::Working, None, Some("Generating"));
             }
             UiEvent::TurnEnd { reason } => {
-                self.is_busy = false;
-                self.streaming_assistant_open = false;
+                self.activity = ActivityState::Idle;
                 self.reveal.snap_all();
                 emit_terminal_progress(false);
                 let (program_state, program_msg) = turn_end_program_status(&reason);
@@ -1221,7 +1359,7 @@ impl AppState {
                 self.tps.on_first_token(ts_ms);
             }
             UiEvent::ReasoningDelta { text, ts_ms } => {
-                let busy = self.is_busy;
+                let busy = self.is_busy();
                 let (idx, item) = self.ensure_open_assistant();
                 let len = if let ChatItem::Assistant { reasoning, .. } = item {
                     reasoning.push_str(&text);
@@ -1234,7 +1372,7 @@ impl AppState {
                 self.tps.on_token_delta(&text, ts_ms);
             }
             UiEvent::TextDelta { text, ts_ms } => {
-                let busy = self.is_busy;
+                let busy = self.is_busy();
                 let (idx, item) = self.ensure_open_assistant();
                 let len = if let ChatItem::Assistant { text: body, .. } = item {
                     body.push_str(&text);
@@ -1247,23 +1385,10 @@ impl AppState {
                 self.tps.on_token_delta(&text, ts_ms);
             }
             UiEvent::ToolCall(call) => {
-                self.streaming_assistant_open = false;
+                self.close_streaming_assistant();
                 self.reveal.snap_all();
                 let args_summary = summarize_tool_args(&call.arguments);
-                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&call.arguments)
-                    && let Some(p) = map
-                        .get("path")
-                        .or_else(|| map.get("file"))
-                        .and_then(Value::as_str)
-                {
-                    let op = call.name.clone();
-                    if !self.touched_files.iter().any(|f| f.path == p && f.op == op) {
-                        self.touched_files.push(FileTouchRow {
-                            path: p.to_string(),
-                            op,
-                        });
-                    }
-                }
+                self.record_touched_file(&call.name, &call.arguments);
                 self.tool_extras.insert(
                     call.id.clone(),
                     ToolExtraMeta {
@@ -1423,8 +1548,9 @@ impl AppState {
                 self.push_notice(level, format!("[{}] {}", record.name, record.message));
             }
             UiEvent::RunFinished(res) => {
-                self.is_busy = false;
-                self.streaming_assistant_open = false;
+                if matches!(self.activity, ActivityState::Agent { .. }) {
+                    self.activity = ActivityState::Idle;
+                }
                 self.reveal.snap_all();
                 emit_terminal_progress(false);
                 if let Err(err) = res
@@ -1448,7 +1574,9 @@ impl AppState {
                 exclude_from_context,
                 output,
             } => {
-                self.is_bash_running = false;
+                if matches!(self.activity, ActivityState::LocalBash) {
+                    self.activity = ActivityState::Idle;
+                }
                 let idx = match output {
                     Ok(out) => {
                         let status = if out.cancelled {
@@ -1492,26 +1620,34 @@ impl AppState {
                 responder,
             } => {
                 if let Some(tx) = responder.lock().unwrap().take() {
-                    self.record_program_status(
-                        ProgramStatusState::Blocked,
-                        Some("permission"),
-                        Some(&format!("Approve {tool_name}")),
-                    );
-                    self.overlay.open_approval(tool_name, args_preview, tx);
+                    let opened_now =
+                        self.overlay
+                            .open_approval(tool_name.clone(), args_preview, tx);
+                    if opened_now {
+                        self.record_program_status(
+                            ProgramStatusState::Blocked,
+                            Some("permission"),
+                            Some(&format!("Approve {tool_name}")),
+                        );
+                    }
                 }
             }
             UiEvent::CompactionStarted { trigger } => {
-                self.is_compacting = true;
                 let label = match trigger.as_str() {
                     "manual" => "手动压缩中…",
                     "overflow" => "溢出恢复压缩中…",
                     "cold-cache" => "冷缓存整理中…",
                     _ => "上下文压缩中…",
-                };
-                self.compaction_status = Some(label.to_string());
+                }
+                .to_string();
+                match &mut self.activity {
+                    ActivityState::Agent {
+                        compaction_status, ..
+                    } => *compaction_status = Some(label),
+                    _ => self.activity = ActivityState::Compacting { status: label },
+                }
             }
             UiEvent::CompactionProgress { stage, delta_chars } => {
-                self.is_compacting = true;
                 let status = match stage.as_str() {
                     "pruned" => "压缩中 · 已剪枝大输出".to_string(),
                     "prefill" => "压缩中 · prefill…".to_string(),
@@ -1519,7 +1655,12 @@ impl AppState {
                     "summary" => format!("压缩中 · 摘要 {delta_chars} 字"),
                     other => format!("压缩中 · {other}"),
                 };
-                self.compaction_status = Some(status);
+                match &mut self.activity {
+                    ActivityState::Agent {
+                        compaction_status, ..
+                    } => *compaction_status = Some(status),
+                    _ => self.activity = ActivityState::Compacting { status },
+                }
             }
             UiEvent::CompactionFinished {
                 outcome,
@@ -1531,8 +1672,13 @@ impl AppState {
                 message,
                 is_manual,
             } => {
-                self.is_compacting = false;
-                self.compaction_status = None;
+                match &mut self.activity {
+                    ActivityState::Agent {
+                        compaction_status, ..
+                    } => *compaction_status = None,
+                    ActivityState::Compacting { .. } => self.activity = ActivityState::Idle,
+                    _ => {}
+                }
                 // 遵循 dsh-TUI 原则：total_usage 计费读数永不随压缩回退，仅刷新上下文占用视图
                 if matches!(outcome.as_str(), "compacted" | "pruned-only")
                     && let Some(after) = tokens_after.filter(|&v| v > 0)
@@ -1680,7 +1826,7 @@ impl AppState {
     }
 
     fn apply_overlay_action(&mut self, action: OverlayAction) -> AppAction {
-        match action {
+        let out = match action {
             OverlayAction::None => AppAction::None,
             OverlayAction::Close => {
                 if let Some(closed) = self.overlay.active.take() {
@@ -1821,7 +1967,7 @@ impl AppState {
             }
             OverlayAction::SelectSession(session_id) => {
                 self.overlay.active = None;
-                if self.is_busy || self.is_bash_running || self.is_compacting {
+                if self.is_running_activity() {
                     self.push_notice(NoticeLevel::Warn, "请先等待或中断当前任务后再切换会话");
                     AppAction::None
                 } else {
@@ -1830,8 +1976,8 @@ impl AppState {
             }
             OverlayAction::ForkSessionAtSeq(seq) => {
                 self.overlay.active = None;
-                if self.is_busy {
-                    self.push_notice(NoticeLevel::Warn, "请先中断当前生成后再分支回溯");
+                if self.is_running_activity() {
+                    self.push_notice(NoticeLevel::Warn, "请先等待或中断当前任务后再分支回溯");
                     AppAction::None
                 } else {
                     AppAction::ForkSessionAtSeq(seq)
@@ -1877,7 +2023,7 @@ impl AppState {
             }
             OverlayAction::UpdateSetting { key, value } => {
                 if key.starts_with("plugin.") {
-                    if self.is_busy || self.is_bash_running || self.is_compacting {
+                    if self.is_running_activity() {
                         self.overlay.set_setting_toggle(&key, value != "true");
                         let msg = "当前有正在执行的任务，请等待完成后再切换模块";
                         self.push_notice(NoticeLevel::Warn, msg);
@@ -1902,6 +2048,7 @@ impl AppState {
                     }
                     "ui.sidePanelOpen" => {
                         self.side_panel.open = value == "true";
+                        self.selection.clear();
                         self.item_cache.clear();
                     }
                     "ui.mouseCapture" => {
@@ -1934,19 +2081,25 @@ impl AppState {
                     if let Some(tx) = ap.responder.take() {
                         let _ = tx.send(decision);
                     }
-                    self.record_program_status(
-                        if self.is_busy {
-                            ProgramStatusState::Working
-                        } else {
-                            ProgramStatusState::Idle
-                        },
-                        None,
-                        None,
-                    );
+                    if !self.promote_next_approval() {
+                        self.record_program_status(
+                            if self.is_busy() {
+                                ProgramStatusState::Working
+                            } else {
+                                ProgramStatusState::Idle
+                            },
+                            None,
+                            None,
+                        );
+                    }
                 }
                 AppAction::None
             }
+        };
+        if matches!(out, AppAction::None) && self.overlay.active.is_none() {
+            let _ = self.promote_next_approval();
         }
+        out
     }
 
     fn apply_effort(&mut self, effort: ReasoningEffort, with_notice: bool) {
@@ -2041,9 +2194,11 @@ impl AppState {
                         decision: ApprovalDecision::Deny,
                     });
                 }
+                if let Some(OverlayKind::ThemePicker { original, .. }) = self.overlay.active {
+                    return self.apply_overlay_action(OverlayAction::RevertTheme(original));
+                }
                 self.pending_settings_model_pick = None;
-                self.overlay.active = None;
-                return AppAction::None;
+                return self.apply_overlay_action(OverlayAction::Close);
             }
             if !self.input.is_empty() {
                 self.input.clear();
@@ -2051,7 +2206,7 @@ impl AppState {
                 self.last_ctrl_c_at = None;
                 return AppAction::None;
             }
-            if self.is_busy || self.is_bash_running || self.is_compacting {
+            if self.is_running_activity() {
                 return AppAction::CancelRun;
             }
             let double_press = self
@@ -2084,7 +2239,7 @@ impl AppState {
         // 4. 全局功能快捷键
         match key.code {
             KeyCode::Char('d') if ctrl => {
-                if !self.is_busy && !self.is_bash_running && self.input.is_empty() {
+                if !self.is_running_activity() && self.input.is_empty() {
                     self.should_quit = true;
                     return AppAction::Quit;
                 }
@@ -2106,6 +2261,7 @@ impl AppState {
             }
             KeyCode::Char('b') if ctrl => {
                 self.side_panel.open = !self.side_panel.open;
+                self.selection.clear();
                 self.item_cache.clear();
                 if self.side_panel.open {
                     return AppAction::RefreshSidePanelData;
@@ -2134,7 +2290,7 @@ impl AppState {
                 return AppAction::None;
             }
             KeyCode::Char('g') if ctrl => {
-                if !self.is_busy && !self.is_bash_running {
+                if !self.is_running_activity() {
                     return AppAction::OpenExternalEditor;
                 }
                 return AppAction::None;
@@ -2171,7 +2327,7 @@ impl AppState {
                     self.selection.clear();
                     return AppAction::None;
                 }
-                if self.is_busy || self.is_bash_running || self.is_compacting {
+                if self.is_running_activity() {
                     return AppAction::CancelRun;
                 }
                 if !self.input.is_empty() {
@@ -2258,7 +2414,7 @@ impl AppState {
                 // 发的是 ESC ESC [ A，crossterm 会拆成 Esc + 字面 "[A"，
                 // 那种终端请用 ↑ 进选择器（实测见 issue #15）。
                 if let Some(last) = self.queued_prompts.last().map(|item| item.id)
-                    && !self.is_bash_running
+                    && !self.is_bash_running()
                 {
                     self.retract_queued(last);
                     return AppAction::None;
@@ -2272,7 +2428,7 @@ impl AppState {
                 if self.input.is_empty()
                     && !self.queued_prompts.is_empty()
                     && !self.overlay.is_open()
-                    && !self.is_bash_running
+                    && !self.is_bash_running()
                 {
                     self.queue_selected = self.queued_prompts.last().map(|item| item.id);
                     return AppAction::None;
@@ -2475,9 +2631,15 @@ impl AppState {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
+        self.selection.clear();
         let max_scroll = self
             .last_total_lines
             .saturating_sub(self.last_viewport_height);
+        if max_scroll == 0 {
+            self.auto_scroll = true;
+            self.scroll_from_top = 0;
+            return;
+        }
         let cur = if self.auto_scroll {
             max_scroll
         } else {
@@ -2488,6 +2650,7 @@ impl AppState {
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
+        self.selection.clear();
         let max_scroll = self
             .last_total_lines
             .saturating_sub(self.last_viewport_height);
@@ -2501,6 +2664,7 @@ impl AppState {
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.selection.clear();
         self.auto_scroll = true;
         self.scroll_from_top = self
             .last_total_lines
@@ -2513,9 +2677,11 @@ impl AppState {
         let max_scroll = total_lines.saturating_sub(viewport_height);
         if self.auto_scroll {
             self.scroll_from_top = max_scroll;
-        } else if self.scroll_from_top >= max_scroll {
-            self.scroll_from_top = max_scroll;
+        } else if max_scroll == 0 {
+            self.scroll_from_top = 0;
             self.auto_scroll = true;
+        } else if self.scroll_from_top > max_scroll {
+            self.scroll_from_top = max_scroll;
         }
         self.scroll_from_top
     }
@@ -2528,6 +2694,7 @@ impl AppState {
         self.session_id = session_id.into();
         self.session_title = session_title;
         self.pending_settings_model_pick = None;
+        self.overlay.resolve_all_approvals(ApprovalDecision::Deny);
         self.items.clear();
         self.tool_extras.clear();
         self.item_cache.clear();
@@ -2535,9 +2702,7 @@ impl AppState {
         self.anomalies.clear();
         self.queued_prompts.clear();
         self.queue_selected = None;
-        self.is_bash_running = false;
-        self.is_compacting = false;
-        self.compaction_status = None;
+        self.activity = ActivityState::Idle;
         self.always_allowed_tools.clear();
         self.reveal.clear();
         self.selection.clear();
@@ -2552,7 +2717,6 @@ impl AppState {
         self.inline_welcome_committed = false;
         self.scroll_from_top = 0;
         self.auto_scroll = true;
-        self.streaming_assistant_open = false;
         self.dismissed_mention = None;
         self.last_turn_end_reason = None;
         self.last_step_outcome = None;
@@ -2620,6 +2784,7 @@ impl AppState {
                     }
                     for (id, name, arguments) in calls {
                         let args_summary = summarize_tool_args(&arguments);
+                        self.record_touched_file(&name, &arguments);
                         self.tool_extras.insert(
                             id.clone(),
                             ToolExtraMeta {
@@ -2941,7 +3106,7 @@ impl AppState {
                 if immediate {
                     return self.steer_queue_head();
                 }
-                if !self.is_busy && !self.is_bash_running && !self.is_compacting {
+                if !self.is_running_activity() {
                     return self.submit_queue_head();
                 }
             }
@@ -2955,12 +3120,16 @@ impl AppState {
                 self.set_flash("请输入要在 Bash 中执行的命令（或按 Esc 退出）");
                 return AppAction::None;
             }
-            if self.is_busy {
+            if self.is_busy() {
                 self.set_flash("模型正在生成中，请等待回合结束或按 Esc 取消后再运行 Bash 命令");
                 return AppAction::None;
             }
-            if self.is_bash_running {
+            if self.is_bash_running() {
                 self.set_flash("已有 Bash 命令正在运行，请先按 Esc 取消");
+                return AppAction::None;
+            }
+            if self.is_compacting() {
+                self.set_flash("上下文正在压缩中，请等待完成或按 Esc 取消后再运行 Bash 命令");
                 return AppAction::None;
             }
 
@@ -2977,7 +3146,7 @@ impl AppState {
             };
         }
 
-        if self.is_bash_running {
+        if self.is_bash_running() || matches!(self.activity, ActivityState::Compacting { .. }) {
             let is_safe_slash = preview
                 .strip_prefix('/')
                 .and_then(|s| s.split_whitespace().next())
@@ -2988,7 +3157,12 @@ impl AppState {
                     )
                 });
             if !is_safe_slash {
-                self.set_flash("Bash 命令正在运行，请等待完成或按 Esc 取消后再发送");
+                let hint = if self.is_bash_running() {
+                    "Bash 命令正在运行，请等待完成或按 Esc 取消后再发送"
+                } else {
+                    "上下文正在压缩中，请等待完成或按 Esc 取消后再发送"
+                };
+                self.set_flash(hint);
                 return AppAction::None;
             }
         }
@@ -3035,7 +3209,7 @@ impl AppState {
         }
 
         let raw_images: Vec<ImageAttachment> = images.iter().map(|(_, img)| img.clone()).collect();
-        if self.is_busy {
+        if self.is_busy() {
             let prompt = trimmed.to_string();
             if immediate {
                 self.set_flash("⚡ 正在中断当前回合并立即发送…");
@@ -3115,6 +3289,7 @@ impl AppState {
             "trace" => AppAction::OpenTrajectoryScene(self.trajectory_scene.mode),
             "panel" => {
                 self.side_panel.open = !self.side_panel.open;
+                self.selection.clear();
                 self.item_cache.clear();
                 if self.side_panel.open {
                     AppAction::RefreshSidePanelData
@@ -3175,7 +3350,7 @@ impl AppState {
                 }
             },
             "clear" | "new" => {
-                if self.is_busy {
+                if self.is_running_activity() {
                     self.push_notice(NoticeLevel::Warn, "请先按 Esc 中断当前任务再开启新会话");
                     AppAction::None
                 } else {
@@ -3219,7 +3394,7 @@ impl AppState {
             "stats" => AppAction::ShowStats,
             "session" => AppAction::ShowSessionInfo,
             "compact" => {
-                if self.is_busy || self.is_bash_running || self.is_compacting {
+                if self.is_running_activity() {
                     self.push_notice(
                         NoticeLevel::Warn,
                         "当前已有任务或压缩正在运行，请先等待完成或按 Esc 取消后再执行 /compact",
@@ -3230,7 +3405,7 @@ impl AppState {
                 }
             }
             "resume" => {
-                if self.is_busy || self.is_bash_running || self.is_compacting {
+                if self.is_running_activity() {
                     self.push_notice(
                         NoticeLevel::Warn,
                         "当前已有任务正在运行，请等待完成或按 Esc 取消后再切换会话",
@@ -4052,7 +4227,7 @@ mod tests {
             reason: UiTurnEndReason::Completed,
         });
 
-        assert!(!app.is_busy);
+        assert!(!app.is_busy());
         assert_eq!(app.total_usage.input_tokens, 100);
         assert_eq!(app.total_usage.output_tokens, 25);
         assert_eq!(app.items.len(), 4);
@@ -4323,12 +4498,12 @@ mod tests {
             None,
         );
 
-        app.is_busy = true;
+        app.set_busy_state(true);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             AppAction::CancelRun
         );
-        app.is_busy = false;
+        app.set_busy_state(false);
 
         app.input.insert_str("/effort high");
         assert_eq!(
@@ -4470,7 +4645,7 @@ mod tests {
         );
 
         // 5. 运行中 Enter 加入队列，Ctrl+Enter 立即打断插队，Esc 暂停
-        app.is_busy = true;
+        app.set_busy_state(true);
         app.input.insert_str("queued one");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -4506,7 +4681,7 @@ mod tests {
         assert!(app.input.is_empty());
         assert!(!app.should_quit);
 
-        app.is_busy = false;
+        app.set_busy_state(false);
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         assert!(matches!(
@@ -4833,7 +5008,7 @@ mod tests {
         assert_eq!(app.bash_mode(), None);
 
         // 4. 并发安全：is_busy 与 is_bash_running 下拒绝运行并保留输入
-        app.is_busy = true;
+        app.set_busy_state(true);
         app.input.set_text_end("! echo hi");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -4841,10 +5016,10 @@ mod tests {
         );
         assert_eq!(app.input.text(), "! echo hi");
         assert!(app.active_flash().is_some());
-        app.is_busy = false;
+        app.set_busy_state(false);
 
         app.start_local_bash("lb-1", "sleep 5", false);
-        assert!(app.is_bash_running);
+        assert!(app.is_bash_running());
         app.input.set_text_end("!! echo two");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -4873,7 +5048,7 @@ mod tests {
                 timed_out: false,
             }),
         });
-        assert!(!app.is_bash_running);
+        assert!(!app.is_bash_running());
         let tokens_after_ctx = app.side_panel_data.context.tool_tokens;
         assert!(tokens_after_ctx > 0);
 
@@ -4927,16 +5102,12 @@ mod tests {
         app.apply_ui_event(UiEvent::CompactionStarted {
             trigger: "manual".into(),
         });
-        assert!(app.is_compacting);
+        assert!(app.is_compacting());
         app.apply_ui_event(UiEvent::CompactionProgress {
             stage: "summary".into(),
             delta_chars: 180,
         });
-        assert!(
-            app.compaction_status
-                .as_deref()
-                .is_some_and(|s| s.contains("180"))
-        );
+        assert!(app.compaction_status().is_some_and(|s| s.contains("180")));
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             AppAction::CancelRun
@@ -4953,8 +5124,8 @@ mod tests {
             message: None,
             is_manual: true,
         });
-        assert!(!app.is_compacting);
-        assert!(app.compaction_status.is_none());
+        assert!(!app.is_compacting());
+        assert!(app.compaction_status().is_none());
         assert_eq!(app.total_usage.input_tokens, 1_200);
         assert_eq!(app.total_usage.output_tokens, 300);
         assert!(app.items.iter().any(|it| matches!(
@@ -5050,11 +5221,13 @@ mod tests {
         app.overlay
             .open_settings(entries, None, "~/.mizar/settings.json".into());
 
-        // 运行中（is_busy / is_bash_running / is_compacting）禁止切换，弹窗状态保持不变并提示中文警告
+        // 运行中（Agent / LocalBash / Compacting）禁止切换，弹窗状态保持不变并提示中文警告
         for case in 0..3 {
-            app.is_busy = case == 0;
-            app.is_bash_running = case == 1;
-            app.is_compacting = case == 2;
+            match case {
+                0 => app.set_busy_state(true),
+                1 => app.set_local_bash_state(),
+                _ => app.set_compacting_state("压缩中…"),
+            }
             let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert_eq!(act, AppAction::None);
             match &app.overlay.active {
@@ -5071,9 +5244,7 @@ mod tests {
         }
 
         // 空闲时允许切换并派发 ApplySetting
-        app.is_busy = false;
-        app.is_bash_running = false;
-        app.is_compacting = false;
+        app.set_idle_state();
         let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             act,
@@ -5094,7 +5265,7 @@ mod tests {
             None,
             None,
         );
-        app.is_busy = true;
+        app.set_busy_state(true);
         for text in prompts {
             app.input.insert_str(text);
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -5254,7 +5425,7 @@ mod tests {
     #[test]
     fn idle_enter_on_empty_draft_submits_queue_head() {
         let mut app = queued_app(&["stuck item"]);
-        app.is_busy = false;
+        app.set_busy_state(false);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::SubmitPrompt("stuck item".into())
@@ -5439,7 +5610,7 @@ mod tests {
             None,
             None,
         );
-        app.is_busy = true;
+        app.set_busy_state(true);
         let img = ImageAttachment::new("image/jpeg", "QkJC").with_dimensions(800, 600);
         let tok = app
             .insert_pasted_image(Some("image/png → image/jpeg"), img.clone())
@@ -5466,7 +5637,7 @@ mod tests {
 
         // 单次 Backspace 不应因内部空格破坏整个占位符
         app.input.move_left(); // cursor before "看下"
-        app.is_busy = false;
+        app.set_busy_state(false);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::SubmitPromptWithImages {
@@ -5669,23 +5840,23 @@ mod tests {
         assert_eq!(app.items.len(), items_before);
 
         // 3. 运行中（is_busy）仍即时触发，不进入排队队列
-        app.is_busy = true;
+        app.set_busy_state(true);
         app.input.set_text_end("/session");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::ShowSessionInfo
         );
         assert!(app.queued_prompts.is_empty());
-        app.is_busy = false;
+        app.set_busy_state(false);
 
         // 4. 本地 bash 运行中（is_bash_running）在 is_safe_slash 白名单内放行
-        app.is_bash_running = true;
+        app.set_local_bash_state();
         app.input.set_text_end("/session");
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::ShowSessionInfo
         );
-        app.is_bash_running = false;
+        app.set_idle_state();
 
         // 5. 交互补全：`/` 下移多项再继续输入过滤不会越界，`/ses` 直接回车立即执行
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -5927,5 +6098,170 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::RenameSession(Some("手动命名标题".into()))
         );
+    }
+
+    #[test]
+    fn activity_state_nests_auto_compaction_and_enforces_guards() {
+        let mut app = AppState::new(
+            PathBuf::from("/tmp/ws"),
+            "s-act",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        // 1. 回合内触发自动压缩与结束：外层 Agent 状态必须完整保留，不能被 CompactionFinished 清空
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        assert!(app.is_busy());
+        assert!(!app.is_compacting());
+
+        app.apply_ui_event(UiEvent::CompactionStarted {
+            trigger: "auto-threshold".into(),
+        });
+        assert!(app.is_busy(), "auto-compaction must preserve is_busy()");
+        assert!(app.is_compacting());
+        assert!(app.compaction_status().is_some());
+
+        app.apply_ui_event(UiEvent::CompactionFinished {
+            outcome: "compacted".into(),
+            tokens_before: Some(10_000),
+            tokens_after: Some(3_000),
+            pruned_count: 1,
+            first_kept_seq: Some(4),
+            summary_preview: None,
+            message: None,
+            is_manual: false,
+        });
+        assert!(
+            app.is_busy(),
+            "ending auto-compaction must keep Agent busy until TurnEnd"
+        );
+        assert!(!app.is_compacting());
+
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Completed,
+        });
+        assert!(!app.is_running_activity());
+
+        // 2. 手动压缩期间：Ctrl+D / Ctrl+G / /new / !bash 均受保护拦截，Esc 可取消
+        app.apply_ui_event(UiEvent::CompactionStarted {
+            trigger: "manual".into(),
+        });
+        assert!(app.is_compacting());
+        assert!(!app.is_busy());
+        assert!(app.is_running_activity());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            AppAction::None
+        );
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            AppAction::None
+        );
+        app.input.set_text_end("/new");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        app.input.set_text_end("! ls");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        app.input.clear();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::CancelRun
+        );
+    }
+
+    #[test]
+    fn approval_queue_and_theme_ctrl_c_and_scroll_lock_preserve_state() {
+        let mut app = AppState::new(
+            PathBuf::from("/tmp/ws"),
+            "s-queue-ov",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.set_theme_preset(ThemePreset::MistDark);
+
+        // 1. ThemePicker 预览后按 Ctrl+C 必须回滚到 original 主题
+        app.overlay.open_theme_picker(app.theme_preset);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_ne!(app.theme_preset, ThemePreset::MistDark);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(app.theme_preset, ThemePreset::MistDark);
+        assert!(!app.overlay.is_open());
+
+        // 2. 模态框期间到达两条并发审批：必须安全排队，依次提升并回复两条 oneshot
+        app.overlay.open_help();
+        let (tx1, mut rx1) = futures::channel::oneshot::channel();
+        let (tx2, mut rx2) = futures::channel::oneshot::channel();
+        app.apply_ui_event(UiEvent::ApprovalRequested {
+            tool_name: "bash".into(),
+            args_preview: "ls".into(),
+            responder: Arc::new(std::sync::Mutex::new(Some(tx1))),
+        });
+        app.apply_ui_event(UiEvent::ApprovalRequested {
+            tool_name: "write".into(),
+            args_preview: "a.txt".into(),
+            responder: Arc::new(std::sync::Mutex::new(Some(tx2))),
+        });
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::HelpModal { .. })
+        ));
+        assert!(rx1.try_recv().unwrap().is_none());
+        assert!(rx2.try_recv().unwrap().is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::Approval(ref ap)) if ap.tool_name == "bash"
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(rx1.try_recv().unwrap(), Some(ApprovalDecision::AllowOnce));
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::Approval(ref ap)) if ap.tool_name == "write"
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(rx2.try_recv().unwrap(), Some(ApprovalDecision::Deny));
+        assert!(!app.overlay.is_open());
+
+        // 3. 手动回看锁不会因视口放大/内容收起而丢失
+        app.effective_scroll(20, 100);
+        app.scroll_up(15);
+        assert!(!app.auto_scroll);
+        app.effective_scroll(20, 90);
+        assert!(
+            !app.auto_scroll,
+            "shrink while scrollable must preserve lock"
+        );
+
+        // 4. restore_session_view 同步恢复 touched_files
+        app.restore_session_view(SessionViewData {
+            session_id: "s-restored".into(),
+            session_title: None,
+            items: vec![SessionReplayItem::Assistant {
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "tc-1".into(),
+                    name: "edit".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+            }],
+            finish_notice: "ok".into(),
+            selection: None,
+            total_usage: TokenUsage::default(),
+            last_prompt_tokens: None,
+        });
+        assert_eq!(app.touched_files.len(), 1);
+        assert_eq!(app.touched_files[0].path, "src/lib.rs");
+        assert_eq!(app.touched_files[0].op, "edit");
     }
 }

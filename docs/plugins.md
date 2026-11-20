@@ -62,7 +62,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `Deferred` | ✗（需激活） | ✓ | ✗（靠 `tool_search` / `searchTools()` 发现） | MCP 工具可选项 |
 | `Hidden` | ✗ | ✗ | ✗ | 显式屏蔽（`exclude_tools`） |
 
-激活与排除的优先级依次为（`mizar-tools` 的 `is_default_active`）：**`include_tools` 通配白名单** > `global_active_overrides` > 工具的 `default_active`；任何情况下 `ToolExposure::Hidden` 与命中 `exclude_tools` 的工具都不可激活。显式激活过的工具会在下一次模型调用时重新参与声明，而 `Codemode` / `Deferred` 工具即使未激活也仍可被脚本或 `tool_search` 调用（`resolve_callable_infos`）。
+激活与排除的优先级依次为（`mizar-tools` 的 `is_default_active`）：**`global_active_overrides`** > **`include_tools` 通配白名单** > **`auto_default_active`**（`codemode`/`tool_search` 按需自动启用） > 工具的 `default_active`；任何情况下 `ToolExposure::Hidden` 与命中 `exclude_tools` 的工具都不可激活。显式激活过的工具会在下一次模型调用时重新参与声明，而 `Codemode` / `Deferred` 工具即使未激活也仍可被脚本或 `tool_search` 调用（`resolve_callable_infos`）。
 
 ### 4.1 最小只读套件（Legacy 模式）
 
@@ -82,13 +82,13 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | Crate | 插件结构体 | 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-tool-search`** | `ToolSearchPlugin` | `"tool-search"` | `tool_search` | `["tools"]` | **BM25 工具发现**：对 `Codemode` / `Deferred` 暴露等级的工具建索引（名称权重 4.0、命名空间 2.0），命中后按会话（或全局）激活，使其出现在下一次模型调用的声明中。存在可搜索工具时自动激活，`default_limit` 默认 8 | `cordis`、`mizar-tools` |
-| **`mizar-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎**：把多个工具调用折叠成一次脚本执行，中间结果不进上下文。提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s）与内联预算（默认 3 000 字符，`DEFAULT_CODEMODE_INLINE_BUDGET`）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`mizar-tool-search`、`mizar-tools` |
+| **`mizar-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎**：把多个工具调用折叠成一次脚本执行，中间结果不进上下文。提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s，支持跨异步嵌套工具调用取消传播）与内联预算（默认 3 000 字符，`DEFAULT_CODEMODE_INLINE_BUDGET`）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`mizar-tool-search`、`mizar-tools` |
 
 ### 4.4 MCP 接入
 
 | Crate | 服务结构体 | 提供服务名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json` 加载配置（项目级省略 `command`/`url` 的同名条目作为增量补丁覆盖 `exposure` / `toolExposure` 等字段），支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`，`Accept: application/json, text/event-stream`）两种传输；按 Server 与逐工具两级配置暴露等级（`McpExposure` 默认 `Codemode`，支持通配符匹配），后台异步连接不阻塞启动；`close_all` 通过关闭标记与 `CancellationToken` 等待在途连接退出以支持安全热卸载；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`mizar-llm`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json` 加载配置（项目级省略 `command`/`url` 的同名条目作为增量补丁覆盖 `exposure` / `toolExposure` 等字段），支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`，复用 `mizar-llm-http` 连接池与自定义 CA 根，支持 `text/event-stream` 增量分块读取）两种传输；按 Server 与逐工具两级配置暴露等级（`McpExposure` 默认 `Codemode`，支持通配符匹配），后台异步连接不阻塞启动；`close_all` 通过 `McpManagerPhase` 状态机、`CancellationToken` 与传输层 `StdioRpcState` 安全退出并唤醒等待者；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`mizar-llm`、`mizar-llm-http`、`mizar-system-prompt`、`mizar-tools` |
 
 ### 4.5 技能系统
 

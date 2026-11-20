@@ -12,6 +12,7 @@ workspace = true
 cordis = { workspace = true }
 dirs = { workspace = true }
 mizar-llm = { workspace = true }
+mizar-llm-http = { workspace = true }
 mizar-system-prompt = { workspace = true }
 mizar-tools = { workspace = true }
 reqwest = { workspace = true }

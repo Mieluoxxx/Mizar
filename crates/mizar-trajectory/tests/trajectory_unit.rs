@@ -111,31 +111,31 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
 
     // 1. grep {"b":2,"a":1}
     let r1 = tools
-        .execute(ToolExecution {
-            name: "grep".into(),
-            args: json!({"b": 2, "a": 1}),
-            session_id: Some("sess-x".into()),
-        })
+        .execute(ToolExecution::new(
+            "grep",
+            json!({"b": 2, "a": 1}),
+            Some("sess-x".into()),
+        ))
         .await;
     assert!(r1.additional_contexts.is_empty());
 
     // 2. todo_write (在 exclude 里，应当透明，不打断链条)
     let r_todo = tools
-        .execute(ToolExecution {
-            name: "todo_write".into(),
-            args: json!({"step": 1}),
-            session_id: Some("sess-x".into()),
-        })
+        .execute(ToolExecution::new(
+            "todo_write",
+            json!({"step": 1}),
+            Some("sess-x".into()),
+        ))
         .await;
     assert!(r_todo.additional_contexts.is_empty());
 
     // 3. grep {"a":1,"b":2} -> 命中阈值 2 且被 pre-execute 拦截，仍收到温和提醒
     let r2 = tools
-        .execute(ToolExecution {
-            name: "grep".into(),
-            args: json!({"a": 1, "b": 2}),
-            session_id: Some("sess-x".into()),
-        })
+        .execute(ToolExecution::new(
+            "grep",
+            json!({"a": 1, "b": 2}),
+            Some("sess-x".into()),
+        ))
         .await;
     assert!(r2.blocked);
     assert_eq!(r2.additional_contexts.len(), 1);
@@ -144,11 +144,11 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
 
     // 4. 第 3 次 grep -> 命中阈值 3，收到详细提醒
     let r3 = tools
-        .execute(ToolExecution {
-            name: "grep".into(),
-            args: json!({"a": 1, "b": 2}),
-            session_id: Some("sess-x".into()),
-        })
+        .execute(ToolExecution::new(
+            "grep",
+            json!({"a": 1, "b": 2}),
+            Some("sess-x".into()),
+        ))
         .await;
     assert!(!r3.blocked);
     assert_eq!(r3.additional_contexts.len(), 1);
@@ -160,11 +160,11 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
 
     // 5. 再来一次连续同参 grep（此时是连续第 3 次 grep，无 todo_write 间隔）-> 额外触发 R01_REPEAT_TOOL_CALL
     let _r4 = tools
-        .execute(ToolExecution {
-            name: "grep".into(),
-            args: json!({"b": 2, "a": 1}),
-            session_id: Some("sess-x".into()),
-        })
+        .execute(ToolExecution::new(
+            "grep",
+            json!({"b": 2, "a": 1}),
+            Some("sess-x".into()),
+        ))
         .await;
 
     // 轨迹服务已记录本次会话并产出告警报告
@@ -255,11 +255,11 @@ async fn incremental_anomaly_eval_emits_new_findings_without_duplicating_old_one
 
     for i in 1..=3 {
         let res = tools
-            .execute(ToolExecution {
-                name: "boom".into(),
-                args: json!({ "n": i }),
-                session_id: Some("sess-err-inc".into()),
-            })
+            .execute(ToolExecution::new(
+                "boom",
+                json!({ "n": i }),
+                Some("sess-err-inc".into()),
+            ))
             .await;
         assert!(res.is_error);
     }

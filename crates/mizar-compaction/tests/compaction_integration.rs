@@ -495,3 +495,576 @@ async fn post_compaction_guards_enforce_read_dedup_and_block_stale_write_while_a
     let _ = std::fs::remove_dir_all(&ws);
     app.fiber().dispose().await;
 }
+
+#[tokio::test]
+async fn nested_exec_and_l1_prune_and_resumed_session_guards_work() {
+    use mizar_session::{
+        LoadedSession, PersistenceResult, PrunedToolResult, SERVICE_SESSION_PERSISTENCE,
+        SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionPersistence,
+        SessionPersistenceHandle,
+    };
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct MemPersistence(Mutex<HashMap<String, (SessionHeader, Vec<SessionEntry>)>>);
+
+    impl SessionPersistence for MemPersistence {
+        fn create_session(&self, header: &SessionHeader) -> PersistenceResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(header.id.clone(), (header.clone(), Vec::new()));
+            Ok(())
+        }
+        fn update_header(&self, _id: &str, _patch: SessionHeaderPatch) -> PersistenceResult<()> {
+            Ok(())
+        }
+        fn load_session(&self, id: &str) -> PersistenceResult<Option<LoadedSession>> {
+            Ok(self.0.lock().unwrap().get(id).map(|(h, e)| LoadedSession {
+                header: h.clone(),
+                entries: e.clone(),
+                max_persisted_seq: e.last().map(|x| x.seq),
+                skipped_events: 0,
+            }))
+        }
+        fn list_sessions(&self, _q: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .values()
+                .map(|(h, _)| h.clone())
+                .collect())
+        }
+        fn append_events(&self, id: &str, entries: &[SessionEntry]) -> PersistenceResult<()> {
+            if let Some((_, log)) = self.0.lock().unwrap().get_mut(id) {
+                log.extend(entries.iter().cloned());
+            }
+            Ok(())
+        }
+        fn flush(&self, _session_id: Option<&str>) -> PersistenceResult<()> {
+            Ok(())
+        }
+        fn flush_async(
+            &self,
+            _session_id: Option<String>,
+        ) -> cordis::BoxFuture<'static, PersistenceResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn fork_session(
+            &self,
+            _from: &str,
+            _up_to: u64,
+            new_header: &SessionHeader,
+        ) -> PersistenceResult<LoadedSession> {
+            Ok(LoadedSession {
+                header: new_header.clone(),
+                entries: Vec::new(),
+                max_persisted_seq: None,
+                skipped_events: 0,
+            })
+        }
+    }
+
+    let ws = std::env::temp_dir().join(format!(
+        "mizar_compaction_guards_extra_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws).unwrap();
+    let sample = ws.join("sample.rs");
+    std::fs::write(&sample, "fn initial() {}\n").unwrap();
+
+    let (adapter, _) = RecordingAdapter::new(128_000, vec![]);
+    let app = setup_stack(adapter, CompactionConfig::default(), Some(ws.clone())).await;
+    let store = app.sessions().unwrap();
+    let tools = app.tools().unwrap();
+
+    // 1. 读盘后通过 L1 Prune 剪枝：整文件 write 被拦截，edit 放行，nested write 放行
+    let s1 = store.create_with(SessionCreateOptions {
+        id: Some("guard-l1".into()),
+        cwd: Some(ws.display().to_string()),
+        ..Default::default()
+    });
+    let r1 = tools
+        .execute(
+            ToolExecution::new("read", json!({ "path": "sample.rs" }), Some(s1.id.clone()))
+                .with_call_id("rc1"),
+        )
+        .await;
+    assert!(!r1.is_error);
+    s1.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::ToolCall {
+            id: "rc1".into(),
+            name: "read".into(),
+            arguments: json!({ "path": "sample.rs" }).to_string(),
+        }],
+        replay: None,
+        usage: None,
+    });
+    s1.append(SessionEvent::ToolResult {
+        tool_call_id: "rc1".into(),
+        name: "read".into(),
+        content: r1.content,
+        is_error: false,
+    });
+    let read_seq = s1.last_seq();
+    s1.append(SessionEvent::user("later turn"));
+    s1.append_prune(vec![PrunedToolResult {
+        target_seq: read_seq,
+        replacement: "pruned preview".into(),
+        original_chars: 100,
+    }]);
+
+    let w_pruned = tools
+        .execute(ToolExecution::new(
+            "write",
+            json!({ "path": "sample.rs", "content": "fn wiped() {}" }),
+            Some(s1.id.clone()),
+        ))
+        .await;
+    assert!(
+        w_pruned.blocked && w_pruned.content.contains("pruned"),
+        "write on L1-pruned read must be blocked: {:?}",
+        w_pruned
+    );
+
+    let e_pruned = tools
+        .execute(ToolExecution::new(
+            "edit",
+            json!({ "path": "sample.rs", "old_text": "fn initial() {}", "new_text": "fn edited() {}" }),
+            Some(s1.id.clone()),
+        ))
+        .await;
+    assert!(!e_pruned.is_error && !e_pruned.blocked, "{:?}", e_pruned);
+
+    // 压缩后 nested write 必须绕过 FileReads 守卫（edit 后新增一轮用户消息以将 edit 压出可见窗口）
+    s1.append(SessionEvent::user("after edit"));
+    s1.append(SessionEvent::user("latest ask"));
+    s1.compact("sum", 1, None);
+    let w_after_compact = tools
+        .execute(ToolExecution::new(
+            "write",
+            json!({ "path": "sample.rs", "content": "fn stale() {}" }),
+            Some(s1.id.clone()),
+        ))
+        .await;
+    assert!(w_after_compact.blocked);
+
+    let w_nested = tools
+        .execute(
+            ToolExecution::new(
+                "write",
+                json!({ "path": "sample.rs", "content": "fn nested_ok() {}\n" }),
+                Some(s1.id.clone()),
+            )
+            .with_nested(true),
+        )
+        .await;
+    assert!(
+        !w_nested.is_error && !w_nested.blocked,
+        "exec.nested should skip FileGuardTracker: {:?}",
+        w_nested
+    );
+    app.fiber().dispose().await;
+
+    // 2. 冷加载恢复会话时从历史事件重建 last_read_seq 并拦截陈旧 write
+    let persistence = Arc::new(MemPersistence::default());
+    let mut header = SessionHeader::new("resumed-guard", 1000);
+    header.cwd = Some(ws.display().to_string());
+    persistence.create_session(&header).unwrap();
+    let entries = vec![
+        SessionEntry {
+            seq: 1,
+            ts: 1001,
+            event: SessionEvent::Assistant {
+                blocks: vec![ContentBlock::ToolCall {
+                    id: "tc-read".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "sample.rs" }).to_string(),
+                }],
+                replay: None,
+                usage: None,
+            },
+        },
+        SessionEntry {
+            seq: 2,
+            ts: 1002,
+            event: SessionEvent::ToolResult {
+                tool_call_id: "tc-read".into(),
+                name: "read".into(),
+                content: "fn nested_ok() {}\n".into(),
+                is_error: false,
+            },
+        },
+        SessionEntry {
+            seq: 3,
+            ts: 1003,
+            event: SessionEvent::user("after read"),
+        },
+        SessionEntry {
+            seq: 4,
+            ts: 1004,
+            event: SessionEvent::Compaction {
+                summary: "summary".into(),
+                first_kept_seq: 3,
+                tokens_before: None,
+                tokens_after: None,
+                digest: Default::default(),
+            },
+        },
+    ];
+    persistence
+        .append_events("resumed-guard", &entries)
+        .unwrap();
+
+    let (adapter2, _) = RecordingAdapter::new(128_000, vec![]);
+    let app2 = Context::new();
+    app2.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(
+            Arc::clone(&persistence) as Arc<dyn SessionPersistence>
+        )),
+    )
+    .unwrap();
+    app2.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    app2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app2.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    app2.plugin(CompactionRuntime::plugin(), CompactionConfig::default())
+        .await
+        .unwrap();
+    app2.plugin(CodingToolsPlugin, CodingToolsConfig::new(ws.clone()))
+        .await
+        .unwrap();
+    let adapter2 = Arc::new(adapter2);
+    app2.plugin(
+        PluginDef::sync("mock-a2", move |ctx, ()| {
+            let llm = ctx.llm()?;
+            let a = Arc::clone(&adapter2);
+            ctx.effect("mock-a2.reg", move || {
+                Ok::<_, LlmError>(Some(llm.register_adapter("mock-compact", a)?))
+            })?;
+            Ok::<_, cordis::CordisError>(())
+        })
+        .inject(["llm"]),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let _resumed = app2.sessions().unwrap().get("resumed-guard").unwrap();
+    let w_resumed_blocked = app2
+        .tools()
+        .unwrap()
+        .execute(ToolExecution::new(
+            "write",
+            json!({ "path": "sample.rs", "content": "fn blocked_after_resume() {}" }),
+            Some("resumed-guard".into()),
+        ))
+        .await;
+    assert!(
+        w_resumed_blocked.blocked,
+        "resumed session must rebuild last_read_seq and block pre-compaction write: {:?}",
+        w_resumed_blocked
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+    app2.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
+    use mizar_agent_loop::{
+        AgentPreStepEvent, AgentStepEndEvent, EVENT_AGENT_PRE_STEP, EVENT_AGENT_STEP_END,
+        StepOutcome,
+    };
+    use mizar_compaction::{
+        CompactionEndEvent, CompactionStartEvent, EVENT_COMPACTION_END, EVENT_COMPACTION_START,
+    };
+    use mizar_session::SessionTraceEvent;
+
+    // 1. llm 服务缺失时 CompactionStart 与 CompactionEnd/EVENT_COMPACTION_END 成对触发
+    let app = Context::new();
+    let llm_fiber = app.plugin(LlmRuntime::plugin(), ());
+    let _ = llm_fiber.wait_settled().await;
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    app.plugin(CompactionRuntime::plugin(), CompactionConfig::default())
+        .await
+        .unwrap();
+
+    let starts = Arc::new(Mutex::new(Vec::<CompactionStartEvent>::new()));
+    let ends = Arc::new(Mutex::new(Vec::<CompactionEndEvent>::new()));
+    let s_cap = Arc::clone(&starts);
+    let e_cap = Arc::clone(&ends);
+    let _h1 = app
+        .on(EVENT_COMPACTION_START, move |ev: &CompactionStartEvent| {
+            s_cap.lock().unwrap().push(ev.clone());
+        })
+        .unwrap();
+    let _h2 = app
+        .on(EVENT_COMPACTION_END, move |ev: &CompactionEndEvent| {
+            e_cap.lock().unwrap().push(ev.clone());
+        })
+        .unwrap();
+
+    let sess = app.sessions().unwrap().create(Some("no-llm".into()));
+    for i in 0..4 {
+        sess.append(SessionEvent::user(format!(
+            "user msg {i} {}",
+            "x".repeat(600)
+        )));
+        sess.append(SessionEvent::assistant_text(format!(
+            "asst msg {i} {}",
+            "y".repeat(600)
+        )));
+    }
+
+    // 提前取出 CompactionRuntime 引用，随后卸载 LlmRuntime 使 ctx.llm() 返回 Err
+    let compaction = app.compaction().unwrap();
+    llm_fiber.dispose().await;
+    let compact_res = compaction
+        .compact_now(
+            Arc::clone(&sess),
+            ManualCompactOptions::default(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(compact_res.is_err());
+
+    assert_eq!(starts.lock().unwrap().len(), 1);
+    {
+        let end_ev = ends.lock().unwrap();
+        assert_eq!(end_ev.len(), 1);
+        assert_eq!(end_ev[0].outcome, CompactionOutcome::Failed);
+    }
+    let traces: Vec<SessionTraceEvent> = sess.with_all_entries(|entries| {
+        entries
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::Trace { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    assert!(matches!(
+        traces.first(),
+        Some(SessionTraceEvent::CompactionStart { .. })
+    ));
+    assert!(matches!(
+        traces.last(),
+        Some(SessionTraceEvent::CompactionEnd { status, .. }) if status == "failed"
+    ));
+    app.fiber().dispose().await;
+
+    // 2. ColdCache 遵循 keep_recent_tokens 下限与 regrowth_ratio，且 last_answered_route 不跨 provider 混用 model
+    struct ProviderRecordingAdapter {
+        provider_id: String,
+        model_id: String,
+        calls: Arc<Mutex<Vec<GenerateOptions>>>,
+        window: u64,
+    }
+
+    impl LlmAdapter for ProviderRecordingAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: self.provider_id.clone(),
+                name: self.provider_id.clone(),
+                protocol: "mock".into(),
+                models: vec![ModelInfo {
+                    id: self.model_id.clone(),
+                    name: self.model_id.clone(),
+                    context_window: Some(self.window),
+                    max_tokens: Some(2_000),
+                    reasoning_efforts: vec![ReasoningEffort::Off],
+                    input: Vec::new(),
+                }],
+            })
+        }
+
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            self.calls.lock().unwrap().push(options);
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                let _ = tx.unbounded_send(Ok(StreamChunk::TextDelta {
+                    index: 0,
+                    text: "## Goal\n- Summary".into(),
+                }));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }));
+            });
+            Box::pin(rx)
+        }
+    }
+
+    let app2 = Context::new();
+    app2.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    app2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app2.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    // usable = 10_000 - 2_000 = 8_000; trigger = 3_200 (half=1_600), keep_recent = 2_000 (> 1_600), regrowth = 1_600
+    let cfg = CompactionConfig {
+        default_context_window: 10_000,
+        soft_window_cap: 0,
+        trigger_ratio: 0.40,
+        keep_recent_ratio: 0.25,
+        regrowth_ratio: 0.20,
+        post_compact_max_ratio: 0.85,
+        prune_threshold_chars: 100_000,
+        cold_cache_idle_secs: 1,
+        ..Default::default()
+    };
+    app2.plugin(CompactionRuntime::plugin(), cfg).await.unwrap();
+
+    let calls_a = Arc::new(Mutex::new(Vec::<GenerateOptions>::new()));
+    let calls_b = Arc::new(Mutex::new(Vec::<GenerateOptions>::new()));
+    let a = Arc::new(ProviderRecordingAdapter {
+        provider_id: "prov-a".into(),
+        model_id: "model-a".into(),
+        calls: Arc::clone(&calls_a),
+        window: 10_000,
+    });
+    let b = Arc::new(ProviderRecordingAdapter {
+        provider_id: "prov-b".into(),
+        model_id: "model-b".into(),
+        calls: Arc::clone(&calls_b),
+        window: 10_000,
+    });
+    app2.plugin(
+        PluginDef::sync("two-provs", move |ctx, ()| {
+            let llm = ctx.llm()?;
+            let a_ref: Arc<dyn LlmAdapter> = Arc::clone(&a) as Arc<dyn LlmAdapter>;
+            let b_ref: Arc<dyn LlmAdapter> = Arc::clone(&b) as Arc<dyn LlmAdapter>;
+            ctx.effect("two-provs.reg", move || {
+                let c1 = llm.register_adapter("prov-a", a_ref)?;
+                let c2 = llm.register_adapter("prov-b", b_ref)?;
+                Ok::<_, LlmError>(Some(cordis::Cleanup::sync(move || {
+                    drop(c1);
+                    drop(c2);
+                })))
+            })?;
+            Ok::<_, cordis::CordisError>(())
+        })
+        .inject(["llm"]),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let s2 = app2.sessions().unwrap().create(Some("cold-route".into()));
+    for i in 0..6 {
+        s2.append(SessionEvent::user(format!("m{i} {}", "a".repeat(1_000))));
+        s2.append(SessionEvent::assistant_text(format!(
+            "r{i} {}",
+            "b".repeat(40)
+        )));
+    }
+    // estimated ~ 1_800 tokens: 高于 trigger/2=1_600 但低于 keep_recent=2_000
+    app2.emit(
+        EVENT_AGENT_STEP_END,
+        AgentStepEndEvent {
+            session: Arc::clone(&s2),
+            turn: 1,
+            step: 1,
+            outcome: StepOutcome::Completed,
+            usage: None,
+            provider: Some("prov-a".into()),
+            model: None,
+            ts_ms: 0,
+        },
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let _ = app2
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s2),
+                turn: 2,
+                step: 1,
+                provider: Some("prov-b".into()),
+                model: Some("model-b".into()),
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(
+        s2.header().compacted_up_to_seq.is_none(),
+        "ColdCache must respect keep_recent_tokens floor"
+    );
+
+    // 追加两轮对话推高到 ~2_850（消息总计 > keep_recent=2_000 且整体 < trigger=3_200），空闲后触发 ColdCache 并使用 prov-a 且不带 model-b
+    s2.append(SessionEvent::user(
+        "u_extra_1 ".to_string() + &"c".repeat(2_000),
+    ));
+    s2.append(SessionEvent::assistant_text(
+        "a_extra_1 ".to_string() + &"d".repeat(2_000),
+    ));
+    app2.emit(
+        EVENT_AGENT_STEP_END,
+        AgentStepEndEvent {
+            session: Arc::clone(&s2),
+            turn: 2,
+            step: 1,
+            outcome: StepOutcome::Completed,
+            usage: None,
+            provider: Some("prov-a".into()),
+            model: None,
+            ts_ms: 0,
+        },
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let _ = app2
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s2),
+                turn: 3,
+                step: 1,
+                provider: Some("prov-b".into()),
+                model: Some("model-b".into()),
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert!(s2.header().compacted_up_to_seq.is_some());
+    assert_eq!(calls_a.lock().unwrap().len(), 1);
+    assert_eq!(calls_b.lock().unwrap().len(), 0);
+    assert_eq!(
+        calls_a.lock().unwrap()[0].model,
+        None,
+        "last_answered_route on prov-a with None model must not mix model-b from prov-b"
+    );
+
+    // 紧接着未增长到 regrowth_tokens 即使再次空闲，也不得重复触发 ColdCache
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let _ = app2
+        .serial::<AgentPreStepEvent, ()>(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepEvent {
+                session: Arc::clone(&s2),
+                turn: 4,
+                step: 1,
+                provider: Some("prov-b".into()),
+                model: Some("model-b".into()),
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+    assert_eq!(
+        calls_a.lock().unwrap().len(),
+        1,
+        "regrowth_tokens hysteresis must block repeated ColdCache"
+    );
+
+    app2.fiber().dispose().await;
+}

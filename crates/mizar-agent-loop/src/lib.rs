@@ -3,7 +3,7 @@
 //! Agent 循环本身也只是一个插件。它不知道模型是哪家、有哪些工具，只认四个服务名：
 //! `llm`、`tools`、`sessions`、`systemPrompt`。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -404,6 +404,7 @@ pub struct AgentLoop {
     ctx: Context,
     config: AgentLoopConfig,
     active_sessions: Arc<Mutex<HashSet<String>>>,
+    short_cutoffs_by_session: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl AgentLoop {
@@ -518,8 +519,15 @@ impl AgentLoop {
         let mut step = 0usize;
         let mut steps_executed = 0usize;
         let mut last_step_outcome: Option<StepOutcome> = None;
-        let mut overflow_recovered = false;
-        let mut consecutive_short_cutoffs = 0usize;
+        let mut last_overflow_step: Option<usize> = None;
+        let mut overflow_recoveries_this_turn = 0usize;
+        let mut consecutive_short_cutoffs = self
+            .short_cutoffs_by_session
+            .lock()
+            .unwrap()
+            .get(&session.id)
+            .copied()
+            .unwrap_or(0);
         loop {
             step += 1;
             if cancel.is_cancelled() {
@@ -594,6 +602,8 @@ impl AgentLoop {
                 content: prompt_text,
             }];
             messages.extend(session.derive_messages());
+            let can_recover_overflow =
+                last_overflow_step != Some(step) && overflow_recoveries_this_turn < 3;
 
             let mut stream = match llm.stream(GenerateOptions {
                 messages,
@@ -610,7 +620,7 @@ impl AgentLoop {
                 Ok(s) => s,
                 Err(err) => {
                     if err.code == LlmErrorCode::ContextWindowExceeded
-                        && !overflow_recovered
+                        && can_recover_overflow
                         && !cancel.is_cancelled()
                     {
                         let recovered = self
@@ -630,8 +640,13 @@ impl AgentLoop {
                             .await
                             .unwrap_or(false);
                         if recovered {
-                            overflow_recovered = true;
+                            last_overflow_step = Some(step);
+                            overflow_recoveries_this_turn += 1;
                             consecutive_short_cutoffs = 0;
+                            self.short_cutoffs_by_session
+                                .lock()
+                                .unwrap()
+                                .remove(&session.id);
                             step_guard.finish(
                                 StepOutcome::Error {
                                     message: "context overflow recovered; retrying".to_string(),
@@ -668,7 +683,7 @@ impl AgentLoop {
                     Ok(c) => c,
                     Err(err) => {
                         if err.code == LlmErrorCode::ContextWindowExceeded
-                            && !overflow_recovered
+                            && can_recover_overflow
                             && !cancel.is_cancelled()
                         {
                             stream_overflow_err = Some(err);
@@ -770,8 +785,13 @@ impl AgentLoop {
                     .await
                     .unwrap_or(false);
                 if recovered {
-                    overflow_recovered = true;
+                    last_overflow_step = Some(step);
+                    overflow_recoveries_this_turn += 1;
                     consecutive_short_cutoffs = 0;
+                    self.short_cutoffs_by_session
+                        .lock()
+                        .unwrap()
+                        .remove(&session.id);
                     step_guard.finish(
                         StepOutcome::Error {
                             message: "context overflow recovered; retrying".to_string(),
@@ -814,7 +834,7 @@ impl AgentLoop {
                         retry_after_ms: *retry_after_ms,
                     };
                     if err.code == LlmErrorCode::ContextWindowExceeded
-                        && !overflow_recovered
+                        && can_recover_overflow
                         && !cancel.is_cancelled()
                     {
                         let recovered = self
@@ -834,8 +854,13 @@ impl AgentLoop {
                             .await
                             .unwrap_or(false);
                         if recovered {
-                            overflow_recovered = true;
+                            last_overflow_step = Some(step);
+                            overflow_recoveries_this_turn += 1;
                             consecutive_short_cutoffs = 0;
+                            self.short_cutoffs_by_session
+                                .lock()
+                                .unwrap()
+                                .remove(&session.id);
                             let outcome = StepOutcome::Error {
                                 message: "context overflow recovered; retrying".to_string(),
                             };
@@ -874,12 +899,20 @@ impl AgentLoop {
                 && text.chars().count() < 200;
             if is_short_cutoff {
                 consecutive_short_cutoffs += 1;
+                self.short_cutoffs_by_session
+                    .lock()
+                    .unwrap()
+                    .insert(session.id.clone(), consecutive_short_cutoffs);
             } else {
                 consecutive_short_cutoffs = 0;
+                self.short_cutoffs_by_session
+                    .lock()
+                    .unwrap()
+                    .remove(&session.id);
             }
 
             if (is_zero_len_cutoff || consecutive_short_cutoffs >= 2)
-                && !overflow_recovered
+                && can_recover_overflow
                 && !cancel.is_cancelled()
             {
                 let reason = if is_zero_len_cutoff {
@@ -906,8 +939,13 @@ impl AgentLoop {
                     .await
                     .unwrap_or(false);
                 if recovered {
-                    overflow_recovered = true;
+                    last_overflow_step = Some(step);
+                    overflow_recoveries_this_turn += 1;
                     consecutive_short_cutoffs = 0;
+                    self.short_cutoffs_by_session
+                        .lock()
+                        .unwrap()
+                        .remove(&session.id);
                     let outcome = StepOutcome::Error {
                         message: "implicit cutoff overflow recovered; retrying".to_string(),
                     };
@@ -919,11 +957,20 @@ impl AgentLoop {
                 }
             }
 
-            if calls.is_empty() && blocks.is_empty() {
-                let err = LlmError::new(
-                    LlmErrorCode::EmptyResponse,
-                    "model output must contain either output text or tool calls",
-                );
+            let has_visible_text = blocks.iter().any(|b| match b {
+                mizar_llm::ContentBlock::Text { text } => !text.trim().is_empty(),
+                _ => false,
+            });
+            if calls.is_empty()
+                && !has_visible_text
+                && !matches!(finish_reason, FinishReason::MaxTokens)
+            {
+                let detail = if blocks.is_empty() {
+                    "model output must contain either output text or tool calls"
+                } else {
+                    "model output contained only reasoning without visible text or tool calls"
+                };
+                let err = LlmError::new(LlmErrorCode::EmptyResponse, detail);
                 let msg = err.to_string();
                 step_guard.finish(
                     StepOutcome::Error {
@@ -954,7 +1001,7 @@ impl AgentLoop {
             drop(step_guard);
 
             if calls.is_empty() {
-                let reason = if is_truncated {
+                let reason = if is_truncated || !has_visible_text {
                     TurnEndReason::Truncated
                 } else {
                     TurnEndReason::Completed
@@ -1033,15 +1080,14 @@ impl AgentLoop {
                             },
                         );
                     });
-                    futs.push(tools.execute_with(
-                        ToolExecution {
-                            name: call.name.clone(),
-                            args,
-                            session_id: Some(session.id.clone()),
-                        },
-                        cancel.clone(),
-                        Some(on_update),
-                    ));
+                    futs.push(
+                        tools.execute_with(
+                            ToolExecution::new(call.name.clone(), args, Some(session.id.clone()))
+                                .with_call_id(call.id.clone()),
+                            cancel.clone(),
+                            Some(on_update),
+                        ),
+                    );
                 }
 
                 let results: Vec<ToolResult> = if futs.len() == 1 {
@@ -1122,6 +1168,7 @@ impl Service for AgentLoop {
             ctx: ctx.clone(),
             config,
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            short_cutoffs_by_session: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 }
@@ -1714,6 +1761,189 @@ mod tests {
         assert_eq!(r_cap.reason, TurnEndReason::MaxSteps);
         assert_eq!(r_cap.last_step_outcome, Some(StepOutcome::ToolCalls));
         assert_eq!(r_cap.steps, 2);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn consecutive_short_cutoffs_across_turns_and_later_step_overflow_trigger_recovery() {
+        struct MultiRecoveryAdapter {
+            calls: AtomicUsize,
+        }
+        impl LlmAdapter for MultiRecoveryAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    match n {
+                        // Turn 1: 短截断 #1 (<200 chars + MaxTokens)
+                        0 => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::text("short 1")));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::MaxTokens,
+                                replay: None,
+                            }));
+                        }
+                        // Turn 2: 短截断 #2 -> 达到 consecutive_short_cutoffs >= 2 触发 overflow 恢复后重试
+                        1 => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::text("short 2")));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::MaxTokens,
+                                replay: None,
+                            }));
+                        }
+                        // Turn 2 重试成功 -> 调用工具进入 Step 2
+                        2 => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                                0,
+                                ToolCall {
+                                    id: "c_step1".into(),
+                                    name: "ping".into(),
+                                    arguments: json!({}).to_string(),
+                                },
+                            )));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::ToolCalls,
+                                replay: None,
+                            }));
+                        }
+                        // Turn 2 Step 2 遭遇 ContextWindowExceeded -> 必须仍能触发第二次 overflow 恢复
+                        3 => {
+                            let _ = tx.unbounded_send(Err(LlmError::new(
+                                LlmErrorCode::ContextWindowExceeded,
+                                "context length exceeded at step 2",
+                            )));
+                        }
+                        // Turn 2 Step 2 重试成功
+                        _ => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::text("all recovered")));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::Stop,
+                                replay: None,
+                            }));
+                        }
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(MultiRecoveryAdapter {
+            calls: AtomicUsize::new(0),
+        })
+        .await;
+        let _reg = app
+            .tools()
+            .unwrap()
+            .register(ToolDefinition::sync_tool(
+                "ping",
+                "ping",
+                json!({}),
+                |_, _| Ok::<_, cordis::BoxError>("pong".to_string()),
+            ))
+            .unwrap();
+
+        let overflow_reasons = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rec = Arc::clone(&overflow_reasons);
+        app.on_serial(
+            EVENT_AGENT_CONTEXT_OVERFLOW,
+            move |ev: AgentContextOverflowEvent| {
+                let rec = Arc::clone(&rec);
+                async move {
+                    rec.lock().unwrap().push(ev.reason);
+                    Some(true)
+                }
+            },
+        )
+        .unwrap();
+
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+
+        let r1 = agent
+            .run_with_report(
+                Arc::clone(&sess),
+                "turn 1",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.reason, TurnEndReason::Truncated);
+        assert!(overflow_reasons.lock().unwrap().is_empty());
+
+        let r2 = agent
+            .run_with_report(
+                Arc::clone(&sess),
+                "turn 2",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.reason, TurnEndReason::Completed);
+        assert_eq!(r2.text, "all recovered");
+        let reasons = overflow_reasons.lock().unwrap().clone();
+        assert_eq!(reasons.len(), 2, "reasons={reasons:?}");
+        assert!(reasons[0].contains("consecutive short max_tokens cutoffs"));
+        assert!(reasons[1].contains("context length exceeded at step 2"));
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_response_without_visible_text_never_completes_silently() {
+        struct ReasoningOnlyAdapter(AtomicUsize);
+        impl LlmAdapter for ReasoningOnlyAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::ReasoningDelta {
+                        index: 0,
+                        text: "internal chain of thought only".into(),
+                    }));
+                    let reason = if n == 0 {
+                        FinishReason::Stop
+                    } else {
+                        FinishReason::MaxTokens
+                    };
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason,
+                        replay: None,
+                    }));
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(ReasoningOnlyAdapter(AtomicUsize::new(0))).await;
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+
+        // 1. Stop 但仅有 Reasoning 无任何 Text/ToolCall -> 必须报 EmptyResponse，不得空转 Completed
+        let err = agent
+            .run_with_report(
+                Arc::clone(&sess),
+                "q1",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Llm(e) if e.code == LlmErrorCode::EmptyResponse));
+
+        // 2. MaxTokens 且仅有 Reasoning 无正文 -> 必须返回 TurnEndReason::Truncated
+        let rep = agent
+            .run_with_report(
+                Arc::clone(&sess),
+                "q2",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep.reason, TurnEndReason::Truncated);
 
         app.fiber().dispose().await;
     }

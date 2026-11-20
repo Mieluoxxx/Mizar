@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -12,28 +14,98 @@ use mizar_llm::{
 };
 
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn build_shared_http_client() -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
-    for env_key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"] {
-        if let Ok(path) = std::env::var(env_key)
-            && !path.trim().is_empty()
-            && let Ok(pem) = std::fs::read(&path)
-            && let Ok(certs) = reqwest::Certificate::from_pem_bundle(&pem)
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let mut msg = err.to_string();
+    let mut current: &dyn std::error::Error = err;
+    while let Some(source) = current.source() {
+        let s = source.to_string();
+        if !s.is_empty() && !msg.contains(&s) {
+            msg.push_str(": ");
+            msg.push_str(&s);
+        }
+        current = source;
+    }
+    msg
+}
+
+fn load_ca_certs_from_path(path: &Path, certs: &mut Vec<reqwest::Certificate>) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(parsed) = reqwest::Certificate::from_pem_bundle(&bytes) else {
+        return false;
+    };
+    if parsed.is_empty() {
+        return false;
+    }
+    certs.extend(parsed);
+    true
+}
+
+/// 从常见系统/代理环境变量（`SSL_CERT_FILE` / `CURL_CA_BUNDLE` / `REQUESTS_CA_BUNDLE` /
+/// `NODE_EXTRA_CA_CERTS`）及标准系统证书路径加载额外根证书，确保企业或沙箱 HTTPS 代理正常校验。
+pub fn configure_custom_ca_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut loaded_any = false;
+    let mut certs = Vec::new();
+
+    for var in [
+        "SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    ] {
+        if let Some(raw) = std::env::var_os(var)
+            && !raw.is_empty()
         {
-            for cert in certs {
-                builder = builder.add_root_certificate(cert);
+            let path = PathBuf::from(raw);
+            if seen.insert(path.clone()) && load_ca_certs_from_path(&path, &mut certs) {
+                loaded_any = true;
             }
-            break;
         }
     }
+
+    if !loaded_any {
+        for fallback in [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-bundle.crt",
+        ] {
+            let path = PathBuf::from(fallback);
+            if seen.insert(path.clone()) && load_ca_certs_from_path(&path, &mut certs) {
+                break;
+            }
+        }
+    }
+
+    for cert in certs {
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
+}
+
+/// 构造带自定义根证书与连接调优的 HTTP 客户端。
+pub fn build_http_client() -> reqwest::Client {
+    let builder = configure_custom_ca_roots(
+        reqwest::Client::builder()
+            .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+            .tcp_nodelay(true),
+    );
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 获取进程级复用的共享 `reqwest::Client`（跨适配器、跨热重载复用连接池与 HTTP/2 连接）。
+pub fn default_http_client() -> reqwest::Client {
+    static SHARED: OnceLock<reqwest::Client> = OnceLock::new();
+    SHARED.get_or_init(build_http_client).clone()
 }
 
 /// 返回进程级共享的 `reqwest::Client`，复用底层连接池、TLS 配置与系统代理状态。
 pub fn shared_http_client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(build_shared_http_client).clone()
+    default_http_client()
 }
 
 /// 协议流式解码器接口，由各个具体协议适配器实现（纯解析逻辑，便于单元测试）。
@@ -44,6 +116,13 @@ pub trait SseStreamDecoder: Send + 'static {
         event: SseEvent,
         emit: &mut dyn FnMut(StreamChunk) -> bool,
     ) -> Result<bool, LlmError>;
+
+    /// 底层响应流在 `on_event` 尚未返回 `Ok(true)` 时到达 EOF 的检查（默认拒绝静默截断）。
+    fn on_eof_without_done(&self) -> Result<(), LlmError> {
+        Err(LlmError::malformed(
+            "SSE stream ended unexpectedly before completion marker",
+        ))
+    }
 
     /// 流结束时刷出收尾分片（例如未能提前发出的 Finish/Usage）。
     fn on_finish(&mut self, _emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
@@ -124,7 +203,10 @@ pub fn spawn_sse_stream<D: SseStreamDecoder>(
                     } else {
                         LlmErrorCode::Transport
                     };
-                    let _ = tx.unbounded_send(Err(LlmError::new(code, format!("http error: {e}"))));
+                    let _ = tx.unbounded_send(Err(LlmError::new(
+                        code,
+                        format!("http error: {}", format_reqwest_error(&e)),
+                    )));
                     return;
                 }
             },
@@ -209,10 +291,22 @@ pub fn spawn_sse_stream<D: SseStreamDecoder>(
         if !done {
             let tail = parser.finish(|| {});
             for ev in tail {
-                let mut emit = |chunk: StreamChunk| tx.unbounded_send(Ok(chunk)).is_ok();
+                let mut receiver_closed = false;
+                let mut emit = |chunk: StreamChunk| -> bool {
+                    if tx.unbounded_send(Ok(chunk)).is_err() {
+                        receiver_closed = true;
+                        false
+                    } else {
+                        true
+                    }
+                };
                 match decoder.on_event(ev, &mut emit) {
                     Ok(is_done) => {
+                        if receiver_closed {
+                            return;
+                        }
                         if is_done {
+                            done = true;
                             break;
                         }
                     }
@@ -222,6 +316,11 @@ pub fn spawn_sse_stream<D: SseStreamDecoder>(
                     }
                 }
             }
+        }
+
+        if !done && let Err(err) = decoder.on_eof_without_done() {
+            let _ = tx.unbounded_send(Err(err));
+            return;
         }
 
         let mut emit = |chunk: StreamChunk| tx.unbounded_send(Ok(chunk)).is_ok();
@@ -386,7 +485,12 @@ pub async fn discover_models_http(
         .headers(header_map)
         .send()
         .await
-        .map_err(|e| LlmError::transport(format!("model discovery failed: {e}")))?;
+        .map_err(|e| {
+            LlmError::transport(format!(
+                "model discovery failed: {}",
+                format_reqwest_error(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -517,5 +621,24 @@ mod tests {
 
         let h3 = HeaderMap::new();
         assert_eq!(parse_retry_after_ms(&h3), None);
+    }
+
+    #[test]
+    fn custom_ca_roots_handles_missing_or_invalid_bundle_and_builds_client() {
+        let missing =
+            std::env::temp_dir().join(format!("mizar_missing_ca_{}.pem", std::process::id()));
+        let mut certs = Vec::new();
+        assert!(!load_ca_certs_from_path(&missing, &mut certs));
+        assert!(certs.is_empty());
+
+        let invalid =
+            std::env::temp_dir().join(format!("mizar_invalid_ca_{}.pem", std::process::id()));
+        std::fs::write(&invalid, b"not a valid pem cert").unwrap();
+        assert!(!load_ca_certs_from_path(&invalid, &mut certs));
+        let _ = std::fs::remove_file(&invalid);
+        assert!(certs.is_empty());
+
+        let _client1 = build_http_client();
+        let _client2 = default_http_client();
     }
 }

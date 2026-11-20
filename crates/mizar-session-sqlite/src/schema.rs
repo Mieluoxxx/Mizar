@@ -1,36 +1,70 @@
 //! SQLite Schema 初始化与连接参数配置（WAL + busy_timeout）。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mizar_session::{
     EntryVisibility, LoadedSession, PersistenceError, PersistenceResult, SESSION_FORMAT_VERSION,
     SessionEntry, SessionEvent, SessionHeader, SessionListQuery, TitleSource,
 };
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params_from_iter};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+const BUSY_RETRY_BUDGET: Duration = Duration::from_millis(5000);
+
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn retry_on_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> PersistenceResult<T> {
+    let deadline = Instant::now() + BUSY_RETRY_BUDGET;
+    let mut backoff_ms = 2u64;
+    loop {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(err) if is_sqlite_busy(&err) && Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let sleep_dur = Duration::from_millis(backoff_ms).min(remaining);
+                if !sleep_dur.is_zero() {
+                    std::thread::sleep(sleep_dur);
+                }
+                backoff_ms = (backoff_ms * 2).min(50);
+            }
+            Err(err) => return Err(map_sqlite_err(err)),
+        }
+    }
+}
 
 pub fn configure_connection(conn: &Connection) -> PersistenceResult<()> {
-    conn.busy_timeout(Duration::from_millis(5000))
+    conn.busy_timeout(BUSY_RETRY_BUDGET)
         .map_err(map_sqlite_err)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;
-         PRAGMA cache_size = -512;",
-    )
-    .map_err(map_sqlite_err)?;
+    let journal_mode: String =
+        retry_on_busy(|| conn.query_row("PRAGMA journal_mode;", [], |r| r.get(0)))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        retry_on_busy(|| conn.execute_batch("PRAGMA journal_mode = WAL;"))?;
+    }
+    retry_on_busy(|| {
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA cache_size = -512;",
+        )
+    })?;
     Ok(())
 }
 
 pub fn configure_reader_connection(conn: &Connection) -> PersistenceResult<()> {
-    conn.busy_timeout(Duration::from_millis(5000))
+    conn.busy_timeout(BUSY_RETRY_BUDGET)
         .map_err(map_sqlite_err)?;
-    conn.execute_batch(
-        "PRAGMA query_only = ON;
-         PRAGMA cache_size = -512;",
-    )
-    .map_err(map_sqlite_err)?;
+    retry_on_busy(|| {
+        conn.execute_batch(
+            "PRAGMA query_only = ON;
+             PRAGMA cache_size = -512;",
+        )
+    })?;
     Ok(())
 }
 
@@ -48,74 +82,126 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> PersistenceResult
     Ok(false)
 }
 
+fn core_tables_present(conn: &Connection) -> PersistenceResult<bool> {
+    retry_on_busy(|| {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions' LIMIT 1;",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|opt| opt.is_some())
+    })
+}
+
 pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
     configure_connection(conn)?;
-    let version: u32 = conn
-        .query_row("PRAGMA user_version;", [], |r| r.get(0))
-        .map_err(map_sqlite_err)?;
+    let version: u32 = retry_on_busy(|| conn.query_row("PRAGMA user_version;", [], |r| r.get(0)))?;
     if version > CURRENT_SCHEMA_VERSION {
         return Err(PersistenceError::Backend(format!(
             "unsupported sqlite session schema version {version} (max supported: {CURRENT_SCHEMA_VERSION})"
         )));
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sessions (
-             id TEXT PRIMARY KEY,
-             format_version INTEGER NOT NULL,
-             cwd TEXT,
-             title TEXT,
-             title_source TEXT,
-             parent_id TEXT,
-             fork_seq INTEGER,
-             created_at_ms INTEGER NOT NULL,
-             updated_at_ms INTEGER NOT NULL,
-             event_count INTEGER NOT NULL DEFAULT 0,
-             surface_count INTEGER NOT NULL DEFAULT 0,
-             compacted_up_to_seq INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS idx_sessions_cwd_updated
-             ON sessions(cwd, updated_at_ms DESC);
-         CREATE INDEX IF NOT EXISTS idx_sessions_updated
-             ON sessions(updated_at_ms DESC);
-         CREATE TABLE IF NOT EXISTS session_events (
-             session_id TEXT NOT NULL,
-             seq INTEGER NOT NULL,
-             ts_ms INTEGER NOT NULL,
-             visibility TEXT NOT NULL,
-             kind TEXT NOT NULL,
-             payload_json TEXT NOT NULL,
-             PRIMARY KEY (session_id, seq),
-             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-         );
-         CREATE TABLE IF NOT EXISTS session_recall_docs (
-             doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
-             session_id TEXT NOT NULL,
-             seq INTEGER NOT NULL,
-             ts_ms INTEGER NOT NULL,
-             kind TEXT NOT NULL,
-             preview TEXT NOT NULL,
-             UNIQUE(session_id, seq),
-             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-         );
-         CREATE INDEX IF NOT EXISTS idx_recall_docs_session_seq
-             ON session_recall_docs(session_id, seq);
-         CREATE VIRTUAL TABLE IF NOT EXISTS session_recall_fts USING fts5(
-             terms,
-             content='',
-             tokenize='ascii'
-         );",
-    )
-    .map_err(map_sqlite_err)?;
-
-    if version < 2 && !has_column(conn, "sessions", "title_source")? {
-        conn.execute("ALTER TABLE sessions ADD COLUMN title_source TEXT;", [])
-            .map_err(map_sqlite_err)?;
+    if version == CURRENT_SCHEMA_VERSION && core_tables_present(conn)? {
+        return Ok(());
     }
 
-    conn.execute_batch("PRAGMA user_version = 2;")
+    retry_on_busy(|| conn.execute_batch("BEGIN IMMEDIATE;"))?;
+    let init_res = (|| -> PersistenceResult<()> {
+        let locked_version: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .map_err(map_sqlite_err)?;
+        if locked_version > CURRENT_SCHEMA_VERSION {
+            return Err(PersistenceError::Backend(format!(
+                "unsupported sqlite session schema version {locked_version} (max supported: {CURRENT_SCHEMA_VERSION})"
+            )));
+        }
+        if locked_version == CURRENT_SCHEMA_VERSION && core_tables_present(conn)? {
+            return Ok(());
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                 id TEXT PRIMARY KEY,
+                 format_version INTEGER NOT NULL,
+                 cwd TEXT,
+                 title TEXT,
+                 title_source TEXT,
+                 parent_id TEXT,
+                 fork_seq INTEGER,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 event_count INTEGER NOT NULL DEFAULT 0,
+                 surface_count INTEGER NOT NULL DEFAULT 0,
+                 compacted_up_to_seq INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_sessions_cwd_updated
+                 ON sessions(cwd, updated_at_ms DESC);
+             CREATE INDEX IF NOT EXISTS idx_sessions_updated
+                 ON sessions(updated_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS session_events (
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 visibility TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 PRIMARY KEY (session_id, seq),
+                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS session_recall_docs (
+                 doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 preview TEXT NOT NULL,
+                 UNIQUE(session_id, seq),
+                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_recall_docs_session_seq
+                 ON session_recall_docs(session_id, seq);
+             CREATE VIRTUAL TABLE IF NOT EXISTS session_recall_fts USING fts5(
+                 terms,
+                 content='',
+                 tokenize='ascii'
+             );",
+        )
         .map_err(map_sqlite_err)?;
 
-    Ok(())
+        if locked_version < 2 && !has_column(conn, "sessions", "title_source")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN title_source TEXT;", [])
+                .map_err(map_sqlite_err)?;
+        }
+
+        if locked_version > 0 && locked_version < 2 {
+            let session_ids: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT session_id FROM session_events")
+                    .map_err(map_sqlite_err)?;
+                let rows = stmt.query_map([], |r| r.get(0)).map_err(map_sqlite_err)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(map_sqlite_err)?
+            };
+            for sid in &session_ids {
+                crate::recall::index_session_events_in_tx(conn, sid)?;
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 2;")
+            .map_err(map_sqlite_err)?;
+        Ok(())
+    })();
+
+    match init_res {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;").map_err(map_sqlite_err)?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
 }
 
 pub fn map_sqlite_err(err: rusqlite::Error) -> PersistenceError {
@@ -204,8 +290,11 @@ pub fn load_session_from_conn(
 
     let mut entries = Vec::new();
     let mut skipped_events = 0usize;
+    let mut max_row_seq: Option<u64> = None;
     for item in rows {
         let (seq, ts_ms, payload_json) = item.map_err(map_sqlite_err)?;
+        let seq_u64 = u64::try_from(seq.max(0)).unwrap_or(0);
+        max_row_seq = Some(max_row_seq.map_or(seq_u64, |m| m.max(seq_u64)));
         // 单条解析失败不能升级为整个会话加载失败：旧版二进制遇到新版写入的事件类型时
         // 应跳过该条并保留其余历史，否则回滚一次就丢全部会话。
         let event: SessionEvent = match serde_json::from_str(&payload_json) {
@@ -217,7 +306,7 @@ pub fn load_session_from_conn(
             }
         };
         entries.push(SessionEntry {
-            seq: u64::try_from(seq.max(0)).unwrap_or(0),
+            seq: seq_u64,
             event,
             ts: i64_to_millis(ts_ms),
         });
@@ -226,6 +315,7 @@ pub fn load_session_from_conn(
     Ok(Some(LoadedSession {
         header,
         entries,
+        max_persisted_seq: max_row_seq,
         skipped_events,
     }))
 }

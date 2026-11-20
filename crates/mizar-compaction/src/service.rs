@@ -202,16 +202,17 @@ impl CompactionRuntime {
             (last_tok, idle)
         };
 
+        let regrowth_ok = last_compacted_tokens
+            .is_none_or(|prev_tok| estimated.saturating_sub(prev_tok) >= budget.regrowth_tokens);
+        let cold_cache_threshold = (budget.trigger_tokens / 2).max(budget.keep_recent_tokens);
         let cold_cache_eligible = cfg.cold_cache_idle_secs > 0
             && idle_secs >= cfg.cold_cache_idle_secs
-            && estimated >= budget.trigger_tokens / 2;
+            && estimated >= cold_cache_threshold
+            && regrowth_ok;
 
         let trigger = if estimated >= budget.trigger_tokens {
             let urgent = estimated >= budget.urgent_tokens;
-            if !urgent
-                && let Some(prev_tok) = last_compacted_tokens
-                && estimated.saturating_sub(prev_tok) < budget.regrowth_tokens
-            {
+            if !urgent && !regrowth_ok {
                 return;
             }
             CompactionTrigger::AutoThreshold
@@ -272,7 +273,7 @@ impl CompactionRuntime {
         let _lock = self.try_lock_session(&session.id)?;
         let cfg = self.config();
 
-        // 路由选择：优先采用本会话最近真正成功答复过的 `answeredRoute`（避免切到小模型时摘要失败）
+        // 路由选择：优先采用本会话最近真正成功答复过的完整 `(provider, model)`，禁止跨 provider 混拼 model
         let (effective_provider, effective_model) = {
             let answered = self
                 .sessions_meta
@@ -281,7 +282,17 @@ impl CompactionRuntime {
                 .get(&session.id)
                 .and_then(|m| m.last_answered_route.clone());
             match answered {
-                Some((ap, am)) if ap.is_some() || am.is_some() => (ap.or(provider), am.or(model)),
+                Some((Some(ap), am)) => {
+                    let matched_model = am.or_else(|| {
+                        if provider.as_deref() == Some(ap.as_str()) {
+                            model
+                        } else {
+                            None
+                        }
+                    });
+                    (Some(ap), matched_model)
+                }
+                Some((None, Some(am))) => (provider, Some(am)),
                 _ => (provider, model),
             }
         };
@@ -293,6 +304,42 @@ impl CompactionRuntime {
         );
         let (sys_prompt, declared_tools, tools_chars) = self.current_prompt_and_tools(&session.id);
         let tokens_before = estimate_session_context_tokens(&session, &sys_prompt, tools_chars);
+
+        struct CompactionTraceGuard {
+            ctx: Context,
+            session: Arc<Session>,
+            trigger: CompactionTrigger,
+            tokens_before: u64,
+            finished: bool,
+        }
+        impl Drop for CompactionTraceGuard {
+            fn drop(&mut self) {
+                if !self.finished {
+                    self.session.append_trace(SessionTraceEvent::CompactionEnd {
+                        status: "failed".to_string(),
+                        first_kept_seq: None,
+                        tokens_before: Some(self.tokens_before),
+                        tokens_after: Some(self.tokens_before),
+                    });
+                    self.ctx.emit(
+                        EVENT_COMPACTION_END,
+                        CompactionEndEvent {
+                            session_id: self.session.id.clone(),
+                            trigger: self.trigger,
+                            outcome: CompactionOutcome::Failed,
+                            tokens_before: self.tokens_before,
+                            tokens_after: self.tokens_before,
+                            pruned_count: 0,
+                            first_kept_seq: None,
+                            summary_preview: None,
+                            skipped_reason: Some(
+                                "compaction aborted before completion".to_string(),
+                            ),
+                        },
+                    );
+                }
+            }
+        }
 
         // 发送开始审计与 UI 事件
         session.append_trace(SessionTraceEvent::CompactionStart {
@@ -307,6 +354,13 @@ impl CompactionRuntime {
                 context_window: budget.context_window,
             },
         );
+        let mut trace_guard = CompactionTraceGuard {
+            ctx: self.ctx.clone(),
+            session: Arc::clone(&session),
+            trigger,
+            tokens_before,
+            finished: false,
+        };
 
         // --- L1：零模型批量剪枝 ---
         let mut pruned_count = 0usize;
@@ -353,6 +407,7 @@ impl CompactionRuntime {
                 skipped_reason: None,
             };
             self.emit_end_event(&session.id, &report);
+            trace_guard.finished = true;
             return Ok(report);
         }
 
@@ -380,6 +435,7 @@ impl CompactionRuntime {
                 tokens_after: Some(tokens_after_prune),
             });
             self.emit_end_event(&session.id, &report);
+            trace_guard.finished = true;
             return Ok(report);
         }
 
@@ -438,10 +494,34 @@ impl CompactionRuntime {
                 tokens_after: Some(tokens_after_prune),
             });
             self.emit_end_event(&session.id, &report);
+            trace_guard.finished = true;
             return Ok(report);
         };
 
-        let llm = self.ctx.llm()?;
+        let llm = match self.ctx.llm() {
+            Ok(llm) => llm,
+            Err(err) => {
+                session.append_trace(SessionTraceEvent::CompactionEnd {
+                    status: "failed".to_string(),
+                    first_kept_seq: None,
+                    tokens_before: Some(tokens_before),
+                    tokens_after: Some(tokens_after_prune),
+                });
+                let err_report = CompactionReport {
+                    outcome: CompactionOutcome::Failed,
+                    trigger,
+                    tokens_before,
+                    tokens_after: tokens_after_prune,
+                    pruned_count,
+                    first_kept_seq: None,
+                    summary_preview: None,
+                    skipped_reason: Some(err.to_string()),
+                };
+                self.emit_end_event(&session.id, &err_report);
+                trace_guard.finished = true;
+                return Err(err.into());
+            }
+        };
         let current_visible_messages = session.derive_messages();
         let ctx_for_progress = self.ctx.clone();
         let sid_for_progress = session.id.clone();
@@ -496,6 +576,7 @@ impl CompactionRuntime {
                     skipped_reason: Some(err.to_string()),
                 };
                 self.emit_end_event(&session.id, &err_report);
+                trace_guard.finished = true;
                 return Err(CompactionError::Llm(err));
             }
         };
@@ -573,6 +654,7 @@ impl CompactionRuntime {
                 tokens_after: Some(tokens_after_prune),
             });
             self.emit_end_event(&session.id, &report);
+            trace_guard.finished = true;
             return Ok(report);
         }
 
@@ -616,6 +698,7 @@ impl CompactionRuntime {
             skipped_reason: None,
         };
         self.emit_end_event(&session.id, &report);
+        trace_guard.finished = true;
         Ok(report)
     }
 
@@ -687,7 +770,7 @@ impl Service for CompactionRuntime {
                 let rt = Arc::clone(&self);
                 let c = ctx.clone();
                 ctx.effect("compaction.pre-step", move || {
-                    let h = c.on_serial::<AgentPreStepEvent, (), _, _>(
+                    let h = c.on_serial_with::<AgentPreStepEvent, (), _, _>(
                         EVENT_AGENT_PRE_STEP,
                         move |ev: AgentPreStepEvent| {
                             let rt = Arc::clone(&rt);
@@ -695,6 +778,10 @@ impl Service for CompactionRuntime {
                                 rt.handle_pre_step(&ev).await;
                                 None
                             }
+                        },
+                        cordis::EventOptions {
+                            priority: -20,
+                            ..Default::default()
                         },
                     )?;
                     Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
@@ -809,6 +896,34 @@ impl Service for CompactionRuntime {
                                     res
                                 }
                             }) as BoxFuture<'static, ToolResult>
+                        },
+                    )?;
+                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                        h.dispose().await;
+                    })))
+                })?;
+            }
+
+            // 6. 追踪会话真实落盘序号，对齐 FileGuardTracker 的 `last_read_seq` 与 `dedup` seq
+            {
+                let guards = Arc::clone(&self.file_guards);
+                let c = ctx.clone();
+                ctx.effect("compaction.session-event-seq", move || {
+                    let h = c.on(
+                        mizar_session::EVENT_SESSION_EVENT,
+                        move |ev: &mizar_session::SessionEventPayload| {
+                            if let mizar_session::SessionEvent::ToolResult {
+                                tool_call_id,
+                                is_error: false,
+                                ..
+                            } = &ev.entry.event
+                            {
+                                guards.reconcile_tool_result_seq(
+                                    &ev.session.id,
+                                    tool_call_id,
+                                    ev.entry.seq,
+                                );
+                            }
                         },
                     )?;
                     Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {

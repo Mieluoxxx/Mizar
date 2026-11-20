@@ -145,6 +145,10 @@ impl Plugin for CodingToolsPlugin {
                             if !guidelines.is_empty() {
                                 lines.push("操作原则：".into());
                                 lines.extend(guidelines.into_iter().map(|g| format!("- {g}")));
+                                lines.push(
+                                    "- 读取或检索多个互不依赖的文件时，尽量在同一轮并发调用多个只读工具（read/grep/find）以减少串行往返"
+                                        .into(),
+                                );
                             }
                             Some(lines.join("\n"))
                         },

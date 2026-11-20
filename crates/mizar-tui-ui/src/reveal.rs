@@ -1,7 +1,7 @@
 //! 30fps 指数衰减平滑吐字控制器（借鉴 `dsh-TUI` `smoothReveal.ts` / `oh-my-pi`）：
 //! 将后端突发到达的大块流式 delta 平滑化为稳定节奏，同时保证安全落在 UTF-8 字符边界。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub const REVEAL_MIN_STEP_BYTES: usize = 4;
 pub const REVEAL_CATCHUP_FRAMES: usize = 8;
@@ -12,17 +12,23 @@ pub enum RevealSlot {
     AssistantReasoning(usize),
 }
 
-#[derive(Debug, Clone)]
-struct RevealCursor {
-    total_bytes: usize,
-    revealed_bytes: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotRevealState {
+    /// 正在平滑推进揭示进度。
+    Animating {
+        revealed_bytes: usize,
+        total_bytes: usize,
+    },
+    /// 当前活跃流已追平到 `revealed_bytes`，后续新文本到达时从该偏移继续平滑揭示。
+    CaughtUp { revealed_bytes: usize },
+    /// 条目已完成流式输出（或已强制对齐），固定展示完整文本。
+    Finalized,
 }
 
 #[derive(Debug, Default)]
 pub struct RevealController {
     pub enabled: bool,
-    cursors: HashMap<RevealSlot, RevealCursor>,
-    completed: HashSet<RevealSlot>,
+    slots: HashMap<RevealSlot, SlotRevealState>,
     generation: u64,
 }
 
@@ -30,8 +36,7 @@ impl RevealController {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            cursors: HashMap::new(),
-            completed: HashSet::new(),
+            slots: HashMap::new(),
             generation: 0,
         }
     }
@@ -41,85 +46,157 @@ impl RevealController {
     }
 
     pub fn clear(&mut self) {
-        self.cursors.clear();
-        self.completed.clear();
+        self.slots.clear();
         self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn has_pending(&self) -> bool {
         self.enabled
-            && self
-                .cursors
-                .values()
-                .any(|c| c.revealed_bytes < c.total_bytes)
+            && self.slots.values().any(|s| {
+                matches!(
+                    s,
+                    SlotRevealState::Animating {
+                        revealed_bytes,
+                        total_bytes
+                    } if revealed_bytes < total_bytes
+                )
+            })
     }
 
-    /// 注册或更新流式条目长度；若尚未追踪且处于激活流式阶段则从当前进度开始平滑推进。
+    /// 注册或更新流式条目长度；若已追平后又收到新文本，从上次已揭示偏移继续平滑推进。
     pub fn observe(&mut self, slot: RevealSlot, total_bytes: usize, active: bool) {
         if !self.enabled || !active {
-            let removed = self.cursors.remove(&slot).is_some();
-            if total_bytes > 0 {
-                self.completed.insert(slot);
-            }
-            if removed {
+            let changed = if total_bytes > 0 {
+                !matches!(
+                    self.slots.insert(slot, SlotRevealState::Finalized),
+                    Some(SlotRevealState::Finalized) | None
+                )
+            } else {
+                self.slots.remove(&slot).is_some()
+            };
+            if changed {
                 self.generation = self.generation.wrapping_add(1);
             }
             return;
         }
-        if self.completed.contains(&slot) {
-            return;
-        }
-        self.cursors
-            .entry(slot)
-            .and_modify(|c| {
-                c.total_bytes = total_bytes;
-                if c.revealed_bytes > total_bytes {
-                    c.revealed_bytes = total_bytes;
+        match self.slots.get_mut(&slot) {
+            Some(SlotRevealState::Finalized) => {}
+            Some(state @ SlotRevealState::CaughtUp { .. }) => {
+                let SlotRevealState::CaughtUp { revealed_bytes } = *state else {
+                    unreachable!();
+                };
+                let clamped = revealed_bytes.min(total_bytes);
+                if clamped < revealed_bytes {
                     self.generation = self.generation.wrapping_add(1);
                 }
-            })
-            .or_insert(RevealCursor {
-                total_bytes,
-                revealed_bytes: 0,
-            });
-    }
-
-    /// 立即对齐所有未完成槽位（例如取消、切换会话或关闭平滑吐字）。
-    pub fn snap_all(&mut self) {
-        if self.cursors.is_empty() {
-            return;
-        }
-        for (slot, c) in self.cursors.drain() {
-            if c.total_bytes > 0 {
-                self.completed.insert(slot);
+                if total_bytes > clamped {
+                    *state = SlotRevealState::Animating {
+                        revealed_bytes: clamped,
+                        total_bytes,
+                    };
+                } else {
+                    *state = SlotRevealState::CaughtUp {
+                        revealed_bytes: clamped,
+                    };
+                }
+            }
+            Some(state @ SlotRevealState::Animating { .. }) => {
+                let SlotRevealState::Animating { revealed_bytes, .. } = *state else {
+                    unreachable!();
+                };
+                let clamped = revealed_bytes.min(total_bytes);
+                if clamped < revealed_bytes {
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                if clamped >= total_bytes {
+                    *state = SlotRevealState::CaughtUp {
+                        revealed_bytes: total_bytes,
+                    };
+                } else {
+                    *state = SlotRevealState::Animating {
+                        revealed_bytes: clamped,
+                        total_bytes,
+                    };
+                }
+            }
+            None => {
+                let init = if total_bytes == 0 {
+                    SlotRevealState::CaughtUp { revealed_bytes: 0 }
+                } else {
+                    SlotRevealState::Animating {
+                        revealed_bytes: 0,
+                        total_bytes,
+                    }
+                };
+                self.slots.insert(slot, init);
             }
         }
-        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// 立即对齐所有槽位（例如取消、切换会话或关闭平滑吐字）。
+    pub fn snap_all(&mut self) {
+        let mut changed = false;
+        self.slots.retain(|_, state| match *state {
+            SlotRevealState::Finalized => true,
+            SlotRevealState::CaughtUp { revealed_bytes } => {
+                if revealed_bytes > 0 {
+                    *state = SlotRevealState::Finalized;
+                    changed = true;
+                    true
+                } else {
+                    changed = true;
+                    false
+                }
+            }
+            SlotRevealState::Animating { total_bytes, .. } => {
+                if total_bytes > 0 {
+                    *state = SlotRevealState::Finalized;
+                    changed = true;
+                    true
+                } else {
+                    changed = true;
+                    false
+                }
+            }
+        });
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     /// 推进一帧动画；返回是否有可见进度发生变化。
     pub fn tick(&mut self) -> bool {
-        if !self.enabled || self.cursors.is_empty() {
+        if !self.enabled || self.slots.is_empty() {
             return false;
         }
         let mut changed = false;
-        let mut finished = Vec::new();
-        for (&slot, c) in &mut self.cursors {
-            if c.revealed_bytes >= c.total_bytes {
-                finished.push(slot);
-                continue;
+        for state in self.slots.values_mut() {
+            if let SlotRevealState::Animating {
+                revealed_bytes,
+                total_bytes,
+            } = *state
+            {
+                if revealed_bytes >= total_bytes {
+                    *state = SlotRevealState::CaughtUp {
+                        revealed_bytes: total_bytes,
+                    };
+                    continue;
+                }
+                let backlog = total_bytes - revealed_bytes;
+                let step = reveal_step(backlog);
+                let next = (revealed_bytes + step).min(total_bytes);
+                changed = true;
+                if next >= total_bytes {
+                    *state = SlotRevealState::CaughtUp {
+                        revealed_bytes: total_bytes,
+                    };
+                } else {
+                    *state = SlotRevealState::Animating {
+                        revealed_bytes: next,
+                        total_bytes,
+                    };
+                }
             }
-            let backlog = c.total_bytes - c.revealed_bytes;
-            let step = reveal_step(backlog);
-            c.revealed_bytes = (c.revealed_bytes + step).min(c.total_bytes);
-            changed = true;
-            if c.revealed_bytes >= c.total_bytes {
-                finished.push(slot);
-            }
-        }
-        for slot in finished {
-            self.cursors.remove(&slot);
-            self.completed.insert(slot);
         }
         if changed {
             self.generation = self.generation.wrapping_add(1);
@@ -132,13 +209,15 @@ impl RevealController {
         if !self.enabled {
             return full_text;
         }
-        let Some(c) = self.cursors.get(&slot) else {
-            return full_text;
+        let revealed_bytes = match self.slots.get(&slot) {
+            None | Some(SlotRevealState::Finalized) => return full_text,
+            Some(SlotRevealState::CaughtUp { revealed_bytes })
+            | Some(SlotRevealState::Animating { revealed_bytes, .. }) => *revealed_bytes,
         };
-        if c.revealed_bytes >= full_text.len() {
+        if revealed_bytes >= full_text.len() {
             return full_text;
         }
-        let mut end = c.revealed_bytes;
+        let mut end = revealed_bytes;
         while end < full_text.len() && !full_text.is_char_boundary(end) {
             end += 1;
         }
@@ -172,5 +251,32 @@ mod tests {
             assert!(steps < 64);
         }
         assert_eq!(ctrl.visible_slice(slot, text), text);
+    }
+
+    #[test]
+    fn resumes_smooth_reveal_after_mid_stream_catchup() {
+        let mut ctrl = RevealController::new(true);
+        let slot = RevealSlot::AssistantText(1);
+        let part1 = "first delta chunk ";
+        ctrl.observe(slot, part1.len(), true);
+        while ctrl.has_pending() {
+            ctrl.tick();
+        }
+        assert_eq!(ctrl.visible_slice(slot, part1), part1);
+
+        // 停顿追平后再次到达较长文本，必须从 part1 末尾继续平滑推进而不是整段瞬显。
+        let part2 = format!("{part1}second delta chunk with plenty of trailing tokens to animate");
+        ctrl.observe(slot, part2.len(), true);
+        assert!(ctrl.has_pending());
+        assert_eq!(ctrl.visible_slice(slot, &part2), part1);
+        assert!(ctrl.tick());
+        let after_one = ctrl.visible_slice(slot, &part2);
+        assert!(after_one.len() > part1.len());
+        assert!(after_one.len() < part2.len());
+
+        // 关闭 active 后直接进入 Finalized 并展示全文。
+        ctrl.observe(slot, part2.len(), false);
+        assert!(!ctrl.has_pending());
+        assert_eq!(ctrl.visible_slice(slot, &part2), part2);
     }
 }
