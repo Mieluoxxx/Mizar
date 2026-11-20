@@ -247,6 +247,15 @@ pub struct RunOptions {
     pub images: Vec<ImageAttachment>,
 }
 
+/// 单轮执行收尾报告（供 CLI / 评测精确判定收敛原因与最后一步结果）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRunReport {
+    pub text: String,
+    pub reason: TurnEndReason,
+    pub last_step_outcome: Option<StepOutcome>,
+    pub steps: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error(transparent)]
@@ -419,6 +428,19 @@ impl AgentLoop {
         cancel: CancellationToken,
         options: RunOptions,
     ) -> Result<String, AgentError> {
+        self.run_with_report(session, input, cancel, options)
+            .await
+            .map(|report| report.text)
+    }
+
+    /// 执行一轮对话并返回完整收尾报告（含终止原因与最后一步结果），供无头模式判定退出码。
+    pub async fn run_with_report(
+        &self,
+        session: Arc<Session>,
+        input: impl Into<String>,
+        cancel: CancellationToken,
+        options: RunOptions,
+    ) -> Result<TurnRunReport, AgentError> {
         let _session_lock = self.lock_session(&session.id)?;
         let res = self
             .run_turn_locked(Arc::clone(&session), input, cancel, options)
@@ -433,7 +455,7 @@ impl AgentLoop {
         input: impl Into<String>,
         cancel: CancellationToken,
         options: RunOptions,
-    ) -> Result<String, AgentError> {
+    ) -> Result<TurnRunReport, AgentError> {
         let llm = self.ctx.llm()?;
         let tools = self.ctx.tools()?;
         let system_prompt = self.ctx.system_prompt()?;
@@ -474,6 +496,8 @@ impl AgentLoop {
         };
 
         let mut step = 0usize;
+        let mut steps_executed = 0usize;
+        let mut last_step_outcome: Option<StepOutcome> = None;
         let mut overflow_recovered = false;
         let mut consecutive_short_cutoffs = 0usize;
         loop {
@@ -505,6 +529,7 @@ impl AgentLoop {
                 turn_guard.set_reason(TurnEndReason::Cancelled);
                 return Err(AgentError::Llm(LlmError::cancelled()));
             }
+            steps_executed += 1;
             self.ctx.emit(
                 EVENT_AGENT_REQUEST,
                 AgentRequestEvent {
@@ -791,12 +816,11 @@ impl AgentLoop {
                         if recovered {
                             overflow_recovered = true;
                             consecutive_short_cutoffs = 0;
-                            step_guard.finish(
-                                StepOutcome::Error {
-                                    message: "context overflow recovered; retrying".to_string(),
-                                },
-                                None,
-                            );
+                            let outcome = StepOutcome::Error {
+                                message: "context overflow recovered; retrying".to_string(),
+                            };
+                            last_step_outcome = Some(outcome.clone());
+                            step_guard.finish(outcome, None);
                             drop(step_guard);
                             step = step.saturating_sub(1);
                             continue;
@@ -864,12 +888,11 @@ impl AgentLoop {
                 if recovered {
                     overflow_recovered = true;
                     consecutive_short_cutoffs = 0;
-                    step_guard.finish(
-                        StepOutcome::Error {
-                            message: "implicit cutoff overflow recovered; retrying".to_string(),
-                        },
-                        usage,
-                    );
+                    let outcome = StepOutcome::Error {
+                        message: "implicit cutoff overflow recovered; retrying".to_string(),
+                    };
+                    last_step_outcome = Some(outcome.clone());
+                    step_guard.finish(outcome, usage);
                     drop(step_guard);
                     step = step.saturating_sub(1);
                     continue;
@@ -906,6 +929,7 @@ impl AgentLoop {
             } else {
                 StepOutcome::Completed
             };
+            last_step_outcome = Some(step_outcome.clone());
             step_guard.finish(step_outcome, usage);
             drop(step_guard);
 
@@ -915,8 +939,13 @@ impl AgentLoop {
                 } else {
                     TurnEndReason::Completed
                 };
-                turn_guard.set_reason(reason);
-                return Ok(text);
+                turn_guard.set_reason(reason.clone());
+                return Ok(TurnRunReport {
+                    text,
+                    reason,
+                    last_step_outcome,
+                    steps: steps_executed,
+                });
             }
 
             let batches = partition_tool_batches(&tools, calls);
@@ -1037,14 +1066,19 @@ impl AgentLoop {
         turn_guard.set_reason(TurnEndReason::MaxSteps);
         let msg = format!(
             "（已达到 max_steps={} 上限并停止，当前进度已保留，发送「继续」即可接着执行）",
-            max_steps.unwrap_or(step.saturating_sub(1))
+            max_steps.unwrap_or(steps_executed)
         );
         session.append_trace(SessionTraceEvent::TurnNotice {
             turn,
             severity: TraceSeverity::Warn,
             text: msg.clone(),
         });
-        Ok(msg)
+        Ok(TurnRunReport {
+            text: msg,
+            reason: TurnEndReason::MaxSteps,
+            last_step_outcome,
+            steps: steps_executed,
+        })
     }
 }
 
@@ -1554,6 +1588,112 @@ mod tests {
             end_reasons.lock().unwrap().last(),
             Some(&TurnEndReason::Truncated)
         );
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn run_with_report_distinguishes_max_tokens_and_max_steps() {
+        struct ModeAdapter {
+            calls: AtomicUsize,
+        }
+        impl LlmAdapter for ModeAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if n == 0 {
+                        // 正常完成
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("ok_stop")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    } else if n == 1 {
+                        // 有文本输出但因 max_tokens 截断
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text(
+                            "partial_answer_longer_than_usual",
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::MaxTokens,
+                            replay: None,
+                        }));
+                    } else {
+                        // 持续请求工具以耗尽 max_steps
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
+                                id: format!("call_{n}"),
+                                name: "ping".into(),
+                                arguments: json!({}).to_string(),
+                            },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(ModeAdapter {
+            calls: AtomicUsize::new(0),
+        })
+        .await;
+        let _reg = app
+            .tools()
+            .unwrap()
+            .register(ToolDefinition::sync_tool(
+                "ping",
+                "ping",
+                json!({}),
+                |_, _| Ok::<_, cordis::BoxError>("pong".to_string()),
+            ))
+            .unwrap();
+        let agent = app.agent_loop().unwrap();
+
+        let s_ok = app.sessions().unwrap().create(None);
+        let r_ok = agent
+            .run_with_report(s_ok, "hi", CancellationToken::new(), RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r_ok.text, "ok_stop");
+        assert_eq!(r_ok.reason, TurnEndReason::Completed);
+        assert_eq!(r_ok.last_step_outcome, Some(StepOutcome::Completed));
+        assert_eq!(r_ok.steps, 1);
+
+        let s_trunc = app.sessions().unwrap().create(None);
+        let r_trunc = agent
+            .run_with_report(
+                s_trunc,
+                "trunc",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_trunc.reason, TurnEndReason::Truncated);
+        assert_eq!(r_trunc.last_step_outcome, Some(StepOutcome::MaxTokens));
+        assert_eq!(r_trunc.steps, 1);
+
+        let s_cap = app.sessions().unwrap().create(None);
+        let r_cap = agent
+            .run_with_report(
+                s_cap,
+                "cap",
+                CancellationToken::new(),
+                RunOptions {
+                    max_steps: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cap.reason, TurnEndReason::MaxSteps);
+        assert_eq!(r_cap.last_step_outcome, Some(StepOutcome::ToolCalls));
+        assert_eq!(r_cap.steps, 2);
 
         app.fiber().dispose().await;
     }

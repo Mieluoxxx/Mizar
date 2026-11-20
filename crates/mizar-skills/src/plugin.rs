@@ -29,6 +29,8 @@ pub struct SkillsConfig {
     pub workspace: PathBuf,
     pub enabled: bool,
     pub include_default_roots: bool,
+    /// 是否包含用户全局 `~/.agents/skills`（默认 true；`--isolated` 时置为 false）。
+    pub include_user_roots: bool,
     pub agents_home: Option<PathBuf>,
     pub custom_skill_dirs: Vec<PathBuf>,
     pub bundled_skill_dir: Option<PathBuf>,
@@ -41,6 +43,7 @@ impl SkillsConfig {
             workspace: workspace.into(),
             enabled: true,
             include_default_roots: true,
+            include_user_roots: true,
             agents_home: None,
             custom_skill_dirs: Vec::new(),
             bundled_skill_dir: None,
@@ -294,6 +297,7 @@ impl Plugin for SkillsPlugin {
                 FilesystemSkillConfig {
                     provider_name: "filesystem".to_string(),
                     include_default_roots: config.include_default_roots,
+                    include_user_roots: config.include_user_roots,
                     agents_home: config.agents_home.clone(),
                     custom_skill_dirs: config.custom_skill_dirs.clone(),
                     bundled_skill_dir: config.bundled_skill_dir.clone(),

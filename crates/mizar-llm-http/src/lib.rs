@@ -50,12 +50,19 @@ fn build_header_map(headers: &[(String, String)]) -> Result<HeaderMap, LlmError>
 }
 
 fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
-    let val = headers.get("retry-after")?.to_str().ok()?.trim();
-    if let Ok(secs) = val.parse::<f64>()
+    if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok())
+        && let Ok(secs) = val.trim().parse::<f64>()
         && secs.is_finite()
         && secs > 0.0
     {
         return Some((secs * 1000.0).round() as u64);
+    }
+    if let Some(val) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok())
+        && let Ok(ms) = val.trim().parse::<f64>()
+        && ms.is_finite()
+        && ms > 0.0
+    {
+        return Some(ms.round() as u64);
     }
     None
 }
@@ -466,4 +473,25 @@ pub fn parse_models_payload(payload: &Value) -> Vec<ModelInfo> {
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn parses_retry_after_and_retry_after_ms_headers() {
+        let mut h1 = HeaderMap::new();
+        h1.insert("retry-after", HeaderValue::from_static("1.5"));
+        h1.insert("retry-after-ms", HeaderValue::from_static("900"));
+        assert_eq!(parse_retry_after_ms(&h1), Some(1500));
+
+        let mut h2 = HeaderMap::new();
+        h2.insert("retry-after-ms", HeaderValue::from_static("2500"));
+        assert_eq!(parse_retry_after_ms(&h2), Some(2500));
+
+        let h3 = HeaderMap::new();
+        assert_eq!(parse_retry_after_ms(&h3), None);
+    }
 }

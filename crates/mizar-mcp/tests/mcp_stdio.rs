@@ -226,3 +226,107 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     let _ = std::fs::remove_dir_all(&dir);
     app.fiber().dispose().await;
 }
+
+#[tokio::test]
+async fn skip_global_config_ignores_global_mcp_but_loads_project_mcp() {
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "mizar_mcp_skip_global_{}_{uniq}",
+        std::process::id()
+    ));
+    let global_dir = dir.join("global_home");
+    let workspace = dir.join("workspace");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&global_dir).unwrap();
+    std::fs::create_dir_all(workspace.join(".mizar")).unwrap();
+
+    let script = dir.join("server.py");
+    std::fs::write(&script, MOCK_MCP_SERVER_PY).unwrap();
+    let marker = dir.join("global_spawned.marker");
+
+    let global_cfg = json!({
+        "mcpServers": {
+            "global_srv": {
+                "command": "python3",
+                "args": ["-c", format!("import pathlib; pathlib.Path({:?}).write_text('ran')", marker.display().to_string())],
+                "exposure": "direct"
+            }
+        }
+    });
+    std::fs::write(
+        global_dir.join("mcp.json"),
+        serde_json::to_string_pretty(&global_cfg).unwrap(),
+    )
+    .unwrap();
+
+    let project_cfg = json!({
+        "mcpServers": {
+            "proj_srv": {
+                "command": "python3",
+                "args": [&script],
+                "exposure": "direct"
+            }
+        }
+    });
+    std::fs::write(
+        workspace.join(".mizar").join("mcp.json"),
+        serde_json::to_string_pretty(&project_cfg).unwrap(),
+    )
+    .unwrap();
+
+    let app = Context::new();
+    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    app.plugin(
+        McpManager::plugin(),
+        McpPluginConfig {
+            workspace: workspace.clone(),
+            global_config_dir: Some(global_dir.clone()),
+            skip_global_config: true,
+            load_config_files: true,
+            servers: Default::default(),
+            background_connect: false,
+        },
+    )
+    .await
+    .unwrap();
+    for rt in app.registry().values() {
+        for f in rt.fibers() {
+            let _ = f.wait_settled().await;
+        }
+    }
+
+    let mcp = app.service::<McpManager>("mcp").unwrap();
+    mcp.wait_ready().await;
+
+    let statuses = mcp.statuses();
+    assert!(
+        statuses.iter().any(|s| s.name == "proj_srv"),
+        "workspace MCP should still load: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|s| s.name == "global_srv"),
+        "global MCP must be skipped: {statuses:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "global MCP server process must never be spawned"
+    );
+
+    let tools = app.tools().unwrap();
+    let names: Vec<String> = tools
+        .list_callable(None)
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(names.contains(&"mcp__proj_srv__grep".to_string()));
+    assert!(!names.iter().any(|n| n.contains("global_srv")));
+
+    app.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -25,6 +25,7 @@ const MAX_SKILL_SCAN_DEPTH: usize = 8;
 pub struct FilesystemSkillConfig {
     pub provider_name: String,
     pub include_default_roots: bool,
+    pub include_user_roots: bool,
     pub agents_home: Option<PathBuf>,
     pub custom_skill_dirs: Vec<PathBuf>,
     pub bundled_skill_dir: Option<PathBuf>,
@@ -35,6 +36,7 @@ impl Default for FilesystemSkillConfig {
         Self {
             provider_name: "filesystem".to_string(),
             include_default_roots: true,
+            include_user_roots: true,
             agents_home: None,
             custom_skill_dirs: Vec::new(),
             bundled_skill_dir: None,
@@ -131,16 +133,20 @@ impl FilesystemSkillProvider {
         let mut roots = Vec::new();
         let mut seen_paths = HashSet::new();
 
-        let user_agents_dir = self
+        let excluded_user_key = self
             .config
             .include_default_roots
             .then(|| {
                 resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills"))
             })
+            .flatten()
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+        let user_agents_dir = (self.config.include_default_roots && self.config.include_user_roots)
+            .then(|| {
+                resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills"))
+            })
             .flatten();
-        let user_agents_key = user_agents_dir
-            .as_ref()
-            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+        let user_agents_key = excluded_user_key;
 
         let effective_cwd = cwd.or(self.default_cwd.as_deref());
         if self.config.include_default_roots

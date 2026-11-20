@@ -41,6 +41,8 @@ pub struct McpPluginConfig {
     pub workspace: PathBuf,
     /// 可选覆盖全局配置目录（默认 `~/.mizar`，或 `MIZAR_HOME`）。
     pub global_config_dir: Option<PathBuf>,
+    /// 显式跳过全局 `mcp.json`（用于 `--isolated` 隔离模式），仅加载工作区 `.mizar/mcp.json`。
+    pub skip_global_config: bool,
     /// 是否从 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json` 自动加载配置（默认 true）。
     pub load_config_files: bool,
     /// 代码内显式追加/覆盖的 MCP Server 配置。
@@ -54,6 +56,7 @@ impl McpPluginConfig {
         Self {
             workspace: workspace.into(),
             global_config_dir: None,
+            skip_global_config: false,
             load_config_files: true,
             servers: HashMap::new(),
             background_connect: true,
@@ -255,11 +258,14 @@ impl McpManager {
         let mut entries_map: HashMap<String, LoadedMcpEntry> = HashMap::new();
 
         if self.config.load_config_files {
-            let global_dir = self
-                .config
-                .global_config_dir
-                .clone()
-                .or_else(resolve_global_config_dir);
+            let global_dir = if self.config.skip_global_config {
+                None
+            } else {
+                self.config
+                    .global_config_dir
+                    .clone()
+                    .or_else(resolve_global_config_dir)
+            };
             let loaded = load_mcp_config_with_global(&self.config.workspace, global_dir.as_deref());
             for err in loaded.errors {
                 self.logger().warn(err);
