@@ -331,6 +331,16 @@ pub enum LaunchpadQuickAction {
     ToggleSidePanel,
 }
 
+/// 排队待发送的一条消息。
+///
+/// 用单调递增的 `id` 而不是下标寻址：`RunFinished` 的自动出队会在一瞬间改变下标，
+/// 选中态若按位置记录就会「高亮第二条却撤回第三条」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedPrompt {
+    pub id: u64,
+    pub text: String,
+}
+
 /// UI 层处理按键/提交后需要 Runner 执行的外部动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
@@ -377,7 +387,10 @@ pub struct AppState {
     pub item_cache: HashMap<usize, CachedItemLines>,
 
     pub input: TextInput,
-    pub queued_prompts: Vec<String>,
+    pub queued_prompts: Vec<QueuedPrompt>,
+    /// 队列选择器当前高亮的条目 id；`None` 表示选择器关闭。
+    pub queue_selected: Option<u64>,
+    next_queue_id: u64,
     pub is_busy: bool,
     pub is_bash_running: bool,
     pub is_compacting: bool,
@@ -472,6 +485,8 @@ impl AppState {
             item_cache: HashMap::new(),
             input: TextInput::new(),
             queued_prompts: Vec::new(),
+            queue_selected: None,
+            next_queue_id: 1,
             is_busy: false,
             is_bash_running: false,
             is_compacting: false,
@@ -1527,7 +1542,8 @@ impl AppState {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        // 2. Ctrl+C：若有活跃鼠标选区，优先复制选区并保持界面；模态弹窗则先关闭/拒绝；
+        // 2. Ctrl+C：若有活跃鼠标选区，优先复制选区并保持界面；队列选择器打开时只收起它；
+        // 模态弹窗则先关闭/拒绝；
         // 非空输入优先由单次 Ctrl+C 清空（含补全浮层与运行中草稿）；否则走中断或双击退出
         if matches!(key.code, KeyCode::Char('c')) && ctrl {
             if self.selection.is_active()
@@ -1538,6 +1554,11 @@ impl AppState {
                 let _ = copy_to_clipboard(&copied);
                 let chars = copied.chars().count();
                 self.set_flash(format!("✓ 已复制 {chars} 字符"));
+                return AppAction::None;
+            }
+            // 选择器打开时 Ctrl+C 只收起选择器，不能误触成 CancelRun / 退出。
+            if self.queue_selected.is_some() {
+                self.queue_selected = None;
                 return AppAction::None;
             }
             if self.overlay.is_modal() {
@@ -1576,6 +1597,13 @@ impl AppState {
                 .handle_key(key, &self.user_skill_names, self.input.history())
         {
             return self.apply_overlay_action(action);
+        }
+
+        // 3.5 队列选择器：浮层之后、全局快捷键之前，才不会被补全或历史回溯劫走
+        if self.queue_selected.is_some()
+            && let Some(action) = self.handle_queue_selector_key(key, ctrl, alt, shift)
+        {
+            return action;
         }
 
         // 4. 全局功能快捷键
@@ -1695,6 +1723,15 @@ impl AppState {
                 return AppAction::None;
             }
             KeyCode::Enter if ctrl && !alt && !shift => return self.prepare_submit(true),
+            KeyCode::Enter if alt && !ctrl && !shift => {
+                // 草稿空时 Alt+Enter 原来的语义（往空草稿里塞换行）没有意义，
+                // 正好当作不依赖 Kitty 键盘协议的立即发送备用入口。
+                if self.input.is_empty() && !self.queued_prompts.is_empty() {
+                    return self.prepare_submit(true);
+                }
+                self.input.insert_char('\n');
+                return AppAction::None;
+            }
             KeyCode::Enter if shift || alt || ctrl => {
                 self.input.insert_char('\n');
                 return AppAction::None;
@@ -1735,6 +1772,17 @@ impl AppState {
                 return AppAction::None;
             }
             KeyCode::Up => {
+                // 草稿空且队列非空时，↑ 进入队列选择器（优先于历史回溯）。
+                // 这里刻意不支持 Alt+↑：终端对它的两种编码里，ESC 前缀式（ESC ESC [ A）
+                // 会被 crossterm 拆成 Esc + 字面 "[A"，反而触发 CancelRun。
+                if self.input.is_empty()
+                    && !self.queued_prompts.is_empty()
+                    && !self.overlay.is_open()
+                    && !self.is_bash_running
+                {
+                    self.queue_selected = self.queued_prompts.last().map(|item| item.id);
+                    return AppAction::None;
+                }
                 self.input.move_up();
                 self.sync_input_completion_overlay();
                 return AppAction::None;
@@ -1992,6 +2040,7 @@ impl AppState {
         self.touched_files.clear();
         self.anomalies.clear();
         self.queued_prompts.clear();
+        self.queue_selected = None;
         self.is_bash_running = false;
         self.is_compacting = false;
         self.compaction_status = None;
@@ -2160,10 +2209,179 @@ impl AppState {
         self.overlay.open_session_tree(entries);
     }
 
+    /// 入队并把选择器自动定位到新条目：消息一旦入队，就能立即用 ↑ 撤回编辑。
+    fn enqueue_prompt(&mut self, prompt: String) {
+        let id = self.next_queue_id;
+        self.next_queue_id = self.next_queue_id.wrapping_add(1);
+        self.queued_prompts.push(QueuedPrompt { id, text: prompt });
+        self.queue_selected = None;
+        self.set_flash(format!(
+            "已加入队列 (共 {} 条待发)，↑ 可撤回编辑",
+            self.queued_prompts.len()
+        ));
+    }
+
+    /// 出队唯一入口：`prepare_submit`、选择器与 `runner` 的自动续发都走这里，
+    /// 两处各自 `remove(0)` 会重复发送。
+    pub fn dequeue_prompt(&mut self, id: u64) -> Option<QueuedPrompt> {
+        let index = self.queued_prompts.iter().position(|item| item.id == id)?;
+        let item = self.queued_prompts.remove(index);
+        self.sync_queue_selection();
+        Some(item)
+    }
+
+    /// 取出队首一条；`runner` 在上一轮成功收尾后调用它继续发送。
+    pub fn dequeue_next(&mut self) -> Option<QueuedPrompt> {
+        let id = self.queued_prompts.first()?.id;
+        self.dequeue_prompt(id)
+    }
+
+    /// 选中项已不存在（出队/丢弃/会话切换）时收起选择器，避免高亮指向空行。
+    fn sync_queue_selection(&mut self) {
+        if let Some(selected) = self.queue_selected
+            && !self.queued_prompts.iter().any(|item| item.id == selected)
+        {
+            self.queue_selected = None;
+        }
+    }
+
+    /// 把队列项撤回输入框：草稿为空则直接填入，非空则与草稿交换。
+    /// 交换而非覆盖，是为了不丢主人已经写下的字；两者互斥，保证同一段文字只在一处。
+    fn retract_queued(&mut self, id: u64) -> bool {
+        let Some(item) = self.dequeue_prompt(id) else {
+            return false;
+        };
+        let draft = self.input.text().trim().to_string();
+        if draft.is_empty() {
+            self.input.replace_draft_from_queue(&item.text);
+            self.set_flash("已撤回队列项，Enter 重新发送");
+        } else {
+            let swap_id = self.next_queue_id;
+            self.next_queue_id = self.next_queue_id.wrapping_add(1);
+            self.queued_prompts.push(QueuedPrompt {
+                id: swap_id,
+                text: draft,
+            });
+            self.input.replace_draft_from_queue(&item.text);
+            self.set_flash("已交换：草稿已存入队尾");
+        }
+        self.sync_input_completion_overlay();
+        true
+    }
+
+    /// 丢弃选中的队列项（不发送）。
+    fn discard_queued(&mut self, id: u64) -> bool {
+        let dropped = self.dequeue_prompt(id).is_some();
+        if dropped {
+            self.set_flash("已丢弃队列项");
+        }
+        dropped
+    }
+
+    /// 立即发送队首：打断当前回合，在 `RunFinished` 后直接发出。
+    fn steer_queue_head(&mut self) -> AppAction {
+        let Some(item) = self.dequeue_next() else {
+            return AppAction::None;
+        };
+        self.set_flash("⚡ 正在中断当前回合并立即发送队列消息…");
+        AppAction::SteerPrompt(item.text)
+    }
+
+    /// 空闲时把队首当作普通消息发出（唤醒中断后滞留的队列）。
+    fn submit_queue_head(&mut self) -> AppAction {
+        let Some(item) = self.dequeue_next() else {
+            return AppAction::None;
+        };
+        self.push_user_message(&item.text);
+        AppAction::SubmitPrompt(item.text)
+    }
+
+    /// 队列选择器的按键处理：↑↓ 移动，⏎ 撤回，Ctrl/Alt+⏎ 撤回并立即发送，Del 丢弃，Esc 关闭。
+    fn handle_queue_selector_key(
+        &mut self,
+        key: KeyEvent,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    ) -> Option<AppAction> {
+        let selected = self.queue_selected?;
+        let index = self
+            .queued_prompts
+            .iter()
+            .position(|item| item.id == selected);
+        let Some(index) = index else {
+            self.queue_selected = None;
+            return None;
+        };
+        let len = self.queued_prompts.len();
+        match key.code {
+            KeyCode::Up if !ctrl && !alt && !shift => {
+                if index == 0 {
+                    // 越过首项就交出选择器，把这次按键还给历史回溯。
+                    self.queue_selected = None;
+                    self.input.move_up();
+                    self.sync_input_completion_overlay();
+                } else {
+                    self.queue_selected = Some(self.queued_prompts[index - 1].id);
+                }
+                Some(AppAction::None)
+            }
+            KeyCode::Down if !ctrl && !alt && !shift => {
+                if index + 1 >= len {
+                    self.queue_selected = None;
+                    self.input.move_down();
+                    self.sync_input_completion_overlay();
+                } else {
+                    self.queue_selected = Some(self.queued_prompts[index + 1].id);
+                }
+                Some(AppAction::None)
+            }
+            KeyCode::Enter if ctrl || alt => {
+                let item = self.dequeue_prompt(selected)?;
+                self.set_flash("⚡ 已撤回队列项并立即发送…");
+                Some(AppAction::SteerPrompt(item.text))
+            }
+            KeyCode::Enter if !shift => {
+                self.retract_queued(selected);
+                Some(AppAction::None)
+            }
+            KeyCode::Delete if !ctrl && !alt => {
+                self.discard_queued(selected);
+                Some(AppAction::None)
+            }
+            KeyCode::Char('x') if ctrl => {
+                self.discard_queued(selected);
+                Some(AppAction::None)
+            }
+            KeyCode::Esc => {
+                self.queue_selected = None;
+                Some(AppAction::None)
+            }
+            // 其他键（含普通字符）交还给正常编辑：先收起选择器，再让按键继续下落。
+            _ => {
+                self.queue_selected = None;
+                None
+            }
+        }
+    }
+
     fn prepare_submit(&mut self, immediate: bool) -> AppAction {
         let preview = self.input.text().trim();
         if preview.is_empty() {
             self.input.take();
+            // 草稿为空时队列才是「主人现在想发的东西」：立即发送插队发队首，
+            // 普通回车在空闲时直接发队首，运行中则保留排队等本轮收尾。
+            if self.queue_selected.is_some() {
+                return AppAction::None;
+            }
+            if !self.queued_prompts.is_empty() {
+                if immediate {
+                    return self.steer_queue_head();
+                }
+                if !self.is_busy && !self.is_bash_running && !self.is_compacting {
+                    return self.submit_queue_head();
+                }
+            }
             return AppAction::None;
         }
 
@@ -2238,11 +2456,7 @@ impl AppState {
                 self.set_flash("⚡ 正在中断当前回合并立即发送…");
                 return AppAction::SteerPrompt(prompt);
             }
-            self.queued_prompts.push(prompt);
-            self.set_flash(format!(
-                "已加入队列 (共 {} 条待发)",
-                self.queued_prompts.len()
-            ));
+            self.enqueue_prompt(prompt);
             return AppAction::None;
         }
 
@@ -3626,7 +3840,13 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppAction::None
         );
-        assert_eq!(app.queued_prompts, vec!["queued one".to_string()]);
+        assert_eq!(
+            app.queued_prompts
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["queued one"]
+        );
         assert!(app.input.is_empty());
 
         app.input.insert_str("urgent steer");
@@ -4226,5 +4446,212 @@ mod tests {
                 value: "false".into(),
             }
         );
+    }
+
+    /// 构造一个运行中、已经排了若干条的 AppState。
+    fn queued_app(prompts: &[&str]) -> AppState {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-queue",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.is_busy = true;
+        for text in prompts {
+            app.input.insert_str(text);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        app
+    }
+
+    fn queued_texts(app: &AppState) -> Vec<&str> {
+        app.queued_prompts
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn empty_draft_up_enters_queue_selector_and_enter_retracts_without_residue() {
+        let mut app = queued_app(&["first", "second"]);
+        assert!(app.input.is_empty());
+
+        // 空草稿按 ↑ 进入选择器，高亮队尾，不写历史也不改输入框。
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        let last_id = app.queued_prompts.last().unwrap().id;
+        assert_eq!(app.queue_selected, Some(last_id));
+        assert!(app.input.is_empty());
+
+        // ⏎ 撤回：该项出队并进入输入框，队列里不能留副本。
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.input.text(), "second");
+        assert_eq!(queued_texts(&app), vec!["first"]);
+        assert_eq!(app.queue_selected, None);
+    }
+
+    #[test]
+    fn up_past_first_closes_selector_and_falls_back_to_history() {
+        let mut app = queued_app(&["only"]);
+        app.input.push_history("older prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.queue_selected.is_some());
+
+        // 已到队首，再按 ↑ 交出选择器，并把这次按键还给历史回溯。
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.queue_selected, None);
+        assert_eq!(app.input.text(), "older prompt");
+        assert_eq!(queued_texts(&app), vec!["only"]);
+    }
+
+    #[test]
+    fn retract_with_nonempty_draft_swaps_draft_into_queue_tail() {
+        let mut app = queued_app(&["queued item"]);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.input.insert_str("draft");
+        // 有草稿时不能直接撤回（↑ 已被选择器吃掉），先手动构造“选择器 + 草稿”状态。
+        app.queue_selected = Some(app.queued_prompts[0].id);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        // 交换：队列项进输入框，草稿进队尾，两处各一份。
+        assert_eq!(app.input.text(), "queued item");
+        assert_eq!(queued_texts(&app), vec!["draft"]);
+    }
+
+    #[test]
+    fn ctrl_enter_on_empty_draft_steers_queue_head() {
+        let mut app = queued_app(&["head item", "tail item"]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            AppAction::SteerPrompt("head item".into())
+        );
+        assert_eq!(queued_texts(&app), vec!["tail item"]);
+    }
+
+    #[test]
+    fn alt_enter_on_empty_draft_steers_queue_head_without_keyboard_protocol() {
+        let mut app = queued_app(&["head item"]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            AppAction::SteerPrompt("head item".into())
+        );
+        assert!(app.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn alt_enter_with_draft_still_inserts_newline() {
+        let mut app = queued_app(&["queued item"]);
+        app.input.insert_str("draft");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            AppAction::None
+        );
+        assert_eq!(app.input.text(), "draft\n");
+        assert_eq!(queued_texts(&app), vec!["queued item"]);
+    }
+
+    #[test]
+    fn esc_prefixed_alt_up_must_not_be_the_only_way_into_the_selector() {
+        // 终端对 Alt+↑ 有两种编码：kitty 的 CSI 1;3A 会到达这里并正常打开选择器；
+        // 但 ESC 前缀式（ESC ESC [ A）会被 crossterm 拆成 Esc + 字面 "[A"，
+        // 反而触发 CancelRun。所以撤回必须只依赖普通 ↑，不能依赖 Alt+↑。
+        let mut app = queued_app(&["tail item"]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            AppAction::None
+        );
+        assert!(app.queue_selected.is_some());
+        assert_eq!(queued_texts(&app), vec!["tail item"]);
+
+        // 关键保证：普通 ↑（零协议依赖）同样能进选择器。
+        let mut plain = queued_app(&["tail item"]);
+        plain.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(plain.queue_selected.is_some());
+    }
+
+    #[test]
+    fn idle_enter_on_empty_draft_submits_queue_head() {
+        let mut app = queued_app(&["stuck item"]);
+        app.is_busy = false;
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::SubmitPrompt("stuck item".into())
+        );
+        assert!(app.queued_prompts.is_empty());
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::User { text }) if text == "stuck item"
+        ));
+    }
+
+    #[test]
+    fn esc_and_ctrl_c_inside_selector_close_it_without_cancelling_run() {
+        let mut app = queued_app(&["item"]);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(app.queue_selected, None);
+        assert_eq!(queued_texts(&app), vec!["item"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            AppAction::None
+        );
+        assert_eq!(app.queue_selected, None);
+        assert_eq!(queued_texts(&app), vec!["item"]);
+    }
+
+    #[test]
+    fn delete_inside_selector_drops_item_without_sending() {
+        let mut app = queued_app(&["keep", "drop me"]);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert_eq!(queued_texts(&app), vec!["keep"]);
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.queue_selected, None);
+    }
+
+    #[test]
+    fn dequeue_clears_selection_pointing_at_the_removed_item() {
+        let mut app = queued_app(&["a", "b"]);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let selected = app.queue_selected.unwrap();
+        assert!(app.dequeue_prompt(selected).is_some());
+        assert_eq!(app.queue_selected, None);
+        // 队首出队后选择器若指向别的条目，应保留。
+        app.queue_selected = Some(app.queued_prompts[0].id);
+        assert_eq!(app.dequeue_next().map(|item| item.text), Some("a".into()));
+        assert!(app.queued_prompts.is_empty());
+        assert_eq!(app.queue_selected, None);
+    }
+
+    #[test]
+    fn queue_selector_does_not_hijack_typing() {
+        let mut app = queued_app(&["item"]);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            AppAction::None
+        );
+        // 普通字符先收起选择器，再正常落进输入框。
+        assert_eq!(app.queue_selected, None);
+        assert_eq!(app.input.text(), "h");
+        assert_eq!(queued_texts(&app), vec!["item"]);
     }
 }

@@ -13,8 +13,15 @@ import Callout from '../../../components/mdx/Callout.astro';
 
 | 快捷键 | 功能 |
 | :--- | :--- |
-| <kbd>Enter</kbd> | 发送当前输入；助手运行中时将新消息排入尾部等待队列（Follow-up） |
-| <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | 立即插队打断（Steer），中止当前流式输出或工具执行并转向新指示 |
+| <kbd>Enter</kbd> | 发送当前输入；助手运行中时将新消息排入尾部等待队列（Follow-up）；输入框为空时发送队首排队消息 |
+| <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | 立即插队打断（Steer），中止当前流式输出或工具执行并转向新指示；输入框为空时改为立即发送队首排队消息 |
+| <kbd>Alt</kbd>+<kbd>Enter</kbd> | 输入框为空时等同 `Ctrl+Enter` 立即发送队首（不依赖终端扩展按键上报）；有草稿时仍是换行 |
+| <kbd>↑</kbd> | 输入框为空且有排队消息时打开队列选择器，高亮最后一条 |
+| 选择器内 <kbd>↑</kbd> / <kbd>↓</kbd> | 上下移动选中项；越过边界自动关闭选择器并交还历史回溯 |
+| 选择器内 <kbd>Enter</kbd> | 撤回选中项到输入框编辑；草稿非空则与草稿交换 |
+| 选择器内 <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | 撤回选中项并立即发送 |
+| 选择器内 <kbd>Delete</kbd> / <kbd>Ctrl</kbd>+<kbd>X</kbd> | 丢弃选中项，不发送 |
+| 选择器内 <kbd>Esc</kbd> / <kbd>Ctrl</kbd>+<kbd>C</kbd> | 只关闭选择器，不取消当前回合 |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> · <kbd>Alt</kbd>+<kbd>Enter</kbd> · <kbd>Ctrl</kbd>+<kbd>J</kbd> | 在一段提示词内手工换行继续输入 |
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | 将自动折叠的长粘贴标签（`[paste #1 +42 lines]`）原地展开为明文编辑 |
 | <kbd>Ctrl</kbd>+<kbd>G</kbd> | 唤起 `$VISUAL` 或 `$EDITOR` 外部编辑器撰写复杂提示词 |

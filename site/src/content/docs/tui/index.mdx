@@ -98,6 +98,21 @@ mizar --inline
 - **<kbd>Enter</kbd>（排队 Follow-up）**：当前任务未结束时，按 `Enter` 会把你的新消息放进尾部排队序列。Mizar 等正在进行的这轮自然收尾并给出回答后，紧接着自动接过下一条任务。
 - **<kbd>Ctrl</kbd>+<kbd>Enter</kbd>（立即插队 Steer）**：发现模型走偏方向（例如去改错了文件）时，直接输入修正要求并按 `Ctrl+Enter`，立刻中断当前流式/工具执行，当场转向你的新指示。
 
+排队之后消息不会「进去就出不来」，队列条本身就是可操作的：
+
+| 操作 | 效果 |
+| :--- | :--- |
+| 草稿空时按 <kbd>↑</kbd> | 打开队列选择器，高亮最后一条 |
+| 选择器内 <kbd>↑</kbd> / <kbd>↓</kbd> | 上下移动；越过边界自动关闭并把按键交还历史回溯 |
+| 选择器内 <kbd>Enter</kbd> | 撤回该项到输入框编辑；草稿非空时与草稿交换，不会丢字 |
+| 选择器内 <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | 撤回并立即发送该项 |
+| 选择器内 <kbd>Delete</kbd> | 丢弃该项，不发送 |
+| 选择器内 <kbd>Esc</kbd> | 只关闭选择器，不取消当前回合 |
+| 草稿空时 <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | 立即发送队首（打断当前回合） |
+| 草稿空时 <kbd>Alt</kbd>+<kbd>Enter</kbd> | 同上；不依赖终端的扩展按键上报，可作兜底 |
+
+撤回即出队，因此「撤回 → 修改 → 再发」只会发送一次；同一段文字任何时刻只存在于队列或输入框其中一处。
+
 <Callout type="tip">
 
 想在一段提示词里手工换行继续写，用 <kbd>Shift</kbd>+<kbd>Enter</kbd>、<kbd>Alt</kbd>+<kbd>Enter</kbd> 或 <kbd>Ctrl</kbd>+<kbd>J</kbd> 均可。完整命令与热键速查请参阅 [斜杠命令](/tui/commands/) 与 [快捷键速查](/tui/keybinds/)。

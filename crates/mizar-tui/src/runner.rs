@@ -1132,10 +1132,12 @@ fn process_ui_event(
             app.push_user_message(&steer);
             return AppAction::SubmitPrompt(steer);
         }
-        if !was_aborted && is_ok && !app.queued_prompts.is_empty() {
-            let next_prompt = app.queued_prompts.remove(0);
-            app.push_user_message(&next_prompt);
-            return AppAction::SubmitPrompt(next_prompt);
+        if !was_aborted
+            && is_ok
+            && let Some(next) = app.dequeue_next()
+        {
+            app.push_user_message(&next.text);
+            return AppAction::SubmitPrompt(next.text);
         }
         if !was_aborted && !is_ok && !app.queued_prompts.is_empty() {
             app.push_notice(
@@ -2653,7 +2655,10 @@ mod tests {
             None,
         );
         app.is_busy = true;
-        app.queued_prompts.push("queued follow-up".into());
+        app.queued_prompts.push(mizar_tui_ui::QueuedPrompt {
+            id: 1,
+            text: "queued follow-up".into(),
+        });
 
         let mut active_cancel = None;
         let mut pending_steer = Some("urgent steer".into());
@@ -2671,7 +2676,13 @@ mod tests {
             app.items.last(),
             Some(ChatItem::User { text }) if text == "urgent steer"
         ));
-        assert_eq!(app.queued_prompts, vec!["queued follow-up".to_string()]);
+        assert_eq!(
+            app.queued_prompts
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["queued follow-up"]
+        );
 
         let act2 = process_ui_event(
             &mut app,
