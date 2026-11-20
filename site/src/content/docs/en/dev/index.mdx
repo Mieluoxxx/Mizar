@@ -48,11 +48,11 @@ Use sub-second single-crate checks when modifying pure UI logic; whenever you to
 # Sub-second check while editing UI logic
 cargo check -p mizar-tui-ui
 
-# Verify minimal feature combination has no missing cfg gates
-cargo check -p mizar-agent-spine --no-default-features
+# Verify minimal feature gates, including test targets
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
 
-# Full CI checks (exact match with repository requirements)
-cargo test --workspace
+# Remaining CI checks
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --no-fail-fast
 ```

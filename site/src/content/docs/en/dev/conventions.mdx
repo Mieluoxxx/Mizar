@@ -37,8 +37,8 @@ Tool schemas, comments, and UI strings follow a strict language split by consume
 `mizar-agent-spine` defines six optional features: `legacy`, `coding`, `compaction`, `sqlite`, `trajectory`, and `router`. Every `use` statement referencing an optional dependency must carry a matching `#[cfg(feature = "...")]`, or stripped builds will immediately fail to compile.
 
 ```bash title="Required minimal feature-gate verification"
-# Verify compilation succeeds with all optional features disabled
-cargo check -p mizar-agent-spine --no-default-features
+# Verify the library and test targets compile with all optional features disabled
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
 ```
 
 Follow three concrete conventions when writing tests:
