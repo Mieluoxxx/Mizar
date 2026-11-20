@@ -2,33 +2,9 @@ name: Feature request
 description: Describe a problem or workflow Mizar could support better.
 labels: [enhancement]
 body:
-  - type: markdown
-    attributes:
-      value: |
-        Start with the task you are trying to accomplish. A proposed implementation is welcome but not required. 中文报告也欢迎。
   - type: textarea
-    id: use-case
+    id: request
     attributes:
-      label: Use case
-      description: What are you trying to do, and where does Mizar get in the way?
+      label: What would you like Mizar to do?
     validations:
       required: true
-  - type: textarea
-    id: workaround
-    attributes:
-      label: Current workaround
-      description: How do you do it today, and what does that approach miss? Say if there is no workaround.
-    validations:
-      required: true
-  - type: textarea
-    id: outcome
-    attributes:
-      label: Desired outcome
-      description: What would let you complete the workflow successfully?
-    validations:
-      required: true
-  - type: textarea
-    id: alternatives
-    attributes:
-      label: Ideas or alternatives
-      description: Optional examples, related issues, or implementation ideas.
