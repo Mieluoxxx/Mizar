@@ -59,7 +59,11 @@ impl SessionPersistence for InMemoryMockBackend {
             .get(session_id)
             .cloned()
             .unwrap_or_default();
-        Ok(Some(LoadedSession { header, entries }))
+        Ok(Some(LoadedSession {
+            header,
+            entries,
+            skipped_events: 0,
+        }))
     }
 
     fn list_sessions(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
@@ -137,7 +141,11 @@ impl SessionPersistence for InMemoryMockBackend {
             .lock()
             .unwrap()
             .insert(header.id.clone(), entries.clone());
-        Ok(LoadedSession { header, entries })
+        Ok(LoadedSession {
+            header,
+            entries,
+            skipped_events: 0,
+        })
     }
 }
 
@@ -333,6 +341,7 @@ fn repair_helper_noop_when_tool_already_resolved() {
                 ts: 2,
             },
         ],
+        skipped_events: 0,
     };
     let repaired = repair_dangling_tool_calls(&mut loaded);
     assert!(repaired.is_empty());
@@ -447,6 +456,70 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
         }
         _ => true,
     }));
+
+    app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn selection_is_log_only_deduped_and_survives_derive_messages() {
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+    let s = store.create(Some("sess-selection".into()));
+
+    assert_eq!(s.latest_selection(), None);
+
+    // 首次写入：provider + model + effort 全给
+    assert!(s.record_selection(
+        Some("magpie".into()),
+        Some("mayoru-responses/deepseek-flash".into()),
+        Some(mizar_llm::ReasoningEffort::High),
+    ));
+    assert_eq!(
+        s.latest_selection(),
+        Some(mizar_session::SessionSelection {
+            provider: Some("magpie".into()),
+            model: Some("mayoru-responses/deepseek-flash".into()),
+            reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
+        })
+    );
+
+    // 完全相同不重复写
+    assert!(!s.record_selection(
+        Some("magpie".into()),
+        Some("mayoru-responses/deepseek-flash".into()),
+        Some(mizar_llm::ReasoningEffort::High),
+    ));
+    assert_eq!(s.all_entries().len(), 1);
+
+    // 只改强度也算变化
+    assert!(s.record_selection(
+        Some("magpie".into()),
+        Some("mayoru-responses/deepseek-flash".into()),
+        Some(mizar_llm::ReasoningEffort::Max),
+    ));
+    assert_eq!(s.all_entries().len(), 2);
+    assert_eq!(
+        s.latest_selection().unwrap().reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::Max)
+    );
+
+    // LogOnly：不进模型上下文、不出现在 surface 视图里
+    assert_eq!(
+        SessionEvent::Selection {
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+        }
+        .visibility(),
+        EntryVisibility::LogOnly
+    );
+    assert!(s.log().is_empty());
+    assert!(s.derive_messages().is_empty());
+    assert_eq!(s.header().surface_count, 0);
+
+    // 但仍在完整事件流里
+    assert_eq!(s.all_entries().len(), 2);
 
     app.fiber().dispose().await;
 }

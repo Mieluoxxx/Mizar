@@ -135,6 +135,7 @@ fn render_entry_verbatim(entry: &SessionEntry) -> Option<String> {
         )),
         SessionEvent::ContextNotice { .. }
         | SessionEvent::ToolResultPrune { .. }
+        | SessionEvent::Selection { .. }
         | SessionEvent::Trace { .. } => None,
     }
 }

@@ -386,6 +386,7 @@ fn format_entry_for_transcript(entry: &SessionEntry) -> Option<String> {
         | SessionEvent::Compaction { .. }
         | SessionEvent::ToolResultPrune { .. }
         | SessionEvent::BashExecution { .. }
+        | SessionEvent::Selection { .. }
         | SessionEvent::Trace { .. } => None,
     }
 }

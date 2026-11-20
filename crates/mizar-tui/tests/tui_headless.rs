@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -19,8 +19,9 @@ use mizar_tui::side_panel::{FileTouchRow, ToolSummaryRow};
 use mizar_tui::{
     AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, ScreenMode,
     SessionReplayItem, SessionViewData, UiEvent, build_item_lines_for_scrollback,
-    build_welcome_lines_for_scrollback, project_fork_view, project_resume_view,
-    project_session_tree, render, subscribe_session_events, to_ui_log_record, wait_for_services,
+    build_welcome_lines_for_scrollback, latest_workspace_selection, project_fork_view,
+    project_resume_view, project_session_tree, render, subscribe_session_events, to_ui_log_record,
+    wait_for_services,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1519,6 +1520,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
             exclude_from_context: true,
         }],
         finish_notice: "ok".into(),
+        selection: None,
     });
     assert_eq!(only_local_state.side_panel_data.context.tool_tokens, 0);
 
@@ -1666,6 +1668,7 @@ fn appends_notices_and_turns_after_welcome_with_scroll_and_hit_rect_projection()
         session_title: None,
         items: long_items,
         finish_notice: "已恢复历史会话".into(),
+        selection: None,
     });
     assert!(state.auto_scroll);
     small_term.draw(|f| render(f, &mut state)).unwrap();
@@ -1750,4 +1753,221 @@ fn inline_mode_tracks_welcome_commit_state_and_scrollback_lines() {
     state.reset_for_new_session("sess-inline-reset", None);
     assert!(!state.inline_welcome_committed);
     assert_eq!(state.inline_committed_items, 0);
+}
+
+/// 会话记录的选择能跨重启沿用：`latest_workspace_selection` 按 cwd 取最近一条，
+/// `peek_selection` 不水合、不触发悬挂工具修复（后者会写库）。
+#[tokio::test]
+async fn latest_workspace_selection_carries_over_across_restarts() {
+    let tmp_root = std::env::temp_dir().join(format!("mizar_tui_sel_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_root);
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let db_path = tmp_root.join("sessions.sqlite");
+
+    let boot = |root: PathBuf, db: PathBuf| async move {
+        let ctx = Context::new();
+        ctx.logger().set_silent();
+        let mut cfg = AgentSpineConfig::coding(root).with_session_db(db);
+        if let AgentToolsMode::Coding {
+            ref mut mcp,
+            ref mut skills,
+            ref mut instructions,
+            ..
+        } = cfg.tools_mode
+        {
+            mcp.load_config_files = false;
+            skills.include_default_roots = false;
+            instructions.include_default_global = false;
+        }
+        ctx.plugin(AgentSpinePlugin, cfg);
+        wait_for_services(&ctx).await.unwrap();
+        ctx
+    };
+
+    // 1. 第一个进程：写下一个会话并记录选择
+    let ctx1 = boot(tmp_root.clone(), db_path.clone()).await;
+    let sessions1 = ctx1.sessions().unwrap();
+    let s1 = sessions1.create_with(mizar_session::SessionCreateOptions {
+        cwd: Some(tmp_root.display().to_string()),
+        ..Default::default()
+    });
+    assert!(s1.record_selection(
+        Some("magpie".into()),
+        Some("isok/claude-opus-5-5".into()),
+        Some(mizar_llm::ReasoningEffort::Max),
+    ));
+    // 冷启动时同一个工作区里没有其他会话，这里应读到自己
+    assert_eq!(
+        latest_workspace_selection(&sessions1, &tmp_root),
+        Some(mizar_session::SessionSelection {
+            provider: Some("magpie".into()),
+            model: Some("isok/claude-opus-5-5".into()),
+            reasoning_effort: Some(mizar_llm::ReasoningEffort::Max),
+        })
+    );
+    s1.flush_async().await.unwrap();
+    ctx1.fiber().dispose().await;
+
+    // 2. 第二个进程：内存里没有任何会话，仍能从 sqlite 读回
+    let ctx2 = boot(tmp_root.clone(), db_path.clone()).await;
+    let sessions2 = ctx2.sessions().unwrap();
+    assert!(!sessions2.contains_in_memory(&s1.id));
+    let peeked =
+        latest_workspace_selection(&sessions2, &tmp_root).expect("跨重启后应读回上一会话的选择");
+    assert_eq!(peeked.model.as_deref(), Some("isok/claude-opus-5-5"));
+    assert_eq!(
+        peeked.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::Max)
+    );
+    // peek 是只读的：没有把会话水合进内存
+    assert!(!sessions2.contains_in_memory(&s1.id));
+
+    // 3. 另一个工作区不应命中（按 cwd 过滤）
+    assert_eq!(
+        latest_workspace_selection(&sessions2, Path::new("/definitely/not/this/workspace")),
+        None
+    );
+
+    ctx2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&tmp_root);
+}
+
+/// resume 时应用该会话自己的选择，而不是启动默认值。
+///
+/// 优先级链的决策在 `resolve_selection`（`mizar-tui` 的纯函数）里，
+/// `mizar-tui-ui` 只负责携带快照、不参与决策，所以这里既断言快照可读出，也断言决策结果。
+#[tokio::test]
+async fn resume_applies_session_selection_over_startup_defaults() {
+    let ctx = Context::new();
+    ctx.logger().set_silent();
+    let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx.plugin(AgentSpinePlugin, cfg);
+    wait_for_services(&ctx).await.unwrap();
+
+    let session = ctx.sessions().unwrap().create(None);
+    session.record_selection(
+        Some("magpie".into()),
+        Some("mayoru-messages/claude-sonnet-5-5".into()),
+        Some(mizar_llm::ReasoningEffort::Low),
+    );
+
+    // 1. 快照能被投影出来（工作区从 sqlite 读回时同样走这条）
+    let view = project_resume_view(&session);
+    let recorded = view.selection.expect("会话有 Selection 记录");
+    assert_eq!(recorded.provider.as_deref(), Some("magpie"));
+    assert_eq!(
+        recorded.model.as_deref(),
+        Some("mayoru-messages/claude-sonnet-5-5")
+    );
+    assert_eq!(
+        recorded.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::Low)
+    );
+
+    // 2. 决策：启动默认值不同，会话记录压过它
+    let startup = mizar_tui::SessionSelection {
+        provider: Some("mock".into()),
+        model: Some("mock-v1".into()),
+        reasoning_effort: Some(mizar_llm::ReasoningEffort::Off),
+    };
+    let sources = mizar_tui::SelectionSources {
+        startup: startup.clone(),
+        session: Some(recorded.clone()),
+        ..Default::default()
+    };
+    let resolved = mizar_tui::resolve_selection(&sources, true).expect("应覆盖启动值");
+    assert_eq!(resolved.provider.as_deref(), Some("magpie"));
+    assert_eq!(
+        resolved.model.as_deref(),
+        Some("mayoru-messages/claude-sonnet-5-5")
+    );
+    assert_eq!(
+        resolved.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::Low)
+    );
+
+    // 3. 应用到 AppState 后与决策一致
+    let mut state = AppState::new(
+        PathBuf::from("."),
+        session.id.clone(),
+        Vec::new(),
+        startup.provider,
+        startup.model,
+        startup.reasoning_effort,
+    );
+    state.provider = resolved.provider;
+    state.model = resolved.model;
+    state.reasoning_effort = resolved.reasoning_effort;
+    assert_eq!(state.provider.as_deref(), Some("magpie"));
+    assert_eq!(
+        state.model.as_deref(),
+        Some("mayoru-messages/claude-sonnet-5-5")
+    );
+    assert_eq!(
+        state.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::Low)
+    );
+
+    ctx.fiber().dispose().await;
+}
+
+/// 会话没有任何 Selection 记录时（旧会话），恢复不改变启动默认值。
+#[tokio::test]
+async fn resume_view_without_selection_keeps_startup_defaults() {
+    let ctx = Context::new();
+    ctx.logger().set_silent();
+    let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    ctx.plugin(AgentSpinePlugin, cfg);
+    wait_for_services(&ctx).await.unwrap();
+
+    let session = ctx.sessions().unwrap().create(None);
+    session.append(SessionEvent::User {
+        text: "只有消息，没有选择记录".into(),
+    });
+
+    let view = project_resume_view(&session);
+    assert_eq!(view.selection, None);
+
+    let mut state = AppState::new(
+        PathBuf::from("."),
+        session.id.clone(),
+        Vec::new(),
+        Some("magpie".into()),
+        Some("mayoru-responses/deepseek-flash".into()),
+        Some(mizar_llm::ReasoningEffort::High),
+    );
+    state.restore_session_view(view);
+    assert_eq!(state.provider.as_deref(), Some("magpie"));
+    assert_eq!(
+        state.model.as_deref(),
+        Some("mayoru-responses/deepseek-flash")
+    );
+    assert_eq!(
+        state.reasoning_effort,
+        Some(mizar_llm::ReasoningEffort::High)
+    );
+
+    ctx.fiber().dispose().await;
 }

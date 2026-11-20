@@ -174,9 +174,19 @@ pub fn load_session_from_conn(
         .map_err(map_sqlite_err)?;
 
     let mut entries = Vec::new();
+    let mut skipped_events = 0usize;
     for item in rows {
         let (seq, ts_ms, payload_json) = item.map_err(map_sqlite_err)?;
-        let event: SessionEvent = serde_json::from_str(&payload_json)?;
+        // 单条解析失败不能升级为整个会话加载失败：旧版二进制遇到新版写入的事件类型时
+        // 应跳过该条并保留其余历史，否则回滚一次就丢全部会话。
+        let event: SessionEvent = match serde_json::from_str(&payload_json) {
+            Ok(event) => event,
+            Err(_) => {
+                // 具体错误由调用方根据 `skipped_events` 汇总告警，避免在写线程里直接写 stdout/stderr。
+                skipped_events += 1;
+                continue;
+            }
+        };
         entries.push(SessionEntry {
             seq: u64::try_from(seq.max(0)).unwrap_or(0),
             event,
@@ -184,7 +194,11 @@ pub fn load_session_from_conn(
         });
     }
 
-    Ok(Some(LoadedSession { header, entries }))
+    Ok(Some(LoadedSession {
+        header,
+        entries,
+        skipped_events,
+    }))
 }
 
 pub fn list_sessions_from_conn(
@@ -223,4 +237,71 @@ pub fn list_sessions_from_conn(
         out.push(row.map_err(map_sqlite_err)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写入一条无法解析的事件不得导致整个会话加载失败：
+    /// 旧版二进制遇到新版写入的事件类型时，应跳过该条并保留其余历史。
+    #[test]
+    fn skips_unparsable_event_and_keeps_the_rest() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let header = SessionHeader::new("sess-partial", 1000);
+        insert_test_session(&conn, &header);
+        insert_test_event(
+            &conn,
+            1,
+            r#"{"type":"user","text":"第一条"}"#,
+            EntryVisibility::Surface,
+        );
+        insert_test_event(
+            &conn,
+            2,
+            r#"{"type":"unknown-future-event","payload":1}"#,
+            EntryVisibility::LogOnly,
+        );
+        insert_test_event(
+            &conn,
+            3,
+            r#"{"type":"user","text":"第三条"}"#,
+            EntryVisibility::Surface,
+        );
+
+        let loaded = load_session_from_conn(&conn, "sess-partial")
+            .expect("单条坏事件不应让整个会话加载失败")
+            .expect("会话应存在");
+
+        assert_eq!(loaded.skipped_events, 1);
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries[0].seq, 1);
+        assert_eq!(loaded.entries[1].seq, 3);
+    }
+
+    fn insert_test_session(conn: &Connection, header: &SessionHeader) {
+        conn.execute(
+            "INSERT INTO sessions (id, format_version, cwd, title, parent_id, fork_seq,
+                                   created_at_ms, updated_at_ms, event_count, surface_count,
+                                   compacted_up_to_seq)
+             VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?3, 0, 0, NULL)",
+            rusqlite::params![
+                header.id,
+                i64::from(header.format_version),
+                millis_to_i64(header.created_at_ms)
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_test_event(conn: &Connection, seq: i64, payload: &str, visibility: EntryVisibility) {
+        conn.execute(
+            "INSERT INTO session_events (session_id, seq, ts_ms, visibility, kind, payload_json)
+             VALUES ('sess-partial', ?1, ?2, ?3, 'x', ?4)",
+            rusqlite::params![seq, seq * 1000, visibility_str(visibility), payload],
+        )
+        .unwrap();
+    }
 }
