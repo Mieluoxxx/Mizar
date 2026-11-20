@@ -134,12 +134,14 @@ pub struct AgentRequestEvent {
 pub struct AgentTextDeltaEvent {
     pub session: Arc<Session>,
     pub text: String,
+    pub ts_ms: u128,
 }
 
 #[derive(Clone)]
 pub struct AgentReasoningDeltaEvent {
     pub session: Arc<Session>,
     pub text: String,
+    pub ts_ms: u128,
 }
 
 #[derive(Clone)]
@@ -656,6 +658,7 @@ impl AgentLoop {
                             AgentTextDeltaEvent {
                                 session: Arc::clone(&session),
                                 text: text.clone(),
+                                ts_ms: now_millis(),
                             },
                         );
                     }
@@ -678,6 +681,7 @@ impl AgentLoop {
                             AgentReasoningDeltaEvent {
                                 session: Arc::clone(&session),
                                 text: text.clone(),
+                                ts_ms: now_millis(),
                             },
                         );
                     }

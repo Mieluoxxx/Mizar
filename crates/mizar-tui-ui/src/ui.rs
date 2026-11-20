@@ -2152,7 +2152,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let auto_scroll = app.auto_scroll;
     let approval_mode = app.approval_mode;
     let ttft_ms = app.last_ttft_ms;
-    let last_tps = app.last_tps;
+    let last_tps = app.tps.rate();
     let flash = app.active_flash().map(str::to_string);
 
     let mut spans = vec![Span::styled(

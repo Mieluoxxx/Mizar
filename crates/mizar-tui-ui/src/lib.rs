@@ -14,6 +14,7 @@ pub mod side_panel;
 pub mod terminal;
 pub mod theme;
 pub mod timeline_rail;
+pub mod tps;
 pub mod trajectory_scene;
 pub mod ui;
 
@@ -25,6 +26,7 @@ pub use app::{
 pub use emphasis::EmphasisConfig;
 pub use terminal::ScreenMode;
 pub use theme::{TerminalColors, Theme, ThemePreset};
+pub use tps::{TpsLedger, estimate_tokens_fraction};
 pub use ui::{
     build_item_lines_for_scrollback, build_item_lines_for_scrollback_at,
     build_welcome_lines_for_scrollback, render,

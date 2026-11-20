@@ -13,10 +13,11 @@ use crossterm::event::{Event as TermEvent, EventStream};
 use futures::StreamExt;
 use mizar_agent_loop::{
     AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent,
-    AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
-    AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
-    AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_FIRST_TOKEN,
-    EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
+    AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent,
+    AgentToolCallEvent, AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent,
+    AgentTurnStartEvent, AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS,
+    EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
+    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
     EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
     RunOptions, TurnEndReason,
 };
@@ -510,10 +511,25 @@ pub fn subscribe_session_events(
     {
         let tx = tx.clone();
         let check = is_current.clone();
+        handles.push(ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
+            if check(&ev.session.id) {
+                let _ = tx.send(UiEvent::StepEnd {
+                    ts_ms: ev.ts_ms,
+                    usage: ev.usage,
+                });
+            }
+        })?);
+    }
+    {
+        let tx = tx.clone();
+        let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::TextDelta(ev.text.clone()));
+                    let _ = tx.send(UiEvent::TextDelta {
+                        text: ev.text.clone(),
+                        ts_ms: ev.ts_ms,
+                    });
                 }
             })?,
         );
@@ -525,7 +541,10 @@ pub fn subscribe_session_events(
             EVENT_AGENT_REASONING_DELTA,
             move |ev: &AgentReasoningDeltaEvent| {
                 if check(&ev.session.id) {
-                    let _ = tx.send(UiEvent::ReasoningDelta(ev.text.clone()));
+                    let _ = tx.send(UiEvent::ReasoningDelta {
+                        text: ev.text.clone(),
+                        ts_ms: ev.ts_ms,
+                    });
                 }
             },
         )?);

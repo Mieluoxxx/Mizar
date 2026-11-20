@@ -34,6 +34,7 @@ use crate::terminal::{
 };
 use crate::theme::{TerminalColors, Theme, ThemePreset};
 use crate::timeline_rail::{RailGeometry, RailHit, TimelineSnapshot, hit_test_rail};
+use crate::tps::TpsLedger;
 use crate::trajectory_scene::{TrajectoryKeyOutcome, TrajectorySceneState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,11 +251,21 @@ pub enum UiEvent {
     StepStart {
         ts_ms: u128,
     },
+    StepEnd {
+        ts_ms: u128,
+        usage: Option<TokenUsage>,
+    },
     FirstToken {
         ts_ms: u128,
     },
-    ReasoningDelta(String),
-    TextDelta(String),
+    ReasoningDelta {
+        text: String,
+        ts_ms: u128,
+    },
+    TextDelta {
+        text: String,
+        ts_ms: u128,
+    },
     ToolCall(ToolCall),
     ToolUpdate {
         call_id: String,
@@ -392,9 +403,7 @@ pub struct AppState {
     pub last_step_start_ms: Option<u128>,
     pub last_ttft_ms: Option<u64>,
     pub ttft_history: Vec<u64>,
-    pub decode_tokens_acc: u64,
-    pub decode_started_at: Option<Instant>,
-    pub last_tps: Option<f64>,
+    pub tps: TpsLedger,
     pub tps_history: Vec<f64>,
     pub spinner_tick: usize,
     pub should_quit: bool,
@@ -482,9 +491,7 @@ impl AppState {
             last_step_start_ms: None,
             last_ttft_ms: None,
             ttft_history: Vec::new(),
-            decode_tokens_acc: 0,
-            decode_started_at: None,
-            last_tps: None,
+            tps: TpsLedger::default(),
             tps_history: Vec::new(),
             spinner_tick: 0,
             should_quit: false,
@@ -757,7 +764,7 @@ impl AppState {
             reasoning_tokens: ((est(reason_chars) as f64) * scale).round() as u64,
             tool_tokens: ((est(tool_chars) as f64) * scale).round() as u64,
             context_window: self.active_context_window(),
-            tps: self.last_tps,
+            tps: self.tps.rate(),
             ttft_ms: self.last_ttft_ms,
             tps_history: self.tps_history.clone(),
             ttft_history: self.ttft_history.clone(),
@@ -804,8 +811,7 @@ impl AppState {
                 self.is_busy = true;
                 self.streaming_assistant_open = false;
                 self.auto_scroll = true;
-                self.decode_tokens_acc = 0;
-                self.decode_started_at = None;
+                self.tps.on_turn_start();
                 emit_terminal_progress(true);
                 emit_program_status(ProgramStatusState::Working, None, Some("Generating"));
             }
@@ -820,7 +826,7 @@ impl AppState {
                 } else {
                     emit_program_status(ProgramStatusState::Done, None, Some("Turn completed"));
                 }
-                if let Some(tps) = self.last_tps {
+                if let Some(tps) = self.tps.on_turn_end() {
                     self.tps_history.push(tps);
                     if self.tps_history.len() > 32 {
                         self.tps_history.remove(0);
@@ -830,6 +836,10 @@ impl AppState {
             }
             UiEvent::StepStart { ts_ms } => {
                 self.last_step_start_ms = Some(ts_ms);
+                self.tps.on_step_start();
+            }
+            UiEvent::StepEnd { ts_ms, usage } => {
+                self.tps.on_step_end(ts_ms, usage);
             }
             UiEvent::FirstToken { ts_ms } => {
                 if let Some(start) = self.last_step_start_ms.take() {
@@ -840,43 +850,29 @@ impl AppState {
                         self.ttft_history.remove(0);
                     }
                 }
-                self.decode_started_at = Some(Instant::now());
+                self.tps.on_first_token(ts_ms);
             }
-            UiEvent::ReasoningDelta(delta) => {
+            UiEvent::ReasoningDelta { text, ts_ms } => {
                 let busy = self.is_busy;
                 let (idx, item) = self.ensure_open_assistant();
                 if let ChatItem::Assistant { reasoning, .. } = item {
-                    reasoning.push_str(&delta);
-                    let len = reasoning.len();
+                    reasoning.push_str(&text);
                     let snapshot = reasoning.clone();
                     self.reveal
                         .observe(RevealSlot::AssistantReasoning(idx), &snapshot, busy);
-                    self.decode_tokens_acc += (delta.chars().count() as u64).div_ceil(4).max(1);
-                    if let Some(t0) = self.decode_started_at {
-                        let secs = t0.elapsed().as_secs_f64();
-                        if secs >= 0.15 {
-                            self.last_tps = Some(self.decode_tokens_acc as f64 / secs);
-                        }
-                    }
-                    let _ = len;
                 }
+                self.tps.on_token_delta(&text, ts_ms);
             }
-            UiEvent::TextDelta(delta) => {
+            UiEvent::TextDelta { text, ts_ms } => {
                 let busy = self.is_busy;
                 let (idx, item) = self.ensure_open_assistant();
-                if let ChatItem::Assistant { text, .. } = item {
-                    text.push_str(&delta);
-                    let snapshot = text.clone();
+                if let ChatItem::Assistant { text: body, .. } = item {
+                    body.push_str(&text);
+                    let snapshot = body.clone();
                     self.reveal
                         .observe(RevealSlot::AssistantText(idx), &snapshot, busy);
-                    self.decode_tokens_acc += (delta.chars().count() as u64).div_ceil(4).max(1);
-                    if let Some(t0) = self.decode_started_at {
-                        let secs = t0.elapsed().as_secs_f64();
-                        if secs >= 0.15 {
-                            self.last_tps = Some(self.decode_tokens_acc as f64 / secs);
-                        }
-                    }
                 }
+                self.tps.on_token_delta(&text, ts_ms);
             }
             UiEvent::ToolCall(call) => {
                 self.streaming_assistant_open = false;
@@ -1985,7 +1981,7 @@ impl AppState {
         self.last_step_start_ms = None;
         self.last_ttft_ms = None;
         self.ttft_history.clear();
-        self.last_tps = None;
+        self.tps.reset();
         self.tps_history.clear();
         self.inline_committed_items = 0;
         self.inline_welcome_committed = false;
@@ -3165,7 +3161,10 @@ mod tests {
 
         app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
         app.apply_ui_event(UiEvent::StepStart { ts_ms: 100 });
-        app.apply_ui_event(UiEvent::ReasoningDelta("先查时间".into()));
+        app.apply_ui_event(UiEvent::ReasoningDelta {
+            text: "先查时间".into(),
+            ts_ms: 200,
+        });
         app.apply_ui_event(UiEvent::FirstToken { ts_ms: 280 });
         assert_eq!(app.last_ttft_ms, Some(180));
 
@@ -3182,7 +3181,10 @@ mod tests {
             blocked: false,
             details: None,
         });
-        app.apply_ui_event(UiEvent::TextDelta("现在是 09:30".into()));
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "现在是 09:30".into(),
+            ts_ms: 300,
+        });
         app.apply_ui_event(UiEvent::Usage(TokenUsage {
             input_tokens: 100,
             output_tokens: 25,
@@ -3207,6 +3209,159 @@ mod tests {
             &app.items[3],
             ChatItem::Assistant { text, .. } if text == "现在是 09:30"
         ));
+    }
+
+    fn new_app_for_tps() -> AppState {
+        AppState::new(
+            PathBuf::from("."),
+            "sess-tps",
+            Vec::new(),
+            Some("default".into()),
+            Some("deepseek-chat".into()),
+            None,
+        )
+    }
+
+    /// 一个 turn 里两次模型调用：工具间隙不进分母，TPS 不随步数翻倍。
+    #[test]
+    fn multi_step_turn_does_not_inflate_tps() {
+        let mut app = new_app_for_tps();
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+
+        // 第一步：100 token / 1s
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::FirstToken { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "x".repeat(400),
+            ts_ms: 500,
+        });
+        app.apply_ui_event(UiEvent::StepEnd {
+            ts_ms: 1_000,
+            usage: Some(TokenUsage {
+                output_tokens: 100,
+                ..TokenUsage::default()
+            }),
+        });
+        assert_eq!(app.tps.rate(), Some(100.0));
+
+        // 工具跑了 51 秒，然后第二步：300 token / 3s
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 52_000 });
+        app.apply_ui_event(UiEvent::FirstToken { ts_ms: 52_000 });
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "x".repeat(400),
+            ts_ms: 52_500,
+        });
+        app.apply_ui_event(UiEvent::StepEnd {
+            ts_ms: 55_000,
+            usage: Some(TokenUsage {
+                output_tokens: 300,
+                ..TokenUsage::default()
+            }),
+        });
+
+        // (100 + 300) / (1s + 3s) = 100 tok/s。旧实现会累积分子、重置分母，得 400 tok/s。
+        assert_eq!(app.tps.rate(), Some(100.0));
+
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Completed,
+        });
+        assert_eq!(app.tps_history, vec![100.0]);
+    }
+
+    /// 中文输出按脚本加权估算，不是 chars/4。
+    #[test]
+    fn cjk_output_is_not_underestimated() {
+        let mut app = new_app_for_tps();
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::FirstToken { ts_ms: 0 });
+        // 80 个汉字在 2 秒内输出完，约 57 token → 约 28.6 tok/s
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "中".repeat(80),
+            ts_ms: 1_000,
+        });
+        app.apply_ui_event(UiEvent::StepEnd {
+            ts_ms: 2_000,
+            usage: None,
+        });
+        let rate = app.tps.rate().expect("CJK 输出必须有读数");
+        // chars/4 只会给 20 token → 10 tok/s
+        assert!(rate > 25.0, "CJK 被低估：{rate}");
+    }
+
+    /// 一批 delta 在同一时间戳排空时，读数仍按事件时间戳算，不出现零耗时尖峰。
+    #[test]
+    fn burst_of_same_timestamp_deltas_uses_event_time() {
+        let mut app = new_app_for_tps();
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::FirstToken { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "x".repeat(400),
+            ts_ms: 600,
+        });
+        let single = app.tps.rate().expect("单次 delta 应有读数");
+
+        // runner 的 try_recv 循环会把积压的 delta 一次性交给 UI。
+        for _ in 0..50 {
+            app.apply_ui_event(UiEvent::TextDelta {
+                text: "x".repeat(400),
+                ts_ms: 600,
+            });
+        }
+        let burst = app.tps.rate().expect("批量 delta 应有读数");
+        // 旧实现用消费时刻 elpased，50 个 delta 一批会冲出几十倍。这里只该按 token 量增大。
+        assert!(
+            burst / single < 60.0,
+            "批量排空产生了异常尖峰：{single} → {burst}"
+        );
+
+        app.apply_ui_event(UiEvent::StepEnd {
+            ts_ms: 1_600,
+            usage: Some(TokenUsage {
+                output_tokens: 800,
+                ..TokenUsage::default()
+            }),
+        });
+        // 800 token / 1.6s，真实用量定案
+        assert_eq!(app.tps.rate(), Some(500.0));
+    }
+
+    /// 没有可测量样本的轮次保留上一个读数，不清空。
+    #[test]
+    fn turn_without_samples_keeps_the_previous_rate() {
+        let mut app = new_app_for_tps();
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::FirstToken { ts_ms: 0 });
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "x".repeat(400),
+            ts_ms: 600,
+        });
+        app.apply_ui_event(UiEvent::StepEnd {
+            ts_ms: 2_000,
+            usage: Some(TokenUsage {
+                output_tokens: 100,
+                ..TokenUsage::default()
+            }),
+        });
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Completed,
+        });
+        assert_eq!(app.tps.rate(), Some(50.0));
+
+        // 第二轮被取消：没有样本，读数保持。
+        app.apply_ui_event(UiEvent::TurnStart { turn: 2 });
+        app.apply_ui_event(UiEvent::StepStart { ts_ms: 10_000 });
+        app.apply_ui_event(UiEvent::StepEnd {
+            ts_ms: 10_100,
+            usage: None,
+        });
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: UiTurnEndReason::Cancelled,
+        });
+        assert_eq!(app.tps.rate(), Some(50.0));
+        assert_eq!(app.tps_history, vec![50.0]);
     }
 
     #[test]
