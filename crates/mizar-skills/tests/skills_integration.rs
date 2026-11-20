@@ -386,3 +386,82 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[tokio::test]
+async fn include_user_roots_false_skips_user_skills_but_keeps_project_skills() {
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("mizar_skills_iso_{}_{uniq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+
+    let home_dir = base.join("home");
+    let user_agents = home_dir.join(".agents");
+    let repo = base.join("repo");
+    std::fs::create_dir_all(user_agents.join("skills/user-only")).unwrap();
+    std::fs::create_dir_all(repo.join(".agents/skills/proj-only")).unwrap();
+
+    std::fs::write(
+        user_agents.join("skills/user-only/SKILL.md"),
+        "---\nname: user-only\ndescription: Global personal skill\n---\nUSER_ONLY_BODY",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".agents/skills/proj-only/SKILL.md"),
+        "---\nname: proj-only\ndescription: Workspace skill\n---\nPROJ_ONLY_BODY",
+    )
+    .unwrap();
+
+    let ctx = Context::new();
+    ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    ctx.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
+        .await
+        .unwrap();
+    let mut cfg = SkillsConfig::new(&repo);
+    cfg.agents_home = Some(user_agents.clone());
+    cfg.include_user_roots = false;
+    ctx.plugin(SkillsPlugin, cfg).await.unwrap();
+    for rt in ctx.registry().values() {
+        for f in rt.fibers() {
+            let _ = f.wait_settled().await;
+        }
+    }
+
+    let names: Vec<String> = ctx
+        .skills()
+        .unwrap()
+        .list(mizar_skills::SkillLookupOptions {
+            cwd: Some(repo.clone()),
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(names.contains(&"proj-only".to_string()), "{names:?}");
+    assert!(!names.contains(&"user-only".to_string()), "{names:?}");
+
+    // 即使 cwd 恰好等于 home_dir（其下有 .agents/skills），也必须屏蔽 user-only
+    let home_names: Vec<String> = ctx
+        .skills()
+        .unwrap()
+        .list(mizar_skills::SkillLookupOptions {
+            cwd: Some(home_dir.clone()),
+            cancel: CancellationToken::new(),
+        })
+        .await
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert!(
+        !home_names.contains(&"user-only".to_string()),
+        "{home_names:?}"
+    );
+
+    ctx.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

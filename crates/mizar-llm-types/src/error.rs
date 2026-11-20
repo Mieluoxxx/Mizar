@@ -25,6 +25,29 @@ pub enum LlmErrorCode {
 }
 
 impl LlmErrorCode {
+    /// 标准化错误码字符串（供结构化诊断输出）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAdapter => "no_adapter",
+            Self::DuplicateProvider => "duplicate_provider",
+            Self::MissingCredential => "missing_credential",
+            Self::InvalidCredential => "invalid_credential",
+            Self::Auth => "auth",
+            Self::RateLimit => "rate_limit",
+            Self::Quota => "quota",
+            Self::ContextWindowExceeded => "context_window_exceeded",
+            Self::InvalidRequest => "invalid_request",
+            Self::ContentRefused => "content_refused",
+            Self::EmptyResponse => "empty_response",
+            Self::MalformedResponse => "malformed_response",
+            Self::Server => "server",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+
     /// 瞬时性、适合自动重试的错误码。
     pub fn is_retryable(self) -> bool {
         matches!(
@@ -209,8 +232,11 @@ pub fn is_empty_response_error(lower: &str) -> bool {
 
 pub fn is_context_window_exceeded(lower: &str) -> bool {
     lower.contains("context_length_exceeded")
+        || lower.contains("context_window_exceeded")
+        || lower.contains("context length exceeded")
         || lower.contains("context window")
         || lower.contains("maximum context length")
+        || lower.contains("exceeds the maximum number of tokens")
         || lower.contains("prompt is too long")
         || lower.contains("input is too long")
         || lower.contains("request too large for")
@@ -268,5 +294,32 @@ mod tests {
         );
         assert_eq!(empty.code, LlmErrorCode::EmptyResponse);
         assert!(empty.is_retryable());
+    }
+
+    #[test]
+    fn exposes_error_code_strings_and_expanded_context_window_patterns() {
+        assert_eq!(
+            LlmErrorCode::MissingCredential.as_str(),
+            "missing_credential"
+        );
+        assert_eq!(LlmErrorCode::RateLimit.as_str(), "rate_limit");
+        assert_eq!(
+            LlmErrorCode::ContextWindowExceeded.as_str(),
+            "context_window_exceeded"
+        );
+        assert_eq!(LlmErrorCode::Auth.as_str(), "auth");
+
+        for msg in [
+            "The input token count exceeds the maximum number of tokens allowed 128000.",
+            "context_window_exceeded for this deployment",
+            "Model context length exceeded during generation",
+        ] {
+            let err = LlmError::classify_http(400, None, msg);
+            assert_eq!(
+                err.code,
+                LlmErrorCode::ContextWindowExceeded,
+                "failed to classify: {msg}"
+            );
+        }
     }
 }

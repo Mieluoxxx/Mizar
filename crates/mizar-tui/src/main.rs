@@ -1,23 +1,34 @@
-//! 终端交互入口 `mizar`（`mizar-tui`）。
+//! 终端交互与无头单次执行入口 `mizar`（`mizar-tui`）。
+//!
+//! 子命令：
+//! - `mizar exec [<prompt>]`：非交互单次无头执行（无 explicit prompt 且 stdin 非 TTY 时读取 stdin 至 EOF）
+//! - `mizar update [--version <ver>] [--force] [--check]`：从 GitHub Releases 检查并更新 `mizar` 二进制
 //!
 //! CLI 参数：
 //! - `--workspace <dir>` / `-C <dir>`：工作目录
+//! - `-p <text>` / `--prompt <text>`：无头模式直接传入任务文本（可用于 root 或 `exec`）
+//! - `--prompt-file <path>`：从文件读取无头任务文本（可用于 root 或 `exec`）
+//! - `--provider <id>`：指定提供方（覆盖配置与环境变量）
+//! - `--model <id>`：指定模型 ID（覆盖配置与环境变量）
+//! - `--protocol <api>` / `--api-format <api>`：指定协议（`completions` / `responses` / `messages` 等）
+//! - `--base-url <url>`：覆盖 API 基址
+//! - `--reasoning-effort <level>`：推理强度（`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`）
+//! - `--max-steps <n>`：限制单轮最大工具循环步数
+//! - `--timeout <secs>`：限制无头单次任务总超时秒数
+//! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
 //! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
 //! - `--tools <a,b,...>` / `-t`：工具白名单
 //! - `--exclude-tools <a,b,...>` / `-xt`：工具黑名单（支持 `*` 通配）
-//! - `--inline`：以 Inline 视口模式启动（保留终端原生滚动历史）
-//! - `--approve`：开启高危工具交互式审批闸门
-//! - `--continue` / `-c`：恢复当前工作区最近一次持久化的历史会话
-//! - `--resume <id>`：按会话 ID 恢复历史会话
+//! - `--inline`：以 Inline 视口模式启动 TUI（保留终端原生滚动历史）
+//! - `--approve`：开启高危工具交互式审批闸门（TUI 专用；无头模式不兼容并直接报错）
+//! - `--continue` / `-c`：恢复当前工作区最近一次持久化的历史会话（TUI）
+//! - `--resume <id>` / `-r <id>`：按会话 ID 恢复历史会话（TUI）
 //! - `--no-persist`：禁用 SQLite 会话落盘（仅当前进程内存模式）
 //! - `--no-instructions`：禁用自动发现与注入 `AGENTS.md` / `CLAUDE.md`
 //! - `--theme <preset>`：指定预设主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`）
 //! - `--help` / `-h`：打印命令行帮助信息并退出
 //! - `--version` / `-V`：打印版本号并退出
-//!
-//! 子命令：
-//! - `mizar update [--version <ver>] [--force] [--check]`：从 GitHub Releases 检查并更新 `mizar` 二进制
 //!
 //! 配置文件目录（全局 `~/.mizar/` + 项目 `<workspace>/.mizar/`，支持 `MIZAR_HOME` 覆盖）：
 //! - `settings.json`：默认提供方/模型、推理强度、工具预设与黑白名单
@@ -25,7 +36,7 @@
 //! - `mcp.json`：MCP Server 配置
 //!
 //! 环境变量（优先覆盖配置文件）：
-//! - `API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY`（未配置时使用离线假模型）
+//! - `API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY`（TUI 未配置时回落离线假模型；无头模式严禁回落假模型）
 //! - `PROTOCOL`：`completions`（默认）/ `responses` / `messages`
 //! - `BASE_URL`、`MODEL`、`WORKSPACE`、`MIZAR_HOME`
 //! - `MIZAR_SKIP_VERSION_CHECK` / `MIZAR_OFFLINE`：跳过启动时版本检查（`MIZAR_OFFLINE` 同时禁用更新下载）
@@ -39,10 +50,12 @@ use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, load_mizar_config,
     resolve_default_session_db_path,
 };
+use mizar_llm::ReasoningEffort;
 use mizar_llm_mock::MockPlugin;
 use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_tools_coding::CodingToolsPreset;
+use mizar_tui::exec::{ExecConfig, resolve_exec_prompt, run_exec_cli};
 use mizar_tui::update::{current_version, is_version_check_disabled, run_update_cli};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -67,6 +80,35 @@ struct CliArgs {
     theme: Option<ThemePreset>,
     help: bool,
     version: bool,
+    explicit_exec: bool,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    positional_prompt: Option<String>,
+    isolated: bool,
+    provider: Option<String>,
+    model: Option<String>,
+    protocol: Option<String>,
+    base_url: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    max_steps: Option<usize>,
+    timeout_secs: Option<u64>,
+}
+
+impl CliArgs {
+    fn is_exec_mode(&self) -> bool {
+        self.explicit_exec || self.prompt.is_some() || self.prompt_file.is_some()
+    }
+
+    fn has_exec_only_flags(&self) -> bool {
+        self.isolated
+            || self.provider.is_some()
+            || self.model.is_some()
+            || self.protocol.is_some()
+            || self.base_url.is_some()
+            || self.reasoning_effort.is_some()
+            || self.max_steps.is_some()
+            || self.timeout_secs.is_some()
+    }
 }
 
 fn format_help_text() -> String {
@@ -77,21 +119,34 @@ Terminal-native AI coding workbench
 
 Usage:
   mizar [OPTIONS]
+  mizar exec [OPTIONS] [<prompt>]
   mizar update [OPTIONS]
 
 Commands:
+  exec                          Run a single non-interactive task and exit
   update                        Check and install the latest release binary
 
 Options:
   -C, --workspace <dir>         Workspace directory (defaults to current directory)
+  -p, --prompt <text>           Task prompt (runs headless exec when used on root)
+      --prompt-file <path>      Read task prompt from file (runs headless exec)
+      --provider <id>           Model provider ID override
+      --model <id>              Model ID override
+      --protocol <api>          Protocol override (completions, responses, messages)
+      --api-format <api>        Alias for --protocol
+      --base-url <url>          Base URL override
+      --reasoning-effort <lvl>  Reasoning effort (off, minimal, low, medium, high, xhigh, max)
+      --max-steps <n>           Maximum agent loop steps (>= 1)
+      --timeout <secs>          Total execution timeout in seconds (>= 1)
+      --isolated                Skip personal global config, MCP, skills, instructions, and DB
       --minimal                 Enable minimal coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
   -t, --tools <a,b,...>         Tool allowlist (comma-separated, supports *)
  -xt, --exclude-tools <a,b,...> Tool denylist (comma-separated, supports *)
-      --inline                  Start in inline viewport mode (preserves scrollback)
-      --approve                 Prompt for approval on high-risk tools
-  -c, --continue                Resume the latest persisted session in workspace
-  -r, --resume <id>             Resume a specific session by ID
+      --inline                  Start in inline viewport mode (TUI only)
+      --approve                 Prompt for approval on high-risk tools (TUI only)
+  -c, --continue                Resume the latest persisted session in workspace (TUI only)
+  -r, --resume <id>             Resume a specific session by ID (TUI only)
       --no-persist              Disable SQLite session persistence
       --no-instructions         Disable AGENTS.md / CLAUDE.md discovery
       --theme <preset>          Theme preset (auto, mist-dark, mist-light, sakura-dark, system, ansi16)
@@ -101,22 +156,105 @@ Options:
     )
 }
 
+fn split_flag_value(raw: &str) -> (&str, Option<String>) {
+    if raw.starts_with("--")
+        && let Some((name, val)) = raw.split_once('=')
+    {
+        return (name, Some(val.to_string()));
+    }
+    for prefix in ["-C=", "-p=", "-t=", "-r=", "-xt="] {
+        if let Some(val) = raw.strip_prefix(prefix) {
+            let flag = &prefix[..prefix.len() - 1];
+            return (flag, Some(val.to_string()));
+        }
+    }
+    (raw, None)
+}
+
+fn take_value<I>(flag: &str, inline: Option<String>, args: &mut I) -> Result<String, String>
+where
+    I: Iterator<Item = String>,
+{
+    match inline {
+        Some(v) => Ok(v),
+        None => args.next().ok_or_else(|| format!("缺少 {flag} 的参数值")),
+    }
+}
+
+fn parse_cli_reasoning_effort(raw: &str) -> Result<ReasoningEffort, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(ReasoningEffort::Off),
+        "minimal" => Ok(ReasoningEffort::Minimal),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        "xhigh" => Ok(ReasoningEffort::XHigh),
+        "max" => Ok(ReasoningEffort::Max),
+        _ => Err(format!(
+            "无效的 --reasoning-effort \"{raw}\"（可选：off, minimal, low, medium, high, xhigh, max）"
+        )),
+    }
+}
+
 fn parse_cli_args_from<I>(args: I) -> Result<CliArgs, String>
 where
     I: IntoIterator<Item = String>,
 {
     let mut out = CliArgs::default();
     let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+    let mut after_double_dash = false;
+
+    while let Some(raw_arg) = args.next() {
+        if !after_double_dash && raw_arg == "--" {
+            after_double_dash = true;
+            continue;
+        }
+        if after_double_dash || !raw_arg.starts_with('-') || raw_arg == "-" {
+            if !after_double_dash
+                && !out.explicit_exec
+                && out.positional_prompt.is_none()
+                && raw_arg == "exec"
+            {
+                out.explicit_exec = true;
+                continue;
+            }
+            if out.explicit_exec || after_double_dash {
+                if out.positional_prompt.is_some() {
+                    return Err(format!("存在多余的位置参数：{raw_arg}"));
+                }
+                out.positional_prompt = Some(raw_arg);
+                continue;
+            }
+            if out.prompt.is_some() || out.prompt_file.is_some() {
+                return Err(format!(
+                    "多余的位置参数（已指定 -p 或 --prompt-file）：{raw_arg}"
+                ));
+            }
+            return Err(format!(
+                "未知参数：{raw_arg}（运行 `mizar --help` 查看可用参数）"
+            ));
+        }
+
+        let (flag, inline) = split_flag_value(&raw_arg);
+        match flag {
             "--workspace" | "-C" => {
-                let val = args.next().ok_or_else(|| format!("缺少 {arg} 的参数值"))?;
+                let val = take_value(flag, inline, &mut args)?;
                 out.workspace = Some(PathBuf::from(val));
             }
-            "--minimal" => out.preset = Some(CodingToolsPreset::MinimalCoding),
-            "--read-only" => out.preset = Some(CodingToolsPreset::ReadOnly),
+            "--minimal" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.preset = Some(CodingToolsPreset::MinimalCoding);
+            }
+            "--read-only" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.preset = Some(CodingToolsPreset::ReadOnly);
+            }
             "--tools" | "-t" => {
-                let val = args.next().ok_or_else(|| format!("缺少 {arg} 的参数值"))?;
+                let val = take_value(flag, inline, &mut args)?;
                 let list: Vec<String> = val
                     .split(',')
                     .map(str::trim)
@@ -126,7 +264,7 @@ where
                 out.include_tools = Some(list);
             }
             "--exclude-tools" | "-xt" => {
-                let val = args.next().ok_or_else(|| format!("缺少 {arg} 的参数值"))?;
+                let val = take_value(flag, inline, &mut args)?;
                 out.exclude_tools.extend(
                     val.split(',')
                         .map(str::trim)
@@ -134,21 +272,133 @@ where
                         .map(ToString::to_string),
                 );
             }
-            "--inline" => out.inline = true,
-            "--approve" => out.approve = true,
-            "--no-persist" => out.no_persist = true,
-            "--no-instructions" => out.no_instructions = true,
-            "--continue" | "-c" => out.resume_session = Some(ResumeTarget::LatestInWorkspace),
+            "--inline" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.inline = true;
+            }
+            "--approve" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.approve = true;
+            }
+            "--no-persist" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.no_persist = true;
+            }
+            "--no-instructions" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.no_instructions = true;
+            }
+            "--continue" | "-c" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.resume_session = Some(ResumeTarget::LatestInWorkspace);
+            }
             "--resume" | "-r" => {
-                let val = args.next().ok_or_else(|| format!("缺少 {arg} 的参数值"))?;
+                let val = take_value(flag, inline, &mut args)?;
                 out.resume_session = Some(ResumeTarget::Id(val));
             }
             "--theme" => {
-                let val = args.next().ok_or_else(|| format!("缺少 {arg} 的参数值"))?;
+                let val = take_value(flag, inline, &mut args)?;
                 out.theme = ThemePreset::parse(&val);
             }
-            "--help" | "-h" => out.help = true,
-            "--version" | "-V" => out.version = true,
+            "--isolated" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.isolated = true;
+            }
+            "--prompt" | "-p" => {
+                if out.prompt.is_some() {
+                    return Err("重复指定了 -p / --prompt 参数".to_string());
+                }
+                let val = take_value(flag, inline, &mut args)?;
+                out.prompt = Some(val);
+            }
+            "--prompt-file" => {
+                if out.prompt_file.is_some() {
+                    return Err("重复指定了 --prompt-file 参数".to_string());
+                }
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--prompt-file 路径不能为空".to_string());
+                }
+                out.prompt_file = Some(PathBuf::from(val));
+            }
+            "--provider" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--provider 不能为空".to_string());
+                }
+                out.provider = Some(val);
+            }
+            "--model" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--model 不能为空".to_string());
+                }
+                out.model = Some(val);
+            }
+            "--protocol" | "--api-format" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err(format!("{flag} 不能为空"));
+                }
+                out.protocol = Some(val);
+            }
+            "--base-url" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--base-url 不能为空".to_string());
+                }
+                out.base_url = Some(val);
+            }
+            "--reasoning-effort" => {
+                let val = take_value(flag, inline, &mut args)?;
+                out.reasoning_effort = Some(parse_cli_reasoning_effort(&val)?);
+            }
+            "--max-steps" => {
+                let val = take_value(flag, inline, &mut args)?;
+                let parsed = val
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("无效的 --max-steps 数值：{val}"))?;
+                if parsed == 0 {
+                    return Err("--max-steps 必须大于等于 1".to_string());
+                }
+                out.max_steps = Some(parsed);
+            }
+            "--timeout" => {
+                let val = take_value(flag, inline, &mut args)?;
+                let parsed = val
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("无效的 --timeout 秒数：{val}"))?;
+                if parsed == 0 {
+                    return Err("--timeout 必须大于等于 1".to_string());
+                }
+                out.timeout_secs = Some(parsed);
+            }
+            "--help" | "-h" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.help = true;
+            }
+            "--version" | "-V" => {
+                if inline.is_some() {
+                    return Err(format!("参数 {flag} 不接受值"));
+                }
+                out.version = true;
+            }
             other => {
                 return Err(format!(
                     "未知参数：{other}（运行 `mizar --help` 查看可用参数）"
@@ -187,15 +437,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("mizar {}", current_version());
         return Ok(());
     }
-    let app = Context::new();
-    // 进入终端界面前先静默，防止启动日志先刷到 stdout 再闪屏
-    app.logger().set_silent();
 
     let explicit_workspace = cli.workspace.clone();
     let workspace = cli
         .workspace
+        .clone()
         .or_else(|| env_non_empty("WORKSPACE").map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().expect("failed to resolve cwd"));
+
+    if cli.is_exec_mode() {
+        if cli.approve {
+            eprintln!(
+                "error: --approve is incompatible with non-interactive exec mode (code=invalid_request)"
+            );
+            std::process::exit(1);
+        }
+        if cli.resume_session.is_some() {
+            eprintln!(
+                "error: --continue/--resume is incompatible with non-interactive exec mode (code=invalid_request)"
+            );
+            std::process::exit(1);
+        }
+        if cli.inline {
+            eprintln!(
+                "error: --inline is incompatible with non-interactive exec mode (code=invalid_request)"
+            );
+            std::process::exit(1);
+        }
+        let prompt = match resolve_exec_prompt(
+            cli.explicit_exec,
+            cli.prompt,
+            cli.prompt_file,
+            cli.positional_prompt,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        };
+        let code = run_exec_cli(ExecConfig {
+            prompt,
+            workspace,
+            provider: cli.provider,
+            model: cli.model,
+            protocol: cli.protocol,
+            base_url: cli.base_url,
+            reasoning_effort: cli.reasoning_effort,
+            max_steps: cli.max_steps,
+            timeout_secs: cli.timeout_secs,
+            isolated: cli.isolated,
+            no_persist: cli.no_persist,
+            no_instructions: cli.no_instructions,
+            approve: cli.approve,
+            preset: cli.preset,
+            include_tools: cli.include_tools,
+            exclude_tools: cli.exclude_tools,
+        })
+        .await;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+
+    if cli.has_exec_only_flags() {
+        eprintln!(
+            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --timeout) require `exec`, `-p/--prompt`, or `--prompt-file`"
+        );
+        std::process::exit(1);
+    }
+
+    let app = Context::new();
+    // 进入终端界面前先静默，防止启动日志先刷到 stdout 再闪屏
+    app.logger().set_silent();
 
     let loaded_cfg = load_mizar_config(&workspace);
     let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());
@@ -344,9 +659,12 @@ mod tests {
         assert!(!ver.is_empty());
         let help = format_help_text();
         assert!(help.contains(&format!("mizar {ver}")));
+        assert!(help.contains("exec"));
         assert!(help.contains("update"));
         assert!(help.contains("--version"));
         assert!(help.contains("--workspace"));
+        assert!(help.contains("--isolated"));
+        assert!(help.contains("--api-format"));
     }
 
     #[test]
@@ -384,5 +702,63 @@ mod tests {
             parsed.resume_session,
             Some(ResumeTarget::LatestInWorkspace)
         ));
+        assert!(!parsed.is_exec_mode());
+    }
+
+    #[test]
+    fn parse_exec_subcommand_flags_aliases_and_rejects_conflicts() {
+        let args: Vec<String> = [
+            "exec",
+            "--isolated",
+            "--provider=openai",
+            "--model",
+            "gpt-eval",
+            "--api-format=responses",
+            "--base-url",
+            "http://127.0.0.1:9999/v1",
+            "--reasoning-effort",
+            "xhigh",
+            "--max-steps=5",
+            "--timeout",
+            "12",
+            "--",
+            "- list files",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+        let parsed = parse_cli_args_from(args).unwrap();
+        assert!(parsed.is_exec_mode());
+        assert!(parsed.explicit_exec);
+        assert!(parsed.isolated);
+        assert_eq!(parsed.provider.as_deref(), Some("openai"));
+        assert_eq!(parsed.model.as_deref(), Some("gpt-eval"));
+        assert_eq!(parsed.protocol.as_deref(), Some("responses"));
+        assert_eq!(parsed.base_url.as_deref(), Some("http://127.0.0.1:9999/v1"));
+        assert_eq!(parsed.reasoning_effort, Some(ReasoningEffort::XHigh));
+        assert_eq!(parsed.max_steps, Some(5));
+        assert_eq!(parsed.timeout_secs, Some(12));
+        assert_eq!(parsed.positional_prompt.as_deref(), Some("- list files"));
+
+        // root -p 进入 exec 模式；重复或额外位置参数或无效参数均报错
+        let root_p = parse_cli_args_from(["-C=/ws".into(), "-p".into(), "ping".into()]).unwrap();
+        assert!(root_p.is_exec_mode());
+        assert!(!root_p.explicit_exec);
+        assert_eq!(root_p.prompt.as_deref(), Some("ping"));
+        assert_eq!(root_p.workspace, Some(PathBuf::from("/ws")));
+
+        assert!(parse_cli_args_from(["-p".into(), "a".into(), "-p".into(), "b".into()]).is_err());
+        assert!(parse_cli_args_from(["exec".into(), "one".into(), "two".into()]).is_err());
+        assert!(parse_cli_args_from(["exec".into(), "--max-steps".into(), "0".into()]).is_err());
+        assert!(parse_cli_args_from(["exec".into(), "--timeout".into(), "0".into()]).is_err());
+        assert!(
+            parse_cli_args_from(["exec".into(), "--reasoning-effort".into(), "ultra".into()])
+                .is_err()
+        );
+        assert!(
+            parse_cli_args_from(["--isolated".into()])
+                .unwrap()
+                .has_exec_only_flags()
+        );
     }
 }

@@ -23,6 +23,7 @@ use mizar_llm::{
     BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo, ProviderInfo,
 };
 use mizar_llm_completions::{CompletionsAdapter, CompletionsCompat, CompletionsConfig};
+pub use mizar_llm_http::resolve_credential;
 use mizar_llm_http::{DEFAULT_IDLE_TIMEOUT, expand_pi_value};
 use mizar_llm_messages::{
     DEFAULT_ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS, MessagesAdapter, MessagesConfig,

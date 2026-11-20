@@ -8,16 +8,16 @@ pub mod plugins;
 
 use std::path::PathBuf;
 
-#[cfg(feature = "router")]
-pub use config::ResolvedLlmRouter;
 pub use config::{
-    CONFIG_DIR_NAME, CodemodeSettings, CompactionSettings, EnvLlmOverride, EnvProviderKind,
-    InstructionsSettings, LoadedMizarConfig, RecallSettings, SettingsConfig, SkillsSettings,
-    ToolSearchSettings, UiSettings, load_mizar_config, load_mizar_config_with_global,
-    normalize_disabled_plugins, patch_settings_file, persist_disabled_plugins,
-    resolve_default_session_db_path, resolve_global_config_dir, resolve_global_settings_path,
-    resolve_project_config_dir,
+    CONFIG_DIR_NAME, CliLlmOverride, CodemodeSettings, CompactionSettings, EnvLlmOverride,
+    EnvProviderKind, InstructionsSettings, LoadedMizarConfig, RecallSettings, SettingsConfig,
+    SkillsSettings, ToolSearchSettings, UiSettings, load_mizar_config, load_mizar_config_isolated,
+    load_mizar_config_with_global, normalize_disabled_plugins, patch_settings_file,
+    persist_disabled_plugins, resolve_default_session_db_path, resolve_global_config_dir,
+    resolve_global_settings_path, resolve_project_config_dir,
 };
+#[cfg(feature = "router")]
+pub use config::{LlmRouteError, ResolvedLlmRouter};
 #[cfg(feature = "compaction")]
 pub use mizar_compaction::{
     CompactionConfig, CompactionContextExt, CompactionEndEvent, CompactionError, CompactionOutcome,
