@@ -2217,3 +2217,239 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
     ctx.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// 端到端回归测试：AgentLoop -> subscribe_session_events -> AppState -> render() / TrajectoryRuntime / --resume
+/// 覆盖 MaxSteps（不污染 session.log）与 FinishReason::MaxTokens 截断（⚠ 输出截断、step 提示、interrupted_steps=1）。
+#[tokio::test]
+async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::stream;
+    use mizar_llm::{
+        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, StreamChunk,
+        ToolCall,
+    };
+    use mizar_tui::terminal::ProgramStatusState;
+    use mizar_tui::{NoticeLevel, UiStepOutcome, UiTurnEndReason};
+
+    struct ScriptedEndStatesAdapter {
+        mode: Arc<AtomicUsize>,
+    }
+
+    impl LlmAdapter for ScriptedEndStatesAdapter {
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            let mode = self.mode.load(Ordering::SeqCst);
+            let chunks = if mode == 0 {
+                vec![
+                    Ok(StreamChunk::tool_call(
+                        0,
+                        ToolCall {
+                            id: "call-read-1".into(),
+                            name: "read".into(),
+                            arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                        },
+                    )),
+                    Ok(StreamChunk::Finish {
+                        reason: FinishReason::ToolCalls,
+                        replay: None,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamChunk::text("被 MaxTokens 截断的半截回答")),
+                    Ok(StreamChunk::Finish {
+                        reason: FinishReason::MaxTokens,
+                        replay: None,
+                    }),
+                ]
+            };
+            Box::pin(stream::iter(chunks))
+        }
+    }
+
+    let app_ctx = Context::new();
+    app_ctx.logger().set_silent();
+
+    let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = spine_cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    app_ctx.plugin(AgentSpinePlugin, spine_cfg);
+    wait_for_services(&app_ctx).await.unwrap();
+
+    let mode = Arc::new(AtomicUsize::new(0));
+    let _adapter_cleanup = app_ctx
+        .llm()
+        .unwrap()
+        .register_adapter(
+            "scripted-end-states",
+            Arc::new(ScriptedEndStatesAdapter {
+                mode: Arc::clone(&mode),
+            }),
+        )
+        .unwrap();
+
+    // 1. Phase A: MaxSteps (max_steps=1)
+    let session = app_ctx.sessions().unwrap().create(None);
+    let active_sid = Arc::new(RwLock::new(session.id.clone()));
+    let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+    let _handles = subscribe_session_events(&app_ctx, Arc::clone(&active_sid), tx.clone()).unwrap();
+
+    let mut state = AppState::new(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        session.id.clone(),
+        Vec::new(),
+        Some("scripted-end-states".into()),
+        None,
+        None,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    let max_steps_ret = app_ctx
+        .agent_loop()
+        .unwrap()
+        .run_with_options(
+            Arc::clone(&session),
+            "执行工具直至步数上限",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("scripted-end-states".into()),
+                max_steps: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        max_steps_ret.contains("max_steps=1"),
+        "expected max_steps return text, got: {max_steps_ret}"
+    );
+    tokio::task::yield_now().await;
+    while let Ok(ev) = rx.try_recv() {
+        state.apply_ui_event(ev);
+    }
+
+    assert_eq!(state.last_turn_end_reason, Some(UiTurnEndReason::MaxSteps));
+    assert_ne!(
+        state.last_program_status.as_ref().map(|(s, _)| *s),
+        Some(ProgramStatusState::Done)
+    );
+    assert!(state.items.iter().any(|item| matches!(
+        item,
+        ChatItem::Notice {
+            level: NoticeLevel::Warn,
+            text,
+        } if text.contains("步数上限")
+    )));
+    assert!(
+        !session.log().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Assistant { blocks, .. } if format!("{blocks:?}").contains("max_steps=1")
+        )),
+        "MaxSteps 提示不应作为 Assistant 消息写入 session.log()"
+    );
+
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let screen_a = buffer_text(terminal.backend());
+    assert!(
+        screen_a.contains("⚠ 步数上限"),
+        "expected ⚠ 步数上限 on screen:\n{screen_a}"
+    );
+    assert!(
+        !screen_a.contains("● 就绪"),
+        "MaxSteps must not render 就绪:\n{screen_a}"
+    );
+
+    // 2. Phase B: FinishReason::MaxTokens -> Truncated
+    let s2 = app_ctx.sessions().unwrap().create(None);
+    *active_sid.write().unwrap() = s2.id.clone();
+    state.reset_for_new_session(&s2.id, None);
+    mode.store(1, Ordering::SeqCst);
+
+    let trunc_ret = app_ctx
+        .agent_loop()
+        .unwrap()
+        .run_with_options(
+            Arc::clone(&s2),
+            "触发 MaxTokens 截断",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("scripted-end-states".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(trunc_ret, "被 MaxTokens 截断的半截回答");
+    tokio::task::yield_now().await;
+    while let Ok(ev) = rx.try_recv() {
+        state.apply_ui_event(ev);
+    }
+
+    assert_eq!(state.last_turn_end_reason, Some(UiTurnEndReason::Truncated));
+    assert_eq!(state.last_step_outcome, Some((1, UiStepOutcome::MaxTokens)));
+    assert_ne!(
+        state.last_program_status.as_ref().map(|(s, _)| *s),
+        Some(ProgramStatusState::Done)
+    );
+    assert!(state.items.iter().any(|item| matches!(
+        item,
+        ChatItem::Notice {
+            level: NoticeLevel::Warn,
+            text,
+        } if text.contains("第 1 步") && text.contains("max_tokens")
+    )));
+
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let screen_b = buffer_text(terminal.backend());
+    assert!(
+        screen_b.contains("⚠ 输出截断"),
+        "expected ⚠ 输出截断 on screen:\n{screen_b}"
+    );
+    assert!(
+        !screen_b.contains("● 就绪"),
+        "Truncated must not render 就绪:\n{screen_b}"
+    );
+
+    let traj = app_ctx.get::<TrajectoryRuntime>("trajectory").unwrap();
+    let report = traj.inspect(&s2.id, TimelineMode::Sequence).unwrap();
+    assert_eq!(
+        report.snapshot.stats.interrupted_steps, 1,
+        "FinishReason::MaxTokens step must increment stats.interrupted_steps"
+    );
+
+    // 3. Phase C: --resume projection (project_resume_view)
+    let view_a = project_resume_view(&session);
+    assert!(view_a.items.iter().any(|item| matches!(
+        item,
+        SessionReplayItem::Notice {
+            level: NoticeLevel::Warn,
+            text,
+        } if text.contains("max_steps=1")
+    )));
+    assert!(!view_a.items.iter().any(|item| matches!(
+        item,
+        SessionReplayItem::Assistant { blocks } if format!("{blocks:?}").contains("max_steps=1")
+    )));
+
+    let view_b = project_resume_view(&s2);
+    assert!(view_b.items.iter().any(|item| matches!(
+        item,
+        SessionReplayItem::Notice {
+            level: NoticeLevel::Warn,
+            text,
+        } if text.contains("max_tokens")
+    )));
+
+    drop(_handles);
+    drop(_adapter_cleanup);
+    app_ctx.fiber().dispose().await;
+}

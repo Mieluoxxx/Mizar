@@ -225,7 +225,9 @@ fn entry_to_trace_event(
                 summary: summary.clone(),
                 evidence: evidence.clone(),
             },
-            SessionTraceEvent::CompactionStart { .. } | SessionTraceEvent::CompactionEnd { .. } => {
+            SessionTraceEvent::CompactionStart { .. }
+            | SessionTraceEvent::CompactionEnd { .. }
+            | SessionTraceEvent::TurnNotice { .. } => {
                 return None;
             }
         },

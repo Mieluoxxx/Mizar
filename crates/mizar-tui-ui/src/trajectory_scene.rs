@@ -380,9 +380,14 @@ fn render_header(
         .map(|r| {
             let s = &r.snapshot.stats;
             let avg_ttft = s.ttft_ms.checked_div(s.ttft_steps).unwrap_or(0);
+            let interrupted = if s.interrupted_steps > 0 {
+                format!(" int:{}", s.interrupted_steps)
+            } else {
+                String::new()
+            };
             format!(
-                "turns:{} steps:{} tools:{} err:{} avgTTFT:{}ms",
-                s.turns, s.steps, s.tool_calls, s.tool_errors, avg_ttft
+                "turns:{} steps:{} tools:{} err:{}{} avgTTFT:{}ms",
+                s.turns, s.steps, s.tool_calls, s.tool_errors, interrupted, avg_ttft
             )
         })
         .unwrap_or_else(|| "暂无轨迹数据".to_string());

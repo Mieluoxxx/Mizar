@@ -351,3 +351,75 @@ fn r06_high_latency_respects_relaxed_default_thresholds() {
     assert_eq!(tool.evidence["durationMs"], 35_000);
     assert_eq!(tool.evidence["thresholdMs"], 30_000);
 }
+
+#[test]
+fn fold_trajectory_counts_max_tokens_as_interrupted_step() {
+    let events = vec![
+        ev(1, 1000, TraceEventKind::TurnStart { turn: 1 }),
+        ev(
+            2,
+            1000,
+            TraceEventKind::UserMessage {
+                text: "write a long essay".into(),
+            },
+        ),
+        ev(
+            3,
+            1010,
+            TraceEventKind::StepStart {
+                turn: 1,
+                step: 1,
+                system_prompt_chars: 100,
+                tools_count: 0,
+            },
+        ),
+        ev(4, 1050, TraceEventKind::FirstToken { turn: 1, step: 1 }),
+        ev(
+            5,
+            1500,
+            TraceEventKind::AssistantMessage {
+                text: "half answer".into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 100,
+                    ..Default::default()
+                }),
+            },
+        ),
+        ev(
+            6,
+            1500,
+            TraceEventKind::StepEnd {
+                turn: 1,
+                step: 1,
+                outcome: "max_tokens".into(),
+                usage: Some(TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 100,
+                    ..Default::default()
+                }),
+            },
+        ),
+        ev(
+            7,
+            1501,
+            TraceEventKind::TurnEnd {
+                turn: 1,
+                reason: "truncated".into(),
+            },
+        ),
+    ];
+
+    let snap = fold_trajectory("s-trunc", &events);
+    assert_eq!(snap.stats.turns, 1);
+    assert_eq!(snap.stats.steps, 1);
+    assert_eq!(snap.stats.interrupted_steps, 1);
+    assert_eq!(snap.turns.len(), 1);
+    assert_eq!(snap.turns[0].reason.as_deref(), Some("truncated"));
+    assert_eq!(
+        snap.turns[0].steps[0].outcome.as_deref(),
+        Some("max_tokens")
+    );
+}

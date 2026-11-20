@@ -136,7 +136,8 @@ pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySna
                     last_counted_turn = Some(*turn);
                     stats.turns += 1;
                 }
-                if outcome == "cancelled" || outcome.starts_with("error") {
+                if outcome == "cancelled" || outcome == "max_tokens" || outcome.starts_with("error")
+                {
                     stats.interrupted_steps += 1;
                 }
                 if let Some(turn_entry) = turns_map.get_mut(turn)

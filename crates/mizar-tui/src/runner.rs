@@ -19,7 +19,7 @@ use mizar_agent_loop::{
     EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
     EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
     EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
-    RunOptions, TurnEndReason,
+    RunOptions, StepOutcome, TurnEndReason,
 };
 use mizar_agent_spine::{
     CompactionContextExt, CompactionEndEvent, CompactionError, CompactionProgressEvent,
@@ -32,7 +32,7 @@ use mizar_llm::{ContentBlock, ImageAttachment, LlmContextExt, ReasoningEffort};
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_session::{
     Session, SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
-    SessionPersistenceContextExt,
+    SessionPersistenceContextExt, SessionTraceEvent, TraceSeverity,
 };
 use mizar_skills::{EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillRegistry};
 use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
@@ -47,7 +47,7 @@ use mizar_trajectory::{
 use mizar_tui_ui::app::{
     AppAction, AppState, ApprovalMode, LocalBashOutput, NoticeLevel, SessionReplayItem,
     SessionSelection, SessionViewData, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord,
-    UiTurnEndReason, short_id, truncate_display,
+    UiStepOutcome, UiTurnEndReason, short_id, truncate_display,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{
@@ -243,9 +243,22 @@ fn to_ui_status(status: AgentStatus) -> UiAgentStatus {
 fn to_ui_turn_end_reason(reason: TurnEndReason) -> UiTurnEndReason {
     match reason {
         TurnEndReason::Completed => UiTurnEndReason::Completed,
+        TurnEndReason::Truncated => UiTurnEndReason::Truncated,
         TurnEndReason::MaxSteps => UiTurnEndReason::MaxSteps,
         TurnEndReason::Cancelled => UiTurnEndReason::Cancelled,
         TurnEndReason::Error { message } => UiTurnEndReason::Error { message },
+    }
+}
+
+fn to_ui_step_outcome(outcome: &StepOutcome) -> UiStepOutcome {
+    match outcome {
+        StepOutcome::Completed => UiStepOutcome::Completed,
+        StepOutcome::ToolCalls => UiStepOutcome::ToolCalls,
+        StepOutcome::MaxTokens => UiStepOutcome::MaxTokens,
+        StepOutcome::Cancelled => UiStepOutcome::Cancelled,
+        StepOutcome::Error { message } => UiStepOutcome::Error {
+            message: message.clone(),
+        },
     }
 }
 
@@ -438,9 +451,24 @@ pub fn project_session_view(
                 cancelled,
                 exclude_from_context,
             }),
-            SessionEvent::ToolResultPrune { .. }
-            | SessionEvent::Selection { .. }
-            | SessionEvent::Trace { .. } => None,
+            SessionEvent::Trace { detail } => match detail {
+                SessionTraceEvent::TurnNotice { severity, text, .. } => {
+                    let level = match severity {
+                        TraceSeverity::Info => NoticeLevel::Info,
+                        TraceSeverity::Warn => NoticeLevel::Warn,
+                        TraceSeverity::Error => NoticeLevel::Error,
+                    };
+                    Some(SessionReplayItem::Notice { level, text })
+                }
+                SessionTraceEvent::TurnEnd { reason, .. } if reason == "truncated" => {
+                    Some(SessionReplayItem::Notice {
+                        level: NoticeLevel::Warn,
+                        text: "输出因达到 max_tokens 上限被截断，回复可能不完整".to_string(),
+                    })
+                }
+                _ => None,
+            },
+            SessionEvent::ToolResultPrune { .. } | SessionEvent::Selection { .. } => None,
         })
         .collect();
     SessionViewData {
@@ -676,7 +704,9 @@ pub fn subscribe_session_events(
         handles.push(ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
             if check(&ev.session.id) {
                 let _ = tx.send(UiEvent::StepEnd {
+                    step: ev.step,
                     ts_ms: ev.ts_ms,
+                    outcome: to_ui_step_outcome(&ev.outcome),
                     usage: ev.usage,
                 });
             }
@@ -1348,9 +1378,15 @@ fn process_ui_event(
     }
 
     if let UiEvent::RunFinished(ref res) = event {
-        let was_aborted =
-            *user_cancelled || res.as_ref().is_err_and(|e| e.contains("request aborted"));
+        let was_aborted = *user_cancelled
+            || res.as_ref().is_err_and(|e| e.contains("request aborted"))
+            || matches!(app.last_turn_end_reason, Some(UiTurnEndReason::Cancelled));
         let is_ok = res.is_ok();
+        let turn_completed = is_ok
+            && matches!(
+                app.last_turn_end_reason,
+                None | Some(UiTurnEndReason::Completed)
+            );
         *active_cancel = None;
         *user_cancelled = false;
         app.apply_ui_event(event);
@@ -1360,7 +1396,7 @@ fn process_ui_event(
             return steer.into_action();
         }
         if !was_aborted
-            && is_ok
+            && turn_completed
             && let Some(next) = app.dequeue_next()
         {
             if !next.images.is_empty() && !app.active_model_supports_images() {
@@ -1378,11 +1414,11 @@ fn process_ui_event(
                 images: next.images.into_iter().map(|(_, img)| img).collect(),
             };
         }
-        if !was_aborted && !is_ok && !app.queued_prompts.is_empty() {
+        if !was_aborted && !turn_completed && !app.queued_prompts.is_empty() {
             app.push_notice(
                 NoticeLevel::Warn,
                 format!(
-                    "上一轮未成功，已保留 {} 条排队消息",
+                    "上一轮未正常结束，已保留 {} 条排队消息",
                     app.queued_prompts.len()
                 ),
             );
@@ -1899,14 +1935,20 @@ async fn handle_action(
             if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
                 if let Some(report) = traj.inspect(&app.session_id, TimelineMode::Sequence) {
                     let s = &report.snapshot.stats;
+                    let interrupted = if s.interrupted_steps > 0 {
+                        format!(" | interrupted={}", s.interrupted_steps)
+                    } else {
+                        String::new()
+                    };
                     app.push_notice(
                         NoticeLevel::Info,
                         format!(
-                            "会话统计：turns={} | steps={} | tools={} (err={}) | tokens ↑{} ↓{} | avg TTFT={}ms | findings={}",
+                            "会话统计：turns={} | steps={} | tools={} (err={}){} | tokens ↑{} ↓{} | avg TTFT={}ms | findings={}",
                             s.turns,
                             s.steps,
                             s.tool_calls,
                             s.tool_errors,
+                            interrupted,
                             s.input_tokens,
                             s.output_tokens,
                             s.ttft_ms.checked_div(s.ttft_steps).unwrap_or(0),
@@ -3554,5 +3596,206 @@ mod tests {
 
         ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn to_ui_turn_end_and_step_outcome_preserve_truncation_variants() {
+        use super::*;
+        assert_eq!(
+            to_ui_turn_end_reason(TurnEndReason::Truncated),
+            UiTurnEndReason::Truncated
+        );
+        assert_eq!(
+            to_ui_step_outcome(&StepOutcome::MaxTokens),
+            UiStepOutcome::MaxTokens
+        );
+    }
+
+    #[test]
+    fn process_ui_event_retains_queued_prompts_after_max_steps_or_truncated() {
+        use super::*;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use mizar_tui_ui::app::ChatItem;
+
+        for (end_reason, step_outcome) in [
+            (UiTurnEndReason::MaxSteps, UiStepOutcome::ToolCalls),
+            (UiTurnEndReason::Truncated, UiStepOutcome::MaxTokens),
+        ] {
+            let mut app = AppState::new(
+                PathBuf::from("."),
+                "sess-queued-retain",
+                Vec::new(),
+                None,
+                None,
+                None,
+            );
+            let mut active_cancel = None;
+            let mut pending_steer = None;
+            let mut user_cancelled = false;
+
+            app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+            app.input.insert_str("next queued prompt");
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.queued_prompts.len(), 1);
+
+            process_ui_event(
+                &mut app,
+                &mut active_cancel,
+                &mut pending_steer,
+                &mut user_cancelled,
+                UiEvent::StepStart { ts_ms: 10 },
+            );
+            process_ui_event(
+                &mut app,
+                &mut active_cancel,
+                &mut pending_steer,
+                &mut user_cancelled,
+                UiEvent::StepEnd {
+                    step: 1,
+                    ts_ms: 20,
+                    outcome: step_outcome,
+                    usage: None,
+                },
+            );
+            process_ui_event(
+                &mut app,
+                &mut active_cancel,
+                &mut pending_steer,
+                &mut user_cancelled,
+                UiEvent::TurnEnd { reason: end_reason },
+            );
+
+            let action = process_ui_event(
+                &mut app,
+                &mut active_cancel,
+                &mut pending_steer,
+                &mut user_cancelled,
+                UiEvent::RunFinished(Ok("non-error return string".into())),
+            );
+            assert_eq!(action, AppAction::RefreshSidePanelData);
+            assert_eq!(app.queued_prompts.len(), 1);
+            assert_eq!(app.queued_prompts[0].text, "next queued prompt");
+            assert!(app.items.iter().any(|item| matches!(
+                item,
+                ChatItem::Notice {
+                    level: NoticeLevel::Warn,
+                    text,
+                } if text.contains("已保留 1 条排队消息")
+            )));
+        }
+
+        // 正常 Completed 时应继续自动出队下一条。
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-queued-complete",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let mut active_cancel = None;
+        let mut pending_steer = None;
+        let mut user_cancelled = false;
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.input.insert_str("auto dequeue me");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        process_ui_event(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::TurnEnd {
+                reason: UiTurnEndReason::Completed,
+            },
+        );
+        let action = process_ui_event(
+            &mut app,
+            &mut active_cancel,
+            &mut pending_steer,
+            &mut user_cancelled,
+            UiEvent::RunFinished(Ok("done".into())),
+        );
+        assert_eq!(action, AppAction::SubmitPrompt("auto dequeue me".into()));
+        assert!(app.queued_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_resume_view_maps_turn_notice_and_truncated_turn_end_to_notice_never_assistant()
+    {
+        use super::*;
+        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+
+        let ctx = Context::new();
+        ctx.logger().set_silent();
+        let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        if let AgentToolsMode::Coding {
+            ref mut mcp,
+            ref mut skills,
+            ref mut instructions,
+            ..
+        } = cfg.tools_mode
+        {
+            mcp.load_config_files = false;
+            skills.include_default_roots = false;
+            instructions.include_default_global = false;
+        }
+        ctx.plugin(AgentSpinePlugin, cfg);
+        wait_for_services(&ctx).await.unwrap();
+
+        let session = ctx.sessions().unwrap().create(None);
+        session.append(SessionEvent::user("hi"));
+        session.append_trace(SessionTraceEvent::TurnNotice {
+            turn: 1,
+            severity: TraceSeverity::Warn,
+            text: "Reached max steps (max_steps=2)".into(),
+        });
+        session.append_trace(SessionTraceEvent::TurnEnd {
+            turn: 1,
+            reason: "max_steps".into(),
+        });
+        session.append_trace(SessionTraceEvent::TurnEnd {
+            turn: 2,
+            reason: "truncated".into(),
+        });
+
+        assert!(
+            !session
+                .log()
+                .iter()
+                .any(|e| matches!(&e.event, SessionEvent::Assistant { .. })),
+            "TurnNotice 不得进入 session.log() 作为 Assistant 消息"
+        );
+        assert!(
+            !session
+                .derive_messages()
+                .iter()
+                .any(|m| format!("{m:?}").contains("Reached max steps")),
+            "TurnNotice 不得污染 derive_messages() 模型上下文"
+        );
+
+        let view = project_resume_view(&session);
+        assert!(
+            !view
+                .items
+                .iter()
+                .any(|i| matches!(i, SessionReplayItem::Assistant { .. })),
+            "重放条目中不应出现伪造的 Assistant"
+        );
+        assert!(view.items.iter().any(|i| matches!(
+            i,
+            SessionReplayItem::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            } if text == "Reached max steps (max_steps=2)"
+        )));
+        assert!(view.items.iter().any(|i| matches!(
+            i,
+            SessionReplayItem::Notice {
+                level: NoticeLevel::Warn,
+                text,
+            } if text.contains("max_tokens")
+        )));
+
+        ctx.fiber().dispose().await;
     }
 }

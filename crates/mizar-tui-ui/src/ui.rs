@@ -2223,22 +2223,31 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let is_bash = app.is_bash_running;
     let is_compacting = app.is_compacting;
     let spinner = BRAILLE_SPINNER[app.spinner_tick % BRAILLE_SPINNER.len()];
-    let status_text = if is_compacting {
+    let (status_text, status_color) = if is_compacting {
         let detail = app.compaction_status.as_deref().unwrap_or("上下文压缩中…");
-        format!("{spinner} {detail}")
+        (format!("{spinner} {detail}"), theme.info)
     } else if is_busy {
-        format!("{spinner} 运行中")
+        (format!("{spinner} 运行中"), theme.warning)
     } else if is_bash {
-        format!("{spinner} Bash")
+        (format!("{spinner} Bash"), theme.warning)
     } else {
-        "● 就绪".to_string()
-    };
-    let status_color = if is_compacting {
-        theme.info
-    } else if is_busy || is_bash {
-        theme.warning
-    } else {
-        theme.success
+        match &app.last_turn_end_reason {
+            None | Some(crate::app::UiTurnEndReason::Completed) => {
+                ("● 就绪".to_string(), theme.success)
+            }
+            Some(crate::app::UiTurnEndReason::Truncated) => {
+                ("⚠ 输出截断".to_string(), theme.warning)
+            }
+            Some(crate::app::UiTurnEndReason::MaxSteps) => {
+                ("⚠ 步数上限".to_string(), theme.warning)
+            }
+            Some(crate::app::UiTurnEndReason::Cancelled) => {
+                ("● 已中断".to_string(), theme.text_muted)
+            }
+            Some(crate::app::UiTurnEndReason::Error { .. }) => {
+                ("✗ 请求失败".to_string(), theme.error)
+            }
+        }
     };
 
     let model_label = app.active_model_label();
@@ -3410,5 +3419,94 @@ mod tests {
         // 12 行高以前会被 avail_h >= 6 的门槛整行吞掉。
         let screen = render_buffer_text(&mut app, 80, 12);
         assert!(screen.contains("队列(1)"), "screen:\n{screen}");
+    }
+
+    #[test]
+    fn status_bar_distinguishes_completed_truncated_max_steps_cancelled_and_error() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-status-bar",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+
+        let initial = render_buffer_text(&mut app, 120, 20);
+        assert!(initial.contains("● 就绪"), "initial screen:\n{initial}");
+
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: crate::app::UiTurnEndReason::Completed,
+        });
+        let completed = render_buffer_text(&mut app, 120, 20);
+        assert!(
+            completed.contains("● 就绪"),
+            "completed screen:\n{completed}"
+        );
+
+        app.apply_ui_event(UiEvent::StepEnd {
+            step: 1,
+            ts_ms: 100,
+            outcome: crate::app::UiStepOutcome::MaxTokens,
+            usage: None,
+        });
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: crate::app::UiTurnEndReason::Truncated,
+        });
+        let truncated = render_buffer_text(&mut app, 120, 20);
+        assert!(
+            truncated.contains("⚠ 输出截断"),
+            "truncated screen:\n{truncated}"
+        );
+        assert!(
+            !truncated.contains("● 就绪"),
+            "truncated should not show 就绪:\n{truncated}"
+        );
+
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: crate::app::UiTurnEndReason::MaxSteps,
+        });
+        let max_steps = render_buffer_text(&mut app, 120, 20);
+        assert!(
+            max_steps.contains("⚠ 步数上限"),
+            "max_steps screen:\n{max_steps}"
+        );
+        assert!(
+            !max_steps.contains("● 就绪"),
+            "max_steps should not show 就绪:\n{max_steps}"
+        );
+
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: crate::app::UiTurnEndReason::Cancelled,
+        });
+        let cancelled = render_buffer_text(&mut app, 120, 20);
+        assert!(
+            cancelled.contains("● 已中断"),
+            "cancelled screen:\n{cancelled}"
+        );
+        assert!(
+            !cancelled.contains("● 就绪"),
+            "cancelled should not show 就绪:\n{cancelled}"
+        );
+
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: crate::app::UiTurnEndReason::Error {
+                message: "boom".into(),
+            },
+        });
+        let errored = render_buffer_text(&mut app, 120, 20);
+        assert!(errored.contains("✗ 请求失败"), "error screen:\n{errored}");
+        assert!(
+            !errored.contains("● 就绪"),
+            "error should not show 就绪:\n{errored}"
+        );
+
+        app.apply_ui_event(UiEvent::TurnStart { turn: 2 });
+        let busy = render_buffer_text(&mut app, 120, 20);
+        assert!(busy.contains("运行中"), "busy screen:\n{busy}");
+        assert!(
+            !busy.contains("✗ 请求失败"),
+            "busy should clear prior error:\n{busy}"
+        );
     }
 }

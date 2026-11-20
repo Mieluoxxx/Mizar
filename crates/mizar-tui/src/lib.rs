@@ -14,9 +14,9 @@ pub mod emphasis {
 pub use mizar_tui_ui::{
     AppAction, AppState, ApprovalMode, ChatItem, EmphasisConfig, LaunchpadQuickAction, NoticeLevel,
     ScreenMode, SessionReplayItem, SessionSelection, SessionViewData, TerminalColors, Theme,
-    ThemePreset, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiTurnEndReason,
-    build_item_lines_for_scrollback, build_item_lines_for_scrollback_at,
-    build_welcome_lines_for_scrollback, render,
+    ThemePreset, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiStepOutcome,
+    UiTurnEndReason, build_item_lines_for_scrollback, build_item_lines_for_scrollback_at,
+    build_welcome_lines_for_scrollback, render, turn_end_program_status,
 };
 pub use mizar_tui_ui::{
     app, editor, markdown, overlay, reveal, selection, side_panel, terminal, theme, timeline_rail,
