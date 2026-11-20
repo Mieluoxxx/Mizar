@@ -29,12 +29,13 @@
 ```sh
 cargo check -p mizar-tui-ui     # 改 UI 的快速回路，秒级
 cargo check --workspace       # 全量；改跨 crate 枚举/字段必跑
-cargo test --workspace
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+cargo test --locked --workspace --no-fail-fast
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-CI 跑后三条，**clippy 的 warning 也算失败**。仓库**没有** xtask / rustfmt.toml / `tempfile` 依赖（`scripts/install.sh` 仅用于安装预编译二进制）。
+CI 跑后四条，**clippy 的 warning 也算失败**。仓库**没有** xtask / rustfmt.toml / `tempfile` 依赖（`scripts/install.sh` 仅用于安装预编译二进制）。
 
 ---
 
@@ -117,7 +118,7 @@ Verified:
 - **改 `mizar-tui-ui` 的枚举/结构体字段，`mizar-tui` 的构造点会一起断**。`OverlayKind` / `OverlayAction` / `UiEvent`
   横跨两个 crate，一次改完再跑 `cargo check --workspace`，别只 check 单个。
 - **feature 组合会漏编**。`mizar-agent-spine` 有 `legacy`/`coding`/`compaction`/`sqlite`/`trajectory`/`router`，
-  可选依赖的 `use` 必须配 `#[cfg(feature)]`。验最小组合：`cargo check -p mizar-agent-spine --no-default-features`。
+  可选依赖的 `use` 必须配 `#[cfg(feature)]`。验最小组合（含测试目标）：`cargo check --locked -p mizar-agent-spine --no-default-features --all-targets`。
 - **改 crate 结构 / `inject` / 服务名时，`docs/plugins.md` 的表格与拓扑图要同步改**，否则立刻过期。
 - **沙箱默认关闭**：`restrictToWorkspace` 默认 `false`，`bash` 能碰工作区外。别假设有隔离。
 - **本文件会被 `mizar-instructions` 加载**，预算 65 536 字节，写长了触发祖先淘汰或正文截断。

@@ -37,8 +37,8 @@ import Callout from '../../../components/mdx/Callout.astro';
 `mizar-agent-spine` 定义了六个可裁剪 feature：`legacy`、`coding`、`compaction`、`sqlite`、`trajectory` 与 `router`。任何来自可选依赖的 `use` 语句都必须配上精确的 `#[cfg(feature = "...")]`，否则裁剪特性时编译立刻中断。
 
 ```bash title="必须验证的最小 feature 门控与测试规范"
-# 验证全部可选 feature 关闭时依然能过编
-cargo check -p mizar-agent-spine --no-default-features
+# 验证全部可选 feature 关闭时，库和测试目标依然能过编
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
 ```
 
 编写测试时注意三条具体约定：

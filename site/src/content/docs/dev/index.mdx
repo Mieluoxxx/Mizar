@@ -48,11 +48,11 @@ Mizar 基于 **Rust 1.98.0**（edition 2024）构建，整个工作区由 **30 �
 # 修改 UI 时的秒级快检
 cargo check -p mizar-tui-ui
 
-# 验证最小 feature 裁剪组合不漏编译门控
-cargo check -p mizar-agent-spine --no-default-features
+# 验证最小 feature 组合（含测试目标）不漏编译门控
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
 
-# CI 完整检查（与仓库要求完全一致）
-cargo test --workspace
+# 其余 CI 检查
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --no-fail-fast
 ```
