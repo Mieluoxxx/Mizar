@@ -20,11 +20,12 @@ pub mod ui;
 
 pub use app::{
     AppAction, AppState, ApprovalMode, BashInputMode, ChatItem, LaunchpadQuickAction,
-    LocalBashOutput, NoticeLevel, QueuedPrompt, SessionReplayItem, SessionSelection,
-    SessionViewData, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord, UiStepOutcome,
-    UiTurnEndReason, turn_end_program_status,
+    LocalBashOutput, NoticeLevel, PendingSettingsModelPick, QueuedPrompt, SessionReplayItem,
+    SessionSelection, SessionViewData, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord,
+    UiStepOutcome, UiTurnEndReason, turn_end_program_status,
 };
 pub use emphasis::EmphasisConfig;
+pub use overlay::SessionPickerItem;
 pub use terminal::ScreenMode;
 pub use theme::{TerminalColors, Theme, ThemePreset};
 pub use tps::{TpsLedger, estimate_tokens_fraction};

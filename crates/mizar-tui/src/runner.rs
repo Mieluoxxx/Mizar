@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
 use cordis::{
     BoxFuture, Cleanup, Context, CordisError, DisposableHandle, LogLevel, LogRecord, LogSink, Next,
 };
@@ -24,16 +25,19 @@ use mizar_agent_loop::{
 use mizar_agent_spine::{
     CompactionContextExt, CompactionEndEvent, CompactionError, CompactionProgressEvent,
     CompactionStartEvent, CompactionTrigger, EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS,
-    EVENT_COMPACTION_START, ManualCompactOptions, SpinePluginsContextExt, patch_settings_file,
-    persist_disabled_plugins, resolve_global_settings_path, strip_summary_wrapper,
+    EVENT_COMPACTION_START, ManualCompactOptions, SpinePluginsContextExt,
+    normalize_session_title_thinking_level, patch_settings_file, persist_disabled_plugins,
+    resolve_global_settings_path, strip_summary_wrapper,
 };
 use mizar_instructions::AgentInstructions;
 use mizar_llm::{ContentBlock, ImageAttachment, LlmContextExt, ReasoningEffort, TokenUsage};
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_session::{
-    Session, SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
-    SessionPersistenceContextExt, SessionTraceEvent, TraceSeverity,
+    EVENT_SESSION_TITLE_UPDATED, Session, SessionContextExt, SessionCreateOptions, SessionEvent,
+    SessionListQuery, SessionPersistenceContextExt, SessionStore, SessionTitleUpdatedPayload,
+    SessionTraceEvent, TraceSeverity,
 };
+use mizar_session_title::{SessionTitleContextExt, parse_model_ref};
 use mizar_skills::{EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillRegistry};
 use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_tools::{
@@ -52,7 +56,8 @@ use mizar_tui_ui::app::{
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{
-    ApprovalDecision, SessionTreeEntry, SettingEntry, SettingItemKind, SkillPickerItem,
+    ApprovalDecision, SessionPickerItem, SessionTreeEntry, SettingEntry, SettingItemKind,
+    SkillPickerItem,
 };
 use mizar_tui_ui::side_panel::{
     FileTouchRow, InstructionSummaryRow, McpSummaryRow, ToolSummaryRow,
@@ -83,6 +88,7 @@ async fn poll_term_event(stream: Option<&mut EventStream>) -> Option<std::io::Re
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeTarget {
+    Picker,
     LatestInWorkspace,
     Id(String),
 }
@@ -1223,7 +1229,7 @@ pub fn subscribe_session_events(
     }
     {
         let tx = tx.clone();
-        let check = is_current;
+        let check = is_current.clone();
         handles.push(
             ctx.on(EVENT_COMPACTION_END, move |ev: &CompactionEndEvent| {
                 if check(&ev.session_id) {
@@ -1241,8 +1247,77 @@ pub fn subscribe_session_events(
             })?,
         );
     }
+    {
+        let tx = tx.clone();
+        let check = is_current;
+        handles.push(ctx.on(
+            EVENT_SESSION_TITLE_UPDATED,
+            move |ev: &SessionTitleUpdatedPayload| {
+                if check(&ev.session.id) {
+                    let _ = tx.send(UiEvent::SessionTitleUpdated(ev.title.clone()));
+                }
+            },
+        )?);
+    }
 
     Ok(handles)
+}
+
+fn format_cwd_tail(raw: Option<&str>) -> String {
+    let Some(cwd) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "-".to_string();
+    };
+    let segs: Vec<&str> = cwd.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    match segs.len() {
+        0 => cwd.to_string(),
+        1 => segs[0].to_string(),
+        n => {
+            let two = format!("{}/{}", segs[n - 2], segs[n - 1]);
+            if two.chars().count() <= 20 {
+                two
+            } else {
+                segs[n - 1].to_string()
+            }
+        }
+    }
+}
+
+fn format_session_updated_at(ms: u128) -> String {
+    i64::try_from(ms)
+        .ok()
+        .filter(|&v| v > 0)
+        .and_then(DateTime::from_timestamp_millis)
+        .map(|utc| utc.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// 仅通过 `list_headers` 轻量查询非空历史会话列表用于 `/resume` 选择器（不加载事件日志）。
+pub fn collect_session_picker_items(sessions: &SessionStore) -> Vec<SessionPickerItem> {
+    sessions
+        .list_headers(&SessionListQuery {
+            cwd: None,
+            limit: Some(100),
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| h.event_count > 0)
+        .map(|h| {
+            let title = h
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("(无标题 #{})", short_id(&h.id)));
+            SessionPickerItem {
+                title,
+                cwd_tail: format_cwd_tail(h.cwd.as_deref()),
+                event_count: h.event_count,
+                updated_at: format_session_updated_at(h.updated_at_ms),
+                session_id: h.id,
+            }
+        })
+        .collect()
 }
 
 /// 等待 `agentLoop`、`sessions`、`llm` 核心服务以及所有已挂载插件就绪（消除异步挂载竞态）。
@@ -1290,7 +1365,12 @@ pub async fn run_tui_with_summary(
     wait_for_services(&ctx).await?;
     let sessions = ctx.sessions()?;
     let mut resume_notice: Option<(NoticeLevel, String)> = None;
+    let mut startup_picker_items: Option<Vec<SessionPickerItem>> = None;
     let (initial_session, resumed) = match &config.resume_session {
+        Some(ResumeTarget::Picker) => {
+            startup_picker_items = Some(collect_session_picker_items(&sessions));
+            (sessions.create(None), false)
+        }
         Some(ResumeTarget::Id(target_id)) => {
             if let Some(found) = sessions.get(target_id) {
                 (found, true)
@@ -1395,6 +1475,13 @@ pub async fn run_tui_with_summary(
     }
     if let Some((lvl, msg)) = resume_notice {
         app.push_notice(lvl, msg);
+    }
+    if let Some(items) = startup_picker_items {
+        if items.is_empty() {
+            app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话，已开启新会话");
+        } else {
+            app.overlay.open_session_picker(items);
+        }
     }
     app.user_skill_names = collect_user_skill_names(&ctx, &config.workspace).await;
     {
@@ -2209,6 +2296,69 @@ async fn handle_action(
                 populate_side_panel_data(ctx, app).await;
             }
         }
+        AppAction::OpenSessionPicker => {
+            if let Ok(sessions) = ctx.sessions() {
+                let items = collect_session_picker_items(&sessions);
+                if items.is_empty() {
+                    app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
+                } else {
+                    app.overlay.open_session_picker(items);
+                }
+            } else {
+                app.push_notice(NoticeLevel::Warn, "sessions 服务未就绪");
+            }
+        }
+        AppAction::ResumeSession(target_id) => {
+            *pending_steer = None;
+            *user_cancelled = false;
+            if let Some(cancel) = active_cancel.take() {
+                cancel.cancel();
+            }
+            let _ =
+                resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
+                    .await;
+        }
+        AppAction::RenameSession(title_arg) => {
+            if let Some(new_title) = title_arg {
+                if active_session.set_title(new_title.clone()) {
+                    app.session_title = active_session.header().title;
+                    app.set_flash(format!("✓ 会话标题已重命名为：{new_title}"));
+                    app.push_notice(NoticeLevel::Info, format!("会话标题已更新为：{new_title}"));
+                } else {
+                    app.push_notice(NoticeLevel::Warn, "标题未变化或为空，未做修改");
+                }
+            } else {
+                let Ok(st) = ctx.session_title() else {
+                    app.push_notice(
+                        NoticeLevel::Warn,
+                        "session-title 服务未启用（可在 /settings 中开启）",
+                    );
+                    return;
+                };
+                let session = Arc::clone(active_session);
+                let provider = app.provider.clone();
+                let model = app.model.clone();
+                let tx = ui_tx.clone();
+                app.set_flash("正在重新生成会话标题…");
+                tokio::spawn(async move {
+                    match st.regenerate_now(session, provider, model).await {
+                        Ok(new_title) => {
+                            let _ = tx.send(UiEvent::Flash(format!("✓ 标题已生成：{new_title}")));
+                            let _ = tx.send(UiEvent::Notice {
+                                level: NoticeLevel::Info,
+                                text: format!("会话标题已重新生成为：{new_title}"),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiEvent::Notice {
+                                level: NoticeLevel::Warn,
+                                text: format!("无法重新生成会话标题：{err}"),
+                            });
+                        }
+                    }
+                });
+            }
+        }
         AppAction::SubmitPrompt(prompt) => {
             if prompt.contains('@')
                 && !app.active_model_supports_images()
@@ -2585,6 +2735,7 @@ async fn handle_action(
             app.open_session_tree_with(project_session_tree(active_session));
         }
         AppAction::OpenSettings(initial_query) => {
+            app.pending_settings_model_pick = None;
             let items = build_settings_entries(ctx, app);
             let save_hint = resolve_global_settings_path()
                 .map(|p| p.display().to_string())
@@ -2743,6 +2894,51 @@ async fn handle_action(
     }
 }
 
+/// 在已运行的 TUI 状态上切换到指定历史会话（`/resume` 选择器与 `--resume` 共用投影与路由恢复）。
+pub async fn resume_session_into_app(
+    ctx: &Context,
+    config: &TuiConfig,
+    app: &mut AppState,
+    active_session: &mut Arc<Session>,
+    active_sid: &Arc<RwLock<String>>,
+    target_id: &str,
+) -> bool {
+    let Ok(sessions) = ctx.sessions() else {
+        app.push_notice(NoticeLevel::Warn, "sessions 服务未就绪");
+        return false;
+    };
+    let Some(next) = sessions.get(target_id) else {
+        app.push_notice(NoticeLevel::Warn, format!("未找到历史会话 `{target_id}`"));
+        return false;
+    };
+    app.pending_settings_model_pick = None;
+    *active_sid.write().unwrap() = next.id.clone();
+
+    let sources = SelectionSources {
+        model_from_env: config.model_from_env,
+        model_from_settings: config.model_from_settings,
+        reasoning_effort_from_settings: config.reasoning_effort_from_settings,
+        startup: SessionSelection {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort,
+        },
+        session: next.latest_selection().map(to_ui_selection),
+        latest_workspace: None,
+    };
+    if let Some(resolved) = resolve_selection(&sources, true) {
+        app.provider = resolved.provider;
+        app.model = resolved.model;
+        app.reasoning_effort = resolved.reasoning_effort;
+    }
+
+    app.restore_session_view(project_resume_view(&next));
+    *active_session = next;
+    populate_side_panel_data(ctx, app).await;
+    app.set_flash(format!("✓ 已恢复会话 ({})", short_id(target_id)));
+    true
+}
+
 fn choice_index(options: &[&str], current: &str) -> usize {
     options
         .iter()
@@ -2771,7 +2967,7 @@ fn parse_soft_window_cap_label(label: &str) -> u64 {
     }
 }
 
-fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry> {
+pub fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry> {
     let theme_opts = [
         "auto",
         "mist-dark",
@@ -2957,6 +3153,42 @@ fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry> {
         ]);
     }
 
+    if let Ok(st) = ctx.session_title() {
+        let cfg = st.config();
+        let thinking_opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        let current_thinking = cfg.reasoning_effort.unwrap_or(ReasoningEffort::Low);
+        let current_thinking_str = format!("{current_thinking:?}").to_lowercase();
+        items.extend([
+            SettingEntry {
+                key: "sessionTitle.enabled".into(),
+                category: "会话标题".into(),
+                label: "自动生成会话标题".into(),
+                description: "首轮输入及周期性自动概括会话主题，人工改名后不自动覆盖".into(),
+                kind: SettingItemKind::Toggle { value: cfg.enabled },
+            },
+            SettingEntry {
+                key: "sessionTitle.model".into(),
+                category: "会话标题".into(),
+                label: "标题生成模型".into(),
+                description: "指定生成会话标题所用模型（Enter 选择，← 恢复跟随会话模型）".into(),
+                kind: SettingItemKind::Model {
+                    provider: cfg.provider,
+                    model: cfg.model,
+                },
+            },
+            SettingEntry {
+                key: "sessionTitle.thinkingLevel".into(),
+                category: "会话标题".into(),
+                label: "标题生成思考强度".into(),
+                description: "控制后台生成标题时的推理强度，默认 low 兼顾速度与成本".into(),
+                kind: SettingItemKind::Choice {
+                    options: thinking_opts.iter().map(|s| s.to_string()).collect(),
+                    selected: choice_index(&thinking_opts, &current_thinking_str),
+                },
+            },
+        ]);
+    }
+
     if let Ok(plugins) = ctx.spine_plugins() {
         for module in plugins.optional_modules() {
             items.push(SettingEntry {
@@ -3080,27 +3312,51 @@ async fn apply_host_setting_change(
                 populate_side_panel_data(ctx, app).await;
             }
         }
-        k if k.starts_with("compaction.") => {
-            if let Ok(comp) = ctx.compaction() {
-                let flag = value == "true";
-                comp.update_config(|cfg| match k {
-                    "compaction.enabled" => cfg.enabled = flag,
-                    "compaction.autoPrune" => cfg.auto_prune = flag,
-                    "compaction.autoCompact" => cfg.auto_compact = flag,
-                    "compaction.reusePrefixCache" => cfg.reuse_prefix_cache = flag,
-                    "compaction.disableSummaryReasoning" => cfg.disable_summary_reasoning = flag,
-                    "compaction.enableReadDedup" => cfg.enable_read_dedup = flag,
-                    "compaction.enableWriteAfterCompactGuard" => {
-                        cfg.enable_write_after_compact_guard = flag
-                    }
-                    "compaction.softWindowCap" => {
-                        cfg.soft_window_cap = parse_soft_window_cap_label(value)
-                    }
-                    _ => {}
-                });
-            }
+        k if k.starts_with("compaction.") || k.starts_with("sessionTitle.") => {
+            apply_runtime_setting_change(ctx, key, value);
         }
         _ => {}
+    }
+}
+
+/// 运行期热更新与终端实例无关的模块配置（`compaction.*`、`sessionTitle.*`）。
+pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
+    if key.starts_with("compaction.")
+        && let Ok(comp) = ctx.compaction()
+    {
+        let flag = value == "true";
+        comp.update_config(|cfg| match key {
+            "compaction.enabled" => cfg.enabled = flag,
+            "compaction.autoPrune" => cfg.auto_prune = flag,
+            "compaction.autoCompact" => cfg.auto_compact = flag,
+            "compaction.reusePrefixCache" => cfg.reuse_prefix_cache = flag,
+            "compaction.disableSummaryReasoning" => cfg.disable_summary_reasoning = flag,
+            "compaction.enableReadDedup" => cfg.enable_read_dedup = flag,
+            "compaction.enableWriteAfterCompactGuard" => {
+                cfg.enable_write_after_compact_guard = flag
+            }
+            "compaction.softWindowCap" => cfg.soft_window_cap = parse_soft_window_cap_label(value),
+            _ => {}
+        });
+    } else if key.starts_with("sessionTitle.")
+        && let Ok(st) = ctx.session_title()
+    {
+        st.update_config(|cfg| match key {
+            "sessionTitle.enabled" => cfg.enabled = value == "true",
+            "sessionTitle.model" => {
+                if let Some((provider, model)) = parse_model_ref(value) {
+                    cfg.provider = provider;
+                    cfg.model = Some(model);
+                } else {
+                    cfg.provider = None;
+                    cfg.model = None;
+                }
+            }
+            "sessionTitle.thinkingLevel" => {
+                cfg.reasoning_effort = Some(normalize_session_title_thinking_level(Some(value)));
+            }
+            _ => {}
+        });
     }
 }
 
@@ -3124,7 +3380,12 @@ fn upsert_nested_json(
 fn persist_setting_change(key: &str, value: &str) -> Result<(), String> {
     let path = resolve_global_settings_path()
         .ok_or_else(|| "无法解析 ~/.mizar/settings.json 路径".to_string())?;
-    patch_settings_file(&path, |root| match key {
+    persist_setting_change_to(&path, key, value)
+}
+
+/// 将单条设置原子写入指定的 `settings.json` 文件。
+pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    patch_settings_file(path, |root| match key {
         "reasoningEffort" => {
             if value == "default" {
                 root.remove("reasoningEffort");
@@ -3188,6 +3449,33 @@ fn persist_setting_change(key: &str, value: &str) -> Result<(), String> {
             "compaction",
             field,
             serde_json::Value::Bool(value == "true"),
+        ),
+        "sessionTitle.enabled" => upsert_nested_json(
+            root,
+            "sessionTitle",
+            "enabled",
+            serde_json::Value::Bool(value == "true"),
+        ),
+        "sessionTitle.model" => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                if let Some(obj) = root.get_mut("sessionTitle").and_then(|v| v.as_object_mut()) {
+                    obj.remove("model");
+                }
+            } else {
+                upsert_nested_json(
+                    root,
+                    "sessionTitle",
+                    "model",
+                    serde_json::Value::String(trimmed.to_string()),
+                );
+            }
+        }
+        "sessionTitle.thinkingLevel" => upsert_nested_json(
+            root,
+            "sessionTitle",
+            "thinkingLevel",
+            serde_json::Value::String(value.trim().to_ascii_lowercase()),
         ),
         _ => {}
     })

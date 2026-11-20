@@ -22,8 +22,8 @@ use crate::emphasis::EmphasisConfig;
 use crate::markdown::RenderedLine;
 use crate::mentions::{FILE_MENTIONS_SOURCE, format_mention_replacement};
 use crate::overlay::{
-    ApprovalDecision, OverlayAction, OverlayKind, OverlayState, SessionTreeEntry,
-    WorkspaceFileCache,
+    ApprovalDecision, OverlayAction, OverlayKind, OverlayState, SessionTreeEntry, SettingEntry,
+    SettingItemKind, WorkspaceFileCache,
 };
 use crate::reveal::{RevealController, RevealSlot};
 use crate::selection::{
@@ -330,6 +330,7 @@ pub enum UiEvent {
         text: String,
     },
     UserSkillsUpdated(Vec<String>),
+    SessionTitleUpdated(Option<String>),
     ToolsUpdated,
     Log(UiLogRecord),
     RunFinished(Result<String, String>),
@@ -384,6 +385,16 @@ pub struct QueuedPrompt {
     pub images: Vec<(String, ImageAttachment)>,
 }
 
+/// 从 `/settings` 暂跳到 `ModelPicker` 选择配置项模型时保存的现场（避免污染当前会话活跃模型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSettingsModelPick {
+    pub setting_key: String,
+    pub items: Vec<SettingEntry>,
+    pub query: String,
+    pub selected: usize,
+    pub save_path_hint: String,
+}
+
 /// UI 层处理按键/提交后需要 Runner 执行的外部动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
@@ -406,6 +417,9 @@ pub enum AppAction {
     CancelRun,
     CompactSession(Option<String>),
     NewSession,
+    OpenSessionPicker,
+    ResumeSession(String),
+    RenameSession(Option<String>),
     ShowStats,
     ShowSessionInfo,
     ShowTools,
@@ -508,6 +522,7 @@ pub struct AppState {
     pub hovered_rail_row: Option<u16>,
     pub trajectory_scene: TrajectorySceneState,
     pub overlay: OverlayState,
+    pub pending_settings_model_pick: Option<PendingSettingsModelPick>,
     pub file_cache: WorkspaceFileCache,
     dismissed_mention: Option<(usize, String)>,
 
@@ -603,6 +618,7 @@ impl AppState {
             hovered_rail_row: None,
             trajectory_scene: TrajectorySceneState::default(),
             overlay: OverlayState::default(),
+            pending_settings_model_pick: None,
             file_cache: WorkspaceFileCache::default(),
             dismissed_mention: None,
             terminal_focused: true,
@@ -818,6 +834,7 @@ impl AppState {
     }
 
     pub fn open_model_selector(&mut self) -> AppAction {
+        self.pending_settings_model_pick = None;
         if self.providers.iter().any(|p| !p.models.is_empty()) {
             let current_hint = match (self.provider.as_deref(), self.model.as_deref()) {
                 (Some(p), Some(m)) => Some(format!("{p}/{m}")),
@@ -1180,6 +1197,9 @@ impl AppState {
             UiEvent::UserSkillsUpdated(names) => {
                 self.user_skill_names = names;
             }
+            UiEvent::SessionTitleUpdated(title) => {
+                self.session_title = title;
+            }
             UiEvent::ToolsUpdated => {}
             UiEvent::Log(record) => {
                 let level = match record.level {
@@ -1449,11 +1469,25 @@ impl AppState {
         match action {
             OverlayAction::None => AppAction::None,
             OverlayAction::Close => {
-                if let Some(OverlayKind::FileMention {
-                    token_start, query, ..
-                }) = self.overlay.active.take()
-                {
-                    self.dismissed_mention = Some((token_start, query));
+                if let Some(closed) = self.overlay.active.take() {
+                    match closed {
+                        OverlayKind::FileMention {
+                            token_start, query, ..
+                        } => {
+                            self.dismissed_mention = Some((token_start, query));
+                        }
+                        OverlayKind::ModelPicker { .. } => {
+                            if let Some(pending) = self.pending_settings_model_pick.take() {
+                                self.overlay.active = Some(OverlayKind::SettingsModal {
+                                    items: pending.items,
+                                    query: pending.query,
+                                    selected: pending.selected,
+                                    save_path_hint: pending.save_path_hint,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 AppAction::None
             }
@@ -1498,14 +1532,48 @@ impl AppState {
                 AppAction::None
             }
             OverlayAction::SelectModel { provider, model } => {
-                self.overlay.active = None;
-                self.provider = Some(provider);
-                self.model = Some(model);
-                self.push_notice(
-                    NoticeLevel::Info,
-                    format!("已切换后续请求模型为：{}", self.active_model_label()),
-                );
-                AppAction::None
+                if let Some(mut pending) = self.pending_settings_model_pick.take() {
+                    let (next_p, next_m, raw_val, flash_val) = if model.trim().is_empty() {
+                        (None, None, String::new(), "跟随会话模型".to_string())
+                    } else if provider.trim().is_empty() {
+                        (None, Some(model.clone()), model.clone(), model)
+                    } else {
+                        let combined = format!("{provider}/{model}");
+                        (Some(provider), Some(model), combined.clone(), combined)
+                    };
+                    if let Some(item) = pending
+                        .items
+                        .iter_mut()
+                        .find(|it| it.key == pending.setting_key)
+                        && let SettingItemKind::Model {
+                            provider: ref mut p_slot,
+                            model: ref mut m_slot,
+                        } = item.kind
+                    {
+                        *p_slot = next_p;
+                        *m_slot = next_m;
+                    }
+                    self.overlay.active = Some(OverlayKind::SettingsModal {
+                        items: pending.items,
+                        query: pending.query,
+                        selected: pending.selected,
+                        save_path_hint: pending.save_path_hint,
+                    });
+                    self.set_flash(format!("✓ 已更新 {} = {flash_val}", pending.setting_key));
+                    AppAction::ApplySetting {
+                        key: pending.setting_key,
+                        value: raw_val,
+                    }
+                } else {
+                    self.overlay.active = None;
+                    self.provider = Some(provider);
+                    self.model = Some(model);
+                    self.push_notice(
+                        NoticeLevel::Info,
+                        format!("已切换后续请求模型为：{}", self.active_model_label()),
+                    );
+                    AppAction::None
+                }
             }
             OverlayAction::SelectEffort(effort) => {
                 self.overlay.active = None;
@@ -1537,6 +1605,15 @@ impl AppState {
                 self.input.set_text_end(&format!("/{skill_name} "));
                 AppAction::None
             }
+            OverlayAction::SelectSession(session_id) => {
+                self.overlay.active = None;
+                if self.is_busy || self.is_bash_running || self.is_compacting {
+                    self.push_notice(NoticeLevel::Warn, "请先等待或中断当前任务后再切换会话");
+                    AppAction::None
+                } else {
+                    AppAction::ResumeSession(session_id)
+                }
+            }
             OverlayAction::ForkSessionAtSeq(seq) => {
                 self.overlay.active = None;
                 if self.is_busy {
@@ -1545,6 +1622,44 @@ impl AppState {
                 } else {
                     AppAction::ForkSessionAtSeq(seq)
                 }
+            }
+            OverlayAction::OpenSettingModelPicker { key } => {
+                if !self.providers.iter().any(|p| !p.models.is_empty()) {
+                    self.push_notice(NoticeLevel::Warn, "当前没有可用的模型路由列表");
+                    return AppAction::None;
+                }
+                if let Some(OverlayKind::SettingsModal {
+                    items,
+                    query,
+                    selected,
+                    save_path_hint,
+                }) = self.overlay.active.take()
+                {
+                    let current_hint =
+                        items
+                            .iter()
+                            .find(|it| it.key == key)
+                            .and_then(|it| match &it.kind {
+                                SettingItemKind::Model {
+                                    provider: Some(p),
+                                    model: Some(m),
+                                } if !p.is_empty() && !m.is_empty() => Some(format!("{p}/{m}")),
+                                SettingItemKind::Model { model: Some(m), .. } if !m.is_empty() => {
+                                    Some(m.clone())
+                                }
+                                _ => None,
+                            });
+                    self.pending_settings_model_pick = Some(PendingSettingsModelPick {
+                        setting_key: key,
+                        items,
+                        query,
+                        selected,
+                        save_path_hint,
+                    });
+                    self.overlay
+                        .open_setting_model_picker(&self.providers, current_hint.as_deref());
+                }
+                AppAction::None
             }
             OverlayAction::UpdateSetting { key, value } => {
                 if key.starts_with("plugin.") {
@@ -1712,6 +1827,7 @@ impl AppState {
                         decision: ApprovalDecision::Deny,
                     });
                 }
+                self.pending_settings_model_pick = None;
                 self.overlay.active = None;
                 return AppAction::None;
             }
@@ -2198,6 +2314,7 @@ impl AppState {
     ) {
         self.session_id = session_id.into();
         self.session_title = session_title;
+        self.pending_settings_model_pick = None;
         self.items.clear();
         self.tool_extras.clear();
         self.item_cache.clear();
@@ -2899,6 +3016,25 @@ impl AppState {
                     AppAction::CompactSession(arg.map(ToString::to_string))
                 }
             }
+            "resume" => {
+                if self.is_busy || self.is_bash_running || self.is_compacting {
+                    self.push_notice(
+                        NoticeLevel::Warn,
+                        "当前已有任务正在运行，请等待完成或按 Esc 取消后再切换会话",
+                    );
+                    AppAction::None
+                } else {
+                    match arg.map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(session_id) => AppAction::ResumeSession(session_id.to_string()),
+                        None => AppAction::OpenSessionPicker,
+                    }
+                }
+            }
+            "rename" => AppAction::RenameSession(
+                arg.map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string),
+            ),
             "export" => AppAction::ExportTrajectory(arg.map(PathBuf::from)),
             _ => AppAction::None,
         }
@@ -2913,6 +3049,8 @@ fn is_builtin_slash_cmd(cmd: &str) -> bool {
             | "q"
             | "help"
             | "h"
+            | "resume"
+            | "rename"
             | "settings"
             | "config"
             | "tools"
@@ -5411,5 +5549,170 @@ mod tests {
         assert_eq!(app.total_usage, restored_usage);
         assert_eq!(app.last_prompt_tokens, Some(2_400));
         assert_eq!(app.side_panel_data.context.last_prompt_tokens, Some(2_400));
+    }
+
+    fn test_providers() -> Vec<ProviderInfo> {
+        vec![ProviderInfo {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            protocol: "openai-responses".into(),
+            models: vec![
+                ModelInfo {
+                    id: "gpt-5".into(),
+                    name: "GPT-5".into(),
+                    context_window: Some(128_000),
+                    max_tokens: Some(16_384),
+                    reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                    input: Vec::new(),
+                },
+                ModelInfo {
+                    id: "gpt-4o-mini".into(),
+                    name: "GPT-4o Mini".into(),
+                    context_window: Some(128_000),
+                    max_tokens: Some(4_096),
+                    reasoning_efforts: vec![ReasoningEffort::Low],
+                    input: Vec::new(),
+                },
+            ],
+        }]
+    }
+
+    #[test]
+    fn settings_model_picker_does_not_mutate_active_session_model_and_esc_restores_row() {
+        let mut app = AppState::new(
+            PathBuf::from("/tmp/ws"),
+            "s-model-pick",
+            test_providers(),
+            Some("openai".into()),
+            Some("gpt-5".into()),
+            Some(ReasoningEffort::Medium),
+        );
+
+        // 打开包含 2 行（第 1 行为 Model 类型）的设置中心并选中第 1 行
+        app.overlay.open_settings(
+            vec![
+                SettingEntry {
+                    key: "sessionTitle.enabled".into(),
+                    category: "会话标题".into(),
+                    label: "自动生成标题".into(),
+                    description: "开关".into(),
+                    kind: SettingItemKind::Toggle { value: true },
+                },
+                SettingEntry {
+                    key: "sessionTitle.model".into(),
+                    category: "会话标题".into(),
+                    label: "标题生成模型".into(),
+                    description: "选择生成会话标题所用模型".into(),
+                    kind: SettingItemKind::Model {
+                        provider: None,
+                        model: None,
+                    },
+                },
+            ],
+            None,
+            "~/.mizar/settings.json".into(),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        // 按 Enter 打开模型选择器
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert!(app.pending_settings_model_pick.is_some());
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::ModelPicker { .. })
+        ));
+
+        // Esc 取消：恢复回设置中心第 1 行，且不改当前会话模型也不下发 ApplySetting
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert!(app.pending_settings_model_pick.is_none());
+        assert_eq!(app.provider.as_deref(), Some("openai"));
+        assert_eq!(app.model.as_deref(), Some("gpt-5"));
+        match &app.overlay.active {
+            Some(OverlayKind::SettingsModal { selected, .. }) => assert_eq!(*selected, 1),
+            _ => panic!("expected SettingsModal restored on Esc"),
+        }
+
+        // 再次 Enter 进入 ModelPicker：第 0 项为 跟随会话模型，向下 2 次选到 openai/gpt-4o-mini
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            act,
+            AppAction::ApplySetting {
+                key: "sessionTitle.model".into(),
+                value: "openai/gpt-4o-mini".into(),
+            }
+        );
+        // 关键不变量：AppState.provider / model 仍保持会话原值不变
+        assert_eq!(app.provider.as_deref(), Some("openai"));
+        assert_eq!(app.model.as_deref(), Some("gpt-5"));
+        // 且 SettingsModal 已还原并停留原行，值已更新
+        match &app.overlay.active {
+            Some(OverlayKind::SettingsModal {
+                items, selected, ..
+            }) => {
+                assert_eq!(*selected, 1);
+                assert_eq!(items[1].display_value(), "openai/gpt-4o-mini");
+            }
+            _ => panic!("expected SettingsModal restored after pick"),
+        }
+
+        // 关闭设置框，普通 Ctrl+L 选模型应正常修改 AppState.provider / model
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.open_model_selector();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let normal_act = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(normal_act, AppAction::None);
+        assert_eq!(app.provider.as_deref(), Some("openai"));
+        assert_eq!(app.model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn session_title_updated_event_and_resume_rename_slash_commands_work() {
+        let mut app = AppState::new(
+            PathBuf::from("/tmp/ws"),
+            "s-slash",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::SessionTitleUpdated(Some(
+            "0402｜FEA｜会话标题生成".into(),
+        )));
+        assert_eq!(
+            app.session_title.as_deref(),
+            Some("0402｜FEA｜会话标题生成")
+        );
+
+        app.input.set_text_end("/resume");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::OpenSessionPicker
+        );
+
+        app.input.set_text_end("/resume sess-xyz");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::ResumeSession("sess-xyz".into())
+        );
+
+        app.input.set_text_end("/rename");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::RenameSession(None)
+        );
+
+        app.input.set_text_end("/rename 手动命名标题");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::RenameSession(Some("手动命名标题".into()))
+        );
     }
 }

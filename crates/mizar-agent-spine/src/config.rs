@@ -143,6 +143,31 @@ pub struct RecallSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
+pub struct SessionTitleSettings {
+    pub enabled: Option<bool>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
+}
+
+/// 将 `sessionTitle.thinkingLevel` 字符串规范化为 `ReasoningEffort`（缺省或无法识别时回退为 `Low`）。
+pub fn normalize_session_title_thinking_level(raw: Option<&str>) -> ReasoningEffort {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return ReasoningEffort::Low;
+    };
+    match s.to_ascii_lowercase().as_str() {
+        "off" | "none" | "0" => ReasoningEffort::Off,
+        "minimal" | "min" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" | "med" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" | "x-high" => ReasoningEffort::XHigh,
+        "max" => ReasoningEffort::Max,
+        _ => ReasoningEffort::Low,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct UiSettings {
     pub theme: Option<String>,
     pub screen_mode: Option<String>,
@@ -178,6 +203,7 @@ pub struct SettingsConfig {
     pub instructions: Option<InstructionsSettings>,
     pub compaction: Option<CompactionSettings>,
     pub recall: Option<RecallSettings>,
+    pub session_title: Option<SessionTitleSettings>,
     pub ui: Option<UiSettings>,
 }
 
@@ -344,6 +370,18 @@ impl SettingsConfig {
             }
             if rec.read_char_limit.is_some() {
                 dst.read_char_limit = rec.read_char_limit;
+            }
+        }
+        if let Some(st) = other.session_title {
+            let dst = self.session_title.get_or_insert_with(Default::default);
+            if st.enabled.is_some() {
+                dst.enabled = st.enabled;
+            }
+            if st.model.is_some() {
+                dst.model = st.model;
+            }
+            if st.thinking_level.is_some() {
+                dst.thinking_level = st.thinking_level;
             }
         }
         if let Some(ui) = other.ui {
@@ -620,6 +658,27 @@ impl LoadedMizarConfig {
                     dst.read_char_limit = v;
                 }
             }
+        }
+
+        #[cfg(feature = "session-title")]
+        if let Some(st) = &self.settings.session_title
+            && let Some(dst) = spine.session_title.as_mut()
+        {
+            if let Some(v) = st.enabled {
+                dst.enabled = v;
+            }
+            if let Some(model_raw) = &st.model {
+                if let Some((provider, model)) = mizar_session_title::parse_model_ref(model_raw) {
+                    dst.provider = provider;
+                    dst.model = Some(model);
+                } else {
+                    dst.provider = None;
+                    dst.model = None;
+                }
+            }
+            dst.reasoning_effort = Some(normalize_session_title_thinking_level(
+                st.thinking_level.as_deref(),
+            ));
         }
 
         #[cfg(feature = "coding")]
@@ -1757,6 +1816,81 @@ mod disabled_plugins_tests {
             serde_json::from_str(&std::fs::read_to_string(&global_settings).unwrap()).unwrap();
         assert_eq!(raw_empty["persona"], "preserve-me");
         assert_eq!(raw_empty["disabledPlugins"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn loads_and_normalizes_session_title_settings() {
+        assert_eq!(
+            normalize_session_title_thinking_level(None),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            normalize_session_title_thinking_level(Some("unknown")),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            normalize_session_title_thinking_level(Some("OFF")),
+            ReasoningEffort::Off
+        );
+        assert_eq!(
+            normalize_session_title_thinking_level(Some("Medium")),
+            ReasoningEffort::Medium
+        );
+
+        let tmp =
+            std::env::temp_dir().join(format!("mizar_session_title_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let global = tmp.join("global");
+        let proj = tmp.join("repo");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(proj.join(".mizar")).unwrap();
+
+        std::fs::write(
+            global.join("settings.json"),
+            r#"{
+                "sessionTitle": {
+                    "enabled": false,
+                    "model": "magpie/mayoru-responses/deepseek-flash"
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(".mizar/settings.json"),
+            r#"{
+                "sessionTitle": {
+                    "enabled": true,
+                    "thinkingLevel": "high"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = load_mizar_config_with_global(&proj, Some(&global));
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        let st = loaded.settings.session_title.as_ref().unwrap();
+        assert_eq!(st.enabled, Some(true));
+        assert_eq!(
+            st.model.as_deref(),
+            Some("magpie/mayoru-responses/deepseek-flash")
+        );
+        assert_eq!(st.thinking_level.as_deref(), Some("high"));
+
+        #[cfg(feature = "session-title")]
+        {
+            let mut spine = AgentSpineConfig::new(&proj);
+            loaded.apply_to_spine(&mut spine);
+            let cfg = spine.session_title.unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(cfg.provider.as_deref(), Some("magpie"));
+            assert_eq!(
+                cfg.model.as_deref(),
+                Some("mayoru-responses/deepseek-flash")
+            );
+            assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::High));
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

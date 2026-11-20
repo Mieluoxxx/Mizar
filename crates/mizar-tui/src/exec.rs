@@ -519,6 +519,13 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
+    if !spine_cfg
+        .disabled_plugins
+        .iter()
+        .any(|id| id == "session-title")
+    {
+        spine_cfg.disabled_plugins.push("session-title".to_string());
+    }
     if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.session_db.is_none()) {
         spine_cfg.session_db_path = None;
     }

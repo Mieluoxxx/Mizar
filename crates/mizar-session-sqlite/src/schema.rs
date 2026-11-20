@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use mizar_session::{
     EntryVisibility, LoadedSession, PersistenceError, PersistenceResult, SESSION_FORMAT_VERSION,
-    SessionEntry, SessionEvent, SessionHeader, SessionListQuery,
+    SessionEntry, SessionEvent, SessionHeader, SessionListQuery, TitleSource,
 };
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 pub fn configure_connection(conn: &Connection) -> PersistenceResult<()> {
     conn.busy_timeout(Duration::from_millis(5000))
@@ -30,6 +30,20 @@ pub fn configure_reader_connection(conn: &Connection) -> PersistenceResult<()> {
     Ok(())
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> PersistenceResult<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table});"))
+        .map_err(map_sqlite_err)?;
+    let mut rows = stmt.query([]).map_err(map_sqlite_err)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_err)? {
+        let name: String = row.get(1).map_err(map_sqlite_err)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
     configure_connection(conn)?;
     let version: u32 = conn
@@ -46,6 +60,7 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
              format_version INTEGER NOT NULL,
              cwd TEXT,
              title TEXT,
+             title_source TEXT,
              parent_id TEXT,
              fork_seq INTEGER,
              created_at_ms INTEGER NOT NULL,
@@ -84,10 +99,17 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
              terms,
              content='',
              tokenize='ascii'
-         );
-         PRAGMA user_version = 1;",
+         );",
     )
     .map_err(map_sqlite_err)?;
+
+    if version < 2 && !has_column(conn, "sessions", "title_source")? {
+        conn.execute("ALTER TABLE sessions ADD COLUMN title_source TEXT;", [])
+            .map_err(map_sqlite_err)?;
+    }
+
+    conn.execute_batch("PRAGMA user_version = 2;")
+        .map_err(map_sqlite_err)?;
 
     Ok(())
 }
@@ -119,12 +141,14 @@ fn row_to_header(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHeader> {
     let event_count: i64 = row.get(8)?;
     let surface_count: i64 = row.get(9)?;
     let compacted_up_to_seq: Option<i64> = row.get(10)?;
+    let title_source_raw: Option<String> = row.get(11)?;
 
     Ok(SessionHeader {
         id: row.get(0)?,
         format_version: u32::try_from(format_version.max(1)).unwrap_or(SESSION_FORMAT_VERSION),
         cwd: row.get(2)?,
         title: row.get(3)?,
+        title_source: title_source_raw.as_deref().and_then(TitleSource::parse),
         parent_id: row.get(4)?,
         fork_seq: fork_seq.and_then(|v| u64::try_from(v).ok()),
         created_at_ms: i64_to_millis(created_at_ms),
@@ -142,7 +166,8 @@ pub fn load_session_from_conn(
     let header = conn
         .query_row(
             "SELECT id, format_version, cwd, title, parent_id, fork_seq,
-                    created_at_ms, updated_at_ms, event_count, surface_count, compacted_up_to_seq
+                    created_at_ms, updated_at_ms, event_count, surface_count,
+                    compacted_up_to_seq, title_source
              FROM sessions
              WHERE id = ?1",
             [session_id],
@@ -207,7 +232,8 @@ pub fn list_sessions_from_conn(
 ) -> PersistenceResult<Vec<SessionHeader>> {
     let mut sql = String::from(
         "SELECT id, format_version, cwd, title, parent_id, fork_seq,
-                created_at_ms, updated_at_ms, event_count, surface_count, compacted_up_to_seq
+                created_at_ms, updated_at_ms, event_count, surface_count,
+                compacted_up_to_seq, title_source
          FROM sessions",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();

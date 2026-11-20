@@ -83,7 +83,7 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     std::fs::write(&mock_py, MOCK_FFF_PY).unwrap();
 
     // 在工作区配置 fff MCP：默认 codemode 暴露，但强制把 multi_grep 屏蔽为 hidden
-    let mut cfg = AgentSpineConfig::coding(&ws);
+    let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["session-title"]);
     if let AgentToolsMode::Coding {
         ref mut mcp,
         ref mut skills,

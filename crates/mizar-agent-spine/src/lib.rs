@@ -10,11 +10,12 @@ use std::path::PathBuf;
 
 pub use config::{
     CONFIG_DIR_NAME, CliLlmOverride, CodemodeSettings, CompactionSettings, EnvLlmOverride,
-    EnvProviderKind, InstructionsSettings, LoadedMizarConfig, RecallSettings, SettingsConfig,
-    SkillsSettings, ToolSearchSettings, UiSettings, load_mizar_config, load_mizar_config_isolated,
-    load_mizar_config_with_global, normalize_disabled_plugins, patch_settings_file,
-    persist_disabled_plugins, resolve_default_session_db_path, resolve_global_config_dir,
-    resolve_global_settings_path, resolve_project_config_dir,
+    EnvProviderKind, InstructionsSettings, LoadedMizarConfig, RecallSettings, SessionTitleSettings,
+    SettingsConfig, SkillsSettings, ToolSearchSettings, UiSettings, load_mizar_config,
+    load_mizar_config_isolated, load_mizar_config_with_global, normalize_disabled_plugins,
+    normalize_session_title_thinking_level, patch_settings_file, persist_disabled_plugins,
+    resolve_default_session_db_path, resolve_global_config_dir, resolve_global_settings_path,
+    resolve_project_config_dir,
 };
 #[cfg(feature = "router")]
 pub use config::{LlmRouteError, ResolvedLlmRouter};
@@ -33,6 +34,12 @@ pub use mizar_instructions::{
 #[cfg(feature = "compaction")]
 pub use mizar_recall::{
     RECALL_READ_TOOL_NAME, RECALL_SEARCH_TOOL_NAME, RecallConfig, RecallPlugin,
+};
+#[cfg(feature = "session-title")]
+pub use mizar_session_title::{
+    DEFAULT_REFRESH_INTERVAL_TURNS, ParsedModelTitle, SERVICE_SESSION_TITLE, SessionTitleConfig,
+    SessionTitleContextExt, SessionTitleError, SessionTitleRuntime, SessionTitleType,
+    format_session_title, parse_model_ref, parse_model_title_output,
 };
 pub use plugins::{
     EVENT_SPINE_PLUGINS_CHANGE, SERVICE_SPINE_PLUGINS, SpineModuleStatus, SpinePluginError,
@@ -107,6 +114,9 @@ pub struct AgentSpineConfig {
     /// 是否启用无损情景回溯工具（`recall_search` / `recall_read`，默认开启且按需自动激活）。
     #[cfg(feature = "compaction")]
     pub recall: Option<RecallConfig>,
+    /// 是否启用基于对话主题的会话标题自动生成服务（默认开启）。
+    #[cfg(feature = "session-title")]
+    pub session_title: Option<SessionTitleConfig>,
     /// 可选：会话 SQLite 持久化数据库路径；为 `None` 时保持纯内存模式（适合测试）。
     pub session_db_path: Option<PathBuf>,
     /// 启动阶段屏蔽的内置可选模块 ID 列表（如 `mcp`、`codemode` 等）。
@@ -135,6 +145,8 @@ impl AgentSpineConfig {
             compaction: Some(CompactionConfig::default()),
             #[cfg(feature = "compaction")]
             recall: Some(RecallConfig::default()),
+            #[cfg(feature = "session-title")]
+            session_title: Some(SessionTitleConfig::default()),
             session_db_path: None,
             disabled_plugins: Vec::new(),
         }
@@ -167,6 +179,8 @@ impl AgentSpineConfig {
             compaction: Some(CompactionConfig::default()),
             #[cfg(feature = "compaction")]
             recall: Some(RecallConfig::default()),
+            #[cfg(feature = "session-title")]
+            session_title: Some(SessionTitleConfig::default()),
             session_db_path: None,
             disabled_plugins: Vec::new(),
         }
@@ -260,6 +274,7 @@ impl Plugin for AgentSpinePlugin {
                     feature = "legacy",
                     feature = "coding",
                     feature = "compaction",
+                    feature = "session-title",
                     feature = "trajectory"
                 )),
                 allow(unused_mut)
@@ -380,6 +395,18 @@ impl Plugin for AgentSpinePlugin {
                                 .to_string(),
                     },
                     ModuleSpec::Recall(recall_cfg),
+                ));
+            }
+
+            #[cfg(feature = "session-title")]
+            if let Some(st_cfg) = config.session_title {
+                specs.push((
+                    SpineModuleMeta {
+                        id: "session-title".to_string(),
+                        label: "会话标题".to_string(),
+                        description: "后台基于用户输入生成与维护会话标题".to_string(),
+                    },
+                    ModuleSpec::SessionTitle(st_cfg),
                 ));
             }
 

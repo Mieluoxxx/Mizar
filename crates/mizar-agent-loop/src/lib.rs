@@ -36,6 +36,7 @@ pub const EVENT_AGENT_TOOL_UPDATE: &str = "agent/tool-update";
 pub const EVENT_AGENT_TOOL_RESULT: &str = "agent/tool-result";
 pub const EVENT_AGENT_USAGE: &str = "agent/usage";
 pub const EVENT_AGENT_TURN_START: &str = "agent/turn-start";
+pub const EVENT_AGENT_TURN_INPUT: &str = "agent/turn-input";
 pub const EVENT_AGENT_TURN_END: &str = "agent/turn-end";
 pub const EVENT_AGENT_STEP_START: &str = "agent/step-start";
 pub const EVENT_AGENT_STEP_FIRST_TOKEN: &str = "agent/step-first-token";
@@ -182,6 +183,15 @@ pub struct AgentUsageEvent {
 pub struct AgentTurnStartEvent {
     pub session: Arc<Session>,
     pub turn: u64,
+    pub ts_ms: u128,
+}
+
+#[derive(Clone)]
+pub struct AgentTurnInputEvent {
+    pub session: Arc<Session>,
+    pub turn: u64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub ts_ms: u128,
 }
 
@@ -481,6 +491,16 @@ impl AgentLoop {
             },
         );
         session.append(SessionEvent::user_with_images(input, options.images));
+        self.ctx.emit(
+            EVENT_AGENT_TURN_INPUT,
+            AgentTurnInputEvent {
+                session: Arc::clone(&session),
+                turn,
+                provider: provider.clone(),
+                model: model.clone(),
+                ts_ms: now_millis(),
+            },
+        );
         self.ctx.emit(
             EVENT_AGENT_STATUS,
             AgentStatusEvent {

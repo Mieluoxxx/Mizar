@@ -38,6 +38,16 @@ pub fn builtin_slash_entries(skill_names: &[String]) -> Vec<SlashEntry> {
             takes_arg: false,
         },
         SlashEntry {
+            command: "resume".into(),
+            description: "恢复历史会话（打开会话选择器或指定 ID）".into(),
+            takes_arg: true,
+        },
+        SlashEntry {
+            command: "rename".into(),
+            description: "重命名当前会话标题（留空由模型重新生成）".into(),
+            takes_arg: true,
+        },
+        SlashEntry {
             command: "settings".into(),
             description: "打开交互式配置面板（实时生效并自动保存）".into(),
             takes_arg: false,
@@ -488,6 +498,15 @@ pub struct ModelPickerItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPickerItem {
+    pub session_id: String,
+    pub title: String,
+    pub cwd_tail: String,
+    pub event_count: u64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingItemKind {
     Toggle {
         value: bool,
@@ -495,6 +514,10 @@ pub enum SettingItemKind {
     Choice {
         options: Vec<String>,
         selected: usize,
+    },
+    Model {
+        provider: Option<String>,
+        model: Option<String>,
     },
 }
 
@@ -521,6 +544,16 @@ impl SettingEntry {
                 .get(*selected)
                 .map(|v| format!("◂ {v} ▸"))
                 .unwrap_or_default(),
+            SettingItemKind::Model { provider, model } => {
+                let p = provider.as_deref().map(str::trim).unwrap_or("");
+                let m = model.as_deref().map(str::trim).unwrap_or("");
+                match (p.is_empty(), m.is_empty()) {
+                    (true, true) => "跟随会话模型".to_string(),
+                    (false, false) => format!("{p}/{m}"),
+                    (true, false) => m.to_string(),
+                    (false, true) => p.to_string(),
+                }
+            }
         }
     }
 
@@ -538,6 +571,15 @@ impl SettingEntry {
                 let next = ((*selected as isize + delta).rem_euclid(len)) as usize;
                 *selected = next;
                 options[next].clone()
+            }
+            SettingItemKind::Model { provider, model } => {
+                let p = provider.as_deref().map(str::trim).unwrap_or("");
+                let m = model.as_deref().map(str::trim).unwrap_or("");
+                match (p.is_empty(), m.is_empty()) {
+                    (false, false) => format!("{p}/{m}"),
+                    (true, false) => m.to_string(),
+                    _ => String::new(),
+                }
             }
         }
     }
@@ -577,6 +619,11 @@ pub enum OverlayKind {
     },
     SkillPicker {
         items: Vec<SkillPickerItem>,
+        query: String,
+        selected: usize,
+    },
+    SessionPicker {
+        items: Vec<SessionPickerItem>,
         query: String,
         selected: usize,
     },
@@ -622,7 +669,11 @@ pub enum OverlayAction {
     RevertTheme(ThemePreset),
     ApplyHistory(String),
     InsertSkillSlash(String),
+    SelectSession(String),
     ForkSessionAtSeq(u64),
+    OpenSettingModelPicker {
+        key: String,
+    },
     UpdateSetting {
         key: String,
         value: String,
@@ -649,6 +700,7 @@ impl OverlayState {
                     | OverlayKind::ThemePicker { .. }
                     | OverlayKind::HistorySearch { .. }
                     | OverlayKind::SkillPicker { .. }
+                    | OverlayKind::SessionPicker { .. }
                     | OverlayKind::SessionTree { .. }
                     | OverlayKind::HelpModal { .. }
                     | OverlayKind::SettingsModal { .. }
@@ -662,7 +714,32 @@ impl OverlayState {
     }
 
     pub fn open_model_picker(&mut self, providers: &[ProviderInfo], current_model: Option<&str>) {
+        self.open_model_picker_with_follow(providers, current_model, false);
+    }
+
+    pub fn open_setting_model_picker(
+        &mut self,
+        providers: &[ProviderInfo],
+        current_model: Option<&str>,
+    ) {
+        self.open_model_picker_with_follow(providers, current_model, true);
+    }
+
+    fn open_model_picker_with_follow(
+        &mut self,
+        providers: &[ProviderInfo],
+        current_model: Option<&str>,
+        allow_follow_session: bool,
+    ) {
         let mut items = Vec::new();
+        if allow_follow_session {
+            items.push(ModelPickerItem {
+                provider_id: String::new(),
+                model_id: String::new(),
+                label: "跟随会话模型".to_string(),
+                detail: "随会话当前模型自动切换 (default)".to_string(),
+            });
+        }
         for p in providers {
             for m in &p.models {
                 let ctx = m
@@ -679,9 +756,9 @@ impl OverlayState {
         }
         let selected = current_model
             .and_then(|cur| {
-                items
-                    .iter()
-                    .position(|it| it.model_id == cur || it.label == cur)
+                items.iter().position(|it| {
+                    !it.model_id.is_empty() && (it.model_id == cur || it.label == cur)
+                })
             })
             .unwrap_or(0);
         self.active = Some(OverlayKind::ModelPicker {
@@ -721,6 +798,14 @@ impl OverlayState {
 
     pub fn open_skill_picker(&mut self, items: Vec<SkillPickerItem>) {
         self.active = Some(OverlayKind::SkillPicker {
+            items,
+            query: String::new(),
+            selected: 0,
+        });
+    }
+
+    pub fn open_session_picker(&mut self, items: Vec<SessionPickerItem>) {
+        self.active = Some(OverlayKind::SessionPicker {
             items,
             query: String::new(),
             selected: 0,
@@ -786,6 +871,21 @@ impl OverlayState {
             && let SettingItemKind::Toggle { value } = &mut item.kind
         {
             *value = new_value;
+        }
+    }
+
+    pub fn set_setting_model(
+        &mut self,
+        key: &str,
+        new_provider: Option<String>,
+        new_model: Option<String>,
+    ) {
+        if let Some(OverlayKind::SettingsModal { items, .. }) = &mut self.active
+            && let Some(item) = items.iter_mut().find(|entry| entry.key == key)
+            && let SettingItemKind::Model { provider, model } = &mut item.kind
+        {
+            *provider = new_provider;
+            *model = new_model;
         }
     }
 
@@ -1049,6 +1149,49 @@ impl OverlayState {
                     _ => Some(OverlayAction::None),
                 }
             }
+            OverlayKind::SessionPicker {
+                items,
+                query,
+                selected,
+            } => {
+                let filtered = filter_session_picker_indices(items, query);
+                match key.code {
+                    KeyCode::Esc => {
+                        if !query.is_empty() {
+                            query.clear();
+                            *selected = 0;
+                            Some(OverlayAction::None)
+                        } else {
+                            Some(OverlayAction::Close)
+                        }
+                    }
+                    KeyCode::Up => {
+                        *selected = selected.saturating_sub(1);
+                        Some(OverlayAction::None)
+                    }
+                    KeyCode::Down => {
+                        if !filtered.is_empty() {
+                            *selected = (*selected + 1).min(filtered.len() - 1);
+                        }
+                        Some(OverlayAction::None)
+                    }
+                    KeyCode::Enter => filtered
+                        .get(*selected)
+                        .and_then(|&idx| items.get(idx))
+                        .map(|it| OverlayAction::SelectSession(it.session_id.clone())),
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *selected = 0;
+                        Some(OverlayAction::None)
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        *selected = 0;
+                        Some(OverlayAction::None)
+                    }
+                    _ => Some(OverlayAction::None),
+                }
+            }
             OverlayKind::SessionTree {
                 entries,
                 selected,
@@ -1128,11 +1271,20 @@ impl OverlayState {
                     KeyCode::Left => {
                         if let Some(&item_idx) = filtered_indices.get(*selected) {
                             let item = &mut items[item_idx];
-                            let value = item.step_value(-1);
-                            Some(OverlayAction::UpdateSetting {
-                                key: item.key.clone(),
-                                value,
-                            })
+                            if let SettingItemKind::Model { provider, model } = &mut item.kind {
+                                *provider = None;
+                                *model = None;
+                                Some(OverlayAction::UpdateSetting {
+                                    key: item.key.clone(),
+                                    value: String::new(),
+                                })
+                            } else {
+                                let value = item.step_value(-1);
+                                Some(OverlayAction::UpdateSetting {
+                                    key: item.key.clone(),
+                                    value,
+                                })
+                            }
                         } else {
                             Some(OverlayAction::None)
                         }
@@ -1140,11 +1292,17 @@ impl OverlayState {
                     KeyCode::Right | KeyCode::Enter => {
                         if let Some(&item_idx) = filtered_indices.get(*selected) {
                             let item = &mut items[item_idx];
-                            let value = item.step_value(1);
-                            Some(OverlayAction::UpdateSetting {
-                                key: item.key.clone(),
-                                value,
-                            })
+                            if matches!(item.kind, SettingItemKind::Model { .. }) {
+                                Some(OverlayAction::OpenSettingModelPicker {
+                                    key: item.key.clone(),
+                                })
+                            } else {
+                                let value = item.step_value(1);
+                                Some(OverlayAction::UpdateSetting {
+                                    key: item.key.clone(),
+                                    value,
+                                })
+                            }
                         } else {
                             Some(OverlayAction::None)
                         }
@@ -1152,11 +1310,17 @@ impl OverlayState {
                     KeyCode::Char(' ') if query.is_empty() => {
                         if let Some(&item_idx) = filtered_indices.get(*selected) {
                             let item = &mut items[item_idx];
-                            let value = item.step_value(1);
-                            Some(OverlayAction::UpdateSetting {
-                                key: item.key.clone(),
-                                value,
-                            })
+                            if matches!(item.kind, SettingItemKind::Model { .. }) {
+                                Some(OverlayAction::OpenSettingModelPicker {
+                                    key: item.key.clone(),
+                                })
+                            } else {
+                                let value = item.step_value(1);
+                                Some(OverlayAction::UpdateSetting {
+                                    key: item.key.clone(),
+                                    value,
+                                })
+                            }
                         } else {
                             Some(OverlayAction::None)
                         }
@@ -1310,6 +1474,13 @@ impl OverlayState {
                                     .get(idx)
                                     .map(|it| OverlayAction::InsertSkillSlash(it.name.clone()))
                             }
+                            OverlayKind::SessionPicker { items, query, .. } => {
+                                let filtered = filter_session_picker_indices(items, query);
+                                filtered
+                                    .get(idx)
+                                    .and_then(|&item_idx| items.get(item_idx))
+                                    .map(|it| OverlayAction::SelectSession(it.session_id.clone()))
+                            }
                             OverlayKind::SessionTree { entries, .. } => {
                                 if let Some(node) = entries.get(idx)
                                     && node.can_fork
@@ -1337,11 +1508,17 @@ impl OverlayState {
                                 if let Some(&item_idx) = filtered_indices.get(idx) {
                                     *selected = idx;
                                     let item = &mut items[item_idx];
-                                    let value = item.step_value(1);
-                                    Some(OverlayAction::UpdateSetting {
-                                        key: item.key.clone(),
-                                        value,
-                                    })
+                                    if matches!(item.kind, SettingItemKind::Model { .. }) {
+                                        Some(OverlayAction::OpenSettingModelPicker {
+                                            key: item.key.clone(),
+                                        })
+                                    } else {
+                                        let value = item.step_value(1);
+                                        Some(OverlayAction::UpdateSetting {
+                                            key: item.key.clone(),
+                                            value,
+                                        })
+                                    }
                                 } else {
                                     None
                                 }
@@ -1416,6 +1593,74 @@ fn filter_setting_indices(items: &[SettingEntry], query: &str) -> Vec<usize> {
         })
         .map(|(i, _)| i)
         .collect()
+}
+
+pub fn filter_session_picker_indices(items: &[SessionPickerItem], query: &str) -> Vec<usize> {
+    let q = query.trim().to_ascii_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            q.is_empty()
+                || item.title.to_ascii_lowercase().contains(&q)
+                || item.cwd_tail.to_ascii_lowercase().contains(&q)
+                || item.session_id.to_ascii_lowercase().contains(&q)
+                || item.updated_at.to_ascii_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn truncate_to_display_width(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let target = max_width - 1;
+    let mut out = String::new();
+    let mut cur = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if cur + w > target {
+            break;
+        }
+        out.push(ch);
+        cur += w;
+    }
+    out.push('…');
+    out
+}
+
+fn pad_to_display_width(text: &str, width: usize) -> String {
+    let truncated = truncate_to_display_width(text, width);
+    let pad = width.saturating_sub(display_width(&truncated));
+    if pad == 0 {
+        truncated
+    } else {
+        format!("{truncated}{}", " ".repeat(pad))
+    }
+}
+
+/// 按终端显示宽度对齐单条会话选择器行，保障包含全角符号（如 `｜`）时跨行列对齐。
+pub fn format_session_picker_row(
+    item: &SessionPickerItem,
+    title_col_w: usize,
+    cwd_col_w: usize,
+) -> (String, String) {
+    let title_col = pad_to_display_width(&item.title, title_col_w);
+    let cwd_col = pad_to_display_width(&item.cwd_tail, cwd_col_w);
+    let meta_col = format!(
+        "{cwd_col} · {:>3} ev · {}",
+        item.event_count, item.updated_at
+    );
+    (title_col, meta_col)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1506,6 +1751,18 @@ fn render_settings_modal(
                     .fg(theme.accent)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
+                SettingItemKind::Model { provider, model } => {
+                    let is_default = provider.as_deref().is_none_or(|p| p.trim().is_empty())
+                        && model.as_deref().is_none_or(|m| m.trim().is_empty());
+                    if is_default {
+                        Style::default().fg(theme.text_muted).bg(bg)
+                    } else {
+                        Style::default()
+                            .fg(theme.accent)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD)
+                    }
+                }
             };
 
             let left_w = 2 + display_width(&cat_tag) + display_width(&item.label);
@@ -1720,6 +1977,24 @@ pub fn render_overlay(
             let title = format!(" 交互式技能选择器 [过滤: {query}] (Enter 填入) ");
             render_centered_list(frame, full_area, &title, &rows, *selected, theme, state);
         }
+        OverlayKind::SessionPicker {
+            items,
+            query,
+            selected,
+        } => {
+            let items_cloned = items.clone();
+            let query_cloned = query.clone();
+            let sel = *selected;
+            render_session_picker(
+                frame,
+                full_area,
+                &items_cloned,
+                &query_cloned,
+                sel,
+                theme,
+                state,
+            );
+        }
         OverlayKind::SessionTree {
             entries,
             selected,
@@ -1850,6 +2125,48 @@ fn clip_left_path(s: &str, max_cols: usize) -> String {
     kept.reverse();
     let tail: String = kept.into_iter().collect();
     format!("…{tail}")
+}
+
+fn render_session_picker(
+    frame: &mut Frame<'_>,
+    full_area: Rect,
+    items: &[SessionPickerItem],
+    query: &str,
+    selected: usize,
+    theme: &Theme,
+    state: &mut OverlayState,
+) {
+    let filtered = filter_session_picker_indices(items, query);
+    let box_w = full_area.width.saturating_sub(4).clamp(50, 106);
+    let box_h = (filtered.len().clamp(1, 14) + 2) as u16;
+    let box_h = box_h.min(full_area.height.saturating_sub(2).max(4));
+    let x = full_area.x + (full_area.width.saturating_sub(box_w)) / 2;
+    let y = full_area.y + (full_area.height.saturating_sub(box_h)) / 2;
+    let rect = Rect::new(x, y, box_w, box_h);
+
+    let inner_w = box_w.saturating_sub(2) as usize;
+    let cwd_col_w = filtered
+        .iter()
+        .filter_map(|&idx| items.get(idx))
+        .map(|it| display_width(&it.cwd_tail))
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 20);
+    let title_col_w = inner_w.saturating_sub(4 + cwd_col_w + 22).max(16);
+
+    let rows: Vec<(String, String)> = filtered
+        .iter()
+        .filter_map(|&idx| items.get(idx))
+        .map(|it| format_session_picker_row(it, title_col_w, cwd_col_w))
+        .collect();
+
+    let title = if query.is_empty() {
+        " 恢复会话 (/resume · ↑↓ 选择 · 输入过滤 · Enter 确认 · Esc 取消) ".to_string()
+    } else {
+        format!(" 恢复会话 [过滤: {query}] (Enter 确认 · Esc 清空) ")
+    };
+
+    draw_list_box(frame, rect, &title, &rows, selected, theme, state);
 }
 
 fn render_centered_list(
@@ -2514,5 +2831,95 @@ mod tests {
             help_text.contains("/session"),
             "expected /session in help modal:\n{help_text}"
         );
+    }
+
+    #[test]
+    fn setting_model_kind_displays_follow_session_or_provider_slash_model() {
+        let follow = SettingEntry {
+            key: "sessionTitle.model".into(),
+            category: "会话标题".into(),
+            label: "标题生成模型".into(),
+            description: "选择生成会话标题所用模型".into(),
+            kind: SettingItemKind::Model {
+                provider: None,
+                model: None,
+            },
+        };
+        assert_eq!(follow.display_value(), "跟随会话模型");
+
+        let empty_str = SettingEntry {
+            kind: SettingItemKind::Model {
+                provider: Some(" ".into()),
+                model: Some("".into()),
+            },
+            ..follow.clone()
+        };
+        assert_eq!(empty_str.display_value(), "跟随会话模型");
+
+        let chosen = SettingEntry {
+            kind: SettingItemKind::Model {
+                provider: Some("magpie".into()),
+                model: Some("mayoru-responses/deepseek-flash".into()),
+            },
+            ..follow
+        };
+        assert_eq!(
+            chosen.display_value(),
+            "magpie/mayoru-responses/deepseek-flash"
+        );
+
+        let mut state = OverlayState::default();
+        state.open_settings(vec![chosen], None, "test".into());
+        let act = state.handle_key(KeyEvent::from(KeyCode::Enter), &[], &[]);
+        assert!(matches!(
+            act,
+            Some(OverlayAction::OpenSettingModelPicker { ref key }) if key == "sessionTitle.model"
+        ));
+
+        let reset = state.handle_key(KeyEvent::from(KeyCode::Left), &[], &[]);
+        assert!(matches!(
+            reset,
+            Some(OverlayAction::UpdateSetting { ref key, ref value })
+                if key == "sessionTitle.model" && value.is_empty()
+        ));
+        if let Some(OverlayKind::SettingsModal { items, .. }) = &state.active {
+            assert_eq!(items[0].display_value(), "跟随会话模型");
+        } else {
+            panic!("expected SettingsModal");
+        }
+    }
+
+    #[test]
+    fn session_picker_aligns_columns_with_fullwidth_chars_and_selects_filtered_item() {
+        let items = vec![
+            SessionPickerItem {
+                session_id: "s-1".into(),
+                title: "0402｜FEA｜会话标题生成与 picker".into(),
+                cwd_tail: "repo-a".into(),
+                event_count: 14,
+                updated_at: "04-02 10:00".into(),
+            },
+            SessionPickerItem {
+                session_id: "s-2".into(),
+                title: "ASCII title".into(),
+                cwd_tail: "my-proj".into(),
+                event_count: 3,
+                updated_at: "04-01 09:30".into(),
+            },
+        ];
+
+        let (left1, right1) = format_session_picker_row(&items[0], 34, 10);
+        let (left2, right2) = format_session_picker_row(&items[1], 34, 10);
+        assert_eq!(display_width(&left1), 34);
+        assert_eq!(display_width(&left2), 34);
+        assert_eq!(display_width(&right1), display_width(&right2));
+
+        let mut state = OverlayState::default();
+        state.open_session_picker(items);
+        let _ = state.handle_key(KeyEvent::from(KeyCode::Char('a')), &[], &[]);
+        let _ = state.handle_key(KeyEvent::from(KeyCode::Char('s')), &[], &[]);
+        let _ = state.handle_key(KeyEvent::from(KeyCode::Char('c')), &[], &[]);
+        let act = state.handle_key(KeyEvent::from(KeyCode::Enter), &[], &[]);
+        assert!(matches!(act, Some(OverlayAction::SelectSession(ref id)) if id == "s-2"));
     }
 }

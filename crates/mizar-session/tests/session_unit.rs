@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use cordis::{BoxFuture, Context, Service};
 use mizar_llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 use mizar_session::{
-    EntryVisibility, LoadedSession, PersistenceError, PersistenceResult,
-    SERVICE_SESSION_PERSISTENCE, SessionContextExt, SessionCreateOptions, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionPersistence,
-    SessionPersistenceHandle, SessionStore, SessionTraceEvent, repair_dangling_tool_calls,
+    EVENT_SESSION_TITLE_UPDATED, EntryVisibility, LoadedSession, PersistenceError,
+    PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionContextExt, SessionCreateOptions,
+    SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    SessionPersistence, SessionPersistenceHandle, SessionStore, SessionTitleUpdatedPayload,
+    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, derive_session_title,
+    repair_dangling_tool_calls,
 };
 
 #[derive(Default)]
@@ -35,8 +37,15 @@ impl SessionPersistence for InMemoryMockBackend {
         let h = headers
             .get_mut(session_id)
             .ok_or_else(|| PersistenceError::NotFound(session_id.to_string()))?;
-        if let Some(title) = patch.title {
-            h.title = Some(title);
+        match patch.title {
+            TitlePatch::Keep => {}
+            TitlePatch::Set(title) => h.title = Some(title),
+            TitlePatch::Clear => h.title = None,
+        }
+        match patch.title_source {
+            TitleSourcePatch::Keep => {}
+            TitleSourcePatch::Set(source) => h.title_source = Some(source),
+            TitleSourcePatch::Clear => h.title_source = None,
         }
         if let Some(ts) = patch.updated_at_ms {
             h.updated_at_ms = h.updated_at_ms.max(ts);
@@ -569,4 +578,159 @@ async fn user_with_images_persists_through_backend_and_restores_via_derive_messa
     );
 
     app2.fiber().dispose().await;
+}
+
+#[test]
+fn derive_session_title_strips_noise_and_keeps_valid_tokens() {
+    assert_eq!(
+        derive_session_title("mizar --resume 12345678-1234-1234-1234-123456789abc 继续修 bug"),
+        Some("继续修 bug".into())
+    );
+    assert_eq!(
+        derive_session_title(
+            "./target/debug/mizar -C /home/user/repo -r 12345678-1234-1234-1234-123456789abc"
+        ),
+        None
+    );
+    assert_eq!(
+        derive_session_title(
+            "mizar --resume 12345678-1234-1234-1234-123456789abc\n排查会话标题生成问题"
+        ),
+        Some("排查会话标题生成问题".into())
+    );
+    assert_eq!(
+        derive_session_title(
+            "请检查 /home/antigravity/Mieluoxxx/Mizar/crates/mizar-session/src/model.rs"
+        ),
+        Some("请检查 src/model.rs".into())
+    );
+    assert_eq!(
+        derive_session_title(
+            "打开 C:\\Users\\alice\\repo\\src\\main.rs 并访问 https://example.com/a/b/c 与 /settings"
+        ),
+        Some("打开 src\\main.rs 并访问 https://example.com/a/b/c 与 /settings".into())
+    );
+    assert_eq!(
+        derive_session_title("恢复会话 12345678-90ab-cdef-1234-567890abcdef 的上下文"),
+        Some("恢复会话 12345678 的上下文".into())
+    );
+}
+
+#[tokio::test]
+async fn set_title_clear_title_emit_event_and_fork_does_not_copy_parent_title() {
+    let backend = Arc::new(InMemoryMockBackend::default());
+    let app = Context::new();
+    app.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend.clone())),
+    )
+    .unwrap();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+
+    let store = app.sessions().unwrap();
+
+    type RecordedTitleEvent = (String, Option<String>, Option<TitleSource>);
+    let events: Arc<Mutex<Vec<RecordedTitleEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_sink = events.clone();
+    let _title_handle = app
+        .on(
+            EVENT_SESSION_TITLE_UPDATED,
+            move |p: &SessionTitleUpdatedPayload| {
+                events_sink.lock().unwrap().push((
+                    p.session.id.clone(),
+                    p.title.clone(),
+                    p.title_source,
+                ));
+            },
+        )
+        .unwrap();
+
+    let parent = store.create_with(SessionCreateOptions {
+        id: Some("p-1".into()),
+        ..Default::default()
+    });
+    parent.append(SessionEvent::user("修复登录问题"));
+    assert_eq!(parent.header().title.as_deref(), Some("修复登录问题"));
+    assert_eq!(parent.header().title_source, Some(TitleSource::Auto));
+
+    // 空标题、无变化调用均返回 false 且不发事件
+    assert!(!parent.set_title("   \n  "));
+    assert!(!parent.set_title_with_source("修复登录问题", TitleSource::Auto));
+
+    assert!(parent.set_title("  0320｜FIX｜登录认证修复  "));
+    assert_eq!(
+        parent.header().title.as_deref(),
+        Some("0320｜FIX｜登录认证修复")
+    );
+    assert_eq!(parent.header().title_source, Some(TitleSource::Manual));
+    assert_eq!(
+        backend.headers.lock().unwrap()["p-1"].title_source,
+        Some(TitleSource::Manual)
+    );
+
+    assert!(parent.clear_title());
+    assert_eq!(parent.header().title, None);
+    assert_eq!(parent.header().title_source, None);
+    assert!(!parent.clear_title());
+    assert_eq!(backend.headers.lock().unwrap()["p-1"].title, None);
+
+    // 重新给父会话设标题并 fork：默认不继承父标题，除非 opts.title 显式指定
+    assert!(parent.set_title("父会话标题"));
+    let forked_no_title = store
+        .fork(
+            "p-1",
+            1,
+            SessionCreateOptions {
+                id: Some("f-1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(forked_no_title.header().title, None);
+    assert_eq!(forked_no_title.header().title_source, None);
+
+    let forked_with_title = store
+        .fork(
+            "p-1",
+            1,
+            SessionCreateOptions {
+                id: Some("f-2".into()),
+                title: Some("自定义分支标题".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        forked_with_title.header().title.as_deref(),
+        Some("自定义分支标题")
+    );
+    assert_eq!(
+        forked_with_title.header().title_source,
+        Some(TitleSource::Manual)
+    );
+
+    let recorded = events.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![
+            (
+                "p-1".into(),
+                Some("修复登录问题".into()),
+                Some(TitleSource::Auto)
+            ),
+            (
+                "p-1".into(),
+                Some("0320｜FIX｜登录认证修复".into()),
+                Some(TitleSource::Manual)
+            ),
+            ("p-1".into(), None, None),
+            (
+                "p-1".into(),
+                Some("父会话标题".into()),
+                Some(TitleSource::Manual)
+            ),
+        ]
+    );
+
+    app.fiber().dispose().await;
 }

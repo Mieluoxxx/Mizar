@@ -23,7 +23,7 @@
 //! - `--inline`：以 Inline 视口模式启动 TUI（保留终端原生滚动历史）
 //! - `--approve`：开启高危工具交互式审批闸门（TUI 专用；无头模式不兼容并直接报错）
 //! - `--continue` / `-c`：恢复当前工作区最近一次持久化的历史会话（TUI）
-//! - `--resume <id>` / `-r <id>`：按会话 ID 恢复历史会话（TUI）
+//! - `--resume [id]` / `-r [id]`：按会话 ID 恢复历史会话；省略 ID 时弹出交互式会话选择器（TUI）
 //! - `--no-persist`：禁用 SQLite 会话落盘（仅当前进程内存模式）
 //! - `--no-instructions`：禁用自动发现与注入 `AGENTS.md` / `CLAUDE.md`
 //! - `--theme <preset>`：指定预设主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`）
@@ -146,7 +146,7 @@ Options:
       --inline                  Start in inline viewport mode (TUI only)
       --approve                 Prompt for approval on high-risk tools (TUI only)
   -c, --continue                Resume the latest persisted session in workspace (TUI only)
-  -r, --resume <id>             Resume a specific session by ID (TUI only)
+  -r, --resume [id]             Open interactive session picker, or resume by ID (TUI only)
       --no-persist              Disable SQLite session persistence
       --no-instructions         Disable AGENTS.md / CLAUDE.md discovery
       --theme <preset>          Theme preset (auto, mist-dark, mist-light, sakura-dark, system, ansi16)
@@ -201,7 +201,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut out = CliArgs::default();
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     let mut after_double_dash = false;
 
     while let Some(raw_arg) = args.next() {
@@ -303,8 +303,24 @@ where
                 out.resume_session = Some(ResumeTarget::LatestInWorkspace);
             }
             "--resume" | "-r" => {
-                let val = take_value(flag, inline, &mut args)?;
-                out.resume_session = Some(ResumeTarget::Id(val));
+                if let Some(val) = inline {
+                    let trimmed = val.trim();
+                    out.resume_session = if trimmed.is_empty() {
+                        Some(ResumeTarget::Picker)
+                    } else {
+                        Some(ResumeTarget::Id(trimmed.to_string()))
+                    };
+                } else if args.peek().is_some_and(|next| !next.starts_with('-')) {
+                    let val = args.next().unwrap();
+                    let trimmed = val.trim();
+                    out.resume_session = if trimmed.is_empty() {
+                        Some(ResumeTarget::Picker)
+                    } else {
+                        Some(ResumeTarget::Id(trimmed.to_string()))
+                    };
+                } else {
+                    out.resume_session = Some(ResumeTarget::Picker);
+                }
             }
             "--theme" => {
                 let val = take_value(flag, inline, &mut args)?;
@@ -760,5 +776,31 @@ mod tests {
                 .unwrap()
                 .has_exec_only_flags()
         );
+    }
+
+    #[test]
+    fn parse_resume_flag_supports_picker_and_explicit_id() {
+        let bare = parse_cli_args_from(["-r".to_string()]).unwrap();
+        assert_eq!(bare.resume_session, Some(ResumeTarget::Picker));
+
+        let before_flag =
+            parse_cli_args_from(["--resume".to_string(), "--inline".to_string()]).unwrap();
+        assert_eq!(before_flag.resume_session, Some(ResumeTarget::Picker));
+        assert!(before_flag.inline);
+
+        let with_id = parse_cli_args_from(["-r".to_string(), "sess-42".to_string()]).unwrap();
+        assert_eq!(
+            with_id.resume_session,
+            Some(ResumeTarget::Id("sess-42".into()))
+        );
+
+        let equals_id = parse_cli_args_from(["--resume=sess-99".to_string()]).unwrap();
+        assert_eq!(
+            equals_id.resume_session,
+            Some(ResumeTarget::Id("sess-99".into()))
+        );
+
+        let equals_empty = parse_cli_args_from(["--resume=".to_string()]).unwrap();
+        assert_eq!(equals_empty.resume_session, Some(ResumeTarget::Picker));
     }
 }
