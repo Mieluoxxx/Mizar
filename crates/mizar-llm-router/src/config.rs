@@ -59,6 +59,9 @@ pub struct CompatConfig {
     pub supports_max_output_tokens: Option<bool>,
     pub force_adaptive_thinking: Option<bool>,
     pub send_session_affinity_headers: Option<bool>,
+    pub session_affinity_format: Option<String>,
+    pub supports_long_cache_retention: Option<bool>,
+    pub supports_prompt_cache_key: Option<bool>,
     pub supports_temperature: Option<bool>,
     pub supports_cache_control_on_tools: Option<bool>,
     pub supports_store: Option<bool>,
@@ -75,10 +78,19 @@ impl From<CompletionsCompat> for CompatConfig {
             ThinkingFormat::OpenRouter => "openrouter",
             ThinkingFormat::Qwen => "qwen",
         };
+        let affinity_fmt = c.session_affinity_mode.map(|mode| match mode {
+            mizar_llm::SessionAffinityMode::Disabled => "none".to_string(),
+            mizar_llm::SessionAffinityMode::OpenAi => "openai".to_string(),
+            mizar_llm::SessionAffinityMode::OpenRouter => "openrouter".to_string(),
+        });
         Self {
             thinking_format: Some(fmt.to_string()),
             max_tokens_field: Some(c.max_tokens_field),
             supports_usage_in_streaming: Some(c.include_usage),
+            send_session_affinity_headers: c.send_session_affinity_headers,
+            session_affinity_format: affinity_fmt,
+            supports_long_cache_retention: c.supports_long_cache_retention,
+            supports_prompt_cache_key: c.supports_prompt_cache_key,
             ..Default::default()
         }
     }
@@ -104,6 +116,16 @@ impl CompatConfig {
             send_session_affinity_headers: overlay
                 .send_session_affinity_headers
                 .or(self.send_session_affinity_headers),
+            session_affinity_format: overlay
+                .session_affinity_format
+                .clone()
+                .or_else(|| self.session_affinity_format.clone()),
+            supports_long_cache_retention: overlay
+                .supports_long_cache_retention
+                .or(self.supports_long_cache_retention),
+            supports_prompt_cache_key: overlay
+                .supports_prompt_cache_key
+                .or(self.supports_prompt_cache_key),
             supports_temperature: overlay.supports_temperature.or(self.supports_temperature),
             supports_cache_control_on_tools: overlay
                 .supports_cache_control_on_tools
@@ -116,6 +138,12 @@ impl CompatConfig {
                 .supports_reasoning_effort
                 .or(self.supports_reasoning_effort),
         }
+    }
+
+    pub fn parsed_session_affinity_mode(&self) -> Option<mizar_llm::SessionAffinityMode> {
+        self.session_affinity_format
+            .as_deref()
+            .and_then(mizar_llm::parse_session_affinity_mode)
     }
 
     pub fn to_completions_compat(&self, mut base: CompletionsCompat) -> CompletionsCompat {
@@ -134,6 +162,18 @@ impl CompatConfig {
         }
         if let Some(inc) = self.supports_usage_in_streaming {
             base.include_usage = inc;
+        }
+        if let Some(send) = self.send_session_affinity_headers {
+            base.send_session_affinity_headers = Some(send);
+        }
+        if let Some(mode) = self.parsed_session_affinity_mode() {
+            base.session_affinity_mode = Some(mode);
+        }
+        if let Some(long_ret) = self.supports_long_cache_retention {
+            base.supports_long_cache_retention = Some(long_ret);
+        }
+        if let Some(pck) = self.supports_prompt_cache_key {
+            base.supports_prompt_cache_key = Some(pck);
         }
         base
     }
@@ -165,6 +205,12 @@ pub struct ModelCostConfig {
 pub struct PromptCacheConfig {
     pub short: Option<u64>,
     pub long: Option<u64>,
+}
+
+impl PromptCacheConfig {
+    pub fn default_retention(&self) -> Option<mizar_llm::CacheRetention> {
+        (self.long.is_some() && self.short.is_none()).then_some(mizar_llm::CacheRetention::Long)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

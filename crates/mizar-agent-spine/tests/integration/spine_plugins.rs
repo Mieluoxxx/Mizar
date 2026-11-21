@@ -271,6 +271,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         startup_tool_names,
         HashSet::from(["probe_echo".to_string()])
     );
+    assert!(!prompt.build().contains("核心工具能力："));
     assert!(!prompt.build().contains("当前工作目录："));
 
     // 2. 热挂载 + 热卸载基础编程工具 (`tools-coding`)，含系统提示词提供者清理验证
@@ -280,7 +281,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     for expected in ["read", "bash", "edit", "write", "grep", "find"] {
         assert!(coding_tools.contains(expected), "missing {expected}");
     }
-    assert!(prompt.build().contains("当前工作目录："));
+    assert!(prompt.build().contains("核心工具能力："));
+    assert!(!prompt.build().contains("当前工作目录："));
     assert!(ctrl.set_enabled("tools-coding", false).await.unwrap());
     let after_disable_coding: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
@@ -288,7 +290,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         after_disable_coding,
         HashSet::from(["probe_echo".to_string()])
     );
-    assert!(!prompt.build().contains("当前工作目录："));
+    assert!(!prompt.build().contains("核心工具能力："));
 
     // 3. 热挂载 tool-search / codemode / mcp / skills / instructions / recall
     for id in [

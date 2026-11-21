@@ -112,49 +112,57 @@ impl Plugin for CodingToolsPlugin {
                 cleanups.push(handle);
             }
 
-            if config.inject_system_prompt
-                && let Some(sp) = ctx.get::<SystemPrompt>("systemPrompt")
-            {
-                let tools_ref = ctx.tools()?;
-                let cwd_display = config.workspace.to_string_lossy().replace('\\', "/");
-                let sec_handle = ctx.effect("tools-coding.system-prompt", move || {
-                    let tools = tools_ref;
-                    let cwd = cwd_display;
-                    Ok::<_, cordis::CordisError>(Some(sp.section(PromptSection::new(
-                        "coding_tools",
-                        20,
-                        move || {
-                            let declared = tools.list_declared_infos(None);
-                            let mut lines = vec![format!("当前工作目录：{cwd}")];
-                            let mut snippets = Vec::new();
-                            let mut guidelines = Vec::new();
-                            for info in &declared {
-                                if let Some(s) = &info.prompt_snippet {
-                                    snippets.push(format!("- {}: {}", info.name, s));
-                                }
-                                for g in &info.prompt_guidelines {
-                                    if !guidelines.contains(g) {
-                                        guidelines.push(g.clone());
+            if config.inject_system_prompt {
+                let tools_ref = std::sync::Arc::clone(&tools);
+                let prompt_fiber = ctx.try_inject(["systemPrompt"], move |c| {
+                    let tools = std::sync::Arc::clone(&tools_ref);
+                    async move {
+                        let sp = c.service::<SystemPrompt>("systemPrompt")?;
+                        c.effect("tools-coding.system-prompt", move || {
+                            let tools = tools;
+                            Ok::<_, cordis::CordisError>(Some(sp.section(PromptSection::new(
+                                "coding_tools",
+                                20,
+                                move || {
+                                    let declared = tools.list_declared_infos(None);
+                                    let mut lines = Vec::new();
+                                    let mut snippets = Vec::new();
+                                    let mut guidelines = Vec::new();
+                                    for info in &declared {
+                                        if let Some(s) = &info.prompt_snippet {
+                                            snippets.push(format!("- {}: {}", info.name, s));
+                                        }
+                                        for g in &info.prompt_guidelines {
+                                            if !guidelines.contains(g) {
+                                                guidelines.push(g.clone());
+                                            }
+                                        }
                                     }
-                                }
-                            }
-                            if !snippets.is_empty() {
-                                lines.push("核心工具能力：".into());
-                                lines.extend(snippets);
-                            }
-                            if !guidelines.is_empty() {
-                                lines.push("操作原则：".into());
-                                lines.extend(guidelines.into_iter().map(|g| format!("- {g}")));
-                                lines.push(
-                                    "- 读取或检索多个互不依赖的文件时，尽量在同一轮并发调用多个只读工具（read/grep/find）以减少串行往返"
-                                        .into(),
-                                );
-                            }
-                            Some(lines.join("\n"))
-                        },
-                    ))))
+                                    if !snippets.is_empty() {
+                                        lines.push("核心工具能力：".into());
+                                        lines.extend(snippets);
+                                    }
+                                    if !guidelines.is_empty() {
+                                        lines.push("操作原则：".into());
+                                        lines
+                                            .extend(guidelines.into_iter().map(|g| format!("- {g}")));
+                                        lines.push(
+                                            "- 读取或检索多个互不依赖的文件时，尽量在同一轮并发调用多个只读工具（read/grep/find）以减少串行往返"
+                                                .into(),
+                                        );
+                                    }
+                                    (!lines.is_empty()).then(|| lines.join("\n"))
+                                },
+                            ))))
+                        })?;
+                        Ok::<_, cordis::CordisError>(())
+                    }
                 })?;
-                cleanups.push(sec_handle);
+                // 若 systemPrompt 已就绪则等待子 fiber 落稳，保证热启用返回后提示段立即可见；
+                // 若尚未挂载（启动并发或无 SystemPrompt 单测）则不阻塞，待其到达后自动补注。
+                if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
+                    prompt_fiber.wait_settled().await?;
+                }
             }
 
             Ok(Some(Cleanup::async_fn(move || async move {
@@ -284,6 +292,46 @@ mod tests {
         assert!(!bash_res.is_error, "bash err: {}", bash_res.content);
         assert!(bash_res.content.contains("Full output saved to:"));
         assert!(bash_res.content.contains("2100"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn registers_system_prompt_section_when_system_prompt_mounts_after_coding_tools() {
+        use mizar_system_prompt::SystemPromptConfig;
+
+        let root = std::env::temp_dir().join(format!(
+            "mizar_coding_late_prompt_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+
+        // 先挂载 CodingToolsPlugin，再挂载 SystemPrompt，复现并发启动时 systemPrompt 尚未就绪的场景
+        let coding = app.plugin(CodingToolsPlugin, CodingToolsConfig::new(&root));
+        coding.wait_settled().await.unwrap();
+        assert!(app.get::<SystemPrompt>("systemPrompt").is_none());
+
+        app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+            .await
+            .unwrap();
+        for rt in app.registry().values() {
+            for f in rt.fibers() {
+                let _ = f.wait_settled().await;
+            }
+        }
+
+        let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap();
+        let built = prompt.build();
+        assert!(built.contains("核心工具能力："), "prompt:\n{built}");
+        assert!(built.contains("操作原则："), "prompt:\n{built}");
+
+        coding.dispose().await;
+        assert!(!prompt.build().contains("核心工具能力："));
 
         let _ = std::fs::remove_dir_all(&root);
         app.fiber().dispose().await;

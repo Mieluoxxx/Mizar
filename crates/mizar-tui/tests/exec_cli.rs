@@ -59,6 +59,9 @@ struct RecordedRequest {
     path: String,
     authorization: Option<String>,
     x_api_key: Option<String>,
+    session_id: Option<String>,
+    x_client_request_id: Option<String>,
+    x_session_id: Option<String>,
     body: Value,
 }
 
@@ -121,16 +124,19 @@ async fn start_gateway(state: Arc<GatewayState>) -> String {
         headers: HeaderMap,
         axum::Json(body): axum::Json<Value>,
     ) -> Response {
+        let header_str = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string)
+        };
         let rec = RecordedRequest {
             path: uri.path().to_string(),
-            authorization: headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .map(ToString::to_string),
-            x_api_key: headers
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
-                .map(ToString::to_string),
+            authorization: header_str("authorization"),
+            x_api_key: header_str("x-api-key"),
+            session_id: header_str("session_id"),
+            x_client_request_id: header_str("x-client-request-id"),
+            x_session_id: header_str("x-session-id"),
             body,
         };
         st.requests.lock().unwrap().push(rec);
@@ -1548,4 +1554,142 @@ async fn exec_supports_multi_turn_continue_resume_json_and_max_tokens() {
     assert!(o_reason.stdout.is_empty());
     let reason_err = String::from_utf8_lossy(&o_reason.stderr);
     assert!(reason_err.contains("empty_response"), "{reason_err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_responses_multi_turn_preserves_cache_key_affinity_and_static_instructions() {
+    let tmp = TempRoot::new("exec_resp_cache");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let state = GatewayState::new(
+        vec![
+            MockStep::ResponsesText("RESP_ONE".into()),
+            MockStep::ResponsesText("RESP_TWO".into()),
+        ],
+        MockStep::ResponsesText("FALLBACK".into()),
+    );
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+
+    let mut c1 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "--json",
+            "first prompt",
+        ],
+    );
+    c1.env("OPENAI_API_KEY", "sk-oai-cache");
+    let o1 = run_with_stdin(c1, None).await;
+    assert!(
+        o1.status.success(),
+        "turn 1 failed: {}",
+        String::from_utf8_lossy(&o1.stderr)
+    );
+    let v1: Value = serde_json::from_slice(&o1.stdout).unwrap();
+    let sid = v1["session_id"].as_str().unwrap().to_string();
+    assert!(!sid.is_empty());
+
+    let mut c2 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "-c",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "--json",
+            "second prompt",
+        ],
+    );
+    c2.env("OPENAI_API_KEY", "sk-oai-cache");
+    let o2 = run_with_stdin(c2, None).await;
+    assert!(
+        o2.status.success(),
+        "turn 2 failed: {}",
+        String::from_utf8_lossy(&o2.stderr)
+    );
+    let v2: Value = serde_json::from_slice(&o2.stdout).unwrap();
+    assert_eq!(v2["resumed"].as_bool(), Some(true));
+    assert_eq!(v2["session_id"].as_str(), Some(sid.as_str()));
+
+    let reqs = state.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+
+    for (idx, req) in reqs.iter().enumerate() {
+        assert!(req.path.ends_with("/responses"), "req[{idx}] {}", req.path);
+        assert_eq!(
+            req.session_id.as_deref(),
+            Some(sid.as_str()),
+            "req[{idx}] missing session_id header"
+        );
+        assert_eq!(
+            req.x_client_request_id.as_deref(),
+            Some(sid.as_str()),
+            "req[{idx}] missing x-client-request-id header"
+        );
+        assert_eq!(
+            req.x_session_id, None,
+            "req[{idx}] unexpected x-session-id header for openai responses"
+        );
+        let cache_key = req.body["prompt_cache_key"].as_str().unwrap_or("");
+        assert!(!cache_key.is_empty() && cache_key.chars().count() <= 64);
+        assert_eq!(cache_key, sid.chars().take(64).collect::<String>());
+    }
+
+    assert_eq!(
+        reqs[0].body["prompt_cache_key"],
+        reqs[1].body["prompt_cache_key"]
+    );
+    let instr0 = reqs[0].body["instructions"].as_str().unwrap();
+    let instr1 = reqs[1].body["instructions"].as_str().unwrap();
+    assert_eq!(instr0, instr1, "instructions changed across turns");
+    assert_eq!(
+        reqs[0].body["tools"], reqs[1].body["tools"],
+        "tools declaration changed across turns"
+    );
+    let ws_raw = ws.to_string_lossy().replace('\\', "/");
+    let ws_display = std::fs::canonicalize(&ws)
+        .unwrap_or_else(|_| ws.clone())
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(!instr0.contains(&ws_raw), "{instr0}");
+    assert!(!instr0.contains(&ws_display), "{instr0}");
+    assert!(!instr0.contains("当前工作目录："), "{instr0}");
+    assert!(!instr0.contains("今天是 "), "{instr0}");
+
+    let count_env = |body: &Value| -> usize {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                item.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("<environment_context>"))
+            })
+            .count()
+    };
+    assert_eq!(count_env(&reqs[0].body), 1, "{}", reqs[0].body["input"]);
+    assert_eq!(count_env(&reqs[1].body), 1, "{}", reqs[1].body["input"]);
+    let env_text = reqs[0].body["input"][0]["content"].as_str().unwrap();
+    assert!(
+        env_text.contains(&format!("<cwd>{ws_display}</cwd>")),
+        "{env_text}"
+    );
+    assert!(env_text.contains("<current_date>"), "{env_text}");
 }

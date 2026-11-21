@@ -11,4 +11,4 @@ pub use mizar_llm_types::*;
 pub use runtime::{
     BoxChunkStream, EVENT_ADAPTERS_UPDATED, EVENT_LLM_STREAM, LlmAdapter, LlmContextExt, LlmRuntime,
 };
-pub use types::GenerateOptions;
+pub use types::{GenerateOptions, resolve_cache_retention};

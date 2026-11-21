@@ -41,6 +41,41 @@ pub const EVENT_AGENT_TURN_END: &str = "agent/turn-end";
 pub const EVENT_AGENT_STEP_START: &str = "agent/step-start";
 pub const EVENT_AGENT_STEP_FIRST_TOKEN: &str = "agent/step-first-token";
 pub const EVENT_AGENT_STEP_END: &str = "agent/step-end";
+pub const ENVIRONMENT_CONTEXT_SOURCE: &str = "environment-context";
+
+fn ensure_environment_context(session: &Arc<Session>) {
+    let already_visible = session.with_visible_entries(|entries| {
+        entries.iter().any(|e| {
+            matches!(
+                &e.event,
+                SessionEvent::ContextNotice { source, .. } if source == ENVIRONMENT_CONTEXT_SOURCE
+            )
+        })
+    });
+    if already_visible {
+        return;
+    }
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let cwd = session
+        .header()
+        .cwd
+        .map(|raw| raw.replace('\\', "/"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut lines = Vec::with_capacity(4);
+    lines.push("<environment_context>".to_string());
+    if let Some(cwd) = cwd {
+        lines.push(format!("<cwd>{cwd}</cwd>"));
+    }
+    lines.push(format!("<current_date>{date}</current_date>"));
+    lines.push("</environment_context>".to_string());
+    session.append(SessionEvent::context_notice(
+        ENVIRONMENT_CONTEXT_SOURCE,
+        lines.join("\n"),
+    ));
+}
 
 fn now_millis() -> u128 {
     SystemTime::now()
@@ -491,6 +526,7 @@ impl AgentLoop {
                 ts_ms: now_millis(),
             },
         );
+        ensure_environment_context(&session);
         session.append(SessionEvent::user_with_images(input, options.images));
         self.ctx.emit(
             EVENT_AGENT_TURN_INPUT,
@@ -557,6 +593,7 @@ impl AgentLoop {
                 turn_guard.set_reason(TurnEndReason::Cancelled);
                 return Err(AgentError::Llm(LlmError::cancelled()));
             }
+            ensure_environment_context(&session);
             steps_executed += 1;
             self.ctx.emit(
                 EVENT_AGENT_REQUEST,
@@ -615,6 +652,8 @@ impl AgentLoop {
                 temperature,
                 reasoning_effort,
                 headers: Vec::new(),
+                session_id: Some(session.id.clone()),
+                cache_retention: None,
                 cancel: cancel.clone(),
             }) {
                 Ok(s) => s,
@@ -1288,8 +1327,8 @@ mod tests {
         );
 
         let log = session.log();
-        assert_eq!(log.len(), 2);
-        match &log[1].event {
+        assert_eq!(log.len(), 3);
+        match &log[2].event {
             SessionEvent::Assistant { blocks, .. } => {
                 assert_eq!(
                     blocks,
@@ -1354,7 +1393,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(empty_err, AgentError::Llm(e) if e.code == LlmErrorCode::EmptyResponse));
-        assert_eq!(session.log().len(), 3); // first user + first assistant + third user
+        assert_eq!(session.log().len(), 4); // environment-context + first user + first assistant + third user
 
         app.fiber().dispose().await;
     }

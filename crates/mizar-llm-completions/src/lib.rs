@@ -10,9 +10,11 @@ use std::time::Duration;
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
-    LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo, ReasoningEffort,
-    ReplayEnvelope, SseEvent, StreamChunk, TokenUsage,
+    BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
+    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
+    clamp_openai_prompt_cache_key, detect_session_affinity_mode, push_session_affinity_headers,
+    resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
@@ -52,6 +54,10 @@ pub struct CompletionsCompat {
     pub max_tokens_field: MaxTokensField,
     #[serde(alias = "supportsUsageInStreaming")]
     pub include_usage: bool,
+    pub send_session_affinity_headers: Option<bool>,
+    pub session_affinity_mode: Option<SessionAffinityMode>,
+    pub supports_long_cache_retention: Option<bool>,
+    pub supports_prompt_cache_key: Option<bool>,
 }
 
 impl CompletionsCompat {
@@ -60,6 +66,7 @@ impl CompletionsCompat {
             thinking_format: ThinkingFormat::DeepSeek,
             max_tokens_field: MaxTokensField::MaxTokens,
             include_usage: true,
+            ..Default::default()
         }
     }
 
@@ -68,6 +75,7 @@ impl CompletionsCompat {
             thinking_format: ThinkingFormat::OpenAI,
             max_tokens_field: MaxTokensField::MaxCompletionTokens,
             include_usage: true,
+            ..Default::default()
         }
     }
 }
@@ -83,6 +91,7 @@ pub struct CompletionsConfig {
     pub model: String,
     pub compat: CompletionsCompat,
     pub headers: Vec<(String, String)>,
+    pub default_cache_retention: Option<CacheRetention>,
     pub models: Vec<ModelInfo>,
     pub idle_timeout: Duration,
 }
@@ -98,6 +107,7 @@ impl Default for CompletionsConfig {
             model: "gpt-4o".to_string(),
             compat: CompletionsCompat::openai(),
             headers: Vec::new(),
+            default_cache_retention: None,
             models: Vec::new(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
@@ -229,6 +239,32 @@ pub fn build_request_body(
         "stream": true,
         "messages": messages,
     });
+
+    let retention =
+        resolve_cache_retention(options.cache_retention.or(config.default_cache_retention));
+    let supports_long = config.compat.supports_long_cache_retention.unwrap_or(true);
+    let allow_cache_key = match config.compat.supports_prompt_cache_key {
+        Some(flag) => flag,
+        None => {
+            config
+                .base_url
+                .to_ascii_lowercase()
+                .contains("api.openai.com")
+                || (retention == CacheRetention::Long && supports_long)
+        }
+    };
+    if retention != CacheRetention::None
+        && allow_cache_key
+        && let Some(key) = options
+            .session_id
+            .as_deref()
+            .and_then(clamp_openai_prompt_cache_key)
+    {
+        body["prompt_cache_key"] = Value::String(key);
+    }
+    if retention == CacheRetention::Long && supports_long {
+        body["prompt_cache_retention"] = json!("24h");
+    }
 
     if config.compat.include_usage {
         body["stream_options"] = json!({ "include_usage": true });
@@ -702,6 +738,7 @@ impl CompletionsAdapter {
         &self,
         api_key: Option<&str>,
         extra: &[(String, String)],
+        session_id: Option<&str>,
     ) -> Vec<(String, String)> {
         let mut headers = Vec::new();
         if let Some(key) = api_key {
@@ -709,6 +746,17 @@ impl CompletionsAdapter {
         }
         headers.extend(self.config.headers.iter().cloned());
         headers.extend(extra.iter().cloned());
+        let mode = self.config.compat.session_affinity_mode.unwrap_or_else(|| {
+            detect_session_affinity_mode(&self.config.provider, Some(&self.config.base_url))
+        });
+        let send_affinity = self
+            .config
+            .compat
+            .send_session_affinity_headers
+            .unwrap_or(mode == SessionAffinityMode::OpenRouter);
+        if send_affinity {
+            push_session_affinity_headers(&mut headers, mode, session_id, true);
+        }
         headers
     }
 }
@@ -744,7 +792,7 @@ impl LlmAdapter for CompletionsAdapter {
             Err(e) => return Box::pin(async move { Err(e) }),
         };
         let url = format!("{}/models", trim_base_url(&self.config.base_url));
-        let headers = self.build_headers(api_key.as_deref(), extra_headers);
+        let headers = self.build_headers(api_key.as_deref(), extra_headers, None);
         let client = self.client.clone();
         Box::pin(async move { discover_models_http(&client, &url, &headers).await })
     }
@@ -765,7 +813,11 @@ impl LlmAdapter for CompletionsAdapter {
             .unwrap_or_else(|| self.config.model.clone());
         let body = build_request_body(&self.config, &options, &model);
         let url = format!("{}/chat/completions", trim_base_url(&self.config.base_url));
-        let headers = self.build_headers(api_key.as_deref(), &options.headers);
+        let headers = self.build_headers(
+            api_key.as_deref(),
+            &options.headers,
+            options.session_id.as_deref(),
+        );
         let decoder = CompletionsSseDecoder::new(self.config.provider.clone(), model);
 
         spawn_sse_stream(
@@ -953,5 +1005,106 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn injects_prompt_cache_fields_and_affinity_headers_by_compat() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Value,
+        )>::new()));
+        let seen = Arc::clone(&recorded);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: axum::http::HeaderMap, body: axum::Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let h = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(ToString::to_string)
+                    };
+                    seen.lock().unwrap().push((
+                        h("session_id"),
+                        h("x-client-request-id"),
+                        h("x-session-affinity"),
+                        h("x-session-id"),
+                        body.0,
+                    ));
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 1. 显式开启 supports_prompt_cache_key + send_session_affinity_headers + Long retention
+        let mut cfg1 = CompletionsConfig::new("k");
+        cfg1.base_url = format!("http://{addr}");
+        cfg1.compat.supports_prompt_cache_key = Some(true);
+        cfg1.compat.send_session_affinity_headers = Some(true);
+        let mut s1 = CompletionsAdapter::new(cfg1).stream(GenerateOptions {
+            messages: vec![Message::user("hi")],
+            session_id: Some("sess-comp-1".into()),
+            cache_retention: Some(CacheRetention::Long),
+            ..Default::default()
+        });
+        while let Some(c) = s1.next().await {
+            let _ = c.unwrap();
+        }
+
+        // 2. 默认非 api.openai.com 且未显式启用：不发 prompt_cache_key 也不发 OpenAI 亲和头
+        let mut cfg2 = CompletionsConfig::new("k");
+        cfg2.base_url = format!("http://{addr}");
+        let mut s2 = CompletionsAdapter::new(cfg2).stream(GenerateOptions {
+            messages: vec![Message::user("hi")],
+            session_id: Some("sess-comp-2".into()),
+            ..Default::default()
+        });
+        while let Some(c) = s2.next().await {
+            let _ = c.unwrap();
+        }
+
+        // 3. OpenRouter provider 默认发 x-session-id
+        let mut cfg3 = CompletionsConfig::new("k");
+        cfg3.provider = "openrouter".into();
+        cfg3.base_url = format!("http://{addr}");
+        let mut s3 = CompletionsAdapter::new(cfg3).stream(GenerateOptions {
+            messages: vec![Message::user("hi")],
+            session_id: Some("sess-or-3".into()),
+            ..Default::default()
+        });
+        while let Some(c) = s3.next().await {
+            let _ = c.unwrap();
+        }
+
+        let log = recorded.lock().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0].0.as_deref(), Some("sess-comp-1"));
+        assert_eq!(log[0].1.as_deref(), Some("sess-comp-1"));
+        assert_eq!(log[0].2.as_deref(), Some("sess-comp-1"));
+        assert_eq!(log[0].3, None);
+        assert_eq!(log[0].4["prompt_cache_key"], "sess-comp-1");
+        assert_eq!(log[0].4["prompt_cache_retention"], "24h");
+
+        assert_eq!(log[1].0, None);
+        assert_eq!(log[1].1, None);
+        assert_eq!(log[1].2, None);
+        assert!(log[1].4.get("prompt_cache_key").is_none());
+
+        assert_eq!(log[2].0, None);
+        assert_eq!(log[2].3.as_deref(), Some("sess-or-3"));
     }
 }

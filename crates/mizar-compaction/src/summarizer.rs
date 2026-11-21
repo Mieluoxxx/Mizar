@@ -33,6 +33,7 @@ Write a concise, high-signal checkpoint summary with these exact sections:
 
 pub struct SummarizeParams<'a> {
     pub llm: &'a LlmRuntime,
+    pub session_id: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub system_prompt: String,
@@ -163,6 +164,8 @@ where
         temperature: Some(0.2),
         reasoning_effort: params.disable_reasoning.then_some(ReasoningEffort::Off),
         headers: Vec::new(),
+        session_id: params.session_id.clone(),
+        cache_retention: None,
         cancel: params.cancel.clone(),
     };
 
@@ -207,6 +210,8 @@ where
         temperature: Some(0.2),
         reasoning_effort: params.disable_reasoning.then_some(ReasoningEffort::Off),
         headers: Vec::new(),
+        session_id: None,
+        cache_retention: None,
         cancel: params.cancel.clone(),
     };
 

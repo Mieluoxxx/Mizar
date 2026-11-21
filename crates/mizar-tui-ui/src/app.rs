@@ -1180,6 +1180,21 @@ fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
             format!("[{source}] 已加载指令：{}", paths.join(", "))
         };
     }
+    if source == "environment-context" {
+        let extract_tag = |tag: &str| -> Option<&str> {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            let rest = text.split_once(&open)?.1;
+            let val = rest.split_once(&close)?.0.trim();
+            (!val.is_empty()).then_some(val)
+        };
+        return match (extract_tag("cwd"), extract_tag("current_date")) {
+            (Some(cwd), Some(date)) => format!("[{source}] {cwd} ({date})"),
+            (Some(cwd), None) => format!("[{source}] {cwd}"),
+            (None, Some(date)) => format!("[{source}] ({date})"),
+            (None, None) => format!("[{source}] 已注入运行环境上下文"),
+        };
+    }
     format!("[{source}] {text}")
 }
 
@@ -1599,6 +1614,15 @@ mod tests {
         );
         assert_eq!(folded, "[file-mentions] 已附加引用：src/lib.rs, src");
         assert!(!folded.contains("SECRET_FILE_BODY"));
+
+        let env_folded = summarize_context_notice_for_replay(
+            "environment-context",
+            "<environment_context>\n<cwd>/workspace/mizar</cwd>\n<current_date>2026-11-22</current_date>\n</environment_context>",
+        );
+        assert_eq!(
+            env_folded,
+            "[environment-context] /workspace/mizar (2026-11-22)"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

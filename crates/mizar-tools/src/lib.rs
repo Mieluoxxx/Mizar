@@ -48,6 +48,18 @@ pub enum ToolExposure {
     Hidden,
 }
 
+impl ToolExposure {
+    const fn sort_rank(self) -> u8 {
+        match self {
+            Self::Direct => 0,
+            Self::ModelOnly => 1,
+            Self::Codemode => 2,
+            Self::Deferred => 3,
+            Self::Hidden => 4,
+        }
+    }
+}
+
 /// 工具并发执行模式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -726,6 +738,13 @@ impl ToolRuntime {
                 return Err(ToolError::DuplicateTool(tool_name));
             }
             st.tools.push(tool);
+            // 并发插件挂载顺序不固定，按暴露层级与工具名归一化以稳定 instructions 与 tools 声明前缀
+            st.tools.sort_by(|a, b| {
+                a.exposure
+                    .sort_rank()
+                    .cmp(&b.exposure.sort_rank())
+                    .then_with(|| a.name.cmp(&b.name))
+            });
         }
         self.ctx.emit(EVENT_TOOLS_CHANGE, ());
 
@@ -1293,6 +1312,89 @@ mod tests {
         assert_eq!(
             tools.get_active_tools("s1"),
             vec!["read", "write", "codemode"]
+        );
+    }
+
+    #[tokio::test]
+    async fn declares_tools_in_deterministic_order_regardless_of_registration_order() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = app.tools().unwrap();
+
+        let _ts = tools
+            .register(
+                ToolDefinition::sync_tool("tool_search", "search", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly),
+            )
+            .unwrap();
+        let _w = tools
+            .register(ToolDefinition::sync_tool(
+                "write",
+                "write",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _r = tools
+            .register(ToolDefinition::sync_tool(
+                "read",
+                "read",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _cm = tools
+            .register(
+                ToolDefinition::sync_tool("codemode", "codemode", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly),
+            )
+            .unwrap();
+        let _mb = tools
+            .register(
+                ToolDefinition::sync_tool("mcp_b", "b", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+        let _ma = tools
+            .register(
+                ToolDefinition::sync_tool("mcp_a", "a", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+
+        let default_names: Vec<String> = tools
+            .list_declared(None)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            default_names,
+            vec!["read", "write", "codemode", "tool_search"]
+        );
+
+        let all_names: Vec<String> = tools.list_all().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            all_names,
+            vec!["read", "write", "codemode", "tool_search", "mcp_a", "mcp_b"]
+        );
+
+        tools.activate_tools("s1", &["mcp_b".to_string()]);
+        let after_activate: Vec<String> = tools
+            .list_declared(Some("s1"))
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            after_activate,
+            vec!["read", "write", "codemode", "tool_search", "mcp_b"]
         );
     }
 }
