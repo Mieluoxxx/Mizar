@@ -2,10 +2,21 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use cordis::{BoxFuture as CordisBoxFuture, Cleanup, Context, CordisError, Service};
+
+#[cfg(all(mizar_loom, test))]
+mod sync {
+    pub(super) use loom::sync::Mutex;
+    pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
+}
+
+#[cfg(not(all(mizar_loom, test)))]
+mod sync {
+    pub(super) use std::sync::Mutex;
+    pub(super) use std::sync::atomic::{AtomicU64, Ordering};
+}
 
 use crate::types::{
     RUNTIME_SKILL_RANK, SkillCandidate, SkillCatalogSnapshot, SkillDefinition, SkillLookupOptions,
@@ -60,9 +71,129 @@ struct IndexedCandidate {
     runtime_def: Option<SkillDefinition>,
 }
 
+struct CatalogData<P, R> {
+    providers: Vec<P>,
+    runtime_skills: Vec<R>,
+}
+
+#[derive(Clone)]
+struct CachedEntry<V> {
+    revision: u64,
+    value: V,
+}
+
+/// 带单调版本号的目录容器：`data` 锁内原子递增 `revision`（`Release`），
+/// 并在释放 `data` 锁后于 `cache` 锁内仅淘汰旧版本缓存，防止跨锁撕裂与陈旧快照写回。
+struct VersionedCatalog<P, R, K, V> {
+    cache_max: usize,
+    revision: sync::AtomicU64,
+    data: sync::Mutex<CatalogData<P, R>>,
+    cache: sync::Mutex<HashMap<K, CachedEntry<V>>>,
+}
+
+impl<P, R, K, V> VersionedCatalog<P, R, K, V>
+where
+    P: Clone,
+    R: Clone,
+    K: Eq + std::hash::Hash + Clone,
+    V: Clone,
+{
+    fn new(cache_max: usize) -> Self {
+        Self::with_initial_data(cache_max, Vec::new(), Vec::new())
+    }
+
+    fn with_initial_data(cache_max: usize, providers: Vec<P>, runtime_skills: Vec<R>) -> Self {
+        Self {
+            cache_max: cache_max.max(1),
+            revision: sync::AtomicU64::new(1),
+            data: sync::Mutex::new(CatalogData {
+                providers,
+                runtime_skills,
+            }),
+            cache: sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn mutate_data<T>(&self, f: impl FnOnce(&mut Vec<P>, &mut Vec<R>) -> (T, bool)) -> (T, bool) {
+        let (res, new_rev) = {
+            let mut data = self.data.lock().unwrap();
+            let guard = &mut *data;
+            let (res, changed) = f(&mut guard.providers, &mut guard.runtime_skills);
+            let new_rev = if changed {
+                Some(self.revision.fetch_add(1, sync::Ordering::Release) + 1)
+            } else {
+                None
+            };
+            (res, new_rev)
+        };
+        if let Some(rev) = new_rev {
+            let mut cache = self.cache.lock().unwrap();
+            // 仅剔除旧版本条目，保留并发期间已基于最新 rev 完成写入的新快照
+            cache.retain(|_, entry| entry.revision >= rev);
+            (res, true)
+        } else {
+            (res, false)
+        }
+    }
+
+    fn invalidate(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        self.revision.fetch_add(1, sync::Ordering::Release);
+        cache.clear();
+    }
+
+    fn try_get_cached(&self, key: &K) -> (u64, Option<V>) {
+        let cache = self.cache.lock().unwrap();
+        let rev = self.revision.load(sync::Ordering::Acquire);
+        let hit = cache
+            .get(key)
+            .filter(|entry| entry.revision == rev)
+            .map(|entry| entry.value.clone());
+        (rev, hit)
+    }
+
+    fn is_revision_unchanged(&self, rev_before: u64) -> bool {
+        self.revision.load(sync::Ordering::Acquire) == rev_before
+    }
+
+    fn snapshot_providers(&self) -> Vec<P> {
+        self.data.lock().unwrap().providers.clone()
+    }
+
+    fn inspect_providers<T>(&self, f: impl FnOnce(&[P]) -> T) -> T {
+        f(&self.data.lock().unwrap().providers)
+    }
+
+    fn snapshot_data(&self) -> (u64, Vec<P>, Vec<R>) {
+        let data = self.data.lock().unwrap();
+        let rev = self.revision.load(sync::Ordering::Acquire);
+        (rev, data.providers.clone(), data.runtime_skills.clone())
+    }
+
+    fn commit_cache(&self, key: K, rev_snapshot: u64, value: V) -> bool {
+        let mut cache = self.cache.lock().unwrap();
+        if self.revision.load(sync::Ordering::Acquire) != rev_snapshot {
+            return false;
+        }
+        if !cache.contains_key(&key)
+            && cache.len() >= self.cache_max
+            && let Some(first_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&first_key);
+        }
+        cache.insert(
+            key,
+            CachedEntry {
+                revision: rev_snapshot,
+                value,
+            },
+        );
+        true
+    }
+}
+
 #[derive(Clone)]
 struct CachedCollect {
-    revision: u64,
     entries: HashMap<String, IndexedCandidate>,
     fingerprints: Vec<(u64, Option<u64>)>,
 }
@@ -74,12 +205,8 @@ pub struct SkillRegistryConfig {
 
 pub struct SkillRegistry {
     ctx: Context,
-    cache_max: usize,
-    next_id: AtomicU64,
-    revision: AtomicU64,
-    providers: Mutex<Vec<RegisteredProvider>>,
-    runtime_skills: Mutex<Vec<RuntimeEntry>>,
-    collect_cache: Mutex<HashMap<Option<PathBuf>, CachedCollect>>,
+    next_id: sync::AtomicU64,
+    catalog: VersionedCatalog<RegisteredProvider, RuntimeEntry, Option<PathBuf>, CachedCollect>,
 }
 
 impl SkillRegistry {
@@ -91,29 +218,36 @@ impl SkillRegistry {
         if name == "runtime" {
             return Err("\"runtime\" is reserved for runtime skill registrations".to_string());
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut list = self.providers.lock().unwrap();
-            if list.iter().any(|p| p.provider.name() == name) {
-                return Err(format!("skill provider \"{name}\" is already registered"));
+        let id = self.next_id.fetch_add(1, sync::Ordering::Relaxed);
+        let (res, changed) = self.catalog.mutate_data(|providers, _| {
+            if providers.iter().any(|p| p.provider.name() == name) {
+                return (
+                    Err(format!("skill provider \"{name}\" is already registered")),
+                    false,
+                );
             }
-            list.push(RegisteredProvider {
+            providers.push(RegisteredProvider {
                 id,
                 order: id as i64,
                 provider,
             });
+            (Ok(()), true)
+        });
+        res?;
+        if changed {
+            self.ctx.emit(EVENT_SKILLS_CHANGE, ());
         }
-        self.invalidate_cache();
 
         let weak = Arc::downgrade(self);
         Ok(Cleanup::sync(move || {
             if let Some(reg) = weak.upgrade() {
-                let mut list = reg.providers.lock().unwrap();
-                let before = list.len();
-                list.retain(|p| p.id != id);
-                if list.len() != before {
-                    drop(list);
-                    reg.invalidate_cache();
+                let (_, changed) = reg.catalog.mutate_data(|providers, _| {
+                    let before = providers.len();
+                    providers.retain(|p| p.id != id);
+                    ((), providers.len() != before)
+                });
+                if changed {
+                    reg.ctx.emit(EVENT_SKILLS_CHANGE, ());
                 }
             }
         }))
@@ -126,17 +260,16 @@ impl SkillRegistry {
         if skill.description.trim().is_empty() {
             return Err(format!("skill \"{}\" requires a description", skill.name));
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut list = self.runtime_skills.lock().unwrap();
-            if list.iter().any(|e| e.definition.summary.name == skill.name) {
-                self.ctx.logger_named("skills").warn(format!(
-                    "runtime skill \"{}\" ignored because it is already registered",
-                    skill.name
-                ));
-                return Ok(Cleanup::sync(|| {}));
+        let id = self.next_id.fetch_add(1, sync::Ordering::Relaxed);
+        let skill_name = skill.name.clone();
+        let (inserted, changed) = self.catalog.mutate_data(|_, runtime_skills| {
+            if runtime_skills
+                .iter()
+                .any(|e| e.definition.summary.name == skill_name)
+            {
+                return (false, false);
             }
-            list.push(RuntimeEntry {
+            runtime_skills.push(RuntimeEntry {
                 id,
                 definition: SkillDefinition {
                     summary: SkillSummary {
@@ -153,29 +286,35 @@ impl SkillRegistry {
                     metadata: skill.metadata,
                 },
             });
+            (true, true)
+        });
+        if !inserted {
+            self.ctx.logger_named("skills").warn(format!(
+                "runtime skill \"{skill_name}\" ignored because it is already registered"
+            ));
+            return Ok(Cleanup::sync(|| {}));
         }
-        self.invalidate_cache();
+        if changed {
+            self.ctx.emit(EVENT_SKILLS_CHANGE, ());
+        }
 
         let weak = Arc::downgrade(self);
         Ok(Cleanup::sync(move || {
             if let Some(reg) = weak.upgrade() {
-                let mut list = reg.runtime_skills.lock().unwrap();
-                let before = list.len();
-                list.retain(|e| e.id != id);
-                if list.len() != before {
-                    drop(list);
-                    reg.invalidate_cache();
+                let (_, changed) = reg.catalog.mutate_data(|_, runtime_skills| {
+                    let before = runtime_skills.len();
+                    runtime_skills.retain(|e| e.id != id);
+                    ((), runtime_skills.len() != before)
+                });
+                if changed {
+                    reg.ctx.emit(EVENT_SKILLS_CHANGE, ());
                 }
             }
         }))
     }
 
     pub fn invalidate_cache(&self) {
-        {
-            let mut cache = self.collect_cache.lock().unwrap();
-            self.revision.fetch_add(1, Ordering::SeqCst);
-            cache.clear();
-        }
+        self.catalog.invalidate();
         self.ctx.emit(EVENT_SKILLS_CHANGE, ());
     }
 
@@ -206,47 +345,39 @@ impl SkillRegistry {
     ) -> (HashMap<String, IndexedCandidate>, bool) {
         let mut attempt = 0;
         loop {
-            let (rev_before, cache_hit) = {
-                let cache = self.collect_cache.lock().unwrap();
-                (
-                    self.revision.load(Ordering::SeqCst),
-                    cache.get(&options.cwd).cloned(),
-                )
-            };
-            let providers = self.providers.lock().unwrap().clone();
-            if let Some(cached) = cache_hit
-                && cached.revision == rev_before
-                && self.is_cache_fresh(&cached, &providers, options).await
-                && self.revision.load(Ordering::SeqCst) == rev_before
-            {
-                return (cached.entries, true);
+            let (rev_before, cache_hit) = self.catalog.try_get_cached(&options.cwd);
+            if let Some(cached) = cache_hit {
+                let providers = self.catalog.snapshot_providers();
+                if self.is_cache_fresh(&cached, &providers, options).await
+                    && self.catalog.is_revision_unchanged(rev_before)
+                {
+                    return (cached.entries, true);
+                }
             }
 
+            let (rev_snapshot, providers, mut rt) = self.catalog.snapshot_data();
             let mut all_candidates: Vec<IndexedCandidate> = Vec::new();
             let mut complete = true;
             let mut fingerprints = Vec::with_capacity(providers.len());
 
             // 运行时注册 skill（rank = 250）
-            {
-                let mut rt = self.runtime_skills.lock().unwrap().clone();
-                rt.sort_by(|a, b| a.definition.summary.name.cmp(&b.definition.summary.name));
-                for (idx, entry) in rt.into_iter().enumerate() {
-                    let def = entry.definition;
-                    let candidate = SkillCandidate {
-                        summary: def.summary.clone(),
-                        rank: RUNTIME_SKILL_RANK,
-                        locator: Arc::new(()),
-                        metadata: def.metadata.clone(),
-                    };
-                    all_candidates.push(IndexedCandidate {
-                        candidate,
-                        provider: None,
-                        provider_id: entry.id,
-                        provider_order: -1,
-                        local_order: idx,
-                        runtime_def: Some(def),
-                    });
-                }
+            rt.sort_by(|a, b| a.definition.summary.name.cmp(&b.definition.summary.name));
+            for (idx, entry) in rt.into_iter().enumerate() {
+                let def = entry.definition;
+                let candidate = SkillCandidate {
+                    summary: def.summary.clone(),
+                    rank: RUNTIME_SKILL_RANK,
+                    locator: Arc::new(()),
+                    metadata: def.metadata.clone(),
+                };
+                all_candidates.push(IndexedCandidate {
+                    candidate,
+                    provider: None,
+                    provider_id: entry.id,
+                    provider_order: -1,
+                    local_order: idx,
+                    runtime_def: Some(def),
+                });
             }
 
             // 所有已注册提供方
@@ -310,32 +441,24 @@ impl SkillRegistry {
             }
 
             if complete {
-                let mut cache = self.collect_cache.lock().unwrap();
-                if self.revision.load(Ordering::SeqCst) != rev_before {
-                    drop(cache);
+                if !self.catalog.commit_cache(
+                    options.cwd.clone(),
+                    rev_snapshot,
+                    CachedCollect {
+                        entries: winners.clone(),
+                        fingerprints,
+                    },
+                ) {
                     attempt += 1;
                     if attempt < MAX_COLLECT_ATTEMPTS {
                         continue;
                     }
                     return (winners, false);
                 }
-                if cache.len() >= self.cache_max
-                    && let Some(first_key) = cache.keys().next().cloned()
-                {
-                    cache.remove(&first_key);
-                }
-                cache.insert(
-                    options.cwd.clone(),
-                    CachedCollect {
-                        revision: rev_before,
-                        entries: winners.clone(),
-                        fingerprints,
-                    },
-                );
                 return (winners, true);
             }
 
-            if self.revision.load(Ordering::SeqCst) != rev_before {
+            if !self.catalog.is_revision_unchanged(rev_snapshot) {
                 attempt += 1;
                 if attempt < MAX_COLLECT_ATTEMPTS {
                     continue;
@@ -385,12 +508,9 @@ impl SkillRegistry {
             return Ok(None);
         };
         if def.summary.name != name {
-            let still_live = self
-                .providers
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|p| p.id == matched.provider_id);
+            let still_live = self.catalog.inspect_providers(|providers| {
+                providers.iter().any(|p| p.id == matched.provider_id)
+            });
             if still_live {
                 self.invalidate_cache();
             }
@@ -412,17 +532,14 @@ impl Service for SkillRegistry {
     }
 
     fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
+        let cache_max = config
+            .collect_cache_max_entries
+            .unwrap_or(DEFAULT_COLLECT_CACHE_MAX)
+            .max(1);
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
-            cache_max: config
-                .collect_cache_max_entries
-                .unwrap_or(DEFAULT_COLLECT_CACHE_MAX)
-                .max(1),
-            next_id: AtomicU64::new(1),
-            revision: AtomicU64::new(1),
-            providers: Mutex::new(Vec::new()),
-            runtime_skills: Mutex::new(Vec::new()),
-            collect_cache: Mutex::new(HashMap::new()),
+            next_id: sync::AtomicU64::new(1),
+            catalog: VersionedCatalog::new(cache_max),
         }))
     }
 
@@ -438,5 +555,120 @@ pub trait SkillsContextExt {
 impl SkillsContextExt for Context {
     fn skills(&self) -> Result<Arc<SkillRegistry>, CordisError> {
         self.service::<SkillRegistry>("skills")
+    }
+}
+
+#[cfg(all(mizar_loom, test))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc as LoomArc;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::thread;
+
+    #[test]
+    fn loom_concurrent_mutation_never_publishes_stale_cache() {
+        loom::model(|| {
+            let catalog = LoomArc::new(VersionedCatalog::<u32, u32, (), u32>::with_initial_data(
+                4,
+                vec![1],
+                vec![],
+            ));
+
+            let w_cat = LoomArc::clone(&catalog);
+            let r_cat = LoomArc::clone(&catalog);
+
+            let writer = thread::spawn(move || {
+                w_cat.mutate_data(|providers, _| {
+                    providers[0] = 2;
+                    ((), true)
+                });
+            });
+
+            let reader = thread::spawn(move || {
+                let (rev, providers, _) = r_cat.snapshot_data();
+                let _ = r_cat.commit_cache((), rev, providers[0]);
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+
+            if let (_, Some(cached)) = catalog.try_get_cached(&()) {
+                assert_eq!(cached, 2, "stale value committed to cache after mutation");
+            }
+        });
+    }
+
+    #[test]
+    fn loom_fast_path_never_hits_stale_after_mutation_returns() {
+        loom::model(|| {
+            let catalog = LoomArc::new(VersionedCatalog::<u32, u32, (), u32>::with_initial_data(
+                4,
+                vec![1],
+                vec![],
+            ));
+            let (rev0, p0, _) = catalog.snapshot_data();
+            assert!(catalog.commit_cache((), rev0, p0[0]));
+
+            let mutated_done = LoomArc::new(AtomicBool::new(false));
+            let w_cat = LoomArc::clone(&catalog);
+            let w_flag = LoomArc::clone(&mutated_done);
+            let r_cat = LoomArc::clone(&catalog);
+            let r_flag = LoomArc::clone(&mutated_done);
+
+            let writer = thread::spawn(move || {
+                w_cat.mutate_data(|providers, _| {
+                    providers[0] = 2;
+                    ((), true)
+                });
+                w_flag.store(true, Ordering::Release);
+            });
+
+            let reader = thread::spawn(move || {
+                let (rev_before, hit) = r_cat.try_get_cached(&());
+                if r_flag.load(Ordering::Acquire)
+                    && let Some(val) = hit
+                    && r_cat.is_revision_unchanged(rev_before)
+                {
+                    assert_eq!(
+                        val, 2,
+                        "fast path served stale value after mutation returned"
+                    );
+                }
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn loom_invalidate_races_with_commit_cache() {
+        loom::model(|| {
+            let catalog = LoomArc::new(VersionedCatalog::<u32, u32, (), u32>::with_initial_data(
+                4,
+                vec![1],
+                vec![],
+            ));
+            let (rev_snap, providers, _) = catalog.snapshot_data();
+
+            let w_cat = LoomArc::clone(&catalog);
+            let r_cat = LoomArc::clone(&catalog);
+
+            let writer = thread::spawn(move || {
+                w_cat.invalidate();
+            });
+
+            let reader = thread::spawn(move || {
+                let _ = r_cat.commit_cache((), rev_snap, providers[0]);
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+
+            assert!(
+                catalog.try_get_cached(&()).1.is_none(),
+                "invalidated revision leaked back into cache"
+            );
+        });
     }
 }

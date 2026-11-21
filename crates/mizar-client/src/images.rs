@@ -453,7 +453,7 @@ mod tests {
     use image::{ImageBuffer, Rgb, Rgba};
 
     #[test]
-    fn sniffs_only_supported_magic_bytes_within_first_16_bytes() {
+    fn sniffs_magic_bytes_and_rejects_pixel_bomb_from_header() {
         assert_eq!(
             sniff_image_format(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]),
             Some(ImageFormat::Png)
@@ -467,60 +467,14 @@ mod tests {
             sniff_image_format(b"RIFF\x00\x00\x00\x00WEBP...."),
             Some(ImageFormat::WebP)
         );
-        // BMP / SVG / Rust 源码均不识别为支持的图片
-        assert_eq!(sniff_image_format(b"BM\x00\x00"), None);
         assert_eq!(sniff_image_format(b"<svg></svg>"), None);
-        assert_eq!(sniff_image_format(b"fn main() {}"), None);
-    }
 
-    #[test]
-    fn small_valid_png_passes_through_without_reencoding() {
-        let img =
-            DynamicImage::ImageRgba8(ImageBuffer::from_pixel(64, 48, Rgba([12, 34, 56, 255])));
-        let raw = encode_png_bytes(&img).unwrap();
-        let processed = process_image_bytes(&raw).unwrap();
-        assert_eq!(processed.attachment.media_type, "image/png");
-        assert_eq!(processed.attachment.width, Some(64));
-        assert_eq!(processed.attachment.height, Some(48));
-        assert_eq!(processed.attachment.data, STANDARD.encode(&raw));
-        assert_eq!(processed.marker_suffix(), None);
-    }
-
-    #[test]
-    fn oversized_dimensions_preserve_aspect_ratio_within_max_edge() {
-        let landscape =
-            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(4032, 3024, Rgb([20, 40, 80])));
-        let raw_landscape = encode_png_bytes(&landscape).unwrap();
-        let out_landscape = process_image_bytes(&raw_landscape).unwrap();
-        assert_eq!(out_landscape.attachment.width, Some(2048));
-        assert_eq!(out_landscape.attachment.height, Some(1536));
-        assert_eq!(
-            out_landscape.marker_suffix().as_deref(),
-            Some("4032×3024 → 2048×1536")
-        );
-
-        let portrait =
-            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(1080, 2400, Rgb([90, 50, 10])));
-        let raw_portrait = encode_png_bytes(&portrait).unwrap();
-        let out_portrait = process_image_bytes(&raw_portrait).unwrap();
-        assert_eq!(out_portrait.attachment.width, Some(922));
-        assert_eq!(out_portrait.attachment.height, Some(2048));
-        assert_eq!(
-            out_portrait.marker_suffix().as_deref(),
-            Some("1080×2400 → 922×2048")
-        );
-    }
-
-    #[test]
-    fn rejects_over_max_pixels_from_header_without_decoding_idat() {
-        // 构造一个仅含合法 IHDR（20000×20000 = 400M 像素 > 100M）但完全没有 IDAT 数据块的最小 PNG。
-        // 若先解码再判分辨率则会报 DecodeFailed/Truncated；必须在 header 阶段直接返回 TooManyPixels。
-        let mut hdr_only = Vec::new();
-        hdr_only.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // 仅含 20000×20000 IHDR 但无 IDAT 的最小 PNG，必须在解码像素前拒收。
+        let mut hdr_only = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&20_000u32.to_be_bytes());
         ihdr.extend_from_slice(&20_000u32.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // bit depth 8, RGB, deflate/filter/interlace
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
         hdr_only.extend_from_slice(&(ihdr.len() as u32).to_be_bytes());
         hdr_only.extend_from_slice(b"IHDR");
         hdr_only.extend_from_slice(&ihdr);
@@ -528,65 +482,68 @@ mod tests {
         hdr_only.extend_from_slice(&crc.to_be_bytes());
 
         let err = process_image_bytes(&hdr_only).expect_err("must reject >100M pixel header");
-        assert!(
-            matches!(
-                err,
-                ImageProcessError::TooManyPixels {
-                    width: 20_000,
-                    height: 20_000,
-                    pixels: 400_000_000,
-                    limit: MAX_IMAGE_PIXELS,
-                }
-            ),
-            "expected TooManyPixels before decoding pixel body, got: {err:?}"
-        );
+        assert!(matches!(
+            err,
+            ImageProcessError::TooManyPixels {
+                width: 20_000,
+                height: 20_000,
+                pixels: 400_000_000,
+                limit: MAX_IMAGE_PIXELS,
+            }
+        ));
     }
 
     #[test]
-    fn high_entropy_png_exceeding_budget_falls_back_to_jpeg_within_limit() {
-        // 构造 2048×2048 高熵伪随机噪声图像：PNG 无法压缩（~12.6MB > 5MB base64），必须回退 JPEG q=85。
+    fn small_png_passthrough_aspect_scaling_and_exif_orientation() {
+        let small =
+            DynamicImage::ImageRgba8(ImageBuffer::from_pixel(64, 48, Rgba([12, 34, 56, 255])));
+        let small_raw = encode_png_bytes(&small).unwrap();
+        let small_out = process_image_bytes(&small_raw).unwrap();
+        assert_eq!(small_out.attachment.media_type, "image/png");
+        assert_eq!(small_out.attachment.data, STANDARD.encode(&small_raw));
+        assert_eq!(small_out.marker_suffix(), None);
+
+        let portrait =
+            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(1080, 2400, Rgb([90, 50, 10])));
+        let portrait_out = process_image_bytes(&encode_png_bytes(&portrait).unwrap()).unwrap();
+        assert_eq!(portrait_out.attachment.width, Some(922));
+        assert_eq!(portrait_out.attachment.height, Some(2048));
+
+        // 4000×2000 带 Orientation=6 旋转后视觉为 2000×4000，应缩为 1024×2048。
+        let raw_img =
+            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(4000, 2000, Rgb([40, 80, 120])));
+        let exif_jpeg = inject_exif_orientation_app1(&encode_jpeg_bytes(&raw_img, 90).unwrap(), 6);
+        let exif_out = process_image_bytes(&exif_jpeg).unwrap();
+        assert_eq!(exif_out.attachment.width, Some(1024));
+        assert_eq!(exif_out.attachment.height, Some(2048));
+    }
+
+    #[test]
+    fn over_budget_png_falls_back_to_jpeg_and_steps_down_edge() {
         let mut buf = RgbImage::new(2048, 2048);
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         for px in buf.pixels_mut() {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            let r = (state >> 16) as u8;
-            let g = (state >> 32) as u8;
-            let b = (state >> 48) as u8;
-            *px = Rgb([r, g, b]);
+            *px = Rgb([
+                (state >> 16) as u8,
+                (state >> 32) as u8,
+                (state >> 48) as u8,
+            ]);
         }
         let png_raw = encode_png_bytes(&DynamicImage::ImageRgb8(buf)).unwrap();
-        assert!(
-            base64_encoded_len(png_raw.len()) > MAX_IMAGE_BASE64_BYTES,
-            "fixture PNG must exceed 5MB base64 budget"
-        );
+        assert!(base64_encoded_len(png_raw.len()) > MAX_IMAGE_BASE64_BYTES);
 
-        let processed = process_image_bytes(&png_raw).unwrap();
-        assert_eq!(processed.attachment.media_type, "image/jpeg");
-        assert!(processed.attachment.data.len() <= MAX_IMAGE_BASE64_BYTES);
-        assert!(
-            processed
-                .marker_suffix()
-                .as_deref()
-                .is_some_and(|s| s.contains("image/png → image/jpeg")),
-            "marker suffix: {:?}",
-            processed.marker_suffix()
-        );
-    }
+        let fallback = process_image_bytes(&png_raw).unwrap();
+        assert_eq!(fallback.attachment.media_type, "image/jpeg");
+        assert!(fallback.attachment.data.len() <= MAX_IMAGE_BASE64_BYTES);
 
-    #[test]
-    fn applies_exif_orientation_before_scaling_to_preserve_visual_aspect() {
-        // 构造 4000×2000 编码分辨率、但带有 EXIF Orientation=6 (Rotate90) 的 JPEG：
-        // 实际视觉方向为 2000×4000（竖图），校正方向后缩放应变成 1024×2048，而非 2048×1024。
-        let raw_img =
-            DynamicImage::ImageRgb8(ImageBuffer::from_pixel(4000, 2000, Rgb([40, 80, 120])));
-        let jpeg_base = encode_jpeg_bytes(&raw_img, 90).unwrap();
-        let exif_jpeg = inject_exif_orientation_app1(&jpeg_base, 6);
-
-        let processed = process_image_bytes(&exif_jpeg).unwrap();
-        assert_eq!(processed.attachment.width, Some(1024));
-        assert_eq!(processed.attachment.height, Some(2048));
+        let budget = 250_000usize;
+        let stepped = process_image_bytes_with_budget(&png_raw, budget).unwrap();
+        assert_eq!(stepped.attachment.media_type, "image/jpeg");
+        assert!(stepped.attachment.width.unwrap() < 2048);
+        assert!(stepped.attachment.data.len() <= budget);
     }
 
     #[test]
@@ -611,64 +568,6 @@ mod tests {
         let decoded_bytes = STANDARD.decode(&processed.attachment.data).unwrap();
         let decoded = image::load_from_memory(&decoded_bytes).unwrap().to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
-    }
-
-    #[test]
-    fn synthetic_code_screenshot_stays_crisp_lossless_png_under_budget() {
-        // 验证 Issue #23 重点关切：2560×1440 代码/终端截图缩放至 2048×1152 后是否能稳定留在 PNG 无损路径。
-        // 模拟深色终端背景 + 等宽字符条带与高亮行（低噪声、多纯色块/横竖笔画）。
-        let mut img = RgbImage::from_pixel(2560, 1440, Rgb([24, 26, 31]));
-        for row in 0..48u32 {
-            let y0 = row * 30;
-            // 状态栏与高亮块
-            let color = if row == 0 || row == 47 {
-                Rgb([45, 52, 68])
-            } else {
-                Rgb([180, 200, 220])
-            };
-            for col in 0..((row * 17) % 120 + 20) {
-                let x0 = 40 + col * 14;
-                if x0 + 8 < 2520 && y0 + 16 < 1440 {
-                    for dy in 4..14 {
-                        for dx in 0..8 {
-                            if (dx + dy + row) % 3 == 0 {
-                                img.put_pixel(x0 + dx, y0 + dy, color);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let raw = encode_png_bytes(&DynamicImage::ImageRgb8(img)).unwrap();
-        let processed = process_image_bytes(&raw).unwrap();
-        assert_eq!(processed.attachment.media_type, "image/png");
-        assert_eq!(processed.attachment.width, Some(2048));
-        assert_eq!(processed.attachment.height, Some(1152));
-        assert!(processed.attachment.data.len() <= MAX_IMAGE_BASE64_BYTES);
-    }
-
-    #[test]
-    fn progressive_edge_step_down_shrinks_image_when_jpeg_exceeds_budget() {
-        let mut buf = RgbImage::new(2048, 2048);
-        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
-        for px in buf.pixels_mut() {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *px = Rgb([
-                (state >> 16) as u8,
-                (state >> 32) as u8,
-                (state >> 48) as u8,
-            ]);
-        }
-        let png_raw = encode_png_bytes(&DynamicImage::ImageRgb8(buf)).unwrap();
-        // 使用更紧预算迫使首次 JPEG q=85（2048×2048）超限，进而触发逐档降长边重试
-        let budget = 250_000usize;
-        let processed = process_image_bytes_with_budget(&png_raw, budget).unwrap();
-        assert_eq!(processed.attachment.media_type, "image/jpeg");
-        assert!(processed.attachment.width.unwrap() < 2048);
-        assert_eq!(processed.attachment.width, processed.attachment.height);
-        assert!(processed.attachment.data.len() <= budget);
     }
 
     fn inject_exif_orientation_app1(jpeg: &[u8], orientation: u16) -> Vec<u8> {

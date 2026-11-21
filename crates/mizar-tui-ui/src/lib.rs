@@ -5,26 +5,29 @@
 pub mod app;
 pub mod editor;
 pub mod emphasis;
+pub mod features;
 pub mod markdown;
-pub mod mentions;
 pub mod overlay;
-pub mod reveal;
 pub mod selection;
 pub mod side_panel;
 pub mod terminal;
 pub mod theme;
 pub mod timeline_rail;
-pub mod tps;
 pub mod trajectory_scene;
 pub mod ui;
+
+pub use mizar_client_core::{HostExtensionFlags, PromptQueue, mentions, reveal, tps};
+
+pub type UiEvent = mizar_client_core::ClientEvent;
 
 pub use app::{
     AppAction, AppState, ApprovalMode, BashInputMode, ChatItem, LaunchpadQuickAction,
     LocalBashOutput, NoticeLevel, PendingSettingsModelPick, QueuedPrompt, SessionReplayItem,
-    SessionSelection, SessionViewData, ToolState, UiAgentStatus, UiEvent, UiLogLevel, UiLogRecord,
+    SessionSelection, SessionViewData, ToolState, UiAgentStatus, UiLogLevel, UiLogRecord,
     UiStepOutcome, UiTurnEndReason, turn_end_program_status,
 };
 pub use emphasis::EmphasisConfig;
+pub use features::TuiFeatures;
 pub use overlay::SessionPickerItem;
 pub use terminal::ScreenMode;
 pub use theme::{TerminalColors, Theme, ThemePreset};

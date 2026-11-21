@@ -9,6 +9,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+pub use mizar_client_core::{
+    ContextBreakdownSnapshot, FileTouchRow, InstructionSummaryRow, McpSummaryRow, SidePanelData,
+    ToolSummaryRow,
+};
+
 use crate::editor::display_width;
 use crate::selection::{SelectionGeometry, SelectionPane};
 use crate::theme::Theme;
@@ -57,90 +62,6 @@ impl SidePanelTab {
             Self::Stats => Self::Context,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ContextBreakdownSnapshot {
-    pub system_tokens: u64,
-    pub user_tokens: u64,
-    pub assistant_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub tool_tokens: u64,
-    pub context_window: u64,
-    pub tps: Option<f64>,
-    pub ttft_ms: Option<u64>,
-    pub tps_history: Vec<f64>,
-    pub ttft_history: Vec<u64>,
-    /// 累计缓存读取量（provider 命中缓存、未计入 `input_tokens` 的部分）。
-    pub cache_read_tokens: u64,
-    /// 累计缓存写入量（Anthropic `cache_creation_input_tokens`）。
-    pub cache_write_tokens: u64,
-    /// 累计净输入（未命中缓存的部分）。**不是** prompt 全量。
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    /// 累计四项总和（`input + cache_read + cache_write + output`）。
-    pub total_tokens: u64,
-    /// 最近一次请求的完整 prompt 体积，用于估算当前上下文占用；无用量时回退到字符估算。
-    pub last_prompt_tokens: Option<u64>,
-}
-
-impl ContextBreakdownSnapshot {
-    /// 累计请求过的 prompt 总量（含命中与写入缓存的部分）。
-    pub fn cumulative_prompt_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cache_read_tokens)
-            .saturating_add(self.cache_write_tokens)
-    }
-
-    /// 累计缓存命中率（`0.0..=100.0`）。分母是 prompt 全量，不是净输入。
-    pub fn cache_hit_rate(&self) -> f64 {
-        let prompt = self.cumulative_prompt_tokens();
-        if prompt == 0 {
-            return 0.0;
-        }
-        (self.cache_read_tokens as f64 / prompt as f64) * 100.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolSummaryRow {
-    pub name: String,
-    pub exposure: String,
-    pub declared: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpSummaryRow {
-    pub name: String,
-    pub status: String,
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileTouchRow {
-    pub path: String,
-    pub op: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstructionSummaryRow {
-    pub path: String,
-    pub scope: String,
-    pub bytes: usize,
-    pub truncated: bool,
-    pub omitted: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SidePanelData {
-    pub context: ContextBreakdownSnapshot,
-    pub instructions: Vec<InstructionSummaryRow>,
-    pub files: Vec<FileTouchRow>,
-    pub git_changes: Vec<FileTouchRow>,
-    pub git_diff_stat: String,
-    pub tools: Vec<ToolSummaryRow>,
-    pub mcps: Vec<McpSummaryRow>,
-    pub findings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -19,6 +19,8 @@ cordis = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 mizar-agent-loop = { workspace = true }
 mizar-agent-spine = { workspace = true }
+mizar-client = { workspace = true }
+mizar-client-core = { workspace = true }
 mizar-instructions = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-llm-mock = { workspace = true }
@@ -34,7 +36,6 @@ mizar-tools-coding = { workspace = true }
 mizar-trajectory = { workspace = true }
 mizar-tui-ui = { workspace = true }
 futures = { workspace = true }
-image = { workspace = true }
 ratatui = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
@@ -44,4 +45,5 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+image = { workspace = true }
 tokio = { workspace = true, features = ["net"] }

@@ -24,3 +24,6 @@ tokio-util = { workspace = true }
 mizar-system-prompt = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(mizar_loom)'.dev-dependencies]
+loom = { workspace = true }

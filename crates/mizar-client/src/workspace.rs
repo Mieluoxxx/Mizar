@@ -1,0 +1,239 @@
+//! 工作区与运行期观测信息汇总（工具、MCP、指令文件、Git 变更、用户技能与轨迹异常）。
+
+use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
+
+use cordis::Context;
+use mizar_client_core::{
+    FileTouchRow, InstructionSummaryRow, McpSummaryRow, SidePanelData, ToolSummaryRow,
+};
+use mizar_instructions::AgentInstructions;
+use mizar_mcp::{McpConnectionState, McpManager};
+use mizar_skills::{SkillLookupOptions, SkillRegistry};
+use mizar_tools::{ToolExposure, ToolRuntime};
+use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
+use tokio_util::sync::CancellationToken;
+
+/// 工作区与后端服务观测数据的纯数据快照，供各端（TUI / Merak）渲染侧栏或仪表盘。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspacePanelSnapshot {
+    pub instructions: Vec<InstructionSummaryRow>,
+    pub git_changes: Vec<FileTouchRow>,
+    pub git_diff_stat: String,
+    pub tools: Vec<ToolSummaryRow>,
+    pub mcps: Vec<McpSummaryRow>,
+    pub findings: Vec<String>,
+}
+
+impl WorkspacePanelSnapshot {
+    /// 一次性采集工作区及全部后端观测维度。
+    pub async fn collect(ctx: &Context, workspace: &Path, session_id: Option<&str>) -> Self {
+        collect_workspace_panel_snapshot(ctx, workspace, session_id).await
+    }
+
+    /// 将工作区观测数据合并进前端侧栏模型（保留前端自己维护的上下文用量与已触达文件列表）。
+    pub fn apply_to_side_panel(&self, panel: &mut SidePanelData, runtime_anomalies: &[String]) {
+        panel.instructions = self.instructions.clone();
+        panel.git_changes = self.git_changes.clone();
+        panel.git_diff_stat = self.git_diff_stat.clone();
+        panel.tools = self.tools.clone();
+        panel.mcps = self.mcps.clone();
+
+        let mut merged = runtime_anomalies.to_vec();
+        for line in &self.findings {
+            if !merged.contains(line) {
+                merged.push(line.clone());
+            }
+        }
+        panel.findings = merged;
+    }
+}
+
+/// 收集完整工作区面板快照（同步聚合服务状态与异步采集 Git 摘要）。
+pub async fn collect_workspace_panel_snapshot(
+    ctx: &Context,
+    workspace: &Path,
+    session_id: Option<&str>,
+) -> WorkspacePanelSnapshot {
+    let instructions = collect_instructions_summary(ctx, session_id);
+    let (git_changes, git_diff_stat) = collect_git_summary(workspace).await;
+    let tools = collect_tools_summary(ctx, session_id);
+    let mcps = collect_mcps_summary(ctx);
+    let findings = session_id
+        .map(|sid| collect_trajectory_findings(ctx, sid))
+        .unwrap_or_default();
+
+    WorkspacePanelSnapshot {
+        instructions,
+        git_changes,
+        git_diff_stat,
+        tools,
+        mcps,
+        findings,
+    }
+}
+
+/// 汇总全局已注册工具及其在当前会话下的可见性（exposure 与声明状态）。
+pub fn collect_tools_summary(ctx: &Context, session_id: Option<&str>) -> Vec<ToolSummaryRow> {
+    let Some(rt) = ctx.get::<ToolRuntime>("tools") else {
+        return Vec::new();
+    };
+    let declared: HashSet<String> = rt
+        .list_declared(session_id)
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    rt.list_all()
+        .into_iter()
+        .map(|info| {
+            let exposure = match info.exposure {
+                ToolExposure::Direct => "direct",
+                ToolExposure::ModelOnly => "model-only",
+                ToolExposure::Codemode => "codemode",
+                ToolExposure::Deferred => "deferred",
+                ToolExposure::Hidden => "hidden",
+            }
+            .to_string();
+            let is_decl = declared.contains(&info.name);
+            ToolSummaryRow {
+                name: info.name,
+                exposure,
+                declared: is_decl,
+            }
+        })
+        .collect()
+}
+
+/// 汇总所有已配置的 MCP Server 连接状态与可用能力。
+pub fn collect_mcps_summary(ctx: &Context) -> Vec<McpSummaryRow> {
+    let Some(mgr) = ctx.get::<McpManager>("mcp") else {
+        return Vec::new();
+    };
+    mgr.statuses()
+        .into_iter()
+        .map(|s| {
+            let (status, ok) = match s.state {
+                McpConnectionState::Connecting => ("连接中…".to_string(), false),
+                McpConnectionState::Connected {
+                    tools_count,
+                    has_resources,
+                } => (
+                    format!(
+                        "已连接 ({tools_count} 工具{})",
+                        if has_resources { " + 资源" } else { "" }
+                    ),
+                    true,
+                ),
+                McpConnectionState::Disabled => ("已禁用".to_string(), false),
+                McpConnectionState::Failed(err) => (format!("失败: {err}"), false),
+            };
+            McpSummaryRow {
+                name: s.name,
+                status,
+                ok,
+            }
+        })
+        .collect()
+}
+
+/// 探测并返回当前工作区/会话加载的 `AGENTS.md` / `CLAUDE.md` 指令作用域摘要。
+pub fn collect_instructions_summary(
+    ctx: &Context,
+    session_id: Option<&str>,
+) -> Vec<InstructionSummaryRow> {
+    let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") else {
+        return Vec::new();
+    };
+    let report = inst.probe_report(session_id);
+    report
+        .scopes
+        .into_iter()
+        .map(|s| InstructionSummaryRow {
+            path: s.display_path,
+            scope: s.scope_kind.as_str().to_string(),
+            bytes: s.bytes,
+            truncated: s.truncated,
+            omitted: s.omitted,
+        })
+        .collect()
+}
+
+/// 带超时采集工作区的 `git status --porcelain`（最多 24 条）与 `git diff --shortstat`。
+pub async fn collect_git_summary(workspace: &Path) -> (Vec<FileTouchRow>, String) {
+    let status_fut = tokio::process::Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(workspace)
+        .output();
+    let mut changes = Vec::new();
+    if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_millis(300), status_fut).await
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines().take(24) {
+            if line.len() < 4 {
+                continue;
+            }
+            let code = line[..2].trim();
+            let path = line[3..].trim().to_string();
+            if !path.is_empty() {
+                changes.push(FileTouchRow {
+                    path,
+                    op: if code.is_empty() {
+                        "?".to_string()
+                    } else {
+                        code.to_string()
+                    },
+                });
+            }
+        }
+    }
+
+    let stat_fut = tokio::process::Command::new("git")
+        .arg("diff")
+        .arg("--shortstat")
+        .current_dir(workspace)
+        .output();
+    let mut stat = String::new();
+    if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_millis(300), stat_fut).await
+        && out.status.success()
+    {
+        stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    }
+    (changes, stat)
+}
+
+/// 列举当前工作区下可由用户通过 `/<skill>` 直接调用的技能名称列表。
+pub async fn collect_user_skill_names(ctx: &Context, workspace: &Path) -> Vec<String> {
+    let Some(reg) = ctx.get::<SkillRegistry>("skills") else {
+        return Vec::new();
+    };
+    reg.list(SkillLookupOptions {
+        cwd: Some(workspace.to_path_buf()),
+        cancel: CancellationToken::new(),
+    })
+    .await
+    .into_iter()
+    .filter(|s| s.is_user_invocable())
+    .map(|s| s.name)
+    .collect()
+}
+
+/// 采集指定会话的轨迹异常发现（去重格式化为 `[Severity] title: summary`）。
+pub fn collect_trajectory_findings(ctx: &Context, session_id: &str) -> Vec<String> {
+    let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") else {
+        return Vec::new();
+    };
+    let Some(report) = traj.inspect(session_id, TimelineMode::Sequence) else {
+        return Vec::new();
+    };
+    let mut findings = Vec::new();
+    for f in report.findings {
+        let line = format!("[{:?}] {}: {}", f.severity, f.title, f.summary);
+        if !findings.contains(&line) {
+            findings.push(line);
+        }
+    }
+    findings
+}

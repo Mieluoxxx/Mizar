@@ -148,19 +148,130 @@ impl Cleanup {
     }
 }
 
-enum EffectState {
-    SyncExecuting,
+#[cfg(all(mizar_loom, test))]
+mod sync {
+    pub(super) use loom::sync::Mutex;
+}
+
+#[cfg(not(all(mizar_loom, test)))]
+mod sync {
+    pub(super) use std::sync::Mutex;
+}
+
+enum EffectState<C> {
+    SyncExecuting { disposed_early: bool },
     AsyncPending { disposed_early: bool },
-    Ready { cleanup: Option<Cleanup> },
+    Ready { cleanup: Option<C> },
     Disposed,
+}
+
+enum DisposeOutcome<C> {
+    RunCleanup(C),
+    DoneNow,
+    Wait,
+}
+
+enum CompleteOutcome<C> {
+    Stored,
+    RunEarlyCleanup(Option<C>),
+}
+
+struct EffectLifecycleInner<C> {
+    sn: Option<u64>,
+    state: EffectState<C>,
+}
+
+/// 单锁保护的副作用生命周期状态机：统一维护序号与状态跃迁，消除双锁失步与提前唤醒窗口。
+struct EffectLifecycle<C> {
+    inner: sync::Mutex<EffectLifecycleInner<C>>,
+}
+
+impl<C> EffectLifecycle<C> {
+    fn new_sync() -> Self {
+        Self {
+            inner: sync::Mutex::new(EffectLifecycleInner {
+                sn: None,
+                state: EffectState::SyncExecuting {
+                    disposed_early: false,
+                },
+            }),
+        }
+    }
+
+    fn new_async() -> Self {
+        Self {
+            inner: sync::Mutex::new(EffectLifecycleInner {
+                sn: None,
+                state: EffectState::AsyncPending {
+                    disposed_early: false,
+                },
+            }),
+        }
+    }
+
+    fn set_sn(&self, sn: u64) {
+        self.inner.lock().unwrap().sn = Some(sn);
+    }
+
+    fn begin_dispose(&self) -> (Option<u64>, DisposeOutcome<C>) {
+        let mut g = self.inner.lock().unwrap();
+        let sn = g.sn.take();
+        let outcome = match std::mem::replace(&mut g.state, EffectState::Disposed) {
+            EffectState::SyncExecuting { .. } => {
+                g.state = EffectState::SyncExecuting {
+                    disposed_early: true,
+                };
+                DisposeOutcome::Wait
+            }
+            EffectState::AsyncPending { .. } => {
+                g.state = EffectState::AsyncPending {
+                    disposed_early: true,
+                };
+                DisposeOutcome::Wait
+            }
+            EffectState::Ready { cleanup: Some(c) } => DisposeOutcome::RunCleanup(c),
+            EffectState::Ready { cleanup: None } => DisposeOutcome::DoneNow,
+            // 已进入 Disposed 时，先进入的清理责任方会在清理完成后统一发出 done 信号
+            EffectState::Disposed => DisposeOutcome::Wait,
+        };
+        (sn, outcome)
+    }
+
+    fn complete_ok(&self, cleanup: Option<C>) -> CompleteOutcome<C> {
+        let mut g = self.inner.lock().unwrap();
+        match std::mem::replace(&mut g.state, EffectState::Disposed) {
+            EffectState::SyncExecuting {
+                disposed_early: false,
+            }
+            | EffectState::AsyncPending {
+                disposed_early: false,
+            } => {
+                g.state = EffectState::Ready { cleanup };
+                CompleteOutcome::Stored
+            }
+            EffectState::SyncExecuting {
+                disposed_early: true,
+            }
+            | EffectState::AsyncPending {
+                disposed_early: true,
+            }
+            | EffectState::Ready { .. }
+            | EffectState::Disposed => CompleteOutcome::RunEarlyCleanup(cleanup),
+        }
+    }
+
+    fn complete_err(&self) -> Option<u64> {
+        let mut g = self.inner.lock().unwrap();
+        g.state = EffectState::Disposed;
+        g.sn.take()
+    }
 }
 
 struct EffectInner {
     #[allow(dead_code)]
     label: String,
     fiber: Weak<FiberInner>,
-    sn: Mutex<Option<u64>>,
-    state: Mutex<EffectState>,
+    lifecycle: EffectLifecycle<Cleanup>,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
 }
@@ -172,39 +283,15 @@ pub struct DisposableHandle(Arc<EffectInner>);
 impl DisposableHandle {
     /// 撤销此注册。同步前缀会立即执行，异步部分在后台任务中完成；可选择 `.await` 等待清理结束。
     pub fn dispose(&self) -> BoxFuture<'static, ()> {
-        let sn = self.0.sn.lock().unwrap().take();
+        let (sn, outcome) = self.0.lifecycle.begin_dispose();
         if let Some(sn) = sn
             && let Some(fiber) = self.0.fiber.upgrade()
         {
             fiber.mutable.lock().unwrap().disposables.remove(sn);
         }
 
-        let action = {
-            let mut state = self.0.state.lock().unwrap();
-            match std::mem::replace(&mut *state, EffectState::Disposed) {
-                EffectState::SyncExecuting => {
-                    let _ = self.0.done_tx.send(true);
-                    None
-                }
-                EffectState::AsyncPending { .. } => {
-                    *state = EffectState::AsyncPending {
-                        disposed_early: true,
-                    };
-                    None
-                }
-                EffectState::Ready { cleanup } => match cleanup {
-                    None => {
-                        let _ = self.0.done_tx.send(true);
-                        None
-                    }
-                    Some(c) => Some(c),
-                },
-                EffectState::Disposed => None,
-            }
-        };
-
-        if let Some(cleanup) = action {
-            match cleanup {
+        match outcome {
+            DisposeOutcome::RunCleanup(cleanup) => match cleanup {
                 Cleanup::Sync(f) => {
                     f();
                     let _ = self.0.done_tx.send(true);
@@ -219,7 +306,11 @@ impl DisposableHandle {
                         let _ = done_tx.send(true);
                     });
                 }
+            },
+            DisposeOutcome::DoneNow => {
+                let _ = self.0.done_tx.send(true);
             }
+            DisposeOutcome::Wait => {}
         }
 
         let mut rx = self.0.done_rx.clone();
@@ -504,53 +595,50 @@ impl Fiber {
         let record = Arc::new(EffectInner {
             label,
             fiber: Arc::downgrade(&self.0),
-            sn: Mutex::new(None),
-            state: Mutex::new(EffectState::SyncExecuting),
+            lifecycle: EffectLifecycle::new_sync(),
             done_tx,
             done_rx,
         });
         let handle = DisposableHandle(Arc::clone(&record));
 
-        // 先占位置，再执行：保证后注册的先撤销
-        let sn = {
+        // 持 fiber.mutable 锁同步入表并绑定 sn，杜绝并发 dispose 读到未写入的 sn
+        {
             let mut m = self.0.mutable.lock().unwrap();
             if m.uid.is_none() || m.state == FiberState::Unloading {
                 return Err(CordisError::InactiveEffect);
             }
-            m.disposables.push(handle.clone())
-        };
-        *record.sn.lock().unwrap() = Some(sn);
+            let sn = m.disposables.push(handle.clone());
+            record.lifecycle.set_sn(sn);
+        }
 
         match execute() {
             Ok(cleanup) => {
-                let mut early_cleanup = None;
-                {
-                    let mut st = record.state.lock().unwrap();
-                    match *st {
-                        EffectState::SyncExecuting => {
-                            *st = EffectState::Ready { cleanup };
+                match record.lifecycle.complete_ok(cleanup) {
+                    CompleteOutcome::Stored => {}
+                    CompleteOutcome::RunEarlyCleanup(early_cleanup) => match early_cleanup {
+                        None => {
+                            let _ = record.done_tx.send(true);
                         }
-                        EffectState::Disposed => {
-                            early_cleanup = cleanup;
+                        Some(Cleanup::Sync(f)) => {
+                            f();
+                            let _ = record.done_tx.send(true);
                         }
-                        _ => {}
-                    }
-                }
-                if let Some(c) = early_cleanup {
-                    match c {
-                        Cleanup::Sync(f) => f(),
-                        Cleanup::Async(f) => {
+                        Some(Cleanup::Async(f)) => {
                             let fut = f();
-                            tokio::spawn(fut);
+                            let done_tx = record.done_tx.clone();
+                            tokio::spawn(async move {
+                                fut.await;
+                                let _ = done_tx.send(true);
+                            });
                         }
-                    }
+                    },
                 }
                 Ok(handle)
             }
             Err(err) => {
-                *record.sn.lock().unwrap() = None;
-                self.0.mutable.lock().unwrap().disposables.remove(sn);
-                *record.state.lock().unwrap() = EffectState::Disposed;
+                if let Some(sn) = record.lifecycle.complete_err() {
+                    self.0.mutable.lock().unwrap().disposables.remove(sn);
+                }
                 let _ = record.done_tx.send(true);
                 Err(CordisError::from_box(err.into()))
             }
@@ -575,23 +663,20 @@ impl Fiber {
         let record = Arc::new(EffectInner {
             label,
             fiber: Arc::downgrade(&self.0),
-            sn: Mutex::new(None),
-            state: Mutex::new(EffectState::AsyncPending {
-                disposed_early: false,
-            }),
+            lifecycle: EffectLifecycle::new_async(),
             done_tx,
             done_rx,
         });
         let handle = DisposableHandle(Arc::clone(&record));
 
-        let sn = {
+        {
             let mut m = self.0.mutable.lock().unwrap();
             if m.uid.is_none() || m.state == FiberState::Unloading {
                 return Err(CordisError::InactiveEffect);
             }
-            m.disposables.push(handle.clone())
-        };
-        *record.sn.lock().unwrap() = Some(sn);
+            let sn = m.disposables.push(handle.clone());
+            record.lifecycle.set_sn(sn);
+        }
 
         let fut = execute();
         let fiber_weak = Arc::downgrade(&self.0);
@@ -599,25 +684,10 @@ impl Fiber {
         tokio::spawn(async move {
             let res = fut.await.map_err(Into::into);
             match res {
-                Ok(cleanup) => {
-                    let run_now = {
-                        let mut st = record_task.state.lock().unwrap();
-                        match *st {
-                            EffectState::AsyncPending {
-                                disposed_early: true,
-                            }
-                            | EffectState::Disposed => {
-                                *st = EffectState::Disposed;
-                                true
-                            }
-                            _ => {
-                                *st = EffectState::Ready { cleanup };
-                                return;
-                            }
-                        }
-                    };
-                    if run_now {
-                        if let Some(c) = cleanup {
+                Ok(cleanup) => match record_task.lifecycle.complete_ok(cleanup) {
+                    CompleteOutcome::Stored => {}
+                    CompleteOutcome::RunEarlyCleanup(early_cleanup) => {
+                        if let Some(c) = early_cleanup {
                             match c {
                                 Cleanup::Sync(f) => f(),
                                 Cleanup::Async(f) => f().await,
@@ -625,17 +695,18 @@ impl Fiber {
                         }
                         let _ = record_task.done_tx.send(true);
                     }
-                }
+                },
                 Err(err) => {
                     let err = CordisError::from_box(err);
-                    *record_task.sn.lock().unwrap() = None;
+                    let removed_sn = record_task.lifecycle.complete_err();
                     if let Some(fiber) = fiber_weak.upgrade() {
-                        fiber.mutable.lock().unwrap().disposables.remove(sn);
+                        if let Some(sn) = removed_sn {
+                            fiber.mutable.lock().unwrap().disposables.remove(sn);
+                        }
                         if let Some(root) = fiber.root.upgrade() {
                             root.logger.error(&err);
                         }
                     }
-                    *record_task.state.lock().unwrap() = EffectState::Disposed;
                     let _ = record_task.done_tx.send(true);
                 }
             }
@@ -904,5 +975,149 @@ impl FiberInner {
         for name in owned {
             root.reflect.notify(&[name.as_str()]);
         }
+    }
+}
+
+#[cfg(all(mizar_loom, test))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc as LoomArc;
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::thread;
+
+    struct MockEffect {
+        lifecycle: EffectLifecycle<()>,
+        cleanup_runs: AtomicUsize,
+        done_signals: AtomicUsize,
+        sn_taken: AtomicUsize,
+    }
+
+    impl MockEffect {
+        fn new_sync(sn: u64) -> Self {
+            let lifecycle = EffectLifecycle::new_sync();
+            lifecycle.set_sn(sn);
+            Self {
+                lifecycle,
+                cleanup_runs: AtomicUsize::new(0),
+                done_signals: AtomicUsize::new(0),
+                sn_taken: AtomicUsize::new(0),
+            }
+        }
+
+        fn new_async(sn: u64) -> Self {
+            let lifecycle = EffectLifecycle::new_async();
+            lifecycle.set_sn(sn);
+            Self {
+                lifecycle,
+                cleanup_runs: AtomicUsize::new(0),
+                done_signals: AtomicUsize::new(0),
+                sn_taken: AtomicUsize::new(0),
+            }
+        }
+
+        fn complete_ok_with_cleanup(&self) {
+            match self.lifecycle.complete_ok(Some(())) {
+                CompleteOutcome::Stored => {}
+                CompleteOutcome::RunEarlyCleanup(early) => {
+                    if early.is_some() {
+                        self.cleanup_runs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    assert_eq!(
+                        self.cleanup_runs.load(Ordering::SeqCst),
+                        1,
+                        "done signalled before early cleanup completed"
+                    );
+                    self.done_signals.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        fn complete_err_cleanup(&self) {
+            if self.lifecycle.complete_err().is_some() {
+                self.sn_taken.fetch_add(1, Ordering::SeqCst);
+            }
+            self.done_signals.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn dispose(&self) {
+            let (sn, outcome) = self.lifecycle.begin_dispose();
+            if sn.is_some() {
+                self.sn_taken.fetch_add(1, Ordering::SeqCst);
+            }
+            match outcome {
+                DisposeOutcome::RunCleanup(()) => {
+                    self.cleanup_runs.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        self.cleanup_runs.load(Ordering::SeqCst),
+                        1,
+                        "done signalled before cleanup completed"
+                    );
+                    self.done_signals.fetch_add(1, Ordering::SeqCst);
+                }
+                DisposeOutcome::DoneNow => {
+                    unreachable!("DoneNow must never trigger when cleanup exists");
+                }
+                DisposeOutcome::Wait => {}
+            }
+        }
+    }
+
+    #[test]
+    fn loom_effect_async_complete_races_with_concurrent_disposes() {
+        loom::model(|| {
+            let eff = LoomArc::new(MockEffect::new_async(1));
+            let e_c = LoomArc::clone(&eff);
+            let e_d1 = LoomArc::clone(&eff);
+            let e_d2 = LoomArc::clone(&eff);
+
+            let h_c = thread::spawn(move || e_c.complete_ok_with_cleanup());
+            let h_d1 = thread::spawn(move || e_d1.dispose());
+            let h_d2 = thread::spawn(move || e_d2.dispose());
+
+            h_c.join().unwrap();
+            h_d1.join().unwrap();
+            h_d2.join().unwrap();
+
+            assert_eq!(eff.cleanup_runs.load(Ordering::SeqCst), 1);
+            assert_eq!(eff.sn_taken.load(Ordering::SeqCst), 1);
+            assert_eq!(eff.done_signals.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn loom_sync_effect_early_dispose_waits_for_cleanup() {
+        loom::model(|| {
+            let eff = LoomArc::new(MockEffect::new_sync(1));
+            let e_c = LoomArc::clone(&eff);
+            let e_d = LoomArc::clone(&eff);
+
+            let h_c = thread::spawn(move || e_c.complete_ok_with_cleanup());
+            let h_d = thread::spawn(move || e_d.dispose());
+
+            h_c.join().unwrap();
+            h_d.join().unwrap();
+
+            assert_eq!(eff.cleanup_runs.load(Ordering::SeqCst), 1);
+            assert_eq!(eff.sn_taken.load(Ordering::SeqCst), 1);
+            assert_eq!(eff.done_signals.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn loom_effect_err_races_with_dispose() {
+        loom::model(|| {
+            let eff = LoomArc::new(MockEffect::new_async(1));
+            let e_err = LoomArc::clone(&eff);
+            let e_d = LoomArc::clone(&eff);
+
+            let h_err = thread::spawn(move || e_err.complete_err_cleanup());
+            let h_d = thread::spawn(move || e_d.dispose());
+
+            h_err.join().unwrap();
+            h_d.join().unwrap();
+
+            assert_eq!(eff.sn_taken.load(Ordering::SeqCst), 1);
+            assert_eq!(eff.done_signals.load(Ordering::SeqCst), 1);
+        });
     }
 }

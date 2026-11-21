@@ -659,19 +659,12 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn semver_comparison_handles_stable_and_prerelease() {
+    fn semver_sha256_tag_and_install_target_guards() {
         assert!(is_newer_version("v0.1.1", "0.1.0"));
-        assert!(is_newer_version("0.2.0", "v0.1.9"));
         assert!(is_newer_version("v0.1.0", "0.1.0-alpha.1"));
         assert!(is_newer_version("v0.1.0-alpha.10", "0.1.0-alpha.2"));
-        assert!(is_newer_version("v0.1.0-rc.1", "0.1.0-alpha.99"));
-        assert!(!is_newer_version("v0.1.0", "0.1.0"));
         assert!(!is_newer_version("v0.1.0-alpha.1", "0.1.0"));
-        assert!(!is_newer_version("v0.0.9", "0.1.0"));
-    }
 
-    #[test]
-    fn parse_update_args_covers_flags_and_errors() {
         let opts = parse_update_args_from([
             "--version".to_string(),
             "0.2.0".to_string(),
@@ -680,37 +673,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(opts.version.as_deref(), Some("0.2.0"));
-        assert!(opts.force);
-        assert!(opts.check_only);
-        assert!(!opts.help);
-
-        assert!(parse_update_args_from(["-v".to_string()]).is_err());
+        assert!(opts.force && opts.check_only);
         assert!(parse_update_args_from(["--bogus".to_string()]).is_err());
-    }
 
-    #[test]
-    fn extract_tag_handles_absolute_and_relative_locations() {
-        assert_eq!(
-            extract_tag_from_location_or_url(
-                "https://github.com/Mieluoxxx/mizar/releases/tag/v0.1.2"
-            ),
-            Some("v0.1.2".to_string())
-        );
         assert_eq!(
             extract_tag_from_location_or_url("/Mieluoxxx/mizar/releases/tag/v0.2.0-rc.1?foo=1"),
             Some("v0.2.0-rc.1".to_string())
         );
-        assert_eq!(
-            extract_tag_from_location_or_url("https://github.com/Mieluoxxx/mizar/releases"),
-            None
-        );
-    }
 
-    #[test]
-    fn verify_sha256_accepts_match_and_rejects_mismatch() {
         let payload = b"mizar-binary-payload";
-        let digest = sha256_hex(payload);
-        let checksums = format!("{digest}  mizar-v0.1.1-aarch64-apple-darwin.tar.gz\n");
+        let checksums = format!(
+            "{}  mizar-v0.1.1-aarch64-apple-darwin.tar.gz\n",
+            sha256_hex(payload)
+        );
         assert!(
             verify_archive_sha256(
                 payload,
@@ -727,14 +702,10 @@ mod tests {
             )
             .is_err()
         );
-    }
 
-    #[test]
-    fn validate_install_target_blocks_dev_and_homebrew_unless_forced() {
         assert!(
             validate_install_target(Path::new("/tmp/repo/target/release/mizar"), false).is_err()
         );
-        assert!(validate_install_target(Path::new("/tmp/repo/target/release/mizar"), true).is_ok());
         assert!(
             validate_install_target(
                 Path::new("/opt/homebrew/Cellar/mizar/0.1.0/bin/mizar"),

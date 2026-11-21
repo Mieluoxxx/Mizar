@@ -10,11 +10,10 @@ workspace = true
 
 [dependencies]
 crossterm = { workspace = true }
-dirs = { workspace = true }
+futures = { workspace = true }
+mizar-client-core = { workspace = true }
 mizar-llm-types = { workspace = true }
 mizar-trajectory-core = { workspace = true }
-futures = { workspace = true }
-ignore = { workspace = true }
 ratatui = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }

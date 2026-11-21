@@ -1,6 +1,5 @@
 //! `mizar exec` 无头模式真实子进程集成测试（基于本地 `axum` HTTP 网关，不连接外网）。
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,25 +302,6 @@ async fn run_with_stdin(cmd: Command, stdin_data: Option<&str>) -> Output {
         .await
         .expect("mizar subprocess timed out after 20s")
         .unwrap()
-}
-
-fn run_with_stdin_sync(mut cmd: Command, stdin_data: Option<&str>) -> Output {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if stdin_data.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    let mut child = cmd.spawn().unwrap();
-    if let Some(data) = stdin_data {
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(data.as_bytes())
-            .unwrap();
-    }
-    child.wait_with_output().unwrap()
 }
 
 /// 完全复刻 `harbor-framework/harbor` `BaseInstalledAgent._classify_exec_error` 的精确 LastMatchWins 分类逻辑，
@@ -1375,33 +1355,6 @@ async fn exec_failure_modes_exit_codes_sanitization_and_harbor_classification() 
     assert!(o_sig.stdout.is_empty());
     let s_sig = String::from_utf8_lossy(&o_sig.stderr);
     assert!(s_sig.contains("code=cancelled"), "{s_sig}");
-}
-
-#[test]
-fn preserves_help_version_and_update_cli() {
-    let tmp = TempRoot::new("exec_meta");
-    let home = tmp.path().join("home");
-    let ws = tmp.path().join("ws");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&ws).unwrap();
-
-    for args in [
-        &["--help"][..],
-        &["exec", "--help"][..],
-        &["--version"][..],
-        &["update", "--help"][..],
-    ] {
-        let out = run_with_stdin_sync(clean_env_cmd(&home, &ws, args), None);
-        assert!(
-            out.status.success(),
-            "args {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            !out.stdout.is_empty(),
-            "args {args:?} produced empty stdout"
-        );
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

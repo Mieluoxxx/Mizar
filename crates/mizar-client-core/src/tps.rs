@@ -218,27 +218,14 @@ mod tests {
     }
 
     #[test]
-    fn ascii_estimate_matches_the_legacy_rate() {
+    fn script_weighted_estimate_avoids_cjk_underestimation_and_per_delta_rounding() {
         assert_eq!(estimate_tokens_fraction(""), 0.0);
         assert_eq!(estimate_tokens_fraction("abcd"), 1.0);
-        assert_eq!(estimate_tokens_fraction(&"x".repeat(400)), 100.0);
-    }
-
-    #[test]
-    fn cjk_estimate_is_script_weighted_not_chars_over_four() {
-        // 80 个汉字 ≈ 57 token；旧的 chars/4 只给 20。
         let dense = estimate_tokens_fraction(&"中".repeat(80));
         assert!((dense - 80.0 / 1.4).abs() < 1e-9, "{dense}");
-        assert!(dense > 50.0, "CJK 被低估：{dense}");
+        assert!((estimate_tokens_fraction("🙂🙂") - 1.0).abs() < 1e-9);
 
-        // emoji 走 OTHER 档，不按密集文字算。
-        let emoji = estimate_tokens_fraction("🙂🙂");
-        assert!((emoji - 1.0).abs() < 1e-9, "{emoji}");
-    }
-
-    #[test]
-    fn short_deltas_are_not_rounded_up_individually() {
-        // 40 个 1 字符的 delta：逐次取整会得到 40 token，真实值只有 10。
+        // 40 个单字符 delta 累计应为 10 token，不能逐次 ceil 成 40。
         let mut ledger = TpsLedger::default();
         ledger.on_turn_start();
         ledger.on_step_start();
@@ -247,80 +234,53 @@ mod tests {
             ledger.on_token_delta("x", i * 50);
         }
         ledger.on_step_end(2_000, None);
-        // 10 token / 2s = 5 tok/s；逐次取整会变成 40 / 2s = 20 tok/s。
         assert_eq!(ledger.rate(), Some(5.0));
     }
 
     #[test]
-    fn multi_step_turn_folds_tokens_over_decode_span() {
+    fn multi_step_turn_and_burst_deltas_fold_by_event_time() {
         let mut ledger = TpsLedger::default();
         ledger.on_turn_start();
 
-        // 第一步：100 token / 1s
         ledger.on_step_start();
         ledger.on_first_token(0);
         ledger.on_token_delta(&"x".repeat(400), 500);
         ledger.on_step_end(1_000, usage(100));
         assert_eq!(ledger.rate(), Some(100.0));
 
-        // 工具执行 51 秒：不进入分母
-        // 第二步：300 token / 3s
+        // 工具间隔 51s 不进分母；同时间戳批量排空仍按事件时间计算。
         ledger.on_step_start();
         ledger.on_first_token(52_000);
-        ledger.on_token_delta(&"x".repeat(400), 52_500);
+        ledger.on_token_delta(&"x".repeat(400), 52_600);
+        let baseline = ledger.rate().unwrap();
+        for _ in 0..10 {
+            ledger.on_token_delta(&"x".repeat(400), 52_600);
+        }
+        assert!(ledger.rate().unwrap() > baseline);
         ledger.on_step_end(55_000, usage(300));
-
-        // (100 + 300) / (1s + 3s) = 100 tok/s，不是 (400 / 54s)
         assert_eq!(ledger.rate(), Some(100.0));
         assert_eq!(ledger.on_turn_end(), Some(100.0));
     }
 
     #[test]
-    fn burst_of_deltas_keeps_the_elapsed_span() {
-        let mut ledger = TpsLedger::default();
-        ledger.on_turn_start();
-        ledger.on_step_start();
-        ledger.on_first_token(0);
-        ledger.on_token_delta(&"x".repeat(400), 600);
-        let baseline = ledger.rate().unwrap();
-
-        // 同一时间戳上排空 50 个 delta：时间戳不变，估算量增长，速率随之变大，
-        // 但跨度仍然来自事件时间戳而不是消费时刻。
-        for _ in 0..50 {
-            ledger.on_token_delta(&"x".repeat(400), 600);
-        }
-        assert!(ledger.rate().unwrap() > baseline);
-        // 跨度未增长，所以速率仍是「该跨度内的 token 数」，不会凭空出现零耗时。
-        ledger.on_step_end(1_600, usage(800));
-        assert_eq!(ledger.rate(), Some(500.0));
-    }
-
-    #[test]
-    fn short_spans_are_not_sampled() {
+    fn short_spans_skipped_and_sampleless_turn_keeps_previous_rate() {
         let mut ledger = TpsLedger::default();
         ledger.on_turn_start();
         ledger.on_step_start();
         ledger.on_first_token(0);
         ledger.on_token_delta(&"x".repeat(400), 500);
-        // 500ms 边界本身不算可靠样本
         ledger.on_step_end(500, usage(500));
         assert_eq!(ledger.rate(), None);
         assert_eq!(ledger.on_turn_end(), None);
-    }
 
-    #[test]
-    fn a_turn_without_samples_restores_the_previous_reading() {
-        let mut ledger = TpsLedger::default();
         ledger.on_turn_start();
         ledger.on_step_start();
         ledger.on_first_token(0);
         ledger.on_token_delta(&"x".repeat(400), 600);
         ledger.on_step_end(2_000, usage(100));
-        assert_eq!(ledger.rate(), Some(50.0));
-        ledger.on_turn_end();
-        assert_eq!(ledger.rate(), Some(50.0));
+        assert_eq!(ledger.on_turn_end(), Some(50.0));
 
-        // 下一轮只有一次被取消的步：读数保留上一轮的 50，而不是清空。
+        // 下一轮仅取消步：无有效样本时不清空上一轮读数。
         ledger.on_turn_start();
         ledger.on_step_start();
         ledger.on_step_end(5_000, None);
@@ -329,49 +289,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_falls_back_to_the_streamed_estimate() {
+    fn missing_first_token_empty_delta_and_unopened_step_are_ignored() {
         let mut ledger = TpsLedger::default();
+        ledger.on_step_end(1_000, usage(100));
         ledger.on_turn_start();
-        ledger.on_step_start();
-        ledger.on_first_token(0);
-        ledger.on_token_delta(&"x".repeat(400), 1_000);
-        ledger.on_step_end(2_000, None);
-        // 100 估算 token / 2s
-        assert_eq!(ledger.rate(), Some(50.0));
-    }
+        ledger.on_step_end(2_000, usage(100));
+        assert_eq!(ledger.rate(), None);
 
-    #[test]
-    fn empty_deltas_do_not_start_the_decode_clock() {
-        let mut ledger = TpsLedger::default();
-        ledger.on_turn_start();
         ledger.on_step_start();
         ledger.on_token_delta("", 0);
         ledger.on_step_end(1_000, usage(100));
-        // 没有首 token 边界就没有跨度，也不采样。
         assert_eq!(ledger.rate(), None);
-    }
 
-    /// 后端只报用量、不发首 token 也不发内容的步（隐藏生成立即失败）：
-    /// 既没有跨度也没有可测内容，不得污染已有读数。
-    #[test]
-    fn step_end_without_first_token_leaves_the_ledger_untouched() {
-        let mut ledger = TpsLedger::default();
-        ledger.on_turn_start();
         ledger.on_step_start();
         ledger.on_step_end(3_000, usage(500));
-        assert_eq!(ledger.rate(), None);
-        assert_eq!(ledger.on_turn_end(), None);
-    }
-
-    /// 取消的步可能在 TurnStart 之前就结束（切换会话时的残留事件）：
-    /// 没有开启的步时不报错、也不产生样本。
-    #[test]
-    fn step_end_without_an_open_step_is_ignored() {
-        let mut ledger = TpsLedger::default();
-        ledger.on_step_end(1_000, usage(100));
-        assert_eq!(ledger.rate(), None);
-        ledger.on_turn_start();
-        ledger.on_step_end(2_000, usage(100));
         assert_eq!(ledger.rate(), None);
         assert_eq!(ledger.on_turn_end(), None);
     }

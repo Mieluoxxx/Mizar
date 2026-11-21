@@ -19,6 +19,7 @@ globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 libc = "0.2"
+loom = "0.7"
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
 rquickjs = { version = "0.14", features = ["futures", "parallel"] }
@@ -62,11 +63,14 @@ mizar-agent-loop = { path = "crates/mizar-agent-loop" }
 mizar-agent-spine = { path = "crates/mizar-agent-spine" }
 mizar-trajectory-core = { path = "crates/mizar-trajectory-core" }
 mizar-trajectory = { path = "crates/mizar-trajectory" }
+mizar-client-core = { path = "crates/mizar-client-core" }
+mizar-client = { path = "crates/mizar-client" }
 mizar-tui-ui = { path = "crates/mizar-tui-ui" }
 mizar-tui = { path = "crates/mizar-tui" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mizar_loom)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
