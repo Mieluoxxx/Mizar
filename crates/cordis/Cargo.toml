@@ -15,3 +15,6 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[target.'cfg(mizar_loom)'.dev-dependencies]
+loom = { workspace = true }
