@@ -145,6 +145,98 @@ impl ImageAttachment {
     }
 }
 
+/// OpenAI `prompt_cache_key` 最大字符数上限。
+pub const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
+
+/// 上游 Prompt Cache 保留策略（对齐 Pi `cacheRetention`：`none` / `short` / `long`）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    None,
+    #[default]
+    Short,
+    Long,
+}
+
+/// 会话亲和路由请求头格式。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionAffinityMode {
+    #[default]
+    Disabled,
+    OpenAi,
+    OpenRouter,
+}
+
+/// 按字符边界把 `prompt_cache_key` 截断到最多 64 字符，空白字符串返回 `None`。
+pub fn clamp_openai_prompt_cache_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let out: String = trimmed
+        .chars()
+        .take(OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH)
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// 解析 `sessionAffinityFormat` 配置字符串。
+pub fn parse_session_affinity_mode(raw: &str) -> Option<SessionAffinityMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "disabled" => Some(SessionAffinityMode::Disabled),
+        "openai" | "responses" => Some(SessionAffinityMode::OpenAi),
+        "openrouter" => Some(SessionAffinityMode::OpenRouter),
+        _ => None,
+    }
+}
+
+/// 根据 provider ID 与 base URL 推导默认会话亲和头模式（OpenRouter 走 `x-session-id`，其余走 OpenAI 亲和头）。
+pub fn detect_session_affinity_mode(provider: &str, base_url: Option<&str>) -> SessionAffinityMode {
+    if provider.trim().eq_ignore_ascii_case("openrouter")
+        || base_url.is_some_and(|url| url.to_ascii_lowercase().contains("openrouter.ai"))
+    {
+        SessionAffinityMode::OpenRouter
+    } else {
+        SessionAffinityMode::OpenAi
+    }
+}
+
+/// 当请求头切片中尚未出现同名头（大小写不敏感）时追加一条，避免覆盖显式配置。
+pub fn push_header_if_absent(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if !headers
+        .iter()
+        .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+    {
+        headers.push((name.to_string(), value.to_string()));
+    }
+}
+
+/// 按给定亲和模式向请求头注入会话粘性标识；`completions` 在 `OpenAi` 模式下额外携带 `x-session-affinity`。
+pub fn push_session_affinity_headers(
+    headers: &mut Vec<(String, String)>,
+    mode: SessionAffinityMode,
+    session_id: Option<&str>,
+    include_completions_affinity_header: bool,
+) {
+    let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    match mode {
+        SessionAffinityMode::Disabled => {}
+        SessionAffinityMode::OpenRouter => {
+            push_header_if_absent(headers, "x-session-id", sid);
+        }
+        SessionAffinityMode::OpenAi => {
+            push_header_if_absent(headers, "session_id", sid);
+            push_header_if_absent(headers, "x-client-request-id", sid);
+            if include_completions_affinity_header {
+                push_header_if_absent(headers, "x-session-affinity", sid);
+            }
+        }
+    }
+}
+
 fn is_false(v: &bool) -> bool {
     !*v
 }

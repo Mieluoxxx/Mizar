@@ -116,16 +116,14 @@ impl Plugin for CodingToolsPlugin {
                 && let Some(sp) = ctx.get::<SystemPrompt>("systemPrompt")
             {
                 let tools_ref = ctx.tools()?;
-                let cwd_display = config.workspace.to_string_lossy().replace('\\', "/");
                 let sec_handle = ctx.effect("tools-coding.system-prompt", move || {
                     let tools = tools_ref;
-                    let cwd = cwd_display;
                     Ok::<_, cordis::CordisError>(Some(sp.section(PromptSection::new(
                         "coding_tools",
                         20,
                         move || {
                             let declared = tools.list_declared_infos(None);
-                            let mut lines = vec![format!("当前工作目录：{cwd}")];
+                            let mut lines = Vec::new();
                             let mut snippets = Vec::new();
                             let mut guidelines = Vec::new();
                             for info in &declared {
@@ -150,7 +148,7 @@ impl Plugin for CodingToolsPlugin {
                                         .into(),
                                 );
                             }
-                            Some(lines.join("\n"))
+                            (!lines.is_empty()).then(|| lines.join("\n"))
                         },
                     ))))
                 })?;

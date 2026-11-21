@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use chrono::Local;
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
 
 #[derive(Debug, Clone, Default)]
@@ -57,7 +56,7 @@ impl SystemPrompt {
     pub fn build(&self) -> String {
         let mut sections: Vec<PromptSection> =
             self.sections.lock().unwrap().values().cloned().collect();
-        sections.sort_by_key(|s| s.order);
+        sections.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
         sections
             .into_iter()
             .filter_map(|s| (s.render)())
@@ -90,21 +89,15 @@ impl Service for SystemPrompt {
 
     fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
         let persona = self.persona.clone();
-        let sp1 = Arc::clone(&self);
-        let sp2 = Arc::clone(&self);
+        let sp = Arc::clone(&self);
         let ctx = ctx.clone();
         Box::pin(async move {
             ctx.effect("systemPrompt.persona", move || {
-                Ok::<_, CordisError>(Some(sp1.section(PromptSection::new(
+                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
                     "persona",
                     0,
                     move || Some(persona.clone()),
                 ))))
-            })?;
-            ctx.effect("systemPrompt.time", move || {
-                Ok::<_, CordisError>(Some(sp2.section(PromptSection::new("time", 100, || {
-                    Some(format!("今天是 {}。", Local::now().format("%Y/%-m/%-d")))
-                }))))
             })?;
             Ok(())
         })
@@ -126,7 +119,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn builds_sections_ordered_and_cleans_up() {
+    async fn builds_sections_ordered_deterministically_without_dynamic_date() {
         let app = Context::new();
         app.plugin(
             SystemPrompt::plugin(),
@@ -138,22 +131,33 @@ mod tests {
         .unwrap();
 
         let sp = app.system_prompt().unwrap();
-        let handle = app
-            .effect("extra.section", || {
-                Ok::<_, CordisError>(Some(
-                    sp.section(PromptSection::new("mid", 50, || Some("中间段落".into()))),
-                ))
+        let h_mid_b = app
+            .effect("extra.b", || {
+                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
+                    "b_same_order",
+                    50,
+                    || Some("段落 B".into()),
+                ))))
+            })
+            .unwrap();
+        let h_mid_a = app
+            .effect("extra.a", || {
+                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
+                    "a_same_order",
+                    50,
+                    || Some("段落 A".into()),
+                ))))
             })
             .unwrap();
 
         let prompt = sp.build();
+        assert!(!prompt.contains("今天是 "));
         let lines: Vec<&str> = prompt.split("\n\n").collect();
-        assert_eq!(lines[0], "测试人设");
-        assert_eq!(lines[1], "中间段落");
-        assert!(lines[2].starts_with("今天是 "));
+        assert_eq!(lines, vec!["测试人设", "段落 A", "段落 B"]);
 
-        handle.dispose().await;
+        h_mid_a.dispose().await;
+        h_mid_b.dispose().await;
         let prompt_after = sp.build();
-        assert!(!prompt_after.contains("中间段落"));
+        assert_eq!(prompt_after, "测试人设");
     }
 }

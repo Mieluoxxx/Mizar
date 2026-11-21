@@ -532,6 +532,7 @@ impl CompactionRuntime {
         let summary_res = generate_checkpoint_summary(
             SummarizeParams {
                 llm: &llm,
+                session_id: Some(session.id.clone()),
                 provider: effective_provider.clone(),
                 model: effective_model.clone(),
                 system_prompt: sys_prompt.clone(),

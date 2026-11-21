@@ -21,6 +21,7 @@ use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service};
 use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo, ProviderInfo,
+    SessionAffinityMode, detect_session_affinity_mode, push_session_affinity_headers,
 };
 use mizar_llm_completions::{CompletionsAdapter, CompletionsCompat, CompletionsConfig};
 pub use mizar_llm_http::resolve_credential;
@@ -66,6 +67,8 @@ struct ResolvedModelTarget {
     protocol: ProtocolKind,
     adapter: Arc<dyn LlmAdapter>,
     headers: BTreeMap<String, String>,
+    base_url: Option<String>,
+    compat: Option<CompatConfig>,
     model_cfg: RouterModelConfig,
 }
 
@@ -75,6 +78,8 @@ struct RoutedAdapter {
     display_name: Option<String>,
     protocol: ProtocolKind,
     default_model: Option<String>,
+    base_url: Option<String>,
+    compat: Option<CompatConfig>,
     provider_headers: BTreeMap<String, String>,
     model_infos: Vec<ModelInfo>,
     inner: Arc<dyn LlmAdapter>,
@@ -158,7 +163,7 @@ impl LlmAdapter for RoutedAdapter {
 
         let target = model.as_deref().and_then(|id| self.model_routes.get(id));
 
-        let (protocol, adapter, overlay_headers) = match target {
+        let (protocol, adapter, overlay_headers, target_base_url, target_compat) = match target {
             Some(t) => {
                 if let Some(effort) = options.reasoning_effort {
                     options.reasoning_effort = t.model_cfg.resolve_thinking_level(effort);
@@ -170,9 +175,26 @@ impl LlmAdapter for RoutedAdapter {
                     options.temperature =
                         t.model_cfg.effective_temperature(options.reasoning_effort);
                 }
-                (t.protocol, Arc::clone(&t.adapter), Some(&t.headers))
+                if options.cache_retention.is_none()
+                    && let Some(cache) = &t.model_cfg.prompt_cache
+                {
+                    options.cache_retention = cache.default_retention();
+                }
+                (
+                    t.protocol,
+                    Arc::clone(&t.adapter),
+                    Some(&t.headers),
+                    t.base_url.as_deref(),
+                    t.compat.as_ref(),
+                )
             }
-            None => (self.protocol, Arc::clone(&self.inner), None),
+            None => (
+                self.protocol,
+                Arc::clone(&self.inner),
+                None,
+                self.base_url.as_deref(),
+                self.compat.as_ref(),
+            ),
         };
 
         let resolved_headers =
@@ -184,6 +206,26 @@ impl LlmAdapter for RoutedAdapter {
             let mut combined = resolved_headers;
             combined.append(&mut options.headers);
             options.headers = combined;
+        }
+
+        let eff_mode = target_compat
+            .and_then(CompatConfig::parsed_session_affinity_mode)
+            .unwrap_or_else(|| detect_session_affinity_mode(&self.provider, target_base_url));
+        let default_send = match protocol {
+            ProtocolKind::OpenaiResponses => true,
+            ProtocolKind::OpenaiCompletions => eff_mode == SessionAffinityMode::OpenRouter,
+            ProtocolKind::AnthropicMessages | ProtocolKind::Mock => false,
+        };
+        if target_compat
+            .and_then(|c| c.send_session_affinity_headers)
+            .unwrap_or(default_send)
+        {
+            push_session_affinity_headers(
+                &mut options.headers,
+                eff_mode,
+                options.session_id.as_deref(),
+                protocol == ProtocolKind::OpenaiCompletions,
+            );
         }
 
         let out = self.ctx.waterfall(
@@ -215,6 +257,7 @@ struct AdapterBuildSpec<'a> {
     use_bearer_auth: bool,
     thinking_budget_tokens: Option<u32>,
     compat: Option<&'a CompatConfig>,
+    prompt_cache: Option<&'a PromptCacheConfig>,
     supports_max_output_tokens: Option<bool>,
     models: Vec<ModelInfo>,
 }
@@ -234,6 +277,9 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
     }
 
     let compat_cfg = spec.compat.cloned().unwrap_or_default();
+    let default_cache_retention = spec
+        .prompt_cache
+        .and_then(PromptCacheConfig::default_retention);
     match spec.protocol {
         ProtocolKind::OpenaiCompletions => {
             let compat = compat_cfg.to_completions_compat(CompletionsCompat::openai());
@@ -249,6 +295,7 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 model: spec.default_model.unwrap_or("gpt-4o").to_string(),
                 compat,
                 headers: Vec::new(),
+                default_cache_retention,
                 models: spec.models,
                 idle_timeout: DEFAULT_IDLE_TIMEOUT,
             }))
@@ -268,6 +315,12 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 model: spec.default_model.map(ToString::to_string),
                 headers: Default::default(),
                 supports_max_output_tokens: supports_max_output,
+                send_session_affinity_headers: compat_cfg.send_session_affinity_headers,
+                session_affinity_mode: compat_cfg.parsed_session_affinity_mode(),
+                supports_long_cache_retention: compat_cfg
+                    .supports_long_cache_retention
+                    .unwrap_or(true),
+                default_cache_retention,
                 models: spec.models,
                 idle_timeout: DEFAULT_IDLE_TIMEOUT,
             }))
@@ -312,6 +365,10 @@ fn build_routed_adapter(
         .map(RouterModelConfig::to_model_info)
         .collect();
     let default_model = route.default_model_id();
+    let default_model_prompt_cache = default_model
+        .as_deref()
+        .and_then(|id| resolved_models.iter().find(|m| m.id == id))
+        .and_then(|m| m.prompt_cache.as_ref());
 
     let inner = build_protocol_adapter(AdapterBuildSpec {
         provider,
@@ -327,6 +384,7 @@ fn build_routed_adapter(
         use_bearer_auth: route.use_bearer_auth,
         thinking_budget_tokens: route.thinking_budget_tokens,
         compat: route.compat.as_ref(),
+        prompt_cache: default_model_prompt_cache,
         supports_max_output_tokens: route.supports_max_output_tokens,
         models: model_infos.clone(),
     });
@@ -354,13 +412,14 @@ fn build_routed_adapter(
             (None, Some(ov)) => Some(ov.clone()),
             (None, None) => None,
         };
+        let resolved_base_url = m.base_url.clone().or_else(|| route.base_url.clone());
 
         let model_adapter = build_protocol_adapter(AdapterBuildSpec {
             provider,
             display_name: route.display_name.as_deref(),
             protocol: model_protocol,
             unsupported_api: unsupported_api.as_deref(),
-            base_url: m.base_url.as_deref().or(route.base_url.as_deref()),
+            base_url: resolved_base_url.as_deref(),
             api_key: route.api_key.as_deref(),
             api_key_env: route.api_key_env.as_deref(),
             default_model: Some(&m.id),
@@ -369,6 +428,7 @@ fn build_routed_adapter(
             use_bearer_auth: route.use_bearer_auth,
             thinking_budget_tokens: route.thinking_budget_tokens,
             compat: merged_compat.as_ref(),
+            prompt_cache: m.prompt_cache.as_ref(),
             supports_max_output_tokens: route.supports_max_output_tokens,
             models: model_infos.clone(),
         });
@@ -381,6 +441,8 @@ fn build_routed_adapter(
                 protocol: model_protocol,
                 adapter: model_adapter,
                 headers: model_headers,
+                base_url: resolved_base_url,
+                compat: merged_compat,
                 model_cfg: m,
             },
         );
@@ -392,6 +454,8 @@ fn build_routed_adapter(
         display_name: route.display_name.clone(),
         protocol: route.protocol,
         default_model,
+        base_url: route.base_url.clone(),
+        compat: route.compat.clone(),
         provider_headers: route.headers.clone(),
         model_infos,
         inner,
@@ -847,5 +911,134 @@ mod tests {
         assert_eq!(recorded[1].1["max_tokens"], 128000);
         assert_eq!(recorded[1].1["thinking"]["type"], "adaptive");
         assert_eq!(recorded[1].1["output_config"]["effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn router_wires_session_affinity_and_prompt_cache_config_to_responses() {
+        type ReqSnap = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            serde_json::Value,
+        );
+        let seen: Arc<Mutex<Vec<ReqSnap>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_srv = Arc::clone(&seen);
+
+        let server = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, body: axum::Json<serde_json::Value>| {
+                let seen = Arc::clone(&seen_srv);
+                async move {
+                    let h = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(ToString::to_string)
+                    };
+                    seen.lock().unwrap().push((
+                        h("session_id"),
+                        h("x-client-request-id"),
+                        h("x-session-id"),
+                        body.0,
+                    ));
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"routed ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r1\"}}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, server).await;
+        });
+
+        let cfg_json = format!(
+            r#"{{
+              "providers": {{
+                "oai": {{
+                  "api": "openai-responses",
+                  "apiKey": "k-oai",
+                  "baseUrl": "http://{addr}/v1",
+                  "compat": {{
+                    "sendSessionAffinityHeaders": true,
+                    "supportsLongCacheRetention": true
+                  }},
+                  "models": [
+                    {{
+                      "id": "gpt-long",
+                      "promptCache": {{ "long": 3600 }}
+                    }},
+                    {{
+                      "id": "gpt-or-hdr",
+                      "compat": {{ "sessionAffinityFormat": "openrouter" }}
+                    }}
+                  ]
+                }}
+              }}
+            }}"#
+        );
+
+        let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
+        let app = Context::new();
+        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
+
+        let hook_seen_sess_hdr = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let hook_cap = Arc::clone(&hook_seen_sess_hdr);
+        app.on_waterfall(
+            EVENT_ROUTER_HEADERS,
+            move |input: RouterHeaderInput, next: Next<RouterHeaderInput, RouterHeaderInput>| {
+                let found = input
+                    .headers
+                    .iter()
+                    .find(|(k, _)| {
+                        k.eq_ignore_ascii_case("session_id")
+                            || k.eq_ignore_ascii_case("x-session-id")
+                    })
+                    .map(|(_, v)| v.clone());
+                hook_cap.lock().unwrap().push(found);
+                next.call(input)
+            },
+        )
+        .unwrap();
+
+        let llm = app.llm().unwrap();
+        for model_id in ["gpt-long", "gpt-or-hdr"] {
+            let mut s = llm
+                .stream(GenerateOptions {
+                    provider: Some("oai".into()),
+                    model: Some(model_id.into()),
+                    session_id: Some("sess-route-42".into()),
+                    messages: vec![Message::user("hi")],
+                    ..Default::default()
+                })
+                .unwrap();
+            while let Some(c) = s.next().await {
+                let _ = c.unwrap();
+            }
+        }
+
+        let log = seen.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].0.as_deref(), Some("sess-route-42"));
+        assert_eq!(log[0].1.as_deref(), Some("sess-route-42"));
+        assert_eq!(log[0].2, None);
+        assert_eq!(log[0].3["prompt_cache_key"], "sess-route-42");
+        assert_eq!(log[0].3["prompt_cache_retention"], "24h");
+
+        assert_eq!(log[1].0, None);
+        assert_eq!(log[1].1, None);
+        assert_eq!(log[1].2.as_deref(), Some("sess-route-42"));
+        assert_eq!(log[1].3["prompt_cache_key"], "sess-route-42");
+        assert!(log[1].3.get("prompt_cache_retention").is_none());
+
+        assert_eq!(
+            *hook_seen_sess_hdr.lock().unwrap(),
+            vec![Some("sess-route-42".into()), Some("sess-route-42".into())]
+        );
     }
 }

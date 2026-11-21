@@ -1511,6 +1511,7 @@ dependencies = [
 name = "mizar-agent-loop"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "cordis",
  "futures",
  "mizar-llm",
@@ -1869,7 +1870,6 @@ dependencies = [
 name = "mizar-system-prompt"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "cordis",
  "tokio",
 ]

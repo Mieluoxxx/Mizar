@@ -9,6 +9,7 @@ description = "Agent 主循环服务 ctx.agentLoop（对应 NamiDSH packages/age
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 cordis = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-session = { workspace = true }

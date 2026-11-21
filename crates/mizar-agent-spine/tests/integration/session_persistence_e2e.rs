@@ -186,7 +186,7 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     assert_eq!(list_summaries[0].steps, 2);
     assert_eq!(list_summaries[0].tool_calls, 1);
 
-    // 续聊第二轮，验证带上第一轮的 4 条表面消息 + System + 新 User = 6 条
+    // 续聊第二轮，验证带上首轮 <environment_context> + 第一轮 4 条表面消息 + System + 新 User = 7 条
     let resumed = sessions2.get("e2e-session").unwrap();
     let reply2 = app2
         .agent_loop()
@@ -195,7 +195,7 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
         .await
         .unwrap();
     assert_eq!(reply2, "重启后恢复续聊成功");
-    assert_eq!(*seen2.lock().unwrap(), vec![6]);
+    assert_eq!(*seen2.lock().unwrap(), vec![7]);
 
     let report2 = traj2
         .inspect("e2e-session", TimelineMode::Sequence)

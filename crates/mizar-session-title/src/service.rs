@@ -316,6 +316,8 @@ impl SessionTitleRuntime {
             temperature: Some(0.2),
             reasoning_effort: params.reasoning_effort,
             headers: Vec::new(),
+            session_id: None,
+            cache_retention: None,
             cancel: params.cancel.clone(),
         };
 
