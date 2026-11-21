@@ -844,15 +844,22 @@ impl Service for McpManager {
         let ctx = ctx.clone();
 
         Box::pin(async move {
-            if let Some(sp) = ctx.get::<SystemPrompt>("systemPrompt") {
-                ctx.effect("mcp.system-prompt", move || {
-                    let mgr = mgr_prompt;
-                    Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                        "mcp_servers",
-                        30,
-                        move || mgr.render_servers_section(),
-                    ))))
-                })?;
+            let prompt_fiber = ctx.try_inject(["systemPrompt"], move |c| {
+                let mgr = Arc::clone(&mgr_prompt);
+                async move {
+                    let sp = c.service::<SystemPrompt>("systemPrompt")?;
+                    c.effect("mcp.system-prompt", move || {
+                        Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
+                            "mcp_servers",
+                            30,
+                            move || mgr.render_servers_section(),
+                        ))))
+                    })?;
+                    Ok::<_, CordisError>(())
+                }
+            })?;
+            if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
+                prompt_fiber.wait_settled().await?;
             }
 
             ctx.effect("mcp.close-all", move || {

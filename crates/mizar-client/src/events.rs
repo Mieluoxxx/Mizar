@@ -512,9 +512,27 @@ pub async fn wait_for_services(ctx: &Context) -> Result<(), WaitServicesError> {
         }
     }
 
-    for rt in ctx.registry().values() {
-        for f in rt.fibers() {
+    // 插件在 apply() 内通过 ctx.try_inject 派生的子 fiber 可能在首轮快照之后出现，
+    // 需迭代直到不再产生新 fiber 且全部落稳（PENDING 态子 fiber 的 inertia 为 false，不会阻塞）。
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let fibers: Vec<cordis::Fiber> = ctx
+            .registry()
+            .values()
+            .into_iter()
+            .flat_map(|rt| rt.fibers())
+            .collect();
+        let mut grew = false;
+        for f in fibers {
+            if let Some(uid) = f.uid()
+                && seen.insert(uid)
+            {
+                grew = true;
+            }
             let _ = f.wait_settled().await;
+        }
+        if !grew {
+            break;
         }
     }
     Ok(())
@@ -579,5 +597,65 @@ mod tests {
 
         ctrl.abort_for_session_switch();
         assert!(ctrl.active_task().is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_services_settles_late_try_inject_child_without_blocking_on_pending_optional()
+    {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use cordis::PluginDef;
+        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+
+        let ctx = Context::new();
+        ctx.logger().set_silent();
+        let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        if let AgentToolsMode::Coding {
+            ref mut mcp,
+            ref mut skills,
+            ref mut instructions,
+            ..
+        } = cfg.tools_mode
+        {
+            mcp.load_config_files = false;
+            skills.include_default_roots = false;
+            instructions.include_default_global = false;
+        }
+        ctx.plugin(AgentSpinePlugin, cfg);
+
+        // 永不就绪的可选依赖（保持 PENDING）不应阻塞 wait_for_services
+        let _pending_optional = ctx
+            .try_inject(["nonExistentOptionalService"], |_| async {
+                Ok::<_, CordisError>(())
+            })
+            .unwrap();
+
+        // 在异步插件体内延迟派生 try_inject 子 fiber，模拟 CodingToolsPlugin / McpManager 挂接 systemPrompt
+        let child_settled = Arc::new(AtomicBool::new(false));
+        let child_settled_cb = Arc::clone(&child_settled);
+        ctx.plugin(
+            PluginDef::sync("late-try-inject-spawner", move |c, ()| {
+                let flag = Arc::clone(&child_settled_cb);
+                c.try_inject(["systemPrompt"], move |_| {
+                    let inner = Arc::clone(&flag);
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        inner.store(true, Ordering::SeqCst);
+                        Ok::<_, CordisError>(())
+                    }
+                })?;
+                Ok::<_, CordisError>(())
+            }),
+            (),
+        );
+
+        wait_for_services(&ctx).await.unwrap();
+        assert!(
+            child_settled.load(Ordering::SeqCst),
+            "wait_for_services returned before dynamically spawned try_inject child settled"
+        );
+
+        ctx.fiber().dispose().await;
     }
 }
