@@ -1,0 +1,32 @@
+[package]
+name = "mizar-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "前端无关的 Mizar 客户端宿主运行时（供 TUI 与 Merak Desktop 共用，零终端依赖）"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+cordis = { workspace = true }
+futures = { workspace = true }
+image = { workspace = true }
+mizar-agent-loop = { workspace = true }
+mizar-agent-spine = { workspace = true }
+mizar-client-core = { workspace = true }
+mizar-instructions = { workspace = true }
+mizar-llm = { workspace = true }
+mizar-mcp = { workspace = true }
+mizar-session = { workspace = true }
+mizar-session-title = { workspace = true }
+mizar-skills = { workspace = true }
+mizar-tools = { workspace = true }
+mizar-tools-coding = { workspace = true }
+mizar-trajectory = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio-util = { workspace = true }

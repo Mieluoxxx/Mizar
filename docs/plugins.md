@@ -1,21 +1,22 @@
 # Mizar 插件与模块清单
 
-本文档介绍 `crates/` 下共 **31 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
+本文档介绍 `crates/` 下共 **33 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
 
-目前仓库为纯 Virtual Workspace，唯一的终端入口为 `crates/mizar-tui/src/main.rs`（`mizar-tui`），通过 `mizar-agent-spine` 按需装配 Agent 能力并由纯前端工作台 `mizar-tui-ui` 渲染界面。**纯模型/纯 UI 层**与**异步插件宿主层**已彻底解耦。
+目前仓库为纯 Virtual Workspace，唯一的终端入口为 `crates/mizar-tui/src/main.rs`（`mizar-tui`），通过 `mizar-agent-spine` 按需装配 Agent 能力，经跨端共享层（`mizar-client-core` / `mizar-client`）连接纯前端工作台 `mizar-tui-ui`（同时可供桌面端 Merak 直嵌复用）。**纯模型/纯 UI/纯客户端契约层**与**异步插件宿主层**已彻底解耦。
 
 ---
 
 ## 一、底层微内核与纯类型/核心层（无 `tokio` / 无 HTTP / 无重运行时）
 
-以下 4 个底层 crate 只保留数据结构、纯逻辑或微内核抽象，可独立进行毫秒级 `cargo check` 与单测：
+以下 5 个底层 crate 只保留数据结构、纯逻辑或微内核抽象，可独立进行毫秒级 `cargo check` 与单测：
 
 | Crate | 类型 | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- |
 | **`cordis`** | 插件微内核框架 | 提供 `Context` 上下文树、`Fiber` 生命周期状态机、`effect` 记账与倒序清理、`Service` 抽象、`inject` 服务依赖注入与 5 种事件分发模式（`emit` / `parallel` / `serial` / `bail` / `waterfall`） | 无 |
 | **`mizar-llm-types`** | 纯 Schema / SSE Core | 定义统一消息、`ContentBlock`、`BlockAssembler`、错误分类与流式 `SseParser`（零 `tokio` / `cordis` / `reqwest`） | 无 |
-| **`mizar-trajectory-core`** | 纯轨迹建模与检测 | 轨迹事件模型、折叠快照、三泳道时间轴建模与异常检测规则（零 `tokio` / `cordis` / 运行时插件依赖） | 无 |
-| **`mizar-tui-ui`** | 纯终端工作台前端 | `AppState` 状态机、虚拟化 Markdown/代码渲染、双栏侧栏、TimelineRail、Overlay、主题与轨迹全屏视图（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`） | `mizar-llm-types`、`mizar-trajectory-core` |
+| **`mizar-trajectory-core`** | 纯轨迹建模与检测 | 轨迹事件模型、折叠快照、三泳道时间轴建模与异常检测规则（零 `tokio` / `cordis` / 运行时插件依赖） | `mizar-llm-types` |
+| **`mizar-client-core`** | 纯客户端契约与算法层 | 跨 TUI 与 Merak Desktop 共享的纯数据结构与算法：`HostExtensionFlags`（10 个官方扩展开关与 `"tui"` 级联派生）、`PromptQueue`（ID 稳定的待发送队列）、`TpsLedger`（解码吞吐账本）、`WorkspaceFileCache`（`.gitignore` 感知后台索引）、`ClientEvent` 统一事件、`mentions` 解析、`reveal` 平滑吐字、`tool_format` 摘要与纯 DTO（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite` / `ratatui` / `crossterm`） | `mizar-llm-types` |
+| **`mizar-tui-ui`** | 纯终端工作台前端 | `AppState` 状态机、`TuiFeatures` 插件特性开关、`pi-emphasis` 视觉语法、虚拟化 Markdown/代码渲染、双栏侧栏、TimelineRail、Overlay、主题与轨迹全屏视图（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`） | `mizar-client-core`、`mizar-llm-types`、`mizar-trajectory-core` |
 
 ---
 
@@ -133,20 +134,26 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理 13 个内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用）。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写配置 | 无（自身负责装配与控制） | `thiserror`、`tokio` 及按 Cargo features 选配的后端 crate |
-| **`mizar-tui`** | 可执行文件 `mizar` | 终端与无头 CLI 入口 | **薄宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，同时提供交互式 TUI 与非交互无头单次执行（`mizar exec` / `-p` / `--prompt-file`）。TUI 模式桥接 Cordis 事件、审批回调、`Session` 重放投影、系统提示词挂载与文件/Git 采样至纯前端 `mizar-tui-ui`，支持欢迎画布、`!` / `!!` 本地 Bash 模式、可取消的 `/compact [focus]` 进度压缩、`/resume` 交互式会话选择器与 `/rename [title]` 改名/重生成，以及 `/settings`（`/config`）的 `[界面]` / `[运行]` / `[压缩]` / `[会话标题]` / `[模块]` 实时切换并原子回写 `~/.mizar/settings.json`；无头 `exec` 模式复用同套装配，支持 `--provider` / `--model` / `--protocol`（`--api-format`）/ `--base-url` / `--reasoning-effort` / `--max-steps` / `--timeout` / `--isolated`，严格校验路由与凭据且仅在 `stdout` 输出最终答案。CLI 同时支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r [id]`、`--no-persist`、`--no-instructions`、`--theme` 与 `mizar update` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测，按需访问 `"spinePlugins"`、`compaction`、`sessionTitle`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理 13 个内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins` 实施 Gate 2 自保护（严禁禁用），同时识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主/TUI 扩展 ID 以避免 `disabledPlugins` 误报未知模块警告。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并将配置加载与路由解析拆分为 `config.rs` + `config/{settings,route}.rs`（提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写） | 无（自身负责装配与控制） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` 及按 Cargo features 选配的后端 crate |
+| **`mizar-client`** | `FileMentionsPlugin`、`ApprovalGatePlugin` 与宿主运行时模块 | `"file-mentions"` / `"approval-gate"`（前端无关宿主运行时） | **跨端宿主运行时（零 `ratatui` / `crossterm` / `mizar-tui-ui`）**：供 `mizar-tui` 与未来桌面端 Merak 共用。内置两个标准 Cordis 插件——`FileMentionsPlugin`（`mentions`：在 `agent/pre-step` 展开 `@` 文件/目录/图片引用为 `ContextNotice`）与 `ApprovalGatePlugin`（`approval`：在 `tools/pre-execute` 拦截高危工具执行并等待决策）；并提供前端无关运行时子模块：`images`（图片嗅探/EXIF 校正/动图首帧与自适应压缩）、`session_view`（只读会话投影/模型选择优先级解析/会话信息报告）、`settings`（设置条目构建、热更新与 `SpinePlugins` 启停原子写回）、`local_bash`（`!` / `!!` 本地 Shell 执行与会话审计）、`events`（核心服务等待、事件订阅与 `LoopClientMsg` / `RunController` 代次控制）以及 `workspace`（`WorkspacePanelSnapshot` 工具/MCP/指令/Git/轨迹聚合） | `FileMentionsPlugin` 依赖 `["llm"]`；`ApprovalGatePlugin` 依赖 `["tools"]`；其余运行时工具按需访问 `agentLoop`、`sessions`、`spinePlugins`、`compaction`、`sessionTitle`、`instructions`、`mcp`、`skills`、`trajectory` | `cordis`、`mizar-agent-loop`、`mizar-agent-spine`、`mizar-client-core`、`mizar-instructions`、`mizar-llm`、`mizar-mcp`、`mizar-session`、`mizar-session-title`、`mizar-skills`、`mizar-tools`、`mizar-tools-coding`、`mizar-trajectory` |
+| **`mizar-tui`** | 可执行文件 `mizar`（含 `TuiEmphasisPlugin`） | 终端与无头 CLI 入口 / `"tui-emphasis"` | **薄终端宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，同时提供交互式 TUI 与非交互无头单次执行（`mizar exec` / `-p` / `--prompt-file`）。TUI 模式（`runner.rs` + `runner/{terminal_io,actions}.rs`）将事件订阅、审批门禁、`@` 引用展开、图片处理、本地 Bash、会话投影与配置热写回全部委托给 `mizar-client` / `mizar-client-core`，自身专注终端 I/O、系统/OSC 5522 剪贴板（`clipboard`）、`mizar-tui-ui` 渲染桥接，以及按 `HostExtensionFlags` 控制 `TuiEmphasisPlugin`（`tui_reply_guidance` 系统提示词挂载）、`FileMentionsPlugin`、审批钩子与各前端特性开关（若 `disabledPlugins` 包含 `"tui"` 则直接拒绝启动而不进入终端 raw mode），支持欢迎画布、`!` / `!!` 本地 Bash 模式、可取消的 `/compact [focus]` 进度压缩、`/resume` 交互式会话选择器与 `/rename [title]` 改名/重生成，以及 `/settings`（`/config`）实时切换；无头 `exec` 模式复用同套装配，支持 `--provider` / `--model` / `--protocol`（`--api-format`）/ `--base-url` / `--reasoning-effort` / `--max-steps` / `--timeout` / `--isolated`，严格校验路由与凭据且仅在 `stdout` 输出最终答案。CLI 同时支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r [id]`、`--no-persist`、`--no-instructions`、`--theme` 与 `mizar update` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测；`TuiEmphasisPlugin` 注入 `["systemPrompt"]`；按需访问 `spinePlugins`、`compaction`、`sessionTitle`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-client`、`mizar-client-core`、`mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
 ---
 
 ## 八、依赖拓扑简图
 
 ```text
-┌─ 终端入口 / 纯前端分离 ────────────────────────────────────────────────────┐
-│  crates/mizar-tui (CLI + 异步宿主适配)                                     │
-│    ├─► crates/mizar-tui-ui  ──► mizar-llm-types / mizar-trajectory-core    │
-│    └─► crates/mizar-agent-spine (feature-gated 装配层 + spinePlugins)     │
-└───────────────────────────────┬────────────────────────────────────────────┘
-                                v
+┌─ 前端与跨端宿主接入层 ──────────────────────────────────────────────────────────┐
+│  crates/mizar-tui (CLI + 终端宿主适配)        Merak Desktop（未来桌面端直嵌）   │
+│    ├─► crates/mizar-tui-ui                          │                           │
+│    │     └─► mizar-client-core / mizar-llm-types / mizar-trajectory-core        │
+│    └────────────────────────┬───────────────────────┘                           │
+│                             v                                                   │
+│  crates/mizar-client（前端无关宿主运行时：零 ratatui / crossterm / mizar-tui-ui）│
+│    ├─► crates/mizar-client-core ──► mizar-llm-types                             │
+│    └─► crates/mizar-agent-spine（feature-gated 装配层 + spinePlugins）          │
+└─────────────────────────────┬───────────────────────────────────────────────────┘
+                              v
 ┌─ 编排与观测层 ─────────────────────────────────────────────────────────────┐
 │  mizar-agent-loop      mizar-trajectory ──► mizar-trajectory-core          │
 │  (agentLoop)         (trajectory + repeat-tool-guard)                      │
@@ -169,7 +176,9 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
         [ cordis 微内核：Context / Fiber / effect / 五种事件分发 ]
 ```
 
-**编译隔离边界**：`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite`；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `mizar-tui-ui` 与薄宿主 `mizar-tui`。
+**编译隔离边界**：
+- `mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite`（其中 `mizar-client-core` **亦禁止**依赖 `ratatui` / `crossterm`）；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `mizar-tui-ui` 与薄宿主 `mizar-tui`。
+- `mizar-client` 与 `mizar-client-core` **严禁引入 `ratatui`、`crossterm` 或 `mizar-tui-ui`**，确保未来 `Merak Desktop` 直嵌零终端依赖。
 
 ---
 
@@ -188,7 +197,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `toolsPreset` | `all` / `minimal` / `read-only` | 编码工具预设，对应 `--minimal` / `--read-only` |
 | `tools` | string[] | 工具白名单（支持 `*` 通配） |
 | `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |
-| `disabledPlugins` | string[] | 声明式屏蔽内置可选 Cordis 模块 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期热启停并原子回写；受保护核心服务忽略并告警） |
+| `disabledPlugins` | string[] | 声明式屏蔽内置可选 Cordis 模块 ID 或官方客户端/TUI 扩展 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期热启停并原子回写；受保护核心服务忽略并告警） |
 | `restrictToWorkspace` | bool | 将文件工具限制在工作区内（**默认 `false`**） |
 | `sessionDb` | string | SQLite 落盘路径；等价环境变量 `MIZAR_SESSION_DB`（`none` / `off` 关闭） |
 | `codemode` | object | `autoEnable` / `onlyMode` / `inlineBudget` / `timeoutMs` |
@@ -199,6 +208,25 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `recall` | object | `enabled` / `autoActivateOnCompaction` / `defaultSearchLimit`（默认 `8`）/ `readCharLimit`（默认 `6000`） |
 | `sessionTitle` | object | `enabled`（默认 `true`）/ `model`（可选 `provider/model`，省略则跟随当前会话模型）/ `thinkingLevel`（默认 `"low"`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
+
+### 客户端宿主与 TUI 扩展模块 ID（`disabledPlugins`）
+
+`mizar-agent-spine` 在 `KNOWN_HOST_EXTENSION_IDS` 中登记了以下 **10 个官方客户端宿主与 TUI 扩展模块 ID**。`SpinePlugins::initialize` 会将其识别为合法已知扩展（不触发未知模块告警或启动错误），由 `mizar-client-core::HostExtensionFlags::from_disabled_plugins`、`mizar-tui-ui::TuiFeatures` 及客户端宿主按开关控制挂载：
+
+| 扩展 ID | 常量名（`mizar-client-core`） | 作用域 | 受 `"tui"` 级联 | 控制的能力与禁用效果 |
+| :--- | :--- | :--- | :--- | :--- |
+| `file-mentions` | `PLUGIN_FILE_MENTIONS` | 跨端宿主扩展 | ✗ 独立 | `mizar-client::FileMentionsPlugin`（在 `agent/pre-step` 自动展开用户输入中的 `@` 文件/目录/图片引用并注入 `ContextNotice`） |
+| `local-bash` | `PLUGIN_LOCAL_BASH` | 跨端宿主扩展 | ✗ 独立 | 本地 `!`（进上下文）/ `!!`（仅本地展示）Shell 命令模式与 `mizar-client::local_bash` 执行 |
+| `approval-gate` | `PLUGIN_APPROVAL_GATE` | 跨端宿主扩展 | ✗ 独立 | `mizar-client::ApprovalGatePlugin`（`tools/pre-execute` 高危工具审批拦截与决策桥接） |
+| `tui` | `PLUGIN_TUI` | 终端宿主总开关 | 总开关 | 控制交互式 `mizar-tui` 工作台启用，并**级联关闭全部 6 个 `tui-*` 子扩展**（不影响 `file-mentions` / `local-bash` / `approval-gate` 等跨端核心能力） |
+| `tui-emphasis` | `PLUGIN_TUI_EMPHASIS` | 终端 UI / 提示词 | ✓ 级联关闭 | `mizar-tui::TuiEmphasisPlugin` 注入 `tui_reply_guidance` 系统提示词与 `pi-emphasis` 回复视觉语法渲染（禁用后不再向模型注入终端胶囊/图标引导规则） |
+| `tui-side-panel` | `PLUGIN_TUI_SIDE_PANEL` | 终端 UI 扩展 | ✓ 级联关闭 | 右侧四页签分栏面板（`Context` / `Files` / `Tools` / `Stats`、`Ctrl+B`、分割线拖拽与侧栏/Git 采样） |
+| `tui-timeline-rail` | `PLUGIN_TUI_TIMELINE_RAIL` | 终端 UI 扩展 | ✓ 级联关闭 | 2 列语义对话时间轴导轨、顶部吸顶回合提示与导轨点击跳转 |
+| `tui-trajectory-view` | `PLUGIN_TUI_TRAJECTORY_VIEW` | 终端 UI 扩展 | ✓ 级联关闭 | `Ctrl+T` / `/trace` 全屏三泳道轨迹分析场景（WaveBand + Timeline/Hotspots + Inspector） |
+| `tui-selection` | `PLUGIN_TUI_SELECTION` | 终端 UI 扩展 | ✓ 级联关闭 | 全屏应用级鼠标文本选区（字符/词/行粒度、多栏围栏复制） |
+| `tui-clipboard` | `PLUGIN_TUI_CLIPBOARD` | 终端 UI 扩展 | ✓ 级联关闭 | `Ctrl+V` 系统剪贴板与 SSH OSC 5522 图片/文件/文本读取粘贴 |
+
+> **Merak Desktop 直嵌说明**：桌面端 Merak 内置 Mizar 时，只需在配置中设置 `disabledPlugins: ["tui"]`，即可一键级联禁用全部 `tui` 与 `tui-*` 终端扩展（含终端 `tui_reply_guidance` 系统提示词注入），同时完整保留 `file-mentions`、`local-bash`、`approval-gate` 以及后端 `AgentSpinePlugin` 全部核心能力。
 
 `models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/mizar-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，并额外支持每个 Server 的 `exposure` 与 `toolExposure`。
 

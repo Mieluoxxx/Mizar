@@ -1,20 +1,24 @@
-//! 提交时 `@` 文件/目录引用展开与 `agent/pre-step` 钩子。
+//! 提交时 `@` 文件/目录/图片引用展开、`agent/pre-step` 钩子与 `FileMentionsPlugin`。
 //!
 //! 保留用户输入原文在 `SessionEvent::User` 中（气泡只渲染用户所写），
-//! 同时把解析得到的 `<attached-file ...>` 与 `<attached-directory ...>` 内容块
+//! 同时把解析得到的 `<attached-file ...>`、`<attached-directory ...>` 与图片附件
 //! 以 `SessionEvent::ContextNotice { source: "file-mentions", .. }` 注入本轮模型上下文。
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use cordis::{Context, CordisError, DisposableHandle};
+use cordis::{
+    BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Plugin,
+};
 use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_client_core::{
+    ClientEvent, FILE_MENTIONS_SOURCE, NoticeLevel, PLUGIN_FILE_MENTIONS, extract_mentions,
+};
 use mizar_llm::{ImageAttachment, LlmContextExt, MAX_IMAGES_PER_MESSAGE};
 use mizar_session::SessionEvent;
 use mizar_tools_coding::path_utils::resolve_read_path;
-use mizar_tui_ui::app::{NoticeLevel, UiEvent};
-use mizar_tui_ui::mentions::{FILE_MENTIONS_SOURCE, extract_mentions};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +42,90 @@ pub struct MentionExpansionResult {
     pub attached: Vec<String>,
     pub missing: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// `FileMentionsPlugin` 插件配置：绑定工作区边界与客户端事件投递通道。
+#[derive(Clone)]
+pub struct FileMentionsConfig {
+    pub workspace: PathBuf,
+    pub restrict_to_workspace: bool,
+    pub emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
+}
+
+impl fmt::Debug for FileMentionsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileMentionsConfig")
+            .field("workspace", &self.workspace)
+            .field("restrict_to_workspace", &self.restrict_to_workspace)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileMentionsConfig {
+    pub fn new(
+        workspace: impl Into<PathBuf>,
+        restrict_to_workspace: bool,
+        tx: mpsc::UnboundedSender<ClientEvent>,
+    ) -> Self {
+        Self::with_callback(workspace, restrict_to_workspace, move |ev| {
+            let _ = tx.send(ev);
+        })
+    }
+
+    pub fn with_callback<F>(
+        workspace: impl Into<PathBuf>,
+        restrict_to_workspace: bool,
+        emit: F,
+    ) -> Self
+    where
+        F: Fn(ClientEvent) + Send + Sync + 'static,
+    {
+        Self {
+            workspace: workspace.into(),
+            restrict_to_workspace,
+            emit: Arc::new(emit),
+        }
+    }
+}
+
+/// 官方客户端文件/目录/图片 `@` 引用展开 Cordis 插件（依赖 `llm` 探测视觉能力）。
+#[derive(Default, Clone, Copy)]
+pub struct FileMentionsPlugin;
+
+impl Plugin for FileMentionsPlugin {
+    type Config = FileMentionsConfig;
+
+    fn name(&self) -> Option<&str> {
+        Some(PLUGIN_FILE_MENTIONS)
+    }
+
+    fn inject(&self) -> Inject {
+        Inject::from(["llm"])
+    }
+
+    fn apply(
+        &self,
+        ctx: Context,
+        config: Self::Config,
+    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
+        Box::pin(async move {
+            let _ = ctx.llm()?;
+            let c = ctx.clone();
+            ctx.effect("mizar-client-file-mentions", move || {
+                let emit = Arc::clone(&config.emit);
+                let handle = register_mention_hook_with(
+                    &c,
+                    config.workspace,
+                    config.restrict_to_workspace,
+                    move |ev| emit(ev),
+                )?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    handle.dispose().await;
+                })))
+            })?;
+            Ok(None)
+        })
+    }
 }
 
 fn escape_xml_attr(s: &str) -> String {
@@ -307,8 +395,23 @@ pub fn register_mention_hook(
     ctx: &Context,
     workspace: PathBuf,
     restrict_to_workspace: bool,
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    tx: mpsc::UnboundedSender<ClientEvent>,
 ) -> Result<DisposableHandle, CordisError> {
+    register_mention_hook_with(ctx, workspace, restrict_to_workspace, move |ev| {
+        let _ = tx.send(ev);
+    })
+}
+
+/// 挂载 `agent/pre-step` 监听器并通过自定义闭包投递 `ClientEvent`（便于上层包装成 `LoopClientMsg`）。
+pub fn register_mention_hook_with<F>(
+    ctx: &Context,
+    workspace: PathBuf,
+    restrict_to_workspace: bool,
+    emit: F,
+) -> Result<DisposableHandle, CordisError>
+where
+    F: Fn(ClientEvent) + Clone + Send + Sync + 'static,
+{
     let processed_seq_by_session: Arc<Mutex<HashMap<String, u64>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let ctx_hook = ctx.clone();
@@ -317,7 +420,7 @@ pub fn register_mention_hook(
         EVENT_AGENT_PRE_STEP,
         move |ev: AgentPreStepEvent| {
             let ws = workspace.clone();
-            let ui_tx = ui_tx.clone();
+            let emit = emit.clone();
             let processed = Arc::clone(&processed_seq_by_session);
             let ctx_hook = ctx_hook.clone();
             async move {
@@ -383,7 +486,7 @@ pub fn register_mention_hook(
                     )
                 {
                     let model_name = ev.model.as_deref().unwrap_or("当前模型");
-                    let _ = ui_tx.send(UiEvent::Notice {
+                    emit(ClientEvent::Notice {
                         level: NoticeLevel::Error,
                         text: format!(
                             "当前模型 {model_name} 不支持图片输入，已取消 `@` 图片发送（{}）",
@@ -401,7 +504,7 @@ pub fn register_mention_hook(
                     let skipped = result.images.len() - allowed;
                     result.images.truncate(allowed);
                     result.image_paths.truncate(allowed);
-                    let _ = ui_tx.send(UiEvent::Notice {
+                    emit(ClientEvent::Notice {
                         level: NoticeLevel::Warn,
                         text: format!(
                             "单条消息最多附加 {MAX_IMAGES_PER_MESSAGE} 张图片，已跳过超出上限的 {skipped} 张 `@` 图片"
@@ -426,19 +529,19 @@ pub fn register_mention_hook(
                 }
 
                 if !result.attached.is_empty() {
-                    let _ = ui_tx.send(UiEvent::Flash(format!(
+                    emit(ClientEvent::Flash(format!(
                         "✓ 已附加 {} 个 @ 引用",
                         result.attached.len()
                     )));
                 }
                 if !result.errors.is_empty() {
-                    let _ = ui_tx.send(UiEvent::Notice {
+                    emit(ClientEvent::Notice {
                         level: NoticeLevel::Error,
                         text: format!("@ 图片处理失败：{}", result.errors.join("; ")),
                     });
                 }
                 if !result.missing.is_empty() {
-                    let _ = ui_tx.send(UiEvent::Notice {
+                    emit(ClientEvent::Notice {
                         level: NoticeLevel::Warn,
                         text: format!("未找到或无法读取 @ 引用：{}", result.missing.join(", ")),
                     });
@@ -469,8 +572,10 @@ mod tests {
 
     #[tokio::test]
     async fn expands_files_line_ranges_directories_and_missing_mentions() {
-        let tmp =
-            std::env::temp_dir().join(format!("mizar_tui_mention_expand_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "mizar_client_mention_expand_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("src/sub")).unwrap();
         std::fs::write(tmp.join("src/a.rs"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
@@ -501,8 +606,10 @@ mod tests {
 
     #[tokio::test]
     async fn expands_image_mentions_into_attachments_without_attached_file_text() {
-        let tmp =
-            std::env::temp_dir().join(format!("mizar_tui_mention_images_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "mizar_client_mention_images_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("shot.png"), tiny_png(3000, 1500)).unwrap();
@@ -580,8 +687,10 @@ mod tests {
             }
         }
 
-        let tmp =
-            std::env::temp_dir().join(format!("mizar_tui_mention_cancel_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!(
+            "mizar_client_mention_cancel_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("shot.png"), tiny_png(100, 100)).unwrap();
@@ -628,6 +737,68 @@ mod tests {
         assert!(session.log().iter().any(|e| {
             matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
         }));
+
+        ctx.fiber().dispose().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn plugin_mounts_and_cleans_up_on_dispose() {
+        use cordis::Service;
+        use mizar_llm::LlmRuntime;
+        use mizar_session::{SessionContextExt, SessionStore};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "mizar_client_mention_plugin_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("hello.txt"), "world").unwrap();
+
+        let ctx = Context::new();
+        ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let plugin_fiber = ctx
+            .plugin(
+                FileMentionsPlugin,
+                FileMentionsConfig::new(tmp.clone(), true, tx),
+            )
+            .await
+            .unwrap();
+
+        let session = ctx.sessions().unwrap().create(None);
+        session.append(SessionEvent::user("看 @hello.txt"));
+
+        let ev = AgentPreStepEvent {
+            session: Arc::clone(&session),
+            turn: 1,
+            step: 1,
+            provider: None,
+            model: None,
+            cancel: CancellationToken::new(),
+        };
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev).await;
+        assert!(session.log().iter().any(|e| {
+            matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
+        }));
+        assert!(matches!(rx.try_recv(), Ok(ClientEvent::Flash(_))));
+
+        // 卸载插件后钩子应随之撤销，不再处理新消息
+        plugin_fiber.dispose().await;
+        session.append(SessionEvent::user("再看 @hello.txt"));
+        let count_before = session.log().len();
+        let ev2 = AgentPreStepEvent {
+            session: Arc::clone(&session),
+            turn: 2,
+            step: 1,
+            provider: None,
+            model: None,
+            cancel: CancellationToken::new(),
+        };
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev2).await;
+        assert_eq!(session.log().len(), count_before);
 
         ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);

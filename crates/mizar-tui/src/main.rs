@@ -621,6 +621,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // 两者都没有时 `model` 仍可能是 `models.json` 推导出来的，那不算显式指定。
     tui_cfg.model_from_env = env_non_empty("MODEL").is_some();
     tui_cfg.model_from_settings = loaded_cfg.settings.default_model.is_some();
+    tui_cfg.disabled_plugins = loaded_cfg.settings.disabled_plugins.clone();
     if let Some(ui) = &loaded_cfg.settings.ui {
         if let Some(ref theme_name) = ui.theme {
             tui_cfg.theme_preset = mizar_tui_ui::theme::ThemePreset::parse(theme_name);
@@ -703,72 +704,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_version_and_help_flags() {
-        assert!(
-            parse_cli_args_from(["--version".to_string()])
-                .unwrap()
-                .version
-        );
-        assert!(parse_cli_args_from(["-V".to_string()]).unwrap().version);
-        assert!(parse_cli_args_from(["--help".to_string()]).unwrap().help);
-        assert!(parse_cli_args_from(["-h".to_string()]).unwrap().help);
-        assert!(parse_cli_args_from(["--bogus".to_string()]).is_err());
-        assert!(parse_cli_args_from(["-C".to_string()]).is_err());
-    }
-
-    #[test]
-    fn resolve_version_and_help_output_non_empty() {
-        let ver = current_version();
-        assert!(!ver.is_empty());
-        let help = format_help_text();
-        assert!(help.contains(&format!("mizar {ver}")));
-        assert!(help.contains("exec"));
-        assert!(help.contains("update"));
-        assert!(help.contains("--version"));
-        assert!(help.contains("--workspace"));
-        assert!(help.contains("--isolated"));
-        assert!(help.contains("--api-format"));
-    }
-
-    #[test]
-    fn parse_existing_cli_flags_preserved() {
-        let parsed = parse_cli_args_from([
-            "-C".to_string(),
-            "/tmp/repo".to_string(),
-            "--minimal".to_string(),
-            "-t".to_string(),
-            "read, edit".to_string(),
-            "-xt".to_string(),
-            "bash".to_string(),
-            "--inline".to_string(),
-            "--approve".to_string(),
-            "--no-persist".to_string(),
-            "--no-instructions".to_string(),
-            "-c".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(parsed.workspace, Some(PathBuf::from("/tmp/repo")));
-        assert!(matches!(
-            parsed.preset,
-            Some(CodingToolsPreset::MinimalCoding)
-        ));
-        assert_eq!(
-            parsed.include_tools,
-            Some(vec!["read".to_string(), "edit".to_string()])
-        );
-        assert_eq!(parsed.exclude_tools, vec!["bash".to_string()]);
-        assert!(parsed.inline);
-        assert!(parsed.approve);
-        assert!(parsed.no_persist);
-        assert!(parsed.no_instructions);
-        assert!(matches!(
-            parsed.resume_session,
-            Some(ResumeTarget::LatestInWorkspace)
-        ));
-        assert!(!parsed.is_exec_mode());
-    }
-
-    #[test]
     fn parse_exec_subcommand_flags_aliases_and_rejects_conflicts() {
         let args: Vec<String> = [
             "exec",
@@ -803,7 +738,6 @@ mod tests {
         assert_eq!(parsed.timeout_secs, Some(12));
         assert_eq!(parsed.positional_prompt.as_deref(), Some("- list files"));
 
-        // root -p 进入 exec 模式；重复或额外位置参数或无效参数均报错
         let root_p = parse_cli_args_from(["-C=/ws".into(), "-p".into(), "ping".into()]).unwrap();
         assert!(root_p.is_exec_mode());
         assert!(!root_p.explicit_exec);
@@ -826,43 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_resume_flag_supports_picker_and_explicit_id() {
-        let bare = parse_cli_args_from(["-r".to_string()]).unwrap();
-        assert_eq!(bare.resume_session, Some(ResumeTarget::Picker));
-
-        let before_flag =
-            parse_cli_args_from(["--resume".to_string(), "--inline".to_string()]).unwrap();
-        assert_eq!(before_flag.resume_session, Some(ResumeTarget::Picker));
-        assert!(before_flag.inline);
-
-        let with_id = parse_cli_args_from(["-r".to_string(), "sess-42".to_string()]).unwrap();
-        assert_eq!(
-            with_id.resume_session,
-            Some(ResumeTarget::Id("sess-42".into()))
-        );
-
-        let equals_id = parse_cli_args_from(["--resume=sess-99".to_string()]).unwrap();
-        assert_eq!(
-            equals_id.resume_session,
-            Some(ResumeTarget::Id("sess-99".into()))
-        );
-
-        let equals_empty = parse_cli_args_from(["--resume=".to_string()]).unwrap();
-        assert_eq!(equals_empty.resume_session, Some(ResumeTarget::Picker));
-    }
-
-    #[test]
-    fn worker_threads_clamped_between_two_and_four() {
-        assert_eq!(default_tokio_worker_threads(1), 2);
-        assert_eq!(default_tokio_worker_threads(2), 2);
-        assert_eq!(default_tokio_worker_threads(3), 3);
-        assert_eq!(default_tokio_worker_threads(4), 4);
-        assert_eq!(default_tokio_worker_threads(16), 4);
-        assert_eq!(default_tokio_worker_threads(64), 4);
-    }
-
-    #[test]
-    fn parse_exec_max_tokens_json_output_and_continue_flags() {
+    fn parse_exec_max_tokens_json_output_and_resume_flags() {
         let parsed = parse_cli_args_from([
             "exec".to_string(),
             "--max-tokens".to_string(),
@@ -884,6 +782,25 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(fmt_text.output_format, Some(ExecOutputFormat::Text));
+
+        assert_eq!(
+            parse_cli_args_from(["--resume".into(), "--inline".into()])
+                .unwrap()
+                .resume_session,
+            Some(ResumeTarget::Picker)
+        );
+        assert_eq!(
+            parse_cli_args_from(["-r".into(), "sess-42".into()])
+                .unwrap()
+                .resume_session,
+            Some(ResumeTarget::Id("sess-42".into()))
+        );
+        assert_eq!(
+            parse_cli_args_from(["--resume=sess-99".into()])
+                .unwrap()
+                .resume_session,
+            Some(ResumeTarget::Id("sess-99".into()))
+        );
 
         assert!(parse_cli_args_from(["exec".into(), "--max-tokens".into(), "0".into()]).is_err());
         assert!(

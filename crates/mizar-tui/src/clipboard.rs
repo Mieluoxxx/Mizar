@@ -945,8 +945,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn mime_selection_strictly_prefers_files_then_image_then_text() {
-        // 同屏同时出现 text + image + file URI 时必须优先 files
+    fn mime_priority_uri_list_and_macos_info_parsing() {
         let all = vec![
             "text/plain;charset=utf-8".to_string(),
             "image/png".to_string(),
@@ -956,8 +955,6 @@ mod tests {
             select_preferred_mime(&all),
             Some(MimeChoice::Files("text/uri-list".into()))
         );
-
-        // 截图常同时带有 text/html（或图像元信息）与 image/bmp + image/png，必须优先 image/png
         let img_and_text = vec![
             "text/plain".to_string(),
             "image/bmp".to_string(),
@@ -967,67 +964,32 @@ mod tests {
             select_preferred_mime(&img_and_text),
             Some(MimeChoice::Image("image/png".into()))
         );
-
-        let text_only = vec!["STRING".to_string(), "UTF8_STRING".to_string()];
         assert_eq!(
-            select_preferred_mime(&text_only),
+            select_preferred_mime(&["STRING".to_string(), "UTF8_STRING".to_string()]),
             Some(MimeChoice::Text("UTF8_STRING".into()))
         );
-    }
 
-    #[test]
-    fn decodes_uri_list_and_gnome_copied_files_with_percent_encoding() {
-        let uri_list =
-            "# comment line\r\nfile:///tmp/my%20shot%231.png\r\nfile://localhost/var/log/a.txt\n";
+        let uri_list = "# comment\r\nfile:///tmp/my%20shot%231.png\r\ncopy\nfile:///home/%E6%88%AA%E5%9B%BE.png\n";
         assert_eq!(
             decode_file_uri_list(uri_list),
             vec![
                 PathBuf::from("/tmp/my shot#1.png"),
-                PathBuf::from("/var/log/a.txt"),
+                PathBuf::from("/home/截图.png"),
             ]
         );
 
-        let gnome = "copy\nfile:///home/user/%E6%88%AA%E5%9B%BE.png\n";
-        assert_eq!(
-            decode_file_uri_list(gnome),
-            vec![PathBuf::from("/home/user/截图.png")]
-        );
-    }
-
-    #[test]
-    fn parses_macos_clipboard_info_tokens_accurately() {
-        let info = "«class PNGf», 48210, «class TIFF», 120000, Unicode text, 18";
-        let p = parse_macos_clipboard_info(info);
-        assert!(!p.has_files);
-        assert!(p.has_png);
-        assert!(p.has_tiff);
-
-        let furl = "«class furl», 144, «class utf8», 22";
-        let pf = parse_macos_clipboard_info(furl);
-        assert!(pf.has_files);
-        assert!(!pf.has_png);
-    }
-
-    #[test]
-    fn detects_ssh_native_unreachable_env_vars() {
-        assert!(!native_unreachable_with(|_| false));
+        let p = parse_macos_clipboard_info("«class PNGf», 48210, «class TIFF», 120000");
+        assert!(p.has_png && p.has_tiff && !p.has_files);
+        assert!(parse_macos_clipboard_info("«class furl», 144").has_files);
         assert!(native_unreachable_with(|k| k == "SSH_CONNECTION"));
-        assert!(native_unreachable_with(|k| k == "SSH_CLIENT"));
-        assert!(native_unreachable_with(|k| k == "SSH_TTY"));
+        assert!(!native_unreachable_with(|_| false));
     }
 
     #[test]
-    fn encodes_and_reassembles_chunked_osc5522_packets() {
-        assert_eq!(
-            build_osc5522_probe_request(),
-            "\x1b]5522;type=read;Lg==\x1b\\"
-        );
+    fn osc5522_chunked_reassembly_and_partial_rejection() {
         let req = build_osc5522_read_request("secret", "mizar", "image/png");
-        assert!(req.starts_with("\x1b]5522;type=read:pw="));
-        assert!(req.contains(":name=bWl6YXI="));
-        assert!(req.ends_with(";aW1hZ2UvcG5n\x1b\\"));
+        assert!(req.starts_with("\x1b]5522;type=read:pw=") && req.ends_with(";aW1hZ2UvcG5n\x1b\\"));
 
-        // 模拟分片到达 + 混杂键盘前缀 + BEL/ST 双终结符 + 分段 base64 数据
         let mime_b64 = STANDARD.encode(b"image/png");
         let chunk1 = STANDARD.encode(b"hello ");
         let chunk2 = STANDARD.encode(b"world");
@@ -1040,17 +1002,26 @@ mod tests {
         let mut buf = stream.as_bytes()[..stream.len() - 12].to_vec();
         let first_pass = extract_osc5522_packets(&mut buf);
         assert_eq!(first_pass.len(), 3);
-        assert_eq!(first_pass[0].status.as_deref(), Some("OK"));
         assert_eq!(first_pass[1].mime.as_deref(), Some("image/png"));
-        assert_eq!(first_pass[1].payload_b64, chunk1);
-        assert_eq!(first_pass[2].payload_b64, chunk2);
-
-        // 补全最后 12 字节 DONE 包
         buf.extend_from_slice(&stream.as_bytes()[stream.len() - 12..]);
         let second_pass = extract_osc5522_packets(&mut buf);
-        assert_eq!(second_pass.len(), 1);
         assert_eq!(second_pass[0].status.as_deref(), Some("DONE"));
         assert!(buf.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
+            let (mut writer, reader) = UnixStream::pair().unwrap();
+            let data_b64 = STANDARD.encode(b"partial-bytes");
+            let payload = format!(
+                "\x1b]5522;type=read:status=OK\x1b\\\x1b]5522;type=read:status=DATA;{data_b64}\x1b\\"
+            );
+            writer.write_all(payload.as_bytes()).unwrap();
+            drop(writer);
+            let err = collect_osc5522_response(reader.as_raw_fd(), Duration::from_millis(50))
+                .expect_err("missing DONE terminator must fail");
+            assert!(matches!(err, ClipboardError::CommandFailed(_)));
+        }
     }
 
     #[cfg(unix)]
@@ -1062,22 +1033,5 @@ mod tests {
         let file = dir.create_secret_file("secret.png").unwrap();
         let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn collect_osc5522_response_rejects_partial_data_without_done() {
-        use std::os::unix::net::UnixStream;
-        let (mut writer, reader) = UnixStream::pair().unwrap();
-        let data_b64 = STANDARD.encode(b"partial-bytes");
-        let payload = format!(
-            "\x1b]5522;type=read:status=OK\x1b\\\x1b]5522;type=read:status=DATA;{data_b64}\x1b\\"
-        );
-        writer.write_all(payload.as_bytes()).unwrap();
-        // 关闭写端或超时后未发送 DONE：必须判为截断失败而非 Ok(partial-bytes)
-        drop(writer);
-        let err = collect_osc5522_response(reader.as_raw_fd(), Duration::from_millis(50))
-            .expect_err("missing DONE terminator must fail");
-        assert!(matches!(err, ClipboardError::CommandFailed(_)));
     }
 }

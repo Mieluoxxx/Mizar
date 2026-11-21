@@ -42,8 +42,9 @@ pub use mizar_session_title::{
     format_session_title, parse_model_ref, parse_model_title_output,
 };
 pub use plugins::{
-    EVENT_SPINE_PLUGINS_CHANGE, SERVICE_SPINE_PLUGINS, SpineModuleStatus, SpinePluginError,
-    SpinePlugins, SpinePluginsChangeEvent, SpinePluginsContextExt, is_protected_module_id,
+    EVENT_SPINE_PLUGINS_CHANGE, KNOWN_HOST_EXTENSION_IDS, SERVICE_SPINE_PLUGINS, SpineModuleStatus,
+    SpinePluginError, SpinePlugins, SpinePluginsChangeEvent, SpinePluginsContextExt,
+    is_protected_module_id,
 };
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin, Service};

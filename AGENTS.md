@@ -3,7 +3,7 @@
 给在本仓库工作的 AI coding agent 的说明。
 
 **Mizar** = Rust 重写的终端 AI 编程 Agent：`mizar`（`mizar-tui`）是唯一可执行入口，`cordis` 是自研微内核，
-30 个 crate 靠 `inject` / `provide` 装配成「流式调模型 → 执行工具 → 回写会话」的主循环。
+33 个 crate 靠 `inject` / `provide` 装配成「流式调模型 → 执行工具 → 回写会话」的主循环。
 
 架构权威文本是 **[docs/plugins.md](docs/plugins.md)**。本文件不复述它，只记「反直觉、看代码看不出来」的规则。
 
@@ -11,10 +11,12 @@
 
 ## 一、不可破坏的边界
 
-**这三个 crate 禁止引入 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`**：
-`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`。
+**这四个 crate 禁止引入 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`**：
+`mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`（其中 `mizar-client-core` **亦禁止**引入 `ratatui` / `crossterm`）。
 
-加了能编过，但架构就废了。需要异步或运行时能力，上移到 `mizar-tui` / `mizar-agent-spine` 宿主层。
+加了能编过，但架构就废了。需要异步或运行时能力，上移到 `mizar-client` / `mizar-tui` / `mizar-agent-spine` 宿主层。
+
+**Merak Desktop 直嵌边界**：**`mizar-client`（及 `mizar-client-core`）禁止引入 `ratatui` / `crossterm` / `mizar-tui-ui`**，确保跨端宿主运行时零终端依赖。
 
 **workspace 规则**：根 `Cargo.toml` 无 `[package]`；依赖一律进 `[workspace.dependencies]`，crate 内写
 `{ workspace = true }`，不写死版本号；每个 crate 带 `[lints] workspace = true`。Rust 固定 **1.98.0**、edition 2024。
@@ -115,9 +117,8 @@ Verified:
 
 ## 六、坑
 
-- **改 `mizar-tui-ui` 的枚举/结构体字段，`mizar-tui` 的构造点会一起断**。`OverlayKind` / `OverlayAction` / `UiEvent`
-  横跨两个 crate，一次改完再跑 `cargo check --workspace`，别只 check 单个。
-- **feature 组合会漏编**。`mizar-agent-spine` 有 `legacy`/`coding`/`compaction`/`sqlite`/`trajectory`/`router`，
+- **改 `mizar-client-core` / `mizar-tui-ui` 的枚举或事件，`mizar-client` / `mizar-tui` 会一起受影响**。`ClientEvent`（`UiEvent`）、`OverlayKind`、`OverlayAction` 跨 crate 传递，一次改完再跑 `cargo check --workspace`，别只 check 单个。
+- **feature 组合会漏编**。`mizar-agent-spine` 有 `legacy`/`coding`/`compaction`/`sqlite`/`session-title`/`trajectory`/`router`，
   可选依赖的 `use` 必须配 `#[cfg(feature)]`。验最小组合（含测试目标）：`cargo check --locked -p mizar-agent-spine --no-default-features --all-targets`。
 - **改 crate 结构 / `inject` / 服务名时，`docs/plugins.md` 的表格与拓扑图要同步改**，否则立刻过期。
 - **沙箱默认关闭**：`restrictToWorkspace` 默认 `false`，`bash` 能碰工作区外。别假设有隔离。
@@ -132,12 +133,14 @@ Verified:
 | 想做什么 | 看 |
 | :--- | :--- |
 | 整体架构 | `docs/plugins.md` |
+| 跨端纯客户端契约 | `crates/mizar-client-core/src/lib.rs`（`HostExtensionFlags`、`PromptQueue`、`TpsLedger`、`WorkspaceFileCache`、`ClientEvent`） |
+| 跨端宿主运行时 | `crates/mizar-client/src/lib.rs`（`FileMentionsPlugin`、`ApprovalGatePlugin`、`events`、`settings`、`session_view`、`workspace`） |
 | 加工具（最小样例 41 行） | `crates/mizar-tool-time/src/lib.rs` |
 | 加 LLM 协议适配器 | `crates/mizar-llm-mock/src/lib.rs` |
 | 主循环 | `crates/mizar-agent-loop/src/lib.rs` |
 | 工具管线（三道 waterfall） | `crates/mizar-tools/src/lib.rs` |
 | 微内核 | `crates/cordis/src/`（`fiber.rs` 状态机、`context.rs` 注入） |
-| UI 渲染 | `crates/mizar-tui-ui/src/`（`ui.rs` 布局、`markdown.rs`、`app.rs`） |
-| CLI 参数 | `crates/mizar-tui/src/main.rs` 顶部 `//!` 即完整参数表 |
-| 装配顺序 | `crates/mizar-agent-spine/src/lib.rs` 的 `apply` |
-| 配置字段 | `crates/mizar-agent-spine/src/config.rs` + `docs/plugins.md` 第九节 |
+| UI 渲染与状态机 | `crates/mizar-tui-ui/src/`（`ui.rs`、`markdown.rs`、`features.rs`、`app.rs`、`app/{cache,events,input}.rs`） |
+| TUI 宿主循环与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
+| 装配顺序与扩展 ID | `crates/mizar-agent-spine/src/lib.rs` 的 `apply` 与 `crates/mizar-agent-spine/src/plugins.rs`（`KNOWN_HOST_EXTENSION_IDS`） |
+| 配置字段 | `crates/mizar-agent-spine/src/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第九节 |

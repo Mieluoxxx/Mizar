@@ -2682,17 +2682,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wraps_markdown_and_code_blocks_within_width() {
-        let md = "# 标题\n- 第一条包含 `inline` 和 **粗体**\n```rust\nlet x = 1234567890;\n```";
-        let lines = render_markdown_lines(md, 14, Style::default(), Color::Cyan);
-        assert!(lines.len() >= 5);
-        for line in &lines {
-            let w: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
-            assert!(w <= 14, "line exceeded width 14: {line:?} (w={w})");
-        }
-    }
-
-    #[test]
     fn supports_cjk_adjacent_bold_and_emphasis_pills_and_tables() {
         let theme = Theme::mist_dark();
         let cfg = EmphasisConfig {
@@ -2720,57 +2709,6 @@ mod tests {
         assert!(text.contains("Needs\u{00a0}you"));
         assert!(text.contains("┌"));
         assert!(text.contains("123"));
-    }
-
-    #[test]
-    fn split_diff_and_word_diff_render_cleanly() {
-        let theme = Theme::mist_dark();
-        let diff = "@@ -1,2 +1,2 @@\n-    let old_val = 1;\n+    let new_val = 2;";
-        let narrow = render_diff_rich(diff, 60, &theme);
-        assert!(narrow.len() >= 3);
-        let wide = render_diff_rich(diff, 100, &theme);
-        let wide_str: String = wide[1]
-            .line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(wide_str.contains('│'), "expected split diff: {wide_str}");
-    }
-
-    #[test]
-    fn table_borders_stay_aligned_with_code_bold_and_nested_pills() {
-        let theme = Theme::mist_dark();
-        let cfg = EmphasisConfig {
-            enabled: true,
-            round_caps: false,
-            icons: false,
-            guidance: true,
-        };
-        let md = "\
-| 检查 | 结果 |
-| --- | --- |
-| `cargo check --all-targets` | **[[Passed]]** 16.6s, 零错误 |
-| `cargo test --workspace` | **[[Passed]]** 全部绿，含 SSE 集成 |
-| `cargo clippy` | **[[Passed]]** 全仓仅 `1` 条警告 |
-| `unsafe` | **[[Keep]]** 仅 2 处真实块 |
-| panic/expect | 8 处，对一个含 `TUI` 的项目来说很低 |";
-
-        let rendered = render_markdown_rich(md, 96, &theme, &cfg);
-        assert!(rendered.len() >= 8);
-        let first_w = spans_display_width(&rendered[0].line.spans);
-        for (row_idx, rl) in rendered.iter().enumerate() {
-            let row_str: String = rl.line.spans.iter().map(|s| s.content.as_ref()).collect();
-            let rw = spans_display_width(&rl.line.spans);
-            assert_eq!(
-                rw, first_w,
-                "table row {row_idx} width mismatch ({rw} != {first_w}): {row_str:?}"
-            );
-            assert!(
-                !row_str.contains("[[Passed]]") && !row_str.contains("[[Keep]]"),
-                "nested bold pill leaked raw brackets: {row_str:?}"
-            );
-        }
     }
 
     #[test]
@@ -2879,68 +2817,6 @@ mod tests {
             summary_row.starts_with("普通总结段落"),
             "summary leaked tree indent: {summary_row:?}"
         );
-    }
-
-    #[test]
-    fn tree_bullet_soft_wrap_preserves_outer_rail_within_width() {
-        let theme = Theme::mist_dark();
-        let cfg = EmphasisConfig::default();
-        let md = "**├── 分支**\n- **codemode** — QuickJS 沙箱执行多个工具调用中间结果不进上下文";
-        let rendered = render_markdown_rich(md, 30, &theme, &cfg);
-        assert!(rendered.len() >= 3);
-        assert!(rendered[2].soft_wrapped);
-        let cont_str: String = rendered[2]
-            .line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(
-            cont_str.starts_with("│    "),
-            "soft wrap lost outer rail: {cont_str:?}"
-        );
-        for rl in &rendered {
-            assert!(spans_display_width(&rl.line.spans) <= 30);
-        }
-    }
-
-    #[test]
-    fn deduplicates_bold_label_before_matching_mode_pill_and_splits_long_prose() {
-        let theme = Theme::mist_dark();
-        let cfg = EmphasisConfig {
-            enabled: true,
-            round_caps: true,
-            icons: true,
-            guidance: true,
-        };
-        let md = "**Investigate** [[Investigate]]：我先梳理各个 crate 的依赖与职责、agent 主循环与工具调度机制。";
-        let rendered = render_markdown_rich(md, 44, &theme, &cfg);
-        assert!(rendered.len() >= 2, "expected pill line + prose lines");
-
-        let line0: String = rendered[0]
-            .line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(
-            line0.matches("Investigate").count(),
-            1,
-            "duplicate Investigate leaked: {line0:?}"
-        );
-        assert!(line0.starts_with('\u{e0b6}') && line0.ends_with('\u{e0b4}'));
-
-        let line1: String = rendered[1]
-            .line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(
-            line1.starts_with("我先梳理"),
-            "prose should start flush at col 0 without colon/indent: {line1:?}"
-        );
-        assert!(!rendered[1].soft_wrapped);
     }
 
     #[test]

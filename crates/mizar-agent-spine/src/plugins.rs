@@ -100,6 +100,21 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "repeat-guard",
 ];
 
+/// 官方客户端宿主与 TUI 扩展模块 ID（由上层宿主/TUI 读取 `disabledPlugins` 自行控制挂载，
+/// `SpinePlugins` 识别为合法已知 ID，不触发未知模块告警）。
+pub const KNOWN_HOST_EXTENSION_IDS: &[&str] = &[
+    "file-mentions",
+    "local-bash",
+    "approval-gate",
+    "tui",
+    "tui-emphasis",
+    "tui-side-panel",
+    "tui-timeline-rail",
+    "tui-trajectory-view",
+    "tui-selection",
+    "tui-clipboard",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpinePluginsChangeEvent {
     pub id: String,
@@ -396,7 +411,8 @@ impl SpinePlugins {
                 startup_errors.push(msg);
             } else if available_ids.contains(id.as_str()) {
                 disabled_set.insert(id);
-            } else if !is_known_optional_id(&id) {
+            } else if !is_known_optional_id(&id) && !KNOWN_HOST_EXTENSION_IDS.contains(&id.as_str())
+            {
                 let msg = format!("未知内置模块 `{id}`，已忽略 disabledPlugins 中的配置");
                 logger.warn(msg.clone());
                 startup_errors.push(msg);
@@ -674,6 +690,34 @@ mod tests {
             unknown_res,
             Err(SpinePluginError::UnknownModule(_))
         ));
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn known_host_extension_ids_are_skipped_without_startup_errors() {
+        let app = Context::new();
+        app.logger().set_silent();
+
+        let mut disabled: Vec<&str> = KNOWN_HOST_EXTENSION_IDS.to_vec();
+        disabled.push("still-unknown-id");
+        let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins(disabled);
+        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
+        for rt in app.registry().values() {
+            for f in rt.fibers() {
+                let _ = f.wait_settled().await;
+            }
+        }
+
+        let ctrl = app.spine_plugins().unwrap();
+        let errs = ctrl.startup_errors();
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected only unknown id error, got: {errs:?}"
+        );
+        assert!(errs[0].contains("still-unknown-id"), "got: {errs:?}");
+        assert!(ctrl.disabled_ids().is_empty());
 
         app.fiber().dispose().await;
     }

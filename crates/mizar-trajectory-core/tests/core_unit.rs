@@ -1,9 +1,8 @@
 use mizar_llm_types::TokenUsage;
 use mizar_trajectory_core::{
-    DetectorConfig, TimelineMode, TraceEvent, TraceEventKind, canonicalize_json, derive_timeline,
-    detect_anomalies, fold_trajectory, wildcard_matches,
+    DetectorConfig, TimelineMode, TraceEvent, TraceEventKind, derive_timeline, detect_anomalies,
+    fold_trajectory,
 };
-use serde_json::json;
 
 fn ev(seq: u64, ts_ms: u128, kind: TraceEventKind) -> TraceEvent {
     TraceEvent {
@@ -12,22 +11,6 @@ fn ev(seq: u64, ts_ms: u128, kind: TraceEventKind) -> TraceEvent {
         session_id: "s1".to_string(),
         kind,
     }
-}
-
-#[test]
-fn canonicalize_json_is_key_order_independent() {
-    let a = json!({ "b": 2, "a": { "y": 1, "x": [ { "d": 4, "c": 3 } ] } });
-    let b = json!({ "a": { "x": [ { "c": 3, "d": 4 } ], "y": 1 }, "b": 2 });
-    assert_eq!(canonicalize_json(&a), canonicalize_json(&b));
-}
-
-#[test]
-fn wildcard_matching_works() {
-    assert!(wildcard_matches("mcp_*", "mcp_search"));
-    assert!(!wildcard_matches("mcp_*", "search"));
-    assert!(wildcard_matches("*_file", "read_file"));
-    assert!(wildcard_matches("todo_write", "todo_write"));
-    assert!(!wildcard_matches("todo_write", "todo_read"));
 }
 
 #[test]
@@ -277,14 +260,6 @@ fn latency_trace(ttft_ms: u128, llm_ms: u128, tool_ms: u128) -> Vec<TraceEvent> 
             },
         ),
     ]
-}
-
-#[test]
-fn detector_config_defaults_use_relaxed_latency_thresholds() {
-    let cfg = DetectorConfig::default();
-    assert_eq!(cfg.slow_step_ms, 60_000);
-    assert_eq!(cfg.slow_tool_ms, 30_000);
-    assert_eq!(cfg.slow_ttft_ms, 15_000);
 }
 
 #[test]

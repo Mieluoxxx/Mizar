@@ -62,6 +62,8 @@ mizar-agent-loop = { path = "crates/mizar-agent-loop" }
 mizar-agent-spine = { path = "crates/mizar-agent-spine" }
 mizar-trajectory-core = { path = "crates/mizar-trajectory-core" }
 mizar-trajectory = { path = "crates/mizar-trajectory" }
+mizar-client-core = { path = "crates/mizar-client-core" }
+mizar-client = { path = "crates/mizar-client" }
 mizar-tui-ui = { path = "crates/mizar-tui-ui" }
 mizar-tui = { path = "crates/mizar-tui" }
 
