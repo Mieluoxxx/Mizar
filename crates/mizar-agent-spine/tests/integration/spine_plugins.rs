@@ -14,8 +14,9 @@ use mizar_agent_loop::{
 use mizar_agent_spine::{
     AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CacheWarmingContextExt,
     CacheWarmingMode, CacheWarmingRuntime, CompactionContextExt, EVENT_SPINE_PLUGINS_CHANGE,
-    RECALL_SEARCH_TOOL_NAME, SERVICE_CACHE_WARMING, SessionTitleContextExt, SessionTitleRuntime,
-    SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
+    RECALL_SEARCH_TOOL_NAME, SERVICE_CACHE_WARMING, SUBAGENT_TOOL_NAME, SessionTitleContextExt,
+    SessionTitleRuntime, SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
+    SubagentContextExt, SubagentRuntime,
 };
 use mizar_compaction::CompactionRuntime;
 use mizar_llm::{
@@ -197,6 +198,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         "instructions",
         "recall",
         "session-title",
+        "cache-warming",
+        "subagent",
         "trajectory",
         "repeat-guard",
     ]);
@@ -250,10 +253,12 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let sessions = app.sessions().unwrap();
 
     // 1. 启动阶段全部可选模块均已跳过，工具与可选服务均未挂载
-    assert_eq!(ctrl.disabled_ids().len(), 11);
+    assert_eq!(ctrl.disabled_ids().len(), 13);
     for svc in [
         "compaction",
         "sessionTitle",
+        SERVICE_CACHE_WARMING,
+        "subagent",
         "mcp",
         "skills",
         "agentInstructions",
@@ -262,6 +267,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         assert!(
             app.get::<CompactionRuntime>(svc).is_none()
                 && app.get::<SessionTitleRuntime>(svc).is_none()
+                && app.get::<CacheWarmingRuntime>(svc).is_none()
+                && app.get::<SubagentRuntime>(svc).is_none()
                 && app.get::<McpManager>(svc).is_none()
                 && app.get::<SkillRegistry>(svc).is_none()
                 && app.get::<AgentInstructions>(svc).is_none()
@@ -454,7 +461,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert_eq!(st_reloaded.config().model.as_deref(), Some("fast-title"));
     assert!(ctrl.set_enabled("session-title", false).await.unwrap());
 
-    // 5c. cache-warming：热卸载/再挂载保留易变配置，且禁用 compaction 不影响 cache-warming 启动就绪
+    // 5c. cache-warming：热挂载 + 热卸载/再挂载保留易变配置
+    assert!(ctrl.set_enabled("cache-warming", true).await.unwrap());
     let cw = app.cache_warming().unwrap();
     cw.set_mode(CacheWarmingMode::Streaming);
     cw.set_show_notices(true);
@@ -467,6 +475,34 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let cw_reloaded = app.cache_warming().unwrap();
     assert_eq!(cw_reloaded.config().mode, CacheWarmingMode::Streaming);
     assert!(cw_reloaded.config().show_cache_miss_notices);
+    assert!(ctrl.set_enabled("cache-warming", false).await.unwrap());
+
+    // 5d. subagent：热挂载 + 工具注册 + 易变配置热更新 + 热卸载 + 再热挂载保留最新配置
+    assert!(ctrl.set_enabled("subagent", true).await.unwrap());
+    assert!(
+        tools
+            .list_all()
+            .into_iter()
+            .any(|t| t.name == SUBAGENT_TOOL_NAME)
+    );
+    let sub = app.subagent().unwrap();
+    sub.update_config(|c| {
+        c.default_max_steps = 8;
+        c.timeout_secs = 45;
+    });
+    assert!(ctrl.set_enabled("subagent", false).await.unwrap());
+    assert!(app.get::<SubagentRuntime>("subagent").is_none());
+    assert!(
+        !tools
+            .list_all()
+            .into_iter()
+            .any(|t| t.name == SUBAGENT_TOOL_NAME)
+    );
+    assert!(ctrl.set_enabled("subagent", true).await.unwrap());
+    let sub_reloaded = app.subagent().unwrap();
+    assert_eq!(sub_reloaded.config().default_max_steps, 8);
+    assert_eq!(sub_reloaded.config().timeout_secs, 45);
+    assert!(ctrl.set_enabled("subagent", false).await.unwrap());
 
     // 6. trajectory & repeat-guard：waterfall 钩子与服务卸载及恢复
     assert!(ctrl.set_enabled("trajectory", true).await.unwrap());

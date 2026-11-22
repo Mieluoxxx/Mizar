@@ -13,6 +13,7 @@ mod session_persistence_e2e;
     feature = "compaction",
     feature = "session-title",
     feature = "cache-warming",
+    feature = "subagent",
     feature = "trajectory"
 ))]
 mod spine_plugins;
