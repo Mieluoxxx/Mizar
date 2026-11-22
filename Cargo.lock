@@ -1601,6 +1601,7 @@ dependencies = [
  "mizar-session",
  "mizar-session-title",
  "mizar-skills",
+ "mizar-subagent",
  "mizar-tools",
  "mizar-tools-coding",
  "mizar-trajectory",

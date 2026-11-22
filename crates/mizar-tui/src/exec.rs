@@ -459,6 +459,11 @@ pub(crate) fn effective_exec_cache_warming_mode(
     }
 }
 
+/// 一次性无头 `exec` 模式下关闭 `subagent`（并行加速与上下文减负统一交由 `codemode` 承担）。
+pub(crate) fn disable_exec_subagent(spine_cfg: &mut AgentSpineConfig) {
+    spine_cfg.subagent = None;
+}
+
 /// 运行无头一次性任务，返回进程应使用的退出码。
 pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     if cfg.approve {
@@ -559,6 +564,8 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     if let Some(ref mut cw) = spine_cfg.cache_warming {
         cw.mode = effective_exec_cache_warming_mode(cw.mode);
     }
+    // 一次性无头 exec 由 codemode 承担确定性并行与上下文减负，关闭异步交互分身插件
+    disable_exec_subagent(&mut spine_cfg);
     if !spine_cfg
         .disabled_plugins
         .iter()
@@ -695,6 +702,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                         .list_headers(&SessionListQuery {
                             cwd: Some(ws_str),
                             limit: Some(1),
+                            exclude_subagents: true,
                         })
                         .ok()
                         .and_then(|mut list| list.drain(..).next())
@@ -1109,5 +1117,13 @@ mod tests {
             effective_exec_cache_warming_mode(CacheWarmingMode::Off),
             CacheWarmingMode::Off
         );
+    }
+
+    #[test]
+    fn exec_mode_disables_subagent_in_favor_of_codemode() {
+        let mut spine = AgentSpineConfig::coding(PathBuf::from("/tmp"));
+        assert!(spine.subagent.is_some());
+        disable_exec_subagent(&mut spine);
+        assert!(spine.subagent.is_none());
     }
 }

@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use mizar_session::{
     EntryVisibility, LoadedSession, PersistenceError, PersistenceResult, SESSION_FORMAT_VERSION,
-    SessionEntry, SessionEvent, SessionHeader, SessionListQuery, TitleSource,
+    SessionEntry, SessionEvent, SessionHeader, SessionListQuery, SessionOrigin, TitleSource,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params_from_iter};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const BUSY_RETRY_BUDGET: Duration = Duration::from_millis(5000);
 
 fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
@@ -129,6 +129,7 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
                  title_source TEXT,
                  parent_id TEXT,
                  fork_seq INTEGER,
+                 origin TEXT,
                  created_at_ms INTEGER NOT NULL,
                  updated_at_ms INTEGER NOT NULL,
                  event_count INTEGER NOT NULL DEFAULT 0,
@@ -173,6 +174,10 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
             conn.execute("ALTER TABLE sessions ADD COLUMN title_source TEXT;", [])
                 .map_err(map_sqlite_err)?;
         }
+        if locked_version < 3 && !has_column(conn, "sessions", "origin")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN origin TEXT;", [])
+                .map_err(map_sqlite_err)?;
+        }
 
         if locked_version > 0 && locked_version < 2 {
             let session_ids: Vec<String> = {
@@ -187,7 +192,19 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
                 crate::recall::index_session_events_in_tx(conn, sid)?;
             }
         }
-        conn.execute_batch("PRAGMA user_version = 2;")
+        if locked_version > 0 && locked_version < 3 {
+            conn.execute(
+                "UPDATE sessions
+                 SET origin = CASE
+                     WHEN parent_id IS NOT NULL AND fork_seq IS NULL THEN 'subagent'
+                     ELSE 'user'
+                 END
+                 WHERE origin IS NULL;",
+                [],
+            )
+            .map_err(map_sqlite_err)?;
+        }
+        conn.execute_batch("PRAGMA user_version = 3;")
             .map_err(map_sqlite_err)?;
         Ok(())
     })();
@@ -232,6 +249,7 @@ fn row_to_header(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHeader> {
     let surface_count: i64 = row.get(9)?;
     let compacted_up_to_seq: Option<i64> = row.get(10)?;
     let title_source_raw: Option<String> = row.get(11)?;
+    let origin_raw: Option<String> = row.get(12)?;
 
     Ok(SessionHeader {
         id: row.get(0)?,
@@ -241,6 +259,7 @@ fn row_to_header(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHeader> {
         title_source: title_source_raw.as_deref().and_then(TitleSource::parse),
         parent_id: row.get(4)?,
         fork_seq: fork_seq.and_then(|v| u64::try_from(v).ok()),
+        origin: origin_raw.as_deref().and_then(SessionOrigin::parse),
         created_at_ms: i64_to_millis(created_at_ms),
         updated_at_ms: i64_to_millis(updated_at_ms),
         event_count: u64::try_from(event_count.max(0)).unwrap_or(0),
@@ -257,7 +276,7 @@ pub fn load_session_from_conn(
         .query_row(
             "SELECT id, format_version, cwd, title, parent_id, fork_seq,
                     created_at_ms, updated_at_ms, event_count, surface_count,
-                    compacted_up_to_seq, title_source
+                    compacted_up_to_seq, title_source, origin
              FROM sessions
              WHERE id = ?1",
             [session_id],
@@ -327,14 +346,24 @@ pub fn list_sessions_from_conn(
     let mut sql = String::from(
         "SELECT id, format_version, cwd, title, parent_id, fork_seq,
                 created_at_ms, updated_at_ms, event_count, surface_count,
-                compacted_up_to_seq, title_source
+                compacted_up_to_seq, title_source, origin
          FROM sessions",
     );
+    let mut clauses: Vec<&'static str> = Vec::new();
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
 
     if let Some(cwd) = &query.cwd {
-        sql.push_str(" WHERE cwd = ?1");
+        clauses.push("cwd = ?1");
         params.push(rusqlite::types::Value::Text(cwd.clone()));
+    }
+    if query.exclude_subagents {
+        clauses.push(
+            "(origin = 'user' OR (origin IS NULL AND (parent_id IS NULL OR fork_seq IS NOT NULL)))",
+        );
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
     }
 
     sql.push_str(" ORDER BY updated_at_ms DESC, id ASC");

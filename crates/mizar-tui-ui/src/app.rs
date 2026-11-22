@@ -239,6 +239,8 @@ pub struct AppState {
     pub last_program_status: Option<(ProgramStatusState, Option<String>)>,
     /// 最近一条连续 Prompt Cache 保活通知的 `(item_idx, fold_count)`，用于折叠防刷屏。
     last_cache_warming_notice: Option<(usize, usize)>,
+    /// 当前活跃会话正在后台运行的 Subagent 数量。
+    pub running_subagents: usize,
 }
 
 impl AppState {
@@ -325,6 +327,7 @@ impl AppState {
             last_step_outcome: None,
             last_program_status: None,
             last_cache_warming_notice: None,
+            running_subagents: 0,
         }
     }
 
@@ -890,6 +893,7 @@ impl AppState {
         self.last_step_outcome = None;
         self.last_program_status = None;
         self.last_cache_warming_notice = None;
+        self.running_subagents = 0;
         self.refresh_context_breakdown();
         self.push_notice(
             NoticeLevel::Info,
@@ -1159,6 +1163,15 @@ impl AppState {
 }
 
 fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
+    if source.starts_with("subagent:") || source.starts_with("subagent-watchdog:") {
+        let first_line = text
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("已返回结果");
+        return format!("[{source}] {}", truncate_display(first_line, 100));
+    }
     if source == "skill-catalog" {
         return "[skill-catalog] 已加载可用技能目录".to_string();
     }
@@ -2844,5 +2857,44 @@ mod tests {
             &app.items[2],
             ChatItem::Notice { text, .. } if text == "已保活 Prompt Cache #4"
         ));
+    }
+
+    #[test]
+    fn subagent_state_updates_count_posts_notice_resets_and_summarizes_replay() {
+        let mut app = AppState::new(
+            PathBuf::from("/tmp"),
+            "sess-sub-ui",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::SubagentState {
+            running_count: 2,
+            notice: Some("后台子代理 scout 已启动 (read_only)".into()),
+        });
+        assert_eq!(app.running_subagents, 2);
+        assert!(matches!(
+            app.items.last(),
+            Some(ChatItem::Notice { level: NoticeLevel::Info, text })
+                if text == "后台子代理 scout 已启动 (read_only)"
+        ));
+
+        app.reset_for_new_session("sess-sub-ui-2", None);
+        assert_eq!(app.running_subagents, 0);
+
+        let replayed = summarize_context_notice_for_replay(
+            "subagent:scout",
+            "Subagent \"scout\" completed (mode=read_only, steps=3, elapsed=2s):\n\nvery long body line",
+        );
+        assert!(replayed.starts_with("[subagent:scout] Subagent \"scout\" completed"));
+        assert!(!replayed.contains("very long body line"));
+
+        let wd_replayed = summarize_context_notice_for_replay(
+            "subagent-watchdog:scout",
+            "Subagent watchdog notice (1/2): scout idle 46s\n\ndetail instructions",
+        );
+        assert!(wd_replayed.starts_with("[subagent-watchdog:scout] Subagent watchdog notice"));
+        assert!(!wd_replayed.contains("detail instructions"));
     }
 }

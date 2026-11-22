@@ -669,6 +669,7 @@ impl TrajectoryRuntime {
             && let Ok(headers) = backend.list_sessions(&SessionListQuery {
                 cwd: None,
                 limit: Some(50),
+                ..Default::default()
             })
         {
             for h in headers {

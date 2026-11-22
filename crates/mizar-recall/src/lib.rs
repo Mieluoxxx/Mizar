@@ -212,6 +212,7 @@ fn fallback_in_memory_search(
     } else if let Ok(headers) = store.list_headers(&SessionListQuery {
         cwd: query.cwd.clone(),
         limit: Some(50),
+        ..Default::default()
     }) {
         headers
             .iter()
@@ -368,6 +369,7 @@ fn build_recall_search_tool(store: Arc<SessionStore>, default_limit: usize) -> T
                 && let Ok(headers) = store.list_headers(&SessionListQuery {
                     cwd: cwd.clone(),
                     limit: Some(50),
+                    ..Default::default()
                 })
             {
                 let mut ids = HashSet::new();

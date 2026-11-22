@@ -80,6 +80,47 @@ impl TurnInput {
         }
     }
 
+    pub fn append_batch(&mut self, next: TurnInput, batch_source: &str) {
+        let next_source = match &next {
+            Self::Notice { source, .. } => Some(source.clone()),
+            Self::User { .. } => None,
+        };
+        let (next_text, mut next_images) = match next {
+            Self::User { text, images } | Self::Notice { text, images, .. } => (text, images),
+        };
+        match self {
+            Self::User { text, images } => {
+                if !next_text.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n\n---\n\n");
+                    }
+                    text.push_str(&next_text);
+                }
+                images.append(&mut next_images);
+            }
+            Self::Notice {
+                source,
+                text,
+                images,
+            } => {
+                if let Some(ns) = next_source {
+                    if source.as_str() != ns.as_str() && !batch_source.is_empty() {
+                        *source = batch_source.to_string();
+                    }
+                } else if !batch_source.is_empty() {
+                    *source = batch_source.to_string();
+                }
+                if !next_text.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n\n---\n\n");
+                    }
+                    text.push_str(&next_text);
+                }
+                images.append(&mut next_images);
+            }
+        }
+    }
+
     pub fn into_session_event(self) -> SessionEvent {
         match self {
             Self::User { text, images } => SessionEvent::user_with_images(text, images),
@@ -168,6 +209,42 @@ struct InboxState {
     next_id: u64,
     active_sessions: HashSet<String>,
     mailboxes: HashMap<String, SessionMailbox>,
+}
+
+fn resolve_push_delivery(
+    mailbox: &mut SessionMailbox,
+    is_active: bool,
+    mode: DeliveryMode,
+    is_human: bool,
+    coalesce_key: Option<&str>,
+) -> (DeliveryMode, bool) {
+    let existing_followup_match = coalesce_key.is_some_and(|key| {
+        mailbox.items.iter().any(|item| {
+            item.mode == DeliveryMode::FollowUp && item.coalesce_key.as_deref() == Some(key)
+        })
+    });
+
+    if is_human {
+        mailbox.auto_wakes_since_human = 0;
+    }
+
+    match mode {
+        DeliveryMode::Inject => (DeliveryMode::Inject, false),
+        DeliveryMode::Steer if is_active => (DeliveryMode::Steer, false),
+        DeliveryMode::Steer | DeliveryMode::FollowUp => {
+            if is_human || existing_followup_match {
+                (DeliveryMode::FollowUp, false)
+            } else {
+                let next_wakes = mailbox.auto_wakes_since_human.saturating_add(1);
+                if next_wakes > mailbox.auto_wake_limit {
+                    (DeliveryMode::Inject, true)
+                } else {
+                    mailbox.auto_wakes_since_human = next_wakes;
+                    (DeliveryMode::FollowUp, false)
+                }
+            }
+        }
+    }
 }
 
 /// 按 `session_id` 隔离的纯内存 Actor 收件箱。
@@ -274,45 +351,40 @@ impl SessionInbox {
         input: TurnInput,
         coalesce_key: Option<String>,
     ) -> InboxPushResult {
+        self.push_internal(session_id, mode, input, coalesce_key, None)
+    }
+
+    /// 批次追加投递：同 `(effective_mode, batch_key)` 条目存在时无论为 `FollowUp`、`Inject` 还是 `Steer`，
+    /// 一律按分隔符拼接正文并切换为 `batch_source`，绝不覆写丢回执。
+    pub fn push_appending(
+        &self,
+        session_id: &str,
+        mode: DeliveryMode,
+        input: TurnInput,
+        batch_key: impl Into<String>,
+        batch_source: impl Into<String>,
+    ) -> InboxPushResult {
+        let key = batch_key.into();
+        let src = batch_source.into();
+        self.push_internal(session_id, mode, input, Some(key), Some(src))
+    }
+
+    fn push_internal(
+        &self,
+        session_id: &str,
+        mode: DeliveryMode,
+        input: TurnInput,
+        coalesce_key: Option<String>,
+        append_batch_source: Option<String>,
+    ) -> InboxPushResult {
         let result = {
             let mut state = self.state.lock().unwrap();
             let is_active = state.active_sessions.contains(session_id);
             let is_human = input.is_user();
 
-            // 预判断同 key 可否原地覆写，避免高频刷屏重复消耗自动唤醒预算。
-            let existing_followup_match = if let Some(ref key) = coalesce_key {
-                state.mailboxes.get(session_id).is_some_and(|mb| {
-                    mb.items.iter().any(|item| {
-                        item.mode == DeliveryMode::FollowUp
-                            && item.coalesce_key.as_deref() == Some(key.as_str())
-                    })
-                })
-            } else {
-                false
-            };
-
             let mailbox = state.mailboxes.entry(session_id.to_string()).or_default();
-            if is_human {
-                mailbox.auto_wakes_since_human = 0;
-            }
-
-            let (effective_mode, degraded) = match mode {
-                DeliveryMode::Inject => (DeliveryMode::Inject, false),
-                DeliveryMode::Steer if is_active => (DeliveryMode::Steer, false),
-                DeliveryMode::Steer | DeliveryMode::FollowUp => {
-                    if is_human || existing_followup_match {
-                        (DeliveryMode::FollowUp, false)
-                    } else {
-                        let next_wakes = mailbox.auto_wakes_since_human.saturating_add(1);
-                        if next_wakes > mailbox.auto_wake_limit {
-                            (DeliveryMode::Inject, true)
-                        } else {
-                            mailbox.auto_wakes_since_human = next_wakes;
-                            (DeliveryMode::FollowUp, false)
-                        }
-                    }
-                }
-            };
+            let (effective_mode, degraded) =
+                resolve_push_delivery(mailbox, is_active, mode, is_human, coalesce_key.as_deref());
 
             if let Some(ref key) = coalesce_key
                 && let Some(existing) = mailbox.items.iter_mut().find(|item| {
@@ -320,7 +392,11 @@ impl SessionInbox {
                         && item.coalesce_key.as_deref() == Some(key.as_str())
                 })
             {
-                existing.input = input;
+                if let Some(ref batch_source) = append_batch_source {
+                    existing.input.append_batch(input, batch_source);
+                } else {
+                    existing.input = input;
+                }
                 InboxPushResult {
                     id: existing.id,
                     effective_mode,
@@ -432,6 +508,25 @@ impl SessionInbox {
         }
     }
 
+    /// 清除所有未投递的用户输入条目，并将已到箱的非人类 `FollowUp`/`Steer` 通知转为 `Inject` 保留正文，
+    /// 供交互 `Esc` 取消时立刻安静停住而不误删后台子代理已落箱成果。
+    pub fn clear_user_items_and_defer_notices(&self, session_id: &str) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
+            return 0;
+        };
+        let before = mailbox.items.len();
+        mailbox.items.retain(|item| !item.input.is_user());
+        let mut affected = before.saturating_sub(mailbox.items.len());
+        for item in &mut mailbox.items {
+            if matches!(item.mode, DeliveryMode::FollowUp | DeliveryMode::Steer) {
+                item.mode = DeliveryMode::Inject;
+                affected += 1;
+            }
+        }
+        affected
+    }
+
     pub fn set_auto_wake_limit(&self, session_id: &str, limit: usize) {
         let mut state = self.state.lock().unwrap();
         let mailbox = state.mailboxes.entry(session_id.to_string()).or_default();
@@ -452,6 +547,25 @@ impl SessionInbox {
             .mailboxes
             .get(session_id)
             .map_or(0, |mb| mb.auto_wakes_since_human)
+    }
+
+    pub fn remaining_auto_wakes(&self, session_id: &str) -> usize {
+        let state = self.state.lock().unwrap();
+        state
+            .mailboxes
+            .get(session_id)
+            .map_or(DEFAULT_AUTO_WAKE_LIMIT, |mb| {
+                mb.auto_wake_limit.saturating_sub(mb.auto_wakes_since_human)
+            })
+    }
+
+    pub fn has_pending_followup_key(&self, session_id: &str, key: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        state.mailboxes.get(session_id).is_some_and(|mb| {
+            mb.items.iter().any(|item| {
+                item.mode == DeliveryMode::FollowUp && item.coalesce_key.as_deref() == Some(key)
+            })
+        })
     }
 }
 
@@ -572,5 +686,92 @@ mod tests {
         assert!(!inbox.has_pending_steer("s1"));
         assert_eq!(rx.try_recv().unwrap(), "s1");
         assert_eq!(inbox.pop_followup("s1").unwrap().text(), "step 2");
+    }
+
+    #[test]
+    fn push_appending_batches_followups_and_preserves_degraded_injects() {
+        let inbox = SessionInbox::new();
+        inbox.set_auto_wake_limit("s1", 2);
+        assert_eq!(inbox.remaining_auto_wakes("s1"), 2);
+
+        // 1. 同一波次 6 条并发通知合并入同一 FollowUp，只消耗 1 格预算且不降级
+        for i in 1..=6 {
+            let res = inbox.push_appending(
+                "s1",
+                DeliveryMode::FollowUp,
+                TurnInput::notice(format!("subagent:w{i}"), format!("done {i}")),
+                "subagent:settled",
+                "subagent:batch",
+            );
+            assert_eq!(res.effective_mode, DeliveryMode::FollowUp);
+            assert!(!res.degraded);
+        }
+        assert_eq!(inbox.auto_wakes_since_human("s1"), 1);
+        assert_eq!(inbox.remaining_auto_wakes("s1"), 1);
+        assert!(inbox.has_pending_followup_key("s1", "subagent:settled"));
+
+        let merged = inbox.pop_followup("s1").unwrap();
+        match merged {
+            TurnInput::Notice { source, text, .. } => {
+                assert_eq!(source, "subagent:batch");
+                for i in 1..=6 {
+                    assert!(
+                        text.contains(&format!("done {i}")),
+                        "missing done {i}: {text}"
+                    );
+                }
+            }
+            other => panic!("expected notice, got {other:?}"),
+        }
+        assert!(!inbox.has_pending_followup_key("s1", "subagent:settled"));
+
+        // 2. 限额为 0 时多条通知均降级为 Inject，但仍然拼接保留全部正文绝不覆写
+        inbox.set_auto_wake_limit("s2", 0);
+        let d1 = inbox.push_appending(
+            "s2",
+            DeliveryMode::FollowUp,
+            TurnInput::notice("subagent:a", "alpha result"),
+            "subagent:settled",
+            "subagent:batch",
+        );
+        let d2 = inbox.push_appending(
+            "s2",
+            DeliveryMode::FollowUp,
+            TurnInput::notice("subagent:b", "beta result"),
+            "subagent:settled",
+            "subagent:batch",
+        );
+        assert_eq!(d1.effective_mode, DeliveryMode::Inject);
+        assert!(d1.degraded);
+        assert_eq!(d2.effective_mode, DeliveryMode::Inject);
+        assert!(d2.degraded);
+
+        let drained = inbox.drain_step_inputs("s2");
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].text().contains("alpha result"));
+        assert!(drained[0].text().contains("beta result"));
+    }
+
+    #[test]
+    fn clear_user_items_and_defer_notices_drops_user_and_keeps_notice_text() {
+        let inbox = SessionInbox::new();
+        inbox.set_auto_wake_limit("s1", 5);
+        inbox.push("s1", DeliveryMode::FollowUp, TurnInput::user("user queued"));
+        inbox.push_appending(
+            "s1",
+            DeliveryMode::FollowUp,
+            TurnInput::notice("subagent:w1", "important summary"),
+            "subagent:settled",
+            "subagent:batch",
+        );
+
+        let affected = inbox.clear_user_items_and_defer_notices("s1");
+        assert_eq!(affected, 2);
+        assert!(inbox.pop_followup("s1").is_none());
+
+        let snap = inbox.snapshot("s1");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].mode, DeliveryMode::Inject);
+        assert_eq!(snap[0].input.text(), "important summary");
     }
 }

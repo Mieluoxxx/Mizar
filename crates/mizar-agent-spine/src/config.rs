@@ -298,6 +298,30 @@ impl LoadedMizarConfig {
             }
         }
 
+        #[cfg(feature = "subagent")]
+        if let Some(sub) = &self.settings.subagent
+            && let Some(dst) = spine.subagent.as_mut()
+        {
+            if let Some(v) = sub.max_steps {
+                dst.default_max_steps = v;
+            }
+            if let Some(v) = sub.max_steps_cap {
+                dst.max_steps_cap = v;
+            }
+            if let Some(v) = sub.timeout_secs {
+                dst.timeout_secs = v;
+            }
+            if let Some(v) = sub.max_concurrent {
+                dst.max_concurrent_per_parent = v;
+            }
+            if let Some(v) = sub.stall_timeout_secs {
+                dst.stall_timeout_secs = v;
+            }
+            if let Some(v) = sub.max_watchdog_alerts {
+                dst.max_watchdog_alerts = v;
+            }
+        }
+
         #[cfg(feature = "coding")]
         if let AgentToolsMode::Coding {
             coding,

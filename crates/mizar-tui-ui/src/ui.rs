@@ -380,6 +380,26 @@ mod tests {
             !busy.contains("✗ 请求失败"),
             "busy should clear prior error:\n{busy}"
         );
+
+        app.apply_ui_event(UiEvent::SubagentState {
+            running_count: 2,
+            notice: Some("后台子代理 agent-2 已启动".into()),
+        });
+        let with_sub = render_buffer_text(&mut app, 120, 20);
+        assert!(
+            with_sub.contains("[subagent:2]"),
+            "status bar should show running subagent count:\n{with_sub}"
+        );
+
+        app.apply_ui_event(UiEvent::SubagentState {
+            running_count: 0,
+            notice: None,
+        });
+        let without_sub = render_buffer_text(&mut app, 120, 20);
+        assert!(
+            !without_sub.contains("[subagent:"),
+            "status bar should hide subagent badge once settled:\n{without_sub}"
+        );
     }
 
     #[test]

@@ -49,9 +49,11 @@ pub use mizar_session_title::{
 };
 #[cfg(feature = "subagent")]
 pub use mizar_subagent::{
-    DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_MAX_STEPS_CAP, DEFAULT_SUBAGENT_TIMEOUT_SECS,
-    SERVICE_SUBAGENT, SUBAGENT_TOOL_NAME, SubagentConfig, SubagentContextExt, SubagentError,
-    SubagentMode, SubagentPlugin, SubagentRuntime,
+    DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_MAX_STEPS_CAP,
+    DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS, DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS,
+    DEFAULT_SUBAGENT_TIMEOUT_SECS, EVENT_SUBAGENT_STATE, SERVICE_SUBAGENT, SUBAGENT_TOOL_NAME,
+    SubagentConfig, SubagentContextExt, SubagentError, SubagentMode, SubagentPlugin,
+    SubagentRunStatus, SubagentRuntime, SubagentStateEvent, SubagentTaskSnapshot,
 };
 pub use plugins::{
     EVENT_SPINE_PLUGINS_CHANGE, KNOWN_HOST_EXTENSION_IDS, SERVICE_SPINE_PLUGINS, SpineModuleStatus,

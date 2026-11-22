@@ -117,6 +117,7 @@ pub fn latest_workspace_selection(
         .list_headers(&SessionListQuery {
             cwd: Some(workspace.display().to_string()),
             limit: Some(1),
+            exclude_subagents: true,
         })
         .ok()?
         .into_iter()
@@ -1054,6 +1055,7 @@ pub fn collect_session_picker_items(sessions: &SessionStore) -> Vec<SessionPicke
         .list_headers(&SessionListQuery {
             cwd: None,
             limit: Some(100),
+            exclude_subagents: true,
         })
         .unwrap_or_default()
         .into_iter()
@@ -1485,6 +1487,43 @@ mod tests {
         assert_eq!(view.cache_miss_audit.cache_rebilled_tokens, 80_000);
         assert_eq!(view.cache_miss_audit.miss_events, 1);
         assert_eq!(view.cache_miss_audit.warm_events, 1);
+
+        ctx.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn latest_workspace_selection_skips_newer_subagent_child_session() {
+        use cordis::Service;
+        use mizar_session::{SessionContextExt, SessionCreateOptions};
+
+        let ctx = Context::new();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let store = ctx.sessions().unwrap();
+        let ws = PathBuf::from("/tmp/mizar-ws-sel");
+
+        let parent = store.create_with(SessionCreateOptions {
+            id: Some("parent-main".into()),
+            cwd: Some(ws.display().to_string()),
+            ..Default::default()
+        });
+        parent.record_selection(
+            Some("anthropic".to_string()),
+            Some("claude-sonnet".to_string()),
+            None,
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let child = store.create_with(SessionCreateOptions {
+            id: Some("child-sub".into()),
+            cwd: Some(ws.display().to_string()),
+            parent_id: Some("parent-main".into()),
+            ..Default::default()
+        });
+        child.append(SessionEvent::user("child task"));
+
+        let sel = latest_workspace_selection(&store, &ws).expect("should find parent selection");
+        assert_eq!(sel.provider.as_deref(), Some("anthropic"));
+        assert_eq!(sel.model.as_deref(), Some("claude-sonnet"));
 
         ctx.fiber().dispose().await;
     }

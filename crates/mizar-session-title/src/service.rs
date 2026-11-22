@@ -160,8 +160,8 @@ impl SessionTitleRuntime {
         if header.title_source == Some(TitleSource::Manual) {
             return;
         }
-        // 子代理派生子会话（非 Fork）绝不触发后台自动标题请求，即使未传入显式标题
-        if header.parent_id.is_some() && header.fork_seq.is_none() {
+        // 子代理派生子会话绝不触发后台自动标题请求，即使未传入显式标题
+        if header.is_subagent_child() {
             return;
         }
 

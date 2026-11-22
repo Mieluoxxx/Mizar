@@ -24,6 +24,7 @@ mizar-mcp = { workspace = true }
 mizar-session = { workspace = true }
 mizar-session-title = { workspace = true }
 mizar-skills = { workspace = true }
+mizar-subagent = { workspace = true }
 mizar-tools = { workspace = true }
 mizar-tools-coding = { workspace = true }
 mizar-trajectory = { workspace = true }

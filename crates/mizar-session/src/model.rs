@@ -416,6 +416,30 @@ pub enum TitleSourcePatch {
     Clear,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    User,
+    Subagent,
+}
+
+impl SessionOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "user" => Some(Self::User),
+            "subagent" => Some(Self::Subagent),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
@@ -432,6 +456,8 @@ pub struct SessionHeader {
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SessionOrigin>,
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
     #[serde(default)]
@@ -452,11 +478,21 @@ impl SessionHeader {
             title_source: None,
             parent_id: None,
             fork_seq: None,
+            origin: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             event_count: 0,
             surface_count: 0,
             compacted_up_to_seq: None,
+        }
+    }
+
+    /// 判断当前会话是否属于子代理派生会话；优先依据显式 `origin`，缺失时回退兼容旧记录推断。
+    pub fn is_subagent_child(&self) -> bool {
+        match self.origin {
+            Some(SessionOrigin::Subagent) => true,
+            Some(SessionOrigin::User) => false,
+            None => self.parent_id.is_some() && self.fork_seq.is_none(),
         }
     }
 }
@@ -468,6 +504,7 @@ pub struct SessionCreateOptions {
     pub title: Option<String>,
     pub parent_id: Option<String>,
     pub fork_seq: Option<u64>,
+    pub origin: Option<SessionOrigin>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -482,6 +519,8 @@ pub struct SessionHeaderPatch {
 pub struct SessionListQuery {
     pub cwd: Option<String>,
     pub limit: Option<usize>,
+    /// 排除子代理派生会话（按 `SessionHeader::is_subagent_child` 判定），保留根会话与用户 Fork 分支。
+    pub exclude_subagents: bool,
 }
 
 /// 面向情景回溯（`recall`）的持久化层检索参数。

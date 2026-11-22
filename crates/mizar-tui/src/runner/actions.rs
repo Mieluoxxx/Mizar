@@ -8,7 +8,8 @@ use cordis::Context;
 use crossterm::event::EventStream;
 use mizar_agent_loop::{AgentLoopContextExt, DeliveryMode, RunOptions, TurnInput};
 use mizar_agent_spine::{
-    CompactionContextExt, CompactionError, ManualCompactOptions, resolve_global_settings_path,
+    CompactionContextExt, CompactionError, ManualCompactOptions, SubagentContextExt,
+    resolve_global_settings_path,
 };
 use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController, steer_session};
 use mizar_client::images;
@@ -249,7 +250,9 @@ pub(super) fn drain_next_inbox_followup(
             app.push_user_message(text);
         }
         TurnInput::Notice { source, text, .. } => {
-            app.push_notice(NoticeLevel::Info, format!("[{source}] {text}"));
+            if !(source.starts_with("subagent:") || source.starts_with("subagent-watchdog:")) {
+                app.push_notice(NoticeLevel::Info, format!("[{source}] {text}"));
+            }
         }
     }
     spawn_agent_run_input(
@@ -264,7 +267,7 @@ pub(super) fn drain_next_inbox_followup(
     true
 }
 
-/// 执行硬取消：关闭审批浮层、触发 `CancellationToken` 并清空会话未投递收件箱。
+/// 执行硬取消：关闭审批浮层、触发 `CancellationToken` 并清理用户输入项（已落箱后台回执转 `Inject` 保留）。
 pub(super) fn cancel_active_run(
     ctx: &Context,
     app: &mut AppState,
@@ -274,7 +277,9 @@ pub(super) fn cancel_active_run(
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     task_state.cancel_active();
     if let Ok(agent_loop) = ctx.agent_loop() {
-        agent_loop.inbox().clear(&active_session.id);
+        agent_loop
+            .inbox()
+            .clear_user_items_and_defer_notices(&active_session.id);
     }
 }
 
@@ -536,6 +541,9 @@ pub async fn resume_session_into_app(
         return false;
     };
     app.pending_settings_model_pick = None;
+    if let Ok(agent_loop) = ctx.agent_loop() {
+        agent_loop.inbox().clear(&next.id);
+    }
     *active_sid.write().unwrap() = next.id.clone();
 
     let sources = SelectionSources {
@@ -659,6 +667,12 @@ pub(super) async fn handle_action(
         AppAction::NewSession => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
+            if let Ok(sub) = ctx.subagent() {
+                sub.cancel_parent_subagents(&active_session.id);
+            }
+            if let Ok(agent_loop) = ctx.agent_loop() {
+                agent_loop.inbox().clear(&active_session.id);
+            }
             if app.is_running_activity() {
                 app.set_idle_state();
             }
@@ -688,6 +702,12 @@ pub(super) async fn handle_action(
         AppAction::ResumeSession(target_id) => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
+            if let Ok(sub) = ctx.subagent() {
+                sub.cancel_parent_subagents(&active_session.id);
+            }
+            if let Ok(agent_loop) = ctx.agent_loop() {
+                agent_loop.inbox().clear(&active_session.id);
+            }
             if app.is_running_activity() {
                 app.set_idle_state();
             }
@@ -1160,6 +1180,12 @@ pub(super) async fn handle_action(
         AppAction::ForkSessionAtSeq(target_seq) => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
+            if let Ok(sub) = ctx.subagent() {
+                sub.cancel_parent_subagents(&active_session.id);
+            }
+            if let Ok(agent_loop) = ctx.agent_loop() {
+                agent_loop.inbox().clear(&active_session.id);
+            }
             if app.is_running_activity() {
                 app.set_idle_state();
             }

@@ -24,6 +24,7 @@ use mizar_client_core::{
 };
 use mizar_llm::LlmRuntime;
 use mizar_session::{EVENT_SESSION_TITLE_UPDATED, SessionStore, SessionTitleUpdatedPayload};
+use mizar_subagent::{EVENT_SUBAGENT_STATE, SubagentStateEvent};
 use mizar_trajectory::{EVENT_TRAJECTORY_ANOMALY, TrajectoryAnomalyEvent};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -461,8 +462,8 @@ where
         )?);
     }
     {
-        let send = send;
-        let check = is_current;
+        let send = send.clone();
+        let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_CACHE_WARMING_NOTICE,
             move |ev: &CacheWarmingNoticeEvent| {
@@ -473,6 +474,20 @@ where
                 }
             },
         )?);
+    }
+    {
+        let send = send;
+        let check = is_current;
+        handles.push(
+            ctx.on(EVENT_SUBAGENT_STATE, move |ev: &SubagentStateEvent| {
+                if check(&ev.parent_session_id) {
+                    send(ClientEvent::SubagentState {
+                        running_count: ev.running_count,
+                        notice: ev.notice.clone(),
+                    });
+                }
+            })?,
+        );
     }
 
     Ok(handles)

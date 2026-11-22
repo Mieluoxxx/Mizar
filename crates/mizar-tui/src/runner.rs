@@ -9,7 +9,7 @@ use cordis::{
 };
 use crossterm::event::EventStream;
 use mizar_agent_loop::AgentLoopContextExt;
-use mizar_agent_spine::SpinePluginsContextExt;
+use mizar_agent_spine::{SpinePluginsContextExt, SubagentContextExt};
 use mizar_client::approval::{ApprovalSnapshot, register_approval_hook_with};
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client::workspace::collect_user_skill_names;
@@ -467,6 +467,7 @@ pub async fn run_tui_with_summary(
                 .list_headers(&SessionListQuery {
                     cwd: Some(ws_str),
                     limit: Some(1),
+                    exclude_subagents: true,
                 })
                 .ok()
                 .and_then(|mut list| list.drain(..).next())
@@ -837,6 +838,7 @@ pub async fn run_tui_with_summary(
 
                 needs_redraw |= step_dirty || action != AppAction::None;
 
+                let was_cancel_run = matches!(action, AppAction::CancelRun);
                 handle_action(
                     &ctx,
                     &config,
@@ -850,6 +852,15 @@ pub async fn run_tui_with_summary(
                     action,
                 )
                 .await;
+                if was_cancel_run {
+                    if let Some(ref mut rx) = wake_rx {
+                        while let Ok(_)
+                        | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) =
+                            rx.try_recv()
+                        {}
+                    }
+                    inbox_wake_ready = false;
+                }
 
                 let can_drain_inbox_followup = !app.is_running_activity()
                     && task_state.active_task().is_none()
@@ -895,6 +906,9 @@ pub async fn run_tui_with_summary(
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     emit_program_status(ProgramStatusState::Idle, None, None);
     task_state.abort_for_session_switch();
+    if let Ok(sub) = ctx.subagent() {
+        sub.cancel_parent_subagents(&app.session_id);
+    }
     for fiber in plugin_fibers.into_iter().rev() {
         fiber.dispose().await;
     }
@@ -1977,11 +1991,23 @@ mod tests {
             DeliveryMode::FollowUp,
             TurnInput::user("queued-drop"),
         );
+        agent_loop.inbox().push_appending(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::notice("subagent:w1", "bg result kept across esc"),
+            "subagent:settled",
+            "subagent:batch",
+        );
 
         super::actions::cancel_active_run(&ctx, &mut app, &sess, &mut task_state);
         assert!(task_state.active_task().unwrap().cancel.is_cancelled());
         assert!(task_state.active_task().unwrap().user_cancelled);
-        assert!(agent_loop.inbox().snapshot(&sess.id).is_empty());
+        assert!(agent_loop.inbox().pop_followup(&sess.id).is_none());
+        let kept = agent_loop.inbox().snapshot(&sess.id);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].mode, DeliveryMode::Inject);
+        assert!(kept[0].input.text().contains("bg result kept across esc"));
+        agent_loop.inbox().clear(&sess.id);
 
         let abort_res = loop {
             match loop_rx.recv().await.unwrap() {

@@ -1,4 +1,4 @@
-//! 单层 Subagent 安全护栏、工具集裁剪与路由解析辅助模块。
+//! 单层 Subagent 安全护栏、工具集裁剪、世代号守卫与路由解析辅助模块。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -7,6 +7,7 @@ use mizar_llm::ProviderInfo;
 use mizar_session::SessionStore;
 use mizar_tools::{PreExecuteDecision, ToolExecution, ToolRuntime, ToolRuntimeInfo};
 
+use crate::tasks::ChildActivityTracker;
 use crate::{SUBAGENT_TOOL_NAME, SubagentError, SubagentMode};
 
 /// 默认判定为只读的工具白名单（兼容未显式填写 `ToolAnnotations.read_only` 的内置/legacy 工具）。
@@ -24,6 +25,9 @@ pub const READ_ONLY_TOOL_ALLOWLIST: &[&str] = &[
     "list_mcp_resource_templates",
     "read_mcp_resource",
 ];
+
+pub(crate) type ActiveChildrenMap = HashMap<String, (u64, SubagentMode)>;
+pub(crate) type ActivityTrackersMap = HashMap<String, (u64, Arc<ChildActivityTracker>)>;
 
 /// 判断指定工具在只读模式下是否允许被子代理声明与执行。
 pub fn is_read_only_tool(name: &str, info: Option<&ToolRuntimeInfo>) -> bool {
@@ -65,14 +69,14 @@ pub fn compute_allowed_tools(
 /// 在 `tools/pre-execute` 管线最外层拦截子代理越权或嵌套调用（含 `codemode` 嵌套沙箱调用）。
 pub fn check_pre_execute(
     exec: &ToolExecution,
-    active_children: &Mutex<HashMap<String, SubagentMode>>,
+    active_children: &Mutex<ActiveChildrenMap>,
     tools: &ToolRuntime,
     sessions: &SessionStore,
 ) -> PreExecuteDecision {
     let Some(sid) = exec.session_id.as_deref() else {
         return PreExecuteDecision::allow();
     };
-    let active_mode = active_children.lock().unwrap().get(sid).copied();
+    let active_mode = active_children.lock().unwrap().get(sid).map(|(_, m)| *m);
     if let Some(mode) = active_mode {
         if exec.name == SUBAGENT_TOOL_NAME {
             return PreExecuteDecision::deny("子代理严禁嵌套调用 subagent（深度严格限制为 1）");
@@ -98,10 +102,10 @@ pub fn check_pre_execute(
     PreExecuteDecision::allow()
 }
 
-/// 校验当前调用会话是否本身就是子代理会话（正在运行或历史非 Fork 子会话），用于阻止深度 > 1 嵌套。
+/// 校验当前调用会话是否本身就是子代理会话（正在运行或历史子会话），用于阻止深度 > 1 嵌套。
 pub fn ensure_not_nested_parent(
     parent_session_id: Option<&str>,
-    active_children: &Mutex<HashMap<String, SubagentMode>>,
+    active_children: &Mutex<ActiveChildrenMap>,
     sessions: &SessionStore,
 ) -> Result<(), SubagentError> {
     let Some(pid) = parent_session_id else {
@@ -114,50 +118,80 @@ pub fn ensure_not_nested_parent(
     Ok(())
 }
 
-/// 判断给定会话是否属于非 Fork 的子代理派生会话。
+/// 判断给定会话是否属于子代理派生会话。
 pub fn is_subagent_child_session(sessions: &SessionStore, session_id: &str) -> bool {
     sessions
         .inspect_readonly(session_id)
-        .is_some_and(|loaded| loaded.header.parent_id.is_some() && loaded.header.fork_seq.is_none())
+        .is_some_and(|loaded| loaded.header.is_subagent_child())
 }
 
-/// 子会话结束/取消/异常退出时无条件回收活跃记录与工具策略的 RAII 守卫。
+/// 绑定单调 `generation`（`run_id`）的子会话 RAII 守卫：仅卸载同一代次的护栏与追踪记录，防并发/乱序误删。
 pub struct ChildSessionGuard {
-    active_children: Arc<Mutex<HashMap<String, SubagentMode>>>,
+    active_children: Arc<Mutex<ActiveChildrenMap>>,
+    activity_trackers: Arc<Mutex<ActivityTrackersMap>>,
     tools: Arc<ToolRuntime>,
     child_session_id: String,
+    generation: u64,
 }
 
 impl ChildSessionGuard {
-    pub fn register(
-        active_children: Arc<Mutex<HashMap<String, SubagentMode>>>,
+    pub(crate) fn register(
+        active_children: Arc<Mutex<ActiveChildrenMap>>,
+        activity_trackers: Arc<Mutex<ActivityTrackersMap>>,
         tools: Arc<ToolRuntime>,
         child_session_id: String,
+        generation: u64,
         mode: SubagentMode,
+        tracker: Arc<ChildActivityTracker>,
     ) -> Self {
         active_children
             .lock()
             .unwrap()
-            .insert(child_session_id.clone(), mode);
+            .insert(child_session_id.clone(), (generation, mode));
+        activity_trackers
+            .lock()
+            .unwrap()
+            .insert(child_session_id.clone(), (generation, tracker));
         Self {
             active_children,
+            activity_trackers,
             tools,
             child_session_id,
+            generation,
         }
     }
 }
 
 impl Drop for ChildSessionGuard {
     fn drop(&mut self) {
-        self.active_children
-            .lock()
-            .unwrap()
-            .remove(&self.child_session_id);
-        self.tools.reset_session_activations(&self.child_session_id);
+        let removed_active = {
+            let mut guard = self.active_children.lock().unwrap();
+            if guard
+                .get(&self.child_session_id)
+                .is_some_and(|(gen_id, _)| *gen_id == self.generation)
+            {
+                guard.remove(&self.child_session_id);
+                true
+            } else {
+                false
+            }
+        };
+        {
+            let mut trackers = self.activity_trackers.lock().unwrap();
+            if trackers
+                .get(&self.child_session_id)
+                .is_some_and(|(gen_id, _)| *gen_id == self.generation)
+            {
+                trackers.remove(&self.child_session_id);
+            }
+        }
+        if removed_active {
+            self.tools.reset_session_activations(&self.child_session_id);
+        }
     }
 }
 
-/// 生成用于子会话标题的紧凑单行任务摘要（按 UTF-8 字符边界截断）。
+/// 生成用于子会话标题与快照的单行紧凑摘要（按 UTF-8 字符边界截断）。
 pub fn shorten_prompt(prompt: &str, max_chars: usize) -> String {
     let normalized: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::new();
@@ -173,6 +207,22 @@ pub fn shorten_prompt(prompt: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// 从 `AgentToolCallEvent` 生成简短可读工具标签（如 `bash: cargo test`），UTF-8 安全截断至 64 字符。
+pub(crate) fn format_tool_activity_label(name: &str, arguments: &str) -> String {
+    let hint = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| {
+            ["command", "path", "pattern", "query", "action", "name"]
+                .iter()
+                .find_map(|key| v.get(key).and_then(|val| val.as_str()).map(str::to_string))
+        });
+    let combined = match hint {
+        Some(h) if !h.trim().is_empty() => format!("{name}: {}", shorten_prompt(&h, 40)),
+        _ => name.to_string(),
+    };
+    combined.chars().take(64).collect()
 }
 
 /// 解析模型覆盖参数（支持 `"model_id"` 与 `"provider/model_id"`），未指定时回退父会话路由。

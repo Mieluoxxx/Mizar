@@ -1,53 +1,67 @@
 //! UNIX 进程式单层 `subagent` 插件（`"subagent"` 服务）：
 //!
-//! 向模型暴露窄接口工具 `subagent(prompt, mode?, model?)`，在独立 `parent_id` 子会话中
-//! 执行受控子任务并将精炼总结作为 `tool_result` 返回父会话：
-//! - 严格深度 1：子会话工具白名单显式剔除 `subagent`，并在 `tools/pre-execute` 二次兜底拦截；
-//! - 默认 `read_only` 并发安全：支持同一步内多个只读子代理并发扇出；
-//! - 取消级联与步数/超时封顶：绑定 `parent_cancel.child_token()` 与 `timeout_secs`；
-//! - 身份隔离：子会话全部 LLM 调用标注 `RequestOrigin::Subagent`，跳过预热与标题生成。
+//! 向模型暴露窄接口只读/受控后台分身工具 `subagent(action?, prompt?, mode?, model?, name?)`，在独立子会话中
+//! 执行长周期异步子任务：
+//! - **后台常驻与 `send` 唤醒/纠偏**：通过 `tokio::spawn` 异步执行子会话并立即释放主对话框；支持通过 `send`
+//!   向运行中分身插话（`Steer`）或唤醒已休眠的 SQLite 子会话继续执行；
+//! - **零 Token Rust 活性看门狗**：订阅 `agent/*` 流式与工具事件刷新活性时间戳，连续静默超时时向父 `SessionInbox`
+//!   投递告警通知（保留最后 1 格自动唤醒预算给最终结算回执），由主代理主动关照与处置；
+//! - **严格深度 1 与单调代次防越权**：`ToolExposure::ModelOnly` 禁止脚本嵌套，`tools/pre-execute(-100)` 与绑定 `run_id`
+//!   的 `ChildSessionGuard` 彻底消除嵌套调用、停止过渡重入与并发降权竞态；
+//! - **身份隔离**：子会话标记显式 `SessionOrigin::Subagent` 与 `RequestOrigin::Subagent`，跳过预热与自动标题生成。
 
 pub mod guardrails;
+pub mod tasks;
+pub mod tool;
+pub mod worker;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, EventOptions, Inject, Next, Plugin,
     Service, ServicePlugin,
 };
 use mizar_agent_loop::{
-    AgentError, AgentLoopContextExt, AgentTurnEndEvent, AgentTurnInputEvent, EVENT_AGENT_TURN_END,
-    EVENT_AGENT_TURN_INPUT, RunOptions, TurnEndReason,
+    AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStepStartEvent, AgentTextDeltaEvent,
+    AgentToolCallEvent, AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent,
+    AgentTurnInputEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STEP_START,
+    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
+    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_INPUT,
 };
-use mizar_llm::{LlmContextExt, LlmErrorCode, RequestOrigin};
-use mizar_session::{SessionContextExt, SessionCreateOptions};
-use mizar_tools::{
-    EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolAnnotations, ToolCallContext, ToolDefinition,
-    ToolExecution, ToolExecutionMode, ToolExposure, ToolOutput, ToolsContextExt,
-};
+use mizar_session::SessionContextExt;
+use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
+use mizar_tools::{EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolsContextExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use guardrails::{
-    ChildSessionGuard, check_pre_execute, compute_allowed_tools, ensure_not_nested_parent,
-    resolve_model_route, shorten_prompt,
+    ActiveChildrenMap, ActivityTrackersMap, check_pre_execute, format_tool_activity_label,
 };
+use tasks::{BackgroundTaskRegistry, ChildActivityTracker};
+pub use tasks::{
+    EVENT_SUBAGENT_STATE, SubagentRunStatus, SubagentStateEvent, SubagentTaskSnapshot,
+};
+use tool::build_subagent_tool_definition;
 
 pub const SERVICE_SUBAGENT: &str = "subagent";
 pub const SUBAGENT_TOOL_NAME: &str = "subagent";
 pub const DEFAULT_SUBAGENT_MAX_STEPS: usize = 20;
 pub const DEFAULT_SUBAGENT_MAX_STEPS_CAP: usize = 40;
 pub const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: usize = 4;
+pub const DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS: u64 = 45;
+pub const DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentConfig {
     pub default_max_steps: usize,
     pub max_steps_cap: usize,
     pub timeout_secs: u64,
+    pub max_concurrent_per_parent: usize,
+    pub stall_timeout_secs: u64,
+    pub max_watchdog_alerts: usize,
 }
 
 impl Default for SubagentConfig {
@@ -56,15 +70,28 @@ impl Default for SubagentConfig {
             default_max_steps: DEFAULT_SUBAGENT_MAX_STEPS,
             max_steps_cap: DEFAULT_SUBAGENT_MAX_STEPS_CAP,
             timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
+            max_concurrent_per_parent: DEFAULT_SUBAGENT_MAX_CONCURRENT,
+            stall_timeout_secs: DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS,
+            max_watchdog_alerts: DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS,
         }
     }
 }
 
 impl SubagentConfig {
-    /// 返回经 `max_steps_cap` 封顶后的有效单次最大步数（至少为 1）。
+    /// 返回经 `max_steps_cap` 封顶后的有效单轮最大步数（至少为 1）。
     pub fn effective_max_steps(&self) -> usize {
         let cap = self.max_steps_cap.max(1);
         self.default_max_steps.clamp(1, cap)
+    }
+
+    /// 返回单父会话允许并发运行的后台子代理上限（至少为 1）。
+    pub fn effective_max_concurrent(&self) -> usize {
+        self.max_concurrent_per_parent.max(1)
+    }
+
+    /// 返回有效单轮超时秒数（至少为 1）。
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.max(1)
     }
 }
 
@@ -95,6 +122,10 @@ impl SubagentMode {
 
 #[derive(Debug, Error)]
 pub enum SubagentError {
+    #[error("无效的 action 参数 `{0}`，仅支持 \"spawn\"、\"send\"、\"status\" 或 \"stop\"")]
+    InvalidAction(String),
+    #[error("action 参数必须为字符串")]
+    InvalidActionType,
     #[error("缺少或为空的 prompt 参数")]
     MissingPrompt,
     #[error("prompt 参数必须为字符串")]
@@ -105,6 +136,34 @@ pub enum SubagentError {
     InvalidModeType,
     #[error("model 参数必须为字符串")]
     InvalidModelType,
+    #[error(
+        "无效的 name 参数 `{0}`：须为 1..=32 位小写字母/数字/`-`/`_`，且以字母或数字开头、不可为 \"all\""
+    )]
+    InvalidName(String),
+    #[error("name 参数必须为字符串")]
+    InvalidNameType,
+    #[error("stop 操作缺少目标 name 参数（可传具体名称或 \"all\"）")]
+    MissingStopTarget,
+    #[error("send 操作缺少目标 name 参数（必须为具体子代理名称，不可为 \"all\"）")]
+    MissingSendTarget,
+    #[error("未找到名为 `{0}` 的子代理；请先使用 action=\"spawn\" 启动")]
+    SubagentNotFound(String),
+    #[error("子代理 `{0}` 正在停止收尾中，请稍后再试")]
+    StoppingInProgress(String),
+    #[error("不允许修改已有子代理 `{0}` 的权限模式（原 mode={1}，请求 mode={2}）")]
+    ModeChangeNotAllowed(String, String, String),
+    #[error(
+        "子代理 `{0}` 正在运行中，无法在运行期间热切 model；请等待其休眠后 send 或 stop 后重派"
+    )]
+    ModelChangeWhileRunning(String),
+    #[error("无法加载子代理 `{0}` 对应的会话 `{1}`")]
+    SessionUnavailable(String, String),
+    #[error("缺少父会话上下文，无法启动后台子代理")]
+    MissingParentSession,
+    #[error("同名后台子代理 `{0}` 正在运行中")]
+    NameAlreadyRunning(String),
+    #[error("当前会话后台子代理并发数已达上限（最多 {0} 个）")]
+    ConcurrencyLimitReached(usize),
     #[error("子代理严禁嵌套调用 subagent（深度严格限制为 1）")]
     NestedSubagentDenied,
     #[error("子代理插件依赖服务不可用: {0}")]
@@ -114,11 +173,14 @@ pub enum SubagentError {
 type TurnRouteMap = HashMap<String, (Option<String>, Option<String>)>;
 
 pub struct SubagentRuntime {
-    ctx: Context,
-    config: Arc<Mutex<SubagentConfig>>,
-    active_children: Arc<Mutex<HashMap<String, SubagentMode>>>,
-    parent_turn_routes: Arc<Mutex<TurnRouteMap>>,
-    dispose_token: CancellationToken,
+    pub(crate) ctx: Context,
+    pub(crate) config: Arc<Mutex<SubagentConfig>>,
+    pub(crate) active_children: Arc<Mutex<ActiveChildrenMap>>,
+    pub(crate) activity_trackers: Arc<Mutex<ActivityTrackersMap>>,
+    pub(crate) tasks: Arc<Mutex<BackgroundTaskRegistry>>,
+    pub(crate) state_emit_lock: Arc<Mutex<()>>,
+    pub(crate) parent_turn_routes: Arc<Mutex<TurnRouteMap>>,
+    pub(crate) dispose_token: CancellationToken,
 }
 
 impl SubagentRuntime {
@@ -145,10 +207,52 @@ impl SubagentRuntime {
             .lock()
             .unwrap()
             .get(session_id)
-            .copied()
+            .map(|(_, m)| *m)
     }
 
-    fn resolve_parent_route(
+    /// 查询指定父会话当前仍在后台运行的子代理数量。
+    pub fn running_subagents_for_parent(&self, parent_session_id: &str) -> usize {
+        self.tasks.lock().unwrap().running_count(parent_session_id)
+    }
+
+    /// 列出指定父会话的后台子代理快照（运行中及最近已结束条目）。
+    pub fn list_subagents_for_parent(&self, parent_session_id: &str) -> Vec<SubagentTaskSnapshot> {
+        self.tasks
+            .lock()
+            .unwrap()
+            .snapshots(parent_session_id, None)
+    }
+
+    /// 取消指定父会话名下全部仍在运行的后台子代理（供切换会话或退出清理调用）。
+    pub fn cancel_parent_subagents(&self, parent_session_id: &str) -> usize {
+        let stopped = self.tasks.lock().unwrap().cancel_parent(parent_session_id);
+        let count = stopped.len();
+        if let Some((name, child_session_id, mode)) = stopped.into_iter().last() {
+            self.emit_state_event(SubagentStateEvent {
+                parent_session_id: parent_session_id.to_string(),
+                name,
+                child_session_id,
+                mode,
+                status: SubagentRunStatus::Stopped,
+                running_count: 0,
+                notice: None,
+            });
+        }
+        count
+    }
+
+    pub(crate) fn emit_state_event(&self, mut ev: SubagentStateEvent) {
+        // 统一在 `state_emit_lock -> tasks` 锁序下现场重读真值并串行广播，防止并发结算乱序卡住状态栏。
+        let _guard = self.state_emit_lock.lock().unwrap();
+        ev.running_count = self
+            .tasks
+            .lock()
+            .unwrap()
+            .running_count(&ev.parent_session_id);
+        self.ctx.emit(EVENT_SUBAGENT_STATE, ev);
+    }
+
+    pub(crate) fn resolve_parent_route(
         &self,
         parent_session_id: Option<&str>,
     ) -> (Option<String>, Option<String>) {
@@ -169,260 +273,13 @@ impl SubagentRuntime {
         (None, None)
     }
 
-    async fn execute_tool_call(
-        self: &Arc<Self>,
-        args: Value,
-        call_ctx: ToolCallContext,
-    ) -> Result<ToolOutput, BoxError> {
-        let prompt = match args.get("prompt") {
-            None | Some(Value::Null) => return Err(SubagentError::MissingPrompt.into()),
-            Some(Value::String(s)) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return Err(SubagentError::MissingPrompt.into());
-                }
-                trimmed.to_string()
-            }
-            Some(_) => return Err(SubagentError::InvalidPromptType.into()),
-        };
-
-        let mode = match args.get("mode") {
-            None | Some(Value::Null) => SubagentMode::ReadOnly,
-            Some(Value::String(s)) => SubagentMode::parse(s)?,
-            Some(_) => return Err(SubagentError::InvalidModeType.into()),
-        };
-
-        let requested_model = match args.get("model") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => {
-                let trimmed = s.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            }
-            Some(_) => return Err(SubagentError::InvalidModelType.into()),
-        };
-
-        let sessions = self
-            .ctx
-            .sessions()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-        let tools = self
-            .ctx
-            .tools()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-        let agent_loop = self
-            .ctx
-            .agent_loop()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-
-        let parent_session_id = call_ctx.session_id().map(str::to_string);
-        ensure_not_nested_parent(
-            parent_session_id.as_deref(),
-            &self.active_children,
-            &sessions,
-        )?;
-
-        if call_ctx.cancel.is_cancelled() || self.dispose_token.is_cancelled() {
-            return Ok(ToolOutput::error("子代理已取消执行"));
-        }
-
-        let parent_cwd = parent_session_id
-            .as_deref()
-            .and_then(|pid| {
-                sessions
-                    .get(pid)
-                    .and_then(|s| s.header().cwd)
-                    .or_else(|| sessions.inspect_readonly(pid).and_then(|l| l.header.cwd))
-            })
-            .or_else(|| sessions.default_cwd());
-
-        let (parent_provider, parent_model) =
-            self.resolve_parent_route(parent_session_id.as_deref());
-        let providers = self
-            .ctx
-            .llm()
-            .map(|llm| llm.provider_infos())
-            .unwrap_or_default();
-        let (provider, model) = resolve_model_route(
-            requested_model.as_deref(),
-            parent_provider,
-            parent_model,
-            &providers,
-        );
-
-        let short_prompt = shorten_prompt(&prompt, 48);
-        let child_session = sessions.create_with(SessionCreateOptions {
-            cwd: parent_cwd,
-            parent_id: parent_session_id,
-            title: Some(format!("Subagent: {short_prompt}")),
-            ..Default::default()
-        });
-
-        let candidate_tools = match call_ctx.session_id() {
-            Some(pid) => tools.get_active_tools(pid),
-            None => tools.get_active_tools(&child_session.id),
-        };
-        let all_infos = tools.list_all();
-        let allowed_tools = compute_allowed_tools(&candidate_tools, &all_infos, mode);
-
-        let _child_guard = ChildSessionGuard::register(
-            Arc::clone(&self.active_children),
-            Arc::clone(&tools),
-            child_session.id.clone(),
-            mode,
-        );
-        tools.set_active_tools(&child_session.id, &allowed_tools);
-
-        let cfg = self.config();
-        let max_steps = cfg.effective_max_steps();
-        let timeout_secs = cfg.timeout_secs;
-        let child_cancel = call_ctx.cancel.child_token();
-
-        call_ctx.emit_update(
-            format!("子代理启动 ({})...", mode.as_str()),
-            Some(json!({
-                "childSessionId": child_session.id,
-                "mode": mode.as_str(),
-            })),
-        );
-
-        let run_opts = RunOptions {
-            provider,
-            model,
-            max_steps: Some(max_steps),
-            origin: Some(RequestOrigin::Subagent),
-            ..Default::default()
-        };
-
-        let child_id = child_session.id.clone();
-        let run_fut = agent_loop.run_with_report(
-            Arc::clone(&child_session),
-            prompt,
-            child_cancel.clone(),
-            run_opts,
-        );
-
-        let outcome = tokio::select! {
-            biased;
-            _ = self.dispose_token.cancelled() => {
-                child_cancel.cancel();
-                return Ok(ToolOutput::error("子代理插件已卸载，子任务已终止").with_details(json!({
-                    "childSessionId": child_id,
-                    "mode": mode.as_str(),
-                    "reason": "disposed",
-                })));
-            }
-            timed = tokio::time::timeout(Duration::from_secs(timeout_secs), run_fut) => timed,
-        };
-
-        match outcome {
-            Err(_) => {
-                child_cancel.cancel();
-                Ok(
-                    ToolOutput::error(format!("子代理执行超时（已超过 {timeout_secs}s 上限）"))
-                        .with_details(json!({
-                            "childSessionId": child_id,
-                            "mode": mode.as_str(),
-                            "reason": "timeout",
-                            "timeoutSecs": timeout_secs,
-                        })),
-                )
-            }
-            Ok(Ok(report)) => {
-                let details = json!({
-                    "childSessionId": child_id,
-                    "mode": mode.as_str(),
-                    "steps": report.steps,
-                    "reason": report.reason.as_str(),
-                });
-                let content = match report.reason {
-                    TurnEndReason::Completed => {
-                        if report.text.trim().is_empty() {
-                            format!("（子代理已完成，共 {} 步，无文本输出）", report.steps)
-                        } else {
-                            report.text
-                        }
-                    }
-                    TurnEndReason::MaxSteps => format!(
-                        "[子代理已达步数上限 (steps={}/{})]\n{}",
-                        report.steps, max_steps, report.text
-                    ),
-                    TurnEndReason::Truncated => format!(
-                        "[子代理输出达到 max_tokens 被截断 (steps={})]\n{}",
-                        report.steps, report.text
-                    ),
-                    TurnEndReason::Cancelled => {
-                        return Ok(ToolOutput::error("子代理已取消执行").with_details(details));
-                    }
-                    TurnEndReason::Error { ref message } => {
-                        return Ok(ToolOutput::error(format!(
-                            "子代理执行失败（steps={}）：{message}",
-                            report.steps
-                        ))
-                        .with_details(details));
-                    }
-                };
-                Ok(ToolOutput::text(content).with_details(details))
-            }
-            Ok(Err(AgentError::Llm(err)))
-                if err.code == LlmErrorCode::Cancelled || child_cancel.is_cancelled() =>
-            {
-                Ok(ToolOutput::error("子代理已取消执行").with_details(json!({
-                    "childSessionId": child_id,
-                    "mode": mode.as_str(),
-                    "reason": "cancelled",
-                })))
-            }
-            Ok(Err(err)) => Ok(
-                ToolOutput::error(format!("子代理执行失败：{err}")).with_details(json!({
-                    "childSessionId": child_id,
-                    "mode": mode.as_str(),
-                    "reason": "error",
-                })),
-            ),
-        }
+    fn tracker_for_child(&self, session_id: &str) -> Option<Arc<ChildActivityTracker>> {
+        self.activity_trackers
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|(_, tracker)| Arc::clone(tracker))
     }
-}
-
-fn build_subagent_tool_definition(runtime: Arc<SubagentRuntime>) -> ToolDefinition {
-    ToolDefinition::async_rich_tool(
-        SUBAGENT_TOOL_NAME,
-        "Delegate a focused, self-contained task to an isolated single-layer child agent session and return its final summary. Multiple read_only calls in the same step execute concurrently. Use mode=\"read_only\" (default) for codebase investigation or review, or mode=\"edit\" when file modifications are required.",
-        json!({
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Clear, self-contained task description for the child agent."
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["read_only", "edit"],
-                    "default": "read_only",
-                    "description": "Execution mode. \"read_only\" restricts tools to read-only inspection; \"edit\" allows workspace editing tools."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model override (\"model_id\" or \"provider/model_id\")."
-                }
-            },
-            "required": ["prompt"]
-        }),
-        move |args, call_ctx| {
-            let rt = Arc::clone(&runtime);
-            async move { rt.execute_tool_call(args, call_ctx).await }
-        },
-    )
-    .with_exposure(ToolExposure::Direct)
-    .with_execution_mode(ToolExecutionMode::Parallel)
-    .with_annotations(ToolAnnotations {
-        read_only: false,
-        destructive: false,
-        idempotent: false,
-        open_world: false,
-    })
-    .with_prompt_snippet(
-        "Delegate an isolated single-layer sub-task to a child agent session and return its summary",
-    )
 }
 
 impl Service for SubagentRuntime {
@@ -437,17 +294,21 @@ impl Service for SubagentRuntime {
     }
 
     fn inject() -> Inject {
-        Inject::from(["tools", "sessions", "agentLoop"])
+        Inject::from(["tools", "sessions", "agentLoop", "systemPrompt"])
     }
 
     fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
         let _ = ctx.tools()?;
         let _ = ctx.sessions()?;
         let _ = ctx.agent_loop()?;
+        let _ = ctx.system_prompt()?;
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
             config: Arc::new(Mutex::new(config)),
             active_children: Arc::new(Mutex::new(HashMap::new())),
+            activity_trackers: Arc::new(Mutex::new(HashMap::new())),
+            tasks: Arc::new(Mutex::new(BackgroundTaskRegistry::default())),
+            state_emit_lock: Arc::new(Mutex::new(())),
             parent_turn_routes: Arc::new(Mutex::new(HashMap::new())),
             dispose_token: CancellationToken::new(),
         }))
@@ -458,6 +319,7 @@ impl Service for SubagentRuntime {
         Box::pin(async move {
             let tools = ctx.tools()?;
             let sessions = ctx.sessions()?;
+            let system_prompt = ctx.system_prompt()?;
 
             // 1. 先在 `tools/pre-execute` 最外层挂载硬护栏，再注册工具（LIFO 卸载时先下线工具再撤护栏）
             let active_guard = Arc::clone(&self.active_children);
@@ -495,7 +357,100 @@ impl Service for SubagentRuntime {
                 })))
             })?;
 
-            // 2. 注册 `subagent` 工具（随插件卸载自动注销）
+            // 2. 订阅运行事件维护子会话实时活性快照（无阻塞、不影响主会话）
+            let rt_step = Arc::clone(&self);
+            let ctx_step = ctx.clone();
+            ctx.effect("subagent.activity-step-start", move || {
+                let h = ctx_step.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
+                    if let Some(tracker) = rt_step.tracker_for_child(&ev.session.id) {
+                        tracker.set_turn_step(ev.step);
+                    }
+                })?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+
+            let rt_tcall = Arc::clone(&self);
+            let ctx_tcall = ctx.clone();
+            ctx.effect("subagent.activity-tool-call", move || {
+                let h = ctx_tcall.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
+                    if let Some(tracker) = rt_tcall.tracker_for_child(&ev.session.id) {
+                        let label = format_tool_activity_label(&ev.call.name, &ev.call.arguments);
+                        tracker.set_tool(&label);
+                    }
+                })?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+
+            let rt_tupd = Arc::clone(&self);
+            let ctx_tupd = ctx.clone();
+            ctx.effect("subagent.activity-tool-update", move || {
+                let h =
+                    ctx_tupd.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
+                        if let Some(tracker) = rt_tupd.tracker_for_child(&ev.session.id) {
+                            if tracker.last_tool().is_none() {
+                                tracker.set_tool(&ev.name);
+                            } else {
+                                tracker.touch();
+                            }
+                        }
+                    })?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+
+            let rt_tres = Arc::clone(&self);
+            let ctx_tres = ctx.clone();
+            ctx.effect("subagent.activity-tool-result", move || {
+                let h =
+                    ctx_tres.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
+                        if let Some(tracker) = rt_tres.tracker_for_child(&ev.session.id) {
+                            if tracker.last_tool().is_none() {
+                                tracker.set_tool(&ev.name);
+                            } else {
+                                tracker.touch();
+                            }
+                        }
+                    })?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+
+            let rt_text = Arc::clone(&self);
+            let ctx_text = ctx.clone();
+            ctx.effect("subagent.activity-text-delta", move || {
+                let h = ctx_text.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
+                    if let Some(tracker) = rt_text.tracker_for_child(&ev.session.id) {
+                        tracker.touch();
+                    }
+                })?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+
+            let rt_reason = Arc::clone(&self);
+            let ctx_reason = ctx.clone();
+            ctx.effect("subagent.activity-reasoning-delta", move || {
+                let h = ctx_reason.on(
+                    EVENT_AGENT_REASONING_DELTA,
+                    move |ev: &AgentReasoningDeltaEvent| {
+                        if let Some(tracker) = rt_reason.tracker_for_child(&ev.session.id) {
+                            tracker.touch();
+                        }
+                    },
+                )?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+
+            // 3. 注册 `subagent` 工具（随插件卸载自动注销）
             let rt_tool = Arc::clone(&self);
             let tools_reg = Arc::clone(&tools);
             ctx.effect("subagent.register-tool", move || {
@@ -503,7 +458,26 @@ impl Service for SubagentRuntime {
                 Ok::<_, mizar_tools::ToolError>(Some(tools_reg.register(def)?))
             })?;
 
-            // 3. 追踪活跃父轮次路由，确保子会话在未传 `model` 时准确继承父会话的 provider/model
+            // 4. 向系统提示词注入精简静态分流契约（KV Cache 前缀 100% 稳定，禁止无意义轮询等待）
+            let sp = Arc::clone(&system_prompt);
+            ctx.effect("subagent.prompt-guidance", move || {
+                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
+                    "subagent",
+                    45,
+                    || {
+                        Some(
+                            "Subagent delegation (`subagent` tool, only when available):\n\
+- Balance responsiveness and efficiency: handle quick 1-3 step lookups directly, and delegate heavy, multi-file, log-heavy, or parallel tasks to background subagents (`action: \"spawn\"`, default) so you stay responsive to the user immediately.\n\
+- Launch independent subagents together in one step, give the user a brief acknowledgement, and end your turn instead of sleeping or polling — settled results arrive as follow-up notices.\n\
+- Use `action: \"send\"` (`name`, `prompt`) to steer a running subagent or wake a settled one with its retained session memory; use `action: \"status\"` for live step/tool/idle inspection or `action: \"stop\"` to cancel.\n\
+- When a `subagent-watchdog:*` alert arrives, inspect the snapshot and decide whether to reassure the user and wait, redirect via `send`, or cancel via `stop`."
+                                .to_string(),
+                        )
+                    },
+                ))))
+            })?;
+
+            // 5. 追踪活跃父轮次路由，确保子会话在未传 `model` 时准确继承父会话的 provider/model
             let routes_in = Arc::clone(&self.parent_turn_routes);
             let active_in = Arc::clone(&self.active_children);
             let ctx_in = ctx.clone();
@@ -532,11 +506,34 @@ impl Service for SubagentRuntime {
                 })))
             })?;
 
-            // 4. 最后登记 dispose_token：LIFO 卸载时优先中止在飞子代理
+            // 6. 最后登记清理句柄：LIFO 卸载时先触发 dispose_token，再停止在飞任务并清零每个父会话状态栏计数
+            let tasks_cleanup = Arc::clone(&self.tasks);
+            let emit_lock_cleanup = Arc::clone(&self.state_emit_lock);
+            let ctx_cleanup = ctx.clone();
             let dispose_token = self.dispose_token.clone();
             ctx.effect("subagent.dispose-token", move || {
                 Ok::<_, CordisError>(Some(Cleanup::sync(move || {
                     dispose_token.cancel();
+                    let stopped_parents = tasks_cleanup.lock().unwrap().cancel_all();
+                    for (parent_session_id, name, child_session_id, mode) in stopped_parents {
+                        let _guard = emit_lock_cleanup.lock().unwrap();
+                        let running_count = tasks_cleanup
+                            .lock()
+                            .unwrap()
+                            .running_count(&parent_session_id);
+                        ctx_cleanup.emit(
+                            EVENT_SUBAGENT_STATE,
+                            SubagentStateEvent {
+                                parent_session_id,
+                                name,
+                                child_session_id,
+                                mode,
+                                status: SubagentRunStatus::Stopped,
+                                running_count,
+                                notice: None,
+                            },
+                        );
+                    }
                 })))
             })?;
 
@@ -576,5 +573,51 @@ pub trait SubagentContextExt {
 impl SubagentContextExt for Context {
     fn subagent(&self) -> Result<Arc<SubagentRuntime>, CordisError> {
         self.service::<SubagentRuntime>(SERVICE_SUBAGENT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::format_background_ui_notice;
+
+    #[test]
+    fn background_ui_notice_honestly_reports_degraded_auto_wake() {
+        let normal = format_background_ui_notice(
+            "scout-a",
+            SubagentRunStatus::Completed,
+            3,
+            20,
+            2,
+            180,
+            false,
+        );
+        assert!(normal.contains("交由主代理汇总"), "{normal}");
+
+        let degraded = format_background_ui_notice(
+            "scout-b",
+            SubagentRunStatus::Completed,
+            3,
+            20,
+            2,
+            180,
+            true,
+        );
+        assert!(degraded.contains("连续自动唤醒上限"), "{degraded}");
+        assert!(!degraded.contains("交由主代理汇总"), "{degraded}");
+    }
+
+    #[test]
+    fn config_clamps_effective_timeout_and_steps() {
+        let cfg = SubagentConfig {
+            default_max_steps: 99,
+            max_steps_cap: 15,
+            timeout_secs: 0,
+            max_concurrent_per_parent: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_max_steps(), 15);
+        assert_eq!(cfg.effective_timeout_secs(), 1);
+        assert_eq!(cfg.effective_max_concurrent(), 1);
     }
 }

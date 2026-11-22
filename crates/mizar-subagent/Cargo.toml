@@ -13,11 +13,12 @@ cordis = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-session = { workspace = true }
+mizar-system-prompt = { workspace = true }
 mizar-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["macros", "time"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
@@ -26,7 +27,6 @@ mizar-codemode = { workspace = true }
 mizar-recall = { workspace = true }
 mizar-session-sqlite = { workspace = true }
 mizar-session-title = { workspace = true }
-mizar-system-prompt = { workspace = true }
 mizar-tool-fs = { workspace = true }
 mizar-tool-time = { workspace = true }
 mizar-tools-coding = { workspace = true }

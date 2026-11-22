@@ -499,6 +499,10 @@ pub enum ClientEvent {
     CacheWarmingNotice {
         text: String,
     },
+    SubagentState {
+        running_count: usize,
+        notice: Option<String>,
+    },
     UserSkillsUpdated(Vec<String>),
     SessionTitleUpdated(Option<String>),
     ToolsUpdated,
