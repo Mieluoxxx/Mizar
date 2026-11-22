@@ -1,6 +1,6 @@
 pub use mizar_llm_types::{
-    CacheRetention, ContentBlock, ContentBlockKind, FinishReason, ImageAttachment,
-    MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
+    CacheRetention, CacheWarmingMode, ContentBlock, ContentBlockKind, FinishReason,
+    ImageAttachment, MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
     OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, PromptCacheLifetime, ProviderInfo, ReasoningEffort,
     ReplayEnvelope, RequestOrigin, SessionAffinityMode, StreamChunk, TokenUsage, ToolCall,
     ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,

@@ -19,6 +19,12 @@ pub use config::{
 };
 #[cfg(feature = "router")]
 pub use config::{LlmRouteError, ResolvedLlmRouter};
+#[cfg(feature = "cache-warming")]
+pub use mizar_cache_warming::{
+    CacheWarmingConfig, CacheWarmingContextExt, CacheWarmingError, CacheWarmingMode,
+    CacheWarmingNoticeEvent, CacheWarmingRuntime, EVENT_CACHE_WARMING_NOTICE,
+    SERVICE_CACHE_WARMING,
+};
 #[cfg(feature = "compaction")]
 pub use mizar_compaction::{
     CompactionConfig, CompactionContextExt, CompactionEndEvent, CompactionError, CompactionOutcome,
@@ -118,6 +124,9 @@ pub struct AgentSpineConfig {
     /// 是否启用基于对话主题的会话标题自动生成服务（默认开启）。
     #[cfg(feature = "session-title")]
     pub session_title: Option<SessionTitleConfig>,
+    /// 是否启用 Prompt Cache 后台定时续命保活服务（默认开启）。
+    #[cfg(feature = "cache-warming")]
+    pub cache_warming: Option<CacheWarmingConfig>,
     /// 可选：会话 SQLite 持久化数据库路径；为 `None` 时保持纯内存模式（适合测试）。
     pub session_db_path: Option<PathBuf>,
     /// 启动阶段屏蔽的内置可选模块 ID 列表（如 `mcp`、`codemode` 等）。
@@ -148,6 +157,8 @@ impl AgentSpineConfig {
             recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
             session_title: Some(SessionTitleConfig::default()),
+            #[cfg(feature = "cache-warming")]
+            cache_warming: Some(CacheWarmingConfig::default()),
             session_db_path: None,
             disabled_plugins: Vec::new(),
         }
@@ -182,6 +193,8 @@ impl AgentSpineConfig {
             recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
             session_title: Some(SessionTitleConfig::default()),
+            #[cfg(feature = "cache-warming")]
+            cache_warming: Some(CacheWarmingConfig::default()),
             session_db_path: None,
             disabled_plugins: Vec::new(),
         }
@@ -276,6 +289,7 @@ impl Plugin for AgentSpinePlugin {
                     feature = "coding",
                     feature = "compaction",
                     feature = "session-title",
+                    feature = "cache-warming",
                     feature = "trajectory"
                 )),
                 allow(unused_mut)
@@ -408,6 +422,19 @@ impl Plugin for AgentSpinePlugin {
                         description: "后台基于用户输入生成与维护会话标题".to_string(),
                     },
                     ModuleSpec::SessionTitle(st_cfg),
+                ));
+            }
+
+            #[cfg(feature = "cache-warming")]
+            if let Some(cw_cfg) = config.cache_warming {
+                specs.push((
+                    SpineModuleMeta {
+                        id: "cache-warming".to_string(),
+                        label: "缓存续命".to_string(),
+                        description: "后台按 $0.05 期望净收益门禁维持 Prompt Cache 温度"
+                            .to_string(),
+                    },
+                    ModuleSpec::CacheWarming(cw_cfg),
                 ));
             }
 

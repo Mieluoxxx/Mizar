@@ -364,6 +364,9 @@ impl AppState {
             UiEvent::Notice { level, text } => {
                 self.push_notice(level, text);
             }
+            UiEvent::CacheWarmingNotice { text } => {
+                self.push_cache_warming_notice(text);
+            }
             UiEvent::UserSkillsUpdated(names) => {
                 self.user_skill_names = names;
             }

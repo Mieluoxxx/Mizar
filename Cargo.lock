@@ -1534,6 +1534,7 @@ dependencies = [
  "dirs",
  "futures",
  "mizar-agent-loop",
+ "mizar-cache-warming",
  "mizar-codemode",
  "mizar-compaction",
  "mizar-instructions",
@@ -1562,6 +1563,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mizar-cache-warming"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-client-core",
+ "mizar-compaction",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "mizar-client"
 version = "0.1.0"
 dependencies = [
@@ -1572,6 +1592,7 @@ dependencies = [
  "image",
  "mizar-agent-loop",
  "mizar-agent-spine",
+ "mizar-cache-warming",
  "mizar-client-core",
  "mizar-instructions",
  "mizar-llm",

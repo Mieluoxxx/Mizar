@@ -18,6 +18,7 @@ use mizar_agent_spine::{
     CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent, CompactionTrigger,
     EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS, EVENT_COMPACTION_START,
 };
+use mizar_cache_warming::{CacheWarmingNoticeEvent, EVENT_CACHE_WARMING_NOTICE};
 use mizar_client_core::{
     ClientEvent, UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
 };
@@ -448,13 +449,27 @@ where
         );
     }
     {
-        let send = send;
-        let check = is_current;
+        let send = send.clone();
+        let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_SESSION_TITLE_UPDATED,
             move |ev: &SessionTitleUpdatedPayload| {
                 if check(&ev.session.id) {
                     send(ClientEvent::SessionTitleUpdated(ev.title.clone()));
+                }
+            },
+        )?);
+    }
+    {
+        let send = send;
+        let check = is_current;
+        handles.push(ctx.on(
+            EVENT_CACHE_WARMING_NOTICE,
+            move |ev: &CacheWarmingNoticeEvent| {
+                if check(&ev.session_id) {
+                    send(ClientEvent::CacheWarmingNotice {
+                        text: ev.text.clone(),
+                    });
                 }
             },
         )?);

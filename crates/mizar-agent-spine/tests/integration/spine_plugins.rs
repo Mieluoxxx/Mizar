@@ -12,9 +12,10 @@ use mizar_agent_loop::{
     AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
 };
 use mizar_agent_spine::{
-    AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CompactionContextExt,
-    EVENT_SPINE_PLUGINS_CHANGE, RECALL_SEARCH_TOOL_NAME, SessionTitleContextExt,
-    SessionTitleRuntime, SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
+    AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CacheWarmingContextExt,
+    CacheWarmingMode, CacheWarmingRuntime, CompactionContextExt, EVENT_SPINE_PLUGINS_CHANGE,
+    RECALL_SEARCH_TOOL_NAME, SERVICE_CACHE_WARMING, SessionTitleContextExt, SessionTitleRuntime,
+    SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
 };
 use mizar_compaction::CompactionRuntime;
 use mizar_llm::{
@@ -453,6 +454,20 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert_eq!(st_reloaded.config().model.as_deref(), Some("fast-title"));
     assert!(ctrl.set_enabled("session-title", false).await.unwrap());
 
+    // 5c. cache-warming：热卸载/再挂载保留易变配置，且禁用 compaction 不影响 cache-warming 启动就绪
+    let cw = app.cache_warming().unwrap();
+    cw.set_mode(CacheWarmingMode::Streaming);
+    cw.set_show_notices(true);
+    assert!(ctrl.set_enabled("cache-warming", false).await.unwrap());
+    assert!(
+        app.get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
+            .is_none()
+    );
+    assert!(ctrl.set_enabled("cache-warming", true).await.unwrap());
+    let cw_reloaded = app.cache_warming().unwrap();
+    assert_eq!(cw_reloaded.config().mode, CacheWarmingMode::Streaming);
+    assert!(cw_reloaded.config().show_cache_miss_notices);
+
     // 6. trajectory & repeat-guard：waterfall 钩子与服务卸载及恢复
     assert!(ctrl.set_enabled("trajectory", true).await.unwrap());
     assert!(ctrl.set_enabled("repeat-guard", true).await.unwrap());
@@ -505,4 +520,117 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(recorded.contains(&("tools-coding".to_string(), true)));
     assert!(recorded.contains(&("tools-coding".to_string(), false)));
     assert!(recorded.contains(&("repeat-guard".to_string(), false)));
+}
+
+#[tokio::test]
+async fn cache_warming_stays_active_when_compaction_is_disabled() {
+    use mizar_llm::{ModelCostRates, PromptCacheLifetime, RequestOrigin, TokenUsage};
+
+    struct PricedAdapter;
+
+    impl LlmAdapter for PricedAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "priced".into(),
+                name: "Priced".into(),
+                protocol: "anthropic-messages".into(),
+                models: vec![ModelInfo {
+                    id: "claude-sonnet".into(),
+                    name: "Claude Sonnet".into(),
+                    cost: Some(ModelCostRates {
+                        input: 3.0,
+                        output: 15.0,
+                        cache_read: 0.3,
+                        cache_write: 3.75,
+                        tiers: Vec::new(),
+                    }),
+                    prompt_cache: Some(PromptCacheLifetime {
+                        short: Some(300),
+                        long: Some(3600),
+                    }),
+                    force_adaptive_thinking: true,
+                    ..Default::default()
+                }],
+            })
+        }
+
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                let _ = tx.unbounded_send(Ok(StreamChunk::TextDelta {
+                    index: 0,
+                    text: "ok".into(),
+                }));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 500,
+                        cache_write_tokens: Some(300_000),
+                        output_tokens: 20,
+                        ..Default::default()
+                    },
+                }));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }));
+            });
+            Box::pin(rx)
+        }
+    }
+
+    let ws = temp_dir("cw_no_compaction");
+    let _guard = DirGuard(ws.clone());
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
+    let app = Context::new();
+    app.plugin(AgentSpinePlugin, cfg).await.unwrap();
+    app.plugin(
+        PluginDef::sync("priced-adapter", |ctx, ()| {
+            let llm = ctx.llm()?;
+            ctx.effect("priced-adapter.reg", move || {
+                Ok::<_, LlmError>(Some(
+                    llm.register_adapter("priced", Arc::new(PricedAdapter))?,
+                ))
+            })?;
+            Ok::<_, cordis::CordisError>(())
+        })
+        .inject(["llm"]),
+        (),
+    )
+    .await
+    .unwrap();
+    wait_all_settled(&app).await;
+
+    let ctrl = app.spine_plugins().unwrap();
+    assert!(!ctrl.is_enabled("compaction"));
+    assert!(
+        ctrl.is_enabled("cache-warming"),
+        "cache-warming must not depend on compaction in inject()"
+    );
+    let cw = app.cache_warming().unwrap();
+    let sessions = app.sessions().unwrap();
+    let session = sessions.create(None);
+    let llm = app.llm().unwrap();
+
+    use futures::StreamExt;
+    let mut stream = llm
+        .stream(GenerateOptions {
+            provider: Some("priced".into()),
+            model: Some("claude-sonnet".into()),
+            session_id: Some(session.id.clone()),
+            origin: RequestOrigin::SessionTurn {
+                session_id: session.id.clone(),
+                turn: 1,
+                step: 1,
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let status = cw.status(&session.id).expect("cache warming status");
+    assert!(status.active);
+
+    app.fiber().dispose().await;
 }

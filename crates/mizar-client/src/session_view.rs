@@ -7,12 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Local};
 use cordis::Context;
 use mizar_agent_spine::strip_summary_wrapper;
+use mizar_cache_warming::{CacheWarmingRuntime, SERVICE_CACHE_WARMING};
 use mizar_client_core::{
-    ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem, SessionSelection,
-    SessionTreeEntry, SessionViewData, abbreviate_home_path, format_tokens, short_id,
+    CacheMissAudit, CacheWarmingSessionStatus, ContextBreakdownSnapshot, NoticeLevel,
+    SessionPickerItem, SessionReplayItem, SessionSelection, SessionTreeEntry, SessionViewData,
+    UsageAuditSample, abbreviate_home_path, compute_cache_miss_audit, format_tokens, short_id,
     truncate_display,
 };
-use mizar_llm::{ContentBlock, ModelInfo, ProviderInfo, TokenUsage};
+use mizar_llm::{ContentBlock, LlmContextExt, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
 use mizar_session::{
     Session, SessionEvent, SessionListQuery, SessionPersistenceContextExt, SessionStore,
     SessionTraceEvent, TraceSeverity,
@@ -244,6 +246,115 @@ fn join_mid_dot(parts: &[String]) -> String {
     out
 }
 
+fn lookup_model_rates(
+    providers: &[ProviderInfo],
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<ModelCostRates> {
+    let mod_id = model.filter(|s| !s.is_empty())?;
+    if let Some(prov_id) = provider.filter(|s| !s.is_empty()) {
+        return providers
+            .iter()
+            .find(|p| p.id == prov_id)
+            .and_then(|p| find_model_in_provider(p, mod_id))
+            .and_then(|m| m.cost.clone());
+    }
+    providers
+        .iter()
+        .find_map(|p| find_model_in_provider(p, mod_id))
+        .and_then(|m| m.cost.clone())
+}
+
+fn collect_usage_audit_samples(
+    entries: &[mizar_session::SessionEntry],
+    providers: &[ProviderInfo],
+) -> (Vec<UsageAuditSample>, Option<ModelCostRates>) {
+    let mut samples = Vec::new();
+    let mut active_provider: Option<String> = None;
+    let mut active_model: Option<String> = None;
+    let mut last_rates: Option<ModelCostRates> = None;
+
+    for entry in entries {
+        match &entry.event {
+            SessionEvent::Selection {
+                provider, model, ..
+            } => {
+                if provider.is_some() {
+                    active_provider = provider.clone();
+                }
+                if model.is_some() {
+                    active_model = model.clone();
+                }
+                if let Some(r) = lookup_model_rates(
+                    providers,
+                    active_provider.as_deref(),
+                    active_model.as_deref(),
+                ) {
+                    last_rates = Some(r);
+                }
+            }
+            SessionEvent::Compaction { .. } => {
+                samples.push(UsageAuditSample::Compaction);
+            }
+            SessionEvent::Assistant {
+                replay,
+                usage: Some(u),
+                ..
+            } => {
+                let rates = replay
+                    .as_ref()
+                    .and_then(|env| {
+                        lookup_model_rates(providers, Some(&env.provider), Some(&env.model))
+                    })
+                    .or_else(|| {
+                        lookup_model_rates(
+                            providers,
+                            active_provider.as_deref(),
+                            active_model.as_deref(),
+                        )
+                    });
+                if let Some(ref r) = rates {
+                    last_rates = Some(r.clone());
+                }
+                samples.push(UsageAuditSample::Assistant { usage: *u, rates });
+            }
+            SessionEvent::Usage {
+                kind,
+                provider,
+                model,
+                usage,
+                ..
+            } if kind == "cache_warm" => {
+                let rates = lookup_model_rates(providers, Some(provider), Some(model));
+                if let Some(ref r) = rates {
+                    last_rates = Some(r.clone());
+                }
+                samples.push(UsageAuditSample::CacheWarm {
+                    usage: *usage,
+                    rates,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    (samples, last_rates)
+}
+
+fn format_eta_secs(secs: u64) -> String {
+    if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s}s")
+        }
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// 构造 `/session` 命令的只读会话身份与账目报告。
 pub fn build_session_info_report(
     ctx: &Context,
@@ -253,7 +364,14 @@ pub fn build_session_info_report(
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
 ) -> String {
-    build_session_info_report_at(
+    let warming = ctx
+        .get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
+        .and_then(|rt| rt.status(&session.id));
+    let providers = ctx
+        .llm()
+        .map(|llm| llm.provider_infos())
+        .unwrap_or_default();
+    build_session_info_report_at_with_cache(
         session,
         ctx.session_persistence().is_some(),
         session_db_path,
@@ -261,6 +379,8 @@ pub fn build_session_info_report(
         last_prompt_tokens,
         context_breakdown,
         now_millis(),
+        warming.as_ref(),
+        &providers,
     )
 }
 
@@ -273,6 +393,32 @@ pub fn build_session_info_report_at(
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
     now_ms: u128,
+) -> String {
+    build_session_info_report_at_with_cache(
+        session,
+        persisted,
+        session_db_path,
+        context_window,
+        last_prompt_tokens,
+        context_breakdown,
+        now_ms,
+        None,
+        &[],
+    )
+}
+
+/// 附带运行期保活状态与路由计价表的完整 `/session` 报告构造函数。
+#[allow(clippy::too_many_arguments)]
+pub fn build_session_info_report_at_with_cache(
+    session: &Session,
+    persisted: bool,
+    session_db_path: Option<&Path>,
+    context_window: u64,
+    last_prompt_tokens: Option<u64>,
+    context_breakdown: &ContextBreakdownSnapshot,
+    now_ms: u128,
+    warming: Option<&CacheWarmingSessionStatus>,
+    providers: &[ProviderInfo],
 ) -> String {
     let header = session.header();
 
@@ -291,9 +437,12 @@ pub fn build_session_info_report_at(
     let mut total_usage = TokenUsage::default();
     let mut latest_context_tokens: Option<u64> = None;
     let mut saw_prune_after_last_context = false;
+    let mut audit = CacheMissAudit::default();
 
     session.with_all_entries(|entries| {
         total_events = entries.len() as u64;
+        let (samples, fallback_rates) = collect_usage_audit_samples(entries, providers);
+        audit = compute_cache_miss_audit(&samples, fallback_rates.as_ref());
         for entry in entries {
             if entry.is_surface() {
                 surface_events += 1;
@@ -533,6 +682,61 @@ pub fn build_session_info_report_at(
     };
     lines.push(format!("上下文   {ctx_summary}"));
 
+    if let Some(st) = warming {
+        let mut parts = vec![st.mode.as_str().to_string()];
+        if st.active {
+            let eta = st
+                .next_warm_in_secs
+                .map(|s| format!("待命（下次 {} 后）", format_eta_secs(s)))
+                .unwrap_or_else(|| "待命中".to_string());
+            parts.push(eta);
+        } else if let Some(ref reason) = st.last_stop_reason {
+            parts.push(format!("已停止（{reason}）"));
+        } else {
+            parts.push("空闲".to_string());
+        }
+        if st.warm_count > 0 {
+            parts.push(format!(
+                "已保活 {} 次（${:.4}）",
+                st.warm_count, st.total_warm_cost_usd
+            ));
+        }
+        lines.push(format!("缓存续命 {}", parts.join(" · ")));
+    }
+
+    if warming.is_some()
+        || audit.miss_events > 0
+        || audit.warm_events > 0
+        || cache_read > 0
+        || cache_write > 0
+    {
+        let mut audit_parts = vec![format!(
+            "Cache Re-billed: {} tokens",
+            format_tokens(audit.cache_rebilled_tokens)
+        )];
+        if audit.miss_events > 0 {
+            if audit.cache_rebilled_cost_usd > 0.0 {
+                audit_parts.push(format!(
+                    "{} 次意外失效 · 额外 ${:.4}",
+                    audit.miss_events, audit.cache_rebilled_cost_usd
+                ));
+            } else {
+                audit_parts.push(format!("{} 次意外失效", audit.miss_events));
+            }
+        }
+        if audit.warm_events > 0 {
+            if audit.total_warm_cost_usd > 0.0 {
+                audit_parts.push(format!(
+                    "续命 {} 次（${:.4}）",
+                    audit.warm_events, audit.total_warm_cost_usd
+                ));
+            } else {
+                audit_parts.push(format!("续命 {} 次", audit.warm_events));
+            }
+        }
+        lines.push(format!("缓存审计 {}", audit_parts.join(" · ")));
+    }
+
     lines.join("\n")
 }
 
@@ -542,11 +746,14 @@ pub fn project_session_view(
     finish_notice: impl Into<String>,
 ) -> SessionViewData {
     let header = session.header();
+    let entries = session.all_entries();
+    let (audit_samples, fallback_rates) = collect_usage_audit_samples(&entries, &[]);
+    let cache_miss_audit = compute_cache_miss_audit(&audit_samples, fallback_rates.as_ref());
     let mut total_usage = TokenUsage::default();
     let mut saw_usage = false;
     let mut last_prompt_tokens: Option<u64> = None;
     let mut items = Vec::new();
-    for entry in session.all_entries() {
+    for entry in entries {
         match entry.event {
             SessionEvent::User { text, images } => {
                 let display = if !images.is_empty() && !text.contains("[Image #") {
@@ -656,6 +863,8 @@ pub fn project_session_view(
         selection: session.latest_selection().map(to_ui_selection),
         total_usage,
         last_prompt_tokens,
+        cache_warming: None,
+        cache_miss_audit,
     }
 }
 
@@ -1173,6 +1382,109 @@ mod tests {
         );
         assert!(!fresh_report.contains("谱系") && !fresh_report.contains("压缩"));
         assert!(fresh_report.contains("存储     仅内存（未持久化）"));
+
+        ctx.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn build_session_info_report_renders_cache_warming_status_and_rebilled_audit() {
+        use cordis::Service;
+        use mizar_cache_warming::CacheWarmingMode;
+        use mizar_llm::ModelCostRates;
+        use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
+
+        let ctx = Context::new();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let store = ctx.sessions().unwrap();
+        let session = store.create(None);
+        session.record_selection(Some("anthropic".into()), Some("claude-sonnet".into()), None);
+        session.append(SessionEvent::Assistant {
+            blocks: vec![ContentBlock::Text { text: "s1".into() }],
+            replay: None,
+            usage: Some(TokenUsage {
+                input_tokens: 500,
+                cache_write_tokens: Some(80_000),
+                output_tokens: 100,
+                ..Default::default()
+            }),
+        });
+        session.append(SessionEvent::usage(
+            "cache_warm",
+            "anthropic",
+            "claude-sonnet",
+            TokenUsage {
+                cache_read_tokens: Some(80_000),
+                output_tokens: 1,
+                ..Default::default()
+            },
+            None,
+        ));
+        session.append(SessionEvent::Assistant {
+            blocks: vec![ContentBlock::Text { text: "s2".into() }],
+            replay: None,
+            usage: Some(TokenUsage {
+                input_tokens: 200,
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(80_000),
+                output_tokens: 120,
+                ..Default::default()
+            }),
+        });
+
+        let providers = vec![ProviderInfo {
+            id: "anthropic".into(),
+            name: "Anthropic".into(),
+            protocol: "anthropic-messages".into(),
+            models: vec![ModelInfo {
+                id: "claude-sonnet".into(),
+                name: "Claude Sonnet".into(),
+                cost: Some(ModelCostRates {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_read: 0.3,
+                    cache_write: 3.75,
+                    tiers: Vec::new(),
+                }),
+                ..Default::default()
+            }],
+        }];
+        let warming = CacheWarmingSessionStatus {
+            mode: CacheWarmingMode::Idle,
+            active: true,
+            next_warm_in_secs: Some(270),
+            next_warm_at_ms: None,
+            warm_count: 1,
+            total_warm_cost_usd: 0.024,
+            last_stop_reason: None,
+            last_warm_cost_usd: Some(0.024),
+            last_miss_cost_usd: Some(0.276),
+        };
+        let breakdown = ContextBreakdownSnapshot::default();
+        let report = build_session_info_report_at_with_cache(
+            &session,
+            false,
+            None,
+            200_000,
+            Some(80_200),
+            &breakdown,
+            session.header().updated_at_ms + 1_000,
+            Some(&warming),
+            &providers,
+        );
+
+        assert!(
+            report.contains("缓存续命 idle · 待命（下次 4m30s 后） · 已保活 1 次（$0.0240）"),
+            "{report}"
+        );
+        assert!(
+            report.contains("缓存审计 Cache Re-billed: 80.0k tokens · 1 次意外失效 · 额外 $0.2760 · 续命 1 次（$0.0240）"),
+            "{report}"
+        );
+
+        let view = project_session_view(&session, "ok");
+        assert_eq!(view.cache_miss_audit.cache_rebilled_tokens, 80_000);
+        assert_eq!(view.cache_miss_audit.miss_events, 1);
+        assert_eq!(view.cache_miss_audit.warm_events, 1);
 
         ctx.fiber().dispose().await;
     }
