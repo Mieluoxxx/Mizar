@@ -158,6 +158,74 @@ pub enum CacheRetention {
     Long,
 }
 
+/// 模型请求来源归属，用于策略分流（如仅对主会话轮次启用缓存预热、子代理跳过自动标题等）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestOrigin {
+    SessionTurn {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        turn: u64,
+        step: usize,
+    },
+    Compaction,
+    SessionTitle,
+    CacheWarm,
+    Subagent,
+    Custom(String),
+}
+
+impl Default for RequestOrigin {
+    fn default() -> Self {
+        Self::Custom(String::new())
+    }
+}
+
+impl RequestOrigin {
+    pub fn is_session_turn(&self) -> bool {
+        matches!(self, Self::SessionTurn { .. })
+    }
+}
+
+/// 模型 Prompt Cache 保留时长配置（单位：秒）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PromptCacheLifetime {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long: Option<u64>,
+}
+
+impl PromptCacheLifetime {
+    pub fn default_retention(&self) -> Option<CacheRetention> {
+        (self.long.is_some() && self.short.is_none()).then_some(CacheRetention::Long)
+    }
+}
+
+/// 分段计费阶梯（当 prompt token 数严格大于 `input_tokens_above` 时生效，单位：美元 / 1M tokens）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ModelCostTier {
+    pub input_tokens_above: u64,
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+/// 模型单价元数据（单位：美元 / 1M tokens）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ModelCostRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<ModelCostTier>,
+}
+
 /// 会话亲和路由请求头格式。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -515,8 +583,8 @@ impl StreamChunk {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -528,6 +596,12 @@ pub struct ModelInfo {
     pub reasoning_efforts: Vec<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCostRates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<PromptCacheLifetime>,
+    #[serde(default)]
+    pub force_adaptive_thinking: bool,
 }
 
 impl ModelInfo {
@@ -537,8 +611,8 @@ impl ModelInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ProviderInfo {
     pub id: String,
     pub name: String,
@@ -627,10 +701,7 @@ mod tests {
         let undeclared = ModelInfo {
             id: "m1".into(),
             name: "M1".into(),
-            context_window: None,
-            max_tokens: None,
-            reasoning_efforts: Vec::new(),
-            input: Vec::new(),
+            ..Default::default()
         };
         assert!(undeclared.supports_images());
 
@@ -645,5 +716,90 @@ mod tests {
             ..undeclared
         };
         assert!(vision.supports_images());
+    }
+
+    #[test]
+    fn request_origin_default_helper_and_serde_roundtrip() {
+        assert_eq!(
+            RequestOrigin::default(),
+            RequestOrigin::Custom(String::new())
+        );
+        assert!(!RequestOrigin::default().is_session_turn());
+
+        let turn = RequestOrigin::SessionTurn {
+            session_id: "sess-1".into(),
+            turn: 3,
+            step: 2,
+        };
+        assert!(turn.is_session_turn());
+
+        for origin in [
+            turn,
+            RequestOrigin::Compaction,
+            RequestOrigin::SessionTitle,
+            RequestOrigin::CacheWarm,
+            RequestOrigin::Subagent,
+            RequestOrigin::Custom("bridge".into()),
+        ] {
+            let json = serde_json::to_string(&origin).unwrap();
+            let back: RequestOrigin = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, origin);
+        }
+    }
+
+    #[test]
+    fn model_info_metadata_dtos_roundtrip_and_default_from_legacy_json() {
+        let legacy: ModelInfo = serde_json::from_str(r#"{"id":"gpt-4o","name":"GPT-4o"}"#).unwrap();
+        assert_eq!(legacy.id, "gpt-4o");
+        assert!(legacy.cost.is_none());
+        assert!(legacy.prompt_cache.is_none());
+        assert!(!legacy.force_adaptive_thinking);
+
+        let full = ModelInfo {
+            id: "claude-sonnet-5-5".into(),
+            name: "Claude Sonnet 5.5".into(),
+            context_window: Some(1_000_000),
+            max_tokens: Some(128_000),
+            reasoning_efforts: vec![ReasoningEffort::Medium, ReasoningEffort::High],
+            input: vec!["text".into(), "image".into()],
+            cost: Some(ModelCostRates {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+                tiers: vec![ModelCostTier {
+                    input_tokens_above: 200_000,
+                    input: 6.0,
+                    output: 22.5,
+                    cache_read: 0.6,
+                    cache_write: 7.5,
+                }],
+            }),
+            prompt_cache: Some(PromptCacheLifetime {
+                short: Some(300),
+                long: Some(3600),
+            }),
+            force_adaptive_thinking: true,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: ModelInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, full);
+
+        assert_eq!(
+            PromptCacheLifetime {
+                short: None,
+                long: Some(3600)
+            }
+            .default_retention(),
+            Some(CacheRetention::Long)
+        );
+        assert_eq!(
+            PromptCacheLifetime {
+                short: Some(300),
+                long: Some(3600)
+            }
+            .default_retention(),
+            None
+        );
     }
 }

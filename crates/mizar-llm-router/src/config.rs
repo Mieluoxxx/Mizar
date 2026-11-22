@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use mizar_llm::{ModelInfo, ReasoningEffort};
+use mizar_llm::{ModelCostRates, ModelCostTier, ModelInfo, PromptCacheLifetime, ReasoningEffort};
 use mizar_llm_completions::{CompletionsCompat, MaxTokensField, ThinkingFormat};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -189,6 +189,30 @@ pub struct ModelCostTierConfig {
     pub cache_write: f64,
 }
 
+impl From<&ModelCostTierConfig> for ModelCostTier {
+    fn from(c: &ModelCostTierConfig) -> Self {
+        Self {
+            input_tokens_above: c.input_tokens_above,
+            input: c.input,
+            output: c.output,
+            cache_read: c.cache_read,
+            cache_write: c.cache_write,
+        }
+    }
+}
+
+impl From<ModelCostTier> for ModelCostTierConfig {
+    fn from(t: ModelCostTier) -> Self {
+        Self {
+            input_tokens_above: t.input_tokens_above,
+            input: t.input,
+            output: t.output,
+            cache_read: t.cache_read,
+            cache_write: t.cache_write,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ModelCostConfig {
@@ -200,6 +224,30 @@ pub struct ModelCostConfig {
     pub tiers: Vec<ModelCostTierConfig>,
 }
 
+impl From<&ModelCostConfig> for ModelCostRates {
+    fn from(c: &ModelCostConfig) -> Self {
+        Self {
+            input: c.input,
+            output: c.output,
+            cache_read: c.cache_read,
+            cache_write: c.cache_write,
+            tiers: c.tiers.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<ModelCostRates> for ModelCostConfig {
+    fn from(r: ModelCostRates) -> Self {
+        Self {
+            input: r.input,
+            output: r.output,
+            cache_read: r.cache_read,
+            cache_write: r.cache_write,
+            tiers: r.tiers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PromptCacheConfig {
@@ -209,7 +257,25 @@ pub struct PromptCacheConfig {
 
 impl PromptCacheConfig {
     pub fn default_retention(&self) -> Option<mizar_llm::CacheRetention> {
-        (self.long.is_some() && self.short.is_none()).then_some(mizar_llm::CacheRetention::Long)
+        PromptCacheLifetime::from(self).default_retention()
+    }
+}
+
+impl From<&PromptCacheConfig> for PromptCacheLifetime {
+    fn from(c: &PromptCacheConfig) -> Self {
+        Self {
+            short: c.short,
+            long: c.long,
+        }
+    }
+}
+
+impl From<PromptCacheLifetime> for PromptCacheConfig {
+    fn from(l: PromptCacheLifetime) -> Self {
+        Self {
+            short: l.short,
+            long: l.long,
+        }
     }
 }
 
@@ -249,8 +315,15 @@ impl From<ModelInfo> for RouterModelConfig {
             name: Some(info.name),
             reasoning: (!info.reasoning_efforts.is_empty()).then_some(true),
             reasoning_efforts: info.reasoning_efforts,
+            input: info.input,
+            cost: info.cost.map(Into::into),
+            prompt_cache: info.prompt_cache.map(Into::into),
             context_window: info.context_window,
             max_tokens: info.max_tokens,
+            compat: info.force_adaptive_thinking.then(|| CompatConfig {
+                force_adaptive_thinking: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -491,6 +564,17 @@ impl RouterModelConfig {
     }
 
     pub fn to_model_info(&self) -> ModelInfo {
+        self.to_model_info_with_compat(None)
+    }
+
+    /// 结合提供方级 `compat` 兜底生成纯模型目录快照（单模型 `compat` 优先）。
+    pub fn to_model_info_with_compat(&self, provider_compat: Option<&CompatConfig>) -> ModelInfo {
+        let force_adaptive_thinking = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.force_adaptive_thinking)
+            .or_else(|| provider_compat.and_then(|c| c.force_adaptive_thinking))
+            .unwrap_or(false);
         ModelInfo {
             id: self.id.clone(),
             name: self.effective_name().to_string(),
@@ -498,6 +582,9 @@ impl RouterModelConfig {
             max_tokens: self.max_tokens,
             reasoning_efforts: self.supported_efforts(),
             input: self.input.clone(),
+            cost: self.cost.as_ref().map(Into::into),
+            prompt_cache: self.prompt_cache.as_ref().map(Into::into),
+            force_adaptive_thinking,
         }
     }
 }
@@ -762,5 +849,74 @@ fn normalize_raw_provider(provider_id: &str, raw: RawProviderRouteConfig) -> Pro
         headers: raw.headers,
         models: raw.models,
         model_overrides: raw.model_overrides,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_model_info_propagates_cost_prompt_cache_and_adaptive_thinking() {
+        let model = RouterModelConfig {
+            id: "claude-sonnet".into(),
+            name: Some("Claude Sonnet".into()),
+            input: vec!["text".into(), "image".into()],
+            cost: Some(ModelCostConfig {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+                tiers: vec![ModelCostTierConfig {
+                    input_tokens_above: 200_000,
+                    input: 6.0,
+                    output: 22.5,
+                    cache_read: 0.6,
+                    cache_write: 7.5,
+                }],
+            }),
+            prompt_cache: Some(PromptCacheConfig {
+                short: Some(300),
+                long: Some(3600),
+            }),
+            context_window: Some(1_000_000),
+            max_tokens: Some(64_000),
+            ..Default::default()
+        };
+
+        let provider_compat = CompatConfig {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        };
+        let inherited = model.to_model_info_with_compat(Some(&provider_compat));
+        assert!(inherited.force_adaptive_thinking);
+        assert_eq!(
+            inherited.prompt_cache,
+            Some(PromptCacheLifetime {
+                short: Some(300),
+                long: Some(3600),
+            })
+        );
+        assert_eq!(inherited.cost.as_ref().unwrap().tiers.len(), 1);
+        assert_eq!(
+            inherited.cost.as_ref().unwrap().tiers[0].input_tokens_above,
+            200_000
+        );
+
+        let mut model_override = model.clone();
+        model_override.compat = Some(CompatConfig {
+            force_adaptive_thinking: Some(false),
+            ..Default::default()
+        });
+        let overridden = model_override.to_model_info_with_compat(Some(&provider_compat));
+        assert!(!overridden.force_adaptive_thinking);
+
+        let back = RouterModelConfig::from(inherited);
+        assert_eq!(back.cost, model.cost);
+        assert_eq!(back.prompt_cache, model.prompt_cache);
+        assert_eq!(
+            back.compat.and_then(|c| c.force_adaptive_thinking),
+            Some(true)
+        );
     }
 }

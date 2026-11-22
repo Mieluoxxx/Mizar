@@ -38,6 +38,7 @@ impl LlmAdapter for MockAdapter {
                 max_tokens: Some(4096),
                 reasoning_efforts: Vec::new(),
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }
