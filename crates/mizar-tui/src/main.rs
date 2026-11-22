@@ -56,7 +56,7 @@ use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_tools_coding::CodingToolsPreset;
 use mizar_tui::exec::{ExecConfig, ExecOutputFormat, resolve_exec_prompt, run_exec_cli};
-use mizar_tui::update::{current_version, is_version_check_disabled, run_update_cli};
+use mizar_tui::update::{current_version, run_update_cli, should_check_for_updates_at_startup};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
     format_resume_command, run_tui_with_summary,
@@ -648,7 +648,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tui_cfg.resume_session = cli.resume_session;
     tui_cfg.restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
-    tui_cfg.check_for_updates = !is_version_check_disabled();
+    tui_cfg.check_for_updates = should_check_for_updates_at_startup();
     if cli.inline {
         tui_cfg.screen_mode = ScreenMode::Inline;
     }

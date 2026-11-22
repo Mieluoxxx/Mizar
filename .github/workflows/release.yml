@@ -67,6 +67,32 @@ jobs:
           set -euo pipefail
           gh api "repos/${REPO}/git/ref/tags/${TAG}" > /dev/null
 
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.meta.outputs.tag }}
+
+      - name: Verify Cargo.toml version matches release tag
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^version[[:space:]]*=[[:space:]]*"/ {
+              sub(/^version[[:space:]]*=[[:space:]]*"/, "")
+              sub(/".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          if [ "$cargo_version" != "$EXPECTED_VERSION" ]; then
+            echo "Version mismatch: tag '${TAG}' expects Cargo.toml [workspace.package].version='${EXPECTED_VERSION}', found '${cargo_version}'" >&2
+            echo "Please bump [workspace.package].version in Cargo.toml and refresh Cargo.lock before tagging." >&2
+            exit 1
+          fi
+
   build:
     needs: prepare
     strategy:
@@ -109,7 +135,7 @@ jobs:
 
       - name: Build release binary
         env:
-          MIZAR_VERSION: ${{ needs.prepare.outputs.version }}
+          MIZAR_RELEASE_BUILD: "1"
         run: cargo build --release --locked --target "${{ matrix.target }}" -p mizar-tui --bin mizar
 
       - name: Verify built binary
