@@ -12,6 +12,7 @@ mod session_persistence_e2e;
     feature = "coding",
     feature = "compaction",
     feature = "session-title",
+    feature = "subagent",
     feature = "trajectory"
 ))]
 mod spine_plugins;

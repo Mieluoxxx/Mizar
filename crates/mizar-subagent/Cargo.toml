@@ -1,0 +1,33 @@
+[package]
+name = "mizar-subagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UNIX 进程式单层 Subagent 调度工具插件：子会话谱系、取消级联、严格深度 1 护栏与只读并发扇出"
+
+[lints]
+workspace = true
+
+[dependencies]
+cordis = { workspace = true }
+mizar-agent-loop = { workspace = true }
+mizar-llm = { workspace = true }
+mizar-session = { workspace = true }
+mizar-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+mizar-codemode = { workspace = true }
+mizar-recall = { workspace = true }
+mizar-session-sqlite = { workspace = true }
+mizar-session-title = { workspace = true }
+mizar-system-prompt = { workspace = true }
+mizar-tool-fs = { workspace = true }
+mizar-tool-time = { workspace = true }
+mizar-tools-coding = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

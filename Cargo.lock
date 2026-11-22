@@ -1547,6 +1547,7 @@ dependencies = [
  "mizar-session-sqlite",
  "mizar-session-title",
  "mizar-skills",
+ "mizar-subagent",
  "mizar-system-prompt",
  "mizar-tool-fs",
  "mizar-tool-search",
@@ -1862,6 +1863,31 @@ dependencies = [
  "mizar-tools",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-subagent"
+version = "0.1.0"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-codemode",
+ "mizar-llm",
+ "mizar-recall",
+ "mizar-session",
+ "mizar-session-sqlite",
+ "mizar-session-title",
+ "mizar-system-prompt",
+ "mizar-tool-fs",
+ "mizar-tool-time",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
 ]
