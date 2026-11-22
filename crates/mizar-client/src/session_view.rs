@@ -966,6 +966,7 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
+                    ..Default::default()
                 },
                 ModelInfo {
                     id: "mayoru-messages/claude-sonnet-5-5".to_string(),
@@ -974,6 +975,7 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
+                    ..Default::default()
                 },
             ],
         }];

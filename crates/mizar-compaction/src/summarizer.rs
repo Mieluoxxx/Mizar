@@ -4,7 +4,7 @@
 use futures::StreamExt;
 use mizar_llm::{
     BlockAssembler, ContentBlock, FinishReason, GenerateOptions, LlmError, LlmErrorCode,
-    LlmRuntime, Message, ReasoningEffort, StreamChunk, ToolSchema,
+    LlmRuntime, Message, ReasoningEffort, RequestOrigin, StreamChunk, ToolSchema,
 };
 use mizar_session::{SessionEntry, SessionEvent};
 use tokio_util::sync::CancellationToken;
@@ -167,6 +167,8 @@ where
         session_id: params.session_id.clone(),
         cache_retention: None,
         cancel: params.cancel.clone(),
+        origin: RequestOrigin::Compaction,
+        disable_continuation: false,
     };
 
     run_summary_stream_with_reasoning_fallback(params.llm, opts, true, on_progress).await
@@ -213,6 +215,8 @@ where
         session_id: None,
         cache_retention: None,
         cancel: params.cancel.clone(),
+        origin: RequestOrigin::Compaction,
+        disable_continuation: false,
     };
 
     run_summary_stream_with_reasoning_fallback(params.llm, opts, false, on_progress).await

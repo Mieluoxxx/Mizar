@@ -1410,6 +1410,7 @@ mod tests {
                         ReasoningEffort::High,
                     ],
                     input: Vec::new(),
+                    ..Default::default()
                 },
                 ModelInfo {
                     id: "model-all".into(),
@@ -1418,6 +1419,7 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
+                    ..Default::default()
                 },
             ],
         }];
@@ -2081,6 +2083,7 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: vec!["text".into()],
+                    ..Default::default()
                 },
                 ModelInfo {
                     id: "vision".into(),
@@ -2089,6 +2092,7 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: vec!["text".into(), "image".into()],
+                    ..Default::default()
                 },
             ],
         }];
@@ -2403,6 +2407,7 @@ mod tests {
                     max_tokens: Some(16_384),
                     reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
                     input: Vec::new(),
+                    ..Default::default()
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
@@ -2411,6 +2416,7 @@ mod tests {
                     max_tokens: Some(4_096),
                     reasoning_efforts: vec![ReasoningEffort::Low],
                     input: Vec::new(),
+                    ..Default::default()
                 },
             ],
         }]

@@ -9,6 +9,7 @@ use futures::StreamExt;
 use mizar_agent_loop::{AgentTurnInputEvent, EVENT_AGENT_TURN_INPUT};
 use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, LlmContextExt, LlmError, ReasoningEffort,
+    RequestOrigin,
 };
 use mizar_session::{Session, SessionContextExt, TitleSource};
 use thiserror::Error;
@@ -319,6 +320,8 @@ impl SessionTitleRuntime {
             session_id: None,
             cache_retention: None,
             cancel: params.cancel.clone(),
+            origin: RequestOrigin::SessionTitle,
+            disable_continuation: false,
         };
 
         let mut stream = llm.stream(opts)?;

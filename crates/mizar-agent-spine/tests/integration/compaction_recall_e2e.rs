@@ -35,6 +35,7 @@ impl LlmAdapter for SummaryMockAdapter {
                 max_tokens: Some(4_096),
                 reasoning_efforts: vec![],
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }

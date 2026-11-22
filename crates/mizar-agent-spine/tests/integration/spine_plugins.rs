@@ -64,6 +64,7 @@ impl LlmAdapter for SimpleReplyAdapter {
                 max_tokens: Some(1_024),
                 reasoning_efforts: vec![],
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }

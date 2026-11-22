@@ -56,6 +56,7 @@ impl LlmAdapter for RecordingAdapter {
                 max_tokens: Some(4_096),
                 reasoning_efforts: vec![ReasoningEffort::Off, ReasoningEffort::Medium],
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }
@@ -885,6 +886,7 @@ async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
                     max_tokens: Some(2_000),
                     reasoning_efforts: vec![ReasoningEffort::Off],
                     input: Vec::new(),
+                    ..Default::default()
                 }],
             })
         }

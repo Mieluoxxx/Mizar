@@ -206,6 +206,7 @@ pub(super) fn spawn_agent_run_input(
         temperature: None,
         reasoning_effort: app.reasoning_effort,
         images: Vec::new(),
+        ..Default::default()
     };
     let tx = loop_tx.clone();
     tokio::spawn(async move {

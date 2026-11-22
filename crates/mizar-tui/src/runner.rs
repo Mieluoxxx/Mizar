@@ -1783,6 +1783,7 @@ mod tests {
                         max_tokens: Some(4_096),
                         reasoning_efforts: vec![ReasoningEffort::Off],
                         input: Vec::new(),
+                        ..Default::default()
                     }],
                 })
             }

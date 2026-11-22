@@ -643,6 +643,7 @@ mod tests {
                             max_tokens: None,
                             reasoning_efforts: Vec::new(),
                             input: vec!["text".into()],
+                            ..Default::default()
                         },
                         ModelInfo {
                             id: "vision-m".into(),
@@ -651,6 +652,7 @@ mod tests {
                             max_tokens: None,
                             reasoning_efforts: Vec::new(),
                             input: vec!["text".into(), "image".into()],
+                            ..Default::default()
                         },
                     ],
                 })

@@ -17,7 +17,7 @@ pub use inbox::{
 };
 use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmContextExt, LlmError,
-    LlmErrorCode, Message, ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
+    LlmErrorCode, Message, ReasoningEffort, RequestOrigin, StreamChunk, TokenUsage, ToolCall,
 };
 use mizar_session::{Session, SessionEvent, SessionTraceEvent, TraceSeverity};
 use mizar_system_prompt::SystemPromptContextExt;
@@ -344,6 +344,7 @@ pub struct RunOptions {
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub images: Vec<ImageAttachment>,
+    pub origin: Option<RequestOrigin>,
 }
 
 /// 单轮执行收尾报告（供 CLI / 评测精确判定收敛原因与最后一步结果）。
@@ -674,6 +675,7 @@ impl AgentLoop {
         let max_tokens = options.max_tokens.or(self.config.max_tokens);
         let temperature = options.temperature.or(self.config.temperature);
         let reasoning_effort = options.reasoning_effort.or(self.config.reasoning_effort);
+        let origin_override = options.origin;
         if !options.images.is_empty() {
             match &mut entry_input {
                 TurnInput::User { images, .. } | TurnInput::Notice { images, .. } => {
@@ -856,6 +858,14 @@ impl AgentLoop {
                 session_id: Some(session.id.clone()),
                 cache_retention: None,
                 cancel: cancel.clone(),
+                origin: origin_override
+                    .clone()
+                    .unwrap_or_else(|| RequestOrigin::SessionTurn {
+                        session_id: session.id.clone(),
+                        turn,
+                        step,
+                    }),
+                disable_continuation: false,
             }) {
                 Ok(s) => s,
                 Err(err) => {
