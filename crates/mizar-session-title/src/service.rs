@@ -9,6 +9,7 @@ use futures::StreamExt;
 use mizar_agent_loop::{AgentTurnInputEvent, EVENT_AGENT_TURN_INPUT};
 use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, LlmContextExt, LlmError, ReasoningEffort,
+    RequestOrigin,
 };
 use mizar_session::{Session, SessionContextExt, TitleSource};
 use thiserror::Error;
@@ -157,6 +158,10 @@ impl SessionTitleRuntime {
         let session = Arc::clone(&ev.session);
         let header = session.header();
         if header.title_source == Some(TitleSource::Manual) {
+            return;
+        }
+        // 子代理派生子会话绝不触发后台自动标题请求，即使未传入显式标题
+        if header.is_subagent_child() {
             return;
         }
 
@@ -319,6 +324,8 @@ impl SessionTitleRuntime {
             session_id: None,
             cache_retention: None,
             cancel: params.cancel.clone(),
+            origin: RequestOrigin::SessionTitle,
+            disable_continuation: false,
         };
 
         let mut stream = llm.stream(opts)?;
@@ -436,5 +443,137 @@ pub trait SessionTitleContextExt {
 impl SessionTitleContextExt for Context {
     fn session_title(&self) -> Result<Arc<SessionTitleRuntime>, CordisError> {
         self.service::<SessionTitleRuntime>(SERVICE_SESSION_TITLE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use futures::channel::mpsc;
+    use mizar_llm::{BoxChunkStream, LlmAdapter, LlmRuntime, ModelInfo, ProviderInfo, StreamChunk};
+    use mizar_session::{SessionCreateOptions, SessionEvent, SessionStore};
+
+    use super::*;
+
+    struct CountingTitleAdapter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmAdapter for CountingTitleAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "real".into(),
+                name: "Real".into(),
+                protocol: "mock".into(),
+                models: vec![ModelInfo {
+                    id: "fast-title".into(),
+                    name: "Fast Title".into(),
+                    ..Default::default()
+                }],
+            })
+        }
+
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                let _ = tx.unbounded_send(Ok(StreamChunk::text("FEA｜分叉会话自动标题")));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }));
+            });
+            Box::pin(rx)
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_non_fork_child_sessions_while_keeping_forked_sessions_enabled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter = Arc::new(CountingTitleAdapter {
+            calls: Arc::clone(&calls),
+        });
+
+        let app = Context::new();
+        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        app.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let _reg = app
+            .llm()
+            .unwrap()
+            .register_adapter("real", adapter)
+            .unwrap();
+        app.plugin(SessionTitleRuntime::plugin(), SessionTitleConfig::default())
+            .await
+            .unwrap();
+
+        let sessions = app.sessions().unwrap();
+        let parent = sessions.create_with(SessionCreateOptions {
+            id: Some("parent-main".into()),
+            ..Default::default()
+        });
+        parent.append(SessionEvent::user("请调查工作区里的核心模块"));
+        let seq = parent.all_entries().last().unwrap().seq;
+
+        // 1. 非 Fork 子会话（即便 title 为 None）必须跳过后台标题生成
+        let child = sessions.create_with(SessionCreateOptions {
+            id: Some("child-subagent".into()),
+            parent_id: Some(parent.id.clone()),
+            ..Default::default()
+        });
+        child.append(SessionEvent::user("执行子任务"));
+        app.emit(
+            EVENT_AGENT_TURN_INPUT,
+            AgentTurnInputEvent {
+                session: Arc::clone(&child),
+                turn: 1,
+                provider: Some("real".into()),
+                model: Some("fast-title".into()),
+                ts_ms: child.header().created_at_ms,
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "non-fork child session must not trigger session-title LLM call"
+        );
+        assert_eq!(child.header().title.as_deref(), Some("执行子任务"));
+        assert_eq!(child.header().title_source, Some(TitleSource::Auto));
+
+        // 2. 经 fork() 派生的会话（fork_seq.is_some()）仍可正常自动生成标题
+        let forked = sessions
+            .fork(&parent.id, seq, SessionCreateOptions::default())
+            .unwrap();
+        assert_eq!(forked.header().parent_id.as_deref(), Some("parent-main"));
+        assert_eq!(forked.header().fork_seq, Some(seq));
+        app.emit(
+            EVENT_AGENT_TURN_INPUT,
+            AgentTurnInputEvent {
+                session: Arc::clone(&forked),
+                turn: 1,
+                provider: Some("real".into()),
+                model: Some("fast-title".into()),
+                ts_ms: forked.header().created_at_ms,
+            },
+        );
+
+        for _ in 0..80 {
+            if forked.header().title.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            forked
+                .header()
+                .title
+                .as_deref()
+                .is_some_and(|t| t.contains("FEA｜分叉会话自动标题"))
+        );
+
+        app.fiber().dispose().await;
     }
 }

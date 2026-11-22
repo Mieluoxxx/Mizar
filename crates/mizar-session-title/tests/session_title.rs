@@ -52,6 +52,7 @@ impl LlmAdapter for RecordingTitleAdapter {
                 max_tokens: Some(4096),
                 reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::Medium],
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }
@@ -435,6 +436,7 @@ async fn failed_or_skipped_attempt_does_not_latch_turn() {
                     max_tokens: Some(4096),
                     reasoning_efforts: vec![ReasoningEffort::Low],
                     input: Vec::new(),
+                    ..Default::default()
                 }],
             })
         }

@@ -173,6 +173,7 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
         .list_headers(&SessionListQuery {
             cwd: Some(ws.to_string_lossy().to_string()),
             limit: Some(10),
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(headers.len(), 1);

@@ -20,8 +20,8 @@ pub use config::{
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo, ProviderInfo,
-    SessionAffinityMode, detect_session_affinity_mode, push_session_affinity_headers,
+    BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, Message, ModelInfo,
+    ProviderInfo, SessionAffinityMode, detect_session_affinity_mode, push_session_affinity_headers,
 };
 use mizar_llm_completions::{CompletionsAdapter, CompletionsCompat, CompletionsConfig};
 pub use mizar_llm_http::resolve_credential;
@@ -92,23 +92,158 @@ fn error_stream(err: LlmError) -> BoxChunkStream {
     Box::pin(rx)
 }
 
-fn resolve_header_map(
+fn append_resolved_headers(
     provider: &str,
     base: &BTreeMap<String, String>,
     overlay: Option<&BTreeMap<String, String>>,
-) -> Result<Vec<(String, String)>, LlmError> {
+    dst: &mut Vec<(String, String)>,
+) -> Result<(), LlmError> {
     let mut merged = base.clone();
     if let Some(extra) = overlay {
         for (k, v) in extra {
             merged.insert(k.clone(), v.clone());
         }
     }
-    let mut out = Vec::with_capacity(merged.len());
     for (k, raw_v) in merged {
+        // 已存在同名请求头（调用方显式指定或先前已规整注入）则跳过，保证幂等且不覆盖调用方值
+        if dst
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(&k))
+        {
+            continue;
+        }
         let (val, _) = expand_pi_value(provider, &raw_v)?;
-        out.push((k, val));
+        dst.push((k, val));
     }
-    Ok(out)
+    Ok(())
+}
+
+fn strip_unsupported_images(messages: &mut [Message]) {
+    for msg in messages {
+        if let Message::User { content, images } = msg
+            && !images.is_empty()
+        {
+            let count = images.len();
+            images.clear();
+            let placeholder = if count == 1 {
+                "[image omitted: target model does not support image input]".to_string()
+            } else {
+                format!("[{count} images omitted: target model does not support image input]")
+            };
+            if content.trim().is_empty() {
+                *content = placeholder;
+            } else {
+                content.push_str("\n\n");
+                content.push_str(&placeholder);
+            }
+        }
+    }
+}
+
+struct TargetRouteParams<'a> {
+    protocol: ProtocolKind,
+    adapter: Arc<dyn LlmAdapter>,
+    overlay_headers: Option<&'a BTreeMap<String, String>>,
+    base_url: Option<&'a str>,
+    compat: Option<&'a CompatConfig>,
+}
+
+impl RoutedAdapter {
+    fn resolve_target_params(&self, model: Option<&str>) -> TargetRouteParams<'_> {
+        match model.and_then(|id| self.model_routes.get(id)) {
+            Some(t) => TargetRouteParams {
+                protocol: t.protocol,
+                adapter: Arc::clone(&t.adapter),
+                overlay_headers: Some(&t.headers),
+                base_url: t.base_url.as_deref(),
+                compat: t.compat.as_ref(),
+            },
+            None => TargetRouteParams {
+                protocol: self.protocol,
+                adapter: Arc::clone(&self.inner),
+                overlay_headers: None,
+                base_url: self.base_url.as_deref(),
+                compat: self.compat.as_ref(),
+            },
+        }
+    }
+
+    fn model_supports_images(&self, model: Option<&str>) -> bool {
+        model
+            .and_then(|id| self.model_infos.iter().find(|m| m.id == id))
+            .is_none_or(ModelInfo::supports_images)
+    }
+
+    fn normalize_options_internal(
+        &self,
+        mut options: GenerateOptions,
+    ) -> (GenerateOptions, Option<LlmError>) {
+        if options.model.is_none() {
+            options.model = self.default_model.clone();
+        }
+
+        if let Some(target) = options
+            .model
+            .as_deref()
+            .and_then(|id| self.model_routes.get(id))
+        {
+            if let Some(effort) = options.reasoning_effort {
+                options.reasoning_effort = target.model_cfg.resolve_thinking_level(effort);
+            }
+            if options.max_tokens.is_none() {
+                options.max_tokens = target.model_cfg.max_tokens;
+            }
+            if options.temperature.is_none() {
+                options.temperature = target
+                    .model_cfg
+                    .effective_temperature(options.reasoning_effort);
+            }
+            if options.cache_retention.is_none()
+                && let Some(cache) = &target.model_cfg.prompt_cache
+            {
+                options.cache_retention = cache.default_retention();
+            }
+        }
+
+        if !self.model_supports_images(options.model.as_deref()) {
+            strip_unsupported_images(&mut options.messages);
+        }
+
+        let target_params = self.resolve_target_params(options.model.as_deref());
+        let header_err = append_resolved_headers(
+            &self.provider,
+            &self.provider_headers,
+            target_params.overlay_headers,
+            &mut options.headers,
+        )
+        .err();
+
+        let eff_mode = target_params
+            .compat
+            .and_then(CompatConfig::parsed_session_affinity_mode)
+            .unwrap_or_else(|| {
+                detect_session_affinity_mode(&self.provider, target_params.base_url)
+            });
+        let default_send = match target_params.protocol {
+            ProtocolKind::OpenaiResponses => true,
+            ProtocolKind::OpenaiCompletions => eff_mode == SessionAffinityMode::OpenRouter,
+            ProtocolKind::AnthropicMessages | ProtocolKind::Mock => false,
+        };
+        if target_params
+            .compat
+            .and_then(|c| c.send_session_affinity_headers)
+            .unwrap_or(default_send)
+        {
+            push_session_affinity_headers(
+                &mut options.headers,
+                eff_mode,
+                options.session_id.as_deref(),
+                target_params.protocol == ProtocolKind::OpenaiCompletions,
+            );
+        }
+
+        (options, header_err)
+    }
 }
 
 impl LlmAdapter for RoutedAdapter {
@@ -124,6 +259,10 @@ impl LlmAdapter for RoutedAdapter {
         })
     }
 
+    fn normalize_options(&self, options: GenerateOptions) -> GenerateOptions {
+        self.normalize_options_internal(options).0
+    }
+
     fn discover_models(&self) -> BoxFuture<'static, Result<Vec<ModelInfo>, LlmError>> {
         self.discover_models_with_headers(&[])
     }
@@ -136,11 +275,15 @@ impl LlmAdapter for RoutedAdapter {
             let models = self.model_infos.clone();
             return Box::pin(async move { Ok(models) });
         }
-        let mut resolved_headers =
-            match resolve_header_map(&self.provider, &self.provider_headers, None) {
-                Ok(h) => h,
-                Err(err) => return Box::pin(async move { Err(err) }),
-            };
+        let mut resolved_headers = Vec::new();
+        if let Err(err) = append_resolved_headers(
+            &self.provider,
+            &self.provider_headers,
+            None,
+            &mut resolved_headers,
+        ) {
+            return Box::pin(async move { Err(err) });
+        }
         resolved_headers.extend(extra_headers.iter().cloned());
         let out = self.ctx.waterfall(
             EVENT_ROUTER_HEADERS,
@@ -155,91 +298,26 @@ impl LlmAdapter for RoutedAdapter {
         self.inner.discover_models_with_headers(&out.headers)
     }
 
-    fn stream(&self, mut options: GenerateOptions) -> BoxChunkStream {
-        let model = options.model.clone().or_else(|| self.default_model.clone());
-        if options.model.is_none() {
-            options.model = model.clone();
+    fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+        let (mut options, header_err) = self.normalize_options_internal(options);
+        if let Some(err) = header_err {
+            return error_stream(err);
         }
 
-        let target = model.as_deref().and_then(|id| self.model_routes.get(id));
-
-        let (protocol, adapter, overlay_headers, target_base_url, target_compat) = match target {
-            Some(t) => {
-                if let Some(effort) = options.reasoning_effort {
-                    options.reasoning_effort = t.model_cfg.resolve_thinking_level(effort);
-                }
-                if options.max_tokens.is_none() {
-                    options.max_tokens = t.model_cfg.max_tokens;
-                }
-                if options.temperature.is_none() {
-                    options.temperature =
-                        t.model_cfg.effective_temperature(options.reasoning_effort);
-                }
-                if options.cache_retention.is_none()
-                    && let Some(cache) = &t.model_cfg.prompt_cache
-                {
-                    options.cache_retention = cache.default_retention();
-                }
-                (
-                    t.protocol,
-                    Arc::clone(&t.adapter),
-                    Some(&t.headers),
-                    t.base_url.as_deref(),
-                    t.compat.as_ref(),
-                )
-            }
-            None => (
-                self.protocol,
-                Arc::clone(&self.inner),
-                None,
-                self.base_url.as_deref(),
-                self.compat.as_ref(),
-            ),
-        };
-
-        let resolved_headers =
-            match resolve_header_map(&self.provider, &self.provider_headers, overlay_headers) {
-                Ok(h) => h,
-                Err(err) => return error_stream(err),
-            };
-        if !resolved_headers.is_empty() {
-            let mut combined = resolved_headers;
-            combined.append(&mut options.headers);
-            options.headers = combined;
-        }
-
-        let eff_mode = target_compat
-            .and_then(CompatConfig::parsed_session_affinity_mode)
-            .unwrap_or_else(|| detect_session_affinity_mode(&self.provider, target_base_url));
-        let default_send = match protocol {
-            ProtocolKind::OpenaiResponses => true,
-            ProtocolKind::OpenaiCompletions => eff_mode == SessionAffinityMode::OpenRouter,
-            ProtocolKind::AnthropicMessages | ProtocolKind::Mock => false,
-        };
-        if target_compat
-            .and_then(|c| c.send_session_affinity_headers)
-            .unwrap_or(default_send)
-        {
-            push_session_affinity_headers(
-                &mut options.headers,
-                eff_mode,
-                options.session_id.as_deref(),
-                protocol == ProtocolKind::OpenaiCompletions,
-            );
-        }
-
+        let target_params = self.resolve_target_params(options.model.as_deref());
+        let model = options.model.clone();
         let out = self.ctx.waterfall(
             EVENT_ROUTER_HEADERS,
             RouterHeaderInput {
                 provider: self.provider.clone(),
-                protocol,
+                protocol: target_params.protocol,
                 model,
                 headers: std::mem::take(&mut options.headers),
             },
             |input| input,
         );
         options.headers = out.headers;
-        adapter.stream(options)
+        target_params.adapter.stream(options)
     }
 }
 
@@ -362,7 +440,7 @@ fn build_routed_adapter(
     let resolved_models = route.resolved_models();
     let model_infos: Vec<ModelInfo> = resolved_models
         .iter()
-        .map(RouterModelConfig::to_model_info)
+        .map(|m| m.to_model_info_with_compat(route.compat.as_ref()))
         .collect();
     let default_model = route.default_model_id();
     let default_model_prompt_cache = default_model
@@ -857,8 +935,27 @@ mod tests {
             vec!["text".to_string(), "image".to_string()]
         );
         assert!(infos[0].models[0].supports_images());
+        assert_eq!(
+            infos[0].models[0].cost,
+            Some(mizar_llm::ModelCostRates {
+                input: 1.5,
+                output: 7.5,
+                cache_read: 0.075,
+                cache_write: 0.0,
+                tiers: Vec::new(),
+            })
+        );
+        assert!(!infos[0].models[0].force_adaptive_thinking);
         assert!(infos[0].models[1].input.is_empty());
         assert!(infos[0].models[1].supports_images());
+        assert_eq!(
+            infos[0].models[1].prompt_cache,
+            Some(mizar_llm::PromptCacheLifetime {
+                short: Some(300),
+                long: Some(3600),
+            })
+        );
+        assert!(infos[0].models[1].force_adaptive_thinking);
         assert_eq!(
             infos[0].models[0].reasoning_efforts,
             vec![
@@ -1040,5 +1137,199 @@ mod tests {
             *hook_seen_sess_hdr.lock().unwrap(),
             vec![Some("sess-route-42".into()), Some("sess-route-42".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn normalize_options_is_idempotent_and_strips_images_for_text_only_models() {
+        let seen_bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_srv = Arc::clone(&seen_bodies);
+
+        let server = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: axum::Json<serde_json::Value>| {
+                let seen = Arc::clone(&seen_srv);
+                async move {
+                    seen.lock().unwrap().push(body.0);
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, server).await;
+        });
+
+        let cfg_json = format!(
+            r#"{{
+              "providers": {{
+                "oai": {{
+                  "api": "openai-completions",
+                  "apiKey": "k-test",
+                  "baseUrl": "http://{addr}/v1",
+                  "headers": {{ "x-prov": "p-val" }},
+                  "compat": {{
+                    "sendSessionAffinityHeaders": true,
+                    "sessionAffinityFormat": "openai",
+                    "forceAdaptiveThinking": true
+                  }},
+                  "models": [
+                    {{
+                      "id": "text-only",
+                      "input": ["text"],
+                      "maxTokens": 4096,
+                      "promptCache": {{ "long": 3600 }},
+                      "samplingParams": {{ "temperature": 0.25 }},
+                      "headers": {{ "x-model": "m-val" }},
+                      "cost": {{ "input": 1.0, "output": 2.0, "cacheRead": 0.1, "cacheWrite": 0.0 }}
+                    }},
+                    {{
+                      "id": "vision-model",
+                      "input": ["text", "image"]
+                    }}
+                  ]
+                }}
+              }}
+            }}"#
+        );
+
+        let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
+        let route = cfg.providers.get("oai").unwrap().clone();
+        let app = Context::new();
+        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
+
+        // 1. 直接验证 RoutedAdapter::normalize_options 幂等性与元数据传播
+        let adapter = build_routed_adapter(&app, "oai", &route);
+        let infos = adapter.info().unwrap().models;
+        assert!(!infos[0].supports_images());
+        assert!(infos[0].force_adaptive_thinking);
+        assert!(infos[0].cost.is_some());
+        assert!(infos[1].supports_images());
+
+        let raw = GenerateOptions {
+            provider: Some("oai".into()),
+            session_id: Some("sess-idem".into()),
+            headers: vec![("x-prov".into(), "caller-wins".into())],
+            messages: vec![
+                Message::user_with_images(
+                    "inspect this",
+                    vec![mizar_llm::ImageAttachment::new("image/png", "AQID")],
+                ),
+                Message::user_with_images(
+                    "",
+                    vec![
+                        mizar_llm::ImageAttachment::new("image/png", "AQID"),
+                        mizar_llm::ImageAttachment::new("image/jpeg", "/9j/"),
+                    ],
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let once = adapter.normalize_options(raw);
+        let twice = adapter.normalize_options(once.clone());
+        assert_eq!(once.model, twice.model);
+        assert_eq!(once.model.as_deref(), Some("text-only"));
+        assert_eq!(once.max_tokens, Some(4096));
+        assert_eq!(once.temperature, Some(0.25));
+        assert_eq!(once.cache_retention, Some(mizar_llm::CacheRetention::Long));
+        assert_eq!(once.headers, twice.headers);
+        assert_eq!(once.messages, twice.messages);
+        assert!(once.messages[0].images().is_empty());
+        assert_eq!(
+            once.messages[0].text_content(),
+            "inspect this\n\n[image omitted: target model does not support image input]"
+        );
+        assert!(once.messages[1].images().is_empty());
+        assert_eq!(
+            once.messages[1].text_content(),
+            "[2 images omitted: target model does not support image input]"
+        );
+        // 调用方显式设置的 x-prov 不被覆盖且不重复
+        assert_eq!(
+            once.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("x-prov"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            once.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("x-prov"))
+                .map(|(_, v)| v.as_str()),
+            Some("caller-wins")
+        );
+
+        // 2. 通过 LlmRuntime::stream 验证 llm/stream 与 llm/after-response 快照一致反映剥离后的载荷
+        let waterfall_images = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let wf_cap = Arc::clone(&waterfall_images);
+        app.on_waterfall(
+            mizar_llm::EVENT_LLM_STREAM,
+            move |opts: GenerateOptions, next: Next<GenerateOptions, BoxChunkStream>| {
+                let imgs: usize = opts.messages.iter().map(|m| m.images().len()).sum();
+                wf_cap.lock().unwrap().push(imgs);
+                next.call(opts)
+            },
+        )
+        .unwrap();
+
+        let after_events = Arc::new(Mutex::new(Vec::<mizar_llm::LlmAfterResponseEvent>::new()));
+        let after_cap = Arc::clone(&after_events);
+        app.on(
+            mizar_llm::EVENT_LLM_AFTER_RESPONSE,
+            move |ev: &mizar_llm::LlmAfterResponseEvent| {
+                after_cap.lock().unwrap().push(ev.clone());
+            },
+        )
+        .unwrap();
+
+        let llm = app.llm().unwrap();
+        let mut s_text = llm
+            .stream(GenerateOptions {
+                provider: Some("oai".into()),
+                model: Some("text-only".into()),
+                messages: vec![Message::user_with_images(
+                    "look",
+                    vec![mizar_llm::ImageAttachment::new("image/png", "AQID")],
+                )],
+                ..Default::default()
+            })
+            .unwrap();
+        while let Some(c) = s_text.next().await {
+            let _ = c.unwrap();
+        }
+
+        let mut s_vision = llm
+            .stream(GenerateOptions {
+                provider: Some("oai".into()),
+                model: Some("vision-model".into()),
+                messages: vec![Message::user_with_images(
+                    "look",
+                    vec![mizar_llm::ImageAttachment::new("image/png", "AQID")],
+                )],
+                ..Default::default()
+            })
+            .unwrap();
+        while let Some(c) = s_vision.next().await {
+            let _ = c.unwrap();
+        }
+
+        assert_eq!(*waterfall_images.lock().unwrap(), vec![0, 1]);
+        let evs = after_events.lock().unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(evs[0].request.messages[0].images().is_empty());
+        assert_eq!(evs[1].request.messages[0].images().len(), 1);
+
+        let bodies = seen_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0]["messages"][0]["content"].is_string());
+        assert!(bodies[1]["messages"][0]["content"].is_array());
     }
 }

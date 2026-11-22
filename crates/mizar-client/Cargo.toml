@@ -16,6 +16,7 @@ futures = { workspace = true }
 image = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-agent-spine = { workspace = true }
+mizar-cache-warming = { workspace = true }
 mizar-client-core = { workspace = true }
 mizar-instructions = { workspace = true }
 mizar-llm = { workspace = true }
@@ -23,6 +24,7 @@ mizar-mcp = { workspace = true }
 mizar-session = { workspace = true }
 mizar-session-title = { workspace = true }
 mizar-skills = { workspace = true }
+mizar-subagent = { workspace = true }
 mizar-tools = { workspace = true }
 mizar-tools-coding = { workspace = true }
 mizar-trajectory = { workspace = true }

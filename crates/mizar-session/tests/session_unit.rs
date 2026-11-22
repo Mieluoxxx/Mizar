@@ -6,7 +6,7 @@ use mizar_llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 use mizar_session::{
     EVENT_SESSION_TITLE_UPDATED, EntryVisibility, LoadedSession, PersistenceError,
     PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionContextExt, SessionCreateOptions,
-    SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin,
     SessionPersistence, SessionPersistenceHandle, SessionStore, SessionTitleUpdatedPayload,
     SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, derive_session_title,
     repair_dangling_tool_calls,
@@ -312,6 +312,7 @@ async fn hydrates_repairs_dangling_tools_and_forks_via_seam() {
         .list_headers(&SessionListQuery {
             cwd: Some("/repo/app".into()),
             limit: Some(10),
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(list.len(), 2);
@@ -885,6 +886,195 @@ async fn repair_skips_past_unparsed_tail_seq_and_inspect_readonly_does_not_mutat
         loaded_sess.compare_and_set_title_auto(Some("auto-one"), "stale-auto", true),
         Err(Some("manual-override".into()))
     );
+
+    app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn usage_event_is_log_only_excluded_from_derived_messages_and_roundtrips_json() {
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+    let s = store.create(None);
+
+    s.append(SessionEvent::user("hi"));
+    let usage = TokenUsage {
+        input_tokens: 120,
+        output_tokens: 1,
+        cache_read_tokens: Some(4_000),
+        cache_write_tokens: Some(0),
+        total_tokens: Some(4_121),
+        reasoning_tokens: None,
+    };
+    let u_ev = SessionEvent::usage(
+        "cache_warm",
+        "anthropic",
+        "claude-sonnet-4-6",
+        usage,
+        Some("ttl=5m".into()),
+    );
+    assert_eq!(u_ev.visibility(), EntryVisibility::LogOnly);
+    assert_eq!(u_ev.kind_name(), "usage");
+    s.append(u_ev.clone());
+    s.append(SessionEvent::usage(
+        "session_title",
+        "openai",
+        "gpt-4o-mini",
+        usage,
+        None,
+    ));
+
+    // 只进入 all_entries，不进入表面 log()/visible_log()，也不进入 derive_messages()
+    assert_eq!(s.log().len(), 1);
+    assert_eq!(s.visible_log().len(), 1);
+    assert_eq!(s.all_entries().len(), 3);
+    assert_eq!(s.header().surface_count, 1);
+    assert_eq!(s.header().event_count, 3);
+    let msgs = s.derive_messages();
+    assert_eq!(msgs, vec![Message::user("hi")]);
+
+    let json = serde_json::to_string(&u_ev).unwrap();
+    assert!(json.contains("\"type\":\"usage\""));
+    assert!(json.contains("\"note\":\"ttl=5m\""));
+    let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, u_ev);
+
+    let no_note = SessionEvent::usage("subagent", "openai", "gpt-5", usage, None);
+    let no_note_json = serde_json::to_string(&no_note).unwrap();
+    assert!(!no_note_json.contains("\"note\""));
+    assert_eq!(
+        serde_json::from_str::<SessionEvent>(&no_note_json).unwrap(),
+        no_note
+    );
+
+    app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn list_headers_exclude_subagents_filters_only_non_fork_children() {
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+
+    let root = store.create_with(SessionCreateOptions {
+        id: Some("root".into()),
+        cwd: Some("/repo/ws".into()),
+        ..Default::default()
+    });
+    root.append(SessionEvent::user("hello"));
+    let forked = store
+        .fork(
+            "root",
+            1,
+            SessionCreateOptions {
+                id: Some("forked".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let child = store.create_with(SessionCreateOptions {
+        id: Some("child".into()),
+        cwd: Some("/repo/ws".into()),
+        parent_id: Some("root".into()),
+        ..Default::default()
+    });
+    assert!(child.header().is_subagent_child());
+    assert!(!root.header().is_subagent_child());
+    assert!(!forked.header().is_subagent_child());
+
+    let filtered = store
+        .list_headers(&SessionListQuery {
+            cwd: Some("/repo/ws".into()),
+            limit: Some(10),
+            exclude_subagents: true,
+        })
+        .unwrap();
+    let ids: Vec<&str> = filtered.iter().map(|h| h.id.as_str()).collect();
+    assert!(!ids.contains(&"child"), "{ids:?}");
+    assert!(ids.contains(&"root") && ids.contains(&"forked"), "{ids:?}");
+
+    app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn explicit_session_origin_overrides_fork_seq_inference_and_repairs_memory_dangling() {
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+
+    let root = store.create_with(SessionCreateOptions {
+        id: Some("root-orig".into()),
+        cwd: Some("/repo/orig".into()),
+        ..Default::default()
+    });
+    root.append(SessionEvent::user("start"));
+    root.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::ToolCall {
+            id: "call_mem_hang".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }],
+        replay: None,
+        usage: None,
+    });
+
+    // fork 默认标记为 SessionOrigin::User
+    let user_fork = store
+        .fork(
+            "root-orig",
+            1,
+            SessionCreateOptions {
+                id: Some("user-fork".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(user_fork.header().origin, Some(SessionOrigin::User));
+    assert!(!user_fork.header().is_subagent_child());
+
+    // 显式标注 SessionOrigin::Subagent 且带 fork_seq 时，仍准确判定为子代理
+    let forked_subagent = store
+        .fork(
+            "root-orig",
+            1,
+            SessionCreateOptions {
+                id: Some("subagent-fork".into()),
+                origin: Some(SessionOrigin::Subagent),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        forked_subagent.header().origin,
+        Some(SessionOrigin::Subagent)
+    );
+    assert!(forked_subagent.header().is_subagent_child());
+
+    // 内存会话悬挂 ToolCall 修复且幂等
+    assert_eq!(root.repair_dangling_tool_calls(), 1);
+    assert_eq!(root.repair_dangling_tool_calls(), 0);
+    assert!(root.log().iter().any(|e| {
+        matches!(
+            &e.event,
+            SessionEvent::ToolResult {
+                tool_call_id,
+                is_error: true,
+                content,
+                ..
+            } if tool_call_id == "call_mem_hang" && content.contains("TOOL_OUTCOME_UNKNOWN")
+        )
+    }));
+
+    let filtered = store
+        .list_headers(&SessionListQuery {
+            cwd: Some("/repo/orig".into()),
+            limit: Some(10),
+            exclude_subagents: true,
+        })
+        .unwrap();
+    let ids: Vec<&str> = filtered.iter().map(|h| h.id.as_str()).collect();
+    assert!(!ids.contains(&"subagent-fork"), "{ids:?}");
+    assert!(ids.contains(&"root-orig") && ids.contains(&"user-fork"));
 
     app.fiber().dispose().await;
 }

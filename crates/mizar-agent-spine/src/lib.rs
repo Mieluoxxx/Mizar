@@ -19,6 +19,12 @@ pub use config::{
 };
 #[cfg(feature = "router")]
 pub use config::{LlmRouteError, ResolvedLlmRouter};
+#[cfg(feature = "cache-warming")]
+pub use mizar_cache_warming::{
+    CacheWarmingConfig, CacheWarmingContextExt, CacheWarmingError, CacheWarmingMode,
+    CacheWarmingNoticeEvent, CacheWarmingRuntime, EVENT_CACHE_WARMING_NOTICE,
+    SERVICE_CACHE_WARMING,
+};
 #[cfg(feature = "compaction")]
 pub use mizar_compaction::{
     CompactionConfig, CompactionContextExt, CompactionEndEvent, CompactionError, CompactionOutcome,
@@ -40,6 +46,14 @@ pub use mizar_session_title::{
     DEFAULT_REFRESH_INTERVAL_TURNS, ParsedModelTitle, SERVICE_SESSION_TITLE, SessionTitleConfig,
     SessionTitleContextExt, SessionTitleError, SessionTitleRuntime, SessionTitleType,
     format_session_title, parse_model_ref, parse_model_title_output,
+};
+#[cfg(feature = "subagent")]
+pub use mizar_subagent::{
+    DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_MAX_STEPS_CAP,
+    DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS, DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS,
+    DEFAULT_SUBAGENT_TIMEOUT_SECS, EVENT_SUBAGENT_STATE, SERVICE_SUBAGENT, SUBAGENT_TOOL_NAME,
+    SubagentConfig, SubagentContextExt, SubagentError, SubagentMode, SubagentPlugin,
+    SubagentRunStatus, SubagentRuntime, SubagentStateEvent, SubagentTaskSnapshot,
 };
 pub use plugins::{
     EVENT_SPINE_PLUGINS_CHANGE, KNOWN_HOST_EXTENSION_IDS, SERVICE_SPINE_PLUGINS, SpineModuleStatus,
@@ -118,6 +132,12 @@ pub struct AgentSpineConfig {
     /// 是否启用基于对话主题的会话标题自动生成服务（默认开启）。
     #[cfg(feature = "session-title")]
     pub session_title: Option<SessionTitleConfig>,
+    /// 是否启用 Prompt Cache 后台定时续命保活服务（默认开启）。
+    #[cfg(feature = "cache-warming")]
+    pub cache_warming: Option<CacheWarmingConfig>,
+    /// 是否启用 UNIX 式单层 Subagent 调度工具（默认开启）。
+    #[cfg(feature = "subagent")]
+    pub subagent: Option<SubagentConfig>,
     /// 可选：会话 SQLite 持久化数据库路径；为 `None` 时保持纯内存模式（适合测试）。
     pub session_db_path: Option<PathBuf>,
     /// 启动阶段屏蔽的内置可选模块 ID 列表（如 `mcp`、`codemode` 等）。
@@ -148,6 +168,10 @@ impl AgentSpineConfig {
             recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
             session_title: Some(SessionTitleConfig::default()),
+            #[cfg(feature = "cache-warming")]
+            cache_warming: Some(CacheWarmingConfig::default()),
+            #[cfg(feature = "subagent")]
+            subagent: Some(SubagentConfig::default()),
             session_db_path: None,
             disabled_plugins: Vec::new(),
         }
@@ -182,6 +206,10 @@ impl AgentSpineConfig {
             recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
             session_title: Some(SessionTitleConfig::default()),
+            #[cfg(feature = "cache-warming")]
+            cache_warming: Some(CacheWarmingConfig::default()),
+            #[cfg(feature = "subagent")]
+            subagent: Some(SubagentConfig::default()),
             session_db_path: None,
             disabled_plugins: Vec::new(),
         }
@@ -276,7 +304,9 @@ impl Plugin for AgentSpinePlugin {
                     feature = "coding",
                     feature = "compaction",
                     feature = "session-title",
-                    feature = "trajectory"
+                    feature = "cache-warming",
+                    feature = "trajectory",
+                    feature = "subagent"
                 )),
                 allow(unused_mut)
             )]
@@ -408,6 +438,32 @@ impl Plugin for AgentSpinePlugin {
                         description: "后台基于用户输入生成与维护会话标题".to_string(),
                     },
                     ModuleSpec::SessionTitle(st_cfg),
+                ));
+            }
+
+            #[cfg(feature = "cache-warming")]
+            if let Some(cw_cfg) = config.cache_warming {
+                specs.push((
+                    SpineModuleMeta {
+                        id: "cache-warming".to_string(),
+                        label: "缓存续命".to_string(),
+                        description: "后台按 $0.05 期望净收益门禁维持 Prompt Cache 温度"
+                            .to_string(),
+                    },
+                    ModuleSpec::CacheWarming(cw_cfg),
+                ));
+            }
+
+            #[cfg(feature = "subagent")]
+            if let Some(sub_cfg) = config.subagent {
+                specs.push((
+                    SpineModuleMeta {
+                        id: "subagent".to_string(),
+                        label: "单层子代理".to_string(),
+                        description: "在独立子会话中执行只读并行调研或受控编辑子任务 (subagent)"
+                            .to_string(),
+                    },
+                    ModuleSpec::Subagent(sub_cfg),
                 ));
             }
 

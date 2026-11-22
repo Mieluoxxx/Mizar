@@ -6,13 +6,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, PluginDef};
+use cordis::{BoxFuture, Context, PluginDef};
 use futures::channel::mpsc;
-use mizar_agent_loop::{AgentLoopContextExt, AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_agent_loop::{
+    AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
+};
 use mizar_agent_spine::{
-    AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CompactionContextExt,
-    EVENT_SPINE_PLUGINS_CHANGE, RECALL_SEARCH_TOOL_NAME, SessionTitleContextExt,
+    AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CacheWarmingContextExt,
+    CacheWarmingMode, CacheWarmingRuntime, CompactionContextExt, EVENT_SPINE_PLUGINS_CHANGE,
+    RECALL_SEARCH_TOOL_NAME, SERVICE_CACHE_WARMING, SUBAGENT_TOOL_NAME, SessionTitleContextExt,
     SessionTitleRuntime, SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
+    SubagentContextExt, SubagentRuntime,
 };
 use mizar_compaction::CompactionRuntime;
 use mizar_llm::{
@@ -62,6 +66,7 @@ impl LlmAdapter for SimpleReplyAdapter {
                 max_tokens: Some(1_024),
                 reasoning_efforts: vec![],
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }
@@ -193,6 +198,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         "instructions",
         "recall",
         "session-title",
+        "cache-warming",
+        "subagent",
         "trajectory",
         "repeat-guard",
     ]);
@@ -246,10 +253,12 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let sessions = app.sessions().unwrap();
 
     // 1. 启动阶段全部可选模块均已跳过，工具与可选服务均未挂载
-    assert_eq!(ctrl.disabled_ids().len(), 11);
+    assert_eq!(ctrl.disabled_ids().len(), 13);
     for svc in [
         "compaction",
         "sessionTitle",
+        SERVICE_CACHE_WARMING,
+        "subagent",
         "mcp",
         "skills",
         "agentInstructions",
@@ -258,6 +267,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         assert!(
             app.get::<CompactionRuntime>(svc).is_none()
                 && app.get::<SessionTitleRuntime>(svc).is_none()
+                && app.get::<CacheWarmingRuntime>(svc).is_none()
+                && app.get::<SubagentRuntime>(svc).is_none()
                 && app.get::<McpManager>(svc).is_none()
                 && app.get::<SkillRegistry>(svc).is_none()
                 && app.get::<AgentInstructions>(svc).is_none()
@@ -318,15 +329,19 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let session = sessions.create(None);
     session.append(SessionEvent::user("hello"));
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session),
                 turn: 1,
                 step: 1,
                 provider: Some("mock".into()),
                 model: Some("mock-1".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -364,15 +379,19 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let session_after_unload = sessions.create(None);
     session_after_unload.append(SessionEvent::user("after unload"));
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session_after_unload),
                 turn: 1,
                 step: 1,
                 provider: Some("mock".into()),
                 model: Some("mock-1".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -387,15 +406,19 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(app.get::<SkillRegistry>("skills").is_some());
     assert!(app.get::<AgentInstructions>("agentInstructions").is_some());
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session_after_unload),
                 turn: 2,
                 step: 1,
                 provider: Some("mock".into()),
                 model: Some("mock-1".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -437,6 +460,49 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(!st_reloaded.config().enabled);
     assert_eq!(st_reloaded.config().model.as_deref(), Some("fast-title"));
     assert!(ctrl.set_enabled("session-title", false).await.unwrap());
+
+    // 5c. cache-warming：热挂载 + 热卸载/再挂载保留易变配置
+    assert!(ctrl.set_enabled("cache-warming", true).await.unwrap());
+    let cw = app.cache_warming().unwrap();
+    cw.set_mode(CacheWarmingMode::Streaming);
+    cw.set_show_notices(true);
+    assert!(ctrl.set_enabled("cache-warming", false).await.unwrap());
+    assert!(
+        app.get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
+            .is_none()
+    );
+    assert!(ctrl.set_enabled("cache-warming", true).await.unwrap());
+    let cw_reloaded = app.cache_warming().unwrap();
+    assert_eq!(cw_reloaded.config().mode, CacheWarmingMode::Streaming);
+    assert!(cw_reloaded.config().show_cache_miss_notices);
+    assert!(ctrl.set_enabled("cache-warming", false).await.unwrap());
+
+    // 5d. subagent：热挂载 + 工具注册 + 易变配置热更新 + 热卸载 + 再热挂载保留最新配置
+    assert!(ctrl.set_enabled("subagent", true).await.unwrap());
+    assert!(
+        tools
+            .list_all()
+            .into_iter()
+            .any(|t| t.name == SUBAGENT_TOOL_NAME)
+    );
+    let sub = app.subagent().unwrap();
+    sub.update_config(|c| {
+        c.default_max_steps = 8;
+        c.timeout_secs = 45;
+    });
+    assert!(ctrl.set_enabled("subagent", false).await.unwrap());
+    assert!(app.get::<SubagentRuntime>("subagent").is_none());
+    assert!(
+        !tools
+            .list_all()
+            .into_iter()
+            .any(|t| t.name == SUBAGENT_TOOL_NAME)
+    );
+    assert!(ctrl.set_enabled("subagent", true).await.unwrap());
+    let sub_reloaded = app.subagent().unwrap();
+    assert_eq!(sub_reloaded.config().default_max_steps, 8);
+    assert_eq!(sub_reloaded.config().timeout_secs, 45);
+    assert!(ctrl.set_enabled("subagent", false).await.unwrap());
 
     // 6. trajectory & repeat-guard：waterfall 钩子与服务卸载及恢复
     assert!(ctrl.set_enabled("trajectory", true).await.unwrap());
@@ -490,4 +556,117 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(recorded.contains(&("tools-coding".to_string(), true)));
     assert!(recorded.contains(&("tools-coding".to_string(), false)));
     assert!(recorded.contains(&("repeat-guard".to_string(), false)));
+}
+
+#[tokio::test]
+async fn cache_warming_stays_active_when_compaction_is_disabled() {
+    use mizar_llm::{ModelCostRates, PromptCacheLifetime, RequestOrigin, TokenUsage};
+
+    struct PricedAdapter;
+
+    impl LlmAdapter for PricedAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "priced".into(),
+                name: "Priced".into(),
+                protocol: "anthropic-messages".into(),
+                models: vec![ModelInfo {
+                    id: "claude-sonnet".into(),
+                    name: "Claude Sonnet".into(),
+                    cost: Some(ModelCostRates {
+                        input: 3.0,
+                        output: 15.0,
+                        cache_read: 0.3,
+                        cache_write: 3.75,
+                        tiers: Vec::new(),
+                    }),
+                    prompt_cache: Some(PromptCacheLifetime {
+                        short: Some(300),
+                        long: Some(3600),
+                    }),
+                    force_adaptive_thinking: true,
+                    ..Default::default()
+                }],
+            })
+        }
+
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                let _ = tx.unbounded_send(Ok(StreamChunk::TextDelta {
+                    index: 0,
+                    text: "ok".into(),
+                }));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 500,
+                        cache_write_tokens: Some(300_000),
+                        output_tokens: 20,
+                        ..Default::default()
+                    },
+                }));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }));
+            });
+            Box::pin(rx)
+        }
+    }
+
+    let ws = temp_dir("cw_no_compaction");
+    let _guard = DirGuard(ws.clone());
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
+    let app = Context::new();
+    app.plugin(AgentSpinePlugin, cfg).await.unwrap();
+    app.plugin(
+        PluginDef::sync("priced-adapter", |ctx, ()| {
+            let llm = ctx.llm()?;
+            ctx.effect("priced-adapter.reg", move || {
+                Ok::<_, LlmError>(Some(
+                    llm.register_adapter("priced", Arc::new(PricedAdapter))?,
+                ))
+            })?;
+            Ok::<_, cordis::CordisError>(())
+        })
+        .inject(["llm"]),
+        (),
+    )
+    .await
+    .unwrap();
+    wait_all_settled(&app).await;
+
+    let ctrl = app.spine_plugins().unwrap();
+    assert!(!ctrl.is_enabled("compaction"));
+    assert!(
+        ctrl.is_enabled("cache-warming"),
+        "cache-warming must not depend on compaction in inject()"
+    );
+    let cw = app.cache_warming().unwrap();
+    let sessions = app.sessions().unwrap();
+    let session = sessions.create(None);
+    let llm = app.llm().unwrap();
+
+    use futures::StreamExt;
+    let mut stream = llm
+        .stream(GenerateOptions {
+            provider: Some("priced".into()),
+            model: Some("claude-sonnet".into()),
+            session_id: Some(session.id.clone()),
+            origin: RequestOrigin::SessionTurn {
+                session_id: session.id.clone(),
+                turn: 1,
+                step: 1,
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let status = cw.status(&session.id).expect("cache warming status");
+    assert!(status.active);
+
+    app.fiber().dispose().await;
 }

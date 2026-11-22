@@ -176,13 +176,22 @@ where
                     return next.call(exec).await;
                 }
 
-                // 若当前工具来自已经切换走的旧会话，直接拒绝，避免弹出孤儿审批框。
-                if exec
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|sid| sid != *active_sid.read().unwrap())
-                {
-                    return PreExecuteDecision::deny("会话已切换，取消过期审批请求");
+                // 区分直系后台/同步子代理会话与真正的过期旧会话，避免误报“会话已切换”，同时不让后台任务抢占前台交互审批框。
+                if let Some(sid) = exec.session_id.as_deref() {
+                    let active_id = active_sid.read().unwrap().clone();
+                    if sid != active_id {
+                        if let Some(store) =
+                            ctx_inner.get::<mizar_session::SessionStore>("sessions")
+                            && let Some(loaded) = store.inspect_readonly(sid)
+                            && loaded.header.is_subagent_child()
+                            && loaded.header.parent_id.as_deref() == Some(active_id.as_str())
+                        {
+                            return PreExecuteDecision::deny(
+                                "当前处于 --approve 审批模式，子代理不支持弹出交互审批框执行非只读工具；请改用 read_only 子代理调研，或由主代理直接执行修改/命令",
+                            );
+                        }
+                        return PreExecuteDecision::deny("会话已切换，取消过期审批请求");
+                    }
                 }
 
                 let args_preview = serde_json::to_string_pretty(&exec.args)
@@ -272,7 +281,7 @@ mod tests {
         assert_eq!(read_out.content, "ok");
         assert!(rx.try_recv().is_err());
 
-        // 2. 非当前活跃会话的工具调用被直接拦截
+        // 2. 非当前活跃会话的工具调用被直接拦截；直系非 Fork 子代理给予诚实说明，避免误报“会话已切换”
         let stale_out = tools
             .execute(ToolExecution::new(
                 "danger_write",
@@ -282,6 +291,32 @@ mod tests {
             .await;
         assert!(stale_out.is_error);
         assert!(stale_out.content.contains("会话已切换"));
+
+        use mizar_session::SessionContextExt;
+        ctx.plugin(mizar_session::SessionStore::plugin(), ())
+            .await
+            .unwrap();
+        let child_sess = ctx
+            .sessions()
+            .unwrap()
+            .create_with(mizar_session::SessionCreateOptions {
+                parent_id: Some("sess-1".into()),
+                ..Default::default()
+            });
+        let child_out = tools
+            .execute(ToolExecution::new(
+                "danger_write",
+                json!({}),
+                Some(child_sess.id.clone()),
+            ))
+            .await;
+        assert!(child_out.is_error);
+        assert!(
+            child_out.content.contains("--approve 审批模式")
+                && !child_out.content.contains("会话已切换"),
+            "{}",
+            child_out.content
+        );
 
         // 3. 活跃会话的写工具触发审批请求，允许后正常放行
         let tools_exec = Arc::clone(&tools);

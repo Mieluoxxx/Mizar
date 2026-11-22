@@ -19,8 +19,8 @@ use uuid::Uuid;
 pub use model::{
     CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
     RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionSelection,
-    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
+    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin,
+    SessionSelection, SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
     derive_session_title,
 };
 pub use persistence::{
@@ -181,14 +181,12 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
     out
 }
 
-/// 检查从持久化或分叉截断加载的日志尾部是否残留未返回 `ToolResult` 的工具调用。
-/// 若存在悬挂工具调用，则自动追加合成的 `TOOL_OUTCOME_UNKNOWN` 错误结果以保持对话协议合法。
-pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntry> {
-    let visible = collect_visible_indices(&loaded.entries);
+fn find_dangling_tool_calls(entries: &[SessionEntry]) -> Vec<(String, String)> {
+    let visible = collect_visible_indices(entries);
     let mut pending: Vec<(String, String)> = Vec::new();
 
     for idx in visible {
-        match &loaded.entries[idx].event {
+        match &entries[idx].event {
             SessionEvent::User { .. } | SessionEvent::Compaction { .. } => {
                 pending.clear();
             }
@@ -206,9 +204,18 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
             | SessionEvent::BashExecution { .. }
             | SessionEvent::ToolResultPrune { .. }
             | SessionEvent::Selection { .. }
+            | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => {}
         }
     }
+
+    pending
+}
+
+/// 检查从持久化或分叉截断加载的日志尾部是否残留未返回 `ToolResult` 的工具调用。
+/// 若存在悬挂工具调用，则自动追加合成的 `TOOL_OUTCOME_UNKNOWN` 错误结果以保持对话协议合法。
+pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntry> {
+    let pending = find_dangling_tool_calls(&loaded.entries);
 
     if pending.is_empty() {
         return Vec::new();
@@ -426,6 +433,25 @@ impl Session {
                 },
             );
         }
+    }
+
+    /// 幂等修复内存会话尾部因运行中断或超时残留的悬挂 `ToolCall`（通过正常 `append` 落盘与广播）。
+    pub fn repair_dangling_tool_calls(self: &Arc<Self>) -> usize {
+        let pending = {
+            let inner = self.inner.lock().unwrap();
+            find_dangling_tool_calls(&inner.log)
+        };
+        let repaired = pending.len();
+        for (tool_call_id, name) in pending {
+            self.append(SessionEvent::ToolResult {
+                tool_call_id,
+                name,
+                content: "[会话恢复：上次运行意外中断或超时，工具结果未知 (TOOL_OUTCOME_UNKNOWN)]"
+                    .to_string(),
+                is_error: true,
+            });
+        }
+        repaired
     }
 
     /// 设置会话标题（标记为人工设置 `TitleSource::Manual`）。
@@ -864,6 +890,7 @@ impl Session {
                 }
                 SessionEvent::ToolResultPrune { .. }
                 | SessionEvent::Selection { .. }
+                | SessionEvent::Usage { .. }
                 | SessionEvent::Trace { .. } => {}
             }
         }
@@ -902,6 +929,7 @@ impl SessionStore {
         header.title_source = header.title.as_ref().map(|_| TitleSource::Manual);
         header.parent_id = opts.parent_id;
         header.fork_seq = opts.fork_seq;
+        header.origin = opts.origin;
 
         let session = Arc::new(Session::from_parts(
             self.ctx.clone(),
@@ -1050,6 +1078,7 @@ impl SessionStore {
         new_header.title_source = new_header.title.as_ref().map(|_| TitleSource::Manual);
         new_header.parent_id = Some(from_session_id.to_string());
         new_header.fork_seq = Some(up_to_seq);
+        new_header.origin = opts.origin.or(Some(SessionOrigin::User));
 
         let mut loaded = if let Some(backend) = self.ctx.session_persistence() {
             backend.fork_session(from_session_id, up_to_seq, &new_header)?
@@ -1134,10 +1163,11 @@ impl SessionStore {
             .values()
             .map(|s| s.header())
             .filter(|h| {
-                query
-                    .cwd
-                    .as_ref()
-                    .is_none_or(|c| h.cwd.as_deref() == Some(c.as_str()))
+                (!query.exclude_subagents || !h.is_subagent_child())
+                    && query
+                        .cwd
+                        .as_ref()
+                        .is_none_or(|c| h.cwd.as_deref() == Some(c.as_str()))
             })
             .collect();
         headers.sort_by(|a, b| {

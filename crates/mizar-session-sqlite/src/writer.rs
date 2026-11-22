@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use mizar_session::{
     LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
     SESSION_FORMAT_VERSION, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
-    SessionListQuery, TitlePatch, TitleSource, TitleSourcePatch,
+    SessionListQuery, SessionOrigin, TitlePatch, TitleSource, TitleSourcePatch,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::oneshot;
@@ -214,15 +214,16 @@ fn insert_session_header(tx: &Transaction<'_>, h: &SessionHeader) -> Persistence
     let mut stmt = tx
         .prepare_cached(
             "INSERT INTO sessions (
-                 id, format_version, cwd, title, title_source, parent_id, fork_seq,
+                 id, format_version, cwd, title, title_source, parent_id, fork_seq, origin,
                  created_at_ms, updated_at_ms, event_count, surface_count, compacted_up_to_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                  cwd = COALESCE(sessions.cwd, excluded.cwd),
                  title = COALESCE(sessions.title, excluded.title),
                  title_source = COALESCE(sessions.title_source, excluded.title_source),
                  parent_id = COALESCE(sessions.parent_id, excluded.parent_id),
                  fork_seq = COALESCE(sessions.fork_seq, excluded.fork_seq),
+                 origin = COALESCE(sessions.origin, excluded.origin),
                  created_at_ms = MIN(sessions.created_at_ms, excluded.created_at_ms),
                  updated_at_ms = MAX(sessions.updated_at_ms, excluded.updated_at_ms),
                  event_count = MAX(sessions.event_count, excluded.event_count),
@@ -242,6 +243,7 @@ fn insert_session_header(tx: &Transaction<'_>, h: &SessionHeader) -> Persistence
         h.title_source.map(TitleSource::as_str),
         h.parent_id,
         h.fork_seq.map(|v| v as i64),
+        h.origin.map(SessionOrigin::as_str),
         millis_to_i64(h.created_at_ms),
         millis_to_i64(h.updated_at_ms),
         h.event_count as i64,

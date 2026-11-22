@@ -449,6 +449,21 @@ fn report_error_with_secrets(msg: &str, secrets: &Arc<Mutex<Vec<String>>>) {
     eprintln!("error: {clean}");
 }
 
+/// 无头 `exec` 模式下强制关闭 `Idle` 后台续命（将 `Idle` 降级为 `Streaming`，保留 `Streaming` / `Off`）。
+pub(crate) fn effective_exec_cache_warming_mode(
+    mode: mizar_llm::CacheWarmingMode,
+) -> mizar_llm::CacheWarmingMode {
+    match mode {
+        mizar_llm::CacheWarmingMode::Idle => mizar_llm::CacheWarmingMode::Streaming,
+        other => other,
+    }
+}
+
+/// 一次性无头 `exec` 模式下关闭 `subagent`（并行加速与上下文减负统一交由 `codemode` 承担）。
+pub(crate) fn disable_exec_subagent(spine_cfg: &mut AgentSpineConfig) {
+    spine_cfg.subagent = None;
+}
+
 /// 运行无头一次性任务，返回进程应使用的退出码。
 pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     if cfg.approve {
@@ -545,6 +560,12 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
+    // 一次性无头 exec 禁止 Idle 后台保活，Idle 降级为 Streaming（仅在工具运行期间保活）
+    if let Some(ref mut cw) = spine_cfg.cache_warming {
+        cw.mode = effective_exec_cache_warming_mode(cw.mode);
+    }
+    // 一次性无头 exec 由 codemode 承担确定性并行与上下文减负，关闭异步交互分身插件
+    disable_exec_subagent(&mut spine_cfg);
     if !spine_cfg
         .disabled_plugins
         .iter()
@@ -681,6 +702,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                         .list_headers(&SessionListQuery {
                             cwd: Some(ws_str),
                             limit: Some(1),
+                            exclude_subagents: true,
                         })
                         .ok()
                         .and_then(|mut list| list.drain(..).next())
@@ -1078,5 +1100,30 @@ mod tests {
         );
         assert!(resolve_exec_prompt(true, Some("x".into()), Some(file), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exec_mode_downgrades_idle_cache_warming_to_streaming() {
+        use mizar_llm::CacheWarmingMode;
+        assert_eq!(
+            effective_exec_cache_warming_mode(CacheWarmingMode::Idle),
+            CacheWarmingMode::Streaming
+        );
+        assert_eq!(
+            effective_exec_cache_warming_mode(CacheWarmingMode::Streaming),
+            CacheWarmingMode::Streaming
+        );
+        assert_eq!(
+            effective_exec_cache_warming_mode(CacheWarmingMode::Off),
+            CacheWarmingMode::Off
+        );
+    }
+
+    #[test]
+    fn exec_mode_disables_subagent_in_favor_of_codemode() {
+        let mut spine = AgentSpineConfig::coding(PathBuf::from("/tmp"));
+        assert!(spine.subagent.is_some());
+        disable_exec_subagent(&mut spine);
+        assert!(spine.subagent.is_none());
     }
 }

@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
-use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
+use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
 use mizar_llm::ContentBlock;
 use mizar_session::{
     EVENT_SESSION_CREATED, EVENT_SESSION_EVENT, EVENT_SESSION_LOADED, RecallSearchHit,
@@ -148,6 +148,7 @@ fn render_entry_verbatim(entry: &SessionEntry) -> Option<String> {
         SessionEvent::ContextNotice { .. }
         | SessionEvent::ToolResultPrune { .. }
         | SessionEvent::Selection { .. }
+        | SessionEvent::Usage { .. }
         | SessionEvent::Trace { .. } => None,
     }
 }
@@ -211,6 +212,7 @@ fn fallback_in_memory_search(
     } else if let Ok(headers) = store.list_headers(&SessionListQuery {
         cwd: query.cwd.clone(),
         limit: Some(50),
+        ..Default::default()
     }) {
         headers
             .iter()
@@ -367,6 +369,7 @@ fn build_recall_search_tool(store: Arc<SessionStore>, default_limit: usize) -> T
                 && let Ok(headers) = store.list_headers(&SessionListQuery {
                     cwd: cwd.clone(),
                     limit: Some(50),
+                    ..Default::default()
                 })
             {
                 let mut ids = HashSet::new();
@@ -765,22 +768,37 @@ impl Plugin for RecallPlugin {
                 let rt_step = Arc::clone(&tools);
                 let ctx_step = ctx.clone();
                 cleanups.push(ctx.effect("recall.on-pre-step", move || {
-                    let h = ctx_step.on_serial_with::<AgentPreStepEvent, (), _, _>(
+                    let h = ctx_step.on_waterfall_with(
                         EVENT_AGENT_PRE_STEP,
-                        move |ev: AgentPreStepEvent| {
+                        move |input: AgentPreStepInput,
+                              next: Next<
+                            AgentPreStepInput,
+                            BoxFuture<'static, AgentPreStepDecision>,
+                        >| {
                             let rt = Arc::clone(&rt_step);
-                            async move {
-                                if should_activate_recall(&ev.session) {
+                            let session = Arc::clone(&input.session);
+                            let cancel = input.cancel.clone();
+                            Box::pin(async move {
+                                if cancel.is_cancelled() {
+                                    return AgentPreStepDecision::Reject {
+                                        reason: "cancelled".to_string(),
+                                    };
+                                }
+                                let decision = next.call(input).await;
+                                if matches!(decision, AgentPreStepDecision::Enter { .. })
+                                    && should_activate_recall(&session)
+                                {
                                     rt.activate_tools(
-                                        &ev.session.id,
+                                        &session.id,
                                         &[
                                             RECALL_SEARCH_TOOL_NAME.to_string(),
                                             RECALL_READ_TOOL_NAME.to_string(),
                                         ],
                                     );
                                 }
-                                None
-                            }
+                                decision
+                            })
+                                as BoxFuture<'static, AgentPreStepDecision>
                         },
                         cordis::EventOptions {
                             priority: 20,

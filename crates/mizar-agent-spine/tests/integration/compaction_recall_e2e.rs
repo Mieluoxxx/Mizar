@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use cordis::{Context, PluginDef};
+use cordis::{BoxFuture, Context, PluginDef};
 use futures::channel::mpsc;
-use mizar_agent_loop::{AgentLoopContextExt, AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_agent_loop::{
+    AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
+};
 use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, CompactionContextExt, CompactionOutcome,
     ManualCompactOptions, RECALL_READ_TOOL_NAME, RECALL_SEARCH_TOOL_NAME,
@@ -33,6 +35,7 @@ impl LlmAdapter for SummaryMockAdapter {
                 max_tokens: Some(4_096),
                 reasoning_efforts: vec![],
                 input: Vec::new(),
+                ..Default::default()
             }],
         })
     }
@@ -117,15 +120,19 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
     // 2. 首步 pre-step 应注入 AGENTS.md
     session.append(SessionEvent::user("早期关键约束：暗号为 星尘压缩密钥_2026"));
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session),
                 turn: 1,
                 step: 1,
                 provider: Some("spine-mock".into()),
                 model: Some("m-spine".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -166,15 +173,19 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
 
     // 4. 压后下一步 pre-step：mizar-instructions 应立即重注 AGENTS.md
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session),
                 turn: 2,
                 step: 1,
                 provider: Some("spine-mock".into()),
                 model: Some("m-spine".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;

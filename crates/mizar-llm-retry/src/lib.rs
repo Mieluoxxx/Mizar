@@ -380,12 +380,26 @@ mod tests {
             })
             .unwrap();
 
+        let after_events = Arc::new(std::sync::Mutex::new(
+            Vec::<mizar_llm::LlmAfterResponseEvent>::new(),
+        ));
+        let after_cap = Arc::clone(&after_events);
+        app.on(
+            mizar_llm::EVENT_LLM_AFTER_RESPONSE,
+            move |ev: &mizar_llm::LlmAfterResponseEvent| {
+                after_cap.lock().unwrap().push(ev.clone());
+            },
+        )
+        .unwrap();
+
         let mut asm = BlockAssembler::new();
         while let Some(item) = stream.next().await {
             asm.push(item.unwrap());
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert_eq!(asm.text(), "recovered");
+        assert_eq!(after_events.lock().unwrap().len(), 1);
+        assert_eq!(after_events.lock().unwrap()[0].provider, "flaky");
     }
 
     #[tokio::test]

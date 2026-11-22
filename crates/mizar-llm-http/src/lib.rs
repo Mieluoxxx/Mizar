@@ -546,6 +546,7 @@ pub fn parse_models_payload(payload: &Value) -> Vec<ModelInfo> {
                     max_tokens,
                     reasoning_efforts: Vec::new(),
                     input,
+                    ..Default::default()
                 })
             })
             .collect();
@@ -595,6 +596,7 @@ pub fn parse_models_payload(payload: &Value) -> Vec<ModelInfo> {
                     max_tokens,
                     reasoning_efforts: Vec::new(),
                     input,
+                    ..Default::default()
                 })
             })
             .collect();

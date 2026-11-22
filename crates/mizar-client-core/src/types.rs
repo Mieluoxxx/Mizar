@@ -9,6 +9,8 @@ use mizar_llm_types::{ContentBlock, ImageAttachment, ReasoningEffort, TokenUsage
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cache_audit::{CacheMissAudit, CacheWarmingSessionStatus};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolState {
     Running,
@@ -207,7 +209,7 @@ pub enum SessionReplayItem {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionViewData {
     pub session_id: String,
     pub session_title: Option<String>,
@@ -220,6 +222,12 @@ pub struct SessionViewData {
     pub total_usage: TokenUsage,
     /// 该会话最近一次实测（或压缩后）上下文 token 数，供跨 resume 恢复占用估算。
     pub last_prompt_tokens: Option<u64>,
+    /// 当前会话的 Prompt Cache 保活实时状态（仅运行期可读时填充）。
+    #[serde(default)]
+    pub cache_warming: Option<CacheWarmingSessionStatus>,
+    /// 从会话账本统计出的意外缓存重计费（`Cache Re-billed`）汇总。
+    #[serde(default)]
+    pub cache_miss_audit: CacheMissAudit,
 }
 
 /// 会话内记录的模型与推理强度选择（客户端侧的纯数据形态）。
@@ -487,6 +495,13 @@ pub enum ClientEvent {
     Notice {
         level: NoticeLevel,
         text: String,
+    },
+    CacheWarmingNotice {
+        text: String,
+    },
+    SubagentState {
+        running_count: usize,
+        notice: Option<String>,
     },
     UserSkillsUpdated(Vec<String>),
     SessionTitleUpdated(Option<String>),

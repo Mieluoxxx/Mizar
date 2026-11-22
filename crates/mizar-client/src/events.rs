@@ -5,23 +5,26 @@ use std::time::Duration;
 
 use cordis::{Context, CordisError, DisposableHandle, LogLevel, LogRecord};
 use mizar_agent_loop::{
-    AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
+    AgentLoop, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
     AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
     AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
-    AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_END,
-    EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA,
-    EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT, EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END,
-    EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE, StepOutcome, TurnEndReason,
+    AgentUsageEvent, DeliveryMode, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS,
+    EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
+    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
+    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
+    InboxPushResult, StepOutcome, TurnEndReason, TurnInput,
 };
 use mizar_agent_spine::{
     CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent, CompactionTrigger,
     EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS, EVENT_COMPACTION_START,
 };
+use mizar_cache_warming::{CacheWarmingNoticeEvent, EVENT_CACHE_WARMING_NOTICE};
 use mizar_client_core::{
     ClientEvent, UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
 };
-use mizar_llm::{ImageAttachment, LlmRuntime};
+use mizar_llm::LlmRuntime;
 use mizar_session::{EVENT_SESSION_TITLE_UPDATED, SessionStore, SessionTitleUpdatedPayload};
+use mizar_subagent::{EVENT_SUBAGENT_STATE, SubagentStateEvent};
 use mizar_trajectory::{EVENT_TRAJECTORY_ANOMALY, TrajectoryAnomalyEvent};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -101,35 +104,12 @@ pub enum ActiveTaskKind {
     ManualCompaction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingPrompt {
-    pub text: String,
-    pub images: Vec<ImageAttachment>,
-}
-
-impl PendingPrompt {
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            images: Vec::new(),
-        }
-    }
-
-    pub fn with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
-        Self {
-            text: text.into(),
-            images,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ActiveTask {
     pub run_id: u64,
     pub session_id: String,
     pub kind: ActiveTaskKind,
     pub cancel: CancellationToken,
-    pub pending_steer: Option<PendingPrompt>,
     pub user_cancelled: bool,
 }
 
@@ -157,24 +137,15 @@ impl RunController {
             session_id,
             kind,
             cancel: cancel.clone(),
-            pending_steer: None,
             user_cancelled: false,
         });
         (run_id, cancel)
     }
 
-    pub fn cancel_active(&mut self, steer: Option<PendingPrompt>) {
+    /// 显式强制打断当前任务（触发 `CancellationToken` 中止流式生成或工具执行）。
+    pub fn cancel_active(&mut self) {
         if let Some(task) = self.active.as_mut() {
-            match steer {
-                Some(prompt) => {
-                    task.pending_steer = Some(prompt);
-                    task.user_cancelled = false;
-                }
-                None => {
-                    task.pending_steer = None;
-                    task.user_cancelled = true;
-                }
-            }
+            task.user_cancelled = true;
             task.cancel.cancel();
         }
     }
@@ -214,7 +185,6 @@ impl RunController {
                 session_id: current_session_id.to_string(),
                 kind: expected_kind,
                 cancel: CancellationToken::new(),
-                pending_steer: None,
                 user_cancelled: false,
             });
         };
@@ -233,6 +203,17 @@ impl RunController {
         }
         self.active.take()
     }
+}
+
+/// 向活跃会话投递温和的步间插话（`DeliveryMode::Steer`），不中止正在执行的工具与当前轮。
+pub fn steer_session(
+    agent_loop: &AgentLoop,
+    session_id: &str,
+    input: impl Into<TurnInput>,
+) -> InboxPushResult {
+    agent_loop
+        .inbox()
+        .push(session_id, DeliveryMode::Steer, input.into())
 }
 
 /// 订阅当前会话相关的 Agent 与轨迹事件并投递到 `tx`。
@@ -469,8 +450,8 @@ where
         );
     }
     {
-        let send = send;
-        let check = is_current;
+        let send = send.clone();
+        let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_SESSION_TITLE_UPDATED,
             move |ev: &SessionTitleUpdatedPayload| {
@@ -479,6 +460,34 @@ where
                 }
             },
         )?);
+    }
+    {
+        let send = send.clone();
+        let check = is_current.clone();
+        handles.push(ctx.on(
+            EVENT_CACHE_WARMING_NOTICE,
+            move |ev: &CacheWarmingNoticeEvent| {
+                if check(&ev.session_id) {
+                    send(ClientEvent::CacheWarmingNotice {
+                        text: ev.text.clone(),
+                    });
+                }
+            },
+        )?);
+    }
+    {
+        let send = send;
+        let check = is_current;
+        handles.push(
+            ctx.on(EVENT_SUBAGENT_STATE, move |ev: &SubagentStateEvent| {
+                if check(&ev.parent_session_id) {
+                    send(ClientEvent::SubagentState {
+                        running_count: ev.running_count,
+                        notice: ev.notice.clone(),
+                    });
+                }
+            })?,
+        );
     }
 
     Ok(handles)
@@ -584,16 +593,12 @@ mod tests {
         assert_eq!(finished.run_id, rid2);
         assert!(ctrl.cancel_token().is_none());
 
-        // 取消时记录 steer 并置位 cancel token
+        // 显式取消置位 user_cancelled 与 cancel token
         let (_rid3, cancel3) = ctrl.start("sess-b".into(), ActiveTaskKind::AgentRun);
-        ctrl.cancel_active(Some(PendingPrompt::text("steer now")));
+        ctrl.cancel_active();
         assert!(cancel3.is_cancelled());
         let active = ctrl.active_task().unwrap();
-        assert!(!active.user_cancelled);
-        assert_eq!(
-            active.pending_steer.as_ref().map(|p| p.text.as_str()),
-            Some("steer now")
-        );
+        assert!(active.user_cancelled);
 
         ctrl.abort_for_session_switch();
         assert!(ctrl.active_task().is_none());

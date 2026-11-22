@@ -10,12 +10,16 @@ use std::sync::{Arc, Mutex};
     feature = "coding",
     feature = "compaction",
     feature = "session-title",
+    feature = "cache-warming",
     feature = "trajectory"
 ))]
 use cordis::Service;
 use cordis::{Context, CordisError, Fiber};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+
+#[cfg(feature = "cache-warming")]
+use mizar_cache_warming::{CacheWarmingConfig, CacheWarmingRuntime};
 
 #[cfg(feature = "coding")]
 use mizar_codemode::{CodemodeConfig, CodemodePlugin};
@@ -31,6 +35,8 @@ use mizar_recall::{RecallConfig, RecallPlugin};
 use mizar_session_title::{SessionTitleConfig, SessionTitleRuntime};
 #[cfg(feature = "coding")]
 use mizar_skills::{SkillRegistry, SkillRegistryConfig, SkillsConfig, SkillsPlugin};
+#[cfg(feature = "subagent")]
+use mizar_subagent::{SubagentConfig, SubagentRuntime};
 #[cfg(feature = "legacy")]
 use mizar_tool_fs::{ToolFsConfig, ToolFsPlugin};
 #[cfg(feature = "coding")]
@@ -96,6 +102,8 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "compaction",
     "recall",
     "session-title",
+    "cache-warming",
+    "subagent",
     "trajectory",
     "repeat-guard",
 ];
@@ -173,6 +181,10 @@ pub(crate) enum ModuleSpec {
     Recall(RecallConfig),
     #[cfg(feature = "session-title")]
     SessionTitle(SessionTitleConfig),
+    #[cfg(feature = "cache-warming")]
+    CacheWarming(CacheWarmingConfig),
+    #[cfg(feature = "subagent")]
+    Subagent(SubagentConfig),
     #[cfg(feature = "trajectory")]
     Trajectory(TrajectoryConfig),
     #[cfg(feature = "trajectory")]
@@ -261,6 +273,14 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         ModuleSpec::SessionTitle(ref cfg) => Ok(vec![
             ctx.try_plugin(SessionTitleRuntime::plugin(), cfg.clone())?,
         ]),
+        #[cfg(feature = "cache-warming")]
+        ModuleSpec::CacheWarming(ref cfg) => Ok(vec![
+            ctx.try_plugin(CacheWarmingRuntime::plugin(), cfg.clone())?,
+        ]),
+        #[cfg(feature = "subagent")]
+        ModuleSpec::Subagent(ref cfg) => Ok(vec![
+            ctx.try_plugin(SubagentRuntime::plugin(), cfg.clone())?,
+        ]),
         #[cfg(feature = "trajectory")]
         ModuleSpec::Trajectory(ref cfg) => Ok(vec![
             ctx.try_plugin(TrajectoryRuntime::plugin(), cfg.clone())?,
@@ -278,7 +298,9 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         feature = "coding",
         feature = "compaction",
         feature = "session-title",
-        feature = "trajectory"
+        feature = "cache-warming",
+        feature = "trajectory",
+        feature = "subagent"
     )),
     allow(dead_code)
 )]
@@ -371,6 +393,14 @@ async fn mount_module_and_wait(
         #[cfg(feature = "session-title")]
         ModuleSpec::SessionTitle(ref cfg) => {
             mount_single_and_wait(ctx, id, SessionTitleRuntime::plugin(), cfg.clone()).await
+        }
+        #[cfg(feature = "cache-warming")]
+        ModuleSpec::CacheWarming(ref cfg) => {
+            mount_single_and_wait(ctx, id, CacheWarmingRuntime::plugin(), cfg.clone()).await
+        }
+        #[cfg(feature = "subagent")]
+        ModuleSpec::Subagent(ref cfg) => {
+            mount_single_and_wait(ctx, id, SubagentRuntime::plugin(), cfg.clone()).await
         }
         #[cfg(feature = "trajectory")]
         ModuleSpec::Trajectory(ref cfg) => {
@@ -558,6 +588,18 @@ impl SpinePlugins {
                     && let Some(st) = self.ctx.get::<SessionTitleRuntime>("sessionTitle")
                 {
                     slot.spec = ModuleSpec::SessionTitle(st.config());
+                }
+                #[cfg(feature = "cache-warming")]
+                if id == "cache-warming"
+                    && let Some(cw) = self.ctx.get::<CacheWarmingRuntime>("cacheWarming")
+                {
+                    slot.spec = ModuleSpec::CacheWarming(cw.config());
+                }
+                #[cfg(feature = "subagent")]
+                if id == "subagent"
+                    && let Some(sub) = self.ctx.get::<SubagentRuntime>("subagent")
+                {
+                    slot.spec = ModuleSpec::Subagent(sub.config());
                 }
                 Action::Disable(std::mem::take(&mut slot.fibers))
             } else {

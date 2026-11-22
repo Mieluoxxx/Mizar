@@ -15,9 +15,10 @@ use std::time::Duration;
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
-    LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo, ReasoningEffort,
-    ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, prefix_digest,
+    BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
+    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, prefix_digest,
+    resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
@@ -112,6 +113,36 @@ fn thinking_budget(effort: ReasoningEffort, override_budget: Option<u32>) -> Opt
     })
 }
 
+fn cache_control_value(retention: CacheRetention) -> Option<Value> {
+    match retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(json!({ "type": "ephemeral" })),
+        CacheRetention::Long => Some(json!({ "type": "ephemeral", "ttl": "1h" })),
+    }
+}
+
+fn attach_cache_control(
+    wire_tools: &mut [Value],
+    wire_messages: &mut [Value],
+    cache_control: &Value,
+) {
+    if let Some(last_tool) = wire_tools.last_mut()
+        && let Some(obj) = last_tool.as_object_mut()
+    {
+        obj.insert("cache_control".to_string(), cache_control.clone());
+    }
+    if let Some(last_user) = wire_messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        && let Some(blocks) = last_user.get_mut("content").and_then(Value::as_array_mut)
+        && let Some(last_block) = blocks.last_mut()
+        && let Some(obj) = last_block.as_object_mut()
+    {
+        obj.insert("cache_control".to_string(), cache_control.clone());
+    }
+}
+
 /// 构建 Anthropic Messages 请求体，并返回当前请求的前缀摘要（用于后续签名回放校验）。
 pub fn build_request_body(
     config: &MessagesConfig,
@@ -133,7 +164,7 @@ pub fn build_request_body(
     }
     let system_text = sys_parts.join("\n\n");
 
-    let wire_tools: Vec<Value> = options
+    let mut wire_tools: Vec<Value> = options
         .tools
         .iter()
         .map(|t| {
@@ -268,11 +299,17 @@ pub fn build_request_body(
         }
     }
 
+    // 摘要在挂载 cache_control 前计算，避免缓存断点随轮次滑动破坏思考签名回放
     let request_prefix_digest = prefix_digest(&json!({
         "system": &system_text,
         "tools": &wire_tools,
         "messages": &wire_messages,
     }));
+
+    let cache_control = cache_control_value(resolve_cache_retention(options.cache_retention));
+    if let Some(cc) = &cache_control {
+        attach_cache_control(&mut wire_tools, &mut wire_messages, cc);
+    }
 
     let mut max_tokens = options.max_tokens.unwrap_or(config.default_max_tokens);
     let adaptive_effort = if config.force_adaptive_thinking {
@@ -308,7 +345,14 @@ pub fn build_request_body(
         "messages": wire_messages,
     });
     if !system_text.is_empty() {
-        body["system"] = Value::String(system_text);
+        body["system"] = match cache_control {
+            Some(cc) => json!([{
+                "type": "text",
+                "text": system_text,
+                "cache_control": cc,
+            }]),
+            None => Value::String(system_text),
+        };
     }
     if !wire_tools.is_empty() {
         body["tools"] = Value::Array(wire_tools);
@@ -963,11 +1007,63 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use futures::StreamExt;
-    use mizar_llm::{BlockAssembler, SseParser, ToolCall, ToolSchema};
+    use mizar_llm::{BlockAssembler, ImageAttachment, SseParser, ToolCall, ToolSchema};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
     use tokio::net::TcpListener;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CacheEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev_mizar: Option<OsString>,
+        prev_pi: Option<OsString>,
+    }
+
+    impl CacheEnvGuard {
+        fn cleared() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_mizar = std::env::var_os("MIZAR_CACHE_RETENTION");
+            let prev_pi = std::env::var_os("PI_CACHE_RETENTION");
+            // SAFETY: 受 `ENV_LOCK` 串行保护，仅在本 crate 单测中隔离环境变量并在 Drop 时恢复。
+            unsafe {
+                std::env::remove_var("MIZAR_CACHE_RETENTION");
+                std::env::remove_var("PI_CACHE_RETENTION");
+            }
+            Self {
+                _lock: lock,
+                prev_mizar,
+                prev_pi,
+            }
+        }
+
+        fn set_mizar(&self, value: &str) {
+            // SAFETY: 持有 `ENV_LOCK`，与本 crate 其他测试串行隔离。
+            unsafe {
+                std::env::set_var("MIZAR_CACHE_RETENTION", value);
+            }
+        }
+    }
+
+    impl Drop for CacheEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: 持有 `ENV_LOCK`，恢复进入测试前的环境变量快照。
+            unsafe {
+                match &self.prev_mizar {
+                    Some(v) => std::env::set_var("MIZAR_CACHE_RETENTION", v),
+                    None => std::env::remove_var("MIZAR_CACHE_RETENTION"),
+                }
+                match &self.prev_pi {
+                    Some(v) => std::env::set_var("PI_CACHE_RETENTION", v),
+                    None => std::env::remove_var("PI_CACHE_RETENTION"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn merges_tool_results_and_omits_stale_thinking_when_prefix_changes() {
+        let _env = CacheEnvGuard::cleared();
         let cfg = MessagesConfig {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-5".into(),
@@ -1043,6 +1139,12 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 2);
         assert_eq!(msgs[2]["content"][1]["is_error"], true);
+        assert!(msgs[0]["content"][0].get("cache_control").is_none());
+        assert!(msgs[2]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            msgs[2]["content"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
 
         // 前缀变更（system 改了）：应省略过期签名 thinking 块，防止 API 拒绝
         let (body_changed, _) = build_request_body(
@@ -1166,8 +1268,7 @@ mod tests {
 
     #[test]
     fn user_images_wire_shape_and_prefix_digest_identity() {
-        use mizar_llm::ImageAttachment;
-
+        let _env = CacheEnvGuard::cleared();
         let cfg = MessagesConfig {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-5".into(),
@@ -1177,6 +1278,7 @@ mod tests {
         let opts_plain = GenerateOptions {
             system: Some("sys v1".into()),
             messages: vec![Message::user("hi")],
+            cache_retention: Some(CacheRetention::None),
             ..Default::default()
         };
         let (body_plain, digest_plain) = build_request_body(&cfg, &opts_plain, "claude-sonnet-4-5");
@@ -1190,22 +1292,52 @@ mod tests {
             "messages": &legacy_messages,
         }));
         assert_eq!(digest_plain, legacy_digest);
+        assert_eq!(body_plain["system"], json!("sys v1"));
         assert_eq!(
             serde_json::to_string(&body_plain["messages"]).unwrap(),
             serde_json::to_string(&legacy_messages).unwrap()
         );
 
-        let opts_img = GenerateOptions {
+        // Short / Long 缓存断点只影响请求体结构，不改变语义 prefix_digest
+        let (body_short, digest_short) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::Short),
+                ..opts_plain.clone()
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(digest_short, legacy_digest);
+        assert_eq!(
+            body_short["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        let (body_long, digest_long) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::Long),
+                ..opts_plain
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(digest_long, legacy_digest);
+        assert_eq!(
+            body_long["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+
+        let opts_img_none = GenerateOptions {
             system: Some("sys v1".into()),
             messages: vec![Message::user_with_images(
                 "describe",
                 vec![ImageAttachment::new("image/png", "AQID")],
             )],
+            cache_retention: Some(CacheRetention::None),
             ..Default::default()
         };
-        let (body_img, _) = build_request_body(&cfg, &opts_img, "claude-sonnet-4-5");
+        let (body_img_none, _) = build_request_body(&cfg, &opts_img_none, "claude-sonnet-4-5");
         assert_eq!(
-            body_img["messages"],
+            body_img_none["messages"],
             json!([{
                 "role": "user",
                 "content": [
@@ -1225,17 +1357,38 @@ mod tests {
             }])
         );
 
+        // 默认 Short 时仅在末尾 user 块（此处为 text）附带 cache_control
+        let (body_img_short, _) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: None,
+                ..opts_img_none
+            },
+            "claude-sonnet-4-5",
+        );
+        assert!(
+            body_img_short["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body_img_short["messages"][0]["content"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+
         // 纯图片无文字时不发送空 text 块（Anthropic API 会拒绝空 text）
-        let opts_img_only = GenerateOptions {
+        let opts_img_only_none = GenerateOptions {
             messages: vec![Message::user_with_images(
                 "",
                 vec![ImageAttachment::new("image/webp", "UklGRg==")],
             )],
+            cache_retention: Some(CacheRetention::None),
             ..Default::default()
         };
-        let (body_img_only, _) = build_request_body(&cfg, &opts_img_only, "claude-sonnet-4-5");
+        let (body_img_only_none, _) =
+            build_request_body(&cfg, &opts_img_only_none, "claude-sonnet-4-5");
         assert_eq!(
-            body_img_only["messages"],
+            body_img_only_none["messages"],
             json!([{
                 "role": "user",
                 "content": [{
@@ -1248,5 +1401,276 @@ mod tests {
                 }]
             }])
         );
+
+        let (body_img_only_short, _) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: None,
+                ..opts_img_only_none
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(
+            body_img_only_short["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn request_body_cache_control_breakpoints_for_none_short_and_long() {
+        let cfg = MessagesConfig::default();
+        let base_opts = GenerateOptions {
+            system: Some("static system".into()),
+            tools: vec![
+                ToolSchema {
+                    name: "read".into(),
+                    description: "read file".into(),
+                    parameters: json!({ "type": "object" }),
+                },
+                ToolSchema {
+                    name: "grep".into(),
+                    description: "search".into(),
+                    parameters: json!({ "type": "object" }),
+                },
+            ],
+            messages: vec![
+                Message::user("first question"),
+                Message::assistant(
+                    vec![ContentBlock::Text {
+                        text: "first answer".into(),
+                    }],
+                    None,
+                ),
+                Message::user_with_images(
+                    "follow up",
+                    vec![ImageAttachment::new("image/png", "AQID")],
+                ),
+            ],
+            ..Default::default()
+        };
+
+        // None: 不附带任何 cache_control，system 保持纯字符串
+        let (body_none, digest_none) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::None),
+                ..base_opts.clone()
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body_none["system"], json!("static system"));
+        assert!(body_none["tools"][0].get("cache_control").is_none());
+        assert!(body_none["tools"][1].get("cache_control").is_none());
+        assert!(
+            body_none["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_none["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_none["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_none["messages"][2]["content"][1]
+                .get("cache_control")
+                .is_none()
+        );
+
+        // Short: {"type": "ephemeral"} 落于 system、最后一个工具、最后一条 user 的最后内容块
+        let (body_short, digest_short) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::Short),
+                ..base_opts.clone()
+            },
+            "claude-sonnet-4-5",
+        );
+        let short_cc = json!({ "type": "ephemeral" });
+        assert_eq!(
+            body_short["system"],
+            json!([{ "type": "text", "text": "static system", "cache_control": short_cc }])
+        );
+        assert!(body_short["tools"][0].get("cache_control").is_none());
+        assert_eq!(body_short["tools"][1]["cache_control"], short_cc);
+        assert!(
+            body_short["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_short["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_short["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body_short["messages"][2]["content"][1]["cache_control"],
+            short_cc
+        );
+
+        // Long: {"type": "ephemeral", "ttl": "1h"} 落于同样三个断点
+        let (body_long, digest_long) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::Long),
+                ..base_opts
+            },
+            "claude-sonnet-4-5",
+        );
+        let long_cc = json!({ "type": "ephemeral", "ttl": "1h" });
+        assert_eq!(
+            body_long["system"],
+            json!([{ "type": "text", "text": "static system", "cache_control": long_cc }])
+        );
+        assert!(body_long["tools"][0].get("cache_control").is_none());
+        assert_eq!(body_long["tools"][1]["cache_control"], long_cc);
+        assert!(
+            body_long["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_long["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body_long["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body_long["messages"][2]["content"][1]["cache_control"],
+            long_cc
+        );
+
+        assert_eq!(digest_none, digest_short);
+        assert_eq!(digest_short, digest_long);
+    }
+
+    #[test]
+    fn request_body_cache_retention_defaults_to_short_and_respects_env() {
+        let env = CacheEnvGuard::cleared();
+        let cfg = MessagesConfig::default();
+        let opts = GenerateOptions {
+            system: Some("sys".into()),
+            tools: vec![ToolSchema {
+                name: "get_time".into(),
+                description: "time".into(),
+                parameters: json!({ "type": "object" }),
+            }],
+            messages: vec![Message::user("hello")],
+            cache_retention: None,
+            ..Default::default()
+        };
+
+        // 未设置环境变量时默认 Short
+        let (body_default, _) = build_request_body(&cfg, &opts, "claude-sonnet-4-5");
+        let short_cc = json!({ "type": "ephemeral" });
+        assert_eq!(body_default["system"][0]["cache_control"], short_cc);
+        assert_eq!(body_default["tools"][0]["cache_control"], short_cc);
+        assert_eq!(
+            body_default["messages"][0]["content"][0]["cache_control"],
+            short_cc
+        );
+
+        // MIZAR_CACHE_RETENTION=long 生效
+        env.set_mizar("long");
+        let (body_env_long, _) = build_request_body(&cfg, &opts, "claude-sonnet-4-5");
+        let long_cc = json!({ "type": "ephemeral", "ttl": "1h" });
+        assert_eq!(body_env_long["system"][0]["cache_control"], long_cc);
+        assert_eq!(body_env_long["tools"][0]["cache_control"], long_cc);
+        assert_eq!(
+            body_env_long["messages"][0]["content"][0]["cache_control"],
+            long_cc
+        );
+
+        // MIZAR_CACHE_RETENTION=none 生效，但显式 options.cache_retention 优先级更高
+        env.set_mizar("none");
+        let (body_env_none, _) = build_request_body(&cfg, &opts, "claude-sonnet-4-5");
+        assert_eq!(body_env_none["system"], json!("sys"));
+        assert!(body_env_none["tools"][0].get("cache_control").is_none());
+        assert!(
+            body_env_none["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+
+        let (body_explicit_override, _) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::Short),
+                ..opts
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(
+            body_explicit_override["system"][0]["cache_control"],
+            short_cc
+        );
+        assert_eq!(
+            body_explicit_override["tools"][0]["cache_control"],
+            short_cc
+        );
+        assert_eq!(
+            body_explicit_override["messages"][0]["content"][0]["cache_control"],
+            short_cc
+        );
+    }
+
+    #[test]
+    fn request_body_cache_control_handles_trailing_assistant_and_empty_fields() {
+        let cfg = MessagesConfig::default();
+
+        // system/tools 为空，末尾为 assistant 时，仍将断点落在最后一条 user 消息上
+        let (body_trailing_assistant, _) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                messages: vec![
+                    Message::user("hi"),
+                    Message::assistant(
+                        vec![ContentBlock::Text {
+                            text: "partial".into(),
+                        }],
+                        None,
+                    ),
+                ],
+                cache_retention: Some(CacheRetention::Short),
+                ..Default::default()
+            },
+            "claude-sonnet-4-5",
+        );
+        assert!(body_trailing_assistant.get("system").is_none());
+        assert!(body_trailing_assistant.get("tools").is_none());
+        assert_eq!(
+            body_trailing_assistant["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            body_trailing_assistant["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+
+        // 完全没有 user 消息时不崩溃
+        let (body_empty_msgs, _) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                cache_retention: Some(CacheRetention::Long),
+                ..Default::default()
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body_empty_msgs["messages"], json!([]));
     }
 }

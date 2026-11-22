@@ -154,7 +154,9 @@ fn entry_to_trace_event(
                 text,
             }
         }
-        SessionEvent::ToolResultPrune { .. } | SessionEvent::Selection { .. } => return None,
+        SessionEvent::ToolResultPrune { .. }
+        | SessionEvent::Selection { .. }
+        | SessionEvent::Usage { .. } => return None,
         SessionEvent::Trace { detail } => match detail {
             SessionTraceEvent::TurnStart { turn } => TraceEventKind::TurnStart { turn: *turn },
             SessionTraceEvent::TurnEnd { turn, reason } => TraceEventKind::TurnEnd {
@@ -667,6 +669,7 @@ impl TrajectoryRuntime {
             && let Ok(headers) = backend.list_sessions(&SessionListQuery {
                 cwd: None,
                 limit: Some(50),
+                ..Default::default()
             })
         {
             for h in headers {

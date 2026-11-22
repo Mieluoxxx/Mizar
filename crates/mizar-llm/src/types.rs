@@ -1,13 +1,14 @@
 pub use mizar_llm_types::{
-    CacheRetention, ContentBlock, ContentBlockKind, FinishReason, ImageAttachment,
-    MAX_IMAGES_PER_MESSAGE, Message, ModelInfo, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, StreamChunk, TokenUsage, ToolCall,
+    CacheRetention, CacheWarmingMode, ContentBlock, ContentBlockKind, FinishReason,
+    ImageAttachment, MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
+    OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, PromptCacheLifetime, ProviderInfo, ReasoningEffort,
+    ReplayEnvelope, RequestOrigin, SessionAffinityMode, StreamChunk, TokenUsage, ToolCall,
     ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,
     parse_session_affinity_mode, push_header_if_absent, push_session_affinity_headers,
 };
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GenerateOptions {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
@@ -21,6 +22,9 @@ pub struct GenerateOptions {
     pub session_id: Option<String>,
     pub cache_retention: Option<CacheRetention>,
     pub cancel: CancellationToken,
+    pub origin: RequestOrigin,
+    /// 禁止推进或覆写上游有状态会话线程（供保活预热请求使用）。
+    pub disable_continuation: bool,
 }
 
 fn parse_cache_retention_str(raw: &str) -> Option<CacheRetention> {

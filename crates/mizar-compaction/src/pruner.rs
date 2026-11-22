@@ -30,9 +30,21 @@ fn take_tail_chars(s: &str, max_chars: usize) -> String {
 
 /// 规划一批零模型剪枝条目（只读计算，不修改会话）。
 pub fn plan_tool_result_prune(session: &Session, config: &CompactionConfig) -> PrunePlan {
+    plan_tool_result_prune_with_pending(session, config, 0)
+}
+
+/// 规划一批零模型剪枝条目，将当前步待提交 `TurnInput` 条数计入最近表面保护窗口，
+/// 避免 `pre-step` 提前到提交前运行导致最近条目保护名额少算当前轮输入。
+pub fn plan_tool_result_prune_with_pending(
+    session: &Session,
+    config: &CompactionConfig,
+    pending_surface_count: usize,
+) -> PrunePlan {
     let visible = session.visible_log();
     let already_pruned = session.pruned_map();
-    let protect = config.prune_protect_recent_surface;
+    let protect = config
+        .prune_protect_recent_surface
+        .saturating_sub(pending_surface_count);
     if visible.len() <= protect {
         return PrunePlan {
             items: Vec::new(),

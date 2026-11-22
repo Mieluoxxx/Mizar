@@ -15,24 +15,42 @@ pub const DEFAULT_RELEASE_REPO_URL: &str = "https://github.com/Mieluoxxx/Mizar";
 pub const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 返回当前二进制声明的版本号（优先读取构建期注入的 `MIZAR_VERSION`，否则回退 `CARGO_PKG_VERSION`）。
-pub fn current_version() -> &'static str {
-    option_env!("MIZAR_VERSION")
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or(env!("CARGO_PKG_VERSION"))
+fn is_truthy_str(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn is_truthy_env(key: &str) -> bool {
     env::var(key)
         .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| is_truthy_str(&v))
         .unwrap_or(false)
+}
+
+/// 判断当前二进制是否属于官方发布构建（需构建期注入 `MIZAR_RELEASE_BUILD=1` 或显式 `MIZAR_VERSION`）。
+pub fn is_release_build() -> bool {
+    option_env!("MIZAR_RELEASE_BUILD").is_some_and(is_truthy_str)
+        || option_env!("MIZAR_VERSION")
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty())
+}
+
+/// 返回当前二进制声明的版本号：优先 `MIZAR_VERSION` 覆盖，其次官方发布构建读
+/// `CARGO_PKG_VERSION`，本地源码/开发构建附带 `+dev` 构建元数据以区分。
+pub fn current_version() -> &'static str {
+    if let Some(v) = option_env!("MIZAR_VERSION")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return v;
+    }
+    if is_release_build() {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        concat!(env!("CARGO_PKG_VERSION"), "+dev")
+    }
 }
 
 pub fn is_offline_enabled() -> bool {
@@ -41,6 +59,36 @@ pub fn is_offline_enabled() -> bool {
 
 pub fn is_version_check_disabled() -> bool {
     is_offline_enabled() || is_truthy_env("MIZAR_SKIP_VERSION_CHECK")
+}
+
+/// 判断是否应在 TUI 启动时执行后台版本检查。
+///
+/// 仅官方发布构建且位于可原地自更新路径时开启；本地源码构建、`/target/{debug,release}/`
+/// 与 Homebrew 安装目录默认跳过，与 `validate_install_target` 保持一致。
+pub fn should_check_for_updates_at_startup() -> bool {
+    let exe_path = env::current_exe().ok();
+    should_check_for_updates_for(
+        is_release_build(),
+        is_version_check_disabled(),
+        exe_path.as_deref(),
+    )
+}
+
+fn should_check_for_updates_for(
+    release_build: bool,
+    disabled_by_env: bool,
+    exe_path: Option<&Path>,
+) -> bool {
+    if disabled_by_env || !release_build {
+        return false;
+    }
+    match exe_path {
+        Some(path) => {
+            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            validate_install_target(&canonical, false).is_ok()
+        }
+        None => true,
+    }
 }
 
 pub fn release_base_url() -> String {
@@ -714,6 +762,58 @@ mod tests {
             .is_err()
         );
         assert!(validate_install_target(Path::new("/Users/me/.local/bin/mizar"), false).is_ok());
+    }
+
+    #[test]
+    fn release_vs_dev_version_and_startup_update_gate() {
+        assert!(!is_newer_version("v0.1.6", "0.1.6+dev"));
+        assert!(is_newer_version("v0.1.7", "0.1.6+dev"));
+
+        if let Some(override_ver) = option_env!("MIZAR_VERSION")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            assert_eq!(current_version(), override_ver);
+        } else if is_release_build() {
+            assert_eq!(current_version(), env!("CARGO_PKG_VERSION"));
+        } else {
+            assert_eq!(
+                current_version(),
+                concat!(env!("CARGO_PKG_VERSION"), "+dev")
+            );
+        }
+
+        assert!(!should_check_for_updates_for(
+            false,
+            false,
+            Some(Path::new("/Users/me/.local/bin/mizar"))
+        ));
+        assert!(!should_check_for_updates_for(
+            true,
+            true,
+            Some(Path::new("/Users/me/.local/bin/mizar"))
+        ));
+        assert!(!should_check_for_updates_for(
+            true,
+            false,
+            Some(Path::new("/tmp/repo/target/debug/mizar"))
+        ));
+        assert!(!should_check_for_updates_for(
+            true,
+            false,
+            Some(Path::new("/tmp/repo/target/release/mizar"))
+        ));
+        assert!(!should_check_for_updates_for(
+            true,
+            false,
+            Some(Path::new("/opt/homebrew/Cellar/mizar/0.1.6/bin/mizar"))
+        ));
+        assert!(should_check_for_updates_for(
+            true,
+            false,
+            Some(Path::new("/Users/me/.local/bin/mizar"))
+        ));
+        assert!(should_check_for_updates_for(true, false, None));
     }
 
     #[tokio::test]

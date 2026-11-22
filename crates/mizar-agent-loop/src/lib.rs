@@ -3,16 +3,21 @@
 //! Agent 循环本身也只是一个插件。它不知道模型是哪家、有哪些工具，只认四个服务名：
 //! `llm`、`tools`、`sessions`、`systemPrompt`。
 
-use std::collections::{HashMap, HashSet};
+pub mod inbox;
+
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, CordisError, Inject, Service};
+use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Next, Service};
 use futures::StreamExt;
 use futures::future::join_all;
+pub use inbox::{
+    DEFAULT_AUTO_WAKE_LIMIT, DeliveryMode, InboxItem, InboxPushResult, SessionInbox, TurnInput,
+};
 use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmContextExt, LlmError,
-    LlmErrorCode, Message, ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
+    LlmErrorCode, Message, ReasoningEffort, RequestOrigin, StreamChunk, TokenUsage, ToolCall,
 };
 use mizar_session::{Session, SessionEvent, SessionTraceEvent, TraceSeverity};
 use mizar_system_prompt::SystemPromptContextExt;
@@ -27,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const EVENT_AGENT_STATUS: &str = "agent/status";
 pub const EVENT_AGENT_PRE_STEP: &str = "agent/pre-step";
-pub const EVENT_AGENT_CONTEXT_OVERFLOW: &str = "agent/context-overflow";
+pub const EVENT_AGENT_REQUEST_ERROR: &str = "agent/request-error";
+pub const EVENT_AGENT_TURN_STOPPING: &str = "agent/turn-stopping";
 pub const EVENT_AGENT_REQUEST: &str = "agent/request";
 pub const EVENT_AGENT_TEXT_DELTA: &str = "agent/text-delta";
 pub const EVENT_AGENT_REASONING_DELTA: &str = "agent/reasoning-delta";
@@ -43,7 +49,19 @@ pub const EVENT_AGENT_STEP_FIRST_TOKEN: &str = "agent/step-first-token";
 pub const EVENT_AGENT_STEP_END: &str = "agent/step-end";
 pub const ENVIRONMENT_CONTEXT_SOURCE: &str = "environment-context";
 
-fn ensure_environment_context(session: &Arc<Session>) {
+fn build_environment_context_notice_if_needed(
+    session: &Arc<Session>,
+    inputs: &[TurnInput],
+) -> Option<TurnInput> {
+    let already_in_inputs = inputs.iter().any(|item| {
+        matches!(
+            item,
+            TurnInput::Notice { source, .. } if source == ENVIRONMENT_CONTEXT_SOURCE
+        )
+    });
+    if already_in_inputs {
+        return None;
+    }
     let already_visible = session.with_visible_entries(|entries| {
         entries.iter().any(|e| {
             matches!(
@@ -53,7 +71,7 @@ fn ensure_environment_context(session: &Arc<Session>) {
         })
     });
     if already_visible {
-        return;
+        return None;
     }
 
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -71,10 +89,10 @@ fn ensure_environment_context(session: &Arc<Session>) {
     }
     lines.push(format!("<current_date>{date}</current_date>"));
     lines.push("</environment_context>".to_string());
-    session.append(SessionEvent::context_notice(
+    Some(TurnInput::notice(
         ENVIRONMENT_CONTEXT_SOURCE,
         lines.join("\n"),
-    ));
+    ))
 }
 
 fn now_millis() -> u128 {
@@ -140,26 +158,62 @@ pub struct AgentStatusEvent {
     pub status: AgentStatus,
 }
 
+/// `agent/pre-step` waterfall 载荷：全系统唯一允许改写、展开、注入或拒收新输入的关口。
 #[derive(Clone)]
-pub struct AgentPreStepEvent {
+pub struct AgentPreStepInput {
     pub session: Arc<Session>,
     pub turn: u64,
     pub step: usize,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub cancel: CancellationToken,
+    pub inputs: Vec<TurnInput>,
+}
+
+/// `agent/pre-step` waterfall 决策：放行（提交 `inputs` 入库）或拒收（不落盘、干净停步）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentPreStepDecision {
+    Enter { inputs: Vec<TurnInput> },
+    Reject { reason: String },
+}
+
+/// 模型请求错误分类（供 `agent/request-error` waterfall 识别自愈策略）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRequestErrorKind {
+    ContextOverflow,
+    StreamError,
+    ProviderError,
+}
+
+/// `agent/request-error` waterfall 载荷：统一承接上下文溢出、流中断与提供方报错的恢复链路。
+#[derive(Clone)]
+pub struct AgentRequestErrorInput {
+    pub session: Arc<Session>,
+    pub turn: u64,
+    pub step: usize,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub kind: AgentRequestErrorKind,
+    pub error_message: String,
     pub cancel: CancellationToken,
 }
 
-/// 当模型调用遭遇上下文窗口溢出或隐性连续截断时发出（`serial` 派发，返回 `Some(true)` 表示已释放空间并允许当前步重试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRequestErrorDecision {
+    Retry,
+    Propagate,
+}
+
+/// `agent/turn-stopping` 无返回值 `serial` 事件载荷：停轮守卫可向 `SessionInbox` 投递 `Steer` 延续下一步。
 #[derive(Clone)]
-pub struct AgentContextOverflowEvent {
+pub struct AgentTurnStoppingEvent {
     pub session: Arc<Session>,
     pub turn: u64,
     pub step: usize,
     pub provider: Option<String>,
     pub model: Option<String>,
-    pub reason: String,
     pub cancel: CancellationToken,
+    pub last_text: String,
 }
 
 #[derive(Clone)]
@@ -290,6 +344,7 @@ pub struct RunOptions {
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub images: Vec<ImageAttachment>,
+    pub origin: Option<RequestOrigin>,
 }
 
 /// 单轮执行收尾报告（供 CLI / 评测精确判定收敛原因与最后一步结果）。
@@ -309,19 +364,18 @@ pub enum AgentError {
     Llm(#[from] LlmError),
     #[error("session \"{0}\" is already running")]
     SessionBusy(String),
+    #[error("pre-step rejected: {0}")]
+    PreStepRejected(String),
 }
 
 struct SessionLockGuard {
-    active_sessions: Arc<Mutex<HashSet<String>>>,
+    inbox: Arc<SessionInbox>,
     session_id: String,
 }
 
 impl Drop for SessionLockGuard {
     fn drop(&mut self) {
-        self.active_sessions
-            .lock()
-            .unwrap()
-            .remove(&self.session_id);
+        self.inbox.release_session(&self.session_id);
     }
 }
 
@@ -435,23 +489,129 @@ impl Drop for StepGuard {
     }
 }
 
+struct TurnRecoveryState {
+    last_overflow_step: Option<usize>,
+    overflow_recoveries: usize,
+    error_retries: usize,
+    consecutive_short_cutoffs: usize,
+}
+
 pub struct AgentLoop {
     ctx: Context,
     config: AgentLoopConfig,
-    active_sessions: Arc<Mutex<HashSet<String>>>,
+    inbox: Arc<SessionInbox>,
     short_cutoffs_by_session: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl AgentLoop {
+    /// 获取纯内存会话信箱（供 TUI / 桌面端 / 插件投递 `Steer`、`FollowUp` 与 `Inject` 消息）。
+    pub fn inbox(&self) -> &SessionInbox {
+        &self.inbox
+    }
+
+    pub fn is_session_busy(&self, session_id: &str) -> bool {
+        self.inbox.is_session_active(session_id)
+    }
+
     fn lock_session(&self, session_id: &str) -> Result<SessionLockGuard, AgentError> {
-        let mut active = self.active_sessions.lock().unwrap();
-        if !active.insert(session_id.to_string()) {
+        if !self.inbox.try_acquire_session(session_id) {
             return Err(AgentError::SessionBusy(session_id.to_string()));
         }
         Ok(SessionLockGuard {
-            active_sessions: Arc::clone(&self.active_sessions),
+            inbox: Arc::clone(&self.inbox),
             session_id: session_id.to_string(),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_request_error(
+        &self,
+        session: &Arc<Session>,
+        turn: u64,
+        step: usize,
+        provider: &Option<String>,
+        model: &Option<String>,
+        cancel: &CancellationToken,
+        kind: AgentRequestErrorKind,
+        error_message: String,
+    ) -> AgentRequestErrorDecision {
+        self.ctx
+            .waterfall(
+                EVENT_AGENT_REQUEST_ERROR,
+                AgentRequestErrorInput {
+                    session: Arc::clone(session),
+                    turn,
+                    step,
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    kind,
+                    error_message,
+                    cancel: cancel.clone(),
+                },
+                |_| -> BoxFuture<'static, AgentRequestErrorDecision> {
+                    Box::pin(async { AgentRequestErrorDecision::Propagate })
+                },
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_recover_request_error(
+        &self,
+        session: &Arc<Session>,
+        turn: u64,
+        step: usize,
+        provider: &Option<String>,
+        model: &Option<String>,
+        cancel: &CancellationToken,
+        kind: AgentRequestErrorKind,
+        error_message: String,
+        recovery: &mut TurnRecoveryState,
+    ) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let allowed = match kind {
+            AgentRequestErrorKind::ContextOverflow => {
+                recovery.last_overflow_step != Some(step) && recovery.overflow_recoveries < 3
+            }
+            AgentRequestErrorKind::StreamError | AgentRequestErrorKind::ProviderError => {
+                recovery.error_retries < 3
+            }
+        };
+        if !allowed {
+            return false;
+        }
+        let decision = self
+            .dispatch_request_error(
+                session,
+                turn,
+                step,
+                provider,
+                model,
+                cancel,
+                kind,
+                error_message,
+            )
+            .await;
+        if decision != AgentRequestErrorDecision::Retry {
+            return false;
+        }
+        match kind {
+            AgentRequestErrorKind::ContextOverflow => {
+                recovery.last_overflow_step = Some(step);
+                recovery.overflow_recoveries += 1;
+                recovery.consecutive_short_cutoffs = 0;
+                self.short_cutoffs_by_session
+                    .lock()
+                    .unwrap()
+                    .remove(&session.id);
+            }
+            AgentRequestErrorKind::StreamError | AgentRequestErrorKind::ProviderError => {
+                recovery.error_retries += 1;
+            }
+        }
+        true
     }
 
     /// 跑一次：用户输入 → [调模型 → 有工具调用就执行 → 结果写回会话 → 再调模型] → 最终回答。
@@ -459,7 +619,7 @@ impl AgentLoop {
     pub async fn run(
         &self,
         session: Arc<Session>,
-        input: impl Into<String>,
+        input: impl Into<TurnInput>,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
         self.run_with_options(session, input, cancel, RunOptions::default())
@@ -470,7 +630,7 @@ impl AgentLoop {
     pub async fn run_with_options(
         &self,
         session: Arc<Session>,
-        input: impl Into<String>,
+        input: impl Into<TurnInput>,
         cancel: CancellationToken,
         options: RunOptions,
     ) -> Result<String, AgentError> {
@@ -483,13 +643,13 @@ impl AgentLoop {
     pub async fn run_with_report(
         &self,
         session: Arc<Session>,
-        input: impl Into<String>,
+        input: impl Into<TurnInput>,
         cancel: CancellationToken,
         options: RunOptions,
     ) -> Result<TurnRunReport, AgentError> {
         let _session_lock = self.lock_session(&session.id)?;
         let res = self
-            .run_turn_locked(Arc::clone(&session), input, cancel, options)
+            .run_turn_locked(Arc::clone(&session), input.into(), cancel, options)
             .await;
         let _ = session.flush_async().await;
         res
@@ -498,7 +658,7 @@ impl AgentLoop {
     async fn run_turn_locked(
         &self,
         session: Arc<Session>,
-        input: impl Into<String>,
+        mut entry_input: TurnInput,
         cancel: CancellationToken,
         options: RunOptions,
     ) -> Result<TurnRunReport, AgentError> {
@@ -515,6 +675,17 @@ impl AgentLoop {
         let max_tokens = options.max_tokens.or(self.config.max_tokens);
         let temperature = options.temperature.or(self.config.temperature);
         let reasoning_effort = options.reasoning_effort.or(self.config.reasoning_effort);
+        let origin_override = options.origin;
+        if !options.images.is_empty() {
+            match &mut entry_input {
+                TurnInput::User { images, .. } | TurnInput::Notice { images, .. } => {
+                    images.extend(options.images);
+                }
+            }
+        }
+        if entry_input.is_user() {
+            self.inbox.record_human_input(&session.id);
+        }
 
         let turn = session.next_turn();
         session.append_trace(SessionTraceEvent::TurnStart { turn });
@@ -523,18 +694,6 @@ impl AgentLoop {
             AgentTurnStartEvent {
                 session: Arc::clone(&session),
                 turn,
-                ts_ms: now_millis(),
-            },
-        );
-        ensure_environment_context(&session);
-        session.append(SessionEvent::user_with_images(input, options.images));
-        self.ctx.emit(
-            EVENT_AGENT_TURN_INPUT,
-            AgentTurnInputEvent {
-                session: Arc::clone(&session),
-                turn,
-                provider: provider.clone(),
-                model: model.clone(),
                 ts_ms: now_millis(),
             },
         );
@@ -552,18 +711,25 @@ impl AgentLoop {
             reason: TurnEndReason::Cancelled,
         };
 
+        let mut pending_entry = Some(entry_input);
+        let mut turn_input_emitted = false;
         let mut step = 0usize;
         let mut steps_executed = 0usize;
         let mut last_step_outcome: Option<StepOutcome> = None;
-        let mut last_overflow_step: Option<usize> = None;
-        let mut overflow_recoveries_this_turn = 0usize;
-        let mut consecutive_short_cutoffs = self
+        let mut notice_steers_this_turn = 0usize;
+        let initial_cutoffs = self
             .short_cutoffs_by_session
             .lock()
             .unwrap()
             .get(&session.id)
             .copied()
             .unwrap_or(0);
+        let mut recovery = TurnRecoveryState {
+            last_overflow_step: None,
+            overflow_recoveries: 0,
+            error_retries: 0,
+            consecutive_short_cutoffs: initial_cutoffs,
+        };
         loop {
             step += 1;
             if cancel.is_cancelled() {
@@ -575,25 +741,64 @@ impl AgentLoop {
             {
                 break;
             }
-            let _ = self
+
+            let mut step_inputs = Vec::new();
+            if let Some(entry) = pending_entry.take() {
+                step_inputs.push(entry);
+            }
+            step_inputs.extend(self.inbox.drain_step_inputs(&session.id));
+
+            let pre_step_decision = self
                 .ctx
-                .serial::<AgentPreStepEvent, ()>(
+                .waterfall(
                     EVENT_AGENT_PRE_STEP,
-                    AgentPreStepEvent {
+                    AgentPreStepInput {
                         session: Arc::clone(&session),
                         turn,
                         step,
                         provider: provider.clone(),
                         model: model.clone(),
                         cancel: cancel.clone(),
+                        inputs: step_inputs,
+                    },
+                    |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                        Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
                     },
                 )
                 .await;
+
             if cancel.is_cancelled() {
                 turn_guard.set_reason(TurnEndReason::Cancelled);
                 return Err(AgentError::Llm(LlmError::cancelled()));
             }
-            ensure_environment_context(&session);
+
+            match pre_step_decision {
+                AgentPreStepDecision::Enter { inputs } => {
+                    for item in inputs {
+                        session.append(item.into_session_event());
+                    }
+                    if !turn_input_emitted {
+                        turn_input_emitted = true;
+                        self.ctx.emit(
+                            EVENT_AGENT_TURN_INPUT,
+                            AgentTurnInputEvent {
+                                session: Arc::clone(&session),
+                                turn,
+                                provider: provider.clone(),
+                                model: model.clone(),
+                                ts_ms: now_millis(),
+                            },
+                        );
+                    }
+                }
+                AgentPreStepDecision::Reject { reason } => {
+                    turn_guard.set_reason(TurnEndReason::Error {
+                        message: reason.clone(),
+                    });
+                    return Err(AgentError::PreStepRejected(reason));
+                }
+            }
+
             steps_executed += 1;
             self.ctx.emit(
                 EVENT_AGENT_REQUEST,
@@ -639,8 +844,6 @@ impl AgentLoop {
                 content: prompt_text,
             }];
             messages.extend(session.derive_messages());
-            let can_recover_overflow =
-                last_overflow_step != Some(step) && overflow_recoveries_this_turn < 3;
 
             let mut stream = match llm.stream(GenerateOptions {
                 messages,
@@ -655,94 +858,78 @@ impl AgentLoop {
                 session_id: Some(session.id.clone()),
                 cache_retention: None,
                 cancel: cancel.clone(),
+                origin: origin_override
+                    .clone()
+                    .unwrap_or_else(|| RequestOrigin::SessionTurn {
+                        session_id: session.id.clone(),
+                        turn,
+                        step,
+                    }),
+                disable_continuation: false,
             }) {
                 Ok(s) => s,
                 Err(err) => {
-                    if err.code == LlmErrorCode::ContextWindowExceeded
-                        && can_recover_overflow
-                        && !cancel.is_cancelled()
-                    {
-                        let recovered = self
-                            .ctx
-                            .serial::<AgentContextOverflowEvent, bool>(
-                                EVENT_AGENT_CONTEXT_OVERFLOW,
-                                AgentContextOverflowEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    provider: provider.clone(),
-                                    model: model.clone(),
-                                    reason: err.to_string(),
-                                    cancel: cancel.clone(),
-                                },
-                            )
-                            .await
-                            .unwrap_or(false);
-                        if recovered {
-                            last_overflow_step = Some(step);
-                            overflow_recoveries_this_turn += 1;
-                            consecutive_short_cutoffs = 0;
-                            self.short_cutoffs_by_session
-                                .lock()
-                                .unwrap()
-                                .remove(&session.id);
-                            step_guard.finish(
-                                StepOutcome::Error {
-                                    message: "context overflow recovered; retrying".to_string(),
-                                },
-                                None,
-                            );
-                            drop(step_guard);
-                            step = step.saturating_sub(1);
-                            continue;
-                        }
-                    }
                     if err.code == LlmErrorCode::Cancelled {
                         step_guard.finish(StepOutcome::Cancelled, None);
                         turn_guard.set_reason(TurnEndReason::Cancelled);
+                        return Err(AgentError::Llm(err));
+                    }
+                    let kind = if err.code == LlmErrorCode::ContextWindowExceeded {
+                        AgentRequestErrorKind::ContextOverflow
                     } else {
-                        let msg = err.to_string();
+                        AgentRequestErrorKind::ProviderError
+                    };
+                    if self
+                        .try_recover_request_error(
+                            &session,
+                            turn,
+                            step,
+                            &provider,
+                            &model,
+                            &cancel,
+                            kind,
+                            err.to_string(),
+                            &mut recovery,
+                        )
+                        .await
+                    {
                         step_guard.finish(
                             StepOutcome::Error {
-                                message: msg.clone(),
+                                message: "request error recovered; retrying".to_string(),
                             },
                             None,
                         );
-                        turn_guard.set_reason(TurnEndReason::Error { message: msg });
+                        drop(step_guard);
+                        step = step.saturating_sub(1);
+                        continue;
                     }
+                    let msg = err.to_string();
+                    step_guard.finish(
+                        StepOutcome::Error {
+                            message: msg.clone(),
+                        },
+                        None,
+                    );
+                    turn_guard.set_reason(TurnEndReason::Error { message: msg });
                     return Err(AgentError::Llm(err));
                 }
             };
 
             let mut assembler = BlockAssembler::new();
             let mut first_token_emitted = false;
-            let mut stream_overflow_err: Option<LlmError> = None;
+            let mut stream_err: Option<LlmError> = None;
             while let Some(chunk_res) = stream.next().await {
                 let chunk = match chunk_res {
                     Ok(c) => c,
                     Err(err) => {
-                        if err.code == LlmErrorCode::ContextWindowExceeded
-                            && can_recover_overflow
-                            && !cancel.is_cancelled()
-                        {
-                            stream_overflow_err = Some(err);
-                            break;
-                        }
                         if err.code == LlmErrorCode::Cancelled {
                             flush_interrupted_assistant(&session, &assembler);
                             step_guard.finish(StepOutcome::Cancelled, assembler.usage());
                             turn_guard.set_reason(TurnEndReason::Cancelled);
-                        } else {
-                            let msg = err.to_string();
-                            step_guard.finish(
-                                StepOutcome::Error {
-                                    message: msg.clone(),
-                                },
-                                None,
-                            );
-                            turn_guard.set_reason(TurnEndReason::Error { message: msg });
+                            return Err(AgentError::Llm(err));
                         }
-                        return Err(AgentError::Llm(err));
+                        stream_err = Some(err);
+                        break;
                     }
                 };
                 match &chunk {
@@ -806,34 +993,29 @@ impl AgentLoop {
                 assembler.push(chunk);
             }
 
-            if let Some(err) = stream_overflow_err {
-                let recovered = self
-                    .ctx
-                    .serial::<AgentContextOverflowEvent, bool>(
-                        EVENT_AGENT_CONTEXT_OVERFLOW,
-                        AgentContextOverflowEvent {
-                            session: Arc::clone(&session),
-                            turn,
-                            step,
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            reason: err.to_string(),
-                            cancel: cancel.clone(),
-                        },
+            if let Some(err) = stream_err {
+                let kind = if err.code == LlmErrorCode::ContextWindowExceeded {
+                    AgentRequestErrorKind::ContextOverflow
+                } else {
+                    AgentRequestErrorKind::StreamError
+                };
+                if self
+                    .try_recover_request_error(
+                        &session,
+                        turn,
+                        step,
+                        &provider,
+                        &model,
+                        &cancel,
+                        kind,
+                        err.to_string(),
+                        &mut recovery,
                     )
                     .await
-                    .unwrap_or(false);
-                if recovered {
-                    last_overflow_step = Some(step);
-                    overflow_recoveries_this_turn += 1;
-                    consecutive_short_cutoffs = 0;
-                    self.short_cutoffs_by_session
-                        .lock()
-                        .unwrap()
-                        .remove(&session.id);
+                {
                     step_guard.finish(
                         StepOutcome::Error {
-                            message: "context overflow recovered; retrying".to_string(),
+                            message: "stream error recovered; retrying".to_string(),
                         },
                         None,
                     );
@@ -872,43 +1054,39 @@ impl AgentLoop {
                         status: *status,
                         retry_after_ms: *retry_after_ms,
                     };
-                    if err.code == LlmErrorCode::ContextWindowExceeded
-                        && can_recover_overflow
-                        && !cancel.is_cancelled()
+                    if err.code == LlmErrorCode::Cancelled {
+                        flush_interrupted_assistant(&session, &assembler);
+                        step_guard.finish(StepOutcome::Cancelled, assembler.usage());
+                        turn_guard.set_reason(TurnEndReason::Cancelled);
+                        return Err(AgentError::Llm(err));
+                    }
+                    let kind = if err.code == LlmErrorCode::ContextWindowExceeded {
+                        AgentRequestErrorKind::ContextOverflow
+                    } else {
+                        AgentRequestErrorKind::StreamError
+                    };
+                    if self
+                        .try_recover_request_error(
+                            &session,
+                            turn,
+                            step,
+                            &provider,
+                            &model,
+                            &cancel,
+                            kind,
+                            err.to_string(),
+                            &mut recovery,
+                        )
+                        .await
                     {
-                        let recovered = self
-                            .ctx
-                            .serial::<AgentContextOverflowEvent, bool>(
-                                EVENT_AGENT_CONTEXT_OVERFLOW,
-                                AgentContextOverflowEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    provider: provider.clone(),
-                                    model: model.clone(),
-                                    reason: err.to_string(),
-                                    cancel: cancel.clone(),
-                                },
-                            )
-                            .await
-                            .unwrap_or(false);
-                        if recovered {
-                            last_overflow_step = Some(step);
-                            overflow_recoveries_this_turn += 1;
-                            consecutive_short_cutoffs = 0;
-                            self.short_cutoffs_by_session
-                                .lock()
-                                .unwrap()
-                                .remove(&session.id);
-                            let outcome = StepOutcome::Error {
-                                message: "context overflow recovered; retrying".to_string(),
-                            };
-                            last_step_outcome = Some(outcome.clone());
-                            step_guard.finish(outcome, None);
-                            drop(step_guard);
-                            step = step.saturating_sub(1);
-                            continue;
-                        }
+                        let outcome = StepOutcome::Error {
+                            message: "request error recovered; retrying".to_string(),
+                        };
+                        last_step_outcome = Some(outcome.clone());
+                        step_guard.finish(outcome, None);
+                        drop(step_guard);
+                        step = step.saturating_sub(1);
+                        continue;
                     }
                     let msg = err.to_string();
                     step_guard.finish(
@@ -937,54 +1115,42 @@ impl AgentLoop {
                 && calls.is_empty()
                 && text.chars().count() < 200;
             if is_short_cutoff {
-                consecutive_short_cutoffs += 1;
+                recovery.consecutive_short_cutoffs += 1;
                 self.short_cutoffs_by_session
                     .lock()
                     .unwrap()
-                    .insert(session.id.clone(), consecutive_short_cutoffs);
+                    .insert(session.id.clone(), recovery.consecutive_short_cutoffs);
             } else {
-                consecutive_short_cutoffs = 0;
+                recovery.consecutive_short_cutoffs = 0;
                 self.short_cutoffs_by_session
                     .lock()
                     .unwrap()
                     .remove(&session.id);
             }
 
-            if (is_zero_len_cutoff || consecutive_short_cutoffs >= 2)
-                && can_recover_overflow
-                && !cancel.is_cancelled()
-            {
+            if is_zero_len_cutoff || recovery.consecutive_short_cutoffs >= 2 {
                 let reason = if is_zero_len_cutoff {
                     "zero-output max_tokens cutoff (suspected context window overflow)".to_string()
                 } else {
                     format!(
-                        "consecutive short max_tokens cutoffs ({consecutive_short_cutoffs}, suspected implicit small context window)"
+                        "consecutive short max_tokens cutoffs ({}, suspected implicit small context window)",
+                        recovery.consecutive_short_cutoffs
                     )
                 };
-                let recovered = self
-                    .ctx
-                    .serial::<AgentContextOverflowEvent, bool>(
-                        EVENT_AGENT_CONTEXT_OVERFLOW,
-                        AgentContextOverflowEvent {
-                            session: Arc::clone(&session),
-                            turn,
-                            step,
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            reason,
-                            cancel: cancel.clone(),
-                        },
+                if self
+                    .try_recover_request_error(
+                        &session,
+                        turn,
+                        step,
+                        &provider,
+                        &model,
+                        &cancel,
+                        AgentRequestErrorKind::ContextOverflow,
+                        reason,
+                        &mut recovery,
                     )
                     .await
-                    .unwrap_or(false);
-                if recovered {
-                    last_overflow_step = Some(step);
-                    overflow_recoveries_this_turn += 1;
-                    consecutive_short_cutoffs = 0;
-                    self.short_cutoffs_by_session
-                        .lock()
-                        .unwrap()
-                        .remove(&session.id);
+                {
                     let outcome = StepOutcome::Error {
                         message: "implicit cutoff overflow recovered; retrying".to_string(),
                     };
@@ -1040,6 +1206,41 @@ impl AgentLoop {
             drop(step_guard);
 
             if calls.is_empty() {
+                if !is_truncated && has_visible_text {
+                    if !self.inbox.has_pending_steer(&session.id) && !cancel.is_cancelled() {
+                        let _: Option<()> = self
+                            .ctx
+                            .serial::<AgentTurnStoppingEvent, ()>(
+                                EVENT_AGENT_TURN_STOPPING,
+                                AgentTurnStoppingEvent {
+                                    session: Arc::clone(&session),
+                                    turn,
+                                    step,
+                                    provider: provider.clone(),
+                                    model: model.clone(),
+                                    cancel: cancel.clone(),
+                                    last_text: text.clone(),
+                                },
+                            )
+                            .await;
+                    }
+                    if cancel.is_cancelled() {
+                        turn_guard.set_reason(TurnEndReason::Cancelled);
+                        return Err(AgentError::Llm(LlmError::cancelled()));
+                    }
+                    if self.inbox.has_pending_steer(&session.id) {
+                        if self.inbox.has_pending_user_steer(&session.id) {
+                            continue;
+                        }
+                        notice_steers_this_turn += 1;
+                        let budget = self.inbox.auto_wake_limit(&session.id);
+                        if notice_steers_this_turn <= budget {
+                            continue;
+                        }
+                        // 超出每轮自动插话预算时将 Notice Steer 降级为 Inject，防止释放锁后再次唤醒新轮。
+                        self.inbox.degrade_notice_steers_to_inject(&session.id);
+                    }
+                }
                 let reason = if is_truncated || !has_visible_text {
                     TurnEndReason::Truncated
                 } else {
@@ -1206,9 +1407,58 @@ impl Service for AgentLoop {
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
             config,
-            active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            inbox: Arc::new(SessionInbox::new()),
             short_cutoffs_by_session: Arc::new(Mutex::new(HashMap::new())),
         }))
+    }
+
+    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
+        let c = ctx.clone();
+        let ctx_effect = ctx.clone();
+        Box::pin(async move {
+            ctx_effect.effect("agent-loop.pre-step-env", move || {
+                let h =
+                    c.on_waterfall_with(
+                        EVENT_AGENT_PRE_STEP,
+                        move |input: AgentPreStepInput,
+                              next: Next<
+                            AgentPreStepInput,
+                            BoxFuture<'static, AgentPreStepDecision>,
+                        >| {
+                            Box::pin(async move {
+                                if input.cancel.is_cancelled() {
+                                    return AgentPreStepDecision::Reject {
+                                        reason: "cancelled".to_string(),
+                                    };
+                                }
+                                let session = Arc::clone(&input.session);
+                                match next.call(input).await {
+                                    AgentPreStepDecision::Enter { mut inputs } => {
+                                        if let Some(notice) =
+                                            build_environment_context_notice_if_needed(
+                                                &session, &inputs,
+                                            )
+                                        {
+                                            inputs.insert(0, notice);
+                                        }
+                                        AgentPreStepDecision::Enter { inputs }
+                                    }
+                                    reject @ AgentPreStepDecision::Reject { .. } => reject,
+                                }
+                            })
+                                as BoxFuture<'static, AgentPreStepDecision>
+                        },
+                        cordis::EventOptions {
+                            priority: -10,
+                            ..Default::default()
+                        },
+                    )?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    h.dispose().await;
+                })))
+            })?;
+            Ok(())
+        })
     }
 }
 
@@ -1884,14 +2134,21 @@ mod tests {
 
         let overflow_reasons = Arc::new(Mutex::new(Vec::<String>::new()));
         let rec = Arc::clone(&overflow_reasons);
-        app.on_serial(
-            EVENT_AGENT_CONTEXT_OVERFLOW,
-            move |ev: AgentContextOverflowEvent| {
+        app.on_waterfall(
+            EVENT_AGENT_REQUEST_ERROR,
+            move |input: AgentRequestErrorInput,
+                  next: Next<
+                AgentRequestErrorInput,
+                BoxFuture<'static, AgentRequestErrorDecision>,
+            >| {
                 let rec = Arc::clone(&rec);
-                async move {
-                    rec.lock().unwrap().push(ev.reason);
-                    Some(true)
-                }
+                Box::pin(async move {
+                    if input.kind == AgentRequestErrorKind::ContextOverflow {
+                        rec.lock().unwrap().push(input.error_message);
+                        return AgentRequestErrorDecision::Retry;
+                    }
+                    next.call(input).await
+                }) as BoxFuture<'static, AgentRequestErrorDecision>
             },
         )
         .unwrap();
@@ -1983,6 +2240,484 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rep.reason, TurnEndReason::Truncated);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn inter_step_steer_continues_running_turn_without_cancelling_or_losing_tool_result() {
+        struct SteerAdapter {
+            step: AtomicUsize,
+            recorded: Arc<Mutex<Vec<Vec<Message>>>>,
+        }
+
+        impl LlmAdapter for SteerAdapter {
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                self.recorded.lock().unwrap().push(options.messages.clone());
+                let n = self.step.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if n == 0 {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
+                                id: "c_gate".into(),
+                                name: "gate_tool".into(),
+                                arguments: "{}".into(),
+                            },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("steered ok")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let app = setup_app_with_adapter(SteerAdapter {
+            step: AtomicUsize::new(0),
+            recorded: Arc::clone(&recorded),
+        })
+        .await;
+
+        let tool_started = Arc::new(tokio::sync::Notify::new());
+        let tool_release = Arc::new(tokio::sync::Notify::new());
+        let started_sig = Arc::clone(&tool_started);
+        let release_sig = Arc::clone(&tool_release);
+        let _reg = app
+            .tools()
+            .unwrap()
+            .register(ToolDefinition::async_tool(
+                "gate_tool",
+                "waits before returning",
+                json!({}),
+                move |_, _| {
+                    let s = Arc::clone(&started_sig);
+                    let r = Arc::clone(&release_sig);
+                    async move {
+                        s.notify_one();
+                        r.notified().await;
+                        Ok::<_, cordis::BoxError>("tool_done".to_string())
+                    }
+                },
+            ))
+            .unwrap();
+
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+        let cancel = CancellationToken::new();
+
+        let agent_bg = Arc::clone(&agent);
+        let sess_bg = Arc::clone(&sess);
+        let cancel_bg = cancel.clone();
+        let run_handle = tokio::spawn(async move {
+            agent_bg
+                .run_with_report(sess_bg, "start alpha", cancel_bg, RunOptions::default())
+                .await
+        });
+
+        tool_started.notified().await;
+        assert!(agent.is_session_busy(&sess.id));
+        assert!(!cancel.is_cancelled());
+
+        let push = agent
+            .inbox()
+            .push(&sess.id, DeliveryMode::Steer, TurnInput::user("steer beta"));
+        assert_eq!(push.effective_mode, DeliveryMode::Steer);
+        assert!(!push.degraded);
+        assert!(
+            !cancel.is_cancelled(),
+            "gentle inter-step steer must not cancel running turn token"
+        );
+
+        tool_release.notify_one();
+        let report = run_handle.await.unwrap().unwrap();
+        assert_eq!(report.reason, TurnEndReason::Completed);
+        assert_eq!(report.text, "steered ok");
+        assert_eq!(report.steps, 2);
+        assert!(!cancel.is_cancelled());
+
+        let calls = recorded.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        let step2_texts: Vec<String> = calls[1].iter().map(|m| m.text_content()).collect();
+        assert!(
+            step2_texts.iter().any(|t| t.contains("tool_done")),
+            "step 2 must include completed tool output: {step2_texts:?}"
+        );
+        assert!(
+            step2_texts.iter().any(|t| t.contains("steer beta")),
+            "step 2 must include steered user prompt: {step2_texts:?}"
+        );
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn turn_stopping_guard_steers_next_step_and_caps_notice_steers_at_auto_wake_limit() {
+        struct DraftAdapter(AtomicUsize);
+        impl LlmAdapter for DraftAdapter {
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let has_fix_notice = options
+                    .messages
+                    .iter()
+                    .any(|m| m.text_content().contains("retry with fix"));
+                let reply = if has_fix_notice { "fixed-2" } else { "draft-1" };
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text(format!("{reply}#{n}"))));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(DraftAdapter(AtomicUsize::new(0))).await;
+        let agent = app.agent_loop().unwrap();
+        let s1 = app.sessions().unwrap().create(None);
+        let s2 = app.sessions().unwrap().create(None);
+        agent.inbox().set_auto_wake_limit(&s1.id, 2);
+        agent.inbox().set_auto_wake_limit(&s2.id, 2);
+
+        let s1_id = s1.id.clone();
+        let s2_id = s2.id.clone();
+        let s1_stops = Arc::new(AtomicUsize::new(0));
+        let s2_stops = Arc::new(AtomicUsize::new(0));
+        let s1_stops_hook = Arc::clone(&s1_stops);
+        let s2_stops_hook = Arc::clone(&s2_stops);
+        let agent_hook = Arc::clone(&agent);
+        app.on_serial(
+            EVENT_AGENT_TURN_STOPPING,
+            move |ev: AgentTurnStoppingEvent| {
+                let agent = Arc::clone(&agent_hook);
+                let s1_id = s1_id.clone();
+                let s2_id = s2_id.clone();
+                let s1_stops = Arc::clone(&s1_stops_hook);
+                let s2_stops = Arc::clone(&s2_stops_hook);
+                let sid = ev.session.id.clone();
+                let last_text = ev.last_text.clone();
+                Box::pin(async move {
+                    if sid == s1_id {
+                        s1_stops.fetch_add(1, Ordering::SeqCst);
+                        if last_text.starts_with("draft-1") {
+                            agent.inbox().push(
+                                &sid,
+                                DeliveryMode::Steer,
+                                TurnInput::notice("verifier", "retry with fix"),
+                            );
+                        }
+                    } else if sid == s2_id {
+                        s2_stops.fetch_add(1, Ordering::SeqCst);
+                        agent.inbox().push(
+                            &sid,
+                            DeliveryMode::Steer,
+                            TurnInput::notice("loop-guard", "never stop"),
+                        );
+                    }
+                    Some(())
+                })
+            },
+        )
+        .unwrap();
+
+        // 1. 一次拦停后满足条件放行
+        let r1 = agent
+            .run_with_report(
+                Arc::clone(&s1),
+                "write code",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.reason, TurnEndReason::Completed);
+        assert!(r1.text.starts_with("fixed-2"), "{}", r1.text);
+        assert_eq!(r1.steps, 2);
+        assert_eq!(s1_stops.load(Ordering::SeqCst), 2);
+
+        // 2. 无限拦停在达到 auto_wake_limit=2 后必须停机，且多余 Notice Steer 降级为 Inject 不再唤醒
+        let mut wake_rx = agent.inbox().subscribe_wake();
+        let r2 = agent
+            .run_with_report(
+                Arc::clone(&s2),
+                "run infinite guard",
+                CancellationToken::new(),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.reason, TurnEndReason::Completed);
+        assert_eq!(r2.steps, 3);
+        assert_eq!(s2_stops.load(Ordering::SeqCst), 3);
+        assert!(agent.inbox().pop_followup(&s2.id).is_none());
+        assert!(wake_rx.try_recv().is_err());
+        let snap = agent.inbox().snapshot(&s2.id);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].mode, DeliveryMode::Inject);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn followup_auto_wake_degrades_past_limit_and_resets_on_human_input() {
+        struct EchoAllAdapter(Arc<Mutex<Vec<Vec<Message>>>>);
+        impl LlmAdapter for EchoAllAdapter {
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                self.0.lock().unwrap().push(options.messages);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text("ack")));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = setup_app_with_adapter(EchoAllAdapter(Arc::clone(&seen))).await;
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+        agent.inbox().set_auto_wake_limit(&sess.id, 2);
+        let mut wake_rx = agent.inbox().subscribe_wake();
+
+        let p1 = agent.inbox().push(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::notice("cron", "wake-1"),
+        );
+        let p2 = agent.inbox().push(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::notice("cron", "wake-2"),
+        );
+        let p3 = agent.inbox().push(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::notice("cron", "degraded-3"),
+        );
+        assert_eq!(p1.effective_mode, DeliveryMode::FollowUp);
+        assert!(!p1.degraded);
+        assert_eq!(p2.effective_mode, DeliveryMode::FollowUp);
+        assert!(!p2.degraded);
+        assert_eq!(p3.effective_mode, DeliveryMode::Inject);
+        assert!(p3.degraded);
+        assert_eq!(agent.inbox().auto_wakes_since_human(&sess.id), 2);
+        assert_eq!(wake_rx.try_recv().unwrap(), sess.id);
+        assert_eq!(wake_rx.try_recv().unwrap(), sess.id);
+        assert!(wake_rx.try_recv().is_err());
+
+        assert!(matches!(
+            agent.inbox().pop_followup(&sess.id),
+            Some(TurnInput::Notice { text, .. }) if text == "wake-1"
+        ));
+        assert!(matches!(
+            agent.inbox().pop_followup(&sess.id),
+            Some(TurnInput::Notice { text, .. }) if text == "wake-2"
+        ));
+        assert!(agent.inbox().pop_followup(&sess.id).is_none());
+
+        // 人类输入运行后必须重置 auto_wakes_since_human，同时把之前降级的 Inject 一并带入当步
+        let ans = agent
+            .run(Arc::clone(&sess), "human resume", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(ans, "ack");
+        assert_eq!(agent.inbox().auto_wakes_since_human(&sess.id), 0);
+
+        let msgs = seen.lock().unwrap()[0].clone();
+        let joined = msgs
+            .iter()
+            .map(|m| m.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("degraded-3"), "{joined}");
+        assert!(joined.contains("human resume"), "{joined}");
+
+        let p4 = agent.inbox().push(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::notice("cron", "wake-after-reset"),
+        );
+        assert_eq!(p4.effective_mode, DeliveryMode::FollowUp);
+        assert!(!p4.degraded);
+        assert_eq!(agent.inbox().auto_wakes_since_human(&sess.id), 1);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn pre_step_reject_skips_commit_and_env_context_reinjects_after_compaction() {
+        struct RecordingEcho(Arc<Mutex<Vec<Vec<Message>>>>);
+        impl LlmAdapter for RecordingEcho {
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                self.0.lock().unwrap().push(options.messages);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text("ok")));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = setup_app_with_adapter(RecordingEcho(Arc::clone(&seen))).await;
+        app.on_waterfall(
+            EVENT_AGENT_PRE_STEP,
+            |input: AgentPreStepInput,
+             next: Next<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>| {
+                Box::pin(async move {
+                    if input.inputs.iter().any(|item| match item {
+                        TurnInput::User { text, .. } => text.contains("forbidden"),
+                        TurnInput::Notice { .. } => false,
+                    }) {
+                        return AgentPreStepDecision::Reject {
+                            reason: "blocked by policy".into(),
+                        };
+                    }
+                    next.call(input).await
+                }) as BoxFuture<'static, AgentPreStepDecision>
+            },
+        )
+        .unwrap();
+
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+
+        let err = agent
+            .run(
+                Arc::clone(&sess),
+                "forbidden action",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::PreStepRejected(ref msg) if msg == "blocked by policy"));
+        assert!(
+            sess.log().is_empty(),
+            "rejected pre-step must not commit prompt or environment_context"
+        );
+
+        agent
+            .run(Arc::clone(&sess), "allowed step", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(sess.derive_messages().iter().any(|m| {
+            matches!(m, Message::User { .. }) && m.text_content().contains("<environment_context>")
+        }));
+
+        // 模拟压缩折叠早期条目后，下一轮 pre-step 应再次注入 <environment_context>
+        sess.compact_at(
+            "## Summary\nprior work",
+            sess.last_seq(),
+            None,
+            None,
+            Default::default(),
+        );
+        agent
+            .run(
+                Arc::clone(&sess),
+                "post compact step",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1]
+                .iter()
+                .any(|m| m.text_content().contains("<environment_context>")),
+            "post-compaction call must re-inject environment_context"
+        );
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn request_error_hook_recovers_stream_error_with_retry() {
+        struct FlakyStreamAdapter(AtomicUsize);
+        impl LlmAdapter for FlakyStreamAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if n == 0 {
+                        let _ = tx.unbounded_send(Err(LlmError::new(
+                            LlmErrorCode::Server,
+                            "transient upstream 503",
+                        )));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("recovered stream")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(FlakyStreamAdapter(AtomicUsize::new(0))).await;
+        let seen_kinds = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&seen_kinds);
+        let retried = Arc::new(AtomicUsize::new(0));
+        let retried_hook = Arc::clone(&retried);
+        app.on_waterfall(
+            EVENT_AGENT_REQUEST_ERROR,
+            move |input: AgentRequestErrorInput,
+                  next: Next<
+                AgentRequestErrorInput,
+                BoxFuture<'static, AgentRequestErrorDecision>,
+            >| {
+                let rec = Arc::clone(&rec);
+                let retried_hook = Arc::clone(&retried_hook);
+                Box::pin(async move {
+                    rec.lock()
+                        .unwrap()
+                        .push((input.kind, input.error_message.clone()));
+                    if input.kind == AgentRequestErrorKind::StreamError
+                        && retried_hook.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        return AgentRequestErrorDecision::Retry;
+                    }
+                    next.call(input).await
+                }) as BoxFuture<'static, AgentRequestErrorDecision>
+            },
+        )
+        .unwrap();
+
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+        let text = agent
+            .run(Arc::clone(&sess), "retry me", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(text, "recovered stream");
+        let recorded = seen_kinds.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, AgentRequestErrorKind::StreamError);
+        assert!(recorded[0].1.contains("transient upstream 503"));
 
         app.fiber().dispose().await;
     }

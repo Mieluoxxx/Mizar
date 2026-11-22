@@ -432,6 +432,14 @@ pub(super) fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App
         ));
     }
 
+    if app.running_subagents > 0 && avail >= 44 {
+        spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
+        spans.push(Span::styled(
+            format!("[subagent:{}]", app.running_subagents),
+            Style::default().fg(theme.info),
+        ));
+    }
+
     if app.screen_mode == ScreenMode::Inline && avail >= 44 {
         spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
         spans.push(Span::styled(

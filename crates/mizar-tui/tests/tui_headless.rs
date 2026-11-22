@@ -579,6 +579,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
                     max_tokens: Some(4096),
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
+                    ..Default::default()
                 }],
             })
         }
@@ -922,6 +923,7 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
                         max_tokens: Some(4096),
                         reasoning_efforts: Vec::new(),
                         input: vec!["text".into()],
+                        ..Default::default()
                     },
                     ModelInfo {
                         id: "vision-ok".into(),
@@ -930,6 +932,7 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
                         max_tokens: Some(4096),
                         reasoning_efforts: Vec::new(),
                         input: vec!["text".into(), "image".into()],
+                        ..Default::default()
                     },
                 ],
             })
@@ -1322,6 +1325,7 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
                     max_tokens: Some(4096),
                     reasoning_efforts: vec![ReasoningEffort::Low],
                     input: Vec::new(),
+                    ..Default::default()
                 }],
             })
         }

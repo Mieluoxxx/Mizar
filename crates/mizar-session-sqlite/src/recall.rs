@@ -66,6 +66,7 @@ pub fn extract_indexable_text(event: &SessionEvent) -> Option<String> {
         SessionEvent::ContextNotice { .. }
         | SessionEvent::ToolResultPrune { .. }
         | SessionEvent::Selection { .. }
+        | SessionEvent::Usage { .. }
         | SessionEvent::Trace { .. } => return None,
     };
 

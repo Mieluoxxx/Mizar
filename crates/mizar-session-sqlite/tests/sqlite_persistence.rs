@@ -111,6 +111,7 @@ async fn persists_and_hydrates_sessions_across_restarts() {
         .list_headers(&SessionListQuery {
             cwd: Some("/work/repo-a".into()),
             limit: Some(10),
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(headers.len(), 1);
@@ -568,7 +569,7 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         let ver: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 2);
+        assert_eq!(ver, 3);
     }
 
     let store1 = app1.sessions().unwrap();
@@ -831,6 +832,7 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
                     .list_sessions(&SessionListQuery {
                         cwd: None,
                         limit: Some(20),
+                        ..Default::default()
                     })
                     .unwrap();
                 check.fiber().dispose().await;
@@ -843,4 +845,271 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_from_messages() {
+    use mizar_llm::{Message, TokenUsage};
+    use mizar_session_sqlite::schema::CURRENT_SCHEMA_VERSION;
+
+    let dir = std::env::temp_dir().join(format!("mizar_sqlite_usage_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("sessions.sqlite");
+
+    let usage = TokenUsage {
+        input_tokens: 42,
+        output_tokens: 1,
+        cache_read_tokens: Some(8_192),
+        cache_write_tokens: None,
+        total_tokens: Some(8_235),
+        reasoning_tokens: None,
+    };
+
+    let app1 = Context::new();
+    app1.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app1.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let s1 = app1
+        .sessions()
+        .unwrap()
+        .create(Some("usage-persist".into()));
+    s1.append(SessionEvent::user("hello"));
+    s1.append(SessionEvent::usage(
+        "cache_warm",
+        "anthropic",
+        "claude-sonnet-4-6",
+        usage,
+        Some("keepalive".into()),
+    ));
+    s1.flush_async().await.unwrap();
+    app1.fiber().dispose().await;
+
+    // 校验 SQLite 表结构仍为现有 schema 版本 2 且 kind/visibility/payload_json 正确落盘
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let ver: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, CURRENT_SCHEMA_VERSION);
+        let (vis, kind): (String, String) = conn
+            .query_row(
+                "SELECT visibility, kind FROM session_events WHERE session_id = ?1 AND seq = 2;",
+                ["usage-persist"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(vis, "log_only");
+        assert_eq!(kind, "usage");
+    }
+
+    let app2 = Context::new();
+    app2.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let reloaded = app2.sessions().unwrap().get("usage-persist").unwrap();
+
+    assert_eq!(reloaded.header().event_count, 2);
+    assert_eq!(reloaded.header().surface_count, 1);
+    assert_eq!(reloaded.log().len(), 1);
+    assert_eq!(reloaded.all_entries().len(), 2);
+    assert!(matches!(
+        &reloaded.all_entries()[1].event,
+        SessionEvent::Usage {
+            kind,
+            provider,
+            model,
+            usage: u,
+            note,
+        } if kind == "cache_warm"
+            && provider == "anthropic"
+            && model == "claude-sonnet-4-6"
+            && *u == usage
+            && note.as_deref() == Some("keepalive")
+    ));
+    assert_eq!(reloaded.derive_messages(), vec![Message::user("hello")]);
+
+    app2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn list_sessions_exclude_subagents_skips_newer_child_for_continue() {
+    let db_path = temp_db_path("exclude_subagents");
+    let _guard = TempDbGuard(db_path.clone());
+
+    let app = Context::new();
+    app.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+
+    let store = app.sessions().unwrap();
+    let root = store.create_with(SessionCreateOptions {
+        id: Some("parent-sess".into()),
+        cwd: Some("/work/repo-sub".into()),
+        ..Default::default()
+    });
+    root.append(SessionEvent::user("start parent"));
+    let forked = store
+        .fork(
+            "parent-sess",
+            1,
+            SessionCreateOptions {
+                id: Some("fork-sess".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    forked.append(SessionEvent::user("branch"));
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let child = store.create_with(SessionCreateOptions {
+        id: Some("subagent-child".into()),
+        cwd: Some("/work/repo-sub".into()),
+        parent_id: Some("parent-sess".into()),
+        ..Default::default()
+    });
+    child.append(SessionEvent::user("subagent step"));
+
+    store.flush(None).unwrap();
+
+    let all = store
+        .list_headers(&SessionListQuery {
+            cwd: Some("/work/repo-sub".into()),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(all[0].id, "subagent-child");
+
+    let filtered = store
+        .list_headers(&SessionListQuery {
+            cwd: Some("/work/repo-sub".into()),
+            limit: Some(1),
+            exclude_subagents: true,
+        })
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_ne!(filtered[0].id, "subagent-child");
+    assert_eq!(filtered[0].id, "fork-sess");
+
+    app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_forks() {
+    let db_path = temp_db_path("migrate_v2_to_v3_origin");
+    let _guard = TempDbGuard(db_path.clone());
+
+    // 1. 构造 v2 schema 数据库（不含 origin 列），含根会话、Fork 会话、历史子代理会话
+    {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 format_version INTEGER NOT NULL,
+                 cwd TEXT,
+                 title TEXT,
+                 title_source TEXT,
+                 parent_id TEXT,
+                 fork_seq INTEGER,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 event_count INTEGER NOT NULL DEFAULT 0,
+                 surface_count INTEGER NOT NULL DEFAULT 0,
+                 compacted_up_to_seq INTEGER
+             );
+             CREATE TABLE session_events (
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 visibility TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 PRIMARY KEY (session_id, seq)
+             );
+             CREATE TABLE session_recall_docs (
+                 doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 preview TEXT NOT NULL,
+                 UNIQUE(session_id, seq)
+             );
+             CREATE VIRTUAL TABLE session_recall_fts USING fts5(terms, content='', tokenize='ascii');
+             INSERT INTO sessions (id, format_version, cwd, parent_id, fork_seq, created_at_ms, updated_at_ms)
+             VALUES
+                 ('v2-root', 1, '/work/v2', NULL, NULL, 1000, 1000),
+                 ('v2-fork', 1, '/work/v2', 'v2-root', 1, 1001, 1001),
+                 ('v2-child', 1, '/work/v2', 'v2-root', NULL, 1002, 1002);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+
+    // 2. 启动迁移到 v3 并核验回填结果
+    let app = Context::new();
+    app.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let ver: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 3);
+    }
+
+    let store = app.sessions().unwrap();
+    assert_eq!(
+        store.get("v2-root").unwrap().header().origin,
+        Some(mizar_session::SessionOrigin::User)
+    );
+    assert_eq!(
+        store.get("v2-fork").unwrap().header().origin,
+        Some(mizar_session::SessionOrigin::User)
+    );
+    assert_eq!(
+        store.get("v2-child").unwrap().header().origin,
+        Some(mizar_session::SessionOrigin::Subagent)
+    );
+
+    // 3. 新建带 fork_seq 但显式标记 origin=Subagent 的会话，exclude_subagents 必须将其排除
+    let explicit_forked_sub = store.create_with(SessionCreateOptions {
+        id: Some("explicit-sub-fork".into()),
+        cwd: Some("/work/v2".into()),
+        parent_id: Some("v2-root".into()),
+        fork_seq: Some(1),
+        origin: Some(mizar_session::SessionOrigin::Subagent),
+        ..Default::default()
+    });
+    assert!(explicit_forked_sub.header().is_subagent_child());
+    store.flush(None).unwrap();
+
+    let filtered = store
+        .list_headers(&SessionListQuery {
+            cwd: Some("/work/v2".into()),
+            limit: None,
+            exclude_subagents: true,
+        })
+        .unwrap();
+    let ids: Vec<&str> = filtered.iter().map(|h| h.id.as_str()).collect();
+    assert!(ids.contains(&"v2-root") && ids.contains(&"v2-fork"));
+    assert!(!ids.contains(&"v2-child"));
+    assert!(!ids.contains(&"explicit-sub-fork"));
+
+    app.fiber().dispose().await;
 }

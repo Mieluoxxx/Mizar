@@ -4,20 +4,18 @@
 //! 同时把解析得到的 `<attached-file ...>`、`<attached-directory ...>` 与图片附件
 //! 以 `SessionEvent::ContextNotice { source: "file-mentions", .. }` 注入本轮模型上下文。
 
-use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use cordis::{
-    BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Plugin,
+    BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Next, Plugin,
 };
-use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput};
 use mizar_client_core::{
     ClientEvent, FILE_MENTIONS_SOURCE, NoticeLevel, PLUGIN_FILE_MENTIONS, extract_mentions,
 };
 use mizar_llm::{ImageAttachment, LlmContextExt, MAX_IMAGES_PER_MESSAGE};
-use mizar_session::SessionEvent;
 use mizar_tools_coding::path_utils::resolve_read_path;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -412,92 +410,64 @@ pub fn register_mention_hook_with<F>(
 where
     F: Fn(ClientEvent) + Clone + Send + Sync + 'static,
 {
-    let processed_seq_by_session: Arc<Mutex<HashMap<String, u64>>> =
-        Arc::new(Mutex::new(HashMap::new()));
     let ctx_hook = ctx.clone();
 
-    ctx.on_serial::<AgentPreStepEvent, (), _, _>(
+    ctx.on_waterfall_with(
         EVENT_AGENT_PRE_STEP,
-        move |ev: AgentPreStepEvent| {
+        move |mut input: AgentPreStepInput,
+              next: Next<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>| {
             let ws = workspace.clone();
             let emit = emit.clone();
-            let processed = Arc::clone(&processed_seq_by_session);
             let ctx_hook = ctx_hook.clone();
-            async move {
-                if ev.cancel.is_cancelled() {
-                    return None;
+            Box::pin(async move {
+                if input.cancel.is_cancelled() {
+                    return AgentPreStepDecision::Reject {
+                        reason: "cancelled".to_string(),
+                    };
                 }
 
-                let sid = ev.session.id.clone();
-                let last_done_seq = processed.lock().unwrap().get(&sid).copied().unwrap_or(0);
-
-                let trailing_users: Vec<(u64, String, usize)> =
-                    ev.session.with_visible_entries(|entries| {
-                        let mut collected = Vec::new();
-                        for entry in entries.iter().rev() {
-                            if entry.seq <= last_done_seq {
-                                break;
-                            }
-                            match &entry.event {
-                                SessionEvent::User { text, images } => {
-                                    collected.push((entry.seq, text.clone(), images.len()))
-                                }
-                                SessionEvent::ContextNotice { source, .. }
-                                    if source != FILE_MENTIONS_SOURCE => {}
-                                SessionEvent::ContextNotice { .. }
-                                | SessionEvent::Assistant { .. }
-                                | SessionEvent::ToolResult { .. }
-                                | SessionEvent::Compaction { .. }
-                                | SessionEvent::ToolResultPrune { .. }
-                                | SessionEvent::BashExecution { .. }
-                                | SessionEvent::Selection { .. }
-                                | SessionEvent::Trace { .. } => break,
-                            }
-                        }
-                        collected.reverse();
-                        collected
-                    });
-
-                if trailing_users.is_empty() {
-                    return None;
+                let mut user_texts = Vec::new();
+                let mut existing_images = 0usize;
+                for item in &input.inputs {
+                    if let TurnInput::User { text, images } = item {
+                        user_texts.push(text.as_str());
+                        existing_images += images.len();
+                    }
                 }
 
-                let max_seq = trailing_users.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
-                let existing_images: usize = trailing_users.iter().map(|(_, _, n)| *n).sum();
-                let combined_text = trailing_users
-                    .iter()
-                    .map(|(_, t, _)| t.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                if user_texts.is_empty() {
+                    return next.call(input).await;
+                }
 
+                let combined_text = user_texts.join("\n");
                 let mut result =
-                    expand_text_mentions(&ws, restrict_to_workspace, &combined_text, &ev.cancel)
+                    expand_text_mentions(&ws, restrict_to_workspace, &combined_text, &input.cancel)
                         .await;
 
-                if ev.cancel.is_cancelled() {
-                    return None;
+                if input.cancel.is_cancelled() {
+                    return AgentPreStepDecision::Reject {
+                        reason: "cancelled".to_string(),
+                    };
                 }
 
                 if !result.images.is_empty()
                     && !model_supports_images(
                         &ctx_hook,
-                        ev.provider.as_deref(),
-                        ev.model.as_deref(),
+                        input.provider.as_deref(),
+                        input.model.as_deref(),
                     )
                 {
-                    let model_name = ev.model.as_deref().unwrap_or("当前模型");
+                    let model_name = input.model.as_deref().unwrap_or("当前模型");
+                    let reason = format!(
+                        "当前模型 {model_name} 不支持图片输入，已取消 `@` 图片发送（{}）",
+                        result.image_paths.join(", ")
+                    );
                     emit(ClientEvent::Notice {
                         level: NoticeLevel::Error,
-                        text: format!(
-                            "当前模型 {model_name} 不支持图片输入，已取消 `@` 图片发送（{}）",
-                            result.image_paths.join(", ")
-                        ),
+                        text: reason.clone(),
                     });
-                    ev.cancel.cancel();
-                    return None;
+                    return AgentPreStepDecision::Reject { reason };
                 }
-
-                processed.lock().unwrap().insert(sid, max_seq);
 
                 if existing_images + result.images.len() > MAX_IMAGES_PER_MESSAGE {
                     let allowed = MAX_IMAGES_PER_MESSAGE.saturating_sub(existing_images);
@@ -521,11 +491,11 @@ where
                 }
 
                 if !notice_sections.is_empty() || !result.images.is_empty() {
-                    ev.session.append(SessionEvent::ContextNotice {
-                        source: FILE_MENTIONS_SOURCE.to_string(),
-                        text: notice_sections.join("\n\n"),
-                        images: result.images,
-                    });
+                    input.inputs.push(TurnInput::notice_with_images(
+                        FILE_MENTIONS_SOURCE,
+                        notice_sections.join("\n\n"),
+                        result.images,
+                    ));
                 }
 
                 if !result.attached.is_empty() {
@@ -547,8 +517,12 @@ where
                     });
                 }
 
-                None
-            }
+                next.call(input).await
+            }) as BoxFuture<'static, AgentPreStepDecision>
+        },
+        cordis::EventOptions {
+            priority: -50,
+            ..Default::default()
         },
     )
 }
@@ -651,7 +625,7 @@ mod tests {
         use mizar_llm::{
             BoxChunkStream, GenerateOptions, LlmAdapter, LlmRuntime, ModelInfo, ProviderInfo,
         };
-        use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
+        use mizar_session::{SessionContextExt, SessionStore};
         use tokio::sync::mpsc;
 
         struct TextOnlyAdapter;
@@ -669,6 +643,7 @@ mod tests {
                             max_tokens: None,
                             reasoning_efforts: Vec::new(),
                             input: vec!["text".into()],
+                            ..Default::default()
                         },
                         ModelInfo {
                             id: "vision-m".into(),
@@ -677,6 +652,7 @@ mod tests {
                             max_tokens: None,
                             reasoning_efforts: Vec::new(),
                             input: vec!["text".into(), "image".into()],
+                            ..Default::default()
                         },
                     ],
                 })
@@ -707,36 +683,64 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let _hook = register_mention_hook(&ctx, tmp.clone(), true, tx).unwrap();
         let session = ctx.sessions().unwrap().create(None);
-        session.append(SessionEvent::user("请看 @shot.png"));
 
-        // 1. 不支持图片的模型在 pre-step 阶段触发 cancel，不应推进 processed_seq
+        // 1. 不支持图片的模型在 pre-step 阶段直接 Reject，不入账用户消息
         let cancel1 = CancellationToken::new();
-        let ev1 = AgentPreStepEvent {
+        let ev1 = AgentPreStepInput {
             session: Arc::clone(&session),
             turn: 1,
             step: 1,
             provider: Some("text-only-p".into()),
             model: Some("text-only-m".into()),
             cancel: cancel1.clone(),
+            inputs: vec![TurnInput::user("请看 @shot.png")],
         };
-        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev1).await;
-        assert!(cancel1.is_cancelled());
+        let decision1 = ctx
+            .events()
+            .waterfall(
+                EVENT_AGENT_PRE_STEP,
+                ev1,
+                |inp| -> cordis::BoxFuture<'static, AgentPreStepDecision> {
+                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+                },
+            )
+            .await;
+        assert!(matches!(decision1, AgentPreStepDecision::Reject { .. }));
 
-        // 2. 换用支持图片的模型重放同 seq 时仍能继续识别 @shot.png 并写入 ContextNotice
+        // 2. 换用支持图片的模型重放同输入时顺利 Enter 并附加 file-mentions 通知
         let cancel2 = CancellationToken::new();
-        let ev2 = AgentPreStepEvent {
+        let ev2 = AgentPreStepInput {
             session: Arc::clone(&session),
             turn: 1,
             step: 1,
             provider: Some("text-only-p".into()),
             model: Some("vision-m".into()),
             cancel: cancel2.clone(),
+            inputs: vec![TurnInput::user("请看 @shot.png")],
         };
-        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev2).await;
+        let decision2 = ctx
+            .events()
+            .waterfall(
+                EVENT_AGENT_PRE_STEP,
+                ev2,
+                |inp| -> cordis::BoxFuture<'static, AgentPreStepDecision> {
+                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+                },
+            )
+            .await;
         assert!(!cancel2.is_cancelled());
-        assert!(session.log().iter().any(|e| {
-            matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
-        }));
+        match decision2 {
+            AgentPreStepDecision::Enter { inputs } => {
+                assert!(inputs.iter().any(|item| {
+                    matches!(
+                        item,
+                        TurnInput::Notice { source, images, .. }
+                        if source == FILE_MENTIONS_SOURCE && images.len() == 1
+                    )
+                }));
+            }
+            other => panic!("expected Enter, got {other:?}"),
+        }
 
         ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);
@@ -769,36 +773,66 @@ mod tests {
             .unwrap();
 
         let session = ctx.sessions().unwrap().create(None);
-        session.append(SessionEvent::user("看 @hello.txt"));
 
-        let ev = AgentPreStepEvent {
+        let ev = AgentPreStepInput {
             session: Arc::clone(&session),
             turn: 1,
             step: 1,
             provider: None,
             model: None,
             cancel: CancellationToken::new(),
+            inputs: vec![TurnInput::user("看 @hello.txt")],
         };
-        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev).await;
-        assert!(session.log().iter().any(|e| {
-            matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
-        }));
+        let decision1 = ctx
+            .events()
+            .waterfall(
+                EVENT_AGENT_PRE_STEP,
+                ev,
+                |inp| -> cordis::BoxFuture<'static, AgentPreStepDecision> {
+                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+                },
+            )
+            .await;
+        match decision1 {
+            AgentPreStepDecision::Enter { inputs } => {
+                assert!(inputs.iter().any(|item| {
+                    matches!(
+                        item,
+                        TurnInput::Notice { source, .. } if source == FILE_MENTIONS_SOURCE
+                    )
+                }));
+            }
+            other => panic!("expected Enter, got {other:?}"),
+        }
         assert!(matches!(rx.try_recv(), Ok(ClientEvent::Flash(_))));
 
         // 卸载插件后钩子应随之撤销，不再处理新消息
         plugin_fiber.dispose().await;
-        session.append(SessionEvent::user("再看 @hello.txt"));
-        let count_before = session.log().len();
-        let ev2 = AgentPreStepEvent {
+        let ev2 = AgentPreStepInput {
             session: Arc::clone(&session),
             turn: 2,
             step: 1,
             provider: None,
             model: None,
             cancel: CancellationToken::new(),
+            inputs: vec![TurnInput::user("再看 @hello.txt")],
         };
-        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev2).await;
-        assert_eq!(session.log().len(), count_before);
+        let decision2 = ctx
+            .events()
+            .waterfall(
+                EVENT_AGENT_PRE_STEP,
+                ev2,
+                |inp| -> cordis::BoxFuture<'static, AgentPreStepDecision> {
+                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+                },
+            )
+            .await;
+        match decision2 {
+            AgentPreStepDecision::Enter { inputs } => {
+                assert_eq!(inputs.len(), 1);
+            }
+            other => panic!("expected Enter, got {other:?}"),
+        }
 
         ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);
