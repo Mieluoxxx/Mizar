@@ -14,8 +14,9 @@ pub use error::{
 pub use sse::{SseEvent, SseParser, prefix_digest};
 pub use types::{
     CacheRetention, ContentBlock, ContentBlockKind, FinishReason, ImageAttachment,
-    MAX_IMAGES_PER_MESSAGE, Message, ModelInfo, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, StreamChunk, TokenUsage, ToolCall,
+    MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
+    OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, PromptCacheLifetime, ProviderInfo, ReasoningEffort,
+    ReplayEnvelope, RequestOrigin, SessionAffinityMode, StreamChunk, TokenUsage, ToolCall,
     ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,
     parse_session_affinity_mode, push_header_if_absent, push_session_affinity_headers,
 };
