@@ -777,9 +777,10 @@ async fn nested_exec_and_l1_prune_and_resumed_session_guards_work() {
 
 #[tokio::test]
 async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
+    use cordis::BoxFuture;
     use mizar_agent_loop::{
-        AgentPreStepEvent, AgentStepEndEvent, EVENT_AGENT_PRE_STEP, EVENT_AGENT_STEP_END,
-        StepOutcome,
+        AgentPreStepDecision, AgentPreStepInput, AgentStepEndEvent, EVENT_AGENT_PRE_STEP,
+        EVENT_AGENT_STEP_END, StepOutcome,
     };
     use mizar_compaction::{
         CompactionEndEvent, CompactionStartEvent, EVENT_COMPACTION_END, EVENT_COMPACTION_START,
@@ -985,15 +986,19 @@ async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
     );
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let _ = app2
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&s2),
                 turn: 2,
                 step: 1,
                 provider: Some("prov-b".into()),
                 model: Some("model-b".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -1024,15 +1029,19 @@ async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
     );
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let _ = app2
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&s2),
                 turn: 3,
                 step: 1,
                 provider: Some("prov-b".into()),
                 model: Some("model-b".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -1048,15 +1057,19 @@ async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
     // 紧接着未增长到 regrowth_tokens 即使再次空闲，也不得重复触发 ColdCache
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let _ = app2
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&s2),
                 turn: 4,
                 step: 1,
                 provider: Some("prov-b".into()),
                 model: Some("model-b".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -1067,4 +1080,133 @@ async fn missing_llm_pairs_compaction_traces_and_cold_cache_and_route_work() {
     );
 
     app2.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn touch_session_activity_resets_cold_cache_idle_window() {
+    use cordis::BoxFuture;
+    use mizar_agent_loop::{
+        AgentPreStepDecision, AgentPreStepInput, AgentStepEndEvent, EVENT_AGENT_PRE_STEP,
+        EVENT_AGENT_STEP_END, StepOutcome,
+    };
+
+    // context_window = 12_000, max_tokens = 4_096 -> usable = 7_904
+    // trigger_ratio = 0.40 -> trigger = 3_161 (half = 1_580), keep_recent = 1_976
+    let (adapter, calls) = RecordingAdapter::new(12_000, Vec::new());
+    let app = Context::new();
+    app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    app.plugin(
+        CompactionRuntime::plugin(),
+        CompactionConfig {
+            default_context_window: 12_000,
+            soft_window_cap: 0,
+            trigger_ratio: 0.40,
+            keep_recent_ratio: 0.25,
+            regrowth_ratio: 0.20,
+            post_compact_max_ratio: 0.85,
+            prune_threshold_chars: 100_000,
+            cold_cache_idle_secs: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let adapter_arc = Arc::new(adapter);
+    app.plugin(
+        PluginDef::sync("mock-prov-touch", move |ctx, ()| {
+            let llm = ctx.llm()?;
+            let a = Arc::clone(&adapter_arc);
+            ctx.effect("mock-prov-touch.reg", move || {
+                Ok::<_, LlmError>(Some(llm.register_adapter("mock-compact", a)?))
+            })?;
+            Ok::<_, cordis::CordisError>(())
+        })
+        .inject(["llm"]),
+        (),
+    )
+    .await
+    .unwrap();
+
+    let s = app.sessions().unwrap().create(Some("touch-idle".into()));
+    for i in 0..8 {
+        s.append(SessionEvent::user(format!("u{i} {}", "a".repeat(1_000))));
+        s.append(SessionEvent::assistant_text(format!(
+            "a{i} {}",
+            "b".repeat(400)
+        )));
+    }
+    // 记录 STEP_END 建立 last_activity_at 起点
+    app.emit(
+        EVENT_AGENT_STEP_END,
+        AgentStepEndEvent {
+            session: Arc::clone(&s),
+            turn: 1,
+            step: 1,
+            outcome: StepOutcome::Completed,
+            usage: None,
+            provider: Some("mock-compact".into()),
+            model: Some("m-test".into()),
+            ts_ms: 0,
+        },
+    );
+
+    // 经过 600ms 后调用 touch_session_activity，再等 600ms（距 STEP_END 已 1200ms > 1s，但距 touch 仅 600ms < 1s）
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    app.compaction().unwrap().touch_session_activity(&s.id);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let _ = app
+        .waterfall(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepInput {
+                session: Arc::clone(&s),
+                turn: 2,
+                step: 1,
+                provider: Some("mock-compact".into()),
+                model: Some("m-test".into()),
+                cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+            },
+        )
+        .await;
+    assert!(
+        s.header().compacted_up_to_seq.is_none(),
+        "touch_session_activity must postpone ColdCache idle deadline"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 0);
+
+    // 再等 550ms 后已超过 1s 空闲阈值，应正常触发 ColdCache
+    tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+    let _ = app
+        .waterfall(
+            EVENT_AGENT_PRE_STEP,
+            AgentPreStepInput {
+                session: Arc::clone(&s),
+                turn: 3,
+                step: 1,
+                provider: Some("mock-compact".into()),
+                model: Some("m-test".into()),
+                cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+            },
+        )
+        .await;
+    assert!(
+        s.header().compacted_up_to_seq.is_some(),
+        "ColdCache should trigger once idle elapses past last touch_session_activity"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    app.fiber().dispose().await;
 }

@@ -888,3 +888,63 @@ async fn repair_skips_past_unparsed_tail_seq_and_inspect_readonly_does_not_mutat
 
     app.fiber().dispose().await;
 }
+
+#[tokio::test]
+async fn usage_event_is_log_only_excluded_from_derived_messages_and_roundtrips_json() {
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+    let s = store.create(None);
+
+    s.append(SessionEvent::user("hi"));
+    let usage = TokenUsage {
+        input_tokens: 120,
+        output_tokens: 1,
+        cache_read_tokens: Some(4_000),
+        cache_write_tokens: Some(0),
+        total_tokens: Some(4_121),
+        reasoning_tokens: None,
+    };
+    let u_ev = SessionEvent::usage(
+        "cache_warm",
+        "anthropic",
+        "claude-sonnet-4-6",
+        usage,
+        Some("ttl=5m".into()),
+    );
+    assert_eq!(u_ev.visibility(), EntryVisibility::LogOnly);
+    assert_eq!(u_ev.kind_name(), "usage");
+    s.append(u_ev.clone());
+    s.append(SessionEvent::usage(
+        "session_title",
+        "openai",
+        "gpt-4o-mini",
+        usage,
+        None,
+    ));
+
+    // 只进入 all_entries，不进入表面 log()/visible_log()，也不进入 derive_messages()
+    assert_eq!(s.log().len(), 1);
+    assert_eq!(s.visible_log().len(), 1);
+    assert_eq!(s.all_entries().len(), 3);
+    assert_eq!(s.header().surface_count, 1);
+    assert_eq!(s.header().event_count, 3);
+    let msgs = s.derive_messages();
+    assert_eq!(msgs, vec![Message::user("hi")]);
+
+    let json = serde_json::to_string(&u_ev).unwrap();
+    assert!(json.contains("\"type\":\"usage\""));
+    assert!(json.contains("\"note\":\"ttl=5m\""));
+    let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, u_ev);
+
+    let no_note = SessionEvent::usage("subagent", "openai", "gpt-5", usage, None);
+    let no_note_json = serde_json::to_string(&no_note).unwrap();
+    assert!(!no_note_json.contains("\"note\""));
+    assert_eq!(
+        serde_json::from_str::<SessionEvent>(&no_note_json).unwrap(),
+        no_note
+    );
+
+    app.fiber().dispose().await;
+}

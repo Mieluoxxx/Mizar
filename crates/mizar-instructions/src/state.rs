@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxFuture, Context, CordisError, Service};
-use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use cordis::{BoxFuture, Context, CordisError, Next, Service};
+use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
 use mizar_session::{Session, SessionEvent};
 use mizar_tools::{EVENT_TOOLS_RESULT, ToolResultEvent};
 use serde_json::Value;
@@ -674,17 +674,31 @@ impl Service for AgentInstructions {
 
             let for_step = Arc::clone(&self);
             let ctx_for_step = ctx_clone.clone();
-            ctx_clone.on_serial::<AgentPreStepEvent, (), _, _>(
+            ctx_clone.on_waterfall(
                 EVENT_AGENT_PRE_STEP,
-                move |ev: AgentPreStepEvent| {
+                move |input: AgentPreStepInput,
+                      next: Next<
+                    AgentPreStepInput,
+                    BoxFuture<'static, AgentPreStepDecision>,
+                >| {
                     let svc = Arc::clone(&for_step);
                     let ctx_inner = ctx_for_step.clone();
-                    let session = Arc::clone(&ev.session);
-                    let cancel = ev.cancel.clone();
-                    async move {
-                        svc.reconcile_pre_step(&ctx_inner, &session, &cancel);
-                        None
-                    }
+                    let session = Arc::clone(&input.session);
+                    let cancel = input.cancel.clone();
+                    Box::pin(async move {
+                        if cancel.is_cancelled() {
+                            return AgentPreStepDecision::Reject {
+                                reason: "cancelled".to_string(),
+                            };
+                        }
+                        let decision = next.call(input).await;
+                        if matches!(decision, AgentPreStepDecision::Enter { .. })
+                            && !cancel.is_cancelled()
+                        {
+                            svc.reconcile_pre_step(&ctx_inner, &session, &cancel);
+                        }
+                        decision
+                    }) as BoxFuture<'static, AgentPreStepDecision>
                 },
             )?;
 

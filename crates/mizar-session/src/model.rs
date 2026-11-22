@@ -221,6 +221,16 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<ReasoningEffort>,
     },
+    /// 非上下文用量账本记录（`EntryVisibility::LogOnly`，例如 `cache_warm` / `session_title` / `subagent`）：
+    /// 依托既有 `(kind, payload_json)` 持久化表落盘，绝不进入 `derive_messages()`。
+    Usage {
+        kind: String,
+        provider: String,
+        model: String,
+        usage: TokenUsage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 /// 一次 `Selection` 事件的只读投影。三个字段各自可缺省，`None` 表示「当时未指定」。
@@ -268,11 +278,28 @@ impl SessionEvent {
         }
     }
 
+    pub fn usage(
+        kind: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        usage: TokenUsage,
+        note: Option<String>,
+    ) -> Self {
+        Self::Usage {
+            kind: kind.into(),
+            provider: provider.into(),
+            model: model.into(),
+            usage,
+            note,
+        }
+    }
+
     pub fn visibility(&self) -> EntryVisibility {
         match self {
-            Self::Trace { .. } | Self::ToolResultPrune { .. } | Self::Selection { .. } => {
-                EntryVisibility::LogOnly
-            }
+            Self::Trace { .. }
+            | Self::ToolResultPrune { .. }
+            | Self::Selection { .. }
+            | Self::Usage { .. } => EntryVisibility::LogOnly,
             Self::BashExecution {
                 exclude_from_context,
                 ..
@@ -322,6 +349,7 @@ impl SessionEvent {
             Self::BashExecution { .. } => "bash-execution",
             Self::Trace { detail } => detail.kind_name(),
             Self::Selection { .. } => "selection",
+            Self::Usage { .. } => "usage",
         }
     }
 }

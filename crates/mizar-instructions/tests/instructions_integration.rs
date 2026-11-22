@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, Service};
-use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use cordis::{BoxFuture, Context, Service};
+use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
 use mizar_instructions::{AgentInstructions, InstructionsConfig, InstructionsContextExt};
 use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
 use mizar_tools::{ToolExecution, ToolRuntime, ToolsContextExt};
@@ -31,15 +31,19 @@ impl Drop for DirGuard {
 
 async fn emit_pre_step(ctx: &Context, session: &Arc<mizar_session::Session>, step: usize) {
     let _ = ctx
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(session),
                 turn: 1,
                 step,
                 provider: None,
                 model: None,
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;

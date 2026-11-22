@@ -348,7 +348,9 @@ pub fn build_session_info_report_at(
                         bash_local_count += 1;
                     }
                 }
-                SessionEvent::Trace { .. } | SessionEvent::Selection { .. } => {}
+                SessionEvent::Trace { .. }
+                | SessionEvent::Selection { .. }
+                | SessionEvent::Usage { .. } => {}
             }
         }
     });
@@ -638,7 +640,9 @@ pub fn project_session_view(
                 }
                 _ => {}
             },
-            SessionEvent::ToolResultPrune { .. } | SessionEvent::Selection { .. } => {}
+            SessionEvent::ToolResultPrune { .. }
+            | SessionEvent::Selection { .. }
+            | SessionEvent::Usage { .. } => {}
         }
     }
     if saw_usage {
@@ -801,6 +805,7 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
             }
             SessionEvent::ToolResultPrune { .. }
             | SessionEvent::Selection { .. }
+            | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => None,
         })
         .collect()

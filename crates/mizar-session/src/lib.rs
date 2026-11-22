@@ -206,6 +206,7 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
             | SessionEvent::BashExecution { .. }
             | SessionEvent::ToolResultPrune { .. }
             | SessionEvent::Selection { .. }
+            | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => {}
         }
     }
@@ -864,6 +865,7 @@ impl Session {
                 }
                 SessionEvent::ToolResultPrune { .. }
                 | SessionEvent::Selection { .. }
+                | SessionEvent::Usage { .. }
                 | SessionEvent::Trace { .. } => {}
             }
         }

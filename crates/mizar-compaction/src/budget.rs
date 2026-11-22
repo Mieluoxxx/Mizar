@@ -170,6 +170,7 @@ pub fn estimate_entry_tokens(entry: &SessionEntry, pruned_replacement: Option<&s
         }
         SessionEvent::ToolResultPrune { .. }
         | SessionEvent::Selection { .. }
+        | SessionEvent::Usage { .. }
         | SessionEvent::Trace { .. } => 0,
     }
 }

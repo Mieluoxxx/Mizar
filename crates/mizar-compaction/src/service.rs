@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Next, Service};
 use mizar_agent_loop::{
-    AgentContextOverflowEvent, AgentPreStepEvent, AgentStepEndEvent, EVENT_AGENT_CONTEXT_OVERFLOW,
-    EVENT_AGENT_PRE_STEP, EVENT_AGENT_STEP_END, StepOutcome,
+    AgentPreStepDecision, AgentPreStepInput, AgentRequestErrorDecision, AgentRequestErrorInput,
+    AgentRequestErrorKind, AgentStepEndEvent, EVENT_AGENT_PRE_STEP, EVENT_AGENT_REQUEST_ERROR,
+    EVENT_AGENT_STEP_END, StepOutcome,
 };
 use mizar_llm::LlmContextExt;
 use mizar_session::{Session, SessionContextExt, SessionTraceEvent};
@@ -24,7 +25,7 @@ use crate::budget::{
 };
 use crate::digest::{build_compaction_digest, plan_compaction_cut};
 use crate::guards::FileGuardTracker;
-use crate::pruner::plan_tool_result_prune;
+use crate::pruner::plan_tool_result_prune_with_pending;
 use crate::summarizer::{SummarizeParams, generate_checkpoint_summary};
 use crate::{
     CompactionConfig, CompactionEndEvent, CompactionError, CompactionOutcome,
@@ -60,6 +61,13 @@ pub struct CompactionRuntime {
 }
 
 impl CompactionRuntime {
+    /// 刷新指定会话的最近活跃时间戳（供缓存保活等外部模块同步冷缓存判定窗口）。
+    pub fn touch_session_activity(&self, session_id: &str) {
+        let mut guard = self.sessions_meta.lock().unwrap();
+        let entry = guard.entry(session_id.to_string()).or_default();
+        entry.last_activity_at = Some(Instant::now());
+    }
+
     pub fn config(&self) -> CompactionConfig {
         self.config.lock().unwrap().clone()
     }
@@ -177,19 +185,26 @@ impl CompactionRuntime {
             opts.model,
             opts.focus,
             false,
+            0,
             cancel,
         )
         .await
     }
 
-    async fn handle_pre_step(&self, ev: &AgentPreStepEvent) {
+    async fn handle_pre_step(&self, ev: &AgentPreStepInput) {
         let cfg = self.config();
         if !cfg.enabled || (!cfg.auto_compact && !cfg.auto_prune) {
             return;
         }
         let budget = self.compute_session_budget(ev.provider.as_deref(), ev.model.as_deref(), &cfg);
         let (sys_prompt, _, tools_chars) = self.current_prompt_and_tools(&ev.session.id);
-        let estimated = estimate_session_context_tokens(&ev.session, &sys_prompt, tools_chars);
+        let pending_tokens: u64 = ev
+            .inputs
+            .iter()
+            .map(|inp| estimate_text_tokens(inp.text()))
+            .sum();
+        let estimated = estimate_session_context_tokens(&ev.session, &sys_prompt, tools_chars)
+            .saturating_add(pending_tokens);
 
         let (last_compacted_tokens, idle_secs) = {
             let guard = self.sessions_meta.lock().unwrap();
@@ -230,12 +245,13 @@ impl CompactionRuntime {
                 ev.model.clone(),
                 None,
                 false,
+                ev.inputs.len(),
                 ev.cancel.clone(),
             )
             .await;
     }
 
-    async fn handle_overflow(&self, ev: &AgentContextOverflowEvent) -> bool {
+    async fn handle_overflow(&self, ev: &AgentRequestErrorInput) -> bool {
         if !self.config().enabled {
             return false;
         }
@@ -247,6 +263,7 @@ impl CompactionRuntime {
                 ev.model.clone(),
                 None,
                 true,
+                0,
                 ev.cancel.clone(),
             )
             .await
@@ -268,6 +285,7 @@ impl CompactionRuntime {
         model: Option<String>,
         focus: Option<String>,
         force_overflow: bool,
+        pending_surface_count: usize,
         cancel: CancellationToken,
     ) -> Result<CompactionReport, CompactionError> {
         let _lock = self.try_lock_session(&session.id)?;
@@ -365,7 +383,8 @@ impl CompactionRuntime {
         // --- L1：零模型批量剪枝 ---
         let mut pruned_count = 0usize;
         if cfg.auto_prune {
-            let prune_plan = plan_tool_result_prune(&session, &cfg);
+            let prune_plan =
+                plan_tool_result_prune_with_pending(&session, &cfg, pending_surface_count);
             if !prune_plan.items.is_empty() {
                 pruned_count = prune_plan.items.len();
                 session.append_prune(prune_plan.items);
@@ -771,14 +790,24 @@ impl Service for CompactionRuntime {
                 let rt = Arc::clone(&self);
                 let c = ctx.clone();
                 ctx.effect("compaction.pre-step", move || {
-                    let h = c.on_serial_with::<AgentPreStepEvent, (), _, _>(
+                    let h = c.on_waterfall_with(
                         EVENT_AGENT_PRE_STEP,
-                        move |ev: AgentPreStepEvent| {
+                        move |input: AgentPreStepInput,
+                              next: Next<
+                            AgentPreStepInput,
+                            BoxFuture<'static, AgentPreStepDecision>,
+                        >| {
                             let rt = Arc::clone(&rt);
-                            async move {
-                                rt.handle_pre_step(&ev).await;
-                                None
-                            }
+                            Box::pin(async move {
+                                if input.cancel.is_cancelled() {
+                                    return AgentPreStepDecision::Reject {
+                                        reason: "cancelled".to_string(),
+                                    };
+                                }
+                                rt.handle_pre_step(&input).await;
+                                next.call(input).await
+                            })
+                                as BoxFuture<'static, AgentPreStepDecision>
                         },
                         cordis::EventOptions {
                             priority: -20,
@@ -817,12 +846,24 @@ impl Service for CompactionRuntime {
             {
                 let rt = Arc::clone(&self);
                 let c = ctx.clone();
-                ctx.effect("compaction.overflow", move || {
-                    let h = c.on_serial::<AgentContextOverflowEvent, bool, _, _>(
-                        EVENT_AGENT_CONTEXT_OVERFLOW,
-                        move |ev: AgentContextOverflowEvent| {
+                ctx.effect("compaction.request-error", move || {
+                    let h = c.on_waterfall(
+                        EVENT_AGENT_REQUEST_ERROR,
+                        move |input: AgentRequestErrorInput,
+                              next: Next<
+                            AgentRequestErrorInput,
+                            BoxFuture<'static, AgentRequestErrorDecision>,
+                        >| {
                             let rt = Arc::clone(&rt);
-                            async move { Some(rt.handle_overflow(&ev).await) }
+                            Box::pin(async move {
+                                if input.kind == AgentRequestErrorKind::ContextOverflow
+                                    && rt.handle_overflow(&input).await
+                                {
+                                    return AgentRequestErrorDecision::Retry;
+                                }
+                                next.call(input).await
+                            })
+                                as BoxFuture<'static, AgentRequestErrorDecision>
                         },
                     )?;
                     Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {

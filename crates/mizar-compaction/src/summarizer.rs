@@ -400,6 +400,7 @@ fn format_entry_for_transcript(entry: &SessionEntry) -> Option<String> {
         | SessionEvent::ToolResultPrune { .. }
         | SessionEvent::BashExecution { .. }
         | SessionEvent::Selection { .. }
+        | SessionEvent::Usage { .. }
         | SessionEvent::Trace { .. } => None,
     }
 }
