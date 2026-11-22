@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
+use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
 use mizar_agent_loop::{
-    AgentPreStepEvent, AgentToolResultEvent, EVENT_AGENT_PRE_STEP, EVENT_AGENT_TOOL_RESULT,
+    AgentPreStepDecision, AgentPreStepInput, AgentToolResultEvent, EVENT_AGENT_PRE_STEP,
+    EVENT_AGENT_TOOL_RESULT, TurnInput,
 };
 use mizar_session::SessionEvent;
 use mizar_tools::{
@@ -350,22 +351,38 @@ impl Plugin for SkillsPlugin {
             let processed_gesture_seqs: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let pre_step_ctx = ctx.clone();
-            ctx.on_serial::<AgentPreStepEvent, (), _, _>(
+            ctx.on_waterfall_with(
                 EVENT_AGENT_PRE_STEP,
-                move |ev: AgentPreStepEvent| {
+                move |input: AgentPreStepInput,
+                      next: Next<
+                    AgentPreStepInput,
+                    BoxFuture<'static, AgentPreStepDecision>,
+                >| {
                     let reg = Arc::clone(&registry);
                     let ctx_inner = pre_step_ctx.clone();
-                    let session = Arc::clone(&ev.session);
-                    let cancel = ev.cancel.clone();
+                    let session = Arc::clone(&input.session);
+                    let cancel = input.cancel.clone();
                     let ws = config.workspace.clone();
                     let max_desc_len = config.catalog_description_max_length.max(3);
                     let published_map = Arc::clone(&published_catalogs);
                     let processed_gestures = Arc::clone(&processed_gesture_seqs);
 
-                    async move {
+                    Box::pin(async move {
                         if cancel.is_cancelled() {
-                            return None;
+                            return AgentPreStepDecision::Reject {
+                                reason: "cancelled".to_string(),
+                            };
                         }
+                        let decision = next.call(input).await;
+                        let AgentPreStepDecision::Enter { mut inputs } = decision else {
+                            return decision;
+                        };
+                        if cancel.is_cancelled() {
+                            return AgentPreStepDecision::Reject {
+                                reason: "cancelled".to_string(),
+                            };
+                        }
+
                         let lookup = SkillLookupOptions {
                             cwd: Some(ws),
                             cancel: cancel.clone(),
@@ -384,7 +401,9 @@ impl Plugin for SkillsPlugin {
                         if skill_tool_visible {
                             let snap = reg.snapshot(lookup.clone()).await;
                             if cancel.is_cancelled() {
-                                return None;
+                                return AgentPreStepDecision::Reject {
+                                    reason: "cancelled".to_string(),
+                                };
                             }
                             let next_state =
                                 build_catalog_state(&snap.skills, max_desc_len, !snap.complete);
@@ -466,14 +485,25 @@ impl Plugin for SkillsPlugin {
                             }
                         }
 
-                        // 2. 扫描最近一轮用户直输消息中的 `/<name>` 手势，仅展开 user_invocable 技能且仅处理尚未处理过的新增消息
-                        let last_done_gesture_seq = processed_gestures
-                            .lock()
-                            .unwrap()
-                            .get(&session.id)
-                            .copied()
-                            .unwrap_or(0);
-                        let (trailing_user_texts, max_user_seq) =
+                        // 2. 扫描本步待入账的用户直输消息（或测试直接追加的未处理 User 条目）中的 `/<name>` 手势
+                        let input_user_texts: Vec<String> = inputs
+                            .iter()
+                            .filter_map(|item| match item {
+                                TurnInput::User { text, .. } => Some(text.clone()),
+                                TurnInput::Notice { .. } => None,
+                            })
+                            .collect();
+                        let from_turn_inputs = !input_user_texts.is_empty();
+
+                        let (trailing_user_texts, max_user_seq) = if from_turn_inputs {
+                            (input_user_texts, None)
+                        } else {
+                            let last_done_gesture_seq = processed_gestures
+                                .lock()
+                                .unwrap()
+                                .get(&session.id)
+                                .copied()
+                                .unwrap_or(0);
                             session.with_visible_entries(|entries| {
                                 let mut collected = Vec::new();
                                 let mut max_seq: Option<u64> = None;
@@ -497,12 +527,14 @@ impl Plugin for SkillsPlugin {
                                         | SessionEvent::ToolResultPrune { .. }
                                         | SessionEvent::BashExecution { .. }
                                         | SessionEvent::Selection { .. }
+                                        | SessionEvent::Usage { .. }
                                         | SessionEvent::Trace { .. } => break,
                                     }
                                 }
                                 collected.reverse();
                                 (collected, max_seq)
-                            });
+                            })
+                        };
 
                         let mut gesture_names = Vec::new();
                         for text in trailing_user_texts {
@@ -533,24 +565,37 @@ impl Plugin for SkillsPlugin {
                         }
 
                         if all_resolved && !cancel.is_cancelled() {
-                            for def in resolved_defs {
-                                session.append(SessionEvent::context_notice(
-                                    SKILL_INVOCATION_SOURCE,
-                                    render_skill_content(&def),
-                                ));
-                            }
-                            if let Some(max_seq) = max_user_seq {
-                                processed_gestures
-                                    .lock()
-                                    .unwrap()
-                                    .entry(session.id.clone())
-                                    .and_modify(|s| *s = (*s).max(max_seq))
-                                    .or_insert(max_seq);
+                            if from_turn_inputs {
+                                for def in resolved_defs {
+                                    inputs.push(TurnInput::notice(
+                                        SKILL_INVOCATION_SOURCE,
+                                        render_skill_content(&def),
+                                    ));
+                                }
+                            } else {
+                                for def in resolved_defs {
+                                    session.append(SessionEvent::context_notice(
+                                        SKILL_INVOCATION_SOURCE,
+                                        render_skill_content(&def),
+                                    ));
+                                }
+                                if let Some(max_seq) = max_user_seq {
+                                    processed_gestures
+                                        .lock()
+                                        .unwrap()
+                                        .entry(session.id.clone())
+                                        .and_modify(|s| *s = (*s).max(max_seq))
+                                        .or_insert(max_seq);
+                                }
                             }
                         }
 
-                        None
-                    }
+                        AgentPreStepDecision::Enter { inputs }
+                    }) as BoxFuture<'static, AgentPreStepDecision>
+                },
+                cordis::EventOptions {
+                    priority: 5,
+                    ..Default::default()
                 },
             )?;
 

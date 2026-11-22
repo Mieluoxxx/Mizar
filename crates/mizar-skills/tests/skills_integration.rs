@@ -468,7 +468,8 @@ async fn include_user_roots_false_skips_user_skills_but_keeps_project_skills() {
 
 #[tokio::test]
 async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_catalog() {
-    use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+    use cordis::BoxFuture;
+    use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
     use mizar_skills::{
         SkillCandidate, SkillDefinition, SkillProvider, SkillProviderObservation, SkillSummary,
     };
@@ -649,69 +650,48 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
     cfg.include_user_roots = false;
     ctx1.plugin(SkillsPlugin, cfg.clone()).await.unwrap();
 
+    let dispatch_pre_step = |ctx: &Context,
+                             session: &Arc<mizar_session::Session>,
+                             turn: u64,
+                             step: usize,
+                             cancel: CancellationToken| {
+        let ctx = ctx.clone();
+        let session = Arc::clone(session);
+        async move {
+            ctx.waterfall(
+                EVENT_AGENT_PRE_STEP,
+                AgentPreStepInput {
+                    session,
+                    turn,
+                    step,
+                    provider: None,
+                    model: None,
+                    cancel,
+                    inputs: Vec::new(),
+                },
+                |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+                },
+            )
+            .await
+        }
+    };
+
     let s = ctx1
         .sessions()
         .unwrap()
         .create(Some("s-skill-resume".into()));
     s.append(SessionEvent::user("run /alpha please"));
-    let _ = ctx1
-        .serial::<AgentPreStepEvent, ()>(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
-                session: Arc::clone(&s),
-                turn: 1,
-                step: 1,
-                provider: None,
-                model: None,
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await;
+    let _ = dispatch_pre_step(&ctx1, &s, 1, 1, CancellationToken::new()).await;
 
     // 模拟已取消的 pre-step 带有 /beta：不得推进 processed_gesture_seq
     s.append(SessionEvent::user("and /beta too"));
     let cancelled = CancellationToken::new();
     cancelled.cancel();
-    let _ = ctx1
-        .serial::<AgentPreStepEvent, ()>(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
-                session: Arc::clone(&s),
-                turn: 2,
-                step: 1,
-                provider: None,
-                model: None,
-                cancel: cancelled,
-            },
-        )
-        .await;
+    let _ = dispatch_pre_step(&ctx1, &s, 2, 1, cancelled).await;
     // 下一次未取消的 pre-step 仍应成功展开 /beta，仅此一次
-    let _ = ctx1
-        .serial::<AgentPreStepEvent, ()>(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
-                session: Arc::clone(&s),
-                turn: 2,
-                step: 1,
-                provider: None,
-                model: None,
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await;
-    let _ = ctx1
-        .serial::<AgentPreStepEvent, ()>(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
-                session: Arc::clone(&s),
-                turn: 2,
-                step: 2,
-                provider: None,
-                model: None,
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await;
+    let _ = dispatch_pre_step(&ctx1, &s, 2, 1, CancellationToken::new()).await;
+    let _ = dispatch_pre_step(&ctx1, &s, 2, 2, CancellationToken::new()).await;
     let beta_count = s.with_visible_entries(|entries| {
         entries
             .iter()
@@ -762,19 +742,7 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
     });
     assert_eq!(before_cat, 1);
 
-    let _ = ctx2
-        .serial::<AgentPreStepEvent, ()>(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
-                session: Arc::clone(&resumed),
-                turn: 3,
-                step: 1,
-                provider: None,
-                model: None,
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await;
+    let _ = dispatch_pre_step(&ctx2, &resumed, 3, 1, CancellationToken::new()).await;
     let after_cat = resumed.with_visible_entries(|e| {
         e.iter()
             .filter(|x| matches!(&x.event, SessionEvent::ContextNotice { source, .. } if source == SKILL_CATALOG_SOURCE))

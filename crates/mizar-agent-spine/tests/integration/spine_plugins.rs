@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, PluginDef};
+use cordis::{BoxFuture, Context, PluginDef};
 use futures::channel::mpsc;
-use mizar_agent_loop::{AgentLoopContextExt, AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_agent_loop::{
+    AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
+};
 use mizar_agent_spine::{
     AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CompactionContextExt,
     EVENT_SPINE_PLUGINS_CHANGE, RECALL_SEARCH_TOOL_NAME, SessionTitleContextExt,
@@ -318,15 +320,19 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let session = sessions.create(None);
     session.append(SessionEvent::user("hello"));
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session),
                 turn: 1,
                 step: 1,
                 provider: Some("mock".into()),
                 model: Some("mock-1".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -364,15 +370,19 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let session_after_unload = sessions.create(None);
     session_after_unload.append(SessionEvent::user("after unload"));
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session_after_unload),
                 turn: 1,
                 step: 1,
                 provider: Some("mock".into()),
                 model: Some("mock-1".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;
@@ -387,15 +397,19 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(app.get::<SkillRegistry>("skills").is_some());
     assert!(app.get::<AgentInstructions>("agentInstructions").is_some());
     let _ = app
-        .serial::<AgentPreStepEvent, ()>(
+        .waterfall(
             EVENT_AGENT_PRE_STEP,
-            AgentPreStepEvent {
+            AgentPreStepInput {
                 session: Arc::clone(&session_after_unload),
                 turn: 2,
                 step: 1,
                 provider: Some("mock".into()),
                 model: Some("mock-1".into()),
                 cancel: CancellationToken::new(),
+                inputs: Vec::new(),
+            },
+            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
         .await;

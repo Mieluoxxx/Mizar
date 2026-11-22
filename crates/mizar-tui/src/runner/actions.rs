@@ -6,11 +6,11 @@ use std::sync::{Arc, RwLock};
 
 use cordis::Context;
 use crossterm::event::EventStream;
-use mizar_agent_loop::{AgentLoopContextExt, RunOptions};
+use mizar_agent_loop::{AgentLoopContextExt, DeliveryMode, RunOptions, TurnInput};
 use mizar_agent_spine::{
     CompactionContextExt, CompactionError, ManualCompactOptions, resolve_global_settings_path,
 };
-use mizar_client::events::{ActiveTaskKind, LoopClientMsg, PendingPrompt, RunController};
+use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController, steer_session};
 use mizar_client::images;
 use mizar_client::local_bash::{execute_local_bash_for_session, next_local_bash_call_id};
 use mizar_client::mentions;
@@ -159,6 +159,27 @@ pub(super) fn spawn_agent_run(
     prompt: String,
     images: Vec<ImageAttachment>,
 ) {
+    spawn_agent_run_input(
+        ctx,
+        config,
+        app,
+        active_session,
+        loop_tx,
+        task_state,
+        TurnInput::user_with_images(prompt, images),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_agent_run_input(
+    ctx: &Context,
+    config: &TuiConfig,
+    app: &mut AppState,
+    active_session: &Arc<Session>,
+    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
+    task_state: &mut RunController,
+    input: TurnInput,
+) {
     let Ok(agent_loop) = ctx.agent_loop() else {
         app.push_notice(NoticeLevel::Error, "agentLoop 服务未就绪");
         return;
@@ -184,12 +205,12 @@ pub(super) fn spawn_agent_run(
         max_tokens: None,
         temperature: None,
         reasoning_effort: app.reasoning_effort,
-        images,
+        images: Vec::new(),
     };
     let tx = loop_tx.clone();
     tokio::spawn(async move {
         let res = agent_loop
-            .run_with_options(session, prompt, cancel, run_opts)
+            .run_with_options(session, input, cancel, run_opts)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(LoopClientMsg::Task {
@@ -198,6 +219,130 @@ pub(super) fn spawn_agent_run(
             event: UiEvent::RunFinished(res),
         });
     });
+}
+
+/// 从 `SessionInbox` 出队当前活跃会话的下一条待唤醒 `FollowUp` 并启动一轮对话。
+pub(super) fn drain_next_inbox_followup(
+    ctx: &Context,
+    config: &TuiConfig,
+    app: &mut AppState,
+    active_session: &Arc<Session>,
+    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
+    task_state: &mut RunController,
+) -> bool {
+    let Ok(agent_loop) = ctx.agent_loop() else {
+        return false;
+    };
+    if agent_loop.is_session_busy(&active_session.id) {
+        return false;
+    }
+    let Some(next_input) = agent_loop.inbox().pop_followup(&active_session.id) else {
+        return false;
+    };
+    match &next_input {
+        TurnInput::User { text, images } => {
+            if !images.is_empty() && !app.active_model_supports_images() {
+                app.reject_unsupported_images_notice();
+                return true;
+            }
+            app.push_user_message(text);
+        }
+        TurnInput::Notice { source, text, .. } => {
+            app.push_notice(NoticeLevel::Info, format!("[{source}] {text}"));
+        }
+    }
+    spawn_agent_run_input(
+        ctx,
+        config,
+        app,
+        active_session,
+        loop_tx,
+        task_state,
+        next_input,
+    );
+    true
+}
+
+/// 执行硬取消：关闭审批浮层、触发 `CancellationToken` 并清空会话未投递收件箱。
+pub(super) fn cancel_active_run(
+    ctx: &Context,
+    app: &mut AppState,
+    active_session: &Session,
+    task_state: &mut RunController,
+) {
+    app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+    task_state.cancel_active();
+    if let Ok(agent_loop) = ctx.agent_loop() {
+        agent_loop.inbox().clear(&active_session.id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_steer_prompt(
+    ctx: &Context,
+    config: &TuiConfig,
+    app: &mut AppState,
+    active_session: &Arc<Session>,
+    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
+    task_state: &mut RunController,
+    prompt: String,
+    images: Vec<ImageAttachment>,
+) {
+    if images.is_empty() {
+        let file_mentions_enabled =
+            HostExtensionFlags::from_disabled_plugins(&config.disabled_plugins).file_mentions;
+        if file_mentions_enabled
+            && prompt.contains('@')
+            && !app.active_model_supports_images()
+            && mentions::mentions_resolve_any_image(
+                &config.workspace,
+                config.restrict_to_workspace,
+                &prompt,
+            )
+            .await
+        {
+            app.input.set_text_end(&prompt);
+            app.reject_unsupported_images_notice();
+            return;
+        }
+    } else if !app.active_model_supports_images() {
+        app.reject_unsupported_images_notice();
+        return;
+    }
+
+    let is_active_agent_run = task_state.active_task().is_some_and(|task| {
+        task.kind == ActiveTaskKind::AgentRun && task.session_id == active_session.id
+    });
+
+    if is_active_agent_run && let Ok(agent_loop) = ctx.agent_loop() {
+        app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+        let push_res = steer_session(
+            &agent_loop,
+            &active_session.id,
+            TurnInput::user_with_images(prompt.clone(), images.clone()),
+        );
+        if push_res.effective_mode == DeliveryMode::Steer {
+            app.push_user_message(&prompt);
+            app.set_flash("⚡ 已投递步间插话，将在当前步完成后继续…");
+            return;
+        }
+        if push_res.effective_mode == DeliveryMode::FollowUp {
+            app.set_flash("⚡ 已排入下一轮续接…");
+            return;
+        }
+    }
+
+    app.push_user_message(&prompt);
+    spawn_agent_run(
+        ctx,
+        config,
+        app,
+        active_session,
+        loop_tx,
+        task_state,
+        prompt,
+        images,
+    );
 }
 
 pub(super) fn spawn_local_bash_run(
@@ -450,8 +595,7 @@ pub(super) async fn handle_action(
             apply_clipboard_content(app, &config.workspace, res).await;
         }
         AppAction::CancelRun => {
-            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-            task_state.cancel_active(None);
+            cancel_active_run(ctx, app, active_session, task_state);
         }
         AppAction::CompactSession(focus) => {
             if app.is_running_activity() {
@@ -634,60 +778,30 @@ pub(super) async fn handle_action(
             );
         }
         AppAction::SteerPrompt(prompt) => {
-            let file_mentions_enabled =
-                HostExtensionFlags::from_disabled_plugins(&config.disabled_plugins).file_mentions;
-            if file_mentions_enabled
-                && prompt.contains('@')
-                && !app.active_model_supports_images()
-                && mentions::mentions_resolve_any_image(
-                    &config.workspace,
-                    config.restrict_to_workspace,
-                    &prompt,
-                )
-                .await
-            {
-                app.input.set_text_end(&prompt);
-                app.reject_unsupported_images_notice();
-                return;
-            }
-            if task_state.cancel_token().is_some() {
-                app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-                task_state.cancel_active(Some(PendingPrompt::text(prompt)));
-            } else {
-                app.push_user_message(&prompt);
-                spawn_agent_run(
-                    ctx,
-                    config,
-                    app,
-                    active_session,
-                    loop_tx,
-                    task_state,
-                    prompt,
-                    Vec::new(),
-                );
-            }
+            handle_steer_prompt(
+                ctx,
+                config,
+                app,
+                active_session,
+                loop_tx,
+                task_state,
+                prompt,
+                Vec::new(),
+            )
+            .await;
         }
         AppAction::SteerPromptWithImages { text, images } => {
-            if !app.active_model_supports_images() {
-                app.reject_unsupported_images_notice();
-                return;
-            }
-            if task_state.cancel_token().is_some() {
-                app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-                task_state.cancel_active(Some(PendingPrompt::with_images(text, images)));
-            } else {
-                app.push_user_message(&text);
-                spawn_agent_run(
-                    ctx,
-                    config,
-                    app,
-                    active_session,
-                    loop_tx,
-                    task_state,
-                    text,
-                    images,
-                );
-            }
+            handle_steer_prompt(
+                ctx,
+                config,
+                app,
+                active_session,
+                loop_tx,
+                task_state,
+                text,
+                images,
+            )
+            .await;
         }
         AppAction::RunLocalBash {
             command,

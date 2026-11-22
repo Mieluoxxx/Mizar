@@ -844,3 +844,93 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_from_messages() {
+    use mizar_llm::{Message, TokenUsage};
+    use mizar_session_sqlite::schema::CURRENT_SCHEMA_VERSION;
+
+    let dir = std::env::temp_dir().join(format!("mizar_sqlite_usage_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("sessions.sqlite");
+
+    let usage = TokenUsage {
+        input_tokens: 42,
+        output_tokens: 1,
+        cache_read_tokens: Some(8_192),
+        cache_write_tokens: None,
+        total_tokens: Some(8_235),
+        reasoning_tokens: None,
+    };
+
+    let app1 = Context::new();
+    app1.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app1.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let s1 = app1
+        .sessions()
+        .unwrap()
+        .create(Some("usage-persist".into()));
+    s1.append(SessionEvent::user("hello"));
+    s1.append(SessionEvent::usage(
+        "cache_warm",
+        "anthropic",
+        "claude-sonnet-4-6",
+        usage,
+        Some("keepalive".into()),
+    ));
+    s1.flush_async().await.unwrap();
+    app1.fiber().dispose().await;
+
+    // 校验 SQLite 表结构仍为现有 schema 版本 2 且 kind/visibility/payload_json 正确落盘
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let ver: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, CURRENT_SCHEMA_VERSION);
+        let (vis, kind): (String, String) = conn
+            .query_row(
+                "SELECT visibility, kind FROM session_events WHERE session_id = ?1 AND seq = 2;",
+                ["usage-persist"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(vis, "log_only");
+        assert_eq!(kind, "usage");
+    }
+
+    let app2 = Context::new();
+    app2.plugin(
+        SqlitePersistencePlugin,
+        SqlitePersistenceConfig::new(&db_path),
+    );
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let reloaded = app2.sessions().unwrap().get("usage-persist").unwrap();
+
+    assert_eq!(reloaded.header().event_count, 2);
+    assert_eq!(reloaded.header().surface_count, 1);
+    assert_eq!(reloaded.log().len(), 1);
+    assert_eq!(reloaded.all_entries().len(), 2);
+    assert!(matches!(
+        &reloaded.all_entries()[1].event,
+        SessionEvent::Usage {
+            kind,
+            provider,
+            model,
+            usage: u,
+            note,
+        } if kind == "cache_warm"
+            && provider == "anthropic"
+            && model == "claude-sonnet-4-6"
+            && *u == usage
+            && note.as_deref() == Some("keepalive")
+    ));
+    assert_eq!(reloaded.derive_messages(), vec![Message::user("hello")]);
+
+    app2.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

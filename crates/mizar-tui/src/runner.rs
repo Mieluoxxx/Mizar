@@ -8,6 +8,7 @@ use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, LogLevel, LogSink, Plugin,
 };
 use crossterm::event::EventStream;
+use mizar_agent_loop::AgentLoopContextExt;
 use mizar_agent_spine::SpinePluginsContextExt;
 use mizar_client::approval::{ApprovalSnapshot, register_approval_hook_with};
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
@@ -35,7 +36,7 @@ mod terminal_io;
 
 pub use actions::{apply_clipboard_content, resume_session_into_app};
 pub use mizar_client::events::{
-    ActiveTask, ActiveTaskKind, LoopClientMsg, PendingPrompt, RunController, WaitServicesError,
+    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, WaitServicesError, steer_session,
     subscribe_session_events, subscribe_session_events_into, to_ui_log_record, to_ui_status,
     to_ui_step_outcome, to_ui_turn_end_reason, wait_for_services,
 };
@@ -298,17 +299,6 @@ pub fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry
     mizar_client::settings::build_settings_entries(ctx, &settings_snapshot_from_app(app))
 }
 
-fn pending_prompt_into_action(prompt: PendingPrompt) -> AppAction {
-    if prompt.images.is_empty() {
-        AppAction::SubmitPrompt(prompt.text)
-    } else {
-        AppAction::SubmitPromptWithImages {
-            text: prompt.text,
-            images: prompt.images,
-        }
-    }
-}
-
 pub(super) fn process_loop_ui_msg(
     app: &mut AppState,
     task_state: &mut RunController,
@@ -376,7 +366,7 @@ pub(super) fn process_loop_ui_msg(
     }
 
     if let UiEvent::RunFinished(ref res) = event {
-        let Some(mut finished_task) = task_state.finish_if_current(
+        let Some(finished_task) = task_state.finish_if_current(
             run_id,
             msg_session_id.as_deref(),
             &app.session_id,
@@ -395,10 +385,6 @@ pub(super) fn process_loop_ui_msg(
             );
         app.apply_ui_event(event);
 
-        if let Some(steer) = finished_task.pending_steer.take() {
-            app.push_user_message(&steer.text);
-            return pending_prompt_into_action(steer);
-        }
         if !was_aborted
             && turn_completed
             && let Some(next) = app.dequeue_next()
@@ -429,6 +415,15 @@ pub(super) fn process_loop_ui_msg(
 
     app.apply_ui_event(event);
     AppAction::None
+}
+
+async fn poll_inbox_wake(
+    rx: Option<&mut tokio::sync::broadcast::Receiver<String>>,
+) -> Result<String, tokio::sync::broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// 在已装配 `AgentSpinePlugin` 与模型适配器的 `Context` 上启动全屏 TUI。
@@ -678,6 +673,8 @@ pub async fn run_tui_with_summary(
         let mut terminal = create_terminal(app.screen_mode)?;
 
         let mut term_stream = Some(EventStream::new());
+        let mut wake_rx = ctx.agent_loop().ok().map(|a| a.inbox().subscribe_wake());
+        let mut inbox_wake_ready = false;
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(90));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut reveal_tick = tokio::time::interval(Duration::from_millis(33));
@@ -818,6 +815,24 @@ pub async fn run_tui_with_summary(
                         }
                         (AppAction::None, dirty)
                     }
+                    maybe_wake = poll_inbox_wake(wake_rx.as_mut()), if !app.is_running_activity() && task_state.active_task().is_none() => {
+                        match maybe_wake {
+                            Ok(sid) => {
+                                if sid == active_session.id {
+                                    inbox_wake_ready = true;
+                                }
+                                (AppAction::None, false)
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                inbox_wake_ready = true;
+                                (AppAction::None, false)
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                wake_rx = None;
+                                (AppAction::None, false)
+                            }
+                        }
+                    }
                 };
 
                 needs_redraw |= step_dirty || action != AppAction::None;
@@ -835,6 +850,27 @@ pub async fn run_tui_with_summary(
                     action,
                 )
                 .await;
+
+                let can_drain_inbox_followup = !app.is_running_activity()
+                    && task_state.active_task().is_none()
+                    && (inbox_wake_ready
+                        || matches!(
+                            app.last_turn_end_reason,
+                            None | Some(UiTurnEndReason::Completed)
+                        ));
+                inbox_wake_ready = false;
+                if can_drain_inbox_followup
+                    && actions::drain_next_inbox_followup(
+                        &ctx,
+                        &config,
+                        &mut app,
+                        &active_session,
+                        &loop_tx,
+                        &mut task_state,
+                    )
+                {
+                    needs_redraw = true;
+                }
 
                 if let Ok(mut guard) = approval_snap.write() {
                     if guard.mode != app.approval_mode {
@@ -880,8 +916,7 @@ mod tests {
     use mizar_tui_ui::app::{AppAction, AppState, ChatItem, UiEvent};
 
     use super::{
-        ActiveTaskKind, LoopClientMsg, PendingPrompt, RunController, TuiEmphasisPlugin,
-        process_loop_ui_msg,
+        ActiveTaskKind, LoopClientMsg, RunController, TuiEmphasisPlugin, process_loop_ui_msg,
     };
 
     fn process_ui_event(
@@ -893,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn process_ui_event_records_user_items_for_steer_and_queued_prompts() {
+    fn process_ui_event_records_user_items_for_cancel_and_queued_prompts() {
         let mut app = AppState::new(
             PathBuf::from("."),
             "sess-queue",
@@ -907,7 +942,7 @@ mod tests {
 
         let mut task_state = RunController::default();
         let (_rid1, cancel1) = task_state.start("sess-queue".into(), ActiveTaskKind::AgentRun);
-        task_state.cancel_active(Some(PendingPrompt::text("urgent steer")));
+        task_state.cancel_active();
         assert!(cancel1.is_cancelled());
 
         let act1 = process_ui_event(
@@ -915,11 +950,7 @@ mod tests {
             &mut task_state,
             UiEvent::RunFinished(Err("request aborted".into())),
         );
-        assert_eq!(act1, AppAction::SubmitPrompt("urgent steer".into()));
-        assert!(matches!(
-            app.items.last(),
-            Some(ChatItem::User { text }) if text == "urgent steer"
-        ));
+        assert_eq!(act1, AppAction::RefreshSidePanelData);
         assert_eq!(
             app.queue
                 .items()
@@ -1712,6 +1743,288 @@ mod tests {
         super::actions::populate_side_panel_data(&ctx, &mut app).await;
         assert!(app.side_panel_data.tools.is_empty());
         assert!(app.side_panel_data.git_changes.is_empty());
+
+        ctx.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn handle_steer_prompt_steers_without_cancel_while_cancel_run_hard_aborts_and_wake_drains_followup()
+     {
+        use std::sync::Arc;
+
+        use cordis::{Context, PluginDef, Service};
+        use futures::channel::mpsc as futures_mpsc;
+        use mizar_agent_loop::{
+            AgentLoop, AgentLoopConfig, AgentLoopContextExt, DeliveryMode, TurnInput,
+        };
+        use mizar_llm::{
+            BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
+            LlmRuntime, Message, ModelInfo, ProviderInfo, ReasoningEffort, StreamChunk, ToolCall,
+        };
+        use mizar_session::{SessionContextExt, SessionStore};
+        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
+        use mizar_tools::{ToolDefinition, ToolOutput, ToolRuntime, ToolsContextExt};
+        use tokio::sync::{Notify, mpsc};
+
+        struct SteerTuiAdapter {
+            recorded: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+        }
+
+        impl LlmAdapter for SteerTuiAdapter {
+            fn info(&self) -> Option<ProviderInfo> {
+                Some(ProviderInfo {
+                    id: "mock-tui".into(),
+                    name: "Mock TUI".into(),
+                    protocol: "mock".into(),
+                    models: vec![ModelInfo {
+                        id: "m-tui".into(),
+                        name: "Mock Model".into(),
+                        context_window: Some(32_000),
+                        max_tokens: Some(4_096),
+                        reasoning_efforts: vec![ReasoningEffort::Off],
+                        input: Vec::new(),
+                    }],
+                })
+            }
+
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                self.recorded.lock().unwrap().push(options.messages.clone());
+                let joined: String = options
+                    .messages
+                    .iter()
+                    .map(|m| m.text_content())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let has_wake = joined.rsplit_once("wake check").is_some();
+                let needs_abort_gate = !has_wake
+                    && joined
+                        .rsplit_once("abort turn")
+                        .is_some_and(|(_, tail)| !tail.contains("gate_done"));
+                let needs_first_gate =
+                    !has_wake && !joined.contains("abort turn") && !joined.contains("gate_done");
+                let has_steer = joined.contains("gentle steer");
+                let (tx, rx) = futures_mpsc::unbounded();
+                tokio::spawn(async move {
+                    if has_wake {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("woke followup ok")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    } else if needs_first_gate || needs_abort_gate {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
+                                id: if needs_abort_gate {
+                                    "call_gate_abort".into()
+                                } else {
+                                    "call_gate".into()
+                                },
+                                name: "tui_gate".into(),
+                                arguments: "{}".into(),
+                            },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    } else if has_steer {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("steered reply")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("plain reply")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let ctx = Context::new();
+        ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+            .await
+            .unwrap();
+        ctx.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
+            .await
+            .unwrap();
+
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = Arc::new(SteerTuiAdapter {
+            recorded: Arc::clone(&recorded),
+        });
+        ctx.plugin(
+            PluginDef::sync("mock-tui-prov", move |c, ()| {
+                let llm = c.llm()?;
+                let a = Arc::clone(&adapter);
+                c.effect("mock-tui-prov.reg", move || {
+                    Ok::<_, LlmError>(Some(llm.register_adapter("mock-tui", a)?))
+                })?;
+                Ok::<_, cordis::CordisError>(())
+            })
+            .inject(["llm"]),
+            (),
+        )
+        .await
+        .unwrap();
+
+        let started_round = Arc::new(Notify::new());
+        let release_round = Arc::new(Notify::new());
+        let started_sig = Arc::clone(&started_round);
+        let release_sig = Arc::clone(&release_round);
+        let _tool_reg = ctx
+            .tools()
+            .unwrap()
+            .register(ToolDefinition::async_rich_tool(
+                "tui_gate",
+                "blocks until released or cancelled",
+                serde_json::json!({}),
+                move |_, call_ctx| {
+                    let s = Arc::clone(&started_sig);
+                    let r = Arc::clone(&release_sig);
+                    async move {
+                        s.notify_one();
+                        tokio::select! {
+                            _ = r.notified() => Ok::<_, cordis::BoxError>(ToolOutput::text("gate_done")),
+                            _ = call_ctx.cancel.cancelled() => Err("cancelled".into()),
+                        }
+                    }
+                },
+            ))
+            .unwrap();
+
+        let sess = ctx.sessions().unwrap().create(None);
+        let cfg = super::TuiConfig::new(std::env::temp_dir());
+        let mut app = AppState::new(
+            std::env::temp_dir(),
+            &sess.id,
+            Vec::new(),
+            Some("mock-tui".into()),
+            Some("m-tui".into()),
+            None,
+        );
+        let (loop_tx, mut loop_rx) = mpsc::unbounded_channel::<super::LoopClientMsg>();
+        let mut task_state = super::RunController::default();
+
+        // 1. 启动第一轮（进入阻塞工具），然后发温和 SteerPrompt：不得取消活跃 CancellationToken
+        super::actions::spawn_agent_run(
+            &ctx,
+            &cfg,
+            &mut app,
+            &sess,
+            &loop_tx,
+            &mut task_state,
+            "first turn".into(),
+            Vec::new(),
+        );
+        started_round.notified().await;
+
+        super::actions::handle_steer_prompt(
+            &ctx,
+            &cfg,
+            &mut app,
+            &sess,
+            &loop_tx,
+            &mut task_state,
+            "gentle steer".into(),
+            Vec::new(),
+        )
+        .await;
+
+        let active_task = task_state.active_task().unwrap();
+        assert!(!active_task.cancel.is_cancelled());
+        assert!(!active_task.user_cancelled);
+        assert!(app.active_flash().is_some_and(|s| s.contains("步间插话")));
+
+        release_round.notify_one();
+        let finish_msg = loop {
+            match loop_rx.recv().await.unwrap() {
+                super::LoopClientMsg::Task {
+                    event: super::UiEvent::RunFinished(res),
+                    ..
+                } => break res,
+                _ => continue,
+            }
+        };
+        assert_eq!(finish_msg.unwrap(), "steered reply");
+        task_state.active = None;
+        app.set_busy_state(false);
+
+        // 2. 启动第二轮并预塞 FollowUp，然后执行硬取消 cancel_active_run：立即取消且清空收件箱
+        let agent_loop = ctx.agent_loop().unwrap();
+        super::actions::spawn_agent_run(
+            &ctx,
+            &cfg,
+            &mut app,
+            &sess,
+            &loop_tx,
+            &mut task_state,
+            "abort turn".into(),
+            Vec::new(),
+        );
+        started_round.notified().await;
+        agent_loop.inbox().push(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::user("queued-drop"),
+        );
+
+        super::actions::cancel_active_run(&ctx, &mut app, &sess, &mut task_state);
+        assert!(task_state.active_task().unwrap().cancel.is_cancelled());
+        assert!(task_state.active_task().unwrap().user_cancelled);
+        assert!(agent_loop.inbox().snapshot(&sess.id).is_empty());
+
+        let abort_res = loop {
+            match loop_rx.recv().await.unwrap() {
+                super::LoopClientMsg::Task {
+                    event: super::UiEvent::RunFinished(res),
+                    ..
+                } => break res,
+                _ => continue,
+            }
+        };
+        assert!(abort_res.is_err());
+        task_state.active = None;
+        app.set_busy_state(false);
+
+        // 3. 空闲时推送 FollowUp 应唤醒 poll_inbox_wake 并由 drain_next_inbox_followup 启动下一轮
+        let mut wake_rx = agent_loop.inbox().subscribe_wake();
+        let wake_push = agent_loop.inbox().push(
+            &sess.id,
+            DeliveryMode::FollowUp,
+            TurnInput::notice("cron", "wake check"),
+        );
+        assert_eq!(wake_push.effective_mode, DeliveryMode::FollowUp);
+        assert!(!wake_push.degraded);
+        let woken_sid = super::poll_inbox_wake(Some(&mut wake_rx)).await.unwrap();
+        assert_eq!(woken_sid, sess.id);
+
+        assert!(super::actions::drain_next_inbox_followup(
+            &ctx,
+            &cfg,
+            &mut app,
+            &sess,
+            &loop_tx,
+            &mut task_state,
+        ));
+        let followup_res = loop {
+            match loop_rx.recv().await.unwrap() {
+                super::LoopClientMsg::Task {
+                    event: super::UiEvent::RunFinished(res),
+                    ..
+                } => break res,
+                _ => continue,
+            }
+        };
+        assert_eq!(followup_res.unwrap(), "woke followup ok");
 
         ctx.fiber().dispose().await;
     }
