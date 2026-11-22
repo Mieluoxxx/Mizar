@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
     feature = "compaction",
     feature = "session-title",
     feature = "cache-warming",
-    feature = "subagent",
     feature = "trajectory"
 ))]
 use cordis::Service;
