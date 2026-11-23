@@ -7,6 +7,7 @@ use std::time::Duration;
 use cordis::Context;
 use mizar_core::instructions::AgentInstructions;
 use mizar_core::skills::{SkillLookupOptions, SkillRegistry};
+use mizar_core::spine::SpinePluginsContextExt;
 use mizar_core::trajectory::TrajectoryRuntime;
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_tools::{ToolExposure, ToolRuntime};
@@ -107,6 +108,9 @@ pub fn collect_tools_summary(ctx: &Context, session_id: Option<&str>) -> Vec<Too
 
 /// 汇总所有已配置的 MCP Server 连接状态与可用能力。
 pub fn collect_mcps_summary(ctx: &Context) -> Vec<McpSummaryRow> {
+    if ctx.spine_plugins().is_ok_and(|p| !p.is_enabled("mcp")) {
+        return Vec::new();
+    }
     let Some(mgr) = ctx.get::<McpManager>("mcp") else {
         return Vec::new();
     };

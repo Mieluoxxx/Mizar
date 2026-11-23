@@ -61,7 +61,7 @@
 | `trajectory` | `"trajectory"` / `"repeat-tool-guard"` | `TrajectoryRuntime`、`RepeatToolGuardPlugin` | 无（事件订阅） | 实时采集 `TraceEvent`、异常检测、`trajectory.jsonl` 导出与连续重复失败工具调用拦截 |
 | `session_title` | `"sessionTitle"` | `SessionTitleRuntime` | `["llm", "sessions"]` | 异步生成与刷新 `MMDD｜TYPE｜Topic` 会话标题，尊重 `/rename` 人工所有权，自动跳过子代理 |
 | `subagent` | `"subagent"` | `SubagentRuntime`、`SubagentPlugin` | `["tools", "sessions", "agentLoop", "systemPrompt"]` | UNIX 进程式单层后台常驻分身 `subagent`（`ModelOnly`），支持 `spawn`/`send`/`status`/`stop`、零 Token 活性看门狗与深度 1 护栏 |
-| `spine` | `"spinePlugins"` / `"agent-spine"` | `AgentSpinePlugin`、`SpinePlugins`、`ToolsGuidePromptPlugin`、`LoadedMizarConfig` | 装配根 | 挂载核心服务与 12 个内置可选模块生命周期控制（Gate 2 核心自保护、`tools_guide` `order=20` 提示词段落挂载、识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主扩展 ID），并承载 `settings.json` / `models.json` / CLI 路由解析 |
+| `spine` | `"spinePlugins"` / `"agent-spine"` | `AgentSpinePlugin`、`SpinePlugins`、`ToolsGuidePromptPlugin`、`LoadedMizarConfig` | 装配根 | 静态挂载核心服务与 12 个内置可选模块，通过轻量原子开关与 `ToolRuntime` 分组屏蔽控制运行期启停（`mcp` 启动禁用时延迟初始化；Gate 2 核心自保护、`tools_guide` `order=20` 提示词段落挂载、识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主扩展 ID），并承载 `settings.json` / `models.json` / CLI 路由解析 |
 
 **内部 Crate 依赖**：`cordis`、`mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`，以及按 Cargo feature 选配的 `mizar-codemode`、`mizar-mcp`。
 
@@ -135,7 +135,7 @@
 | `toolsPreset` | `all` / `minimal` / `read-only` | 编码工具预设，对应 `--minimal` / `--read-only` |
 | `tools` | string[] | 工具白名单（支持 `*` 通配） |
 | `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |
-| `disabledPlugins` | string[] | 声明式屏蔽内置可选 Cordis 模块 ID 或官方客户端/TUI 扩展 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期热启停并原子回写；受保护核心服务忽略并告警） |
+| `disabledPlugins` | string[] | 声明式屏蔽内置可选模块 ID 或官方客户端/TUI 扩展 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期零销毁原子启停并原子回写；受保护核心服务忽略并告警） |
 | `restrictToWorkspace` | bool | 将文件工具限制在工作区内（**默认 `false`**） |
 | `sessionDb` | string | SQLite 落盘路径；等价环境变量 `MIZAR_SESSION_DB`（`none` / `off` 关闭） |
 | `codemode` | object | `autoEnable` / `onlyMode` / `inlineBudget` / `timeoutMs` |

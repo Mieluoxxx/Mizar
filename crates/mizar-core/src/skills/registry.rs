@@ -9,13 +9,13 @@ use cordis::{BoxFuture as CordisBoxFuture, Cleanup, Context, CordisError, Servic
 #[cfg(all(mizar_loom, test))]
 mod sync {
     pub(super) use loom::sync::Mutex;
-    pub(super) use loom::sync::atomic::{AtomicU64, Ordering};
+    pub(super) use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 }
 
 #[cfg(not(all(mizar_loom, test)))]
 mod sync {
     pub(super) use std::sync::Mutex;
-    pub(super) use std::sync::atomic::{AtomicU64, Ordering};
+    pub(super) use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 }
 
 use crate::skills::types::{
@@ -205,11 +205,23 @@ pub struct SkillRegistryConfig {
 
 pub struct SkillRegistry {
     ctx: Context,
+    enabled: sync::AtomicBool,
     next_id: sync::AtomicU64,
     catalog: VersionedCatalog<RegisteredProvider, RuntimeEntry, Option<PathBuf>, CachedCollect>,
 }
 
 impl SkillRegistry {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(sync::Ordering::Acquire)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        let prev = self.enabled.swap(enabled, sync::Ordering::AcqRel);
+        if prev != enabled {
+            self.ctx.emit(EVENT_SKILLS_CHANGE, ());
+        }
+    }
+
     pub fn register_provider(
         self: &Arc<Self>,
         provider: Arc<dyn SkillProvider>,
@@ -473,7 +485,21 @@ impl SkillRegistry {
         }
     }
 
+    pub(crate) async fn list_raw(&self, options: SkillLookupOptions) -> Vec<SkillSummary> {
+        let (entries, _) = self.collect(&options).await;
+        let mut skills: Vec<SkillSummary> =
+            entries.into_values().map(|e| e.candidate.summary).collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills
+    }
+
     pub async fn snapshot(&self, options: SkillLookupOptions) -> SkillCatalogSnapshot {
+        if !self.is_enabled() {
+            return SkillCatalogSnapshot {
+                skills: Vec::new(),
+                complete: true,
+            };
+        }
         let (entries, complete) = self.collect(&options).await;
         let mut skills: Vec<SkillSummary> =
             entries.into_values().map(|e| e.candidate.summary).collect();
@@ -490,7 +516,7 @@ impl SkillRegistry {
         name: &str,
         options: SkillLookupOptions,
     ) -> Result<Option<SkillDefinition>, String> {
-        if !is_skill_name(name) {
+        if !self.is_enabled() || !is_skill_name(name) {
             return Ok(None);
         }
         let (entries, _) = self.collect(&options).await;
@@ -541,6 +567,7 @@ impl Service for SkillRegistry {
             .max(1);
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
+            enabled: sync::AtomicBool::new(true),
             next_id: sync::AtomicU64::new(1),
             catalog: VersionedCatalog::new(cache_max),
         }))

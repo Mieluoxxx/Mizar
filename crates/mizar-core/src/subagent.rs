@@ -16,6 +16,7 @@ pub mod tool;
 pub mod worker;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{AgentEvent, AgentLoopContextExt};
@@ -170,6 +171,7 @@ type TurnRouteMap = HashMap<String, (Option<String>, Option<String>)>;
 pub struct SubagentRuntime {
     pub(crate) ctx: Context,
     pub(crate) config: Arc<Mutex<SubagentConfig>>,
+    pub(crate) module_enabled: AtomicBool,
     pub(crate) active_children: Arc<Mutex<ActiveChildrenMap>>,
     pub(crate) activity_trackers: Arc<Mutex<ActivityTrackersMap>>,
     pub(crate) tasks: Arc<Mutex<BackgroundTaskRegistry>>,
@@ -183,11 +185,19 @@ impl SubagentRuntime {
         ServicePlugin::new()
     }
 
+    pub fn is_module_enabled(&self) -> bool {
+        self.module_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_module_enabled(&self, enabled: bool) {
+        self.module_enabled.store(enabled, Ordering::Release);
+    }
+
     pub fn config(&self) -> SubagentConfig {
         self.config.lock().unwrap().clone()
     }
 
-    /// 热更新子代理配置（供运行期调参或 `SpinePlugins` 重挂同步）。
+    /// 热更新子代理配置（供运行期调参使用）。
     pub fn update_config(&self, f: impl FnOnce(&mut SubagentConfig)) {
         let mut guard = self.config.lock().unwrap();
         f(&mut guard);
@@ -300,6 +310,7 @@ impl Service for SubagentRuntime {
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
             config: Arc::new(Mutex::new(config)),
+            module_enabled: AtomicBool::new(true),
             active_children: Arc::new(Mutex::new(HashMap::new())),
             activity_trackers: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(BackgroundTaskRegistry::default())),
@@ -438,15 +449,20 @@ impl Service for SubagentRuntime {
 
             // 4. 向系统提示词注入精简静态分流契约（order = 60，子代理自身零感知且 KV Cache 前缀 100% 稳定）
             let sp = Arc::clone(&system_prompt);
+            let rt_prompt = Arc::clone(&self);
             let active_prompt = Arc::clone(&self.active_children);
             let sessions_prompt = Arc::clone(&sessions);
             ctx.effect("subagent.prompt-guidance", move || {
+                let rt_prompt = Arc::clone(&rt_prompt);
                 let active_children = Arc::clone(&active_prompt);
                 let sessions = Arc::clone(&sessions_prompt);
                 Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
                     "subagent",
                     60,
                     move |session_id| {
+                        if !rt_prompt.is_module_enabled() {
+                            return None;
+                        }
                         if let Some(sid) = session_id
                             && (active_children.lock().unwrap().contains_key(sid)
                                 || is_subagent_child_session(&sessions, sid))

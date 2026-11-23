@@ -1,37 +1,33 @@
-//! 内置 Cordis 模块控制器（`"spinePlugins"`）：
+//! 内置模块控制器（`"spinePlugins"`）：
 //!
-//! 统一管理 `mizar-agent-spine` 装配的可选内置 Cordis 模块生命周期（启动屏蔽与运行期热挂载/热卸载），
-//! 并对核心内核服务（`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins`）实施 Gate 2 自保护。
+//! 在启动阶段静态挂载全部可选内置模块后，以轻量 `AtomicBool` 门控与 `ToolRuntime` 分组屏蔽实现零销毁运行期启停
+//! （仅重量级外部进程 `mcp` 在启动禁用时延迟到首次启用再初始化），并对核心内核服务实施 Gate 2 自保护。
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Fiber, Inject, Plugin, Service};
+#[cfg(any(feature = "mcp", test))]
+use cordis::Service;
+use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Plugin};
 use thiserror::Error;
+#[cfg(feature = "mcp")]
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::compaction::{CompactionConfig, CompactionRuntime};
-use crate::instructions::{AgentInstructions, InstructionsConfig};
-use crate::session_title::{SessionTitleConfig, SessionTitleRuntime};
-use crate::skills::{SkillRegistry, SkillRegistryConfig, SkillsConfig, SkillsPlugin};
-use crate::subagent::{SubagentConfig, SubagentRuntime};
+use crate::compaction::CompactionRuntime;
+use crate::instructions::AgentInstructions;
+use crate::session_title::SessionTitleRuntime;
+use crate::skills::SkillRegistry;
+use crate::spine::config::normalize_disabled_plugins;
+use crate::subagent::SubagentRuntime;
 use crate::system_prompt::{PromptSection, SystemPrompt};
-use crate::trajectory::{
-    RepeatGuardConfig, RepeatToolGuardPlugin, TrajectoryConfig, TrajectoryRuntime,
-};
-#[cfg(feature = "codemode")]
-use mizar_codemode::{CodemodeConfig, CodemodePlugin};
+use crate::trajectory::TrajectoryRuntime;
 #[cfg(feature = "mcp")]
 use mizar_mcp::{McpManager, McpPluginConfig};
-use mizar_session::recall::{RecallConfig, RecallPlugin};
-use mizar_tools::ToolsContextExt;
-use mizar_tools::coding::{CodingToolsConfig, CodingToolsPlugin, build_tools_guide};
-use mizar_tools::search::{ToolSearchConfig, ToolSearchPlugin};
-
-use crate::spine::config::normalize_disabled_plugins;
+use mizar_tools::coding::build_tools_guide;
+use mizar_tools::{ToolRuntime, ToolsContextExt};
 
 pub const SERVICE_SPINE_PLUGINS: &str = "spinePlugins";
-pub const EVENT_SPINE_PLUGINS_CHANGE: &str = "spinePlugins/change";
 
 /// 受 Gate 2 自保护的核心服务 ID：任何情况下均不允许禁用。
 const PROTECTED_MODULES: &[(&str, &str, &str)] = &[
@@ -63,7 +59,7 @@ const PROTECTED_MODULES: &[(&str, &str, &str)] = &[
     (
         "spinePlugins",
         "模块控制器",
-        "管理内置 Cordis 模块热启停与自保护策略（核心内核服务）",
+        "管理内置模块启停开关与自保护策略（核心内核服务）",
     ),
 ];
 
@@ -97,12 +93,6 @@ pub const KNOWN_HOST_EXTENSION_IDS: &[&str] = &[
     "tui-selection",
     "tui-clipboard",
 ];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpinePluginsChangeEvent {
-    pub id: String,
-    pub enabled: bool,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpineModuleStatus {
@@ -154,16 +144,22 @@ impl Plugin for ToolsGuidePromptPlugin {
     ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
         Box::pin(async move {
             let tools = ctx.tools()?;
-            let prompt_fiber = ctx.try_inject(["systemPrompt"], move |c| {
+            let prompt_handle = ctx.try_inject(["systemPrompt"], move |c| {
                 let tools = Arc::clone(&tools);
                 async move {
                     let sp = c.service::<SystemPrompt>("systemPrompt")?;
+                    let gate_ctx = c.clone();
                     c.effect("tools-coding.system-prompt", move || {
-                        let tools = tools;
                         Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
                             "tools_guide",
                             20,
                             move |session_id| {
+                                if let Some(plugins) =
+                                    gate_ctx.get::<SpinePlugins>(SERVICE_SPINE_PLUGINS)
+                                    && !plugins.is_enabled("tools-coding")
+                                {
+                                    return None;
+                                }
                                 build_tools_guide(&tools.list_declared_infos(session_id))
                             },
                         ))))
@@ -171,53 +167,24 @@ impl Plugin for ToolsGuidePromptPlugin {
                     Ok::<_, CordisError>(())
                 }
             })?;
-            // 若 systemPrompt 已就绪则等待子 fiber 落稳，保证热启用返回后提示段立即可见；
-            // 若尚未挂载（启动并发或后挂 SystemPrompt 单测）则不阻塞，待其到达后自动补注。
             if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
-                prompt_fiber.wait_settled().await?;
+                prompt_handle.wait_settled().await?;
             }
             Ok(Some(Cleanup::async_fn(move || async move {
-                prompt_fiber.dispose().await;
+                prompt_handle.dispose().await;
             })))
         })
     }
 }
 
-#[derive(Clone)]
-pub(crate) enum ModuleSpec {
-    ToolsCoding(CodingToolsConfig),
-    ToolSearch(ToolSearchConfig),
-    #[cfg(feature = "codemode")]
-    Codemode(CodemodeConfig),
-    #[cfg(feature = "mcp")]
-    Mcp(McpPluginConfig),
-    Skills(SkillsConfig),
-    Instructions(InstructionsConfig),
-    Compaction(CompactionConfig),
-    Recall(RecallConfig),
-    SessionTitle(SessionTitleConfig),
-    Subagent(SubagentConfig),
-    Trajectory(TrajectoryConfig),
-    RepeatGuard(RepeatGuardConfig),
-}
-
-struct ModuleSlot {
+struct ModuleToggle {
     meta: SpineModuleMeta,
-    spec: ModuleSpec,
-    fibers: Vec<Fiber>,
+    enabled: Arc<AtomicBool>,
 }
 
-impl ModuleSlot {
+impl ModuleToggle {
     fn is_enabled(&self) -> bool {
-        !self.fibers.is_empty()
-            && self.fibers.iter().all(|f| {
-                matches!(
-                    f.state(),
-                    cordis::FiberState::Pending
-                        | cordis::FiberState::Loading
-                        | cordis::FiberState::Active
-                )
-            })
+        self.enabled.load(Ordering::Acquire)
     }
 
     fn status(&self) -> SpineModuleStatus {
@@ -235,195 +202,91 @@ pub fn is_protected_module_id(id: &str) -> bool {
     PROTECTED_MODULES.iter().any(|(pid, _, _)| *pid == id)
 }
 
-fn is_known_optional_id(id: &str) -> bool {
-    KNOWN_OPTIONAL_IDS.contains(&id)
-}
-
-fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, CordisError> {
-    match *spec {
-        ModuleSpec::ToolsCoding(ref cfg) => {
-            let tools_fiber = ctx.try_plugin(CodingToolsPlugin, cfg.clone())?;
-            if !cfg.inject_system_prompt {
-                return Ok(vec![tools_fiber]);
-            }
-            let prompt_fiber = match ctx.try_plugin(ToolsGuidePromptPlugin, ()) {
-                Ok(f) => f,
-                Err(err) => {
-                    tokio::spawn(tools_fiber.dispose());
-                    return Err(err);
-                }
-            };
-            Ok(vec![tools_fiber, prompt_fiber])
-        }
-        ModuleSpec::ToolSearch(ref cfg) => Ok(vec![ctx.try_plugin(ToolSearchPlugin, cfg.clone())?]),
-        #[cfg(feature = "codemode")]
-        ModuleSpec::Codemode(ref cfg) => Ok(vec![ctx.try_plugin(CodemodePlugin, cfg.clone())?]),
-        #[cfg(feature = "mcp")]
-        ModuleSpec::Mcp(ref cfg) => Ok(vec![ctx.try_plugin(McpManager::plugin(), cfg.clone())?]),
-        ModuleSpec::Skills(ref cfg) => {
-            let reg_fiber =
-                ctx.try_plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())?;
-            let plugin_fiber = match ctx.try_plugin(SkillsPlugin, cfg.clone()) {
-                Ok(f) => f,
-                Err(err) => {
-                    tokio::spawn(reg_fiber.dispose());
-                    return Err(err);
-                }
-            };
-            Ok(vec![reg_fiber, plugin_fiber])
-        }
-        ModuleSpec::Instructions(ref cfg) => Ok(vec![
-            ctx.try_plugin(AgentInstructions::plugin(), cfg.clone())?,
-        ]),
-        ModuleSpec::Compaction(ref cfg) => Ok(vec![
-            ctx.try_plugin(CompactionRuntime::plugin(), cfg.clone())?,
-        ]),
-        ModuleSpec::Recall(ref cfg) => Ok(vec![ctx.try_plugin(RecallPlugin, cfg.clone())?]),
-        ModuleSpec::SessionTitle(ref cfg) => Ok(vec![
-            ctx.try_plugin(SessionTitleRuntime::plugin(), cfg.clone())?,
-        ]),
-        ModuleSpec::Subagent(ref cfg) => Ok(vec![
-            ctx.try_plugin(SubagentRuntime::plugin(), cfg.clone())?,
-        ]),
-        ModuleSpec::Trajectory(ref cfg) => Ok(vec![
-            ctx.try_plugin(TrajectoryRuntime::plugin(), cfg.clone())?,
-        ]),
-        ModuleSpec::RepeatGuard(ref cfg) => {
-            Ok(vec![ctx.try_plugin(RepeatToolGuardPlugin, cfg.clone())?])
-        }
+fn tool_group_for_module(id: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match id {
+        "tools-coding" => Some((&["read", "bash", "edit", "write", "grep", "find"], &[])),
+        "tool-search" => Some((&["tool_search"], &[])),
+        "codemode" => Some((&["codemode"], &[])),
+        "mcp" => Some((
+            &[
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+            ],
+            &["mcp__"],
+        )),
+        "skills" => Some((&["skill"], &[])),
+        "recall" => Some((&["recall"], &[])),
+        "subagent" => Some((&["subagent"], &[])),
+        _ => None,
     }
 }
 
-async fn mount_single_and_wait<P: cordis::Plugin>(
-    ctx: &Context,
-    id: &str,
-    plugin: P,
-    cfg: P::Config,
-) -> Result<Vec<Fiber>, SpinePluginError> {
-    let fiber = ctx.try_plugin(plugin, cfg)?;
-    if let Err(err) = fiber.wait_settled().await {
-        fiber.dispose().await;
-        return Err(SpinePluginError::Lifecycle {
-            id: id.to_string(),
-            reason: err.to_string(),
-        });
-    }
-    Ok(vec![fiber])
-}
-
-async fn mount_module_and_wait(
-    ctx: &Context,
-    id: &str,
-    spec: &ModuleSpec,
-) -> Result<Vec<Fiber>, SpinePluginError> {
-    match *spec {
-        ModuleSpec::ToolsCoding(ref cfg) => {
-            let tools_fiber = ctx.try_plugin(CodingToolsPlugin, cfg.clone())?;
-            if let Err(err) = tools_fiber.wait_settled().await {
-                tools_fiber.dispose().await;
-                return Err(SpinePluginError::Lifecycle {
-                    id: id.to_string(),
-                    reason: err.to_string(),
-                });
-            }
-            if !cfg.inject_system_prompt {
-                return Ok(vec![tools_fiber]);
-            }
-            let prompt_fiber = match ctx.try_plugin(ToolsGuidePromptPlugin, ()) {
-                Ok(f) => f,
-                Err(err) => {
-                    tools_fiber.dispose().await;
-                    return Err(err.into());
-                }
-            };
-            if let Err(err) = prompt_fiber.wait_settled().await {
-                prompt_fiber.dispose().await;
-                tools_fiber.dispose().await;
-                return Err(SpinePluginError::Lifecycle {
-                    id: id.to_string(),
-                    reason: err.to_string(),
-                });
-            }
-            Ok(vec![tools_fiber, prompt_fiber])
-        }
-        ModuleSpec::ToolSearch(ref cfg) => {
-            mount_single_and_wait(ctx, id, ToolSearchPlugin, cfg.clone()).await
-        }
-        #[cfg(feature = "codemode")]
-        ModuleSpec::Codemode(ref cfg) => {
-            mount_single_and_wait(ctx, id, CodemodePlugin, cfg.clone()).await
-        }
-        #[cfg(feature = "mcp")]
-        ModuleSpec::Mcp(ref cfg) => {
-            mount_single_and_wait(ctx, id, McpManager::plugin(), cfg.clone()).await
-        }
-        ModuleSpec::Skills(ref cfg) => {
-            let reg_fiber =
-                ctx.try_plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())?;
-            if let Err(err) = reg_fiber.wait_settled().await {
-                reg_fiber.dispose().await;
-                return Err(SpinePluginError::Lifecycle {
-                    id: id.to_string(),
-                    reason: err.to_string(),
-                });
-            }
-            let plugin_fiber = match ctx.try_plugin(SkillsPlugin, cfg.clone()) {
-                Ok(f) => f,
-                Err(err) => {
-                    reg_fiber.dispose().await;
-                    return Err(err.into());
-                }
-            };
-            if let Err(err) = plugin_fiber.wait_settled().await {
-                plugin_fiber.dispose().await;
-                reg_fiber.dispose().await;
-                return Err(SpinePluginError::Lifecycle {
-                    id: id.to_string(),
-                    reason: err.to_string(),
-                });
-            }
-            Ok(vec![reg_fiber, plugin_fiber])
-        }
-        ModuleSpec::Instructions(ref cfg) => {
-            mount_single_and_wait(ctx, id, AgentInstructions::plugin(), cfg.clone()).await
-        }
-        ModuleSpec::Compaction(ref cfg) => {
-            mount_single_and_wait(ctx, id, CompactionRuntime::plugin(), cfg.clone()).await
-        }
-        ModuleSpec::Recall(ref cfg) => {
-            mount_single_and_wait(ctx, id, RecallPlugin, cfg.clone()).await
-        }
-        ModuleSpec::SessionTitle(ref cfg) => {
-            mount_single_and_wait(ctx, id, SessionTitleRuntime::plugin(), cfg.clone()).await
-        }
-        ModuleSpec::Subagent(ref cfg) => {
-            mount_single_and_wait(ctx, id, SubagentRuntime::plugin(), cfg.clone()).await
-        }
-        ModuleSpec::Trajectory(ref cfg) => {
-            mount_single_and_wait(ctx, id, TrajectoryRuntime::plugin(), cfg.clone()).await
-        }
-        ModuleSpec::RepeatGuard(ref cfg) => {
-            mount_single_and_wait(ctx, id, RepeatToolGuardPlugin, cfg.clone()).await
-        }
+fn service_name_for_module(id: &str) -> Option<&'static str> {
+    match id {
+        "compaction" => Some("compaction"),
+        "instructions" => Some("agentInstructions"),
+        "skills" => Some("skills"),
+        "session-title" => Some("sessionTitle"),
+        "subagent" => Some("subagent"),
+        "trajectory" => Some("trajectory"),
+        _ => None,
     }
 }
 
-/// 内置 Cordis 模块控制器服务（`"spinePlugins"`）。
+fn sync_service_gate(ctx: &Context, id: &str, enabled: bool) {
+    match id {
+        "compaction" => {
+            if let Some(rt) = ctx.get::<CompactionRuntime>("compaction") {
+                rt.set_module_enabled(enabled);
+            }
+        }
+        "instructions" => {
+            if let Some(rt) = ctx.get::<AgentInstructions>("agentInstructions") {
+                rt.set_enabled(enabled);
+            }
+        }
+        "skills" => {
+            if let Some(rt) = ctx.get::<SkillRegistry>("skills") {
+                rt.set_enabled(enabled);
+            }
+        }
+        "session-title" => {
+            if let Some(rt) = ctx.get::<SessionTitleRuntime>("sessionTitle") {
+                rt.set_module_enabled(enabled);
+            }
+        }
+        "subagent" => {
+            if let Some(rt) = ctx.get::<SubagentRuntime>("subagent") {
+                rt.set_module_enabled(enabled);
+            }
+        }
+        "trajectory" => {
+            if let Some(rt) = ctx.get::<TrajectoryRuntime>("trajectory") {
+                rt.set_enabled(enabled);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 内置模块控制器服务（`"spinePlugins"`）。
 pub struct SpinePlugins {
     ctx: Context,
-    slots: Mutex<Vec<ModuleSlot>>,
+    modules: Vec<ModuleToggle>,
     startup_errors: Vec<String>,
-    op_lock: AsyncMutex<()>,
+    #[cfg(feature = "mcp")]
+    mcp_pending: AsyncMutex<Option<McpPluginConfig>>,
 }
 
 impl SpinePlugins {
     pub(crate) fn initialize(
         ctx: Context,
-        specs: Vec<(SpineModuleMeta, ModuleSpec)>,
+        metas: Vec<SpineModuleMeta>,
         raw_disabled: Vec<String>,
-    ) -> Result<Arc<Self>, CordisError> {
+    ) -> Arc<Self> {
         let normalized_disabled = normalize_disabled_plugins(raw_disabled);
-        let available_ids: HashSet<&str> = specs.iter().map(|(m, _)| m.id.as_str()).collect();
+        let available_ids: HashSet<&str> = metas.iter().map(|m| m.id.as_str()).collect();
         let mut disabled_set: HashSet<String> = HashSet::new();
         let mut startup_errors = Vec::new();
 
@@ -435,7 +298,8 @@ impl SpinePlugins {
                 startup_errors.push(msg);
             } else if available_ids.contains(id.as_str()) {
                 disabled_set.insert(id);
-            } else if !is_known_optional_id(&id) && !KNOWN_HOST_EXTENSION_IDS.contains(&id.as_str())
+            } else if !KNOWN_OPTIONAL_IDS.contains(&id.as_str())
+                && !KNOWN_HOST_EXTENSION_IDS.contains(&id.as_str())
             {
                 let msg = format!("未知内置模块 `{id}`，已忽略 disabledPlugins 中的配置");
                 tracing::warn!(target: "mizar::spine-plugins", "{msg}");
@@ -443,22 +307,86 @@ impl SpinePlugins {
             }
         }
 
-        let mut slots = Vec::with_capacity(specs.len());
-        for (meta, spec) in specs {
-            let fibers = if disabled_set.contains(&meta.id) {
-                Vec::new()
-            } else {
-                mount_module_spawn(&ctx, &spec)?
-            };
-            slots.push(ModuleSlot { meta, spec, fibers });
+        let modules = metas
+            .into_iter()
+            .map(|meta| {
+                let enabled = !disabled_set.contains(&meta.id);
+                ModuleToggle {
+                    meta,
+                    enabled: Arc::new(AtomicBool::new(enabled)),
+                }
+            })
+            .collect();
+
+        Arc::new(Self {
+            ctx,
+            modules,
+            startup_errors,
+            #[cfg(feature = "mcp")]
+            mcp_pending: AsyncMutex::new(None),
+        })
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(crate) fn defer_mcp_mount(&self, cfg: McpPluginConfig) {
+        if let Ok(mut guard) = self.mcp_pending.try_lock() {
+            *guard = Some(cfg);
+        }
+    }
+
+    pub(crate) fn flag_for(&self, id: &str) -> Option<Arc<AtomicBool>> {
+        self.modules
+            .iter()
+            .find(|m| m.meta.id == id)
+            .map(|m| Arc::clone(&m.enabled))
+    }
+
+    /// 对启动阶段被屏蔽的可选模块挂接一次性状态同步，在对应服务就绪后读取实时开关。
+    pub(crate) fn attach_initial_gates(&self) -> Result<(), CordisError> {
+        let disabled_tool_modules: Vec<(String, Arc<AtomicBool>)> = self
+            .modules
+            .iter()
+            .filter(|m| !m.is_enabled() && tool_group_for_module(&m.meta.id).is_some())
+            .map(|m| (m.meta.id.clone(), Arc::clone(&m.enabled)))
+            .collect();
+
+        if !disabled_tool_modules.is_empty() {
+            self.ctx.try_inject(["tools"], move |c| {
+                let groups = disabled_tool_modules.clone();
+                async move {
+                    if let Ok(tools) = c.tools() {
+                        for (id, flag) in groups {
+                            if !flag.load(Ordering::Acquire)
+                                && let Some((names, prefixes)) = tool_group_for_module(&id)
+                            {
+                                tools.set_disabled_tool_group(&id, names, prefixes, true);
+                            }
+                        }
+                    }
+                    Ok::<_, CordisError>(())
+                }
+            })?;
         }
 
-        Ok(Arc::new(Self {
-            ctx,
-            slots: Mutex::new(slots),
-            startup_errors,
-            op_lock: AsyncMutex::new(()),
-        }))
+        for m in &self.modules {
+            if m.is_enabled() {
+                continue;
+            }
+            let Some(svc) = service_name_for_module(&m.meta.id) else {
+                continue;
+            };
+            let id = m.meta.id.clone();
+            let flag = Arc::clone(&m.enabled);
+            self.ctx.try_inject([svc], move |c| {
+                let id = id.clone();
+                let flag = Arc::clone(&flag);
+                async move {
+                    sync_service_gate(&c, &id, flag.load(Ordering::Acquire));
+                    Ok::<_, CordisError>(())
+                }
+            })?;
+        }
+        Ok(())
     }
 
     /// 启动阶段校验 `disabledPlugins` 时记录的拒绝或告警信息。
@@ -478,15 +406,13 @@ impl SpinePlugins {
                 enabled: true,
             })
             .collect();
-        let slots = self.slots.lock().unwrap();
-        out.extend(slots.iter().map(ModuleSlot::status));
+        out.extend(self.modules.iter().map(ModuleToggle::status));
         out
     }
 
     /// 列出当前运行时可用的可选模块状态（供 `/settings` `[模块]` 分组展示）。
     pub fn optional_modules(&self) -> Vec<SpineModuleStatus> {
-        let slots = self.slots.lock().unwrap();
-        slots.iter().map(ModuleSlot::status).collect()
+        self.modules.iter().map(ModuleToggle::status).collect()
     }
 
     /// 查询单个模块状态。
@@ -500,11 +426,10 @@ impl SpinePlugins {
                 enabled: true,
             });
         }
-        let slots = self.slots.lock().unwrap();
-        slots
+        self.modules
             .iter()
-            .find(|s| s.meta.id == id)
-            .map(ModuleSlot::status)
+            .find(|m| m.meta.id == id)
+            .map(ModuleToggle::status)
     }
 
     pub fn is_protected(&self, id: &str) -> bool {
@@ -515,28 +440,34 @@ impl SpinePlugins {
         if is_protected_module_id(id) {
             return true;
         }
-        self.slots
-            .lock()
-            .unwrap()
+        self.modules
             .iter()
-            .find(|s| s.meta.id == id)
-            .is_some_and(ModuleSlot::is_enabled)
+            .find(|m| m.meta.id == id)
+            .is_some_and(ModuleToggle::is_enabled)
     }
 
     /// 返回当前处于禁用状态的可选模块 ID（已排序去重，可直接回写 `"disabledPlugins"`）。
     pub fn disabled_ids(&self) -> Vec<String> {
-        let slots = self.slots.lock().unwrap();
         normalize_disabled_plugins(
-            slots
+            self.modules
                 .iter()
-                .filter(|s| !s.is_enabled())
-                .map(|s| s.meta.id.clone()),
+                .filter(|m| !m.is_enabled())
+                .map(|m| m.meta.id.clone()),
         )
+    }
+
+    fn apply_runtime_state(&self, id: &str, enabled: bool) {
+        if let Some((names, prefixes)) = tool_group_for_module(id)
+            && let Some(tools) = self.ctx.get::<ToolRuntime>("tools")
+        {
+            tools.set_disabled_tool_group(id, names, prefixes, !enabled);
+        }
+        sync_service_gate(&self.ctx, id, enabled);
     }
 
     /// 热切换指定可选内置模块的启用状态。
     ///
-    /// 返回 `Ok(true)` 表示实际发生了挂载/卸载切换；`Ok(false)` 表示状态未变。
+    /// 返回 `Ok(true)` 表示状态发生切换；`Ok(false)` 表示状态未变。
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, SpinePluginError> {
         if is_protected_module_id(id) {
             if !enabled {
@@ -545,97 +476,32 @@ impl SpinePlugins {
             return Ok(false);
         }
 
-        let _op = self.op_lock.lock().await;
-
-        enum Action {
-            Noop(Vec<Fiber>),
-            Disable(Vec<Fiber>),
-            Enable {
-                old_fibers: Vec<Fiber>,
-                spec: ModuleSpec,
-            },
-        }
-
-        let action = {
-            let mut slots = self.slots.lock().unwrap();
-            let Some(slot) = slots.iter_mut().find(|s| s.meta.id == id) else {
-                return Err(SpinePluginError::UnknownModule(id.to_string()));
-            };
-            let currently_enabled = slot.is_enabled();
-            if currently_enabled == enabled {
-                let stale = if !enabled {
-                    std::mem::take(&mut slot.fibers)
-                } else {
-                    Vec::new()
-                };
-                Action::Noop(stale)
-            } else if !enabled {
-                // 卸载前同步热更新后的易变配置（如 compaction.*），避免重新启用时状态脑裂
-                if id == "compaction"
-                    && let Some(comp) = self.ctx.get::<CompactionRuntime>("compaction")
-                {
-                    slot.spec = ModuleSpec::Compaction(comp.config());
-                }
-                if id == "session-title"
-                    && let Some(st) = self.ctx.get::<SessionTitleRuntime>("sessionTitle")
-                {
-                    slot.spec = ModuleSpec::SessionTitle(st.config());
-                }
-                if id == "subagent"
-                    && let Some(sub) = self.ctx.get::<SubagentRuntime>("subagent")
-                {
-                    slot.spec = ModuleSpec::Subagent(sub.config());
-                }
-                Action::Disable(std::mem::take(&mut slot.fibers))
-            } else {
-                Action::Enable {
-                    old_fibers: std::mem::take(&mut slot.fibers),
-                    spec: slot.spec.clone(),
-                }
-            }
+        let Some(toggle) = self.modules.iter().find(|m| m.meta.id == id) else {
+            return Err(SpinePluginError::UnknownModule(id.to_string()));
         };
+        if toggle.is_enabled() == enabled {
+            return Ok(false);
+        }
 
-        match action {
-            Action::Noop(stale) => {
-                for fiber in stale.into_iter().rev() {
-                    fiber.dispose().await;
-                }
-                Ok(false)
-            }
-            Action::Disable(fibers) => {
-                for fiber in fibers.into_iter().rev() {
-                    fiber.dispose().await;
-                }
-                self.ctx.emit(
-                    EVENT_SPINE_PLUGINS_CHANGE,
-                    SpinePluginsChangeEvent {
+        #[cfg(feature = "mcp")]
+        if id == "mcp" && enabled {
+            let mut guard = self.mcp_pending.lock().await;
+            if let Some(cfg) = guard.clone() {
+                let handle = self.ctx.try_plugin(McpManager::plugin(), cfg)?;
+                if let Err(err) = handle.wait_settled().await {
+                    handle.dispose().await;
+                    return Err(SpinePluginError::Lifecycle {
                         id: id.to_string(),
-                        enabled: false,
-                    },
-                );
-                Ok(true)
-            }
-            Action::Enable { old_fibers, spec } => {
-                for fiber in old_fibers.into_iter().rev() {
-                    fiber.dispose().await;
+                        reason: err.to_string(),
+                    });
                 }
-                let fibers = mount_module_and_wait(&self.ctx, id, &spec).await?;
-                {
-                    let mut slots = self.slots.lock().unwrap();
-                    if let Some(slot) = slots.iter_mut().find(|s| s.meta.id == id) {
-                        slot.fibers = fibers;
-                    }
-                }
-                self.ctx.emit(
-                    EVENT_SPINE_PLUGINS_CHANGE,
-                    SpinePluginsChangeEvent {
-                        id: id.to_string(),
-                        enabled: true,
-                    },
-                );
-                Ok(true)
+                *guard = None;
             }
         }
+
+        toggle.enabled.store(enabled, Ordering::Release);
+        self.apply_runtime_state(id, enabled);
+        Ok(true)
     }
 }
 
@@ -659,6 +525,7 @@ mod tests {
     use mizar_llm::LlmContextExt;
     use mizar_session::SessionContextExt;
     use mizar_tools::ToolsContextExt;
+    use mizar_tools::coding::{CodingToolsConfig, CodingToolsPlugin};
 
     #[tokio::test]
     async fn core_modules_are_protected_under_minimal_features() {
@@ -778,6 +645,8 @@ mod tests {
         assert!(ctrl.set_enabled("tool-search", true).await.unwrap());
         assert!(ctrl.is_enabled("tool-search"));
         assert!(tools.list_all().iter().any(|t| t.name == "tool_search"));
+        // 0 个外部 MCP 工具时，启用 tool-search 仍保持按需激活语义（不向模型默认声明）
+        assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
 
         assert!(ctrl.set_enabled("tools-coding", false).await.unwrap());
         assert!(!ctrl.is_enabled("tools-coding"));
@@ -788,22 +657,6 @@ mod tests {
         assert!(ctrl.set_enabled("tools-coding", true).await.unwrap());
         assert!(tools.list().iter().any(|t| t.name == "read"));
         assert!(prompt.build().contains("Available tools:"));
-
-        // 若外部直接释放某可选模块的底层 Fiber，is_enabled/disabled_ids 必须实时反映为禁用且允许干净重挂
-        let slot_fiber = {
-            let slots = ctrl.slots.lock().unwrap();
-            slots
-                .iter()
-                .find(|s| s.meta.id == "tool-search")
-                .unwrap()
-                .fibers[0]
-                .clone()
-        };
-        slot_fiber.dispose().await;
-        assert!(!ctrl.is_enabled("tool-search"));
-        assert!(ctrl.disabled_ids().contains(&"tool-search".to_string()));
-        assert!(ctrl.set_enabled("tool-search", true).await.unwrap());
-        assert!(ctrl.is_enabled("tool-search"));
 
         let _ = std::fs::remove_dir_all(&ws);
         app.fiber().dispose().await;

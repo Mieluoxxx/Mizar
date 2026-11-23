@@ -2,6 +2,7 @@
 //! 监听用户每轮输入事件，在后台异步生成并维护简洁的 `MMDD｜TYPE｜Topic` 会话标题。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{AgentEvent, AgentTurnInputEvent, subscribe_agent_events_when_ready};
@@ -80,6 +81,7 @@ impl Drop for InFlightGuard {
 pub struct SessionTitleRuntime {
     ctx: Context,
     config: Arc<Mutex<SessionTitleConfig>>,
+    module_enabled: AtomicBool,
     in_flight: Arc<Mutex<HashSet<String>>>,
     states: Arc<Mutex<HashMap<String, SessionTitleState>>>,
     dispose_token: CancellationToken,
@@ -88,6 +90,14 @@ pub struct SessionTitleRuntime {
 impl SessionTitleRuntime {
     pub fn plugin() -> ServicePlugin<Self> {
         ServicePlugin::new()
+    }
+
+    pub fn is_module_enabled(&self) -> bool {
+        self.module_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_module_enabled(&self, enabled: bool) {
+        self.module_enabled.store(enabled, Ordering::Release);
     }
 
     pub fn config(&self) -> SessionTitleConfig {
@@ -147,7 +157,7 @@ impl SessionTitleRuntime {
     }
 
     fn handle_turn_input(self: &Arc<Self>, ev: &AgentTurnInputEvent) {
-        if self.dispose_token.is_cancelled() {
+        if !self.is_module_enabled() || self.dispose_token.is_cancelled() {
             return;
         }
         let cfg = self.config();
@@ -411,6 +421,7 @@ impl Service for SessionTitleRuntime {
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
             config: Arc::new(Mutex::new(config)),
+            module_enabled: AtomicBool::new(true),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             states: Arc::new(Mutex::new(HashMap::new())),
             dispose_token: CancellationToken::new(),

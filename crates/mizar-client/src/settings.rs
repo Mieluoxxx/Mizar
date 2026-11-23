@@ -174,7 +174,9 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         },
     ];
 
-    if let Ok(comp) = ctx.compaction() {
+    if let Ok(comp) = ctx.compaction()
+        && comp.is_module_enabled()
+    {
         let cfg = comp.config();
         let cap_opts = ["off", "200k", "400k"];
         items.extend([
@@ -210,7 +212,9 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         ]);
     }
 
-    if let Ok(st) = ctx.session_title() {
+    if let Ok(st) = ctx.session_title()
+        && st.is_module_enabled()
+    {
         let cfg = st.config();
         let thinking_opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
         let current_thinking = cfg.reasoning_effort.unwrap_or(ReasoningEffort::Low);
@@ -563,7 +567,7 @@ mod tests {
         let out_enable = toggle_spine_module(&ctx, Some(&settings_path), "compaction", true).await;
         assert!(out_enable.ok);
         assert!(out_enable.disabled_ids.is_empty());
-        assert!(ctx.compaction().is_ok());
+        assert!(ctx.compaction().unwrap().is_module_enabled());
 
         let after_enable = build_settings_entries(&ctx, &snap);
         let comp_keys: Vec<&str> = after_enable
@@ -614,7 +618,7 @@ mod tests {
                 .is_empty()
         );
         assert!(crate::workspace::collect_instructions_summary(&ctx, Some(&session.id)).is_empty());
-        assert!(ctx.compaction().is_err());
+        assert!(!ctx.compaction().unwrap().is_module_enabled());
         let after_disable = build_settings_entries(&ctx, &snap);
         assert!(!after_disable.iter().any(|e| e.category == "压缩"));
         let persisted_2: serde_json::Value =

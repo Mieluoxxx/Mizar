@@ -7,6 +7,7 @@ pub mod config;
 pub mod plugins;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub use crate::compaction::{
     CompactionConfig, CompactionContextExt, CompactionEndEvent, CompactionError, CompactionOutcome,
@@ -41,28 +42,29 @@ pub use config::{
 };
 pub use mizar_session::recall::{RECALL_TOOL_NAME, RecallConfig, RecallPlugin};
 pub use plugins::{
-    EVENT_SPINE_PLUGINS_CHANGE, KNOWN_HOST_EXTENSION_IDS, SERVICE_SPINE_PLUGINS, SpineModuleStatus,
-    SpinePluginError, SpinePlugins, SpinePluginsChangeEvent, SpinePluginsContextExt,
-    ToolsGuidePromptPlugin, is_protected_module_id,
+    KNOWN_HOST_EXTENSION_IDS, SERVICE_SPINE_PLUGINS, SpineModuleStatus, SpinePluginError,
+    SpinePlugins, SpinePluginsContextExt, ToolsGuidePromptPlugin, is_protected_module_id,
 };
 
 use crate::agent_loop::{AgentLoop, AgentLoopConfig};
-use crate::skills::SkillsConfig;
+use crate::skills::{SkillRegistry, SkillRegistryConfig, SkillsConfig, SkillsPlugin};
 use crate::system_prompt::{SystemPrompt, SystemPromptConfig};
-use crate::trajectory::{RepeatGuardConfig, TrajectoryConfig};
+use crate::trajectory::{
+    RepeatGuardConfig, RepeatToolGuardPlugin, TrajectoryConfig, TrajectoryRuntime,
+};
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin, Service};
 #[cfg(feature = "codemode")]
-use mizar_codemode::CodemodeConfig;
+use mizar_codemode::{CodemodeConfig, CodemodePlugin};
 use mizar_llm::LlmRuntime;
 #[cfg(feature = "mcp")]
-use mizar_mcp::McpPluginConfig;
+use mizar_mcp::{McpManager, McpPluginConfig};
 use mizar_session::sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
 use mizar_session::{SessionContextExt, SessionStore};
-use mizar_tools::coding::{CodingToolsConfig, CodingToolsPreset};
-use mizar_tools::search::ToolSearchConfig;
+use mizar_tools::coding::{CodingToolsConfig, CodingToolsPlugin, CodingToolsPreset};
+use mizar_tools::search::{ToolSearchConfig, ToolSearchPlugin};
 use mizar_tools::{ToolRuntime, ToolsContextExt};
 
-use plugins::{ModuleSpec, SpineModuleMeta};
+use plugins::SpineModuleMeta;
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -242,20 +244,113 @@ impl Plugin for AgentSpinePlugin {
             )?;
             ctx.try_plugin(AgentLoop::plugin(), config.agent)?;
 
-            let mut specs: Vec<(SpineModuleMeta, ModuleSpec)> = Vec::new();
+            let mut metas: Vec<SpineModuleMeta> = Vec::new();
+            let push_meta =
+                |metas: &mut Vec<SpineModuleMeta>, id: &str, label: &str, desc: &str| {
+                    metas.push(SpineModuleMeta {
+                        id: id.to_string(),
+                        label: label.to_string(),
+                        description: desc.to_string(),
+                    });
+                };
+
+            if config.compaction.is_some() {
+                push_meta(
+                    &mut metas,
+                    "compaction",
+                    "上下文压缩",
+                    "上下文压缩与压后写文件守卫",
+                );
+            }
+            if matches!(config.tools_mode, AgentToolsMode::Coding { .. }) {
+                push_meta(
+                    &mut metas,
+                    "tools-coding",
+                    "基础编程工具",
+                    "提供 read / bash / edit / write / grep / find 编程工具",
+                );
+                push_meta(
+                    &mut metas,
+                    "tool-search",
+                    "延迟工具检索",
+                    "按需检索与激活延迟工具及 MCP 工具 (tool_search)",
+                );
+                #[cfg(feature = "codemode")]
+                push_meta(
+                    &mut metas,
+                    "codemode",
+                    "脚本执行沙箱",
+                    "通过 QuickJS 沙箱批量编排与调用工具 (codemode)",
+                );
+                #[cfg(feature = "mcp")]
+                push_meta(
+                    &mut metas,
+                    "mcp",
+                    "MCP 客户端",
+                    "连接外部 MCP 服务器并暴露其工具与提示词",
+                );
+                push_meta(
+                    &mut metas,
+                    "skills",
+                    "技能加载器",
+                    "发现并按需激活全局与项目级 Skill 扩展",
+                );
+                push_meta(
+                    &mut metas,
+                    "instructions",
+                    "项目指令",
+                    "自动发现并注入 AGENTS.md / CLAUDE.md 指令规范",
+                );
+            }
+            if config.recall.is_some() {
+                push_meta(
+                    &mut metas,
+                    "recall",
+                    "情景记忆回溯",
+                    "静态常驻的历史会话检索与回溯工具 (recall)",
+                );
+            }
+            if config.session_title.is_some() {
+                push_meta(
+                    &mut metas,
+                    "session-title",
+                    "会话标题",
+                    "后台基于用户输入生成与维护会话标题",
+                );
+            }
+            if config.subagent.is_some() {
+                push_meta(
+                    &mut metas,
+                    "subagent",
+                    "单层子代理",
+                    "在独立子会话中执行只读并行调研或受控编辑子任务 (subagent)",
+                );
+            }
+            if config.trajectory.is_some() {
+                push_meta(
+                    &mut metas,
+                    "trajectory",
+                    "轨迹采集",
+                    "记录模型/工具执行轨迹并生成异常与状态投影",
+                );
+            }
+            if config.repeat_guard.is_some() {
+                push_meta(
+                    &mut metas,
+                    "repeat-guard",
+                    "重复调用守卫",
+                    "拦截连续重复的失败工具调用，防止死循环",
+                );
+            }
+
+            let controller = SpinePlugins::initialize(ctx.clone(), metas, config.disabled_plugins);
+            ctx.provide(SERVICE_SPINE_PLUGINS, Arc::clone(&controller))?;
 
             // 在 `instructions` / `skills` / `recall` 之前装配 `compaction`：
             // 使同一次 `agent/pre-step` 中先完成压缩推进 `compacted_up_to_seq`，
             // 随后指令、技能与回溯工具立即可见新压缩边界并当步完成重注/激活。
             if let Some(compaction_cfg) = config.compaction {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "compaction".to_string(),
-                        label: "上下文压缩".to_string(),
-                        description: "上下文压缩与压后写文件守卫".to_string(),
-                    },
-                    ModuleSpec::Compaction(compaction_cfg),
-                ));
+                ctx.try_plugin(CompactionRuntime::plugin(), compaction_cfg)?;
             }
 
             match config.tools_mode {
@@ -272,120 +367,44 @@ impl Plugin for AgentSpinePlugin {
                     skills,
                     instructions,
                 } => {
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "tools-coding".to_string(),
-                            label: "基础编程工具".to_string(),
-                            description: "提供 read / bash / edit / write / grep / find 编程工具"
-                                .to_string(),
-                        },
-                        ModuleSpec::ToolsCoding(coding),
-                    ));
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "tool-search".to_string(),
-                            label: "延迟工具检索".to_string(),
-                            description: "按需检索与激活延迟工具及 MCP 工具 (tool_search)"
-                                .to_string(),
-                        },
-                        ModuleSpec::ToolSearch(tool_search),
-                    ));
+                    let inject_prompt = coding.inject_system_prompt;
+                    ctx.try_plugin(CodingToolsPlugin, coding)?;
+                    if inject_prompt {
+                        ctx.try_plugin(ToolsGuidePromptPlugin, ())?;
+                    }
+                    ctx.try_plugin(ToolSearchPlugin, tool_search)?;
                     #[cfg(feature = "codemode")]
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "codemode".to_string(),
-                            label: "脚本执行沙箱".to_string(),
-                            description: "通过 QuickJS 沙箱批量编排与调用工具 (codemode)"
-                                .to_string(),
-                        },
-                        ModuleSpec::Codemode(codemode),
-                    ));
+                    ctx.try_plugin(CodemodePlugin, codemode)?;
                     #[cfg(feature = "mcp")]
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "mcp".to_string(),
-                            label: "MCP 客户端".to_string(),
-                            description: "连接外部 MCP 服务器并暴露其工具与提示词".to_string(),
-                        },
-                        ModuleSpec::Mcp(mcp),
-                    ));
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "skills".to_string(),
-                            label: "技能加载器".to_string(),
-                            description: "发现并按需激活全局与项目级 Skill 扩展".to_string(),
-                        },
-                        ModuleSpec::Skills(skills),
-                    ));
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "instructions".to_string(),
-                            label: "项目指令".to_string(),
-                            description: "自动发现并注入 AGENTS.md / CLAUDE.md 指令规范"
-                                .to_string(),
-                        },
-                        ModuleSpec::Instructions(instructions),
-                    ));
+                    if controller.is_enabled("mcp") {
+                        ctx.try_plugin(McpManager::plugin(), mcp)?;
+                    } else {
+                        controller.defer_mcp_mount(mcp);
+                    }
+                    ctx.try_plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())?;
+                    ctx.try_plugin(SkillsPlugin, skills)?;
+                    ctx.try_plugin(AgentInstructions::plugin(), instructions)?;
                 }
             }
 
             if let Some(recall_cfg) = config.recall {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "recall".to_string(),
-                        label: "情景记忆回溯".to_string(),
-                        description: "静态常驻的历史会话检索与回溯工具 (recall)".to_string(),
-                    },
-                    ModuleSpec::Recall(recall_cfg),
-                ));
+                ctx.try_plugin(RecallPlugin, recall_cfg)?;
             }
-
             if let Some(st_cfg) = config.session_title {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "session-title".to_string(),
-                        label: "会话标题".to_string(),
-                        description: "后台基于用户输入生成与维护会话标题".to_string(),
-                    },
-                    ModuleSpec::SessionTitle(st_cfg),
-                ));
+                ctx.try_plugin(SessionTitleRuntime::plugin(), st_cfg)?;
             }
-
             if let Some(sub_cfg) = config.subagent {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "subagent".to_string(),
-                        label: "单层子代理".to_string(),
-                        description: "在独立子会话中执行只读并行调研或受控编辑子任务 (subagent)"
-                            .to_string(),
-                    },
-                    ModuleSpec::Subagent(sub_cfg),
-                ));
+                ctx.try_plugin(SubagentRuntime::plugin(), sub_cfg)?;
             }
-
             if let Some(traj_cfg) = config.trajectory {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "trajectory".to_string(),
-                        label: "轨迹采集".to_string(),
-                        description: "记录模型/工具执行轨迹并生成异常与状态投影".to_string(),
-                    },
-                    ModuleSpec::Trajectory(traj_cfg),
-                ));
+                ctx.try_plugin(TrajectoryRuntime::plugin(), traj_cfg)?;
             }
-            if let Some(guard_cfg) = config.repeat_guard {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "repeat-guard".to_string(),
-                        label: "重复调用守卫".to_string(),
-                        description: "拦截连续重复的失败工具调用，防止死循环".to_string(),
-                    },
-                    ModuleSpec::RepeatGuard(guard_cfg),
-                ));
+            if let Some(mut guard_cfg) = config.repeat_guard {
+                guard_cfg.enabled_flag = controller.flag_for("repeat-guard");
+                ctx.try_plugin(RepeatToolGuardPlugin, guard_cfg)?;
             }
 
-            let controller = SpinePlugins::initialize(ctx.clone(), specs, config.disabled_plugins)?;
-            ctx.provide(SERVICE_SPINE_PLUGINS, controller)?;
+            controller.attach_initial_gates()?;
             Ok(None)
         })
     }

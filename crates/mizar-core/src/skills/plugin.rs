@@ -319,8 +319,9 @@ impl Plugin for SkillsPlugin {
             })?;
 
             // 仅在发现至少 1 个模型可调用技能时注册 `skill` 工具；0 skills 时保持工具表精简零开销
+            // 使用 `list_raw` 避免受运行期启用开关门控影响，确保禁用启动后热启用仍具备 `skill` 工具
             let initial_skills = registry
-                .list(SkillLookupOptions {
+                .list_raw(SkillLookupOptions {
                     cwd: Some(config.workspace.clone()),
                     cancel: CancellationToken::new(),
                 })
@@ -339,6 +340,9 @@ impl Plugin for SkillsPlugin {
                 let fs_for_mut = Arc::clone(&fs_provider);
                 let ws_for_mut = config.workspace.clone();
                 subscribe_agent_events_when_ready(&ctx, "skills.tool-result", move |ev| {
+                    if !reg_for_mut.is_enabled() {
+                        return;
+                    }
                     let AgentEvent::ToolResult(ev) = ev else {
                         return;
                     };
@@ -400,6 +404,9 @@ impl Plugin for SkillsPlugin {
                             return AgentPreStepDecision::Reject {
                                 reason: "cancelled".to_string(),
                             };
+                        }
+                        if !reg.is_enabled() {
+                            return AgentPreStepDecision::Enter { inputs };
                         }
 
                         let lookup = SkillLookupOptions {
