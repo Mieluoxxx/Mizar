@@ -7,6 +7,7 @@
 //! - 新一轮用户输入（`agent/turn-start`）自动清零该会话的重复链
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{AgentEvent, subscribe_agent_events_when_ready};
@@ -54,6 +55,8 @@ pub struct RepeatGuardConfig {
     pub inject_reminder: bool,
     /// 可选：连续重复达到该次数后强制拦截（默认 None，仅建议不阻断）。
     pub hard_block_after: Option<usize>,
+    /// 可选：运行期启停开关（供 `SpinePlugins` 零销毁切换使用，默认开启）。
+    pub enabled_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Default for RepeatGuardConfig {
@@ -65,6 +68,7 @@ impl Default for RepeatGuardConfig {
             arguments_preview_chars: 500,
             inject_reminder: true,
             hard_block_after: None,
+            enabled_flag: None,
         }
     }
 }
@@ -141,6 +145,9 @@ impl Plugin for RepeatToolGuardPlugin {
             let preview_cap = config.arguments_preview_chars;
             let inject_reminder = config.inject_reminder;
             let hard_block_after = config.hard_block_after;
+            let enabled_flag = config
+                .enabled_flag
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
 
             let chains: Arc<Mutex<HashMap<String, Chain>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -155,8 +162,12 @@ impl Plugin for RepeatToolGuardPlugin {
                     let include = include.clone();
                     let exclude = exclude.clone();
                     let threshold_set = threshold_set.clone();
+                    let enabled_flag = Arc::clone(&enabled_flag);
 
                     Box::pin(async move {
+                        if !enabled_flag.load(Ordering::Acquire) {
+                            return next.call(input).await;
+                        }
                         let tool_name = input.exec.name.clone();
                         let tracked = (include.is_empty()
                             || include.iter().any(|p| wildcard_matches(p, &tool_name)))

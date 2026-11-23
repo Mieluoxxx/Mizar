@@ -1245,7 +1245,7 @@ mod tests {
             true,
         )
         .await;
-        assert!(ctx.compaction().is_ok());
+        assert!(ctx.compaction().unwrap().is_module_enabled());
         match &app.overlay.active {
             Some(OverlayKind::SettingsModal { items, .. }) => {
                 assert!(items.iter().any(|e| e.key == "compaction.enabled"));
@@ -1272,7 +1272,7 @@ mod tests {
         }
         assert!(app.user_skill_names.is_empty());
         assert!(app.side_panel_data.instructions.is_empty());
-        assert!(ctx.compaction().is_err());
+        assert!(!ctx.compaction().unwrap().is_module_enabled());
         let after_disable_entries = super::build_settings_entries(&ctx, &app);
         assert!(!after_disable_entries.iter().any(|e| e.category == "压缩"));
         let persisted_2: serde_json::Value =
@@ -1293,8 +1293,9 @@ mod tests {
         )
         .await;
         assert!(
-            ctx.get::<mizar_core::skills::SkillRegistry>("skills")
-                .is_none()
+            !ctx.get::<mizar_core::skills::SkillRegistry>("skills")
+                .unwrap()
+                .is_enabled()
         );
         let persisted_3: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();

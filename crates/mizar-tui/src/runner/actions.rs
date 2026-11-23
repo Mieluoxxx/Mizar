@@ -27,8 +27,8 @@ use mizar_core::instructions::AgentInstructions;
 use mizar_core::session_title::SessionTitleContextExt;
 use mizar_core::skills::{SkillLookupOptions, SkillRegistry};
 use mizar_core::spine::{
-    CompactionContextExt, CompactionError, ManualCompactOptions, SubagentContextExt,
-    resolve_global_settings_path,
+    CompactionContextExt, CompactionError, ManualCompactOptions, SpinePluginsContextExt,
+    SubagentContextExt, resolve_global_settings_path,
 };
 use mizar_core::trajectory::{TimelineMode, TrajectoryRuntime};
 use mizar_llm::{ImageAttachment, LlmContextExt};
@@ -720,6 +720,10 @@ pub(super) async fn handle_action(
                 app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
                 return;
             };
+            if !compaction.is_module_enabled() {
+                app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
+                return;
+            }
             if !compaction.config().enabled {
                 app.push_notice(NoticeLevel::Info, "上下文压缩已在配置中禁用");
                 return;
@@ -829,6 +833,13 @@ pub(super) async fn handle_action(
                     );
                     return;
                 };
+                if !st.is_module_enabled() {
+                    app.push_notice(
+                        NoticeLevel::Warn,
+                        "session-title 服务未启用（可在 /settings 中开启）",
+                    );
+                    return;
+                }
                 let session = Arc::clone(active_session);
                 let provider = app.provider.clone();
                 let model = app.model.clone();
@@ -1013,7 +1024,9 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowMcp => {
-            if let Some(mgr) = ctx.get::<McpManager>("mcp") {
+            if ctx.spine_plugins().is_ok_and(|p| !p.is_enabled("mcp")) {
+                app.push_notice(NoticeLevel::Warn, "MCP 服务未启用");
+            } else if let Some(mgr) = ctx.get::<McpManager>("mcp") {
                 let statuses = mgr.statuses();
                 if statuses.is_empty() {
                     app.push_notice(
@@ -1044,7 +1057,9 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowSkills => {
-            if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
+            if let Some(reg) = ctx.get::<SkillRegistry>("skills")
+                && reg.is_enabled()
+            {
                 let list = reg
                     .list(SkillLookupOptions {
                         cwd: Some(app.workspace.clone()),
@@ -1246,7 +1261,9 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::OpenSkillPicker => {
-            if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
+            if let Some(reg) = ctx.get::<SkillRegistry>("skills")
+                && reg.is_enabled()
+            {
                 let list = reg
                     .list(SkillLookupOptions {
                         cwd: Some(app.workspace.clone()),

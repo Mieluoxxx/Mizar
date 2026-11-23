@@ -2,6 +2,7 @@
 //! 统一编排单阶段检查点摘要、溢出兜底恢复、手动 `/compact`、上下文压力探测与 `write` 写前读守卫。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{
@@ -51,12 +52,21 @@ impl Drop for InFlightGuard {
 pub struct CompactionRuntime {
     ctx: Context,
     config: Arc<Mutex<CompactionConfig>>,
+    module_enabled: AtomicBool,
     in_flight: Arc<Mutex<HashSet<String>>>,
     sessions_meta: Arc<Mutex<HashMap<String, SessionCompactionMeta>>>,
     file_guards: Arc<FileGuardTracker>,
 }
 
 impl CompactionRuntime {
+    pub fn is_module_enabled(&self) -> bool {
+        self.module_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_module_enabled(&self, enabled: bool) {
+        self.module_enabled.store(enabled, Ordering::Release);
+    }
+
     pub fn config(&self) -> CompactionConfig {
         self.config.lock().unwrap().clone()
     }
@@ -171,7 +181,7 @@ impl CompactionRuntime {
         opts: ManualCompactOptions,
         cancel: CancellationToken,
     ) -> Result<CompactionReport, CompactionError> {
-        if !self.config().enabled {
+        if !self.is_module_enabled() || !self.config().enabled {
             return Ok(CompactionReport::skipped("compaction is disabled"));
         }
         self.run_compaction_pipeline(
@@ -187,6 +197,9 @@ impl CompactionRuntime {
     }
 
     async fn handle_pre_step(&self, ev: &AgentPreStepInput) {
+        if !self.is_module_enabled() {
+            return;
+        }
         let cfg = self.config();
         if !cfg.enabled || !cfg.auto_compact {
             return;
@@ -219,7 +232,7 @@ impl CompactionRuntime {
     }
 
     async fn handle_overflow(&self, ev: &AgentRequestErrorInput) -> bool {
-        if !self.config().enabled {
+        if !self.is_module_enabled() || !self.config().enabled {
             return false;
         }
         match self
@@ -586,6 +599,7 @@ impl Service for CompactionRuntime {
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
             config: Arc::new(Mutex::new(config)),
+            module_enabled: AtomicBool::new(true),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             sessions_meta: Arc::new(Mutex::new(HashMap::new())),
             file_guards: Arc::new(FileGuardTracker::new()),
@@ -632,8 +646,12 @@ impl Service for CompactionRuntime {
 
             // 2. 步后记录最近真正成功答复过的 `(provider, model)` 路由
             {
+                let rt_step = Arc::clone(&self);
                 let meta = Arc::clone(&self.sessions_meta);
                 subscribe_agent_events_when_ready(&ctx, "compaction.step-end", move |ev| {
+                    if !rt_step.is_module_enabled() {
+                        return;
+                    }
                     if let AgentEvent::StepEnd(ev) = ev
                         && matches!(ev.outcome, StepOutcome::Completed | StepOutcome::ToolCalls)
                         && (ev.provider.is_some() || ev.model.is_some())
@@ -678,6 +696,7 @@ impl Service for CompactionRuntime {
 
             // 4. 统一 `write` 写前读守卫（>50 行首读要求 + 压后陈旧整文件覆写拦截）
             {
+                let rt_pre = Arc::clone(&self);
                 let guards = Arc::clone(&self.file_guards);
                 let c = ctx.clone();
                 let c_inner = ctx.clone();
@@ -690,9 +709,13 @@ impl Service for CompactionRuntime {
                                 ToolExecution,
                                 BoxFuture<'static, PreExecuteDecision>,
                             >| {
+                                let rt_pre = Arc::clone(&rt_pre);
                                 let guards = Arc::clone(&guards);
                                 let ctx_ref = c_inner.clone();
                                 Box::pin(async move {
+                                    if !rt_pre.is_module_enabled() {
+                                        return next.call(exec).await;
+                                    }
                                     if let Ok(sessions) = ctx_ref.sessions() {
                                         let decision = guards.check_pre_execute(&exec, &sessions);
                                         if !decision.allow {
@@ -712,6 +735,7 @@ impl Service for CompactionRuntime {
 
             // 5. 追踪成功 `read`/`write` 后的文件可见状态
             {
+                let rt_post = Arc::clone(&self);
                 let guards = Arc::clone(&self.file_guards);
                 let c = ctx.clone();
                 let c_inner = ctx.clone();
@@ -720,9 +744,13 @@ impl Service for CompactionRuntime {
                         EVENT_TOOLS_POST_EXECUTE,
                         move |input: PostExecuteInput,
                               next: Next<PostExecuteInput, BoxFuture<'static, ToolResult>>| {
+                            let rt_post = Arc::clone(&rt_post);
                             let guards = Arc::clone(&guards);
                             let ctx_ref = c_inner.clone();
                             Box::pin(async move {
+                                if !rt_post.is_module_enabled() {
+                                    return next.call(input).await;
+                                }
                                 let exec = input.exec.clone();
                                 let res = next.call(input).await;
                                 if let Ok(sessions) = ctx_ref.sessions() {
@@ -741,12 +769,16 @@ impl Service for CompactionRuntime {
 
             // 6. 追踪会话真实落盘序号，对齐 FileGuardTracker 的 `last_read_seq`
             {
+                let rt_seq = Arc::clone(&self);
                 let guards = Arc::clone(&self.file_guards);
                 let c = ctx.clone();
                 ctx.effect("compaction.session-event-seq", move || {
                     let h = c.on(
                         mizar_session::EVENT_SESSION_EVENT,
                         move |ev: &mizar_session::SessionEventPayload| {
+                            if !rt_seq.is_module_enabled() {
+                                return;
+                            }
                             if let mizar_session::SessionEvent::ToolResult {
                                 tool_call_id,
                                 is_error: false,

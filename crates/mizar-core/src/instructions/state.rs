@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput};
@@ -90,12 +91,17 @@ async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 
 pub struct AgentInstructions {
     config: InstructionsConfig,
+    module_enabled: AtomicBool,
     sessions: Mutex<HashMap<String, SessionInstructionState>>,
 }
 
 impl AgentInstructions {
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled
+        self.config.enabled && self.module_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.module_enabled.store(enabled, Ordering::Release);
     }
 
     pub fn config(&self) -> &InstructionsConfig {
@@ -109,18 +115,18 @@ impl AgentInstructions {
 
     /// 若尚未运行过任何步，也可按当前配置做一次只读探测供 UI 查询。
     pub fn probe_report(&self, session_id: Option<&str>) -> SessionInstructionsReport {
-        if let Some(sid) = session_id
-            && let Some(existing) = self.session_report(sid)
-        {
-            return existing;
-        }
-        if !self.config.enabled {
+        if !self.is_enabled() {
             return SessionInstructionsReport {
                 enabled: false,
                 project_root: None,
                 scopes: Vec::new(),
                 warnings: Vec::new(),
             };
+        }
+        if let Some(sid) = session_id
+            && let Some(existing) = self.session_report(sid)
+        {
+            return existing;
         }
         let disc = discover_instructions(&self.config, &[]);
         let statuses = render_baseline_message(
@@ -213,7 +219,7 @@ impl AgentInstructions {
     }
 
     fn record_tool_touch(&self, ev: &ToolResultEvent) {
-        if !self.config.enabled || !self.config.follow_subdirs {
+        if !self.is_enabled() || !self.config.follow_subdirs {
             return;
         }
         if ev.result.is_error || ev.result.blocked {
@@ -656,7 +662,7 @@ impl AgentInstructions {
         session: &Arc<Session>,
         cancel: &CancellationToken,
     ) -> Option<TurnInput> {
-        if !self.config.enabled || self.config.max_bytes == 0 || cancel.is_cancelled() {
+        if !self.is_enabled() || self.config.max_bytes == 0 || cancel.is_cancelled() {
             return None;
         }
 
@@ -764,7 +770,7 @@ impl AgentInstructions {
         session: &Arc<Session>,
         cancel: &CancellationToken,
     ) -> Option<TurnInput> {
-        if !self.config.enabled || self.config.max_bytes == 0 || cancel.is_cancelled() {
+        if !self.is_enabled() || self.config.max_bytes == 0 || cancel.is_cancelled() {
             return None;
         }
 
@@ -864,6 +870,7 @@ impl Service for AgentInstructions {
     fn create(_ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
         Ok(Arc::new(Self {
             config,
+            module_enabled: AtomicBool::new(true),
             sessions: Mutex::new(HashMap::new()),
         }))
     }

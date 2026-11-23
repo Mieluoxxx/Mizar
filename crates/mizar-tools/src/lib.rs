@@ -593,6 +593,18 @@ struct CachedDeclaredLoadout {
     active_names: Arc<HashSet<String>>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DisabledToolGroup {
+    names: Vec<String>,
+    prefixes: Vec<String>,
+}
+
+impl DisabledToolGroup {
+    fn matches(&self, name: &str) -> bool {
+        self.names.iter().any(|n| n == name) || self.prefixes.iter().any(|p| name.starts_with(p))
+    }
+}
+
 #[derive(Default)]
 struct ToolState {
     version: u64,
@@ -601,6 +613,8 @@ struct ToolState {
     global_active_overrides: HashMap<String, bool>,
     /// 插件按需自动启用状态（如 `codemode` / `tool_search`），不绕过显式 `include_patterns`。
     auto_default_active: HashMap<String, bool>,
+    /// 按模块名分组的运行期临时屏蔽集（不污染 `global_active_overrides` 与 `exclude_patterns`）。
+    disabled_tool_groups: HashMap<String, DisabledToolGroup>,
     /// 若设置了 `Some(patterns)`，默认只激活匹配这些模式且未关闭的工具。
     include_patterns: Option<Vec<String>>,
     /// 屏蔽规则（即使注册或尝试激活也不对外暴露）。
@@ -625,12 +639,22 @@ impl ToolState {
             .any(|p| wildcard_matches(p, name))
     }
 
+    fn is_suppressed(&self, name: &str) -> bool {
+        self.disabled_tool_groups
+            .values()
+            .any(|group| group.matches(name))
+    }
+
+    fn is_blocked(&self, name: &str) -> bool {
+        self.is_excluded(name) || self.is_suppressed(name)
+    }
+
     fn is_activatable(tool: &ToolDefinition, excluded: bool) -> bool {
         !excluded && tool.exposure != ToolExposure::Hidden
     }
 
     fn is_default_active(&self, tool: &ToolDefinition) -> bool {
-        if !Self::is_activatable(tool, self.is_excluded(&tool.name)) {
+        if !Self::is_activatable(tool, self.is_blocked(&tool.name)) {
             return false;
         }
         if let Some(&overridden) = self.global_active_overrides.get(&tool.name) {
@@ -649,7 +673,7 @@ impl ToolState {
     }
 
     fn is_tool_active_for_session(&self, session_id: Option<&str>, tool: &ToolDefinition) -> bool {
-        if !Self::is_activatable(tool, self.is_excluded(&tool.name)) {
+        if !Self::is_activatable(tool, self.is_blocked(&tool.name)) {
             return false;
         }
         if let Some(sid) = session_id
@@ -679,7 +703,7 @@ impl ToolState {
             for name in explicit {
                 if seen.insert(name.as_str())
                     && let Some(def) = by_name.get(name.as_str())
-                    && Self::is_activatable(def, self.is_excluded(name))
+                    && Self::is_activatable(def, self.is_blocked(name))
                 {
                     out.push((*def).clone());
                 }
@@ -700,7 +724,7 @@ impl ToolState {
             for name in added {
                 if seen.insert(name.as_str())
                     && let Some(def) = by_name.get(name.as_str())
-                    && Self::is_activatable(def, self.is_excluded(name))
+                    && Self::is_activatable(def, self.is_blocked(name))
                 {
                     out.push((*def).clone());
                 }
@@ -714,7 +738,7 @@ impl ToolState {
         self.tools
             .iter()
             .filter(|t| {
-                if self.is_excluded(&t.name) {
+                if self.is_blocked(&t.name) {
                     return false;
                 }
                 match t.exposure {
@@ -731,7 +755,7 @@ impl ToolState {
         let Some(tool) = self.tools.iter().find(|t| t.name == tool_name) else {
             return false;
         };
-        if self.is_excluded(tool_name) {
+        if self.is_blocked(tool_name) {
             return false;
         }
         match tool.exposure {
@@ -810,6 +834,40 @@ impl ToolRuntime {
         }
     }
 
+    /// 按模块名屏蔽或恢复一组工具（按精确名与前缀匹配），不覆盖 `global_active_overrides` 或 `auto_default_active`。
+    pub fn set_disabled_tool_group(
+        &self,
+        group_key: &str,
+        names: &[&str],
+        prefixes: &[&str],
+        disabled: bool,
+    ) {
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            if disabled {
+                let next = DisabledToolGroup {
+                    names: names.iter().map(|s| (*s).to_string()).collect(),
+                    prefixes: prefixes.iter().map(|s| (*s).to_string()).collect(),
+                };
+                let same = st.disabled_tool_groups.get(group_key) == Some(&next);
+                if !same {
+                    st.disabled_tool_groups.insert(group_key.to_string(), next);
+                    st.bump_version();
+                }
+                !same
+            } else {
+                let removed = st.disabled_tool_groups.remove(group_key).is_some();
+                if removed {
+                    st.bump_version();
+                }
+                removed
+            }
+        };
+        if changed {
+            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        }
+    }
+
     /// 全局覆盖某个工具的激活状态（优先级高于 `include_patterns` 与 `auto_default_active`）。
     pub fn set_global_active_override(&self, name: &str, active: bool) {
         let changed = {
@@ -880,7 +938,7 @@ impl ToolRuntime {
                     st.tools
                         .iter()
                         .find(|t| &t.name == n)
-                        .is_some_and(|t| ToolState::is_activatable(t, st.is_excluded(n)))
+                        .is_some_and(|t| ToolState::is_activatable(t, st.is_blocked(n)))
                 })
                 .collect();
             st.session_policies.insert(
@@ -912,7 +970,7 @@ impl ToolRuntime {
                     .tools
                     .iter()
                     .find(|t| &t.name == name)
-                    .is_some_and(|t| ToolState::is_activatable(t, st.is_excluded(name)));
+                    .is_some_and(|t| ToolState::is_activatable(t, st.is_blocked(name)));
                 if ok && !newly_added.contains(name) {
                     newly_added.push(name.clone());
                 }
@@ -983,8 +1041,12 @@ impl ToolRuntime {
 
             let active_defs = st.resolve_active_defs(session_id);
             let callable = st.resolve_callable_infos(&active_defs);
-            let registered: Vec<ToolRuntimeInfo> =
-                st.tools.iter().map(ToolDefinition::info).collect();
+            let registered: Vec<ToolRuntimeInfo> = st
+                .tools
+                .iter()
+                .filter(|t| !st.is_blocked(&t.name))
+                .map(ToolDefinition::info)
+                .collect();
             (st.version, active_defs, callable, registered)
         };
 
@@ -1068,7 +1130,7 @@ impl ToolRuntime {
     /// 按工具名精确查询单个未屏蔽工具的元数据（避免为单项校验克隆全量列表）。
     pub fn get_tool_info(&self, name: &str) -> Option<ToolRuntimeInfo> {
         let st = self.state.lock().unwrap();
-        if st.is_excluded(name) {
+        if st.is_blocked(name) {
             return None;
         }
         st.tools
@@ -1089,7 +1151,7 @@ impl ToolRuntime {
         let st = self.state.lock().unwrap();
         st.tools
             .iter()
-            .filter(|t| !st.is_excluded(&t.name))
+            .filter(|t| !st.is_blocked(&t.name))
             .map(ToolDefinition::info)
             .collect()
     }
@@ -1105,7 +1167,7 @@ impl ToolRuntime {
 
     fn find_tool(&self, name: &str) -> Option<ToolDefinition> {
         let st = self.state.lock().unwrap();
-        if st.is_excluded(name) {
+        if st.is_blocked(name) {
             return None;
         }
         st.tools.iter().find(|t| t.name == name).cloned()
@@ -1566,5 +1628,60 @@ mod tests {
         assert!(tools.get_tool_info("read").is_some());
         assert!(!tools.is_tool_active(Some("s1"), "extra"));
         assert_eq!(hook_runs.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn disabled_tool_group_hides_tools_without_clobbering_overrides() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = app.tools().unwrap();
+
+        let _r = tools
+            .register(ToolDefinition::sync_tool(
+                "read",
+                "read",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _ts = tools
+            .register(
+                ToolDefinition::sync_tool("tool_search", "ts", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly)
+                .with_default_active(false),
+            )
+            .unwrap();
+        let _mcp = tools
+            .register(
+                ToolDefinition::sync_tool("mcp__demo__ping", "ping", json!({}), |_, _| {
+                    Ok::<_, BoxError>("pong".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+
+        tools.set_auto_default_active("tool_search", Some(false));
+        tools.set_global_active_override("read", true);
+        assert!(tools.list().iter().any(|t| t.name == "read"));
+        assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
+
+        tools.set_disabled_tool_group("tools-coding", &["read"], &[], true);
+        tools.set_disabled_tool_group("mcp", &[], &["mcp__"], true);
+        assert!(!tools.list_all().iter().any(|t| t.name == "read"));
+        assert!(!tools.list_all().iter().any(|t| t.name == "mcp__demo__ping"));
+        assert!(!tools.list().iter().any(|t| t.name == "read"));
+        let exec_err = tools
+            .execute(ToolExecution::new("read", json!({}), None))
+            .await;
+        assert!(exec_err.is_error);
+
+        // 恢复后保留原有的 global_active_overrides 与 auto_default_active 语义
+        tools.set_disabled_tool_group("tools-coding", &["read"], &[], false);
+        tools.set_disabled_tool_group("mcp", &[], &["mcp__"], false);
+        assert!(tools.list().iter().any(|t| t.name == "read"));
+        assert!(tools.list_all().iter().any(|t| t.name == "mcp__demo__ping"));
+        assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
     }
 }

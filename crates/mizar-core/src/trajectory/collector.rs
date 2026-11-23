@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -340,6 +341,7 @@ impl SessionTraceBuffer {
 pub struct TrajectoryRuntime {
     ctx: Context,
     config: TrajectoryConfig,
+    enabled: AtomicBool,
     buffers: Mutex<HashMap<String, SessionTraceBuffer>>,
 }
 
@@ -354,6 +356,13 @@ enum ManagedDelta {
 }
 
 impl TrajectoryRuntime {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
     fn session_in_memory(&self, session_id: &str) -> bool {
         self.ctx
             .get::<SessionStore>("sessions")
@@ -522,6 +531,9 @@ impl TrajectoryRuntime {
     }
 
     pub fn events(&self, session_id: &str) -> Vec<TraceEvent> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
         if let Some(session) = self.resolve_session(session_id) {
             return trace_events_from_session(&session);
         }
@@ -535,6 +547,9 @@ impl TrajectoryRuntime {
 
     /// 对指定会话（内存激活或 SQLite 持久化历史）做一次完整轨迹折叠、时间轴投影与异常检测。
     pub fn inspect(&self, session_id: &str, mode: TimelineMode) -> Option<TrajectoryReport> {
+        if !self.is_enabled() {
+            return None;
+        }
         if let Some(session) = self.resolve_session(session_id) {
             self.sync_managed_session(&session);
             let findings = {
@@ -576,6 +591,9 @@ impl TrajectoryRuntime {
 
     /// 零快照拷贝提取指定会话的异常发现（避免构造全量 `TrajectorySnapshot` 与时间轴）。
     pub fn findings_only(&self, session_id: &str) -> Vec<TrajectoryFinding> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
         if let Some(session) = self.resolve_session(session_id) {
             self.sync_managed_session(&session);
             let buffers = self.buffers.lock().unwrap();
@@ -825,6 +843,7 @@ impl Service for TrajectoryRuntime {
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
             config,
+            enabled: AtomicBool::new(true),
             buffers: Mutex::new(HashMap::new()),
         }))
     }
@@ -835,15 +854,19 @@ impl Service for TrajectoryRuntime {
         Box::pin(async move {
             let rt_created = Arc::clone(&rt);
             ctx.on(EVENT_SESSION_CREATED, move |ev: &SessionCreatedPayload| {
+                if !rt_created.is_enabled() {
+                    return;
+                }
                 let mut buffers = rt_created.buffers.lock().unwrap();
                 buffers.entry(ev.session.id.clone()).or_default();
             })?;
 
             let rt_agent = Arc::clone(&rt);
-            subscribe_agent_events_when_ready(
-                &ctx,
-                "trajectory.agent-events",
-                move |ev| match ev {
+            subscribe_agent_events_when_ready(&ctx, "trajectory.agent-events", move |ev| {
+                if !rt_agent.is_enabled() {
+                    return;
+                }
+                match ev {
                     AgentEvent::TurnStart(ev) => {
                         {
                             let mut buffers = rt_agent.buffers.lock().unwrap();
@@ -945,12 +968,15 @@ impl Service for TrajectoryRuntime {
                         }
                     }
                     _ => {}
-                },
-            )
+                }
+            })
             .await?;
 
             let rt_tool_result = Arc::clone(&rt);
             ctx.on(EVENT_TOOLS_RESULT, move |ev: &ToolResultEvent| {
+                if !rt_tool_result.is_enabled() {
+                    return;
+                }
                 let Some(session_id) = ev.exec.session_id.as_deref() else {
                     return;
                 };
@@ -1008,6 +1034,9 @@ impl Service for TrajectoryRuntime {
 
             let rt_session = Arc::clone(&rt);
             ctx.on(EVENT_SESSION_EVENT, move |ev: &SessionEventPayload| {
+                if !rt_session.is_enabled() {
+                    return;
+                }
                 let sid = &ev.session.id;
                 let trace_event = {
                     let mut buffers = rt_session.buffers.lock().unwrap();
@@ -1030,6 +1059,9 @@ impl Service for TrajectoryRuntime {
 
             let rt_guard = Arc::clone(&rt);
             ctx.on(EVENT_GUARD_REPEAT, move |ev: &GuardRepeatEvent| {
+                if !rt_guard.is_enabled() {
+                    return;
+                }
                 let (turn, step) = {
                     let buffers = rt_guard.buffers.lock().unwrap();
                     buffers

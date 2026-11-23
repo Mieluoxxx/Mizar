@@ -1,5 +1,5 @@
-//! 集成测试：验证 `"spinePlugins"` 在真实 Cordis 运行时下的 Gate 2 核心自保护、
-//! 启动屏蔽与热卸载/热挂载生命周期（工具、系统提示词、waterfall 钩子、事件监听与服务注册）。
+//! 集成测试：验证 `"spinePlugins"` 的 Gate 2 核心自保护、启动屏蔽、延迟 MCP 挂载与零销毁原子开关切换
+//! （工具可见性、系统提示词、waterfall 钩子、服务启用门控与配置保留）。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -11,16 +11,14 @@ use futures::channel::mpsc;
 use mizar_core::agent_loop::{
     AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
 };
-use mizar_core::compaction::CompactionRuntime;
+use mizar_core::instructions::InstructionsContextExt;
 use mizar_core::skills::SkillRegistry;
 use mizar_core::spine::{
-    AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CompactionContextExt,
-    EVENT_SPINE_PLUGINS_CHANGE, RECALL_TOOL_NAME, SUBAGENT_TOOL_NAME, SessionTitleContextExt,
-    SessionTitleRuntime, SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
-    SubagentContextExt, SubagentRuntime,
+    AgentSpineConfig, AgentSpinePlugin, CompactionContextExt, RECALL_TOOL_NAME, SUBAGENT_TOOL_NAME,
+    SessionTitleContextExt, SpinePluginError, SpinePluginsContextExt, SubagentContextExt,
 };
 use mizar_core::system_prompt::SystemPromptContextExt;
-use mizar_core::trajectory::TrajectoryRuntime;
+use mizar_core::trajectory::TrajectoryContextExt;
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo,
     ProviderInfo, StreamChunk,
@@ -175,8 +173,8 @@ async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
 }
 
 #[tokio::test]
-async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
-    let ws = temp_dir("hot_lifecycle");
+async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
+    let ws = temp_dir("toggle_lifecycle");
     let _guard = DirGuard(ws.clone());
     std::fs::create_dir_all(ws.join(".git")).unwrap();
     std::fs::create_dir_all(ws.join(".agents/skills/demo-skill")).unwrap();
@@ -205,20 +203,9 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
 
     let app = Context::new();
-    let events: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
-    let events_sub = Arc::clone(&events);
-    let _sub = app
-        .on(
-            EVENT_SPINE_PLUGINS_CHANGE,
-            move |ev: &SpinePluginsChangeEvent| {
-                events_sub.lock().unwrap().push((ev.id.clone(), ev.enabled));
-            },
-        )
-        .unwrap();
-
     app.plugin(AgentSpinePlugin, cfg).await.unwrap();
 
-    // 注册一个探测工具，用于验证 repeat-guard 钩子的动态挂载/卸载
+    // 注册一个探测工具，用于验证 repeat-guard 钩子的动态启用/禁用
     let probe_calls = Arc::new(Mutex::new(0usize));
     let probe_calls_ref = Arc::clone(&probe_calls);
     app.plugin(
@@ -252,38 +239,40 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let prompt = app.system_prompt().unwrap();
     let sessions = app.sessions().unwrap();
 
-    // 1. 启动阶段全部可选模块均已跳过，工具与可选服务均未挂载
+    // 1. 启动阶段全部可选模块处于禁用状态：MCP 延迟未挂载，其余模块门控为 false 且工具被屏蔽
     assert_eq!(ctrl.disabled_ids().len(), 12);
-    for svc in [
-        "compaction",
-        "sessionTitle",
-        "subagent",
-        "mcp",
-        "skills",
-        "agentInstructions",
-        "trajectory",
-    ] {
-        assert!(
-            app.get::<CompactionRuntime>(svc).is_none()
-                && app.get::<SessionTitleRuntime>(svc).is_none()
-                && app.get::<SubagentRuntime>(svc).is_none()
-                && app.get::<McpManager>(svc).is_none()
-                && app.get::<SkillRegistry>(svc).is_none()
-                && app.get::<AgentInstructions>(svc).is_none()
-                && app.get::<TrajectoryRuntime>(svc).is_none(),
-            "optional service {svc} should not be mounted while disabled at startup"
-        );
-    }
+    assert!(
+        app.get::<McpManager>("mcp").is_none(),
+        "mcp must stay unmounted while disabled at startup"
+    );
+    assert!(!app.compaction().unwrap().is_module_enabled());
+    assert!(!app.session_title().unwrap().is_module_enabled());
+    assert!(!app.subagent().unwrap().is_module_enabled());
+    assert!(!app.get::<SkillRegistry>("skills").unwrap().is_enabled());
+    assert!(!app.agent_instructions().unwrap().is_enabled());
+    assert!(!app.trajectory().unwrap().is_enabled());
+
     let startup_tool_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
         startup_tool_names,
         HashSet::from(["probe_echo".to_string()])
     );
+    assert!(
+        tools
+            .execute(ToolExecution::new(
+                "read",
+                json!({"path": "AGENTS.md"}),
+                None
+            ))
+            .await
+            .is_error
+    );
     assert!(!prompt.build().contains("Available tools:"));
+    assert!(!prompt.build().contains("Subagent delegation"));
     assert!(!prompt.build().contains("当前工作目录："));
 
-    // 2. 热挂载 + 热卸载基础编程工具 (`tools-coding`)，含系统提示词提供者清理验证
+    // 2. 启用与禁用基础编程工具 (`tools-coding`)，含 tools_guide 系统提示词切换验证
     assert!(ctrl.set_enabled("tools-coding", true).await.unwrap());
     assert!(!ctrl.set_enabled("tools-coding", true).await.unwrap());
     let coding_tools: HashSet<String> = tools.list().into_iter().map(|t| t.name).collect();
@@ -301,7 +290,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     );
     assert!(!prompt.build().contains("Available tools:"));
 
-    // 3. 热挂载 tool-search / codemode / mcp / skills / instructions / recall
+    // 3. 启用 tool-search / codemode / mcp / skills / instructions / recall
     for id in [
         "tool-search",
         "codemode",
@@ -313,8 +302,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         assert!(ctrl.set_enabled(id, true).await.unwrap(), "enable {id}");
     }
     assert!(app.get::<McpManager>("mcp").is_some());
-    assert!(app.get::<SkillRegistry>("skills").is_some());
-    assert!(app.get::<AgentInstructions>("agentInstructions").is_some());
+    assert!(app.get::<SkillRegistry>("skills").unwrap().is_enabled());
+    assert!(app.agent_instructions().unwrap().is_enabled());
 
     let enabled_tool_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
@@ -322,6 +311,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(enabled_tool_names.contains("codemode"));
     assert!(enabled_tool_names.contains("skill"));
     assert!(enabled_tool_names.contains(RECALL_TOOL_NAME));
+    // 0 个外部 MCP 工具时，tool_search 仍保持按需自动激活语义
+    assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
 
     // 触发一次 pre-step，验证 instructions 与 skills 监听器均正常向会话注入上下文
     let session = sessions.create(None);
@@ -357,7 +348,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
     )));
 
-    // 4. 热卸载 tool-search / codemode / mcp / skills / instructions / recall
+    // 4. 禁用 tool-search / codemode / mcp / skills / instructions / recall
     for id in [
         "tool-search",
         "codemode",
@@ -368,9 +359,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     ] {
         assert!(ctrl.set_enabled(id, false).await.unwrap(), "disable {id}");
     }
-    assert!(app.get::<McpManager>("mcp").is_none());
-    assert!(app.get::<SkillRegistry>("skills").is_none());
-    assert!(app.get::<AgentInstructions>("agentInstructions").is_none());
+    assert!(!app.get::<SkillRegistry>("skills").unwrap().is_enabled());
+    assert!(!app.agent_instructions().unwrap().is_enabled());
     let after_unload_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
@@ -378,9 +368,9 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         HashSet::from(["probe_echo".to_string()])
     );
 
-    // 确认 instructions 与 skills 监听器已被卸载：新建会话不再收到对应 ContextNotice
+    // 确认 instructions 与 skills 已停止注入：新建会话不再收到对应 ContextNotice
     let session_after_unload = sessions.create(None);
-    session_after_unload.append(SessionEvent::user("after unload"));
+    session_after_unload.append(SessionEvent::user("after disable"));
     if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
@@ -408,11 +398,11 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE") || text.contains("demo-skill")
     )));
 
-    // 再次热挂载 skills 与 instructions，验证可重复恢复
+    // 再次启用 skills 与 instructions，验证可重复恢复
     assert!(ctrl.set_enabled("skills", true).await.unwrap());
     assert!(ctrl.set_enabled("instructions", true).await.unwrap());
-    assert!(app.get::<SkillRegistry>("skills").is_some());
-    assert!(app.get::<AgentInstructions>("agentInstructions").is_some());
+    assert!(app.get::<SkillRegistry>("skills").unwrap().is_enabled());
+    assert!(app.agent_instructions().unwrap().is_enabled());
     if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
@@ -444,37 +434,39 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
     )));
 
-    // 5. compaction：易变配置热更新 + 热卸载 + 再热挂载保留最新配置（防状态脑裂）
+    // 5. compaction：易变配置热更新 + 禁用 + 再启用保留最新配置
     assert!(ctrl.set_enabled("compaction", true).await.unwrap());
     let comp = app.compaction().unwrap();
+    assert!(comp.is_module_enabled());
     comp.update_config(|c| {
         c.auto_compact = false;
     });
     assert!(ctrl.set_enabled("compaction", false).await.unwrap());
-    assert!(app.get::<CompactionRuntime>("compaction").is_none());
+    assert!(!comp.is_module_enabled());
     assert!(ctrl.set_enabled("compaction", true).await.unwrap());
-    let comp_reloaded = app.compaction().unwrap();
+    assert!(comp.is_module_enabled());
     assert!(
-        !comp_reloaded.config().auto_compact,
+        !comp.config().auto_compact,
         "re-enabled compaction must preserve prior runtime config mutations"
     );
 
-    // 5b. session-title：热挂载 + 易变配置热更新 + 热卸载 + 再热挂载保留最新配置
+    // 5b. session-title：启用 + 易变配置热更新 + 禁用 + 再启用保留最新配置
     assert!(ctrl.set_enabled("session-title", true).await.unwrap());
     let st = app.session_title().unwrap();
+    assert!(st.is_module_enabled());
     st.update_config(|c| {
         c.enabled = false;
         c.model = Some("fast-title".into());
     });
     assert!(ctrl.set_enabled("session-title", false).await.unwrap());
-    assert!(app.get::<SessionTitleRuntime>("sessionTitle").is_none());
+    assert!(!st.is_module_enabled());
     assert!(ctrl.set_enabled("session-title", true).await.unwrap());
-    let st_reloaded = app.session_title().unwrap();
-    assert!(!st_reloaded.config().enabled);
-    assert_eq!(st_reloaded.config().model.as_deref(), Some("fast-title"));
+    assert!(st.is_module_enabled());
+    assert!(!st.config().enabled);
+    assert_eq!(st.config().model.as_deref(), Some("fast-title"));
     assert!(ctrl.set_enabled("session-title", false).await.unwrap());
 
-    // 5d. subagent：热挂载 + 工具注册 + 易变配置热更新 + 热卸载 + 再热挂载保留最新配置
+    // 5d. subagent：启用 + 工具可见 + 易变配置热更新 + 禁用 + 再启用保留最新配置
     assert!(ctrl.set_enabled("subagent", true).await.unwrap());
     assert!(
         tools
@@ -483,12 +475,13 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
             .any(|t| t.name == SUBAGENT_TOOL_NAME)
     );
     let sub = app.subagent().unwrap();
+    assert!(sub.is_module_enabled());
     sub.update_config(|c| {
         c.default_max_steps = 8;
         c.timeout_secs = 45;
     });
     assert!(ctrl.set_enabled("subagent", false).await.unwrap());
-    assert!(app.get::<SubagentRuntime>("subagent").is_none());
+    assert!(!sub.is_module_enabled());
     assert!(
         !tools
             .list_all()
@@ -496,15 +489,15 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
             .any(|t| t.name == SUBAGENT_TOOL_NAME)
     );
     assert!(ctrl.set_enabled("subagent", true).await.unwrap());
-    let sub_reloaded = app.subagent().unwrap();
-    assert_eq!(sub_reloaded.config().default_max_steps, 8);
-    assert_eq!(sub_reloaded.config().timeout_secs, 45);
+    assert!(sub.is_module_enabled());
+    assert_eq!(sub.config().default_max_steps, 8);
+    assert_eq!(sub.config().timeout_secs, 45);
     assert!(ctrl.set_enabled("subagent", false).await.unwrap());
 
-    // 6. trajectory & repeat-guard：waterfall 钩子与服务卸载及恢复
+    // 6. trajectory & repeat-guard：waterfall 钩子与服务禁用及恢复
     assert!(ctrl.set_enabled("trajectory", true).await.unwrap());
     assert!(ctrl.set_enabled("repeat-guard", true).await.unwrap());
-    assert!(app.get::<TrajectoryRuntime>("trajectory").is_some());
+    assert!(app.trajectory().unwrap().is_enabled());
 
     let guard_session = sessions.create(None);
     for _ in 0..2 {
@@ -534,7 +527,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
 
     assert!(ctrl.set_enabled("repeat-guard", false).await.unwrap());
     assert!(ctrl.set_enabled("trajectory", false).await.unwrap());
-    assert!(app.get::<TrajectoryRuntime>("trajectory").is_none());
+    assert!(!app.trajectory().unwrap().is_enabled());
 
     let after_guard_off = tools
         .execute(ToolExecution::new(
@@ -545,12 +538,9 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         .await;
     assert!(
         after_guard_off.additional_contexts.is_empty(),
-        "repeat-guard waterfall hook must be cleanly removed after disable"
+        "repeat-guard waterfall hook must pass through cleanly after disable"
     );
 
     assert!(ctrl.set_enabled("repeat-guard", true).await.unwrap());
-    let recorded = events.lock().unwrap();
-    assert!(recorded.contains(&("tools-coding".to_string(), true)));
-    assert!(recorded.contains(&("tools-coding".to_string(), false)));
-    assert!(recorded.contains(&("repeat-guard".to_string(), false)));
+    assert!(ctrl.is_enabled("repeat-guard"));
 }
