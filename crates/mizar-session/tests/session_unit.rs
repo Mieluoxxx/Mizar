@@ -1078,3 +1078,156 @@ async fn explicit_session_origin_overrides_fork_seq_inference_and_repairs_memory
 
     app.fiber().dispose().await;
 }
+
+#[tokio::test]
+async fn lightweight_header_and_selection_queries_avoid_full_load_session() {
+    use mizar_session::SessionSelection;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingHeaderBackend {
+        headers: HashMap<String, SessionHeader>,
+        selections: HashMap<String, SessionSelection>,
+        load_session_calls: AtomicUsize,
+        load_header_calls: AtomicUsize,
+        latest_selection_calls: AtomicUsize,
+    }
+
+    impl SessionPersistence for CountingHeaderBackend {
+        fn create_session(&self, _: &SessionHeader) -> PersistenceResult<()> {
+            Ok(())
+        }
+        fn update_header(&self, _: &str, _: SessionHeaderPatch) -> PersistenceResult<()> {
+            Ok(())
+        }
+        fn load_session(&self, _: &str) -> PersistenceResult<Option<LoadedSession>> {
+            self.load_session_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn load_header(&self, session_id: &str) -> PersistenceResult<Option<SessionHeader>> {
+            self.load_header_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.headers.get(session_id).cloned())
+        }
+        fn latest_selection(
+            &self,
+            session_id: &str,
+        ) -> PersistenceResult<Option<SessionSelection>> {
+            self.latest_selection_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.selections.get(session_id).cloned())
+        }
+        fn list_sessions(&self, _: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+            Ok(self.headers.values().cloned().collect())
+        }
+        fn append_events(&self, _: &str, _: &[SessionEntry]) -> PersistenceResult<()> {
+            Ok(())
+        }
+        fn flush(&self, _: Option<&str>) -> PersistenceResult<()> {
+            Ok(())
+        }
+        fn flush_async(&self, _: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn fork_session(
+            &self,
+            from_session_id: &str,
+            _: u64,
+            _: &SessionHeader,
+        ) -> PersistenceResult<LoadedSession> {
+            Err(PersistenceError::NotFound(from_session_id.to_string()))
+        }
+    }
+
+    let mut parent_h = SessionHeader::new("cold-parent", 10);
+    parent_h.cwd = Some("/ws/light".into());
+    let mut child_h = SessionHeader::new("cold-child", 20);
+    child_h.cwd = Some("/ws/light".into());
+    child_h.parent_id = Some("cold-parent".into());
+
+    let mut headers = HashMap::new();
+    headers.insert("cold-parent".into(), parent_h);
+    headers.insert("cold-child".into(), child_h);
+
+    let mut selections = HashMap::new();
+    selections.insert(
+        "cold-child".into(),
+        SessionSelection {
+            provider: Some("openai".into()),
+            model: Some("gpt-5".into()),
+            reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
+        },
+    );
+
+    let backend = Arc::new(CountingHeaderBackend {
+        headers,
+        selections,
+        load_session_calls: AtomicUsize::new(0),
+        load_header_calls: AtomicUsize::new(0),
+        latest_selection_calls: AtomicUsize::new(0),
+    });
+
+    let app = Context::new();
+    app.provide(
+        mizar_session::SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend.clone())),
+    )
+    .unwrap();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
+
+    // 1. 持久化冷会话轻量读取不得触发 load_session
+    let h = store.inspect_header_async("cold-child").await.unwrap();
+    assert_eq!(h.cwd.as_deref(), Some("/ws/light"));
+    assert_eq!(
+        store.lineage_session_ids_async("cold-child").await,
+        vec!["cold-child", "cold-parent"]
+    );
+    let sel = store.peek_selection_async("cold-child").await.unwrap();
+    assert_eq!(sel.provider.as_deref(), Some("openai"));
+    assert_eq!(sel.model.as_deref(), Some("gpt-5"));
+    assert_eq!(
+        store
+            .peek_selection_light("cold-child")
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("gpt-5")
+    );
+    assert_eq!(backend.load_session_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.load_header_calls.load(Ordering::SeqCst) >= 3);
+    assert_eq!(backend.latest_selection_calls.load(Ordering::SeqCst), 2);
+
+    // 2. 内存会话同样走轻量通道而不触发持久化查询
+    let mem = store.create_with(SessionCreateOptions {
+        id: Some("mem-sess".into()),
+        cwd: Some("/ws/mem".into()),
+        ..Default::default()
+    });
+    mem.record_selection(
+        Some("anthropic".into()),
+        Some("claude-sonnet-4-5".into()),
+        Some(mizar_llm::ReasoningEffort::Medium),
+    );
+    assert_eq!(
+        store.inspect_header("mem-sess").unwrap().cwd.as_deref(),
+        Some("/ws/mem")
+    );
+    assert_eq!(
+        store
+            .peek_selection_light("mem-sess")
+            .unwrap()
+            .provider
+            .as_deref(),
+        Some("anthropic")
+    );
+    assert_eq!(
+        store
+            .peek_selection_async("mem-sess")
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("claude-sonnet-4-5")
+    );
+    assert_eq!(backend.load_session_calls.load(Ordering::SeqCst), 0);
+
+    app.fiber().dispose().await;
+}

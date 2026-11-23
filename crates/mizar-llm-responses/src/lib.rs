@@ -1,6 +1,6 @@
 //! OpenAI Responses 协议适配器（对应 `NamiDSH/packages/llm-responses`）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +10,8 @@ use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
     LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
     ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
-    clamp_openai_prompt_cache_key, detect_session_affinity_mode, push_session_affinity_headers,
-    resolve_cache_retention,
+    ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,
+    push_session_affinity_headers, resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 pub const PROTOCOL_RESPONSES: &str = "openai-responses";
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u32 = 16;
+const CONFIGURATION_UPDATE_REQUEST_EFFORT: &str = "medium";
 
 #[derive(Debug, Clone)]
 pub struct ResponsesConfig {
@@ -35,6 +36,9 @@ pub struct ResponsesConfig {
     pub supports_developer_role: bool,
     pub use_top_level_instructions: bool,
     pub supports_strict_mode: bool,
+    pub supports_mid_convo_effort: bool,
+    pub supports_additional_tools: bool,
+    pub supports_tool_search_output: bool,
     pub send_session_affinity_headers: Option<bool>,
     pub session_affinity_mode: Option<SessionAffinityMode>,
     pub supports_long_cache_retention: bool,
@@ -57,6 +61,9 @@ impl Default for ResponsesConfig {
             supports_developer_role: true,
             use_top_level_instructions: false,
             supports_strict_mode: false,
+            supports_mid_convo_effort: false,
+            supports_additional_tools: false,
+            supports_tool_search_output: false,
             send_session_affinity_headers: None,
             session_affinity_mode: None,
             supports_long_cache_retention: true,
@@ -528,11 +535,236 @@ fn effort_str(effort: ReasoningEffort) -> Option<&'static str> {
     }
 }
 
-pub fn build_request_body(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolSyncMode {
+    None,
+    AdditionalTools,
+    ToolSearchOutput,
+}
+
+impl ToolSyncMode {
+    fn from_config(config: &ResponsesConfig) -> Self {
+        if config.supports_additional_tools {
+            Self::AdditionalTools
+        } else if config.supports_tool_search_output {
+            Self::ToolSearchOutput
+        } else {
+            Self::None
+        }
+    }
+
+    fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::AdditionalTools => Some("additional_tools"),
+            Self::ToolSearchOutput => Some("tool_search_output"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolSyncRecord {
+    mode: String,
+    base_tools: Vec<ToolSchema>,
+    added_tools: Vec<ToolSchema>,
+    removed_tools: Vec<String>,
+}
+
+impl ToolSyncRecord {
+    fn from_replay(replay: &ReplayEnvelope) -> Option<Self> {
+        let raw = replay.response.get("toolSync")?;
+        let mode = raw.get("mode").and_then(Value::as_str)?.to_string();
+        let parse_tools = |key: &str| -> Vec<ToolSchema> {
+            raw.get(key)
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value::<ToolSchema>(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let removed_tools = raw
+            .get("removedTools")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            mode,
+            base_tools: parse_tools("baseTools"),
+            added_tools: parse_tools("addedTools"),
+            removed_tools,
+        })
+    }
+
+    fn to_value(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("mode".to_string(), Value::String(self.mode.clone()));
+        if !self.base_tools.is_empty()
+            && let Ok(val) = serde_json::to_value(&self.base_tools)
+        {
+            obj.insert("baseTools".to_string(), val);
+        }
+        if !self.added_tools.is_empty()
+            && let Ok(val) = serde_json::to_value(&self.added_tools)
+        {
+            obj.insert("addedTools".to_string(), val);
+        }
+        if !self.removed_tools.is_empty() {
+            obj.insert("removedTools".to_string(), json!(self.removed_tools));
+        }
+        Value::Object(obj)
+    }
+}
+
+struct BuiltResponsesRequest {
+    body: Value,
+    recorded_effort: Option<String>,
+    recorded_tool_sync: Option<Value>,
+}
+
+fn is_chatgpt_sign_in(config: &ResponsesConfig, api_key: Option<&str>) -> bool {
+    let base_url = config
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1");
+    config.provider == "openai"
+        && trim_base_url(base_url) == "https://api.openai.com/v1"
+        && api_key.is_some_and(|k| !k.is_empty() && !k.starts_with("sk-"))
+}
+
+fn resolve_configuration_update_effort(
+    config: &ResponsesConfig,
+    options: &GenerateOptions,
+    api_key: Option<&str>,
+) -> Option<&'static str> {
+    if !config.supports_mid_convo_effort || is_chatgpt_sign_in(config, api_key) {
+        return None;
+    }
+    let effort = options.reasoning_effort?;
+    if effort == ReasoningEffort::Off {
+        return None;
+    }
+    effort_str(effort)
+}
+
+fn short_hash(seed: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in seed.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn convert_responses_tool(
+    tool: &ToolSchema,
+    supports_strict_mode: bool,
+    tool_search_result: bool,
+) -> Value {
+    let (parameters, strict) = if supports_strict_mode {
+        match make_strict_json_schema(&tool.parameters) {
+            Some(strict_schema) => (strict_schema, true),
+            None => (tool.parameters.clone(), false),
+        }
+    } else {
+        (tool.parameters.clone(), false)
+    };
+    let mut item = json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": parameters,
+        "strict": strict,
+    });
+    if tool_search_result && let Some(obj) = item.as_object_mut() {
+        obj.insert("defer_loading".to_string(), json!(true));
+    }
+    item
+}
+
+fn convert_responses_tools(
+    tools: &[ToolSchema],
+    supports_strict_mode: bool,
+    tool_search_result: bool,
+) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| convert_responses_tool(t, supports_strict_mode, tool_search_result))
+        .collect()
+}
+
+fn render_incremental_tools_notice(unavailable: &BTreeSet<String>) -> String {
+    let notice = "This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.";
+    if unavailable.is_empty() {
+        notice.to_string()
+    } else {
+        let joined: Vec<&str> = unavailable.iter().map(String::as_str).collect();
+        format!("{notice}\nStill unavailable: {}.", joined.join(", "))
+    }
+}
+
+fn render_tool_removal_notice(names: &[String]) -> String {
+    let bullets: Vec<String> = names.iter().map(|n| format!("- {n}")).collect();
+    format!(
+        "The following tools are no longer available. Do not call them:\n{}",
+        bullets.join("\n")
+    )
+}
+
+fn push_configuration_update(input: &mut Vec<Value>, effort: &str) {
+    input.push(json!({
+        "type": "configuration_update",
+        "reasoning": { "effort": effort },
+    }));
+}
+
+fn push_tool_search_pair(
+    input: &mut Vec<Value>,
+    tools: &[ToolSchema],
+    seed: &str,
+    supports_strict_mode: bool,
+) {
+    if tools.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let call_id = format!(
+        "mizar_tool_load_{}",
+        short_hash(&format!("{seed}:{}", names.join(",")))
+    );
+    input.push(json!({
+        "type": "tool_search_call",
+        "call_id": call_id,
+        "execution": "client",
+        "status": "completed",
+        "arguments": {
+            "query": names.join(" "),
+            "limit": names.len(),
+        },
+    }));
+    input.push(json!({
+        "type": "tool_search_output",
+        "call_id": call_id,
+        "execution": "client",
+        "status": "completed",
+        "tools": convert_responses_tools(tools, supports_strict_mode, true),
+    }));
+}
+
+fn build_request_with_metadata(
     config: &ResponsesConfig,
     options: &GenerateOptions,
     model: &str,
-) -> Value {
+    api_key: Option<&str>,
+) -> BuiltResponsesRequest {
     let mut sys_parts = Vec::new();
     if let Some(sys) = &options.system
         && !sys.is_empty()
@@ -547,28 +779,284 @@ pub fn build_request_body(
         }
     }
     let instructions = sys_parts.join("\n\n");
+    let instruction_role = if config.supports_developer_role {
+        "developer"
+    } else {
+        "user"
+    };
 
-    let mut input: Vec<Value> = Vec::new();
-    if !instructions.is_empty() && !config.use_top_level_instructions {
-        // GPT-6.2 对顶层 instructions 不进前缀缓存，内联放在 input 首位才能稳定命中 Prompt Cache。
-        let role = if config.supports_developer_role {
-            "developer"
-        } else {
-            "user"
+    let tool_sync_mode = ToolSyncMode::from_config(config);
+    let configuration_update_effort = resolve_configuration_update_effort(config, options, api_key);
+
+    let matched_sync_for = |msg: &Message, expected_mode: &str| -> Option<ToolSyncRecord> {
+        let Message::Assistant {
+            replay: Some(replay),
+            ..
+        } = msg
+        else {
+            return None;
         };
-        input.push(json!({
-            "type": "message",
-            "role": role,
-            "content": instructions,
-        }));
-    }
-    input.extend(
+        if !replay.matches(PROTOCOL_RESPONSES, &config.provider, model) {
+            return None;
+        }
+        ToolSyncRecord::from_replay(replay).filter(|rec| rec.mode == expected_mode)
+    };
+
+    let head_sync_msg_idx = tool_sync_mode.as_str().and_then(|expected_mode| {
         options
             .messages
             .iter()
-            .filter(|m| !matches!(m, Message::System { .. }))
-            .flat_map(|m| to_wire_with_replay(m, &config.provider, model)),
-    );
+            .position(|m| matched_sync_for(m, expected_mode).is_some())
+    });
+
+    let mut input: Vec<Value> = Vec::new();
+
+    // 增量工具模式（对齐 Pi）：
+    // - AdditionalTools：Turn-0 工具集放 input 首位，后续新增/重定义只追加 additional_tools，移除只发文本通知；
+    // - ToolSearchOutput：顶层 body["tools"] 永远冻结在 Turn-0 基线，后续新增工具合成 tool_search_call + tool_search_output。
+    let mut declared_additional_tools = false;
+    let mut active_tools: BTreeMap<String, ToolSchema> = BTreeMap::new();
+    let mut unavailable_tools: BTreeSet<String> = BTreeSet::new();
+
+    let mut top_level_tools: Vec<ToolSchema> = Vec::new();
+    let mut tool_search_declared: BTreeSet<String> = BTreeSet::new();
+    let mut tool_search_turn: usize = 0;
+
+    let mut next_tool_sync_record: Option<ToolSyncRecord> =
+        tool_sync_mode.as_str().map(|mode| ToolSyncRecord {
+            mode: mode.to_string(),
+            ..Default::default()
+        });
+
+    match tool_sync_mode {
+        ToolSyncMode::AdditionalTools => {
+            let initial_tools = if let Some(idx) = head_sync_msg_idx {
+                matched_sync_for(&options.messages[idx], "additional_tools")
+                    .map(|r| r.added_tools)
+                    .unwrap_or_default()
+            } else {
+                if let Some(rec) = next_tool_sync_record.as_mut() {
+                    rec.added_tools = options.tools.clone();
+                }
+                options.tools.clone()
+            };
+            if !initial_tools.is_empty() {
+                for t in &initial_tools {
+                    active_tools.insert(t.name.clone(), t.clone());
+                }
+                declared_additional_tools = true;
+                input.push(json!({
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": convert_responses_tools(&initial_tools, config.supports_strict_mode, false),
+                }));
+            }
+        }
+        ToolSyncMode::ToolSearchOutput => {
+            top_level_tools = if let Some(idx) = head_sync_msg_idx {
+                matched_sync_for(&options.messages[idx], "tool_search_output")
+                    .map(|r| r.base_tools)
+                    .unwrap_or_default()
+            } else {
+                if let Some(rec) = next_tool_sync_record.as_mut() {
+                    rec.base_tools = options.tools.clone();
+                }
+                options.tools.clone()
+            };
+            for t in &top_level_tools {
+                tool_search_declared.insert(t.name.clone());
+            }
+        }
+        ToolSyncMode::None => {
+            top_level_tools = options.tools.clone();
+        }
+    }
+
+    if !instructions.is_empty() && !config.use_top_level_instructions {
+        // GPT-6.2 对顶层 instructions 不进前缀缓存，内联放在 input 首位（或 additional_tools 之后）才能稳定命中 Prompt Cache。
+        input.push(json!({
+            "type": "message",
+            "role": instruction_role,
+            "content": instructions,
+        }));
+    }
+
+    for (msg_idx, msg) in options.messages.iter().enumerate() {
+        match msg {
+            Message::System { .. } => {}
+            Message::Assistant { replay, .. } => {
+                let wire_items = to_wire_with_replay(msg, &config.provider, model);
+                if wire_items.is_empty() {
+                    continue;
+                }
+
+                let is_head_sync = head_sync_msg_idx == Some(msg_idx);
+                if !is_head_sync {
+                    match tool_sync_mode {
+                        ToolSyncMode::AdditionalTools => {
+                            if let Some(sync_rec) = matched_sync_for(msg, "additional_tools") {
+                                if !sync_rec.added_tools.is_empty() {
+                                    for t in &sync_rec.added_tools {
+                                        unavailable_tools.remove(&t.name);
+                                        active_tools.insert(t.name.clone(), t.clone());
+                                    }
+                                    if declared_additional_tools {
+                                        input.push(json!({
+                                            "type": "message",
+                                            "role": instruction_role,
+                                            "content": render_incremental_tools_notice(&unavailable_tools),
+                                        }));
+                                    }
+                                    declared_additional_tools = true;
+                                    input.push(json!({
+                                        "type": "additional_tools",
+                                        "role": "developer",
+                                        "tools": convert_responses_tools(&sync_rec.added_tools, config.supports_strict_mode, false),
+                                    }));
+                                }
+                                let added_names: HashSet<&str> = sync_rec
+                                    .added_tools
+                                    .iter()
+                                    .map(|t| t.name.as_str())
+                                    .collect();
+                                let removed: Vec<String> = sync_rec
+                                    .removed_tools
+                                    .into_iter()
+                                    .filter(|name| !added_names.contains(name.as_str()))
+                                    .collect();
+                                if !removed.is_empty() {
+                                    for name in &removed {
+                                        active_tools.remove(name);
+                                        unavailable_tools.insert(name.clone());
+                                    }
+                                    input.push(json!({
+                                        "type": "message",
+                                        "role": instruction_role,
+                                        "content": render_tool_removal_notice(&removed),
+                                    }));
+                                }
+                            }
+                        }
+                        ToolSyncMode::ToolSearchOutput => {
+                            if let Some(sync_rec) = matched_sync_for(msg, "tool_search_output")
+                                && !sync_rec.added_tools.is_empty()
+                            {
+                                push_tool_search_pair(
+                                    &mut input,
+                                    &sync_rec.added_tools,
+                                    &format!("turn:{tool_search_turn}"),
+                                    config.supports_strict_mode,
+                                );
+                                tool_search_turn += 1;
+                                for t in &sync_rec.added_tools {
+                                    tool_search_declared.insert(t.name.clone());
+                                }
+                            }
+                        }
+                        ToolSyncMode::None => {}
+                    }
+                }
+
+                if configuration_update_effort.is_some()
+                    && let Some(r) = replay.as_ref()
+                    && r.matches(PROTOCOL_RESPONSES, &config.provider, model)
+                    && let Some(recorded_level) = r
+                        .response
+                        .get("providerThinkingLevel")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                {
+                    push_configuration_update(&mut input, recorded_level);
+                }
+
+                input.extend(wire_items);
+            }
+            _ => {
+                input.extend(to_wire_with_replay(msg, &config.provider, model));
+            }
+        }
+    }
+
+    // 为当前将要生成的这一轮计算增量工具变更（Turn 0 已在头部处理）
+    if head_sync_msg_idx.is_some() {
+        match tool_sync_mode {
+            ToolSyncMode::AdditionalTools => {
+                let desired_names: HashSet<&str> =
+                    options.tools.iter().map(|t| t.name.as_str()).collect();
+                let added: Vec<ToolSchema> = options
+                    .tools
+                    .iter()
+                    .filter(|t| active_tools.get(&t.name) != Some(*t))
+                    .cloned()
+                    .collect();
+                let removed: Vec<String> = active_tools
+                    .keys()
+                    .filter(|name| !desired_names.contains(name.as_str()))
+                    .cloned()
+                    .collect();
+
+                if !added.is_empty() {
+                    for t in &added {
+                        unavailable_tools.remove(&t.name);
+                        active_tools.insert(t.name.clone(), t.clone());
+                    }
+                    if declared_additional_tools {
+                        input.push(json!({
+                            "type": "message",
+                            "role": instruction_role,
+                            "content": render_incremental_tools_notice(&unavailable_tools),
+                        }));
+                    }
+                    input.push(json!({
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": convert_responses_tools(&added, config.supports_strict_mode, false),
+                    }));
+                }
+
+                if !removed.is_empty() {
+                    for name in &removed {
+                        active_tools.remove(name);
+                        unavailable_tools.insert(name.clone());
+                    }
+                    input.push(json!({
+                        "type": "message",
+                        "role": instruction_role,
+                        "content": render_tool_removal_notice(&removed),
+                    }));
+                }
+
+                if let Some(rec) = next_tool_sync_record.as_mut() {
+                    rec.added_tools = added;
+                    rec.removed_tools = removed;
+                }
+            }
+            ToolSyncMode::ToolSearchOutput => {
+                let added: Vec<ToolSchema> = options
+                    .tools
+                    .iter()
+                    .filter(|t| !tool_search_declared.contains(&t.name))
+                    .cloned()
+                    .collect();
+                if !added.is_empty() {
+                    push_tool_search_pair(
+                        &mut input,
+                        &added,
+                        &format!("turn:{tool_search_turn}"),
+                        config.supports_strict_mode,
+                    );
+                    if let Some(rec) = next_tool_sync_record.as_mut() {
+                        rec.added_tools = added;
+                    }
+                }
+            }
+            ToolSyncMode::None => {}
+        }
+    }
+
+    if let Some(current_effort) = configuration_update_effort {
+        push_configuration_update(&mut input, current_effort);
+    }
 
     let mut body = json!({
         "model": model,
@@ -600,7 +1088,14 @@ pub fn build_request_body(
     if let Some(temp) = options.temperature {
         body["temperature"] = json!(temp);
     }
-    if let Some(requested_effort) = options.reasoning_effort
+    if let Some(current_effort) = configuration_update_effort {
+        let _ = current_effort;
+        body["reasoning"] = json!({
+            "effort": CONFIGURATION_UPDATE_REQUEST_EFFORT,
+            "summary": "auto",
+        });
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    } else if let Some(requested_effort) = options.reasoning_effort
         && let Some(effort) = effort_str(requested_effort)
     {
         if requested_effort == ReasoningEffort::Off {
@@ -610,31 +1105,27 @@ pub fn build_request_body(
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
     }
-    if !options.tools.is_empty() {
-        let tools: Vec<Value> = options
-            .tools
-            .iter()
-            .map(|t| {
-                let (parameters, strict) = if config.supports_strict_mode {
-                    match make_strict_json_schema(&t.parameters) {
-                        Some(strict_schema) => (strict_schema, true),
-                        None => (t.parameters.clone(), false),
-                    }
-                } else {
-                    (t.parameters.clone(), false)
-                };
-                json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": parameters,
-                    "strict": strict,
-                })
-            })
-            .collect();
-        body["tools"] = Value::Array(tools);
+    if !top_level_tools.is_empty() {
+        body["tools"] = Value::Array(convert_responses_tools(
+            &top_level_tools,
+            config.supports_strict_mode,
+            false,
+        ));
     }
-    body
+
+    BuiltResponsesRequest {
+        body,
+        recorded_effort: configuration_update_effort.map(ToString::to_string),
+        recorded_tool_sync: next_tool_sync_record.map(|rec| rec.to_value()),
+    }
+}
+
+pub fn build_request_body(
+    config: &ResponsesConfig,
+    options: &GenerateOptions,
+    model: &str,
+) -> Value {
+    build_request_with_metadata(config, options, model, config.api_key.as_deref()).body
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -775,6 +1266,8 @@ pub struct ResponsesSseDecoder {
     finish_reason: Option<FinishReason>,
     event_phase: ResponsesEventPhase,
     finish_phase: ResponsesFinishPhase,
+    recorded_effort: Option<String>,
+    recorded_tool_sync: Option<Value>,
 }
 
 impl ResponsesSseDecoder {
@@ -794,7 +1287,19 @@ impl ResponsesSseDecoder {
             finish_reason: None,
             event_phase: ResponsesEventPhase::Streaming,
             finish_phase: ResponsesFinishPhase::Pending,
+            recorded_effort: None,
+            recorded_tool_sync: None,
         }
+    }
+
+    pub fn with_recorded_effort(mut self, effort: Option<String>) -> Self {
+        self.recorded_effort = effort;
+        self
+    }
+
+    pub fn with_recorded_tool_sync(mut self, tool_sync: Option<Value>) -> Self {
+        self.recorded_tool_sync = tool_sync;
+        self
     }
 
     fn alloc_index(&mut self) -> usize {
@@ -1686,10 +2191,16 @@ impl SseStreamDecoder for ResponsesSseDecoder {
             .collect();
 
         let mut replay_response = json!({ "id": self.response_id });
-        if let Some(obj) = replay_response.as_object_mut()
-            && !output_items.is_empty()
-        {
-            obj.insert("outputItems".to_string(), Value::Array(output_items));
+        if let Some(obj) = replay_response.as_object_mut() {
+            if !output_items.is_empty() {
+                obj.insert("outputItems".to_string(), Value::Array(output_items));
+            }
+            if let Some(ref effort) = self.recorded_effort {
+                obj.insert("providerThinkingLevel".to_string(), json!(effort));
+            }
+            if let Some(ref tool_sync) = self.recorded_tool_sync {
+                obj.insert("toolSync".to_string(), tool_sync.clone());
+            }
         }
         let replay = ReplayEnvelope {
             protocol: PROTOCOL_RESPONSES.to_string(),
@@ -1811,21 +2322,23 @@ impl LlmAdapter for ResponsesAdapter {
         };
 
         let model = options.model.clone().unwrap_or_else(|| self.model.clone());
-        let body = build_request_body(&self.config, &options, &model);
+        let built = build_request_with_metadata(&self.config, &options, &model, api_key.as_deref());
         let url = format!("{}/responses", trim_base_url(&self.base_url));
         let headers = self.build_headers(
             api_key.as_deref(),
             &options.headers,
             options.session_id.as_deref(),
         );
-        let decoder = ResponsesSseDecoder::new(self.config.provider.clone(), model);
+        let decoder = ResponsesSseDecoder::new(self.config.provider.clone(), model)
+            .with_recorded_effort(built.recorded_effort)
+            .with_recorded_tool_sync(built.recorded_tool_sync);
 
         spawn_sse_stream(
             SseRequest {
                 client: self.client.clone(),
                 url,
                 headers,
-                body,
+                body: built.body,
                 cancel: options.cancel,
                 idle_timeout: self.config.idle_timeout,
             },
@@ -2489,5 +3002,455 @@ mod tests {
                 ..
             } | StreamChunk::Finish { .. }
         )));
+    }
+
+    fn make_tool(name: &str, desc: &str) -> ToolSchema {
+        ToolSchema {
+            name: name.into(),
+            description: desc.into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" }
+                },
+                "required": ["q"]
+            }),
+        }
+    }
+
+    #[test]
+    fn configuration_update_preserves_prefix_across_effort_switches_and_skips_chatgpt_signin() {
+        let cfg = ResponsesConfig {
+            provider: "openai".into(),
+            supports_mid_convo_effort: true,
+            ..Default::default()
+        };
+
+        // Turn 0: reasoning_effort = High -> 顶层固定为 medium，末尾追加 configuration_update(high)
+        let built0 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys".into()),
+                messages: vec![Message::user("first")],
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-test-key"),
+        );
+        assert_eq!(built0.body["reasoning"]["effort"], "medium");
+        assert_eq!(built0.recorded_effort.as_deref(), Some("high"));
+        let input0 = built0.body["input"].as_array().unwrap();
+        assert_eq!(input0.len(), 3);
+        assert_eq!(
+            input0[2],
+            json!({ "type": "configuration_update", "reasoning": { "effort": "high" } })
+        );
+
+        let a0 = Message::assistant(
+            vec![ContentBlock::Text {
+                text: "reply 0".into(),
+            }],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_RESPONSES.into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                response: json!({
+                    "id": "resp_0",
+                    "outputItems": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "id": "msg_0",
+                        "status": "completed",
+                        "content": [{ "type": "output_text", "text": "reply 0", "annotations": [] }]
+                    }],
+                    "providerThinkingLevel": built0.recorded_effort.as_deref().unwrap(),
+                }),
+                blocks: Vec::new(),
+            }),
+        );
+
+        // Turn 1: 切换为 Low -> 顶层仍保持 medium，a0 前还原 configuration_update(high)，末尾追加 configuration_update(low)
+        let built1 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys".into()),
+                messages: vec![Message::user("first"), a0, Message::user("second")],
+                reasoning_effort: Some(ReasoningEffort::Low),
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-test-key"),
+        );
+        assert_eq!(built1.body["reasoning"]["effort"], "medium");
+        assert_eq!(built1.recorded_effort.as_deref(), Some("low"));
+        let input1 = built1.body["input"].as_array().unwrap();
+        assert_eq!(&input1[..input0.len()], input0.as_slice());
+        assert_eq!(input1[3]["type"], "message");
+        assert_eq!(input1[4]["role"], "user");
+        assert_eq!(
+            input1[5],
+            json!({ "type": "configuration_update", "reasoning": { "effort": "low" } })
+        );
+
+        // ChatGPT Sign-In (provider="openai" + default base_url + 非 sk- token) 不发送 configuration_update
+        let chatgpt_built = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys".into()),
+                messages: vec![Message::user("first")],
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("eyJ_oauth_token"),
+        );
+        assert_eq!(chatgpt_built.body["reasoning"]["effort"], "high");
+        assert!(chatgpt_built.recorded_effort.is_none());
+        assert!(
+            !chatgpt_built.body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item.get("type") == Some(&json!("configuration_update")))
+        );
+
+        // 默认关闭 supports_mid_convo_effort 时与旧行为一致
+        let default_built = build_request_body(
+            &ResponsesConfig::default(),
+            &GenerateOptions {
+                messages: vec![Message::user("first")],
+                reasoning_effort: Some(ReasoningEffort::High),
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert_eq!(default_built["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn additional_tools_handles_incremental_add_remove_readd_and_preserves_prefix() {
+        let cfg = ResponsesConfig {
+            provider: "openai".into(),
+            supports_additional_tools: true,
+            ..Default::default()
+        };
+        let t_read = make_tool("read", "Read file");
+        let t_bash = make_tool("bash", "Run shell");
+        let t_mcp = make_tool("mcp_search", "Search external MCP");
+
+        // Turn 0: 工具声明进 input[0] 的 additional_tools，不写顶层 body["tools"]
+        let built0 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys".into()),
+                messages: vec![Message::user("u0")],
+                tools: vec![t_read.clone(), t_bash.clone()],
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-1"),
+        );
+        assert!(built0.body.get("tools").is_none());
+        let input0 = built0.body["input"].as_array().unwrap();
+        assert_eq!(input0[0]["type"], "additional_tools");
+        assert_eq!(input0[0]["role"], "developer");
+        assert_eq!(input0[0]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(input0[1]["role"], "developer");
+        assert_eq!(input0[2]["role"], "user");
+
+        let a0 = Message::assistant(
+            vec![ContentBlock::Text { text: "a0".into() }],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_RESPONSES.into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                response: json!({
+                    "id": "r0",
+                    "outputItems": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "id": "m0",
+                        "status": "completed",
+                        "content": [{ "type": "output_text", "text": "a0", "annotations": [] }]
+                    }],
+                    "toolSync": built0.recorded_tool_sync.clone().unwrap(),
+                }),
+                blocks: Vec::new(),
+            }),
+        );
+
+        // Turn 1: 动态挂载 t_mcp 并移除 t_bash -> 前缀完全保序，末尾追加增量说明 + additional_tools([t_mcp]) + 移除通知
+        let built1 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys".into()),
+                messages: vec![Message::user("u0"), a0.clone(), Message::user("u1")],
+                tools: vec![t_read.clone(), t_mcp.clone()],
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-1"),
+        );
+        assert!(built1.body.get("tools").is_none());
+        let input1 = built1.body["input"].as_array().unwrap();
+        assert_eq!(&input1[..input0.len()], input0.as_slice());
+        let tail1 = &input1[input0.len()..];
+        assert_eq!(tail1[2]["role"], "developer");
+        assert!(
+            tail1[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("incremental tools update")
+        );
+        assert_eq!(tail1[3]["type"], "additional_tools");
+        assert_eq!(tail1[3]["tools"][0]["name"], "mcp_search");
+        assert_eq!(tail1[4]["role"], "developer");
+        assert!(tail1[4]["content"].as_str().unwrap().contains("- bash"));
+
+        let a1 = Message::assistant(
+            vec![ContentBlock::Text { text: "a1".into() }],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_RESPONSES.into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                response: json!({
+                    "id": "r1",
+                    "outputItems": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "id": "m1",
+                        "status": "completed",
+                        "content": [{ "type": "output_text", "text": "a1", "annotations": [] }]
+                    }],
+                    "toolSync": built1.recorded_tool_sync.clone().unwrap(),
+                }),
+                blocks: Vec::new(),
+            }),
+        );
+
+        // Turn 2: 工具集不变时不重复发 additional_tools；若再增一个新工具，则重申仍然不可用的 bash
+        let t_extra = make_tool("extra", "Extra tool");
+        let built2 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys".into()),
+                messages: vec![
+                    Message::user("u0"),
+                    a0,
+                    Message::user("u1"),
+                    a1,
+                    Message::user("u2"),
+                ],
+                tools: vec![t_read, t_mcp, t_extra],
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-1"),
+        );
+        let input2 = built2.body["input"].as_array().unwrap();
+        assert_eq!(&input2[..input1.len()], input1.as_slice());
+        let tail2 = &input2[input1.len()..];
+        assert!(
+            tail2[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Still unavailable: bash.")
+        );
+        assert_eq!(tail2[3]["type"], "additional_tools");
+        assert_eq!(tail2[3]["tools"][0]["name"], "extra");
+    }
+
+    #[test]
+    fn tool_search_output_freezes_top_level_tools_and_appends_synthetic_search_items() {
+        let cfg = ResponsesConfig {
+            provider: "openai".into(),
+            supports_tool_search_output: true,
+            ..Default::default()
+        };
+        let t_base = make_tool("read", "Read file");
+        let t_dyn = make_tool("mcp_sql", "Query SQL");
+
+        let built0 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                messages: vec![Message::user("u0")],
+                tools: vec![t_base.clone()],
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-1"),
+        );
+        assert_eq!(built0.body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(built0.body["tools"][0]["name"], "read");
+
+        let a0 = Message::assistant(
+            vec![ContentBlock::Text { text: "a0".into() }],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_RESPONSES.into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                response: json!({
+                    "id": "r0",
+                    "outputItems": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "id": "m0",
+                        "status": "completed",
+                        "content": [{ "type": "output_text", "text": "a0", "annotations": [] }]
+                    }],
+                    "toolSync": built0.recorded_tool_sync.clone().unwrap(),
+                }),
+                blocks: Vec::new(),
+            }),
+        );
+
+        let built1 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                messages: vec![Message::user("u0"), a0.clone(), Message::user("u1")],
+                tools: vec![t_base.clone(), t_dyn.clone()],
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-1"),
+        );
+        // 顶层 tools 保持冻结为 Turn-0 的 [read]
+        assert_eq!(built1.body["tools"], built0.body["tools"]);
+        let input1 = built1.body["input"].as_array().unwrap();
+        let call_item = &input1[3];
+        let output_item = &input1[4];
+        assert_eq!(call_item["type"], "tool_search_call");
+        assert_eq!(call_item["execution"], "client");
+        assert_eq!(call_item["arguments"]["query"], "mcp_sql");
+        assert_eq!(output_item["type"], "tool_search_output");
+        assert_eq!(output_item["call_id"], call_item["call_id"]);
+        assert_eq!(output_item["tools"][0]["name"], "mcp_sql");
+        assert_eq!(output_item["tools"][0]["defer_loading"], true);
+
+        // Turn 2 回放 Turn 1 的 tool_search_call/output 时，call_id 与前缀必须完全确定性一致
+        let a1 = Message::assistant(
+            vec![ContentBlock::Text { text: "a1".into() }],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_RESPONSES.into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                response: json!({
+                    "id": "r1",
+                    "outputItems": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "id": "m1",
+                        "status": "completed",
+                        "content": [{ "type": "output_text", "text": "a1", "annotations": [] }]
+                    }],
+                    "toolSync": built1.recorded_tool_sync.clone().unwrap(),
+                }),
+                blocks: Vec::new(),
+            }),
+        );
+        let built2 = build_request_with_metadata(
+            &cfg,
+            &GenerateOptions {
+                messages: vec![
+                    Message::user("u0"),
+                    a0,
+                    Message::user("u1"),
+                    a1,
+                    Message::user("u2"),
+                ],
+                tools: vec![t_base, t_dyn],
+                ..Default::default()
+            },
+            "gpt-5",
+            Some("sk-1"),
+        );
+        let input2 = built2.body["input"].as_array().unwrap();
+        assert_eq!(&input2[..input1.len()], input1.as_slice());
+    }
+
+    #[tokio::test]
+    async fn adapter_streams_and_replays_configuration_update_and_additional_tools_end_to_end() {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let app = Router::new().route(
+            "/responses",
+            post({
+                let bodies = Arc::clone(&bodies);
+                move |axum::Json(body): axum::Json<Value>| async move {
+                    let idx = {
+                        let mut guard = bodies.lock().unwrap();
+                        let i = guard.len();
+                        guard.push(body);
+                        i
+                    };
+                    let sse = format!(
+                        concat!(
+                            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"msg_{i}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}}}\n\n",
+                            "data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_{i}\",\"delta\":\"ok_{i}\"}}\n\n",
+                            "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"msg_{i}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{{\"type\":\"output_text\",\"text\":\"ok_{i}\",\"annotations\":[]}}]}}}}\n\n",
+                            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{i}\",\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n\n"
+                        ),
+                        i = idx
+                    );
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let adapter = ResponsesAdapter::new(ResponsesConfig {
+            provider: "custom-resp".into(),
+            api_key: Some("sk-e2e".into()),
+            base_url: Some(format!("http://{addr}")),
+            supports_mid_convo_effort: true,
+            supports_additional_tools: true,
+            ..Default::default()
+        });
+
+        let t1 = make_tool("read", "Read");
+        let t2 = make_tool("mcp_new", "MCP");
+
+        // Turn 0: High + [read]
+        let mut s0 = adapter.stream(GenerateOptions {
+            messages: vec![Message::user("hi")],
+            tools: vec![t1.clone()],
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        });
+        let mut asm0 = BlockAssembler::new();
+        while let Some(chunk) = s0.next().await {
+            asm0.push(chunk.unwrap());
+        }
+        let replay0 = asm0.replay().unwrap();
+        assert_eq!(replay0.response["providerThinkingLevel"], "high");
+
+        // Turn 1: Low + [read, mcp_new]
+        let a0 = Message::assistant(asm0.blocks(), Some(replay0));
+        let mut s1 = adapter.stream(GenerateOptions {
+            messages: vec![Message::user("hi"), a0, Message::user("next")],
+            tools: vec![t1, t2],
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        });
+        let mut asm1 = BlockAssembler::new();
+        while let Some(chunk) = s1.next().await {
+            asm1.push(chunk.unwrap());
+        }
+
+        let captured = bodies.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        let in0 = captured[0]["input"].as_array().unwrap();
+        let in1 = captured[1]["input"].as_array().unwrap();
+        assert_eq!(&in1[..in0.len()], in0.as_slice());
+        assert_eq!(captured[1]["reasoning"]["effort"], "medium");
+        assert_eq!(in1.last().unwrap()["type"], "configuration_update");
+        assert_eq!(in1.last().unwrap()["reasoning"]["effort"], "low");
     }
 }

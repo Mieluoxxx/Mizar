@@ -41,7 +41,9 @@ async fn persists_and_hydrates_sessions_across_restarts() {
     app1.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app1.plugin(SessionStore::plugin(), ());
     app1.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -97,7 +99,9 @@ async fn persists_and_hydrates_sessions_across_restarts() {
     app2.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -147,7 +151,9 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
     app.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app.plugin(SessionStore::plugin(), ());
     app.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -215,7 +221,9 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
     app2.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -238,7 +246,9 @@ async fn works_with_in_memory_sqlite_config() {
     app.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(":memory:"),
-    );
+    )
+    .await
+    .unwrap();
     app.plugin(SessionStore::plugin(), ());
     app.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -270,7 +280,9 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
 
     {
         let app = Context::new();
-        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
+            .await
+            .unwrap();
         app.plugin(SessionStore::plugin(), ());
         app.plugin(
             cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -305,7 +317,9 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
     }
 
     let app2 = Context::new();
-    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
+        .await
+        .unwrap();
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -355,7 +369,9 @@ async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
     let _guard = TempDbGuard(db.clone());
 
     let app = Context::new();
-    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
+        .await
+        .unwrap();
     app.plugin(SessionStore::plugin(), ());
     app.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -457,7 +473,9 @@ async fn persists_and_derives_user_images_through_sqlite() {
 
     {
         let app = Context::new();
-        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
+            .await
+            .unwrap();
         app.plugin(SessionStore::plugin(), ());
         app.plugin(
             cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -480,7 +498,9 @@ async fn persists_and_derives_user_images_through_sqlite() {
     }
 
     let app2 = Context::new();
-    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db));
+    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
+        .await
+        .unwrap();
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -555,7 +575,9 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
     app1.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app1.plugin(SessionStore::plugin(), ());
     app1.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -612,7 +634,9 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
     app2.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app2.plugin(SessionStore::plugin(), ());
     app2.plugin(
         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -775,7 +799,9 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
                 b.wait();
                 rt.block_on(async move {
                     let app = Context::new();
-                    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&path));
+                    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&path))
+                        .await
+                        .map_err(|e| format!("sqlite boot failed: {e}"))?;
                     app.plugin(SessionStore::plugin(), ());
                     app.plugin(
                         cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
@@ -814,10 +840,13 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
                 .unwrap();
             rt.block_on(async move {
                 let check = Context::new();
-                check.plugin(
-                    SqlitePersistencePlugin,
-                    SqlitePersistenceConfig::new(&db_path),
-                );
+                check
+                    .plugin(
+                        SqlitePersistencePlugin,
+                        SqlitePersistenceConfig::new(&db_path),
+                    )
+                    .await
+                    .unwrap();
                 check.plugin(SessionStore::plugin(), ());
                 check
                     .plugin(
@@ -870,7 +899,9 @@ async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_
     app1.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app1.plugin(SessionStore::plugin(), ()).await.unwrap();
     let s1 = app1
         .sessions()
@@ -909,7 +940,9 @@ async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_
     app2.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app2.plugin(SessionStore::plugin(), ()).await.unwrap();
     let reloaded = app2.sessions().unwrap().get("usage-persist").unwrap();
 
@@ -946,7 +979,9 @@ async fn list_sessions_exclude_subagents_skips_newer_child_for_continue() {
     app.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app.plugin(SessionStore::plugin(), ()).await.unwrap();
 
     let store = app.sessions().unwrap();
@@ -1062,7 +1097,9 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
     app.plugin(
         SqlitePersistencePlugin,
         SqlitePersistenceConfig::new(&db_path),
-    );
+    )
+    .await
+    .unwrap();
     app.plugin(SessionStore::plugin(), ()).await.unwrap();
 
     {
@@ -1112,4 +1149,258 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
     assert!(!ids.contains(&"explicit-sub-fork"));
 
     app.fiber().dispose().await;
+}
+
+#[tokio::test]
+async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_recompute() {
+    use mizar_session::{
+        RecallSearchQuery, SessionEntry, SessionHeader, SessionPersistence, SessionSelection,
+    };
+    use mizar_session_sqlite::{
+        SqliteSessionPersistence,
+        recall::{MAX_RECALL_SEARCH_HITS, MAX_RECALL_SEARCH_TOTAL_BYTES},
+    };
+    use std::time::Duration;
+
+    let db_path = temp_db_path("async_busy_fork");
+    let _guard = TempDbGuard(db_path.clone());
+
+    let persistence =
+        SqliteSessionPersistence::open_with_busy_timeout(&db_path, Duration::from_millis(50))
+            .unwrap();
+
+    // 1. 写入父会话消息、Selection 与多条检索条目
+    let mut parent_h = SessionHeader::new("parent-async", 1000);
+    parent_h.cwd = Some("/ws/async".into());
+    parent_h.title = Some("Async Parent".into());
+    persistence.create_session(&parent_h).unwrap();
+    persistence
+        .append_events(
+            "parent-async",
+            &[
+                SessionEntry {
+                    seq: 1,
+                    event: SessionEvent::user("父会话早期关键标记 PARENT_TOKEN_111"),
+                    ts: 1001,
+                },
+                SessionEntry {
+                    seq: 2,
+                    event: SessionEvent::Selection {
+                        provider: Some("openai".into()),
+                        model: Some("gpt-5".into()),
+                        reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
+                    },
+                    ts: 1002,
+                },
+                SessionEntry {
+                    seq: 3,
+                    event: SessionEvent::user("分叉切点之后的父会话独占内容 PARENT_AFTER_FORK_999"),
+                    ts: 1003,
+                },
+            ],
+        )
+        .unwrap();
+    persistence.flush_async(None).await.unwrap();
+
+    // 2. 轻量异步读取 load_header_async / latest_selection_async
+    let hdr = persistence
+        .load_header_async("parent-async".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hdr.title.as_deref(), Some("Async Parent"));
+    let sel = persistence
+        .latest_selection_async("parent-async".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sel,
+        SessionSelection {
+            provider: Some("openai".into()),
+            model: Some("gpt-5".into()),
+            reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
+        }
+    );
+
+    // 3. fork_session 不应在写锁内重算并复制父会话 FTS5 行，但子会话检索仍可按谱系命中 <= fork_seq 的前缀且不泄漏 > fork_seq
+    let mut child_h = SessionHeader::new("child-async", 2000);
+    child_h.cwd = Some("/ws/async".into());
+    let _forked = persistence
+        .fork_session("parent-async", 2, &child_h)
+        .unwrap();
+    persistence
+        .append_events(
+            "child-async",
+            &[SessionEntry {
+                seq: 3,
+                event: SessionEvent::user("子会话新增词条 CHILD_POST_FORK_222"),
+                ts: 2001,
+            }],
+        )
+        .unwrap();
+    persistence.flush_async(None).await.unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let child_inherited_fts_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_recall_docs WHERE session_id = 'child-async' AND seq <= 2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            child_inherited_fts_rows, 0,
+            "fork_session must not duplicate parent FTS5 docs"
+        );
+    }
+
+    let child_inherited_hits = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "PARENT_TOKEN_111".into(),
+            session_ids: vec!["child-async".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_inherited_hits.len(), 1);
+    assert_eq!(child_inherited_hits[0].session_id, "child-async");
+    assert_eq!(child_inherited_hits[0].seq, 1);
+
+    let child_leaked_hits = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "PARENT_AFTER_FORK_999".into(),
+            session_ids: vec!["child-async".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        child_leaked_hits.is_empty(),
+        "child must not see parent events with seq > fork_seq: {child_leaked_hits:?}"
+    );
+
+    let lineage_hits = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "PARENT_TOKEN_111".into(),
+            session_ids: vec!["child-async".into(), "parent-async".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lineage_hits.len(), 1);
+    assert_eq!(lineage_hits[0].session_id, "parent-async");
+
+    let child_own_hits = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "CHILD_POST_FORK_222".into(),
+            session_ids: vec!["child-async".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_own_hits.len(), 1);
+    assert_eq!(child_own_hits[0].seq, 3);
+
+    // 4. 瞬时跨连接写锁冲突 (SQLITE_BUSY) 不得永久毒化 sticky_error / last_error
+    let blocker = rusqlite::Connection::open(&db_path).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    persistence
+        .append_events(
+            "child-async",
+            &[SessionEntry {
+                seq: 4,
+                event: SessionEvent::user("锁释放前尝试写入"),
+                ts: 2002,
+            }],
+        )
+        .unwrap();
+    let busy_err = persistence.flush_async(None).await;
+    assert!(busy_err.is_err(), "expected transient SQLITE_BUSY error");
+
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    drop(blocker);
+
+    persistence
+        .append_events(
+            "child-async",
+            &[SessionEntry {
+                seq: 4,
+                event: SessionEvent::user("锁释放后恢复写入 RECOVERED_AFTER_BUSY"),
+                ts: 2003,
+            }],
+        )
+        .unwrap();
+    persistence.flush_async(None).await.unwrap();
+
+    let recovered = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "RECOVERED_AFTER_BUSY".into(),
+            session_ids: vec!["child-async".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].seq, 4);
+
+    // 5. FTS5 结果条数与总字节数硬上限
+    let mut bulk = Vec::new();
+    for i in 10..40u64 {
+        bulk.push(SessionEntry {
+            seq: i,
+            event: SessionEvent::user(format!("CAP_NEEDLE_WORD {} {}", i, "z".repeat(400))),
+            ts: 3000 + u128::from(i),
+        });
+    }
+    persistence.append_events("child-async", &bulk).unwrap();
+    persistence.flush_async(None).await.unwrap();
+
+    let capped_hits = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "CAP_NEEDLE_WORD".into(),
+            session_ids: vec!["child-async".into()],
+            cwd: None,
+            limit: 50,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(capped_hits.len() <= MAX_RECALL_SEARCH_HITS);
+    let total_bytes: usize = capped_hits
+        .iter()
+        .map(|h| {
+            h.session_id.len()
+                + h.session_title.as_deref().map_or(0, str::len)
+                + h.kind.len()
+                + h.snippet.len()
+        })
+        .sum();
+    assert!(total_bytes <= MAX_RECALL_SEARCH_TOTAL_BYTES);
+
+    persistence.shutdown().unwrap();
+
+    // 6. 验证 open_async 可正常从异步上下文初始化并读取
+    let reopened = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let loaded = reopened
+        .load_session_async("child-async".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.header.id, "child-async");
+    reopened.shutdown().unwrap();
 }

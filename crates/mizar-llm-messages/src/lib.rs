@@ -9,6 +9,7 @@
 //! - 思考签名（`signature`）与前缀摘要（`prefixDigest`）绑定，跨模型切换安全降级
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,7 @@ use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
     LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, prefix_digest,
-    resolve_cache_retention,
+    ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
@@ -68,6 +68,60 @@ impl Default for MessagesConfig {
             models: Vec::new(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
+    }
+}
+
+const FNV1A_OFFSET: u128 = 0x6c62272e07bb0142_62b821756295c58d;
+const FNV1A_PRIME: u128 = 0x0000000001000000_000000000000013b;
+
+/// 增量流式 128-bit FNV-1a 前缀摘要器：
+/// 先一次性喂入 `system` 与 `tools`，再按消息定型顺序增量追加，避免每次 O(M²×S) 克隆与整树序列化。
+#[derive(Clone)]
+struct StreamingPrefixHasher {
+    state: u128,
+    message_count: usize,
+}
+
+impl StreamingPrefixHasher {
+    fn new(system_text: &str, wire_tools: &[Value]) -> Self {
+        let mut hasher = Self {
+            state: FNV1A_OFFSET,
+            message_count: 0,
+        };
+        let _ = hasher.write_all(br#"{"system":"#);
+        let _ = serde_json::to_writer(&mut hasher, system_text);
+        let _ = hasher.write_all(br#","tools":"#);
+        let _ = serde_json::to_writer(&mut hasher, wire_tools);
+        let _ = hasher.write_all(br#","messages":["#);
+        hasher
+    }
+
+    fn push_message(&mut self, msg: &Value) {
+        if self.message_count > 0 {
+            let _ = self.write_all(b",");
+        }
+        let _ = serde_json::to_writer(&mut *self, msg);
+        self.message_count += 1;
+    }
+
+    fn snapshot_digest(&self) -> String {
+        let mut snap = self.clone();
+        let _ = snap.write_all(b"]}");
+        format!("{:032x}", snap.state)
+    }
+}
+
+impl Write for StreamingPrefixHasher {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &byte in buf {
+            self.state ^= u128::from(byte);
+            self.state = self.state.wrapping_mul(FNV1A_PRIME);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -177,6 +231,8 @@ pub fn build_request_body(
         .collect();
 
     let mut wire_messages: Vec<Value> = Vec::new();
+    let mut prefix_hasher = StreamingPrefixHasher::new(&system_text, &wire_tools);
+    let mut hashed_messages = 0usize;
 
     for msg in &options.messages {
         match msg {
@@ -225,11 +281,11 @@ pub fn build_request_body(
                 push_user_block(&mut wire_messages, block);
             }
             Message::Assistant { blocks, replay } => {
-                let prior_digest = prefix_digest(&json!({
-                    "system": &system_text,
-                    "tools": &wire_tools,
-                    "messages": &wire_messages,
-                }));
+                for finalized in &wire_messages[hashed_messages..] {
+                    prefix_hasher.push_message(finalized);
+                }
+                hashed_messages = wire_messages.len();
+                let prior_digest = prefix_hasher.snapshot_digest();
 
                 let can_replay_thinking = replay.as_ref().is_some_and(|r| {
                     r.matches(PROTOCOL_MESSAGES, &config.provider, model)
@@ -295,16 +351,19 @@ pub fn build_request_body(
                     "role": "assistant",
                     "content": assistant_blocks,
                 }));
+                if let Some(pushed) = wire_messages.last() {
+                    prefix_hasher.push_message(pushed);
+                    hashed_messages = wire_messages.len();
+                }
             }
         }
     }
 
+    for finalized in &wire_messages[hashed_messages..] {
+        prefix_hasher.push_message(finalized);
+    }
     // 摘要在挂载 cache_control 前计算，避免缓存断点随轮次滑动破坏思考签名回放
-    let request_prefix_digest = prefix_digest(&json!({
-        "system": &system_text,
-        "tools": &wire_tools,
-        "messages": &wire_messages,
-    }));
+    let request_prefix_digest = prefix_hasher.snapshot_digest();
 
     let cache_control = cache_control_value(resolve_cache_retention(options.cache_retention));
     if let Some(cc) = &cache_control {
@@ -1286,12 +1345,10 @@ mod tests {
             "role": "user",
             "content": [{ "type": "text", "text": "hi" }],
         })];
-        let legacy_digest = prefix_digest(&json!({
-            "system": "sys v1",
-            "tools": [],
-            "messages": &legacy_messages,
-        }));
-        assert_eq!(digest_plain, legacy_digest);
+        let mut expected_hasher = StreamingPrefixHasher::new("sys v1", &[]);
+        expected_hasher.push_message(&legacy_messages[0]);
+        let expected_digest = expected_hasher.snapshot_digest();
+        assert_eq!(digest_plain, expected_digest);
         assert_eq!(body_plain["system"], json!("sys v1"));
         assert_eq!(
             serde_json::to_string(&body_plain["messages"]).unwrap(),
@@ -1307,7 +1364,7 @@ mod tests {
             },
             "claude-sonnet-4-5",
         );
-        assert_eq!(digest_short, legacy_digest);
+        assert_eq!(digest_short, expected_digest);
         assert_eq!(
             body_short["messages"][0]["content"][0]["cache_control"],
             json!({ "type": "ephemeral" })
@@ -1320,7 +1377,7 @@ mod tests {
             },
             "claude-sonnet-4-5",
         );
-        assert_eq!(digest_long, legacy_digest);
+        assert_eq!(digest_long, expected_digest);
         assert_eq!(
             body_long["messages"][0]["content"][0]["cache_control"],
             json!({ "type": "ephemeral", "ttl": "1h" })
@@ -1672,5 +1729,139 @@ mod tests {
             "claude-sonnet-4-5",
         );
         assert_eq!(body_empty_msgs["messages"], json!([]));
+    }
+
+    #[test]
+    fn streaming_prefix_digest_is_deterministic_and_replays_multi_turn_thinking() {
+        let _env = CacheEnvGuard::cleared();
+        let cfg = MessagesConfig {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-5".into(),
+            ..Default::default()
+        };
+        let tools = vec![mizar_llm::ToolSchema {
+            name: "read".into(),
+            description: "Read file".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        }];
+
+        // Turn 1: system + tools + user
+        let turn1_msgs = vec![Message::user("check main.rs")];
+        let (_, digest1) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys prompt".into()),
+                tools: tools.clone(),
+                messages: turn1_msgs.clone(),
+                cache_retention: Some(CacheRetention::Short),
+                ..Default::default()
+            },
+            "claude-sonnet-4-5",
+        );
+
+        let assistant1 = Message::assistant(
+            vec![
+                ContentBlock::Reasoning {
+                    text: "plan 1".into(),
+                },
+                ContentBlock::ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/main.rs"}"#.into(),
+                },
+            ],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_MESSAGES.into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                response: json!({ "prefixDigest": digest1 }),
+                blocks: vec![json!({ "signature": "sig_1" }), json!({})],
+            }),
+        );
+
+        // Turn 2: 连续多条 tool result 与 user 消息会折叠进同一个 wire user 消息，且必须命中 Turn 1 摘要
+        let turn2_msgs = vec![
+            turn1_msgs[0].clone(),
+            assistant1.clone(),
+            Message::tool("call_1", "fn main() {}", false),
+            Message::user("now summarize"),
+        ];
+        let (body2, digest2) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys prompt".into()),
+                tools: tools.clone(),
+                messages: turn2_msgs.clone(),
+                cache_retention: Some(CacheRetention::Short),
+                ..Default::default()
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(body2["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(body2["messages"][1]["content"][0]["signature"], "sig_1");
+
+        let assistant2 = Message::assistant(
+            vec![
+                ContentBlock::Reasoning {
+                    text: "plan 2".into(),
+                },
+                ContentBlock::Text {
+                    text: "Done".into(),
+                },
+            ],
+            Some(ReplayEnvelope {
+                protocol: PROTOCOL_MESSAGES.into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                response: json!({ "prefixDigest": digest2 }),
+                blocks: vec![json!({ "signature": "sig_2" }), json!({})],
+            }),
+        );
+
+        // Turn 3: 两轮思考签名均应完整回放，且重复调用结果完全一致
+        let mut turn3_msgs = turn2_msgs;
+        turn3_msgs.push(assistant2);
+        turn3_msgs.push(Message::user("thanks"));
+        let opts3 = GenerateOptions {
+            system: Some("sys prompt".into()),
+            tools: tools.clone(),
+            messages: turn3_msgs.clone(),
+            cache_retention: Some(CacheRetention::Short),
+            ..Default::default()
+        };
+        let (body3_a, digest3_a) = build_request_body(&cfg, &opts3, "claude-sonnet-4-5");
+        let (body3_b, digest3_b) = build_request_body(&cfg, &opts3, "claude-sonnet-4-5");
+        assert_eq!(digest3_a, digest3_b);
+        assert_eq!(body3_a, body3_b);
+        assert_eq!(body3_a["messages"][1]["content"][0]["signature"], "sig_1");
+        assert_eq!(body3_a["messages"][3]["content"][0]["signature"], "sig_2");
+
+        // 篡改早期消息会导致后续两轮的 thinking 签名均失效并被安全剥离
+        let mut tampered = turn3_msgs;
+        tampered[0] = Message::user("check other.rs");
+        let (body_tampered, digest_tampered) = build_request_body(
+            &cfg,
+            &GenerateOptions {
+                system: Some("sys prompt".into()),
+                tools,
+                messages: tampered,
+                cache_retention: Some(CacheRetention::Short),
+                ..Default::default()
+            },
+            "claude-sonnet-4-5",
+        );
+        assert_ne!(digest_tampered, digest3_a);
+        assert_ne!(
+            body_tampered["messages"][1]["content"][0]["type"],
+            "thinking"
+        );
+        assert_ne!(
+            body_tampered["messages"][3]["content"][0]["type"],
+            "thinking"
+        );
     }
 }

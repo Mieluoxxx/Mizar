@@ -4,14 +4,15 @@ use std::time::{Duration, Instant};
 
 use mizar_session::{
     EntryVisibility, LoadedSession, PersistenceError, PersistenceResult, SESSION_FORMAT_VERSION,
-    SessionEntry, SessionEvent, SessionHeader, SessionListQuery, SessionOrigin, TitleSource,
+    SessionEntry, SessionEvent, SessionHeader, SessionListQuery, SessionOrigin, SessionSelection,
+    TitleSource,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params_from_iter};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const BUSY_RETRY_BUDGET: Duration = Duration::from_millis(5000);
 
-fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+pub(crate) fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     matches!(
         err,
         rusqlite::Error::SqliteFailure(inner, _)
@@ -19,8 +20,11 @@ fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-fn retry_on_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> PersistenceResult<T> {
-    let deadline = Instant::now() + BUSY_RETRY_BUDGET;
+fn retry_on_busy_with_timeout<T>(
+    timeout: Duration,
+    mut op: impl FnMut() -> rusqlite::Result<T>,
+) -> PersistenceResult<T> {
+    let deadline = Instant::now() + timeout;
     let mut backoff_ms = 2u64;
     loop {
         match op() {
@@ -39,14 +43,21 @@ fn retry_on_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> PersistenceR
 }
 
 pub fn configure_connection(conn: &Connection) -> PersistenceResult<()> {
-    conn.busy_timeout(BUSY_RETRY_BUDGET)
-        .map_err(map_sqlite_err)?;
-    let journal_mode: String =
-        retry_on_busy(|| conn.query_row("PRAGMA journal_mode;", [], |r| r.get(0)))?;
+    configure_connection_with_timeout(conn, BUSY_RETRY_BUDGET)
+}
+
+pub(crate) fn configure_connection_with_timeout(
+    conn: &Connection,
+    timeout: Duration,
+) -> PersistenceResult<()> {
+    conn.busy_timeout(timeout).map_err(map_sqlite_err)?;
+    let journal_mode: String = retry_on_busy_with_timeout(timeout, || {
+        conn.query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+    })?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
-        retry_on_busy(|| conn.execute_batch("PRAGMA journal_mode = WAL;"))?;
+        retry_on_busy_with_timeout(timeout, || conn.execute_batch("PRAGMA journal_mode = WAL;"))?;
     }
-    retry_on_busy(|| {
+    retry_on_busy_with_timeout(timeout, || {
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
@@ -57,9 +68,15 @@ pub fn configure_connection(conn: &Connection) -> PersistenceResult<()> {
 }
 
 pub fn configure_reader_connection(conn: &Connection) -> PersistenceResult<()> {
-    conn.busy_timeout(BUSY_RETRY_BUDGET)
-        .map_err(map_sqlite_err)?;
-    retry_on_busy(|| {
+    configure_reader_connection_with_timeout(conn, BUSY_RETRY_BUDGET)
+}
+
+pub(crate) fn configure_reader_connection_with_timeout(
+    conn: &Connection,
+    timeout: Duration,
+) -> PersistenceResult<()> {
+    conn.busy_timeout(timeout).map_err(map_sqlite_err)?;
+    retry_on_busy_with_timeout(timeout, || {
         conn.execute_batch(
             "PRAGMA query_only = ON;
              PRAGMA cache_size = -512;",
@@ -82,8 +99,8 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> PersistenceResult
     Ok(false)
 }
 
-fn core_tables_present(conn: &Connection) -> PersistenceResult<bool> {
-    retry_on_busy(|| {
+fn core_tables_present(conn: &Connection, timeout: Duration) -> PersistenceResult<bool> {
+    retry_on_busy_with_timeout(timeout, || {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions' LIMIT 1;",
             [],
@@ -95,18 +112,27 @@ fn core_tables_present(conn: &Connection) -> PersistenceResult<bool> {
 }
 
 pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
-    configure_connection(conn)?;
-    let version: u32 = retry_on_busy(|| conn.query_row("PRAGMA user_version;", [], |r| r.get(0)))?;
+    init_schema_with_timeout(conn, BUSY_RETRY_BUDGET)
+}
+
+pub(crate) fn init_schema_with_timeout(
+    conn: &Connection,
+    timeout: Duration,
+) -> PersistenceResult<()> {
+    configure_connection_with_timeout(conn, timeout)?;
+    let version: u32 = retry_on_busy_with_timeout(timeout, || {
+        conn.query_row("PRAGMA user_version;", [], |r| r.get(0))
+    })?;
     if version > CURRENT_SCHEMA_VERSION {
         return Err(PersistenceError::Backend(format!(
             "unsupported sqlite session schema version {version} (max supported: {CURRENT_SCHEMA_VERSION})"
         )));
     }
-    if version == CURRENT_SCHEMA_VERSION && core_tables_present(conn)? {
+    if version == CURRENT_SCHEMA_VERSION && core_tables_present(conn, timeout)? {
         return Ok(());
     }
 
-    retry_on_busy(|| conn.execute_batch("BEGIN IMMEDIATE;"))?;
+    retry_on_busy_with_timeout(timeout, || conn.execute_batch("BEGIN IMMEDIATE;"))?;
     let init_res = (|| -> PersistenceResult<()> {
         let locked_version: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
@@ -116,7 +142,7 @@ pub fn init_schema(conn: &Connection) -> PersistenceResult<()> {
                 "unsupported sqlite session schema version {locked_version} (max supported: {CURRENT_SCHEMA_VERSION})"
             )));
         }
-        if locked_version == CURRENT_SCHEMA_VERSION && core_tables_present(conn)? {
+        if locked_version == CURRENT_SCHEMA_VERSION && core_tables_present(conn, timeout)? {
             return Ok(());
         }
 
@@ -268,24 +294,54 @@ fn row_to_header(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHeader> {
     })
 }
 
+pub fn load_header_from_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> PersistenceResult<Option<SessionHeader>> {
+    conn.query_row(
+        "SELECT id, format_version, cwd, title, parent_id, fork_seq,
+                created_at_ms, updated_at_ms, event_count, surface_count,
+                compacted_up_to_seq, title_source, origin
+         FROM sessions
+         WHERE id = ?1",
+        [session_id],
+        row_to_header,
+    )
+    .optional()
+    .map_err(map_sqlite_err)
+}
+
+pub fn latest_selection_from_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> PersistenceResult<Option<SessionSelection>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT payload_json
+             FROM session_events
+             WHERE session_id = ?1 AND kind = 'selection'
+             ORDER BY seq DESC",
+        )
+        .map_err(map_sqlite_err)?;
+    let rows = stmt
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_err)?;
+    for row in rows {
+        let payload_json = row.map_err(map_sqlite_err)?;
+        if let Ok(event) = serde_json::from_str::<SessionEvent>(&payload_json)
+            && let Some(selection) = event.as_selection()
+        {
+            return Ok(Some(selection));
+        }
+    }
+    Ok(None)
+}
+
 pub fn load_session_from_conn(
     conn: &Connection,
     session_id: &str,
 ) -> PersistenceResult<Option<LoadedSession>> {
-    let header = conn
-        .query_row(
-            "SELECT id, format_version, cwd, title, parent_id, fork_seq,
-                    created_at_ms, updated_at_ms, event_count, surface_count,
-                    compacted_up_to_seq, title_source, origin
-             FROM sessions
-             WHERE id = ?1",
-            [session_id],
-            row_to_header,
-        )
-        .optional()
-        .map_err(map_sqlite_err)?;
-
-    let Some(header) = header else {
+    let Some(header) = load_header_from_conn(conn, session_id)? else {
         return Ok(None);
     };
 

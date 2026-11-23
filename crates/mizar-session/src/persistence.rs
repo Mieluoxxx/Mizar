@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::model::{
     LoadedSession, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionHeader,
-    SessionHeaderPatch, SessionListQuery,
+    SessionHeaderPatch, SessionListQuery, SessionSelection,
 };
 
 pub const SERVICE_SESSION_PERSISTENCE: &str = "sessionPersistence";
@@ -44,7 +44,56 @@ pub trait SessionPersistence: Send + Sync + 'static {
 
     fn load_session(&self, session_id: &str) -> PersistenceResult<Option<LoadedSession>>;
 
+    /// 轻量读取会话头信息，避免反序列化与深拷贝完整 `entries`。
+    fn load_header(&self, session_id: &str) -> PersistenceResult<Option<SessionHeader>> {
+        Ok(self.load_session(session_id)?.map(|s| s.header))
+    }
+
+    /// 轻量读取会话最后记录的 `Selection` 快照，避免加载完整事件日志。
+    fn latest_selection(&self, session_id: &str) -> PersistenceResult<Option<SessionSelection>> {
+        let Some(loaded) = self.load_session(session_id)? else {
+            return Ok(None);
+        };
+        Ok(loaded
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.event.as_selection()))
+    }
+
     fn list_sessions(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>>;
+
+    fn load_session_async(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, PersistenceResult<Option<LoadedSession>>> {
+        let res = self.load_session(&session_id);
+        Box::pin(async move { res })
+    }
+
+    fn load_header_async(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, PersistenceResult<Option<SessionHeader>>> {
+        let res = self.load_header(&session_id);
+        Box::pin(async move { res })
+    }
+
+    fn latest_selection_async(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, PersistenceResult<Option<SessionSelection>>> {
+        let res = self.latest_selection(&session_id);
+        Box::pin(async move { res })
+    }
+
+    fn list_sessions_async(
+        &self,
+        query: SessionListQuery,
+    ) -> BoxFuture<'static, PersistenceResult<Vec<SessionHeader>>> {
+        let res = self.list_sessions(&query);
+        Box::pin(async move { res })
+    }
 
     fn append_events(&self, session_id: &str, entries: &[SessionEntry]) -> PersistenceResult<()>;
 
@@ -65,6 +114,14 @@ pub trait SessionPersistence: Send + Sync + 'static {
         _query: &RecallSearchQuery,
     ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
         Ok(None)
+    }
+
+    fn search_recall_async(
+        &self,
+        query: RecallSearchQuery,
+    ) -> BoxFuture<'static, PersistenceResult<Option<Vec<RecallSearchHit>>>> {
+        let res = self.search_recall(&query);
+        Box::pin(async move { res })
     }
 }
 

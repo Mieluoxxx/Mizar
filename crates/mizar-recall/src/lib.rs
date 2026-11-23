@@ -5,7 +5,6 @@
 //! - 优先调用 SQLite 后端的 FTS5 1..=3 n-gram 索引，未挂载持久化时自动回退至内存扫描；
 //! - 严格限定单次返回字符上限、跨会话作用域校验与 `is_current_session` 标记，防止回溯反向撑爆上下文。
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
@@ -22,10 +21,23 @@ use serde_json::{Value, json};
 pub const RECALL_TOOL_NAME: &str = "recall";
 
 const MAX_SEARCH_LIMIT: usize = 20;
+const MAX_SEARCH_OUTPUT_BYTES: usize = 8_192;
 const MAX_READ_RANGE_ENTRIES: u64 = 12;
 const DEFAULT_READ_CHAR_LIMIT: usize = 6_000;
 const MAX_READ_CHAR_LIMIT: usize = 8_192;
+const MAX_READ_OUTPUT_BYTES: usize = 16_384;
 const FALLBACK_SNIPPET_CHARS: usize = 240;
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 #[derive(Debug, Clone)]
 pub struct RecallConfig {
@@ -174,7 +186,7 @@ fn build_fallback_snippet(text: &str, terms: &[String]) -> String {
     out
 }
 
-fn fallback_in_memory_search(
+async fn fallback_in_memory_search(
     store: &SessionStore,
     query: &RecallSearchQuery,
 ) -> Vec<RecallSearchHit> {
@@ -189,20 +201,28 @@ fn fallback_in_memory_search(
     }
 
     let target_sessions: Vec<mizar_session::LoadedSession> = if !query.session_ids.is_empty() {
-        query
-            .session_ids
-            .iter()
-            .filter_map(|id| store.inspect_readonly(id))
-            .collect()
-    } else if let Ok(headers) = store.list_headers(&SessionListQuery {
-        cwd: query.cwd.clone(),
-        limit: Some(50),
-        ..Default::default()
-    }) {
-        headers
-            .iter()
-            .filter_map(|h| store.inspect_readonly(&h.id))
-            .collect()
+        let mut out = Vec::with_capacity(query.session_ids.len());
+        for id in &query.session_ids {
+            if let Some(sess) = store.inspect_readonly_async(id).await {
+                out.push(sess);
+            }
+        }
+        out
+    } else if let Ok(headers) = store
+        .list_headers_async(SessionListQuery {
+            cwd: query.cwd.clone(),
+            limit: Some(50),
+            ..Default::default()
+        })
+        .await
+    {
+        let mut out = Vec::with_capacity(headers.len());
+        for h in &headers {
+            if let Some(sess) = store.inspect_readonly_async(&h.id).await {
+                out.push(sess);
+            }
+        }
+        out
     } else {
         Vec::new()
     };
@@ -244,24 +264,33 @@ fn fallback_in_memory_search(
     exact
 }
 
-fn is_session_authorized(store: &SessionStore, caller_sid: Option<&str>, target_sid: &str) -> bool {
+async fn is_session_authorized(
+    store: &SessionStore,
+    caller_sid: Option<&str>,
+    target_sid: &str,
+) -> bool {
     let Some(caller_id) = caller_sid else {
         return true;
     };
     if caller_id == target_sid {
         return true;
     }
-    let lineage = store.lineage_session_ids(caller_id);
+    let lineage = store.lineage_session_ids_async(caller_id).await;
     if lineage.iter().any(|id| id == target_sid) {
         return true;
     }
-    let caller_cwd = store
-        .inspect_readonly(caller_id)
-        .and_then(|s| s.header.cwd)
-        .or_else(|| store.default_cwd());
+    let caller_cwd = match store
+        .inspect_header_async(caller_id)
+        .await
+        .and_then(|h| h.cwd)
+    {
+        Some(cwd) => Some(cwd),
+        None => store.default_cwd(),
+    };
     let target_cwd = store
-        .inspect_readonly(target_sid)
-        .and_then(|s| s.header.cwd);
+        .inspect_header_async(target_sid)
+        .await
+        .and_then(|h| h.cwd);
     match (caller_cwd, target_cwd) {
         (Some(a), Some(b)) => a == b,
         _ => false,
@@ -275,21 +304,22 @@ async fn execute_recall_search(
     scope: &str,
     limit: usize,
 ) -> Result<ToolOutput, BoxError> {
+    let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
     let (session_ids, cwd) = match scope {
         "current" => match &caller_sid {
             Some(sid) => (vec![sid.clone()], None),
             None => (Vec::new(), store.default_cwd()),
         },
         "workspace" => {
-            let ws = caller_sid
-                .as_deref()
-                .and_then(|sid| store.inspect_readonly(sid))
-                .and_then(|s| s.header.cwd)
-                .or_else(|| store.default_cwd());
+            let ws = match caller_sid.as_deref() {
+                Some(sid) => store.inspect_header_async(sid).await.and_then(|h| h.cwd),
+                None => None,
+            }
+            .or_else(|| store.default_cwd());
             (Vec::new(), ws)
         }
         _ => match &caller_sid {
-            Some(sid) => (store.lineage_session_ids(sid), None),
+            Some(sid) => (store.lineage_session_ids_async(sid).await, None),
             None => (Vec::new(), store.default_cwd()),
         },
     };
@@ -297,37 +327,17 @@ async fn execute_recall_search(
     let search_query = RecallSearchQuery {
         query: query_str.clone(),
         session_ids,
-        cwd: cwd.clone(),
+        cwd,
         limit,
     };
 
-    let mut hits = match store.search_recall(&search_query) {
+    // SQLite FTS5 返回 Ok(Some([])) 代表已完整检索索引且无匹配，严禁回退 50 会话冷扫。
+    // 仅在持久化未挂载 (Ok(None)) 或检索出错 (Err(_)) 时走内存兜底扫描。
+    let mut hits = match store.search_recall_async(search_query.clone()).await {
         Ok(Some(db_hits)) => db_hits,
-        Ok(None) | Err(_) => fallback_in_memory_search(&store, &search_query),
+        Ok(None) | Err(_) => fallback_in_memory_search(&store, &search_query).await,
     };
-
-    // 若在 workspace 范围下但无 SQLite，补扫所有已列出的会话头（已在内存者）
-    if hits.is_empty()
-        && scope == "workspace"
-        && cwd.is_some()
-        && let Ok(headers) = store.list_headers(&SessionListQuery {
-            cwd,
-            limit: Some(50),
-            ..Default::default()
-        })
-    {
-        let mut ids = HashSet::new();
-        for h in headers {
-            ids.insert(h.id);
-        }
-        let q = RecallSearchQuery {
-            query: query_str.clone(),
-            session_ids: ids.into_iter().collect(),
-            cwd: None,
-            limit,
-        };
-        hits = fallback_in_memory_search(&store, &q);
-    }
+    hits.truncate(limit);
 
     if hits.is_empty() {
         return Ok(ToolOutput::text(format!(
@@ -342,13 +352,19 @@ async fn execute_recall_search(
         })));
     }
 
-    let mut lines = Vec::with_capacity(hits.len() + 2);
-    lines.push(format!(
+    let footer = "Use recall(seq=..., session_id=...) to inspect full verbatim entries.";
+    let mut formatted_entries = Vec::with_capacity(hits.len());
+    let mut structured_hits = Vec::with_capacity(hits.len());
+    let mut truncated_by_bytes = false;
+    // 预留头部行（最多 ~96 字节）与末尾提示行及换行符，保证总输出 <= MAX_SEARCH_OUTPUT_BYTES
+    let max_header_bytes = format!(
         "Found {} preserved history hit(s) for {:?} (scope={scope}):",
         hits.len(),
         query_str
-    ));
-    let mut structured_hits = Vec::with_capacity(hits.len());
+    )
+    .len();
+    let mut used_bytes = max_header_bytes + 1 + footer.len() + 1;
+
     for hit in &hits {
         let is_current = caller_sid.as_deref() == Some(hit.session_id.as_str());
         let origin = if is_current {
@@ -356,25 +372,48 @@ async fn execute_recall_search(
         } else {
             format!("session:{}", hit.session_id)
         };
-        lines.push(format!(
-            "- [{origin} seq #{} | {}] {}",
-            hit.seq, hit.kind, hit.snippet
-        ));
+        let prefix = format!("- [{origin} seq #{} | {}] ", hit.seq, hit.kind);
+        let mut snippet = hit.snippet.clone();
+        let line_len = prefix.len() + snippet.len() + 1;
+
+        if used_bytes + line_len > MAX_SEARCH_OUTPUT_BYTES {
+            truncated_by_bytes = true;
+            if formatted_entries.is_empty() {
+                let avail = MAX_SEARCH_OUTPUT_BYTES.saturating_sub(used_bytes + prefix.len() + 4);
+                snippet = format!("{}…", truncate_utf8_bytes(&snippet, avail));
+            } else {
+                break;
+            }
+        }
+
+        let line = format!("{prefix}{snippet}");
+        used_bytes += line.len() + 1;
+        formatted_entries.push(line);
         structured_hits.push(json!({
             "sessionId": hit.session_id,
             "sessionTitle": hit.session_title,
             "isCurrentSession": is_current,
             "seq": hit.seq,
             "kind": hit.kind,
-            "snippet": hit.snippet,
+            "snippet": snippet,
         }));
     }
-    lines.push("Use recall(seq=..., session_id=...) to inspect full verbatim entries.".into());
+
+    let header_line = format!(
+        "Found {} preserved history hit(s) for {:?} (scope={scope}):",
+        formatted_entries.len(),
+        query_str
+    );
+    let mut lines = Vec::with_capacity(formatted_entries.len() + 2);
+    lines.push(header_line);
+    lines.extend(formatted_entries);
+    lines.push(footer.into());
 
     let meta = json!({
         "mode": "search",
         "query": query_str,
         "scope": scope,
+        "truncated": truncated_by_bytes,
         "hits": structured_hits,
     });
     Ok(ToolOutput::text(lines.join("\n"))
@@ -415,7 +454,7 @@ async fn execute_recall_read(
         .or_else(|| caller_sid.map(ToString::to_string))
         .ok_or("Missing `session_id` and no active session.")?;
 
-    if !is_session_authorized(&store, caller_sid, &target_sid) {
+    if !is_session_authorized(&store, caller_sid, &target_sid).await {
         return Err(format!(
             "Access denied: session `{target_sid}` is outside current lineage or workspace."
         )
@@ -423,7 +462,8 @@ async fn execute_recall_read(
     }
 
     let session = store
-        .inspect_readonly(&target_sid)
+        .inspect_readonly_async(&target_sid)
+        .await
         .ok_or_else(|| format!("Session `{target_sid}` not found."))?;
 
     let mut rendered_blocks = Vec::new();
@@ -500,8 +540,27 @@ async fn execute_recall_read(
         })));
     }
 
-    let slice: String = full_text.chars().skip(offset).take(limit).collect();
-    let returned_chars = slice.chars().count();
+    let mut slice: String = full_text.chars().skip(offset).take(limit).collect();
+    let mut returned_chars = slice.chars().count();
+    let has_more_chars = offset + returned_chars < total_chars;
+    let footer_for = |next: usize| {
+        format!(
+            "\n\n[Showing chars {offset}..{next} of {total_chars}. Call recall(seq={start_seq}, end_seq={end_seq}, offset={next}) to continue, or pass to_file=true.]"
+        )
+    };
+    let footer_overhead = if has_more_chars {
+        footer_for(offset + returned_chars).len()
+    } else {
+        0
+    };
+    if slice.len() + footer_overhead > MAX_READ_OUTPUT_BYTES {
+        let worst_footer_len = footer_for(total_chars).len();
+        let max_slice_bytes = MAX_READ_OUTPUT_BYTES.saturating_sub(worst_footer_len);
+        let capped = truncate_utf8_bytes(&slice, max_slice_bytes).to_string();
+        returned_chars = capped.chars().count();
+        slice = capped;
+    }
+
     let next_offset = if offset + returned_chars < total_chars {
         Some(offset + returned_chars)
     } else {
@@ -510,10 +569,7 @@ async fn execute_recall_read(
 
     let mut out = slice;
     if let Some(next) = next_offset {
-        out.push_str(&format!(
-            "\n\n[Showing chars {offset}..{} of {total_chars}. Call recall(seq={start_seq}, end_seq={end_seq}, offset={next}) to continue, or pass to_file=true.]",
-            offset + returned_chars
-        ));
+        out.push_str(&footer_for(next));
     }
 
     let meta = json!({
@@ -984,5 +1040,229 @@ mod tests {
 
         app2.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_fts5_search_does_not_fallback_to_cold_scan() {
+        use mizar_session::{
+            LoadedSession, PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE,
+            SessionHeader, SessionHeaderPatch, SessionPersistence, SessionPersistenceHandle,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct EmptyFtsBackend {
+            list_calls: AtomicUsize,
+            load_calls: AtomicUsize,
+            search_calls: AtomicUsize,
+        }
+
+        impl SessionPersistence for EmptyFtsBackend {
+            fn create_session(&self, _: &SessionHeader) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn update_header(&self, _: &str, _: SessionHeaderPatch) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn load_session(&self, _: &str) -> PersistenceResult<Option<LoadedSession>> {
+                self.load_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            fn load_header(&self, _: &str) -> PersistenceResult<Option<SessionHeader>> {
+                Ok(None)
+            }
+            fn list_sessions(&self, _: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![SessionHeader::new("other-cold", 1)])
+            }
+            fn append_events(&self, _: &str, _: &[SessionEntry]) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn flush(&self, _: Option<&str>) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn flush_async(&self, _: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn fork_session(
+                &self,
+                from_id: &str,
+                _: u64,
+                _: &SessionHeader,
+            ) -> PersistenceResult<LoadedSession> {
+                Err(PersistenceError::NotFound(from_id.to_string()))
+            }
+            fn search_recall(
+                &self,
+                _: &RecallSearchQuery,
+            ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
+                self.search_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Vec::new()))
+            }
+        }
+
+        let backend = Arc::new(EmptyFtsBackend {
+            list_calls: AtomicUsize::new(0),
+            load_calls: AtomicUsize::new(0),
+            search_calls: AtomicUsize::new(0),
+        });
+
+        let app = Context::new();
+        app.provide(
+            SERVICE_SESSION_PERSISTENCE,
+            Arc::new(SessionPersistenceHandle::new(backend.clone())),
+        )
+        .unwrap();
+        app.plugin(SessionStore::plugin(), ()).await.unwrap();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        app.plugin(RecallPlugin, RecallConfig::default())
+            .await
+            .unwrap();
+
+        let store = app.sessions().unwrap();
+        let tools = app.tools().unwrap();
+        let caller = store.create_with(SessionCreateOptions {
+            id: Some("fts-empty-caller".into()),
+            cwd: Some("/ws/empty-fts".into()),
+            ..Default::default()
+        });
+        caller.append(SessionEvent::user("无关文本"));
+
+        let res = tools
+            .execute(ToolExecution::new(
+                RECALL_TOOL_NAME,
+                json!({ "query": "不存在的词条", "scope": "workspace" }),
+                Some(caller.id.clone()),
+            ))
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.contains("No preserved history matched"));
+        assert_eq!(backend.search_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.load_calls.load(Ordering::SeqCst), 0);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn fallback_runs_only_when_persistence_absent_or_errors_and_enforces_caps() {
+        use mizar_session::{
+            LoadedSession, PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE,
+            SessionHeader, SessionHeaderPatch, SessionPersistence, SessionPersistenceHandle,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ErrorFtsBackend {
+            search_calls: AtomicUsize,
+        }
+
+        impl SessionPersistence for ErrorFtsBackend {
+            fn create_session(&self, _: &SessionHeader) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn update_header(&self, _: &str, _: SessionHeaderPatch) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn load_session(&self, _: &str) -> PersistenceResult<Option<LoadedSession>> {
+                Ok(None)
+            }
+            fn list_sessions(&self, _: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+                Ok(Vec::new())
+            }
+            fn append_events(&self, _: &str, _: &[SessionEntry]) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn flush(&self, _: Option<&str>) -> PersistenceResult<()> {
+                Ok(())
+            }
+            fn flush_async(&self, _: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn fork_session(
+                &self,
+                from_id: &str,
+                _: u64,
+                _: &SessionHeader,
+            ) -> PersistenceResult<LoadedSession> {
+                Err(PersistenceError::NotFound(from_id.to_string()))
+            }
+            fn search_recall(
+                &self,
+                _: &RecallSearchQuery,
+            ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
+                self.search_calls.fetch_add(1, Ordering::SeqCst);
+                Err(PersistenceError::Backend("fts unavailable".into()))
+            }
+        }
+
+        let backend = Arc::new(ErrorFtsBackend {
+            search_calls: AtomicUsize::new(0),
+        });
+        let app = Context::new();
+        app.provide(
+            SERVICE_SESSION_PERSISTENCE,
+            Arc::new(SessionPersistenceHandle::new(backend.clone())),
+        )
+        .unwrap();
+        app.plugin(SessionStore::plugin(), ()).await.unwrap();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        app.plugin(RecallPlugin, RecallConfig::default())
+            .await
+            .unwrap();
+
+        let store = app.sessions().unwrap();
+        let tools = app.tools().unwrap();
+        let s = store.create_with(SessionCreateOptions {
+            id: Some("cap-sess".into()),
+            cwd: Some("/ws/caps".into()),
+            ..Default::default()
+        });
+        for i in 1..=30 {
+            s.append(SessionEvent::user(format!(
+                "ERR_FALLBACK_KEY #{i} 中文占位符内容_{}",
+                "语".repeat(120)
+            )));
+        }
+
+        // 1. FTS 出错时回退内存扫描并强制条数上限 (<= 20) 与字节上限 (<= 8 KiB)
+        let search_res = tools
+            .execute(ToolExecution::new(
+                RECALL_TOOL_NAME,
+                json!({ "query": "ERR_FALLBACK_KEY", "scope": "current", "limit": 99 }),
+                Some(s.id.clone()),
+            ))
+            .await;
+        assert!(!search_res.is_error, "{}", search_res.content);
+        assert_eq!(backend.search_calls.load(Ordering::SeqCst), 1);
+        assert!(search_res.content.len() <= MAX_SEARCH_OUTPUT_BYTES);
+        let hits = search_res
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.get("hits"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(!hits.is_empty() && hits.len() <= MAX_SEARCH_LIMIT);
+
+        // 2. 多字节中文读取超出 16 KiB 时，按 UTF-8 字节硬上限截断并保持 nextOffset 准确
+        let big_seq = 31u64;
+        s.append(SessionEvent::user("汉".repeat(7_000)));
+        let page1 = tools
+            .execute(ToolExecution::new(
+                RECALL_TOOL_NAME,
+                json!({ "seq": big_seq, "limit": 8192 }),
+                Some(s.id.clone()),
+            ))
+            .await;
+        assert!(!page1.is_error, "{}", page1.content);
+        assert!(page1.content.len() <= MAX_READ_OUTPUT_BYTES);
+        assert!(
+            page1
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.get("nextOffset"))
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+
+        app.fiber().dispose().await;
     }
 }

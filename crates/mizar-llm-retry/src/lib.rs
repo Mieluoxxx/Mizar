@@ -6,7 +6,10 @@
 //!   按 `retry_after_ms` 或指数退避等待后自动重连；
 //! - 全程响应 `CancellationToken`。
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
@@ -40,6 +43,35 @@ impl Default for RetryConfig {
     }
 }
 
+pub const MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(60);
+
+fn jitter_unit_sample() -> f64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut z = RandomState::new()
+        .hash_one(seq)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn apply_backoff_jitter(base: Duration, unit_sample: f64) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let scale = 0.75 + unit_sample.clamp(0.0, 1.0) * 0.5;
+    let nanos = (base.as_nanos() as f64 * scale).round();
+    if !nanos.is_finite() || nanos <= 0.0 {
+        return Duration::ZERO;
+    }
+    if nanos >= u64::MAX as f64 {
+        return Duration::try_from_secs_f64(base.as_secs_f64() * scale).unwrap_or(base);
+    }
+    Duration::from_nanos(nanos as u64)
+}
+
 impl RetryConfig {
     fn is_retryable(&self, code: LlmErrorCode) -> bool {
         code.is_retryable() || self.extra_retryable_codes.contains(&code)
@@ -47,12 +79,14 @@ impl RetryConfig {
 
     fn delay_for(&self, attempt: usize, retry_after_ms: Option<u64>) -> Duration {
         if let Some(ms) = retry_after_ms {
-            return Duration::from_millis(ms).min(self.max_delay);
+            return Duration::from_millis(ms).min(MAX_RETRY_AFTER_DELAY);
         }
         let factor = 1u32.checked_shl(attempt as u32).unwrap_or(u32::MAX);
-        self.initial_delay
+        let base = self
+            .initial_delay
             .saturating_mul(factor)
-            .min(self.max_delay)
+            .min(self.max_delay);
+        apply_backoff_jitter(base, jitter_unit_sample())
     }
 }
 
@@ -664,5 +698,38 @@ mod tests {
         }
         assert_eq!(asm3.reasoning(), "streaming thought");
         assert_eq!(asm3.finish(), FinishReason::MaxTokens);
+    }
+
+    #[test]
+    fn backoff_applies_plus_minus_25_percent_jitter_and_caps_retry_after_at_60s() {
+        let base = Duration::from_millis(400);
+        assert_eq!(apply_backoff_jitter(base, 0.0), Duration::from_millis(300));
+        assert_eq!(apply_backoff_jitter(base, 0.5), Duration::from_millis(400));
+        assert_eq!(apply_backoff_jitter(base, 1.0), Duration::from_millis(500));
+        assert_eq!(apply_backoff_jitter(Duration::ZERO, 0.8), Duration::ZERO);
+
+        let cfg = RetryConfig {
+            initial_delay: Duration::from_millis(400),
+            max_delay: Duration::from_secs(10),
+            ..Default::default()
+        };
+
+        let samples: Vec<Duration> = (0..24).map(|_| cfg.delay_for(1, None)).collect();
+        let expected_base = Duration::from_millis(800);
+        let low = Duration::from_millis(600);
+        let high = Duration::from_millis(1000);
+        assert!(
+            samples.iter().all(|&d| d >= low && d <= high),
+            "samples out of [600ms, 1000ms]: {samples:?}"
+        );
+        assert!(
+            samples.iter().any(|&d| d != expected_base),
+            "expected non-constant jittered samples: {samples:?}"
+        );
+
+        // Retry-After 不受 max_delay(10s) 压扁，上限提升至 60s
+        assert_eq!(cfg.delay_for(0, Some(30_000)), Duration::from_secs(30));
+        assert_eq!(cfg.delay_for(0, Some(60_000)), Duration::from_secs(60));
+        assert_eq!(cfg.delay_for(0, Some(120_000)), Duration::from_secs(60));
     }
 }

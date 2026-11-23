@@ -983,13 +983,87 @@ impl SessionStore {
         backend.load_session(id).ok().flatten()
     }
 
+    /// 异步只读加载或快照指定会话（优先走内存缓存，否则非阻塞委托持久化后端）。
+    pub async fn inspect_readonly_async(&self, id: &str) -> Option<LoadedSession> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            let max_seq = inner
+                .log
+                .last()
+                .map_or(0, |e| e.seq)
+                .max(inner.min_last_seq);
+            return Some(LoadedSession {
+                header: inner.header.clone(),
+                entries: inner.log.clone(),
+                max_persisted_seq: (max_seq > 0).then_some(max_seq),
+                skipped_events: 0,
+            });
+        }
+        let backend = self.ctx.session_persistence()?;
+        backend
+            .load_session_async(id.to_string())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// 轻量只读获取会话头信息（避免深拷贝或全量反序列化 `entries`）。
+    pub fn inspect_header(&self, id: &str) -> Option<SessionHeader> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            return Some(existing.header());
+        }
+        let backend = self.ctx.session_persistence()?;
+        backend.load_header(id).ok().flatten()
+    }
+
+    /// 异步轻量只读获取会话头信息。
+    pub async fn inspect_header_async(&self, id: &str) -> Option<SessionHeader> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            return Some(existing.header());
+        }
+        let backend = self.ctx.session_persistence()?;
+        backend
+            .load_header_async(id.to_string())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// 轻量只读窥视某个会话最后记录的选择：不水合、不克隆整段事件日志、不触发悬挂工具调用修复。
+    pub fn peek_selection_light(&self, session_id: &str) -> Option<SessionSelection> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(session_id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            return inner
+                .log
+                .iter()
+                .rev()
+                .find_map(|entry| entry.event.as_selection());
+        }
+        let backend = self.ctx.session_persistence()?;
+        backend.latest_selection(session_id).ok().flatten()
+    }
+
     /// 只读窥视某个会话最后记录的选择：不水合进内存、不触发悬挂工具调用修复（后者会写库）。
     pub fn peek_selection(&self, session_id: &str) -> Option<SessionSelection> {
-        self.inspect_readonly(session_id)?
-            .entries
-            .iter()
-            .rev()
-            .find_map(|entry| entry.event.as_selection())
+        self.peek_selection_light(session_id)
+    }
+
+    /// 异步轻量只读窥视某个会话最后记录的选择。
+    pub async fn peek_selection_async(&self, session_id: &str) -> Option<SessionSelection> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(session_id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            return inner
+                .log
+                .iter()
+                .rev()
+                .find_map(|entry| entry.event.as_selection());
+        }
+        let backend = self.ctx.session_persistence()?;
+        backend
+            .latest_selection_async(session_id.to_string())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// 优先从内存返回；若内存中不存在且挂载了持久化后端，则自动从后端水合重建（包含悬挂工具调用自愈）。
@@ -1133,7 +1207,26 @@ impl SessionStore {
             }
             chain.push(id.clone());
             depth += 1;
-            cur = self.inspect_readonly(&id).and_then(|s| s.header.parent_id);
+            cur = self.inspect_header(&id).and_then(|h| h.parent_id);
+        }
+        chain
+    }
+
+    /// 异步沿 `parent_id` 向上回溯会话谱系链（轻量仅查头信息，最多 64 代，防环）。
+    pub async fn lineage_session_ids_async(&self, session_id: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut cur = Some(session_id.to_string());
+        let mut depth = 0usize;
+        while let Some(id) = cur {
+            if depth >= 64 || chain.contains(&id) {
+                break;
+            }
+            chain.push(id.clone());
+            depth += 1;
+            cur = self
+                .inspect_header_async(&id)
+                .await
+                .and_then(|h| h.parent_id);
         }
         chain
     }
@@ -1150,12 +1243,19 @@ impl SessionStore {
         }
     }
 
-    /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。
-    pub fn list_headers(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+    /// 异步委托给持久化后端执行全文情景回溯。
+    pub async fn search_recall_async(
+        &self,
+        query: RecallSearchQuery,
+    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
         if let Some(backend) = self.ctx.session_persistence() {
-            return backend.list_sessions(query);
+            backend.search_recall_async(query).await
+        } else {
+            Ok(None)
         }
+    }
 
+    fn list_in_memory_headers(&self, query: &SessionListQuery) -> Vec<SessionHeader> {
         let mut headers: Vec<SessionHeader> = self
             .sessions
             .lock()
@@ -1178,7 +1278,26 @@ impl SessionStore {
         if let Some(limit) = query.limit {
             headers.truncate(limit);
         }
-        Ok(headers)
+        headers
+    }
+
+    /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。
+    pub fn list_headers(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+        if let Some(backend) = self.ctx.session_persistence() {
+            return backend.list_sessions(query);
+        }
+        Ok(self.list_in_memory_headers(query))
+    }
+
+    /// 异步列出全部会话头信息。
+    pub async fn list_headers_async(
+        &self,
+        query: SessionListQuery,
+    ) -> PersistenceResult<Vec<SessionHeader>> {
+        if let Some(backend) = self.ctx.session_persistence() {
+            return backend.list_sessions_async(query).await;
+        }
+        Ok(self.list_in_memory_headers(&query))
     }
 
     pub fn flush(&self, session_id: Option<&str>) -> PersistenceResult<()> {
