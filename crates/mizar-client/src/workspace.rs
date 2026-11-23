@@ -4,13 +4,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use cordis::Context;
-use mizar_core::instructions::AgentInstructions;
-use mizar_core::skills::{SkillLookupOptions, SkillRegistry};
-use mizar_core::spine::SpinePluginsContextExt;
-use mizar_core::trajectory::TrajectoryRuntime;
+use mizar_core::skills::SkillLookupOptions;
+use mizar_core::spine::MizarRuntime;
 use mizar_mcp::{McpConnectionState, McpManager};
-use mizar_tools::{ToolExposure, ToolRuntime};
+use mizar_tools::ToolExposure;
 use mizar_types::client::{
     FileTouchRow, InstructionSummaryRow, McpSummaryRow, SidePanelData, ToolSummaryRow,
 };
@@ -29,8 +26,12 @@ pub struct WorkspacePanelSnapshot {
 
 impl WorkspacePanelSnapshot {
     /// 一次性采集工作区及全部后端观测维度。
-    pub async fn collect(ctx: &Context, workspace: &Path, session_id: Option<&str>) -> Self {
-        collect_workspace_panel_snapshot(ctx, workspace, session_id).await
+    pub async fn collect(
+        runtime: &MizarRuntime,
+        workspace: &Path,
+        session_id: Option<&str>,
+    ) -> Self {
+        collect_workspace_panel_snapshot(runtime, workspace, session_id).await
     }
 
     /// 将工作区观测数据合并进前端侧栏模型（保留前端自己维护的上下文用量与已触达文件列表）。
@@ -53,16 +54,17 @@ impl WorkspacePanelSnapshot {
 
 /// 收集完整工作区面板快照（同步聚合服务状态与异步采集 Git 摘要）。
 pub async fn collect_workspace_panel_snapshot(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     workspace: &Path,
     session_id: Option<&str>,
 ) -> WorkspacePanelSnapshot {
-    let instructions = collect_instructions_summary(ctx, session_id);
-    let (git_changes, git_diff_stat) = collect_git_summary(workspace).await;
-    let tools = collect_tools_summary(ctx, session_id);
-    let mcps = collect_mcps_summary(ctx);
+    let instructions = collect_instructions_summary(runtime, session_id);
+    let ((git_changes, git_diff_stat), mcp_mgr) =
+        tokio::join!(collect_git_summary(workspace), runtime.mcp());
+    let tools = collect_tools_summary(runtime, session_id);
+    let mcps = format_mcps_summary(runtime.modules.is_enabled("mcp"), mcp_mgr.as_deref());
     let findings = session_id
-        .map(|sid| collect_trajectory_findings(ctx, sid))
+        .map(|sid| collect_trajectory_findings(runtime, sid))
         .unwrap_or_default();
 
     WorkspacePanelSnapshot {
@@ -76,10 +78,11 @@ pub async fn collect_workspace_panel_snapshot(
 }
 
 /// 汇总全局已注册工具及其在当前会话下的可见性（exposure 与声明状态）。
-pub fn collect_tools_summary(ctx: &Context, session_id: Option<&str>) -> Vec<ToolSummaryRow> {
-    let Some(rt) = ctx.get::<ToolRuntime>("tools") else {
-        return Vec::new();
-    };
+pub fn collect_tools_summary(
+    runtime: &MizarRuntime,
+    session_id: Option<&str>,
+) -> Vec<ToolSummaryRow> {
+    let rt = &runtime.tools;
     let declared: HashSet<String> = rt
         .list_declared(session_id)
         .into_iter()
@@ -106,12 +109,11 @@ pub fn collect_tools_summary(ctx: &Context, session_id: Option<&str>) -> Vec<Too
         .collect()
 }
 
-/// 汇总所有已配置的 MCP Server 连接状态与可用能力。
-pub fn collect_mcps_summary(ctx: &Context) -> Vec<McpSummaryRow> {
-    if ctx.spine_plugins().is_ok_and(|p| !p.is_enabled("mcp")) {
+fn format_mcps_summary(enabled: bool, mgr: Option<&McpManager>) -> Vec<McpSummaryRow> {
+    if !enabled {
         return Vec::new();
     }
-    let Some(mgr) = ctx.get::<McpManager>("mcp") else {
+    let Some(mgr) = mgr else {
         return Vec::new();
     };
     mgr.statuses()
@@ -141,12 +143,20 @@ pub fn collect_mcps_summary(ctx: &Context) -> Vec<McpSummaryRow> {
         .collect()
 }
 
+/// 汇总所有已配置的 MCP Server 连接状态与可用能力。
+pub fn collect_mcps_summary(runtime: &MizarRuntime) -> Vec<McpSummaryRow> {
+    format_mcps_summary(
+        runtime.modules.is_enabled("mcp"),
+        runtime.try_mcp().as_deref(),
+    )
+}
+
 /// 探测并返回当前工作区/会话加载的 `AGENTS.md` / `CLAUDE.md` 指令作用域摘要。
 pub fn collect_instructions_summary(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     session_id: Option<&str>,
 ) -> Vec<InstructionSummaryRow> {
-    let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") else {
+    let Some(inst) = runtime.instructions.as_ref() else {
         return Vec::new();
     };
     let report = inst.probe_report(session_id);
@@ -217,8 +227,8 @@ pub async fn collect_git_summary(workspace: &Path) -> (Vec<FileTouchRow>, String
 }
 
 /// 列举当前工作区下可由用户通过 `/<skill>` 直接调用的技能名称列表。
-pub async fn collect_user_skill_names(ctx: &Context, workspace: &Path) -> Vec<String> {
-    let Some(reg) = ctx.get::<SkillRegistry>("skills") else {
+pub async fn collect_user_skill_names(runtime: &MizarRuntime, workspace: &Path) -> Vec<String> {
+    let Some(reg) = runtime.skills.as_ref() else {
         return Vec::new();
     };
     reg.list(SkillLookupOptions {
@@ -233,8 +243,8 @@ pub async fn collect_user_skill_names(ctx: &Context, workspace: &Path) -> Vec<St
 }
 
 /// 采集指定会话的轨迹异常发现（去重格式化为 `[Severity] title: summary`）。
-pub fn collect_trajectory_findings(ctx: &Context, session_id: &str) -> Vec<String> {
-    let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") else {
+pub fn collect_trajectory_findings(runtime: &MizarRuntime, session_id: &str) -> Vec<String> {
+    let Some(traj) = runtime.trajectory.as_ref() else {
         return Vec::new();
     };
     let raw_findings = traj.findings_only(session_id);

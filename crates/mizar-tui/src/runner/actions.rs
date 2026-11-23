@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use cordis::Context;
 use crossterm::event::EventStream;
 use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController, steer_session};
 use mizar_client::images;
@@ -22,19 +21,16 @@ use mizar_client::workspace::{
     WorkspacePanelSnapshot, collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
     collect_workspace_panel_snapshot,
 };
-use mizar_core::agent_loop::{AgentLoopContextExt, DeliveryMode, RunOptions, TurnInput};
-use mizar_core::instructions::AgentInstructions;
-use mizar_core::session_title::SessionTitleContextExt;
-use mizar_core::skills::{SkillLookupOptions, SkillRegistry};
+use mizar_core::agent_loop::{DeliveryMode, RunOptions, TurnInput};
+use mizar_core::skills::SkillLookupOptions;
 use mizar_core::spine::{
-    CompactionContextExt, CompactionError, ManualCompactOptions, SpinePluginsContextExt,
-    SubagentContextExt, resolve_global_settings_path,
+    CompactionError, ManualCompactOptions, MizarRuntime, resolve_global_settings_path,
 };
-use mizar_core::trajectory::{TimelineMode, TrajectoryRuntime};
-use mizar_llm::{ImageAttachment, LlmContextExt};
-use mizar_mcp::{McpConnectionState, McpManager};
-use mizar_session::{Session, SessionContextExt, SessionCreateOptions};
-use mizar_tools::{ToolExposure, ToolRuntime};
+use mizar_core::trajectory::TimelineMode;
+use mizar_llm::ImageAttachment;
+use mizar_mcp::McpConnectionState;
+use mizar_session::{Session, SessionCreateOptions};
+use mizar_tools::ToolExposure;
 use mizar_tui_ui::app::{AppAction, AppState, ChatItem, NoticeLevel, SessionSelection, UiEvent};
 use mizar_tui_ui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui_ui::terminal::{
@@ -166,7 +162,7 @@ pub async fn apply_clipboard_content(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_agent_run(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
@@ -176,7 +172,7 @@ pub(super) fn spawn_agent_run(
     images: Vec<ImageAttachment>,
 ) {
     spawn_agent_run_input(
-        ctx,
+        runtime,
         config,
         app,
         active_session,
@@ -188,7 +184,7 @@ pub(super) fn spawn_agent_run(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_agent_run_input(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
@@ -196,10 +192,7 @@ pub(super) fn spawn_agent_run_input(
     task_state: &mut RunController,
     input: TurnInput,
 ) {
-    let Ok(agent_loop) = ctx.agent_loop() else {
-        app.push_notice(NoticeLevel::Error, "agentLoop 服务未就绪");
-        return;
-    };
+    let agent_loop = Arc::clone(&runtime.agent_loop);
     let (run_id, cancel) = task_state.start(active_session.id.clone(), ActiveTaskKind::AgentRun);
     app.set_busy_state(true);
 
@@ -240,20 +233,17 @@ pub(super) fn spawn_agent_run_input(
 
 /// 从 `SessionInbox` 出队当前活跃会话的下一条待唤醒 `FollowUp` 并启动一轮对话。
 pub(super) fn drain_next_inbox_followup(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
     loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
     task_state: &mut RunController,
 ) -> bool {
-    let Ok(agent_loop) = ctx.agent_loop() else {
-        return false;
-    };
-    if agent_loop.is_session_busy(&active_session.id) {
+    if runtime.agent_loop.is_session_busy(&active_session.id) {
         return false;
     }
-    let Some(next_input) = agent_loop.inbox().pop_followup(&active_session.id) else {
+    let Some(next_input) = runtime.agent_loop.inbox().pop_followup(&active_session.id) else {
         return false;
     };
     match &next_input {
@@ -271,7 +261,7 @@ pub(super) fn drain_next_inbox_followup(
         }
     }
     spawn_agent_run_input(
-        ctx,
+        runtime,
         config,
         app,
         active_session,
@@ -284,23 +274,22 @@ pub(super) fn drain_next_inbox_followup(
 
 /// 执行硬取消：关闭审批浮层、触发 `CancellationToken` 并清理用户输入项（已落箱后台回执转 `Inject` 保留）。
 pub(super) fn cancel_active_run(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     app: &mut AppState,
     active_session: &Session,
     task_state: &mut RunController,
 ) {
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     task_state.cancel_active();
-    if let Ok(agent_loop) = ctx.agent_loop() {
-        agent_loop
-            .inbox()
-            .clear_user_items_and_defer_notices(&active_session.id);
-    }
+    runtime
+        .agent_loop
+        .inbox()
+        .clear_user_items_and_defer_notices(&active_session.id);
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_steer_prompt(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
@@ -335,10 +324,10 @@ pub(super) async fn handle_steer_prompt(
         task.kind == ActiveTaskKind::AgentRun && task.session_id == active_session.id
     });
 
-    if is_active_agent_run && let Ok(agent_loop) = ctx.agent_loop() {
+    if is_active_agent_run {
         app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
         let push_res = steer_session(
-            &agent_loop,
+            &runtime.agent_loop,
             &active_session.id,
             TurnInput::user_with_images(prompt.clone(), images.clone()),
         );
@@ -355,7 +344,7 @@ pub(super) async fn handle_steer_prompt(
 
     app.push_user_message(&prompt);
     spawn_agent_run(
-        ctx,
+        runtime,
         config,
         app,
         active_session,
@@ -474,7 +463,7 @@ impl SidePanelRefreshController {
 }
 
 pub(super) fn schedule_side_panel_refresh(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     app: &mut AppState,
     panel_ctrl: &mut SidePanelRefreshController,
 ) {
@@ -486,12 +475,12 @@ pub(super) fn schedule_side_panel_refresh(
     panel_ctrl.abort();
     panel_ctrl.generation = panel_ctrl.generation.wrapping_add(1);
     let generation = panel_ctrl.generation;
-    let ctx_bg = ctx.clone();
+    let runtime_bg = Arc::clone(runtime);
     let ws_bg = app.workspace.clone();
     let sid_bg = app.session_id.clone();
     let tx = panel_ctrl.tx.clone();
     panel_ctrl.in_flight = Some(tokio::spawn(async move {
-        let snapshot = collect_workspace_panel_snapshot(&ctx_bg, &ws_bg, Some(&sid_bg)).await;
+        let snapshot = collect_workspace_panel_snapshot(&runtime_bg, &ws_bg, Some(&sid_bg)).await;
         let _ = tx.send((generation, sid_bg, snapshot));
     }));
 }
@@ -506,38 +495,39 @@ fn rollback_trailing_user_bubble(app: &mut AppState, expected_text: &str) {
     }
 }
 
-pub(super) fn populate_tools_and_mcps(ctx: &Context, app: &mut AppState) {
+pub(super) fn populate_tools_and_mcps(runtime: &MizarRuntime, app: &mut AppState) {
     if !app.features.side_panel {
         return;
     }
-    app.side_panel_data.tools = collect_tools_summary(ctx, Some(&app.session_id));
-    app.side_panel_data.mcps = collect_mcps_summary(ctx);
+    app.side_panel_data.tools = collect_tools_summary(runtime, Some(&app.session_id));
+    app.side_panel_data.mcps = collect_mcps_summary(runtime);
 }
 
-pub(super) async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
+pub(super) async fn populate_side_panel_data(runtime: &MizarRuntime, app: &mut AppState) {
     if !app.features.side_panel {
         return;
     }
     app.refresh_context_breakdown();
     app.side_panel_data.files = app.touched_files.clone();
     let snapshot =
-        collect_workspace_panel_snapshot(ctx, &app.workspace, Some(&app.session_id)).await;
+        collect_workspace_panel_snapshot(runtime, &app.workspace, Some(&app.session_id)).await;
     snapshot.apply_to_side_panel(&mut app.side_panel_data, &app.anomalies);
 }
 
 #[cfg(test)]
 pub(super) async fn apply_module_toggle_setting(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     app: &mut AppState,
     settings_path: Option<&Path>,
     plugin_id: &str,
     enabled: bool,
 ) {
-    apply_module_toggle_setting_with_panel(ctx, app, settings_path, plugin_id, enabled, None).await;
+    apply_module_toggle_setting_with_panel(runtime, app, settings_path, plugin_id, enabled, None)
+        .await;
 }
 
 pub(super) async fn apply_module_toggle_setting_with_panel(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     app: &mut AppState,
     settings_path: Option<&Path>,
     plugin_id: &str,
@@ -551,21 +541,21 @@ pub(super) async fn apply_module_toggle_setting_with_panel(
         app.push_notice(NoticeLevel::Warn, msg);
         app.set_flash(msg);
         app.overlay
-            .refresh_settings(super::build_settings_entries(ctx, app));
+            .refresh_settings(super::build_settings_entries(runtime, app));
         return;
     }
 
-    let outcome = toggle_spine_module(ctx, settings_path, plugin_id, enabled).await;
+    let outcome = toggle_spine_module(runtime, settings_path, plugin_id, enabled).await;
     if outcome.ok {
-        app.user_skill_names = collect_user_skill_names(ctx, &app.workspace).await;
+        app.user_skill_names = collect_user_skill_names(runtime, &app.workspace).await;
         if let Some(ctrl) = panel_ctrl {
-            schedule_side_panel_refresh(ctx, app, ctrl);
+            schedule_side_panel_refresh(runtime, app, ctrl);
         } else {
-            populate_side_panel_data(ctx, app).await;
+            populate_side_panel_data(runtime, app).await;
         }
     }
     app.overlay
-        .refresh_settings(super::build_settings_entries(ctx, app));
+        .refresh_settings(super::build_settings_entries(runtime, app));
     if let Some(flash) = outcome.flash {
         app.set_flash(flash);
     }
@@ -575,7 +565,7 @@ pub(super) async fn apply_module_toggle_setting_with_panel(
 }
 
 pub(super) async fn apply_host_setting_change(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     app: &mut AppState,
     terminal: &mut BufferedTerminal,
     panel_ctrl: &mut SidePanelRefreshController,
@@ -611,10 +601,10 @@ pub(super) async fn apply_host_setting_change(
             let _ = set_mouse_capture_enabled(enabled);
         }
         "ui.sidePanelOpen" => {
-            schedule_side_panel_refresh(ctx, app, panel_ctrl);
+            schedule_side_panel_refresh(runtime, app, panel_ctrl);
         }
         k if k.starts_with("compaction.") || k.starts_with("sessionTitle.") => {
-            apply_runtime_setting_change(ctx, key, value);
+            apply_runtime_setting_change(runtime, key, value);
         }
         _ => {}
     }
@@ -622,25 +612,19 @@ pub(super) async fn apply_host_setting_change(
 
 /// 在已运行的 TUI 状态上切换到指定历史会话（`/resume` 选择器与 `--resume` 共用投影与路由恢复）。
 pub async fn resume_session_into_app(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &mut Arc<Session>,
     active_sid: &Arc<RwLock<String>>,
     target_id: &str,
 ) -> bool {
-    let Ok(sessions) = ctx.sessions() else {
-        app.push_notice(NoticeLevel::Warn, "sessions 服务未就绪");
-        return false;
-    };
-    let Some(next) = sessions.get(target_id) else {
+    let Some(next) = runtime.sessions.get(target_id) else {
         app.push_notice(NoticeLevel::Warn, format!("未找到历史会话 `{target_id}`"));
         return false;
     };
     app.pending_settings_model_pick = None;
-    if let Ok(agent_loop) = ctx.agent_loop() {
-        agent_loop.inbox().clear(&next.id);
-    }
+    runtime.agent_loop.inbox().clear(&next.id);
     *active_sid.write().unwrap() = next.id.clone();
 
     let sources = SelectionSources {
@@ -664,7 +648,7 @@ pub async fn resume_session_into_app(
     app.restore_session_view(project_resume_view(&next));
     *active_session = next;
     if app.features.side_panel && app.side_panel.open {
-        populate_side_panel_data(ctx, app).await;
+        populate_side_panel_data(runtime, app).await;
     }
     app.set_flash(format!("✓ 已恢复会话 ({})", short_id(target_id)));
     true
@@ -672,7 +656,7 @@ pub async fn resume_session_into_app(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_action(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &mut Arc<Session>,
@@ -706,7 +690,7 @@ pub(super) async fn handle_action(
             apply_clipboard_content(app, &config.workspace, res).await;
         }
         AppAction::CancelRun => {
-            cancel_active_run(ctx, app, active_session, task_state);
+            cancel_active_run(runtime, app, active_session, task_state);
         }
         AppAction::CompactSession(focus) => {
             if app.is_running_activity() {
@@ -716,7 +700,7 @@ pub(super) async fn handle_action(
                 );
                 return;
             }
-            let Ok(compaction) = ctx.compaction() else {
+            let Some(compaction) = runtime.compaction.as_ref().map(Arc::clone) else {
                 app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
                 return;
             };
@@ -743,11 +727,9 @@ pub(super) async fn handle_action(
             tokio::spawn(async move {
                 match compaction.compact_now(session, opts, cancel).await {
                     Ok(_) | Err(CompactionError::Llm(_)) => {
-                        // Pipeline 内部已广播 `EVENT_COMPACTION_END`，避免重复投递
+                        // Pipeline 内部已广播 `on_end` 事件，避免重复投递
                     }
-                    Err(
-                        err @ (CompactionError::AlreadyRunning(_) | CompactionError::Cordis(_)),
-                    ) => {
+                    Err(err @ CompactionError::AlreadyRunning(_)) => {
                         let _ = tx.send(LoopClientMsg::Task {
                             run_id,
                             session_id: task_session_id,
@@ -768,52 +750,42 @@ pub(super) async fn handle_action(
         AppAction::NewSession => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
-            if let Ok(sub) = ctx.subagent() {
+            if let Some(sub) = runtime.subagent.as_ref() {
                 sub.cancel_parent_subagents(&active_session.id);
             }
-            if let Ok(agent_loop) = ctx.agent_loop() {
-                agent_loop.inbox().clear(&active_session.id);
-            }
+            runtime.agent_loop.inbox().clear(&active_session.id);
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            if let Ok(sessions) = ctx.sessions() {
-                let next = sessions.create(None);
-                let title = next.header().title;
-                *active_sid.write().unwrap() = next.id.clone();
-                app.reset_for_new_session(next.id.clone(), title);
-                *active_session = next;
-                schedule_side_panel_refresh(ctx, app, panel_ctrl);
-            }
+            let next = runtime.sessions.create(None);
+            let title = next.header().title;
+            *active_sid.write().unwrap() = next.id.clone();
+            app.reset_for_new_session(next.id.clone(), title);
+            *active_session = next;
+            schedule_side_panel_refresh(runtime, app, panel_ctrl);
         }
         AppAction::OpenSessionPicker => {
-            if let Ok(sessions) = ctx.sessions() {
-                let items = collect_session_picker_items(&sessions);
-                if items.is_empty() {
-                    app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
-                } else {
-                    app.overlay.open_session_picker(items);
-                }
+            let items = collect_session_picker_items(&runtime.sessions);
+            if items.is_empty() {
+                app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
             } else {
-                app.push_notice(NoticeLevel::Warn, "sessions 服务未就绪");
+                app.overlay.open_session_picker(items);
             }
         }
         AppAction::ResumeSession(target_id) => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
-            if let Ok(sub) = ctx.subagent() {
+            if let Some(sub) = runtime.subagent.as_ref() {
                 sub.cancel_parent_subagents(&active_session.id);
             }
-            if let Ok(agent_loop) = ctx.agent_loop() {
-                agent_loop.inbox().clear(&active_session.id);
-            }
+            runtime.agent_loop.inbox().clear(&active_session.id);
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            if resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
+            if resume_session_into_app(runtime, config, app, active_session, active_sid, &target_id)
                 .await
             {
-                schedule_side_panel_refresh(ctx, app, panel_ctrl);
+                schedule_side_panel_refresh(runtime, app, panel_ctrl);
             }
         }
         AppAction::RenameSession(title_arg) => {
@@ -826,7 +798,7 @@ pub(super) async fn handle_action(
                     app.push_notice(NoticeLevel::Warn, "标题未变化或为空，未做修改");
                 }
             } else {
-                let Ok(st) = ctx.session_title() else {
+                let Some(st) = runtime.session_title.as_ref().map(Arc::clone) else {
                     app.push_notice(
                         NoticeLevel::Warn,
                         "session-title 服务未启用（可在 /settings 中开启）",
@@ -885,7 +857,7 @@ pub(super) async fn handle_action(
                 return;
             }
             spawn_agent_run(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -902,7 +874,7 @@ pub(super) async fn handle_action(
                 return;
             }
             spawn_agent_run(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -914,7 +886,7 @@ pub(super) async fn handle_action(
         }
         AppAction::SteerPrompt(prompt) => {
             handle_steer_prompt(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -927,7 +899,7 @@ pub(super) async fn handle_action(
         }
         AppAction::SteerPromptWithImages { text, images } => {
             handle_steer_prompt(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -956,7 +928,7 @@ pub(super) async fn handle_action(
             );
         }
         AppAction::ShowStats => {
-            if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
+            if let Some(traj) = runtime.trajectory.as_ref() {
                 if let Some(report) = traj.inspect(&app.session_id, TimelineMode::Sequence) {
                     let s = &report.snapshot.stats;
                     let interrupted = if s.interrupted_steps > 0 {
@@ -987,46 +959,43 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowSessionInfo => {
-            let report = super::build_session_info_report(ctx, config, active_session, app);
+            let report = super::build_session_info_report(runtime, config, active_session, app);
             app.push_notice(NoticeLevel::Info, report);
         }
         AppAction::ShowTools => {
-            if let Some(rt) = ctx.get::<ToolRuntime>("tools") {
-                let declared: HashSet<String> = rt
-                    .list_declared(Some(&app.session_id))
-                    .into_iter()
-                    .map(|t| t.name)
-                    .collect();
-                let all = rt.list_all();
-                let mut lines = vec![format!(
-                    "工具列表（当前会话已声明 {} / 共 {} 个可用）：",
-                    declared.len(),
-                    all.len()
-                )];
-                for info in all {
-                    let active_mark = if declared.contains(&info.name) {
-                        "●"
-                    } else {
-                        "○"
-                    };
-                    let exp = match info.exposure {
-                        ToolExposure::Direct => "direct",
-                        ToolExposure::ModelOnly => "model-only",
-                        ToolExposure::Codemode => "codemode",
-                        ToolExposure::Deferred => "deferred",
-                        ToolExposure::Hidden => "hidden",
-                    };
-                    lines.push(format!("  {active_mark} {} [{exp}]", info.name));
-                }
-                app.push_notice(NoticeLevel::Info, lines.join("\n"));
-            } else {
-                app.push_notice(NoticeLevel::Warn, "tools 服务未就绪");
+            let rt = &runtime.tools;
+            let declared: HashSet<String> = rt
+                .list_declared(Some(&app.session_id))
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            let all = rt.list_all();
+            let mut lines = vec![format!(
+                "工具列表（当前会话已声明 {} / 共 {} 个可用）：",
+                declared.len(),
+                all.len()
+            )];
+            for info in all {
+                let active_mark = if declared.contains(&info.name) {
+                    "●"
+                } else {
+                    "○"
+                };
+                let exp = match info.exposure {
+                    ToolExposure::Direct => "direct",
+                    ToolExposure::ModelOnly => "model-only",
+                    ToolExposure::Codemode => "codemode",
+                    ToolExposure::Deferred => "deferred",
+                    ToolExposure::Hidden => "hidden",
+                };
+                lines.push(format!("  {active_mark} {} [{exp}]", info.name));
             }
+            app.push_notice(NoticeLevel::Info, lines.join("\n"));
         }
         AppAction::ShowMcp => {
-            if ctx.spine_plugins().is_ok_and(|p| !p.is_enabled("mcp")) {
+            if !runtime.modules.is_enabled("mcp") {
                 app.push_notice(NoticeLevel::Warn, "MCP 服务未启用");
-            } else if let Some(mgr) = ctx.get::<McpManager>("mcp") {
+            } else if let Some(mgr) = runtime.mcp().await {
                 let statuses = mgr.statuses();
                 if statuses.is_empty() {
                     app.push_notice(
@@ -1057,7 +1026,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowSkills => {
-            if let Some(reg) = ctx.get::<SkillRegistry>("skills")
+            if let Some(reg) = runtime.skills.as_ref()
                 && reg.is_enabled()
             {
                 let list = reg
@@ -1107,7 +1076,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowInstructions => {
-            if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
+            if let Some(inst) = runtime.instructions.as_ref() {
                 let report = inst.probe_report(Some(&app.session_id));
                 if !report.enabled {
                     app.push_notice(
@@ -1148,7 +1117,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ExportTrajectory(custom_path) => {
-            if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
+            if let Some(traj) = runtime.trajectory.as_ref() {
                 if let Some(jsonl) = traj.export_jsonl(&app.session_id) {
                     let target = custom_path.unwrap_or_else(|| {
                         app.workspace
@@ -1169,9 +1138,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowOrSwitchModel(target) => {
-            if let Ok(llm) = ctx.llm() {
-                app.providers = llm.provider_infos();
-            }
+            app.providers = runtime.llm.provider_infos();
             match target {
                 None if app.providers.iter().any(|p| !p.models.is_empty()) => {
                     let _ = app.open_model_selector();
@@ -1211,19 +1178,20 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::RefreshSidePanelData => {
-            schedule_side_panel_refresh(ctx, app, panel_ctrl);
+            schedule_side_panel_refresh(runtime, app, panel_ctrl);
         }
         AppAction::RefreshSidePanelTools => {
             if app.features.side_panel && app.side_panel.open {
-                populate_tools_and_mcps(ctx, app);
+                populate_tools_and_mcps(runtime, app);
             }
         }
         AppAction::OpenTrajectoryScene(mode) => {
             if !app.features.trajectory_view {
                 return;
             }
-            let report = ctx
-                .get::<TrajectoryRuntime>("trajectory")
+            let report = runtime
+                .trajectory
+                .as_ref()
                 .and_then(|traj| traj.inspect(&app.session_id, mode));
             app.open_trajectory_with_report(report);
         }
@@ -1232,7 +1200,7 @@ pub(super) async fn handle_action(
         }
         AppAction::OpenSettings(initial_query) => {
             app.pending_settings_model_pick = None;
-            let items = super::build_settings_entries(ctx, app);
+            let items = super::build_settings_entries(runtime, app);
             let save_hint = resolve_global_settings_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~/.mizar/settings.json".to_string());
@@ -1242,7 +1210,7 @@ pub(super) async fn handle_action(
             if let Some(plugin_id) = key.strip_prefix("plugin.") {
                 let settings_path = resolve_global_settings_path();
                 apply_module_toggle_setting_with_panel(
-                    ctx,
+                    runtime,
                     app,
                     settings_path.as_deref(),
                     plugin_id,
@@ -1252,7 +1220,7 @@ pub(super) async fn handle_action(
                 .await;
                 return;
             }
-            apply_host_setting_change(ctx, app, terminal, panel_ctrl, &key, &value).await;
+            apply_host_setting_change(runtime, app, terminal, panel_ctrl, &key, &value).await;
             if let Err(err) = persist_setting_change(&key, &value) {
                 app.push_notice(
                     NoticeLevel::Warn,
@@ -1261,7 +1229,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::OpenSkillPicker => {
-            if let Some(reg) = ctx.get::<SkillRegistry>("skills")
+            if let Some(reg) = runtime.skills.as_ref()
                 && reg.is_enabled()
             {
                 let list = reg
@@ -1295,26 +1263,26 @@ pub(super) async fn handle_action(
         AppAction::ForkSessionAtSeq(target_seq) => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
-            if let Ok(sub) = ctx.subagent() {
+            if let Some(sub) = runtime.subagent.as_ref() {
                 sub.cancel_parent_subagents(&active_session.id);
             }
-            if let Ok(agent_loop) = ctx.agent_loop() {
-                agent_loop.inbox().clear(&active_session.id);
-            }
+            runtime.agent_loop.inbox().clear(&active_session.id);
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            if let Ok(sessions) = ctx.sessions() {
-                match sessions.fork(&app.session_id, target_seq, SessionCreateOptions::default()) {
-                    Ok(next) => {
-                        *active_sid.write().unwrap() = next.id.clone();
-                        app.restore_session_view(project_fork_view(&next, target_seq));
-                        *active_session = next;
-                        schedule_side_panel_refresh(ctx, app, panel_ctrl);
-                    }
-                    Err(err) => {
-                        app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
-                    }
+            match runtime.sessions.fork(
+                &app.session_id,
+                target_seq,
+                SessionCreateOptions::default(),
+            ) {
+                Ok(next) => {
+                    *active_sid.write().unwrap() = next.id.clone();
+                    app.restore_session_view(project_fork_view(&next, target_seq));
+                    *active_session = next;
+                    schedule_side_panel_refresh(runtime, app, panel_ctrl);
+                }
+                Err(err) => {
+                    app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
                 }
             }
         }

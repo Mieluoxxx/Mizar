@@ -1,9 +1,9 @@
 //! Mizar 单阶段上下文压缩引擎。
 //!
-//! 整合核心工程实践并贴合 Mizar 微内核边界：
+//! 整合核心工程实践：
 //! - **单阶段检查点摘要**：步前按真实可用窗口 80% 触发（优先尾置指令复用主对话 KV Cache 前缀，
 //!   失败自动回退纯净转写），配合确定性 `<mizar-digest>` 硬事实与膨胀保护；
-//! - **溢出兜底恢复**：`agent/request-error` 捕获 `ContextOverflow` 时以 `retain=0` 强制压缩并重试；
+//! - **溢出兜底恢复**：`agent_loop.request_error_hook()` 捕获 `ContextOverflow` 时以 `retain=0` 强制压缩并重试；
 //! - **统一 `write` 写前读守卫**：对已存在且超过 50 行的文件执行整文件 `write` 前，
 //!   要求本会话已 `read` 且该读取未被压出上下文，始终放行新建文件、`<=50` 行小文件与 `edit`。
 
@@ -13,7 +13,6 @@ pub mod guards;
 pub mod service;
 pub mod summarizer;
 
-use cordis::CordisError;
 use mizar_llm::LlmError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,17 +21,11 @@ pub use budget::{
     ContextBudget, compute_budget, estimate_session_context_tokens, estimate_text_tokens,
 };
 pub use digest::{CutPlan, build_compaction_digest, plan_compaction_cut};
-pub use service::{CompactionContextExt, CompactionRuntime};
+pub use service::CompactionRuntime;
 pub use summarizer::strip_summary_wrapper;
-
-pub const EVENT_COMPACTION_START: &str = "compaction/start";
-pub const EVENT_COMPACTION_PROGRESS: &str = "compaction/progress";
-pub const EVENT_COMPACTION_END: &str = "compaction/end";
 
 #[derive(Debug, Error)]
 pub enum CompactionError {
-    #[error(transparent)]
-    Cordis(#[from] CordisError),
     #[error(transparent)]
     Llm(#[from] LlmError),
     #[error("会话 `{0}` 正在执行压缩，请稍候")]

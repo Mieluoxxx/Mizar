@@ -3,22 +3,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cordis::{Context, Service};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{
-    AgentEvent, AgentLoop, AgentLoopConfig, AgentLoopContextExt, AgentTurnInputEvent,
-};
-use mizar_core::session_title::{SessionTitleConfig, SessionTitleContextExt, SessionTitleRuntime};
+use mizar_core::agent_loop::{AgentEvent, AgentLoop, AgentLoopConfig, AgentTurnInputEvent};
+use mizar_core::session_title::{SessionTitleConfig, SessionTitleRuntime};
 use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
-    LlmErrorCode, LlmRuntime, ModelInfo, ProviderInfo, ReasoningEffort, StreamChunk,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmError, LlmErrorCode, LlmRuntime,
+    ModelInfo, ProviderInfo, ReasoningEffort, StreamChunk,
 };
-use mizar_session::{
-    EVENT_SESSION_TITLE_UPDATED, SessionContextExt, SessionCreateOptions, SessionEvent,
-    SessionStore, SessionTitleUpdatedPayload, TitleSource,
-};
+use mizar_session::{SessionCreateOptions, SessionEvent, SessionStore, TitleSource};
 use mizar_tools::ToolRuntime;
+use mizar_types::HookGuard;
 
 struct ScriptedReply {
     text: Result<String, LlmError>,
@@ -95,30 +90,43 @@ impl LlmAdapter for RecordingTitleAdapter {
     }
 }
 
+struct TitleTestHarness {
+    llm: Arc<LlmRuntime>,
+    sessions: Arc<SessionStore>,
+    agent_loop: Arc<AgentLoop>,
+    session_title: Arc<SessionTitleRuntime>,
+    _guards: HookGuard,
+}
+
 async fn setup_app(
     adapter_provider: &str,
     adapter: Arc<dyn LlmAdapter>,
     cfg: SessionTitleConfig,
-) -> (Context, cordis::Cleanup) {
-    let app = Context::new();
-    app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SessionStore::plugin(), ()).await.unwrap();
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
-        .await
-        .unwrap();
-    let llm_cleanup = app
-        .llm()
-        .unwrap()
-        .register_adapter(adapter_provider, adapter)
-        .unwrap();
-    app.plugin(SessionTitleRuntime::plugin(), cfg)
-        .await
-        .unwrap();
-    (app, llm_cleanup)
+) -> (TitleTestHarness, HookGuard) {
+    let llm = LlmRuntime::new();
+    let sessions = SessionStore::new();
+    let tools = ToolRuntime::new();
+    let sp = SystemPrompt::new(SystemPromptConfig::default());
+    let agent_loop = AgentLoop::new(
+        Arc::clone(&llm),
+        tools,
+        Arc::clone(&sessions),
+        sp,
+        AgentLoopConfig::default(),
+    );
+    let llm_cleanup = llm.register_adapter(adapter_provider, adapter).unwrap();
+    let (session_title, title_guard) =
+        SessionTitleRuntime::install(Arc::clone(&llm), &agent_loop, cfg);
+    (
+        TitleTestHarness {
+            llm,
+            sessions,
+            agent_loop,
+            session_title,
+            _guards: title_guard,
+        },
+        llm_cleanup,
+    )
 }
 
 async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -159,18 +167,13 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
 
     let updated_events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&updated_events);
-    let _ev_handle = app
-        .on(
-            EVENT_SESSION_TITLE_UPDATED,
-            move |p: &SessionTitleUpdatedPayload| {
-                sink.lock()
-                    .unwrap()
-                    .push((p.session.id.clone(), p.title.clone(), p.title_source));
-            },
-        )
-        .unwrap();
+    let _ev_handle = app.sessions.on_title_updated(move |p| {
+        sink.lock()
+            .unwrap()
+            .push((p.session.id.clone(), p.title.clone(), p.title_source));
+    });
 
-    let session = app.sessions().unwrap().create_with(SessionCreateOptions {
+    let session = app.sessions.create_with(SessionCreateOptions {
         id: Some("s-cadence".into()),
         ..Default::default()
     });
@@ -184,8 +187,7 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
         content: "TOOL_SECRET".into(),
         is_error: false,
     });
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
@@ -218,8 +220,7 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
 
     // Turn 2: 未命中刷新间隔，不应再调用模型
     session.append(SessionEvent::user("继续调试第 2 轮"));
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 2,
@@ -232,8 +233,7 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
 
     // Turn 3: 命中 refresh_interval_turns=3，再次刷新标题
     session.append(SessionEvent::user("顺便补全周期刷新与测试"));
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 3,
@@ -263,8 +263,6 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
                     && *src == Some(TitleSource::Auto)
             })
     );
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -293,13 +291,12 @@ async fn respects_manual_ownership_and_inflight_race_and_allows_explicit_regener
     )
     .await;
 
-    let session = app.sessions().unwrap().create_with(SessionCreateOptions {
+    let session = app.sessions.create_with(SessionCreateOptions {
         id: Some("s-own".into()),
         ..Default::default()
     });
     session.append(SessionEvent::user("测试人工改名保护"));
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
@@ -317,8 +314,7 @@ async fn respects_manual_ownership_and_inflight_race_and_allows_explicit_regener
 
     // Turn 2 到达：已是 Manual 所有权，不再触发自动刷新
     session.append(SessionEvent::user("第 2 轮提问"));
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 2,
@@ -330,7 +326,7 @@ async fn respects_manual_ownership_and_inflight_race_and_allows_explicit_regener
     assert_eq!(adapter.call_count.load(Ordering::SeqCst), 1);
 
     // 显式 /rename 无参数重生成可以重新生成并切回 Auto 所有权
-    let rt = app.session_title().unwrap();
+    let rt = &app.session_title;
     let updated = rt
         .regenerate_now(
             Arc::clone(&session),
@@ -342,8 +338,6 @@ async fn respects_manual_ownership_and_inflight_race_and_allows_explicit_regener
     assert!(updated.contains("｜FIX｜手动重生成结果"));
     assert_eq!(session.header().title.as_deref(), Some(updated.as_str()));
     assert_eq!(session.header().title_source, Some(TitleSource::Auto));
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -372,13 +366,12 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
     )
     .await;
 
-    let session = app.sessions().unwrap().create_with(SessionCreateOptions {
+    let session = app.sessions.create_with(SessionCreateOptions {
         id: Some("s-fail".into()),
         ..Default::default()
     });
     session.append(SessionEvent::user("保留的兜底标题"));
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
@@ -389,7 +382,6 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(failing_adapter.call_count.load(Ordering::SeqCst), 1);
     assert_eq!(session.header().title.as_deref(), Some("保留的兜底标题"));
-    app.fiber().dispose().await;
 
     // 2. Offline Mock 静默跳过（0 次调用）
     let offline_adapter = RecordingTitleAdapter::new("Offline Mock", Vec::new());
@@ -399,13 +391,12 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
         SessionTitleConfig::default(),
     )
     .await;
-    let s2 = app2.sessions().unwrap().create_with(SessionCreateOptions {
+    let s2 = app2.sessions.create_with(SessionCreateOptions {
         id: Some("s-offline".into()),
         ..Default::default()
     });
     s2.append(SessionEvent::user("离线模式测试"));
-    app2.agent_loop()
-        .unwrap()
+    app2.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&s2),
             turn: 1,
@@ -415,7 +406,6 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
         }));
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(offline_adapter.call_count.load(Ordering::SeqCst), 0);
-    app2.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -505,22 +495,17 @@ async fn failed_or_skipped_attempt_does_not_latch_turn() {
 
     let (app, _cleanup) =
         setup_app("real", real_adapter.clone(), SessionTitleConfig::default()).await;
-    let _mock_cleanup = app
-        .llm()
-        .unwrap()
-        .register_adapter("mock", mock_adapter)
-        .unwrap();
+    let _mock_cleanup = app.llm.register_adapter("mock", mock_adapter).unwrap();
     let adapter_calls = &real_calls;
 
-    let session = app.sessions().unwrap().create_with(SessionCreateOptions {
+    let session = app.sessions.create_with(SessionCreateOptions {
         id: Some("s-retry-turn".into()),
         ..Default::default()
     });
     session.append(SessionEvent::user("测试 turn 1 不被锁死"));
 
     // 1. Offline mock 在 turn=1 跳过后，不应锁死 turn=1
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
@@ -532,8 +517,7 @@ async fn failed_or_skipped_attempt_does_not_latch_turn() {
     assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
 
     // 2. 切到真实模型但首轮调用出错，出错后也不应永久锁死 turn=1
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
@@ -545,8 +529,7 @@ async fn failed_or_skipped_attempt_does_not_latch_turn() {
 
     // 3. 再次触发 turn=1 仍可生成并应用标题
     tokio::time::sleep(Duration::from_millis(20)).await;
-    app.agent_loop()
-        .unwrap()
+    app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
@@ -563,6 +546,4 @@ async fn failed_or_skipped_attempt_does_not_latch_turn() {
     })
     .await;
     assert_eq!(adapter_calls.load(Ordering::SeqCst), 2);
-
-    app.fiber().dispose().await;
 }

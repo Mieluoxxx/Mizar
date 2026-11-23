@@ -53,7 +53,7 @@ pub fn create_read_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
 
                 let target = resolve_read_path(&cwd, raw_path, restrict_to_workspace)
                     .await
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
 
                 let meta = tokio::fs::metadata(&target).await.map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
@@ -273,7 +273,7 @@ mod tests {
             exec: ToolExecution::new("read", args.clone(), None),
             cancel: tokio_util::sync::CancellationToken::new(),
             on_update: None,
-            ctx: cordis::Context::new(),
+            tools: crate::ToolRuntime::new(),
         }
     }
 

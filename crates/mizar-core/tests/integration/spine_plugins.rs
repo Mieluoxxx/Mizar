@@ -6,26 +6,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{BoxFuture, Context, PluginDef};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{
-    AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
-};
-use mizar_core::instructions::InstructionsContextExt;
-use mizar_core::skills::SkillRegistry;
+use mizar_core::agent_loop::{AgentPreStepDecision, AgentPreStepInput};
 use mizar_core::spine::{
-    AgentSpineConfig, AgentSpinePlugin, CompactionContextExt, RECALL_TOOL_NAME, SUBAGENT_TOOL_NAME,
-    SessionTitleContextExt, SpinePluginError, SpinePluginsContextExt, SubagentContextExt,
+    AgentSpineConfig, MizarRuntime, RECALL_TOOL_NAME, SUBAGENT_TOOL_NAME, SpinePluginError,
 };
-use mizar_core::system_prompt::SystemPromptContextExt;
-use mizar_core::trajectory::TrajectoryContextExt;
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo,
-    ProviderInfo, StreamChunk,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, ModelInfo, ProviderInfo, StreamChunk,
 };
-use mizar_mcp::McpManager;
-use mizar_session::{SessionContextExt, SessionEvent};
-use mizar_tools::{ToolDefinition, ToolExecution, ToolsContextExt};
+use mizar_session::SessionEvent;
+use mizar_tools::{ToolDefinition, ToolExecution};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -84,14 +74,6 @@ impl LlmAdapter for SimpleReplyAdapter {
     }
 }
 
-async fn wait_all_settled(app: &Context) {
-    for rt in app.registry().values() {
-        for fiber in rt.fibers() {
-            let _ = fiber.wait_settled().await;
-        }
-    }
-}
-
 #[tokio::test]
 async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
     let ws = temp_dir("protected");
@@ -110,25 +92,12 @@ async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
     cfg.agent.provider = Some("mock".into());
     cfg.agent.model = Some("mock-1".into());
 
-    let app = Context::new();
-    app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-    app.plugin(
-        PluginDef::sync("mock-adapter", |ctx, ()| {
-            let llm = ctx.llm()?;
-            let adapter = Arc::new(SimpleReplyAdapter);
-            ctx.effect("mock-adapter.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("mock", adapter)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    )
-    .await
-    .unwrap();
-    wait_all_settled(&app).await;
+    let runtime = MizarRuntime::build(cfg).await.unwrap();
+    runtime
+        .register_adapter("mock", Arc::new(SimpleReplyAdapter))
+        .unwrap();
 
-    let ctrl = app.spine_plugins().unwrap();
+    let ctrl = &runtime.modules;
     let errs = ctrl.startup_errors();
     for protected_id in [
         "llm",
@@ -160,16 +129,14 @@ async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
     ));
 
     // 主循环与核心服务依然完好可用
-    let sessions = app.sessions().unwrap();
-    let _tools = app.tools().unwrap();
-    let _prompt = app.system_prompt().unwrap();
-    let loop_svc = app.agent_loop().unwrap();
-    let session = sessions.create(None);
-    let answer = loop_svc
+    let session = runtime.sessions.create(None);
+    let answer = runtime
+        .agent_loop
         .run(Arc::clone(&session), "ping", CancellationToken::new())
         .await
         .unwrap();
     assert!(answer.contains("core-loop-ok"), "unexpected: {answer}");
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -202,55 +169,39 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     assert!(cfg.session_title.is_none());
     cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
 
-    let app = Context::new();
-    app.plugin(AgentSpinePlugin, cfg).await.unwrap();
+    let runtime = MizarRuntime::build(cfg).await.unwrap();
 
     // 注册一个探测工具，用于验证 repeat-guard 钩子的动态启用/禁用
     let probe_calls = Arc::new(Mutex::new(0usize));
     let probe_calls_ref = Arc::clone(&probe_calls);
-    app.plugin(
-        PluginDef::sync("probe-tool", move |ctx, ()| {
-            let tools = ctx.tools()?;
-            let counter = Arc::clone(&probe_calls_ref);
-            let def = ToolDefinition::sync_tool(
-                "probe_echo",
-                "Echo probe tool for lifecycle verification",
-                json!({"type": "object", "properties": {"v": {"type": "string"}}}),
-                move |args, _exec| {
-                    *counter.lock().unwrap() += 1;
-                    Ok::<_, mizar_tools::ToolError>(format!("probe:{args}"))
-                },
-            );
-            ctx.effect("probe-tool.reg", move || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(def)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["tools"]),
-        (),
-    )
-    .await
-    .unwrap();
+    let def = ToolDefinition::sync_tool(
+        "probe_echo",
+        "Echo probe tool for lifecycle verification",
+        json!({"type": "object", "properties": {"v": {"type": "string"}}}),
+        move |args, _exec| {
+            *probe_calls_ref.lock().unwrap() += 1;
+            Ok::<_, mizar_tools::ToolError>(format!("probe:{args}"))
+        },
+    );
+    runtime.push_guard(runtime.tools.register(def).unwrap());
 
-    wait_all_settled(&app).await;
-
-    let ctrl = app.spine_plugins().unwrap();
-    let tools = app.tools().unwrap();
-    let prompt = app.system_prompt().unwrap();
-    let sessions = app.sessions().unwrap();
+    let ctrl = &runtime.modules;
+    let tools = &runtime.tools;
+    let prompt = &runtime.system_prompt;
+    let sessions = &runtime.sessions;
 
     // 1. 启动阶段全部可选模块处于禁用状态：MCP 延迟未挂载，其余模块门控为 false 且工具被屏蔽
     assert_eq!(ctrl.disabled_ids().len(), 12);
     assert!(
-        app.get::<McpManager>("mcp").is_none(),
+        runtime.mcp().await.is_none(),
         "mcp must stay unmounted while disabled at startup"
     );
-    assert!(!app.compaction().unwrap().is_module_enabled());
-    assert!(!app.session_title().unwrap().is_module_enabled());
-    assert!(!app.subagent().unwrap().is_module_enabled());
-    assert!(!app.get::<SkillRegistry>("skills").unwrap().is_enabled());
-    assert!(!app.agent_instructions().unwrap().is_enabled());
-    assert!(!app.trajectory().unwrap().is_enabled());
+    assert!(!runtime.compaction.as_ref().unwrap().is_module_enabled());
+    assert!(!runtime.session_title.as_ref().unwrap().is_module_enabled());
+    assert!(!runtime.subagent.as_ref().unwrap().is_module_enabled());
+    assert!(!runtime.skills.as_ref().unwrap().is_enabled());
+    assert!(!runtime.instructions.as_ref().unwrap().is_enabled());
+    assert!(!runtime.trajectory.as_ref().unwrap().is_enabled());
 
     let startup_tool_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
@@ -301,9 +252,9 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     ] {
         assert!(ctrl.set_enabled(id, true).await.unwrap(), "enable {id}");
     }
-    assert!(app.get::<McpManager>("mcp").is_some());
-    assert!(app.get::<SkillRegistry>("skills").unwrap().is_enabled());
-    assert!(app.agent_instructions().unwrap().is_enabled());
+    assert!(runtime.mcp().await.is_some());
+    assert!(runtime.skills.as_ref().unwrap().is_enabled());
+    assert!(runtime.instructions.as_ref().unwrap().is_enabled());
 
     let enabled_tool_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
@@ -317,22 +268,17 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     // 触发一次 pre-step，验证 instructions 与 skills 监听器均正常向会话注入上下文
     let session = sessions.create(None);
     session.append(SessionEvent::user("hello"));
-    if let AgentPreStepDecision::Enter { inputs } = app
-        .waterfall(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepInput {
-                session: Arc::clone(&session),
-                turn: 1,
-                step: 1,
-                provider: Some("mock".into()),
-                model: Some("mock-1".into()),
-                cancel: CancellationToken::new(),
-                inputs: Vec::new(),
-            },
-            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-            },
-        )
+    if let AgentPreStepDecision::Enter { inputs } = runtime
+        .agent_loop
+        .run_pre_step(AgentPreStepInput {
+            session: Arc::clone(&session),
+            turn: 1,
+            step: 1,
+            provider: Some("mock".into()),
+            model: Some("mock-1".into()),
+            cancel: CancellationToken::new(),
+            inputs: Vec::new(),
+        })
         .await
     {
         for item in inputs {
@@ -359,8 +305,8 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     ] {
         assert!(ctrl.set_enabled(id, false).await.unwrap(), "disable {id}");
     }
-    assert!(!app.get::<SkillRegistry>("skills").unwrap().is_enabled());
-    assert!(!app.agent_instructions().unwrap().is_enabled());
+    assert!(!runtime.skills.as_ref().unwrap().is_enabled());
+    assert!(!runtime.instructions.as_ref().unwrap().is_enabled());
     let after_unload_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
@@ -371,22 +317,17 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     // 确认 instructions 与 skills 已停止注入：新建会话不再收到对应 ContextNotice
     let session_after_unload = sessions.create(None);
     session_after_unload.append(SessionEvent::user("after disable"));
-    if let AgentPreStepDecision::Enter { inputs } = app
-        .waterfall(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepInput {
-                session: Arc::clone(&session_after_unload),
-                turn: 1,
-                step: 1,
-                provider: Some("mock".into()),
-                model: Some("mock-1".into()),
-                cancel: CancellationToken::new(),
-                inputs: Vec::new(),
-            },
-            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-            },
-        )
+    if let AgentPreStepDecision::Enter { inputs } = runtime
+        .agent_loop
+        .run_pre_step(AgentPreStepInput {
+            session: Arc::clone(&session_after_unload),
+            turn: 1,
+            step: 1,
+            provider: Some("mock".into()),
+            model: Some("mock-1".into()),
+            cancel: CancellationToken::new(),
+            inputs: Vec::new(),
+        })
         .await
     {
         for item in inputs {
@@ -401,24 +342,19 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     // 再次启用 skills 与 instructions，验证可重复恢复
     assert!(ctrl.set_enabled("skills", true).await.unwrap());
     assert!(ctrl.set_enabled("instructions", true).await.unwrap());
-    assert!(app.get::<SkillRegistry>("skills").unwrap().is_enabled());
-    assert!(app.agent_instructions().unwrap().is_enabled());
-    if let AgentPreStepDecision::Enter { inputs } = app
-        .waterfall(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepInput {
-                session: Arc::clone(&session_after_unload),
-                turn: 2,
-                step: 1,
-                provider: Some("mock".into()),
-                model: Some("mock-1".into()),
-                cancel: CancellationToken::new(),
-                inputs: Vec::new(),
-            },
-            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-            },
-        )
+    assert!(runtime.skills.as_ref().unwrap().is_enabled());
+    assert!(runtime.instructions.as_ref().unwrap().is_enabled());
+    if let AgentPreStepDecision::Enter { inputs } = runtime
+        .agent_loop
+        .run_pre_step(AgentPreStepInput {
+            session: Arc::clone(&session_after_unload),
+            turn: 2,
+            step: 1,
+            provider: Some("mock".into()),
+            model: Some("mock-1".into()),
+            cancel: CancellationToken::new(),
+            inputs: Vec::new(),
+        })
         .await
     {
         for item in inputs {
@@ -436,7 +372,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
 
     // 5. compaction：易变配置热更新 + 禁用 + 再启用保留最新配置
     assert!(ctrl.set_enabled("compaction", true).await.unwrap());
-    let comp = app.compaction().unwrap();
+    let comp = runtime.compaction.as_ref().unwrap();
     assert!(comp.is_module_enabled());
     comp.update_config(|c| {
         c.auto_compact = false;
@@ -452,7 +388,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
 
     // 5b. session-title：启用 + 易变配置热更新 + 禁用 + 再启用保留最新配置
     assert!(ctrl.set_enabled("session-title", true).await.unwrap());
-    let st = app.session_title().unwrap();
+    let st = runtime.session_title.as_ref().unwrap();
     assert!(st.is_module_enabled());
     st.update_config(|c| {
         c.enabled = false;
@@ -474,7 +410,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
             .into_iter()
             .any(|t| t.name == SUBAGENT_TOOL_NAME)
     );
-    let sub = app.subagent().unwrap();
+    let sub = runtime.subagent.as_ref().unwrap();
     assert!(sub.is_module_enabled());
     sub.update_config(|c| {
         c.default_max_steps = 8;
@@ -497,7 +433,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     // 6. trajectory & repeat-guard：waterfall 钩子与服务禁用及恢复
     assert!(ctrl.set_enabled("trajectory", true).await.unwrap());
     assert!(ctrl.set_enabled("repeat-guard", true).await.unwrap());
-    assert!(app.trajectory().unwrap().is_enabled());
+    assert!(runtime.trajectory.as_ref().unwrap().is_enabled());
 
     let guard_session = sessions.create(None);
     for _ in 0..2 {
@@ -527,7 +463,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
 
     assert!(ctrl.set_enabled("repeat-guard", false).await.unwrap());
     assert!(ctrl.set_enabled("trajectory", false).await.unwrap());
-    assert!(!app.trajectory().unwrap().is_enabled());
+    assert!(!runtime.trajectory.as_ref().unwrap().is_enabled());
 
     let after_guard_off = tools
         .execute(ToolExecution::new(
@@ -543,4 +479,5 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
 
     assert!(ctrl.set_enabled("repeat-guard", true).await.unwrap());
     assert!(ctrl.is_enabled("repeat-guard"));
+    runtime.shutdown().await;
 }

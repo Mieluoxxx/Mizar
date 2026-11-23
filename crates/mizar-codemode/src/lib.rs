@@ -8,11 +8,10 @@ pub mod schema_ts;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use mizar_tools::{
-    EVENT_TOOLS_CHANGE, ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure,
-    ToolRuntime, ToolsContextExt,
+    ToolAnnotations, ToolDefinition, ToolError, ToolExecutionMode, ToolExposure, ToolRuntime,
 };
+use mizar_types::hooks::HookGuard;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
@@ -75,127 +74,91 @@ fn sync_auto_enable(tools: &ToolRuntime, state: &Mutex<AutoEnableState>) {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct CodemodePlugin;
+/// 注册 `codemode` 工具到 `ToolRuntime`（支持按需自动启用）；返回的 `HookGuard` 在析构时自动注销。
+pub fn register_codemode(
+    tools: Arc<ToolRuntime>,
+    config: CodemodeConfig,
+) -> Result<Vec<HookGuard>, ToolError> {
+    let session_store: Arc<Mutex<HashMap<String, HashMap<String, Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let worker_sem = Arc::new(Semaphore::new(config.max_workers.max(1)));
+    let only_mode = config.only_mode;
+    let inline_budget = config.inline_budget;
+    let timeout_ms = config.timeout_ms;
 
-impl Plugin for CodemodePlugin {
-    type Config = CodemodeConfig;
+    let store_for_exec = Arc::clone(&session_store);
+    let sem_for_exec = Arc::clone(&worker_sem);
 
-    fn name(&self) -> Option<&str> {
-        Some("codemode")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let tools = ctx.tools()?;
-            let session_store: Arc<Mutex<HashMap<String, HashMap<String, Value>>>> =
-                Arc::new(Mutex::new(HashMap::new()));
-            let worker_sem = Arc::new(Semaphore::new(config.max_workers.max(1)));
-            let only_mode = config.only_mode;
-            let inline_budget = config.inline_budget;
-            let timeout_ms = config.timeout_ms;
-
-            let store_for_exec = Arc::clone(&session_store);
-            let sem_for_exec = Arc::clone(&worker_sem);
-
-            let reg = ctx.effect("codemode.register", || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(
-                    ToolDefinition::async_rich_tool(
-                        CODEMODE_TOOL_NAME,
-                        create_codemode_description(&[], inline_budget),
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "code": {
-                                    "type": "string",
-                                    "description": "Async JavaScript code to run in the QuickJS sandbox."
-                                }
-                            },
-                            "required": ["code"]
-                        }),
-                        move |args, call_ctx| {
-                            let store = Arc::clone(&store_for_exec);
-                            let sem = Arc::clone(&sem_for_exec);
-                            async move {
-                                let code = args
-                                    .get("code")
-                                    .and_then(Value::as_str)
-                                    .ok_or("Missing required `code` parameter.")?
-                                    .to_string();
-                                let rt = call_ctx.ctx.tools()?;
-                                execute_codemode_script(
-                                    code,
-                                    call_ctx,
-                                    rt,
-                                    store,
-                                    sem,
-                                    timeout_ms,
-                                )
-                                .await
-                            }
-                        },
-                    )
-                    .with_exposure(ToolExposure::ModelOnly)
-                    .with_default_active(false)
-                    .with_execution_mode(ToolExecutionMode::Sequential)
-                    .with_annotations(ToolAnnotations {
-                        read_only: false,
-                        destructive: false,
-                        idempotent: false,
-                        open_world: false,
-                    })
-                    .with_prepare_loadout(move |loadout| {
-                        Some(prepare_codemode_loadout(loadout, only_mode, inline_budget))
-                    })
-                    .with_prompt_snippet("Execute sandboxed JavaScript to compose multiple tools in one turn"),
-                )?))
-            })?;
-
-            let mut handles = vec![reg];
-            if config.auto_enable {
-                let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
-                sync_auto_enable(&tools, &last_state);
-                let tools_sub = tools;
-                let last_sub = Arc::clone(&last_state);
-                let sub = ctx.on(EVENT_TOOLS_CHANGE, move |_: &()| {
-                    sync_auto_enable(&tools_sub, &last_sub);
-                })?;
-                handles.push(sub);
-            }
-
-            Ok(Some(Cleanup::async_fn(move || async move {
-                for h in handles {
-                    h.dispose().await;
+    let reg = tools.register(
+        ToolDefinition::async_rich_tool(
+            CODEMODE_TOOL_NAME,
+            create_codemode_description(&[], inline_budget),
+            json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Async JavaScript code to run in the QuickJS sandbox."
+                    }
+                },
+                "required": ["code"]
+            }),
+            move |args, call_ctx| {
+                let store = Arc::clone(&store_for_exec);
+                let sem = Arc::clone(&sem_for_exec);
+                async move {
+                    let code = args
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .ok_or("Missing required `code` parameter.")?
+                        .to_string();
+                    let rt = Arc::clone(&call_ctx.tools);
+                    execute_codemode_script(code, call_ctx, rt, store, sem, timeout_ms).await
                 }
-            })))
+            },
+        )
+        .with_exposure(ToolExposure::ModelOnly)
+        .with_default_active(false)
+        .with_execution_mode(ToolExecutionMode::Sequential)
+        .with_annotations(ToolAnnotations {
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
         })
+        .with_prepare_loadout(move |loadout| {
+            Some(prepare_codemode_loadout(loadout, only_mode, inline_budget))
+        })
+        .with_prompt_snippet("Execute sandboxed JavaScript to compose multiple tools in one turn"),
+    )?;
+
+    let mut guards = vec![reg];
+    if config.auto_enable {
+        let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
+        sync_auto_enable(&tools, &last_state);
+        let tools_weak = Arc::downgrade(&tools);
+        let last_sub = Arc::clone(&last_state);
+        guards.push(tools.on_change(move |_: &()| {
+            if let Some(rt) = tools_weak.upgrade() {
+                sync_auto_enable(&rt, &last_sub);
+            }
+        }));
     }
+
+    Ok(guards)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordis::{Context, Service};
     use mizar_tools::{ToolExecution, ToolNamespace, ToolOutput};
+    use mizar_types::BoxError;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn executes_async_js_orchestrating_tools_store_search_and_isolation() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(CodemodePlugin, CodemodeConfig::default())
-            .await
-            .unwrap();
-
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
+        let _guards = register_codemode(Arc::clone(&tools), CodemodeConfig::default()).unwrap();
         assert!(
             tools.list_declared(Some("s1")).is_empty(),
             "codemode should stay inactive until Codemode exposure tools register"
@@ -293,19 +256,12 @@ mod tests {
             "unexpected timeout msg: {}",
             res_timeout.content
         );
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn handles_exit_with_message_unspoofable_errors_and_async_host_timeout() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(CodemodePlugin, CodemodeConfig::default())
-            .await
-            .unwrap();
-
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
+        let _guards = register_codemode(Arc::clone(&tools), CodemodeConfig::default()).unwrap();
         let nested_cancelled = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&nested_cancelled);
         let _slow = tools
@@ -385,19 +341,12 @@ mod tests {
             *nested_cancelled.lock().unwrap(),
             "script timeout must cancel in-flight nested host tool call"
         );
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn codemode_stays_hidden_without_codemode_tools_and_activates_when_registered() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(CodemodePlugin, CodemodeConfig::default())
-            .await
-            .unwrap();
-
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
+        let _guards = register_codemode(Arc::clone(&tools), CodemodeConfig::default()).unwrap();
         let _direct = tools
             .register(
                 ToolDefinition::sync_tool("read", "Read file", json!({}), |_, _| {
@@ -439,10 +388,7 @@ mod tests {
             "codemode must activate once a ToolExposure::Codemode tool is registered"
         );
 
-        match cm_guard {
-            Cleanup::Sync(f) => f(),
-            Cleanup::Async(f) => f().await,
-        }
+        drop(cm_guard);
         assert!(
             !tools
                 .list_declared(Some("s1"))
@@ -450,7 +396,5 @@ mod tests {
                 .any(|t| t.name == CODEMODE_TOOL_NAME),
             "codemode must deactivate again after Codemode tools unregister"
         );
-
-        app.fiber().dispose().await;
     }
 }

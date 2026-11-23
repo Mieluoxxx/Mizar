@@ -1,6 +1,6 @@
 //! LLM 流式自动重试中间件（对应 `NamiDSH/packages/llm-retry`）。
 //!
-//! 通过 `ctx.waterfall("llm/stream", ...)` 无侵入拦截所有适配器流：
+//! 通过 `LlmRuntime::stream_hook()` 无侵入拦截所有适配器流：
 //! - 仅在尚未向下游发出任何可见内容（`TextDelta` / `ReasoningDelta` / `ToolCallDelta` / `BlockEnd`）前触发重试；
 //! - 若错误属于瞬时故障（`RateLimit` / `Server` / `Timeout` / `Transport` / `EmptyResponse` / `MalformedResponse`），
 //!   按 `retry_after_ms` 或指数退避等待后自动重连；
@@ -13,12 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::{
-    BoxChunkStream, ContentBlock, EVENT_LLM_STREAM, FinishReason, GenerateOptions, LlmContextExt,
-    LlmError, LlmErrorCode, LlmRuntime, StreamChunk,
+    BoxChunkStream, ContentBlock, FinishReason, GenerateOptions, LlmError, LlmErrorCode,
+    LlmRuntime, StreamChunk,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
 use futures::StreamExt;
 use futures::channel::mpsc;
+use mizar_types::hooks::{HookGuard, Next};
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -384,44 +384,25 @@ fn wrap_with_retry(
     Box::pin(rx)
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct LlmRetryPlugin;
-
-impl Plugin for LlmRetryPlugin {
-    type Config = RetryConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("llm-retry")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["llm"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let llm = ctx.llm()?;
-            ctx.on_waterfall(
-                EVENT_LLM_STREAM,
-                move |options: GenerateOptions, next: Next<GenerateOptions, BoxChunkStream>| {
-                    let first = next.call(options.clone());
-                    wrap_with_retry(Arc::clone(&llm), config.clone(), options, first)
-                },
-            )?;
-            Ok(None)
-        })
-    }
+/// 向 `LlmRuntime` 安装流式自动重试中间件；返回的 `HookGuard` 析构时自动摘除。
+pub fn install_retry(llm: &Arc<LlmRuntime>, config: RetryConfig) -> HookGuard {
+    let weak = Arc::downgrade(llm);
+    llm.stream_hook().register(
+        move |options: GenerateOptions, next: Next<GenerateOptions, BoxChunkStream>| {
+            let first = next.call(options.clone());
+            if let Some(llm) = weak.upgrade() {
+                wrap_with_retry(llm, config.clone(), options, first)
+            } else {
+                first
+            }
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlockAssembler, LlmAdapter, LlmRuntime, Message};
-    use cordis::Service;
+    use crate::{BlockAssembler, LlmAdapter, Message};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
 
@@ -456,22 +437,18 @@ mod tests {
 
     #[tokio::test]
     async fn retries_transient_failure_before_visible_content() {
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(
-            LlmRetryPlugin,
+        let llm = LlmRuntime::new();
+        let _retry = install_retry(
+            &llm,
             RetryConfig {
                 max_retries: 2,
                 initial_delay: Duration::from_millis(5),
                 max_delay: Duration::from_millis(20),
                 ..Default::default()
             },
-        )
-        .await
-        .unwrap();
+        );
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let llm = app.llm().unwrap();
         let _reg = llm
             .register_adapter(
                 "flaky",
@@ -496,13 +473,9 @@ mod tests {
             Vec::<crate::LlmAfterResponseEvent>::new(),
         ));
         let after_cap = Arc::clone(&after_events);
-        app.on(
-            crate::EVENT_LLM_AFTER_RESPONSE,
-            move |ev: &crate::LlmAfterResponseEvent| {
-                after_cap.lock().unwrap().push(ev.clone());
-            },
-        )
-        .unwrap();
+        let _after_guard = llm.on_after_response(move |ev: &crate::LlmAfterResponseEvent| {
+            after_cap.lock().unwrap().push(ev.clone());
+        });
 
         let mut asm = BlockAssembler::new();
         while let Some(item) = stream.next().await {
@@ -516,21 +489,17 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_retry_after_partial_content_was_emitted() {
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(
-            LlmRetryPlugin,
+        let llm = LlmRuntime::new();
+        let _retry = install_retry(
+            &llm,
             RetryConfig {
                 max_retries: 3,
                 initial_delay: Duration::from_millis(5),
                 ..Default::default()
             },
-        )
-        .await
-        .unwrap();
+        );
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let llm = app.llm().unwrap();
         let _reg = llm
             .register_adapter(
                 "flaky2",
@@ -611,20 +580,16 @@ mod tests {
             }
         }
 
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(
-            LlmRetryPlugin,
+        let llm = LlmRuntime::new();
+        let _retry = install_retry(
+            &llm,
             RetryConfig {
                 max_retries: 2,
                 initial_delay: Duration::from_millis(5),
                 ..Default::default()
             },
-        )
-        .await
-        .unwrap();
+        );
 
-        let llm = app.llm().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let _r1 = llm
             .register_adapter(

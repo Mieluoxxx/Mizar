@@ -1,26 +1,24 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cordis::{Context, PluginDef, Service};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopContextExt};
+use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig};
 use mizar_core::compaction::{
-    CompactionConfig, CompactionContextExt, CompactionOutcome, CompactionRuntime,
-    ManualCompactOptions,
+    CompactionConfig, CompactionOutcome, CompactionRuntime, ManualCompactOptions,
 };
 use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt,
-    LlmError, LlmErrorCode, LlmRuntime, ModelInfo, ProviderInfo, ReasoningEffort, RequestOrigin,
-    StreamChunk, TokenUsage,
+    BoxChunkStream, ContentBlock, FinishReason, GenerateOptions, LlmAdapter, LlmError,
+    LlmErrorCode, LlmRuntime, ModelInfo, ProviderInfo, ReasoningEffort, RequestOrigin, StreamChunk,
+    TokenUsage,
 };
 use mizar_session::{
-    LoadedSession, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionContextExt,
-    SessionCreateOptions, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
-    SessionListQuery, SessionPersistence, SessionPersistenceHandle, SessionStore,
+    LoadedSession, PersistenceResult, SessionCreateOptions, SessionEntry, SessionEvent,
+    SessionHeader, SessionHeaderPatch, SessionListQuery, SessionPersistence, SessionStore,
 };
-use mizar_tools::coding::{CodingToolsConfig, CodingToolsPlugin};
-use mizar_tools::{ToolDefinition, ToolExecution, ToolExposure, ToolRuntime, ToolsContextExt};
+use mizar_tools::coding::{CodingToolsConfig, register_coding_tools};
+use mizar_tools::{ToolDefinition, ToolExecution, ToolExposure, ToolRuntime};
+use mizar_types::HookGuard;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -111,52 +109,48 @@ impl LlmAdapter for RecordingAdapter {
     }
 }
 
+struct CompactionHarness {
+    sessions: Arc<SessionStore>,
+    tools: Arc<ToolRuntime>,
+    agent_loop: Arc<AgentLoop>,
+    compaction: Arc<CompactionRuntime>,
+    _guards: Vec<HookGuard>,
+}
+
 async fn setup_stack(
     adapter: RecordingAdapter,
     cfg: CompactionConfig,
     workspace: Option<std::path::PathBuf>,
-) -> Context {
-    let app = Context::new();
-    app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SessionStore::plugin(), ()).await.unwrap();
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    app.plugin(CompactionRuntime::plugin(), cfg).await.unwrap();
+) -> CompactionHarness {
+    let llm = LlmRuntime::new();
+    let sessions = SessionStore::new();
+    let tools = ToolRuntime::new();
+    let sp = SystemPrompt::new(SystemPromptConfig::default());
+    let agent_loop = AgentLoop::new(
+        Arc::clone(&llm),
+        Arc::clone(&tools),
+        Arc::clone(&sessions),
+        Arc::clone(&sp),
+        AgentLoopConfig::default(),
+    );
+    let (compaction, compact_guard) =
+        CompactionRuntime::install(Arc::clone(&llm), &sessions, &tools, sp, &agent_loop, cfg);
+    let mut guards = vec![compact_guard];
     if let Some(ws) = workspace {
-        app.sessions()
-            .unwrap()
-            .set_default_cwd(Some(ws.display().to_string()));
-        app.plugin(CodingToolsPlugin, CodingToolsConfig::new(ws))
-            .await
-            .unwrap();
+        sessions.set_default_cwd(Some(ws.display().to_string()));
+        guards.extend(register_coding_tools(&tools, &CodingToolsConfig::new(ws)).unwrap());
     }
-    app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
-        .await
-        .unwrap();
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
+    guards.push(
+        llm.register_adapter("mock-compact", Arc::new(adapter))
+            .unwrap(),
+    );
+    CompactionHarness {
+        sessions,
+        tools,
+        agent_loop,
+        compaction,
+        _guards: guards,
     }
-
-    let adapter = Arc::new(adapter);
-    app.plugin(
-        PluginDef::sync("mock-compact-adapter", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter);
-            ctx.effect("mock-compact-adapter.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("mock-compact", a)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    )
-    .await
-    .unwrap();
-    app
 }
 
 #[tokio::test]
@@ -175,9 +169,9 @@ async fn one_million_window_does_not_trigger_at_200k_or_380k_and_triggers_at_80_
         ],
     );
     let app = setup_stack(adapter, CompactionConfig::default(), None).await;
-    let store = app.sessions().unwrap();
-    let agent = app.agent_loop().unwrap();
-    let compaction = app.compaction().unwrap();
+    let store = &app.sessions;
+    let agent = &app.agent_loop;
+    let compaction = &app.compaction;
 
     let s = store.create(Some("1m-window".into()));
     let pressure = compaction.inspect_context(&s, Some("mock-compact"), Some("m-test"));
@@ -260,8 +254,6 @@ async fn one_million_window_does_not_trigger_at_200k_or_380k_and_triggers_at_80_
             1
         );
     }
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -282,8 +274,8 @@ async fn high_cache_hit_prompt_tokens_triggers_auto_compaction() {
         ..Default::default()
     };
     let app = setup_stack(adapter, cfg, None).await;
-    let store = app.sessions().unwrap();
-    let agent = app.agent_loop().unwrap();
+    let store = &app.sessions;
+    let agent = &app.agent_loop;
 
     let s = store.create(Some("cache-hit-anchor".into()));
     s.append(SessionEvent::user("early large user context ".repeat(200)));
@@ -320,8 +312,6 @@ async fn high_cache_hit_prompt_tokens_triggers_auto_compaction() {
             "expected compaction triggered by prompt_tokens() including cache_read"
         );
     }
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -343,9 +333,9 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
         ],
     );
     let app = setup_stack(adapter, CompactionConfig::default(), None).await;
-    let store = app.sessions().unwrap();
-    let tools = app.tools().unwrap();
-    let compaction = app.compaction().unwrap();
+    let store = &app.sessions;
+    let tools = &app.tools;
+    let compaction = &app.compaction;
 
     let _reg = tools
         .register(
@@ -454,8 +444,6 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
             .iter()
             .any(|t| t.name == "extra_deferred")
     );
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -466,8 +454,8 @@ async fn unknown_model_falls_back_to_default_context_window_without_borrowing_fi
         ..Default::default()
     };
     let app = setup_stack(adapter, cfg, None).await;
-    let store = app.sessions().unwrap();
-    let compaction = app.compaction().unwrap();
+    let store = &app.sessions;
+    let compaction = &app.compaction;
     let s = store.create(None);
 
     let unknown = compaction.inspect_context(&s, Some("mock-compact"), Some("unknown-model"));
@@ -477,8 +465,6 @@ async fn unknown_model_falls_back_to_default_context_window_without_borrowing_fi
     let known = compaction.inspect_context(&s, Some("mock-compact"), Some("m-test"));
     assert_eq!(known.context_window, 1_048_576);
     assert_eq!(known.effective_window, 1_048_576 - 131_072);
-
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -500,8 +486,8 @@ async fn overflow_recovery_retries_with_zero_tail_and_clean_transcript() {
     );
 
     let app = setup_stack(adapter, CompactionConfig::default(), None).await;
-    let store = app.sessions().unwrap();
-    let agent = app.agent_loop().unwrap();
+    let store = &app.sessions;
+    let agent = &app.agent_loop;
 
     let s = store.create(Some("overflow-recovery".into()));
     s.append(SessionEvent::user("历史消息 1 ".repeat(100)));
@@ -526,8 +512,6 @@ async fn overflow_recovery_retries_with_zero_tail_and_clean_transcript() {
         assert_eq!(summary_call.temperature, None);
         assert_eq!(summary_call.reasoning_effort, Some(ReasoningEffort::Off));
     }
-
-    app.fiber().dispose().await;
 }
 
 #[derive(Default)]
@@ -579,7 +563,7 @@ impl SessionPersistence for MemPersistence {
     fn flush_async(
         &self,
         _session_id: Option<String>,
-    ) -> cordis::BoxFuture<'static, PersistenceResult<()>> {
+    ) -> mizar_types::BoxFuture<'static, PersistenceResult<()>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -618,9 +602,9 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
         ))],
     );
     let app = setup_stack(adapter, CompactionConfig::default(), Some(ws.clone())).await;
-    let store = app.sessions().unwrap();
-    let tools = app.tools().unwrap();
-    let compaction = app.compaction().unwrap();
+    let store = &app.sessions;
+    let tools = &app.tools;
+    let compaction = &app.compaction;
     let s = store.create_with(SessionCreateOptions {
         id: Some("write-guard".into()),
         cwd: Some(ws.display().to_string()),
@@ -791,7 +775,7 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
         .await;
     assert!(!w_nested.is_error && !w_nested.blocked);
 
-    app.fiber().dispose().await;
+    drop(app);
 
     // 8. 持久化冷重载后仍能从历史事件重建 last_read_seq 并拦截压缩前读取的大文件覆写
     let persistence = Arc::new(MemPersistence::default());
@@ -846,46 +830,34 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
         .unwrap();
 
     let (adapter2, _) = RecordingAdapter::new(128_000, Some(16_384), vec![]);
-    let app2 = Context::new();
-    app2.provide(
-        SERVICE_SESSION_PERSISTENCE,
-        Arc::new(SessionPersistenceHandle::new(
-            Arc::clone(&persistence) as Arc<dyn SessionPersistence>
-        )),
-    )
-    .unwrap();
-    app2.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
-    app2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app2.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
+    let llm2 = LlmRuntime::new();
+    let sessions2 =
+        SessionStore::with_persistence(Arc::clone(&persistence) as Arc<dyn SessionPersistence>);
+    let tools2 = ToolRuntime::new();
+    let sp2 = SystemPrompt::new(SystemPromptConfig::default());
+    let agent2 = AgentLoop::new(
+        Arc::clone(&llm2),
+        Arc::clone(&tools2),
+        Arc::clone(&sessions2),
+        Arc::clone(&sp2),
+        AgentLoopConfig::default(),
+    );
+    let (_c2, _cg2) = CompactionRuntime::install(
+        Arc::clone(&llm2),
+        &sessions2,
+        &tools2,
+        sp2,
+        &agent2,
+        CompactionConfig::default(),
+    );
+    let _tool_guards2 =
+        register_coding_tools(&tools2, &CodingToolsConfig::new(ws.clone())).unwrap();
+    let _reg2 = llm2
+        .register_adapter("mock-compact", Arc::new(adapter2))
         .unwrap();
-    app2.plugin(CompactionRuntime::plugin(), CompactionConfig::default())
-        .await
-        .unwrap();
-    app2.plugin(CodingToolsPlugin, CodingToolsConfig::new(ws.clone()))
-        .await
-        .unwrap();
-    let adapter2 = Arc::new(adapter2);
-    app2.plugin(
-        PluginDef::sync("mock-a2", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter2);
-            ctx.effect("mock-a2.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("mock-compact", a)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    )
-    .await
-    .unwrap();
 
-    let _resumed = app2.sessions().unwrap().get("resumed-guard").unwrap();
-    let w_resumed_blocked = app2
-        .tools()
-        .unwrap()
+    let _resumed = sessions2.get("resumed-guard").unwrap();
+    let w_resumed_blocked = tools2
         .execute(ToolExecution::new(
             "write",
             json!({ "path": "big60.txt", "content": "blocked after resume\n" }),
@@ -894,6 +866,5 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
         .await;
     assert!(w_resumed_blocked.blocked, "{w_resumed_blocked:?}");
 
-    app2.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&ws);
 }

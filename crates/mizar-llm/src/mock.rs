@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, Message,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmError, LlmRuntime, Message,
     ModelInfo, ProviderInfo, StreamChunk, ToolCall,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
+use mizar_types::hooks::HookGuard;
 
 pub struct MockAdapter;
 
@@ -176,31 +176,6 @@ impl LlmAdapter for MockAdapter {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct MockPlugin;
-
-impl Plugin for MockPlugin {
-    type Config = ();
-
-    fn name(&self) -> Option<&str> {
-        Some("llm-mock")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["llm"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        _config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let llm = ctx.llm()?;
-            ctx.effect("llm-mock.registerAdapter", || {
-                Ok::<_, crate::LlmError>(Some(llm.register_adapter("mock", Arc::new(MockAdapter))?))
-            })?;
-            Ok(None)
-        })
-    }
+pub fn register_mock_adapter(llm: &Arc<LlmRuntime>) -> Result<HookGuard, LlmError> {
+    llm.register_adapter("mock", Arc::new(MockAdapter))
 }

@@ -1,40 +1,35 @@
 //! Agent 循环（对应 `NamiDSH/packages/agent-loop`）。
 //!
-//! Agent 循环本身也只是一个插件。它不知道模型是哪家、有哪些工具，只认四个服务名：
-//! `llm`、`tools`、`sessions`、`systemPrompt`。
+//! 聚焦「流式调模型 → 执行工具 → 回写会话」主循环，通过构造函数静态注入
+//! `LlmRuntime`、`ToolRuntime`、`SessionStore`、`SystemPrompt` 四个核心依赖，
+//! 并对外暴露 `pre_step` / `request_error` / `turn_stopping` 强类型钩子与 `AgentEvent` 事件总线。
 
 pub mod inbox;
 
 use std::collections::HashMap;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::system_prompt::SystemPromptContextExt;
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Next, Service};
+use crate::system_prompt::SystemPrompt;
 use futures::StreamExt;
 use futures::future::join_all;
 pub use inbox::{
     DEFAULT_AUTO_WAKE_LIMIT, DeliveryMode, InboxItem, InboxPushResult, SessionInbox, TurnInput,
 };
 use mizar_llm::{
-    BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmContextExt, LlmError,
-    LlmErrorCode, Message, ReasoningEffort, RequestOrigin, StreamChunk, TokenUsage, ToolCall,
+    BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmError, LlmErrorCode,
+    LlmRuntime, Message, ReasoningEffort, RequestOrigin, StreamChunk, TokenUsage, ToolCall,
 };
-use mizar_session::{Session, SessionEvent, SessionTraceEvent, TraceSeverity};
+use mizar_session::{Session, SessionEvent, SessionStore, SessionTraceEvent, TraceSeverity};
 use mizar_tools::{
     ToolExecution, ToolExecutionMode, ToolResult, ToolRuntime, ToolUpdate, ToolUpdateCallback,
-    ToolsContextExt,
 };
+use mizar_types::{BoxFuture, HookGuard, HookOptions, SerialHook, WaterfallHook};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub const EVENT_AGENT_PRE_STEP: &str = "agent/pre-step";
-pub const EVENT_AGENT_REQUEST_ERROR: &str = "agent/request-error";
-pub const EVENT_AGENT_TURN_STOPPING: &str = "agent/turn-stopping";
 pub const ENVIRONMENT_CONTEXT_SOURCE: &str = "environment-context";
 
 fn build_environment_context_notice_if_needed(
@@ -331,11 +326,8 @@ pub enum AgentEvent {
 
 const AGENT_EVENT_BROADCAST_CAPACITY: usize = 2048;
 
-type AgentEventListener = Arc<dyn Fn(&AgentEvent) + Send + Sync>;
-
 struct AgentEventBus {
-    next_id: AtomicU64,
-    listeners: RwLock<Vec<(u64, AgentEventListener)>>,
+    listeners: mizar_types::SyncEventBus<AgentEvent>,
     tx: tokio::sync::broadcast::Sender<AgentEvent>,
 }
 
@@ -343,8 +335,7 @@ impl AgentEventBus {
     fn new() -> Arc<Self> {
         let (tx, _) = tokio::sync::broadcast::channel(AGENT_EVENT_BROADCAST_CAPACITY);
         Arc::new(Self {
-            next_id: AtomicU64::new(1),
-            listeners: RwLock::new(Vec::new()),
+            listeners: mizar_types::SyncEventBus::new(),
             tx,
         })
     }
@@ -353,84 +344,18 @@ impl AgentEventBus {
         self.tx.subscribe()
     }
 
-    fn on_event(
-        self: &Arc<Self>,
-        cb: impl Fn(&AgentEvent) + Send + Sync + 'static,
-    ) -> AgentEventGuard {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let listener: AgentEventListener = Arc::new(cb);
-        self.listeners.write().unwrap().push((id, listener));
-        AgentEventGuard {
-            bus: Arc::downgrade(self),
-            id,
-        }
+    fn on_event(&self, cb: impl Fn(&AgentEvent) + Send + Sync + 'static) -> AgentEventGuard {
+        self.listeners.on(cb)
     }
 
     fn emit(&self, ev: AgentEvent) {
-        // 先快照再释放读锁，避免回调内 Drop 句柄触发重入死锁。
-        let snapshot: Vec<AgentEventListener> = {
-            let guard = self.listeners.read().unwrap();
-            guard.iter().map(|(_, cb)| Arc::clone(cb)).collect()
-        };
-        for cb in snapshot {
-            cb(&ev);
-        }
+        self.listeners.emit(&ev);
         let _ = self.tx.send(ev);
     }
 }
 
 /// 强类型 `AgentEvent` 同步订阅句柄：Drop 时自动注销监听器。
-#[must_use = "dropping AgentEventGuard immediately unregisters the AgentEvent listener"]
-pub struct AgentEventGuard {
-    bus: Weak<AgentEventBus>,
-    id: u64,
-}
-
-impl fmt::Debug for AgentEventGuard {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AgentEventGuard")
-            .field("id", &self.id)
-            .finish()
-    }
-}
-
-impl Drop for AgentEventGuard {
-    fn drop(&mut self) {
-        if let Some(bus) = self.bus.upgrade() {
-            bus.listeners
-                .write()
-                .unwrap()
-                .retain(|(id, _)| *id != self.id);
-        }
-    }
-}
-
-/// 在 `agentLoop` 就绪后挂载强类型事件监听，并将 RAII 句柄登记到 `effect` 中随上下文清理。
-pub(crate) async fn subscribe_agent_events_when_ready<F>(
-    ctx: &Context,
-    effect_label: &'static str,
-    cb: F,
-) -> Result<cordis::Fiber, CordisError>
-where
-    F: Fn(&AgentEvent) + Send + Sync + 'static,
-{
-    let cb = Arc::new(cb);
-    let fiber = ctx.try_inject(["agentLoop"], move |c| {
-        let cb = Arc::clone(&cb);
-        async move {
-            let agent_loop = c.agent_loop()?;
-            c.effect(effect_label, move || {
-                let guard = agent_loop.on_event(move |ev| cb(ev));
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || drop(guard))))
-            })?;
-            Ok::<_, CordisError>(())
-        }
-    })?;
-    if ctx.get::<AgentLoop>("agentLoop").is_some() {
-        fiber.wait_settled().await?;
-    }
-    Ok(fiber)
-}
+pub type AgentEventGuard = HookGuard;
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentLoopConfig {
@@ -468,8 +393,6 @@ pub struct TurnRunReport {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error(transparent)]
-    Cordis(#[from] CordisError),
     #[error(transparent)]
     Llm(#[from] LlmError),
     #[error("session \"{0}\" is already running")]
@@ -626,15 +549,109 @@ fn parse_tool_arguments(tool_name: &str, raw_arguments: &str) -> Result<Value, S
 }
 
 pub struct AgentLoop {
-    ctx: Context,
+    llm: Arc<LlmRuntime>,
+    tools: Arc<ToolRuntime>,
+    #[allow(dead_code)]
+    sessions: Arc<SessionStore>,
+    system_prompt: Arc<SystemPrompt>,
     config: AgentLoopConfig,
     inbox: Arc<SessionInbox>,
     short_cutoffs_by_session: Arc<Mutex<HashMap<String, usize>>>,
     events: Arc<AgentEventBus>,
+    pre_step: WaterfallHook<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>,
+    request_error:
+        WaterfallHook<AgentRequestErrorInput, BoxFuture<'static, AgentRequestErrorDecision>>,
+    turn_stopping: SerialHook<AgentTurnStoppingEvent, ()>,
+    _env_guard: HookGuard,
 }
 
 impl AgentLoop {
-    /// 获取纯内存会话信箱（供 TUI / 桌面端 / 插件投递 `Steer`、`FollowUp` 与 `Inject` 消息）。
+    /// 静态构造 `AgentLoop` 并预装内置 `<environment_context>` 步前注入钩子（`priority = -10`）。
+    pub fn new(
+        llm: Arc<LlmRuntime>,
+        tools: Arc<ToolRuntime>,
+        sessions: Arc<SessionStore>,
+        system_prompt: Arc<SystemPrompt>,
+        config: AgentLoopConfig,
+    ) -> Arc<Self> {
+        let pre_step = WaterfallHook::new();
+        let env_guard = pre_step.register_with(
+            HookOptions {
+                priority: -10,
+                ..Default::default()
+            },
+            |input: AgentPreStepInput,
+             next: mizar_types::Next<
+                AgentPreStepInput,
+                BoxFuture<'static, AgentPreStepDecision>,
+            >| {
+                Box::pin(async move {
+                    if input.cancel.is_cancelled() {
+                        return AgentPreStepDecision::Reject {
+                            reason: "cancelled".to_string(),
+                        };
+                    }
+                    let session = Arc::clone(&input.session);
+                    match next.call(input).await {
+                        AgentPreStepDecision::Enter { mut inputs } => {
+                            if let Some(notice) =
+                                build_environment_context_notice_if_needed(&session, &inputs)
+                            {
+                                inputs.insert(0, notice);
+                            }
+                            AgentPreStepDecision::Enter { inputs }
+                        }
+                        reject @ AgentPreStepDecision::Reject { .. } => reject,
+                    }
+                }) as BoxFuture<'static, AgentPreStepDecision>
+            },
+        );
+        Arc::new(Self {
+            llm,
+            tools,
+            sessions,
+            system_prompt,
+            config,
+            inbox: Arc::new(SessionInbox::new()),
+            short_cutoffs_by_session: Arc::new(Mutex::new(HashMap::new())),
+            events: AgentEventBus::new(),
+            pre_step,
+            request_error: WaterfallHook::new(),
+            turn_stopping: SerialHook::new(),
+            _env_guard: env_guard,
+        })
+    }
+
+    pub fn config(&self) -> &AgentLoopConfig {
+        &self.config
+    }
+
+    pub fn pre_step_hook(
+        &self,
+    ) -> &WaterfallHook<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>> {
+        &self.pre_step
+    }
+
+    pub fn request_error_hook(
+        &self,
+    ) -> &WaterfallHook<AgentRequestErrorInput, BoxFuture<'static, AgentRequestErrorDecision>> {
+        &self.request_error
+    }
+
+    pub fn turn_stopping_hook(&self) -> &SerialHook<AgentTurnStoppingEvent, ()> {
+        &self.turn_stopping
+    }
+
+    /// 显式执行一次 `pre_step` 拦截链（供无需启动整轮模型推理的场景使用）。
+    pub async fn run_pre_step(&self, input: AgentPreStepInput) -> AgentPreStepDecision {
+        self.pre_step
+            .run(input, |inp| {
+                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+            })
+            .await
+    }
+
+    /// 获取纯内存会话信箱（供 TUI / 桌面端 / 宿主扩展投递 `Steer`、`FollowUp` 与 `Inject` 消息）。
     pub fn inbox(&self) -> &SessionInbox {
         &self.inbox
     }
@@ -680,9 +697,8 @@ impl AgentLoop {
         kind: AgentRequestErrorKind,
         error_message: String,
     ) -> AgentRequestErrorDecision {
-        self.ctx
-            .waterfall(
-                EVENT_AGENT_REQUEST_ERROR,
+        self.request_error
+            .run(
                 AgentRequestErrorInput {
                     session: Arc::clone(session),
                     turn,
@@ -693,9 +709,7 @@ impl AgentLoop {
                     error_message,
                     cancel: cancel.clone(),
                 },
-                |_| -> BoxFuture<'static, AgentRequestErrorDecision> {
-                    Box::pin(async { AgentRequestErrorDecision::Propagate })
-                },
+                |_| Box::pin(async { AgentRequestErrorDecision::Propagate }),
             )
             .await
     }
@@ -807,9 +821,9 @@ impl AgentLoop {
         cancel: CancellationToken,
         options: RunOptions,
     ) -> Result<TurnRunReport, AgentError> {
-        let llm = self.ctx.llm()?;
-        let tools = self.ctx.tools()?;
-        let system_prompt = self.ctx.system_prompt()?;
+        let llm = Arc::clone(&self.llm);
+        let tools = Arc::clone(&self.tools);
+        let system_prompt = Arc::clone(&self.system_prompt);
 
         let provider = options.provider.or_else(|| self.config.provider.clone());
         let model = options.model.or_else(|| self.config.model.clone());
@@ -889,22 +903,15 @@ impl AgentLoop {
             step_inputs.extend(self.inbox.drain_step_inputs(&session.id));
 
             let pre_step_decision = self
-                .ctx
-                .waterfall(
-                    EVENT_AGENT_PRE_STEP,
-                    AgentPreStepInput {
-                        session: Arc::clone(&session),
-                        turn,
-                        step,
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        cancel: cancel.clone(),
-                        inputs: step_inputs,
-                    },
-                    |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                        Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-                    },
-                )
+                .run_pre_step(AgentPreStepInput {
+                    session: Arc::clone(&session),
+                    turn,
+                    step,
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    cancel: cancel.clone(),
+                    inputs: step_inputs,
+                })
                 .await;
 
             if cancel.is_cancelled() {
@@ -1399,19 +1406,16 @@ impl AgentLoop {
                 if !is_truncated && has_visible_text {
                     if !self.inbox.has_pending_steer(&session.id) && !cancel.is_cancelled() {
                         let _: Option<()> = self
-                            .ctx
-                            .serial::<AgentTurnStoppingEvent, ()>(
-                                EVENT_AGENT_TURN_STOPPING,
-                                AgentTurnStoppingEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    provider: provider.clone(),
-                                    model: model.clone(),
-                                    cancel: cancel.clone(),
-                                    last_text: text.clone(),
-                                },
-                            )
+                            .turn_stopping
+                            .run(AgentTurnStoppingEvent {
+                                session: Arc::clone(&session),
+                                turn,
+                                step,
+                                provider: provider.clone(),
+                                model: model.clone(),
+                                cancel: cancel.clone(),
+                                last_text: text.clone(),
+                            })
                             .await;
                     }
                     if cancel.is_cancelled() {
@@ -1579,132 +1583,51 @@ impl AgentLoop {
     }
 }
 
-impl Service for AgentLoop {
-    type Config = AgentLoopConfig;
-
-    fn service_name() -> &'static str {
-        "agentLoop"
-    }
-
-    fn plugin_name() -> &'static str {
-        "AgentLoop"
-    }
-
-    fn inject() -> Inject {
-        Inject::from(["llm", "tools", "sessions", "systemPrompt"])
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            config,
-            inbox: Arc::new(SessionInbox::new()),
-            short_cutoffs_by_session: Arc::new(Mutex::new(HashMap::new())),
-            events: AgentEventBus::new(),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let c = ctx.clone();
-        let ctx_effect = ctx.clone();
-        Box::pin(async move {
-            ctx_effect.effect("agent-loop.pre-step-env", move || {
-                let h =
-                    c.on_waterfall_with(
-                        EVENT_AGENT_PRE_STEP,
-                        move |input: AgentPreStepInput,
-                              next: Next<
-                            AgentPreStepInput,
-                            BoxFuture<'static, AgentPreStepDecision>,
-                        >| {
-                            Box::pin(async move {
-                                if input.cancel.is_cancelled() {
-                                    return AgentPreStepDecision::Reject {
-                                        reason: "cancelled".to_string(),
-                                    };
-                                }
-                                let session = Arc::clone(&input.session);
-                                match next.call(input).await {
-                                    AgentPreStepDecision::Enter { mut inputs } => {
-                                        if let Some(notice) =
-                                            build_environment_context_notice_if_needed(
-                                                &session, &inputs,
-                                            )
-                                        {
-                                            inputs.insert(0, notice);
-                                        }
-                                        AgentPreStepDecision::Enter { inputs }
-                                    }
-                                    reject @ AgentPreStepDecision::Reject { .. } => reject,
-                                }
-                            })
-                                as BoxFuture<'static, AgentPreStepDecision>
-                        },
-                        cordis::EventOptions {
-                            priority: -10,
-                            ..Default::default()
-                        },
-                    )?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-            Ok(())
-        })
-    }
-}
-
-pub trait AgentLoopContextExt {
-    fn agent_loop(&self) -> Result<Arc<AgentLoop>, CordisError>;
-}
-
-impl AgentLoopContextExt for Context {
-    fn agent_loop(&self) -> Result<Arc<AgentLoop>, CordisError> {
-        self.service::<AgentLoop>("agentLoop")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::system_prompt::{SystemPrompt, SystemPromptConfig};
-    use cordis::PluginDef;
     use futures::channel::mpsc;
     use mizar_llm::{BoxChunkStream, LlmAdapter, LlmRuntime};
-    use mizar_session::{SessionContextExt, SessionStore};
+    use mizar_session::SessionStore;
     use mizar_tools::{ToolDefinition, ToolRuntime};
+    use mizar_types::{BoxError, Next};
 
     use super::*;
 
-    async fn setup_app_with_adapter<A: LlmAdapter>(adapter: A) -> Context {
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-            .await
-            .unwrap();
-        app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
-            .await
-            .unwrap();
+    struct TestHarness {
+        #[allow(dead_code)]
+        llm: Arc<LlmRuntime>,
+        sessions: Arc<SessionStore>,
+        tools: Arc<ToolRuntime>,
+        #[allow(dead_code)]
+        system_prompt: Arc<SystemPrompt>,
+        agent_loop: Arc<AgentLoop>,
+        _adapter_guard: HookGuard,
+    }
 
-        let adapter = Arc::new(adapter);
-        app.plugin(
-            PluginDef::sync("test-adapter", move |ctx, ()| {
-                let llm = ctx.llm()?;
-                let a = Arc::clone(&adapter);
-                ctx.effect("test-adapter.reg", move || {
-                    Ok::<_, LlmError>(Some(llm.register_adapter("test", a)?))
-                })?;
-                Ok::<_, CordisError>(())
-            })
-            .inject(["llm"]),
-            (),
-        )
-        .await
-        .unwrap();
-        app
+    fn setup_app_with_adapter<A: LlmAdapter>(adapter: A) -> TestHarness {
+        let llm = LlmRuntime::new();
+        let sessions = SessionStore::new();
+        let tools = ToolRuntime::new();
+        let system_prompt = SystemPrompt::new(SystemPromptConfig::default());
+        let agent_loop = AgentLoop::new(
+            Arc::clone(&llm),
+            Arc::clone(&tools),
+            Arc::clone(&sessions),
+            Arc::clone(&system_prompt),
+            AgentLoopConfig::default(),
+        );
+        let adapter_guard = llm.register_adapter("test", Arc::new(adapter)).unwrap();
+        TestHarness {
+            llm,
+            sessions,
+            tools,
+            system_prompt,
+            agent_loop,
+            _adapter_guard: adapter_guard,
+        }
     }
 
     #[tokio::test]
@@ -1736,10 +1659,9 @@ mod tests {
         let seen_models = Arc::new(Mutex::new(Vec::new()));
         let app = setup_app_with_adapter(CancelStreamAdapter {
             seen_models: Arc::clone(&seen_models),
-        })
-        .await;
+        });
 
-        let session = app.sessions().unwrap().create(None);
+        let session = app.sessions.create(None);
         let cancel = CancellationToken::new();
         let cancel_trigger = cancel.clone();
         tokio::spawn(async move {
@@ -1748,8 +1670,7 @@ mod tests {
         });
 
         let err = app
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run_with_options(
                 Arc::clone(&session),
                 "测试中断",
@@ -1786,8 +1707,6 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -1812,9 +1731,9 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(SlowOrEmptyAdapter(AtomicUsize::new(0))).await;
-        let session = app.sessions().unwrap().create(None);
-        let agent = app.agent_loop().unwrap();
+        let app = setup_app_with_adapter(SlowOrEmptyAdapter(AtomicUsize::new(0)));
+        let session = app.sessions.create(None);
+        let agent = Arc::clone(&app.agent_loop);
 
         let s1 = Arc::clone(&session);
         let a1 = Arc::clone(&agent);
@@ -1836,8 +1755,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(empty_err, AgentError::Llm(e) if e.code == LlmErrorCode::EmptyResponse));
         assert_eq!(session.log().len(), 4); // environment-context + first user + first assistant + third user
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -1884,19 +1801,19 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(MultiCallAdapter(AtomicUsize::new(0))).await;
+        let app = setup_app_with_adapter(MultiCallAdapter(AtomicUsize::new(0)));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let overlapped = Arc::new(AtomicBool::new(false));
         let updates = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let updates_sub = Arc::clone(&updates);
-        let _updates_guard = app.agent_loop().unwrap().on_event(move |ev| {
+        let _updates_guard = app.agent_loop.on_event(move |ev| {
             if let AgentEvent::ToolUpdate(ev) = ev {
                 updates_sub.lock().unwrap().push(ev.preview.clone());
             }
         });
 
-        let tools = app.tools().unwrap();
+        let tools = &app.tools;
         let in_flight_reg = Arc::clone(&in_flight);
         let overlapped_reg = Arc::clone(&overlapped);
         let _reg = tools
@@ -1916,7 +1833,7 @@ mod tests {
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                             cur.fetch_sub(1, Ordering::SeqCst);
-                            Ok::<_, cordis::BoxError>(mizar_tools::ToolOutput::text(format!(
+                            Ok::<_, BoxError>(mizar_tools::ToolOutput::text(format!(
                                 "id={}",
                                 args["id"]
                             )))
@@ -1927,10 +1844,9 @@ mod tests {
             )
             .unwrap();
 
-        let session = app.sessions().unwrap().create(None);
+        let session = app.sessions.create(None);
         let answer = app
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run(Arc::clone(&session), "go", CancellationToken::new())
             .await
             .unwrap();
@@ -1940,8 +1856,6 @@ mod tests {
             "parallel tools should overlap"
         );
         assert_eq!(updates.lock().unwrap().len(), 2);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -1977,23 +1891,21 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(ChainAdapter(AtomicUsize::new(0))).await;
+        let app = setup_app_with_adapter(ChainAdapter(AtomicUsize::new(0)));
         let _reg = app
-            .tools()
-            .unwrap()
+            .tools
             .register(ToolDefinition::sync_tool(
                 "ping",
                 "ping",
                 json!({}),
-                |_, _| Ok::<_, cordis::BoxError>("pong".to_string()),
+                |_, _| Ok::<_, BoxError>("pong".to_string()),
             ))
             .unwrap();
 
         // 默认不限步数：12 步工具链应顺利跑完而非被旧的 8 步限制打断
-        let s1 = app.sessions().unwrap().create(None);
+        let s1 = app.sessions.create(None);
         let reply = app
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run(Arc::clone(&s1), "marathon", CancellationToken::new())
             .await
             .unwrap();
@@ -2002,16 +1914,15 @@ mod tests {
         // 显式指定 RunOptions.max_steps 时应按上限中止并记录 MaxSteps
         let end_reasons = Arc::new(Mutex::new(Vec::<TurnEndReason>::new()));
         let reasons_sub = Arc::clone(&end_reasons);
-        let _reasons_guard = app.agent_loop().unwrap().on_event(move |ev| {
+        let _reasons_guard = app.agent_loop.on_event(move |ev| {
             if let AgentEvent::TurnEnd(ev) = ev {
                 reasons_sub.lock().unwrap().push(ev.reason.clone());
             }
         });
 
-        let s2 = app.sessions().unwrap().create(None);
+        let s2 = app.sessions.create(None);
         let capped = app
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run_with_options(
                 Arc::clone(&s2),
                 "capped",
@@ -2055,8 +1966,6 @@ mod tests {
                 detail: SessionTraceEvent::TurnEnd { reason, .. }
             } if reason == "max_steps"
         )));
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2085,23 +1994,22 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(TruncatedAdapter(AtomicUsize::new(0))).await;
+        let app = setup_app_with_adapter(TruncatedAdapter(AtomicUsize::new(0)));
         let step_outcomes = Arc::new(Mutex::new(Vec::<StepOutcome>::new()));
         let end_reasons = Arc::new(Mutex::new(Vec::<TurnEndReason>::new()));
 
         let so_sub = Arc::clone(&step_outcomes);
         let tr_sub = Arc::clone(&end_reasons);
-        let _outcomes_guard = app.agent_loop().unwrap().on_event(move |ev| match ev {
+        let _outcomes_guard = app.agent_loop.on_event(move |ev| match ev {
             AgentEvent::StepEnd(ev) => so_sub.lock().unwrap().push(ev.outcome.clone()),
             AgentEvent::TurnEnd(ev) => tr_sub.lock().unwrap().push(ev.reason.clone()),
             _ => {}
         });
 
         // 1. 文本在 FinishReason::MaxTokens 下截断：步级为 MaxTokens，轮级必须为 Truncated 而非 Completed
-        let s1 = app.sessions().unwrap().create(None);
+        let s1 = app.sessions.create(None);
         let reply1 = app
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run(Arc::clone(&s1), "请写长文", CancellationToken::new())
             .await
             .unwrap();
@@ -2122,10 +2030,9 @@ mod tests {
         )));
 
         // 2. 仅思考耗尽预算、无正文的 MaxTokens 截断：同样不得记成 Completed
-        let s2 = app.sessions().unwrap().create(None);
+        let s2 = app.sessions.create(None);
         let reply2 = app
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run(Arc::clone(&s2), "深度推理", CancellationToken::new())
             .await
             .unwrap();
@@ -2134,8 +2041,6 @@ mod tests {
             end_reasons.lock().unwrap().last(),
             Some(&TurnEndReason::Truncated)
         );
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2186,21 +2091,19 @@ mod tests {
 
         let app = setup_app_with_adapter(ModeAdapter {
             calls: AtomicUsize::new(0),
-        })
-        .await;
+        });
         let _reg = app
-            .tools()
-            .unwrap()
+            .tools
             .register(ToolDefinition::sync_tool(
                 "ping",
                 "ping",
                 json!({}),
-                |_, _| Ok::<_, cordis::BoxError>("pong".to_string()),
+                |_, _| Ok::<_, BoxError>("pong".to_string()),
             ))
             .unwrap();
-        let agent = app.agent_loop().unwrap();
+        let agent = &app.agent_loop;
 
-        let s_ok = app.sessions().unwrap().create(None);
+        let s_ok = app.sessions.create(None);
         let r_ok = agent
             .run_with_report(s_ok, "hi", CancellationToken::new(), RunOptions::default())
             .await
@@ -2210,7 +2113,7 @@ mod tests {
         assert_eq!(r_ok.last_step_outcome, Some(StepOutcome::Completed));
         assert_eq!(r_ok.steps, 1);
 
-        let s_trunc = app.sessions().unwrap().create(None);
+        let s_trunc = app.sessions.create(None);
         let r_trunc = agent
             .run_with_report(
                 s_trunc,
@@ -2224,7 +2127,7 @@ mod tests {
         assert_eq!(r_trunc.last_step_outcome, Some(StepOutcome::MaxTokens));
         assert_eq!(r_trunc.steps, 1);
 
-        let s_cap = app.sessions().unwrap().create(None);
+        let s_cap = app.sessions.create(None);
         let r_cap = agent
             .run_with_report(
                 s_cap,
@@ -2240,8 +2143,6 @@ mod tests {
         assert_eq!(r_cap.reason, TurnEndReason::MaxSteps);
         assert_eq!(r_cap.last_step_outcome, Some(StepOutcome::ToolCalls));
         assert_eq!(r_cap.steps, 2);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2309,23 +2210,20 @@ mod tests {
 
         let app = setup_app_with_adapter(MultiRecoveryAdapter {
             calls: AtomicUsize::new(0),
-        })
-        .await;
+        });
         let _reg = app
-            .tools()
-            .unwrap()
+            .tools
             .register(ToolDefinition::sync_tool(
                 "ping",
                 "ping",
                 json!({}),
-                |_, _| Ok::<_, cordis::BoxError>("pong".to_string()),
+                |_, _| Ok::<_, BoxError>("pong".to_string()),
             ))
             .unwrap();
 
         let overflow_reasons = Arc::new(Mutex::new(Vec::<String>::new()));
         let rec = Arc::clone(&overflow_reasons);
-        app.on_waterfall(
-            EVENT_AGENT_REQUEST_ERROR,
+        let _err_hook = app.agent_loop.request_error_hook().register(
             move |input: AgentRequestErrorInput,
                   next: Next<
                 AgentRequestErrorInput,
@@ -2340,11 +2238,10 @@ mod tests {
                     next.call(input).await
                 }) as BoxFuture<'static, AgentRequestErrorDecision>
             },
-        )
-        .unwrap();
+        );
 
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
 
         let r1 = agent
             .run_with_report(
@@ -2373,8 +2270,6 @@ mod tests {
         assert_eq!(reasons.len(), 2, "reasons={reasons:?}");
         assert!(reasons[0].contains("consecutive short max_tokens cutoffs"));
         assert!(reasons[1].contains("context length exceeded at step 2"));
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2403,9 +2298,9 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(ReasoningOnlyAdapter(AtomicUsize::new(0))).await;
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let app = setup_app_with_adapter(ReasoningOnlyAdapter(AtomicUsize::new(0)));
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
 
         // 1. Stop 但仅有 Reasoning 无任何 Text/ToolCall -> 必须报 EmptyResponse，不得空转 Completed
         let err = agent
@@ -2430,8 +2325,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rep.reason, TurnEndReason::Truncated);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2476,16 +2369,14 @@ mod tests {
         let app = setup_app_with_adapter(SteerAdapter {
             step: AtomicUsize::new(0),
             recorded: Arc::clone(&recorded),
-        })
-        .await;
+        });
 
         let tool_started = Arc::new(tokio::sync::Notify::new());
         let tool_release = Arc::new(tokio::sync::Notify::new());
         let started_sig = Arc::clone(&tool_started);
         let release_sig = Arc::clone(&tool_release);
         let _reg = app
-            .tools()
-            .unwrap()
+            .tools
             .register(ToolDefinition::async_tool(
                 "gate_tool",
                 "waits before returning",
@@ -2496,14 +2387,14 @@ mod tests {
                     async move {
                         s.notify_one();
                         r.notified().await;
-                        Ok::<_, cordis::BoxError>("tool_done".to_string())
+                        Ok::<_, BoxError>("tool_done".to_string())
                     }
                 },
             ))
             .unwrap();
 
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let agent = Arc::clone(&app.agent_loop);
+        let sess = app.sessions.create(None);
         let cancel = CancellationToken::new();
 
         let agent_bg = Arc::clone(&agent);
@@ -2547,8 +2438,6 @@ mod tests {
             step2_texts.iter().any(|t| t.contains("steer beta")),
             "step 2 must include steered user prompt: {step2_texts:?}"
         );
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2574,10 +2463,10 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(DraftAdapter(AtomicUsize::new(0))).await;
-        let agent = app.agent_loop().unwrap();
-        let s1 = app.sessions().unwrap().create(None);
-        let s2 = app.sessions().unwrap().create(None);
+        let app = setup_app_with_adapter(DraftAdapter(AtomicUsize::new(0)));
+        let agent = Arc::clone(&app.agent_loop);
+        let s1 = app.sessions.create(None);
+        let s2 = app.sessions.create(None);
         agent.inbox().set_auto_wake_limit(&s1.id, 2);
         agent.inbox().set_auto_wake_limit(&s2.id, 2);
 
@@ -2588,39 +2477,38 @@ mod tests {
         let s1_stops_hook = Arc::clone(&s1_stops);
         let s2_stops_hook = Arc::clone(&s2_stops);
         let agent_hook = Arc::clone(&agent);
-        app.on_serial(
-            EVENT_AGENT_TURN_STOPPING,
-            move |ev: AgentTurnStoppingEvent| {
-                let agent = Arc::clone(&agent_hook);
-                let s1_id = s1_id.clone();
-                let s2_id = s2_id.clone();
-                let s1_stops = Arc::clone(&s1_stops_hook);
-                let s2_stops = Arc::clone(&s2_stops_hook);
-                let sid = ev.session.id.clone();
-                let last_text = ev.last_text.clone();
-                Box::pin(async move {
-                    if sid == s1_id {
-                        s1_stops.fetch_add(1, Ordering::SeqCst);
-                        if last_text.starts_with("draft-1") {
+        let _stop_guard =
+            app.agent_loop
+                .turn_stopping_hook()
+                .register(move |ev: &AgentTurnStoppingEvent| {
+                    let agent = Arc::clone(&agent_hook);
+                    let s1_id = s1_id.clone();
+                    let s2_id = s2_id.clone();
+                    let s1_stops = Arc::clone(&s1_stops_hook);
+                    let s2_stops = Arc::clone(&s2_stops_hook);
+                    let sid = ev.session.id.clone();
+                    let last_text = ev.last_text.clone();
+                    Box::pin(async move {
+                        if sid == s1_id {
+                            s1_stops.fetch_add(1, Ordering::SeqCst);
+                            if last_text.starts_with("draft-1") {
+                                agent.inbox().push(
+                                    &sid,
+                                    DeliveryMode::Steer,
+                                    TurnInput::notice("verifier", "retry with fix"),
+                                );
+                            }
+                        } else if sid == s2_id {
+                            s2_stops.fetch_add(1, Ordering::SeqCst);
                             agent.inbox().push(
                                 &sid,
                                 DeliveryMode::Steer,
-                                TurnInput::notice("verifier", "retry with fix"),
+                                TurnInput::notice("loop-guard", "never stop"),
                             );
                         }
-                    } else if sid == s2_id {
-                        s2_stops.fetch_add(1, Ordering::SeqCst);
-                        agent.inbox().push(
-                            &sid,
-                            DeliveryMode::Steer,
-                            TurnInput::notice("loop-guard", "never stop"),
-                        );
-                    }
-                    Some(())
-                })
-            },
-        )
-        .unwrap();
+                        Some(())
+                    })
+                });
 
         // 1. 一次拦停后满足条件放行
         let r1 = agent
@@ -2656,8 +2544,6 @@ mod tests {
         let snap = agent.inbox().snapshot(&s2.id);
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].mode, DeliveryMode::Inject);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2679,9 +2565,9 @@ mod tests {
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let app = setup_app_with_adapter(EchoAllAdapter(Arc::clone(&seen))).await;
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let app = setup_app_with_adapter(EchoAllAdapter(Arc::clone(&seen)));
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
         agent.inbox().set_auto_wake_limit(&sess.id, 2);
         let mut wake_rx = agent.inbox().subscribe_wake();
 
@@ -2746,8 +2632,6 @@ mod tests {
         assert_eq!(p4.effective_mode, DeliveryMode::FollowUp);
         assert!(!p4.degraded);
         assert_eq!(agent.inbox().auto_wakes_since_human(&sess.id), 1);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2769,9 +2653,8 @@ mod tests {
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let app = setup_app_with_adapter(RecordingEcho(Arc::clone(&seen))).await;
-        app.on_waterfall(
-            EVENT_AGENT_PRE_STEP,
+        let app = setup_app_with_adapter(RecordingEcho(Arc::clone(&seen)));
+        let _pre_step_guard = app.agent_loop.pre_step_hook().register(
             |input: AgentPreStepInput,
              next: Next<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>| {
                 Box::pin(async move {
@@ -2786,11 +2669,10 @@ mod tests {
                     next.call(input).await
                 }) as BoxFuture<'static, AgentPreStepDecision>
             },
-        )
-        .unwrap();
+        );
 
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
 
         let err = agent
             .run(
@@ -2839,8 +2721,6 @@ mod tests {
                 .any(|m| m.text_content().contains("<environment_context>")),
             "post-compaction call must re-inject environment_context"
         );
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2868,13 +2748,12 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(FlakyStreamAdapter(AtomicUsize::new(0))).await;
+        let app = setup_app_with_adapter(FlakyStreamAdapter(AtomicUsize::new(0)));
         let seen_kinds = Arc::new(Mutex::new(Vec::new()));
         let rec = Arc::clone(&seen_kinds);
         let retried = Arc::new(AtomicUsize::new(0));
         let retried_hook = Arc::clone(&retried);
-        app.on_waterfall(
-            EVENT_AGENT_REQUEST_ERROR,
+        let _req_err_guard = app.agent_loop.request_error_hook().register(
             move |input: AgentRequestErrorInput,
                   next: Next<
                 AgentRequestErrorInput,
@@ -2894,11 +2773,10 @@ mod tests {
                     next.call(input).await
                 }) as BoxFuture<'static, AgentRequestErrorDecision>
             },
-        )
-        .unwrap();
+        );
 
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
         let text = agent
             .run(Arc::clone(&sess), "retry me", CancellationToken::new())
             .await
@@ -2908,8 +2786,6 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].0, AgentRequestErrorKind::StreamError);
         assert!(recorded[0].1.contains("transient upstream 503"));
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -2955,28 +2831,27 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(ToolFirstTokenAdapter(AtomicUsize::new(0))).await;
+        let app = setup_app_with_adapter(ToolFirstTokenAdapter(AtomicUsize::new(0)));
         let _reg = app
-            .tools()
-            .unwrap()
+            .tools
             .register(ToolDefinition::sync_tool(
                 "echo",
                 "echo",
                 json!({ "type": "object", "properties": {} }),
-                |_, _| Ok::<_, cordis::BoxError>("ok".to_string()),
+                |_, _| Ok::<_, BoxError>("ok".to_string()),
             ))
             .unwrap();
 
         let first_tokens = Arc::new(Mutex::new(Vec::<usize>::new()));
         let ft_cap = Arc::clone(&first_tokens);
-        let _ft_guard = app.agent_loop().unwrap().on_event(move |ev| {
+        let _ft_guard = app.agent_loop.on_event(move |ev| {
             if let AgentEvent::StepFirstToken(ev) = ev {
                 ft_cap.lock().unwrap().push(ev.step);
             }
         });
 
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
         let text = agent
             .run(Arc::clone(&sess), "call tool", CancellationToken::new())
             .await
@@ -2994,8 +2869,6 @@ mod tests {
             })
             .collect();
         assert_eq!(trace_ft, vec![1, 2]);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -3056,12 +2929,11 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(MalformedArgsAdapter(AtomicUsize::new(0))).await;
+        let app = setup_app_with_adapter(MalformedArgsAdapter(AtomicUsize::new(0)));
         let executed = Arc::new(Mutex::new(Vec::<Value>::new()));
         let exec_cap = Arc::clone(&executed);
         let _reg = app
-            .tools()
-            .unwrap()
+            .tools
             .register(ToolDefinition::sync_tool(
                 "write_item",
                 "write item",
@@ -3072,13 +2944,13 @@ mod tests {
                 }),
                 move |args, _| {
                     exec_cap.lock().unwrap().push(args);
-                    Ok::<_, cordis::BoxError>("wrote ok.txt".to_string())
+                    Ok::<_, BoxError>("wrote ok.txt".to_string())
                 },
             ))
             .unwrap();
 
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
         let text = agent
             .run(Arc::clone(&sess), "do write", CancellationToken::new())
             .await
@@ -3111,8 +2983,6 @@ mod tests {
         assert!(tool_results[1].1.contains("expected a JSON object"));
         assert_eq!(tool_results[2].0, "c_fixed");
         assert!(!tool_results[2].2);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -3144,18 +3014,15 @@ mod tests {
             }
         }
 
-        // 1. 未装配 LlmRetryPlugin 时，AgentLoop 内部自动重试并成功
-        let app_no_retry =
-            setup_app_with_adapter(ReasoningThenAnswerAdapter(AtomicUsize::new(0))).await;
-        let sess1 = app_no_retry.sessions().unwrap().create(None);
+        // 1. 未装配 Retry 拦截时，AgentLoop 内部自动重试并成功
+        let app_no_retry = setup_app_with_adapter(ReasoningThenAnswerAdapter(AtomicUsize::new(0)));
+        let sess1 = app_no_retry.sessions.create(None);
         let text1 = app_no_retry
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run(Arc::clone(&sess1), "hi", CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(text1, "final answer");
-        app_no_retry.fiber().dispose().await;
 
         // 2. 模拟 LlmRetryPlugin 对仅推理流返回 Err(EmptyResponse) 时，AgentLoop 同样自动重试并成功
         struct StreamEmptyErrThenAnswerAdapter(AtomicUsize);
@@ -3186,16 +3053,14 @@ mod tests {
         }
 
         let app_stream_err =
-            setup_app_with_adapter(StreamEmptyErrThenAnswerAdapter(AtomicUsize::new(0))).await;
-        let sess2 = app_stream_err.sessions().unwrap().create(None);
+            setup_app_with_adapter(StreamEmptyErrThenAnswerAdapter(AtomicUsize::new(0)));
+        let sess2 = app_stream_err.sessions.create(None);
         let text2 = app_stream_err
-            .agent_loop()
-            .unwrap()
+            .agent_loop
             .run(Arc::clone(&sess2), "hi", CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(text2, "recovered answer");
-        app_stream_err.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -3208,9 +3073,9 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(NoopAdapter).await;
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let app = setup_app_with_adapter(NoopAdapter);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
 
         let log = Arc::new(Mutex::new(Vec::<(&'static str, usize)>::new()));
         let log1 = Arc::clone(&log);
@@ -3248,7 +3113,6 @@ mod tests {
         );
 
         drop(g2);
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -3261,9 +3125,9 @@ mod tests {
             }
         }
 
-        let app = setup_app_with_adapter(NoopAdapter).await;
-        let agent = app.agent_loop().unwrap();
-        let sess = app.sessions().unwrap().create(None);
+        let app = setup_app_with_adapter(NoopAdapter);
+        let agent = &app.agent_loop;
+        let sess = app.sessions.create(None);
 
         let mut rx = agent.subscribe();
         agent.emit_event(AgentEvent::Status(AgentStatusEvent {
@@ -3291,7 +3155,5 @@ mod tests {
             }
             other => panic!("unexpected second event: {other:?}"),
         }
-
-        app.fiber().dispose().await;
     }
 }

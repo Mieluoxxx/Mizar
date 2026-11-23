@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use cordis::{BoxFuture as CordisBoxFuture, Cleanup, Context, CordisError, Service};
+use mizar_types::{HookGuard, SyncEventBus};
 
 #[cfg(all(mizar_loom, test))]
 mod sync {
@@ -23,7 +23,6 @@ use crate::skills::types::{
     SkillProviderObservation, SkillRegistration, SkillSummary, is_skill_name,
 };
 
-pub const EVENT_SKILLS_CHANGE: &str = "skills/change";
 const DEFAULT_COLLECT_CACHE_MAX: usize = 128;
 const MAX_COLLECT_ATTEMPTS: usize = 2;
 
@@ -204,13 +203,30 @@ pub struct SkillRegistryConfig {
 }
 
 pub struct SkillRegistry {
-    ctx: Context,
     enabled: sync::AtomicBool,
     next_id: sync::AtomicU64,
     catalog: VersionedCatalog<RegisteredProvider, RuntimeEntry, Option<PathBuf>, CachedCollect>,
+    on_change: SyncEventBus<()>,
 }
 
 impl SkillRegistry {
+    pub fn new(config: SkillRegistryConfig) -> Arc<Self> {
+        let cache_max = config
+            .collect_cache_max_entries
+            .unwrap_or(DEFAULT_COLLECT_CACHE_MAX)
+            .max(1);
+        Arc::new(Self {
+            enabled: sync::AtomicBool::new(true),
+            next_id: sync::AtomicU64::new(1),
+            catalog: VersionedCatalog::new(cache_max),
+            on_change: SyncEventBus::new(),
+        })
+    }
+
+    pub fn on_change(&self, cb: impl Fn(&()) + Send + Sync + 'static) -> HookGuard {
+        self.on_change.on(cb)
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(sync::Ordering::Acquire)
     }
@@ -218,14 +234,14 @@ impl SkillRegistry {
     pub fn set_enabled(&self, enabled: bool) {
         let prev = self.enabled.swap(enabled, sync::Ordering::AcqRel);
         if prev != enabled {
-            self.ctx.emit(EVENT_SKILLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
     pub fn register_provider(
         self: &Arc<Self>,
         provider: Arc<dyn SkillProvider>,
-    ) -> Result<Cleanup, String> {
+    ) -> Result<HookGuard, String> {
         let name = provider.name().to_string();
         if name == "runtime" {
             return Err("\"runtime\" is reserved for runtime skill registrations".to_string());
@@ -247,11 +263,11 @@ impl SkillRegistry {
         });
         res?;
         if changed {
-            self.ctx.emit(EVENT_SKILLS_CHANGE, ());
+            self.on_change.emit(&());
         }
 
         let weak = Arc::downgrade(self);
-        Ok(Cleanup::sync(move || {
+        Ok(HookGuard::new(move || {
             if let Some(reg) = weak.upgrade() {
                 let (_, changed) = reg.catalog.mutate_data(|providers, _| {
                     let before = providers.len();
@@ -259,13 +275,13 @@ impl SkillRegistry {
                     ((), providers.len() != before)
                 });
                 if changed {
-                    reg.ctx.emit(EVENT_SKILLS_CHANGE, ());
+                    reg.on_change.emit(&());
                 }
             }
         }))
     }
 
-    pub fn register(self: &Arc<Self>, skill: SkillRegistration) -> Result<Cleanup, String> {
+    pub fn register(self: &Arc<Self>, skill: SkillRegistration) -> Result<HookGuard, String> {
         if !is_skill_name(&skill.name) {
             return Err(format!("invalid skill name \"{}\"", skill.name));
         }
@@ -305,14 +321,14 @@ impl SkillRegistry {
                 target: "mizar::skills",
                 "runtime skill \"{skill_name}\" ignored because it is already registered"
             );
-            return Ok(Cleanup::sync(|| {}));
+            return Ok(HookGuard::noop());
         }
         if changed {
-            self.ctx.emit(EVENT_SKILLS_CHANGE, ());
+            self.on_change.emit(&());
         }
 
         let weak = Arc::downgrade(self);
-        Ok(Cleanup::sync(move || {
+        Ok(HookGuard::new(move || {
             if let Some(reg) = weak.upgrade() {
                 let (_, changed) = reg.catalog.mutate_data(|_, runtime_skills| {
                     let before = runtime_skills.len();
@@ -320,7 +336,7 @@ impl SkillRegistry {
                     ((), runtime_skills.len() != before)
                 });
                 if changed {
-                    reg.ctx.emit(EVENT_SKILLS_CHANGE, ());
+                    reg.on_change.emit(&());
                 }
             }
         }))
@@ -328,7 +344,7 @@ impl SkillRegistry {
 
     pub fn invalidate_cache(&self) {
         self.catalog.invalidate();
-        self.ctx.emit(EVENT_SKILLS_CHANGE, ());
+        self.on_change.emit(&());
     }
 
     async fn is_cache_fresh(
@@ -546,45 +562,6 @@ impl SkillRegistry {
             return Ok(None);
         }
         Ok(Some(def))
-    }
-}
-
-impl Service for SkillRegistry {
-    type Config = SkillRegistryConfig;
-
-    fn service_name() -> &'static str {
-        "skills"
-    }
-
-    fn plugin_name() -> &'static str {
-        "SkillRegistry"
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        let cache_max = config
-            .collect_cache_max_entries
-            .unwrap_or(DEFAULT_COLLECT_CACHE_MAX)
-            .max(1);
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            enabled: sync::AtomicBool::new(true),
-            next_id: sync::AtomicU64::new(1),
-            catalog: VersionedCatalog::new(cache_max),
-        }))
-    }
-
-    fn init(self: Arc<Self>, _ctx: &Context) -> CordisBoxFuture<'static, Result<(), CordisError>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-pub trait SkillsContextExt {
-    fn skills(&self) -> Result<Arc<SkillRegistry>, CordisError>;
-}
-
-impl SkillsContextExt for Context {
-    fn skills(&self) -> Result<Arc<SkillRegistry>, CordisError> {
-        self.service::<SkillRegistry>("skills")
     }
 }
 

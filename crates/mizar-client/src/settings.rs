@@ -2,11 +2,10 @@
 
 use std::path::Path;
 
-use cordis::Context;
-use mizar_core::session_title::{SessionTitleContextExt, parse_model_ref};
+use mizar_core::session_title::parse_model_ref;
 use mizar_core::spine::{
-    CompactionContextExt, SpinePluginsContextExt, normalize_session_title_thinking_level,
-    patch_settings_file, persist_disabled_plugins, resolve_global_settings_path,
+    MizarRuntime, normalize_session_title_thinking_level, patch_settings_file,
+    persist_disabled_plugins, resolve_global_settings_path,
 };
 use mizar_llm::ReasoningEffort;
 use mizar_types::client::{ApprovalMode, NoticeLevel, SettingEntry, SettingItemKind};
@@ -39,7 +38,7 @@ impl Default for SettingsViewSnapshot {
     }
 }
 
-/// 内置 Cordis 模块热切换的结构化执行结果，供各端（TUI / Merak）同步各自界面与提示。
+/// 内置可选模块热切换的结构化执行结果，供各端（TUI / Merak）同步各自界面与提示。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleToggleOutcome {
     pub ok: bool,
@@ -74,8 +73,11 @@ fn parse_max_context_tokens_label(label: &str) -> Option<u64> {
     }
 }
 
-/// 根据前端视图快照与 Cordis 运行时服务状态构建统一 `/settings` 条目列表。
-pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec<SettingEntry> {
+/// 根据前端视图快照与运行时服务状态构建统一 `/settings` 条目列表。
+pub fn build_settings_entries(
+    runtime: &MizarRuntime,
+    snap: &SettingsViewSnapshot,
+) -> Vec<SettingEntry> {
     let theme_opts = [
         "auto",
         "mist-dark",
@@ -174,7 +176,7 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         },
     ];
 
-    if let Ok(comp) = ctx.compaction()
+    if let Some(comp) = runtime.compaction.as_ref()
         && comp.is_module_enabled()
     {
         let cfg = comp.config();
@@ -212,7 +214,7 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         ]);
     }
 
-    if let Ok(st) = ctx.session_title()
+    if let Some(st) = runtime.session_title.as_ref()
         && st.is_module_enabled()
     {
         let cfg = st.config();
@@ -250,18 +252,16 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         ]);
     }
 
-    if let Ok(plugins) = ctx.spine_plugins() {
-        for module in plugins.optional_modules() {
-            items.push(SettingEntry {
-                key: format!("plugin.{}", module.id),
-                category: "模块".into(),
-                label: format!("{} ({})", module.label, module.id),
-                description: module.description,
-                kind: SettingItemKind::Toggle {
-                    value: module.enabled,
-                },
-            });
-        }
+    for module in runtime.modules.optional_modules() {
+        items.push(SettingEntry {
+            key: format!("plugin.{}", module.id),
+            category: "模块".into(),
+            label: format!("{} ({})", module.label, module.id),
+            description: module.description,
+            kind: SettingItemKind::Toggle {
+                value: module.enabled,
+            },
+        });
     }
 
     items
@@ -269,25 +269,12 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
 
 /// 运行期热更新内置 `SpinePlugins` 模块的启用状态，并可选原子写回 `disabledPlugins`。
 pub async fn toggle_spine_module(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     settings_path: Option<&Path>,
     plugin_id: &str,
     enabled: bool,
 ) -> ModuleToggleOutcome {
-    let Ok(plugins) = ctx.spine_plugins() else {
-        return ModuleToggleOutcome {
-            ok: false,
-            plugin_id: plugin_id.to_string(),
-            enabled,
-            label: plugin_id.to_string(),
-            disabled_ids: Vec::new(),
-            flash: None,
-            notices: vec![(
-                NoticeLevel::Error,
-                "spinePlugins 控制器服务不可用".to_string(),
-            )],
-        };
-    };
+    let plugins = &runtime.modules;
 
     let label = plugins
         .get(plugin_id)
@@ -343,9 +330,9 @@ pub async fn toggle_spine_module(
 }
 
 /// 运行期热更新与终端实例无关的模块配置（`compaction.*`、`sessionTitle.*`）。
-pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
+pub fn apply_runtime_setting_change(runtime: &MizarRuntime, key: &str, value: &str) {
     if key.starts_with("compaction.")
-        && let Ok(comp) = ctx.compaction()
+        && let Some(comp) = runtime.compaction.as_ref()
     {
         let flag = value == "true";
         comp.update_config(|cfg| match key {
@@ -357,7 +344,7 @@ pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
             _ => {}
         });
     } else if key.starts_with("sessionTitle.")
-        && let Ok(st) = ctx.session_title()
+        && let Some(st) = runtime.session_title.as_ref()
     {
         st.update_config(|cfg| match key {
             "sessionTitle.enabled" => cfg.enabled = value == "true",
@@ -508,8 +495,7 @@ pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
-    use mizar_session::SessionContextExt;
+    use mizar_core::spine::{AgentSpineConfig, AgentToolsMode};
 
     use super::*;
 
@@ -532,27 +518,25 @@ mod tests {
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         std::fs::write(&settings_path, r#"{"defaultModel":"gpt-4o"}"#).unwrap();
 
-        let ctx = Context::new();
         let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
         if let AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
             mcp.global_config_dir = Some(tmp.join(".mizar"));
         }
-        ctx.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        crate::events::wait_for_services(&ctx).await.unwrap();
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let session = ctx.sessions().unwrap().create(None);
+        let session = runtime.sessions.create(None);
         let snap = SettingsViewSnapshot::default();
         assert!(
-            crate::workspace::collect_user_skill_names(&ctx, &ws)
+            crate::workspace::collect_user_skill_names(&runtime, &ws)
                 .await
                 .contains(&"client-demo".to_string())
         );
         assert!(
-            !crate::workspace::collect_instructions_summary(&ctx, Some(&session.id)).is_empty()
+            !crate::workspace::collect_instructions_summary(&runtime, Some(&session.id)).is_empty()
         );
 
         // 启动时 compaction 被屏蔽：设置列表中不含 [压缩] 配置项，且 plugin.compaction 为 false
-        let initial_entries = build_settings_entries(&ctx, &snap);
+        let initial_entries = build_settings_entries(&runtime, &snap);
         assert!(
             !initial_entries.iter().any(|e| e.category == "压缩"),
             "compaction entries must be omitted while module is disabled"
@@ -564,12 +548,13 @@ mod tests {
         assert_eq!(comp_entry.kind, SettingItemKind::Toggle { value: false });
 
         // 1. 运行期启用 compaction -> 服务上线 + 列表包含 [压缩] + 写入 disabledPlugins: []
-        let out_enable = toggle_spine_module(&ctx, Some(&settings_path), "compaction", true).await;
+        let out_enable =
+            toggle_spine_module(&runtime, Some(&settings_path), "compaction", true).await;
         assert!(out_enable.ok);
         assert!(out_enable.disabled_ids.is_empty());
-        assert!(ctx.compaction().unwrap().is_module_enabled());
+        assert!(runtime.compaction.as_ref().unwrap().is_module_enabled());
 
-        let after_enable = build_settings_entries(&ctx, &snap);
+        let after_enable = build_settings_entries(&runtime, &snap);
         let comp_keys: Vec<&str> = after_enable
             .iter()
             .filter(|e| e.category == "压缩")
@@ -583,17 +568,30 @@ mod tests {
                 "compaction.maxContextTokens",
             ]
         );
-        apply_runtime_setting_change(&ctx, "compaction.maxContextTokens", "200k");
+        apply_runtime_setting_change(&runtime, "compaction.maxContextTokens", "200k");
         assert_eq!(
-            ctx.compaction().unwrap().config().max_context_tokens,
+            runtime
+                .compaction
+                .as_ref()
+                .unwrap()
+                .config()
+                .max_context_tokens,
             Some(200_000)
         );
         persist_setting_change_to(&settings_path, "compaction.maxContextTokens", "200k").unwrap();
         let persisted_cap: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(persisted_cap["compaction"]["maxContextTokens"], 200_000);
-        apply_runtime_setting_change(&ctx, "compaction.maxContextTokens", "off");
-        assert_eq!(ctx.compaction().unwrap().config().max_context_tokens, None);
+        apply_runtime_setting_change(&runtime, "compaction.maxContextTokens", "off");
+        assert_eq!(
+            runtime
+                .compaction
+                .as_ref()
+                .unwrap()
+                .config()
+                .max_context_tokens,
+            None
+        );
         persist_setting_change_to(&settings_path, "compaction.maxContextTokens", "off").unwrap();
         let persisted_off: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -609,17 +607,19 @@ mod tests {
 
         // 2. 禁用 skills / instructions / compaction -> skills 与指令采集清空、[压缩] 移除、排序去重落盘
         for id in ["skills", "instructions", "compaction"] {
-            let res = toggle_spine_module(&ctx, Some(&settings_path), id, false).await;
+            let res = toggle_spine_module(&runtime, Some(&settings_path), id, false).await;
             assert!(res.ok);
         }
         assert!(
-            crate::workspace::collect_user_skill_names(&ctx, &ws)
+            crate::workspace::collect_user_skill_names(&runtime, &ws)
                 .await
                 .is_empty()
         );
-        assert!(crate::workspace::collect_instructions_summary(&ctx, Some(&session.id)).is_empty());
-        assert!(!ctx.compaction().unwrap().is_module_enabled());
-        let after_disable = build_settings_entries(&ctx, &snap);
+        assert!(
+            crate::workspace::collect_instructions_summary(&runtime, Some(&session.id)).is_empty()
+        );
+        assert!(!runtime.compaction.as_ref().unwrap().is_module_enabled());
+        let after_disable = build_settings_entries(&runtime, &snap);
         assert!(!after_disable.iter().any(|e| e.category == "压缩"));
         let persisted_2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -629,10 +629,10 @@ mod tests {
         );
 
         // 3. 尝试禁用受保护核心模块必须被拒绝且不破坏已有配置
-        let protected_res = toggle_spine_module(&ctx, Some(&settings_path), "llm", false).await;
+        let protected_res = toggle_spine_module(&runtime, Some(&settings_path), "llm", false).await;
         assert!(!protected_res.ok);
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

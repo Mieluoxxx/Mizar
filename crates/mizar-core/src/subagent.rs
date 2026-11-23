@@ -19,14 +19,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentEvent, AgentLoopContextExt};
-use crate::system_prompt::{PromptSection, SystemPromptContextExt};
-use cordis::{
-    BoxError, BoxFuture, Cleanup, Context, CordisError, EventOptions, Inject, Next, Plugin,
-    Service, ServicePlugin,
-};
-use mizar_session::SessionContextExt;
-use mizar_tools::{EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolsContextExt};
+use crate::agent_loop::{AgentEvent, AgentLoop};
+use crate::system_prompt::{PromptSection, SystemPrompt};
+use mizar_llm::LlmRuntime;
+use mizar_session::SessionStore;
+use mizar_tools::{PreExecuteDecision, ToolError, ToolExecution, ToolRuntime};
+use mizar_types::{BoxFuture, HookGuard, HookOptions, Next, SyncEventBus};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -36,12 +34,9 @@ use guardrails::{
     is_subagent_child_session,
 };
 use tasks::{BackgroundTaskRegistry, ChildActivityTracker};
-pub use tasks::{
-    EVENT_SUBAGENT_STATE, SubagentRunStatus, SubagentStateEvent, SubagentTaskSnapshot,
-};
+pub use tasks::{SubagentRunStatus, SubagentStateEvent, SubagentTaskSnapshot};
 use tool::build_subagent_tool_definition;
 
-pub const SERVICE_SUBAGENT: &str = "subagent";
 pub const SUBAGENT_TOOL_NAME: &str = "subagent";
 pub const DEFAULT_SUBAGENT_MAX_STEPS: usize = 20;
 pub const DEFAULT_SUBAGENT_MAX_STEPS_CAP: usize = 40;
@@ -169,7 +164,10 @@ pub enum SubagentError {
 type TurnRouteMap = HashMap<String, (Option<String>, Option<String>)>;
 
 pub struct SubagentRuntime {
-    pub(crate) ctx: Context,
+    pub(crate) llm: Arc<LlmRuntime>,
+    pub(crate) tools: Arc<ToolRuntime>,
+    pub(crate) sessions: Arc<SessionStore>,
+    pub(crate) agent_loop: Arc<AgentLoop>,
     pub(crate) config: Arc<Mutex<SubagentConfig>>,
     pub(crate) module_enabled: AtomicBool,
     pub(crate) active_children: Arc<Mutex<ActiveChildrenMap>>,
@@ -178,11 +176,216 @@ pub struct SubagentRuntime {
     pub(crate) state_emit_lock: Arc<Mutex<()>>,
     pub(crate) parent_turn_routes: Arc<Mutex<TurnRouteMap>>,
     pub(crate) dispose_token: CancellationToken,
+    on_state: SyncEventBus<SubagentStateEvent>,
 }
 
 impl SubagentRuntime {
-    pub fn plugin() -> ServicePlugin<Self> {
-        ServicePlugin::new()
+    pub fn on_state(&self, cb: impl Fn(&SubagentStateEvent) + Send + Sync + 'static) -> HookGuard {
+        self.on_state.on(cb)
+    }
+
+    pub fn install(
+        llm: Arc<LlmRuntime>,
+        tools: Arc<ToolRuntime>,
+        sessions: Arc<SessionStore>,
+        agent_loop: Arc<AgentLoop>,
+        system_prompt: &Arc<SystemPrompt>,
+        config: SubagentConfig,
+    ) -> Result<(Arc<Self>, HookGuard), ToolError> {
+        let rt = Arc::new(Self {
+            llm,
+            tools: Arc::clone(&tools),
+            sessions: Arc::clone(&sessions),
+            agent_loop: Arc::clone(&agent_loop),
+            config: Arc::new(Mutex::new(config)),
+            module_enabled: AtomicBool::new(true),
+            active_children: Arc::new(Mutex::new(HashMap::new())),
+            activity_trackers: Arc::new(Mutex::new(HashMap::new())),
+            tasks: Arc::new(Mutex::new(BackgroundTaskRegistry::default())),
+            state_emit_lock: Arc::new(Mutex::new(())),
+            parent_turn_routes: Arc::new(Mutex::new(HashMap::new())),
+            dispose_token: CancellationToken::new(),
+            on_state: SyncEventBus::new(),
+        });
+
+        let mut guards = Vec::new();
+
+        // 1. 先在 `tools.pre_execute_hook()` 最外层挂载硬护栏，再注册工具（LIFO 卸载时先下线工具再撤护栏）
+        {
+            let active_guard = Arc::clone(&rt.active_children);
+            let tools_guard = Arc::clone(&tools);
+            let sessions_guard = Arc::clone(&sessions);
+            guards.push(tools.pre_execute_hook().register_with(
+                HookOptions {
+                    priority: -100,
+                    prepend: true,
+                },
+                move |exec: ToolExecution,
+                      next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+                    let active_children = Arc::clone(&active_guard);
+                    let tools = Arc::clone(&tools_guard);
+                    let sessions = Arc::clone(&sessions_guard);
+                    Box::pin(async move {
+                        let decision =
+                            check_pre_execute(&exec, &active_children, &tools, &sessions);
+                        if !decision.allow {
+                            return decision;
+                        }
+                        next.call(exec).await
+                    }) as BoxFuture<'static, PreExecuteDecision>
+                },
+            ));
+        }
+
+        // 2. 订阅强类型 AgentEvent 维护子会话实时活性快照与父轮次路由（无阻塞、不影响主会话）
+        {
+            let weak_events = Arc::downgrade(&rt);
+            let ev_guard = agent_loop.on_event(move |ev| {
+                let Some(rt_events) = weak_events.upgrade() else {
+                    return;
+                };
+                match ev {
+                    AgentEvent::StepStart(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            tracker.set_turn_step(ev.step);
+                        }
+                    }
+                    AgentEvent::ToolCall(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            let label =
+                                format_tool_activity_label(&ev.call.name, &ev.call.arguments);
+                            tracker.set_tool(&label);
+                        }
+                    }
+                    AgentEvent::ToolUpdate(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            if tracker.last_tool().is_none() {
+                                tracker.set_tool(&ev.name);
+                            } else {
+                                tracker.touch();
+                            }
+                        }
+                    }
+                    AgentEvent::ToolResult(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            if tracker.last_tool().is_none() {
+                                tracker.set_tool(&ev.name);
+                            } else {
+                                tracker.touch();
+                            }
+                        }
+                    }
+                    AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {
+                        let session_id = match ev {
+                            AgentEvent::TextDelta(e) => &e.session.id,
+                            AgentEvent::ReasoningDelta(e) => &e.session.id,
+                            _ => unreachable!(),
+                        };
+                        if let Some(tracker) = rt_events.tracker_for_child(session_id) {
+                            tracker.touch();
+                        }
+                    }
+                    AgentEvent::TurnInput(ev) => {
+                        if !rt_events
+                            .active_children
+                            .lock()
+                            .unwrap()
+                            .contains_key(&ev.session.id)
+                        {
+                            rt_events.parent_turn_routes.lock().unwrap().insert(
+                                ev.session.id.clone(),
+                                (ev.provider.clone(), ev.model.clone()),
+                            );
+                        }
+                    }
+                    AgentEvent::TurnEnd(ev) => {
+                        rt_events
+                            .parent_turn_routes
+                            .lock()
+                            .unwrap()
+                            .remove(&ev.session.id);
+                    }
+                    AgentEvent::Status(_)
+                    | AgentEvent::Request(_)
+                    | AgentEvent::TurnStart(_)
+                    | AgentEvent::StepFirstToken(_)
+                    | AgentEvent::StepEnd(_)
+                    | AgentEvent::Usage(_) => {}
+                }
+            });
+            guards.push(HookGuard::new(move || drop(ev_guard)));
+        }
+
+        // 3. 注册 `subagent` 工具（随守卫释放自动注销）
+        {
+            let def = build_subagent_tool_definition(Arc::clone(&rt));
+            guards.push(tools.register(def)?);
+        }
+
+        // 4. 向系统提示词注入精简静态分流契约（order = 60，子代理自身零感知且 KV Cache 前缀 100% 稳定）
+        {
+            let weak_prompt = Arc::downgrade(&rt);
+            let active_prompt = Arc::clone(&rt.active_children);
+            let sessions_prompt = Arc::clone(&sessions);
+            guards.push(system_prompt.section(PromptSection::new_for_session(
+                "subagent",
+                60,
+                move |session_id| {
+                    if !weak_prompt
+                        .upgrade()
+                        .is_some_and(|r| r.is_module_enabled())
+                    {
+                        return None;
+                    }
+                    if let Some(sid) = session_id
+                        && (active_prompt.lock().unwrap().contains_key(sid)
+                            || is_subagent_child_session(&sessions_prompt, sid))
+                    {
+                        return None;
+                    }
+                    Some(
+                        "Subagent delegation (`subagent` tool, only when available):\n\
+- Balance responsiveness and efficiency: handle quick 1-3 step lookups directly, and delegate heavy, multi-file, log-heavy, or parallel tasks to background subagents (`action: \"spawn\"`, default) so you stay responsive to the user immediately.\n\
+- Launch independent subagents together in one step, give the user a brief acknowledgement, and end your turn instead of sleeping or polling — settled results arrive as follow-up notices.\n\
+- Use `action: \"send\"` (`name`, `prompt`) to steer a running subagent or wake a settled one with its retained session memory; use `action: \"status\"` for live step/tool/idle inspection or `action: \"stop\"` to cancel.\n\
+- When a `subagent-watchdog:*` alert arrives, inspect the snapshot and decide whether to reassure the user and wait, redirect via `send`, or cancel via `stop`."
+                            .to_string(),
+                    )
+                },
+            )));
+        }
+
+        // 5. 清理句柄：LIFO 卸载时先触发 dispose_token，再停止在飞任务并清零每个父会话状态栏计数
+        {
+            let weak_cleanup = Arc::downgrade(&rt);
+            let tasks_cleanup = Arc::clone(&rt.tasks);
+            let emit_lock_cleanup = Arc::clone(&rt.state_emit_lock);
+            let dispose_token = rt.dispose_token.clone();
+            guards.push(HookGuard::new(move || {
+                dispose_token.cancel();
+                let stopped_parents = tasks_cleanup.lock().unwrap().cancel_all();
+                if let Some(rt_ref) = weak_cleanup.upgrade() {
+                    for (parent_session_id, name, child_session_id, mode) in stopped_parents {
+                        let _guard = emit_lock_cleanup.lock().unwrap();
+                        let running_count = tasks_cleanup
+                            .lock()
+                            .unwrap()
+                            .running_count(&parent_session_id);
+                        rt_ref.on_state.emit(&SubagentStateEvent {
+                            parent_session_id,
+                            name,
+                            child_session_id,
+                            mode,
+                            status: SubagentRunStatus::Stopped,
+                            running_count,
+                            notice: None,
+                        });
+                    }
+                }
+            }));
+        }
+
+        Ok((rt, HookGuard::group(guards)))
     }
 
     pub fn is_module_enabled(&self) -> bool {
@@ -254,7 +457,7 @@ impl SubagentRuntime {
             .lock()
             .unwrap()
             .running_count(&ev.parent_session_id);
-        self.ctx.emit(EVENT_SUBAGENT_STATE, ev);
+        self.on_state.emit(&ev);
     }
 
     pub(crate) fn resolve_parent_route(
@@ -269,8 +472,7 @@ impl SubagentRuntime {
         {
             return route;
         }
-        if let Ok(sessions) = self.ctx.sessions()
-            && let Some(parent) = sessions.get(pid)
+        if let Some(parent) = self.sessions.get(pid)
             && let Some(sel) = parent.latest_selection()
         {
             return (sel.provider, sel.model);
@@ -284,270 +486,6 @@ impl SubagentRuntime {
             .unwrap()
             .get(session_id)
             .map(|(_, tracker)| Arc::clone(tracker))
-    }
-}
-
-impl Service for SubagentRuntime {
-    type Config = SubagentConfig;
-
-    fn service_name() -> &'static str {
-        SERVICE_SUBAGENT
-    }
-
-    fn plugin_name() -> &'static str {
-        "subagent"
-    }
-
-    fn inject() -> Inject {
-        Inject::from(["tools", "sessions", "agentLoop", "systemPrompt"])
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        let _ = ctx.tools()?;
-        let _ = ctx.sessions()?;
-        let _ = ctx.agent_loop()?;
-        let _ = ctx.system_prompt()?;
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            config: Arc::new(Mutex::new(config)),
-            module_enabled: AtomicBool::new(true),
-            active_children: Arc::new(Mutex::new(HashMap::new())),
-            activity_trackers: Arc::new(Mutex::new(HashMap::new())),
-            tasks: Arc::new(Mutex::new(BackgroundTaskRegistry::default())),
-            state_emit_lock: Arc::new(Mutex::new(())),
-            parent_turn_routes: Arc::new(Mutex::new(HashMap::new())),
-            dispose_token: CancellationToken::new(),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            let tools = ctx.tools()?;
-            let sessions = ctx.sessions()?;
-            let agent_loop = ctx.agent_loop()?;
-            let system_prompt = ctx.system_prompt()?;
-
-            // 1. 先在 `tools/pre-execute` 最外层挂载硬护栏，再注册工具（LIFO 卸载时先下线工具再撤护栏）
-            let active_guard = Arc::clone(&self.active_children);
-            let tools_guard = Arc::clone(&tools);
-            let sessions_guard = Arc::clone(&sessions);
-            let ctx_guard = ctx.clone();
-            ctx.effect("subagent.pre-execute-guard", move || {
-                let active_children = Arc::clone(&active_guard);
-                let tools = Arc::clone(&tools_guard);
-                let sessions = Arc::clone(&sessions_guard);
-                let h = ctx_guard.on_waterfall_with(
-                    EVENT_TOOLS_PRE_EXECUTE,
-                    move |exec: ToolExecution,
-                          next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
-                        let active_children = Arc::clone(&active_children);
-                        let tools = Arc::clone(&tools);
-                        let sessions = Arc::clone(&sessions);
-                        Box::pin(async move {
-                            let decision =
-                                check_pre_execute(&exec, &active_children, &tools, &sessions);
-                            if !decision.allow {
-                                return decision;
-                            }
-                            next.call(exec).await
-                        })
-                            as BoxFuture<'static, PreExecuteDecision>
-                    },
-                    EventOptions {
-                        priority: -100,
-                        prepend: true,
-                    },
-                )?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            // 2. 订阅强类型 AgentEvent 维护子会话实时活性快照与父轮次路由（无阻塞、不影响主会话）
-            let rt_events = Arc::clone(&self);
-            let agent_for_events = Arc::clone(&agent_loop);
-            ctx.effect("subagent.agent-events", move || {
-                let guard = agent_for_events.on_event(move |ev| match ev {
-                    AgentEvent::StepStart(ev) => {
-                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
-                            tracker.set_turn_step(ev.step);
-                        }
-                    }
-                    AgentEvent::ToolCall(ev) => {
-                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
-                            let label =
-                                format_tool_activity_label(&ev.call.name, &ev.call.arguments);
-                            tracker.set_tool(&label);
-                        }
-                    }
-                    AgentEvent::ToolUpdate(ev) => {
-                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
-                            if tracker.last_tool().is_none() {
-                                tracker.set_tool(&ev.name);
-                            } else {
-                                tracker.touch();
-                            }
-                        }
-                    }
-                    AgentEvent::ToolResult(ev) => {
-                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
-                            if tracker.last_tool().is_none() {
-                                tracker.set_tool(&ev.name);
-                            } else {
-                                tracker.touch();
-                            }
-                        }
-                    }
-                    AgentEvent::TextDelta(ev) => {
-                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
-                            tracker.touch();
-                        }
-                    }
-                    AgentEvent::ReasoningDelta(ev) => {
-                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
-                            tracker.touch();
-                        }
-                    }
-                    AgentEvent::TurnInput(ev) => {
-                        if !rt_events
-                            .active_children
-                            .lock()
-                            .unwrap()
-                            .contains_key(&ev.session.id)
-                        {
-                            rt_events.parent_turn_routes.lock().unwrap().insert(
-                                ev.session.id.clone(),
-                                (ev.provider.clone(), ev.model.clone()),
-                            );
-                        }
-                    }
-                    AgentEvent::TurnEnd(ev) => {
-                        rt_events
-                            .parent_turn_routes
-                            .lock()
-                            .unwrap()
-                            .remove(&ev.session.id);
-                    }
-                    AgentEvent::Status(_)
-                    | AgentEvent::Request(_)
-                    | AgentEvent::TurnStart(_)
-                    | AgentEvent::StepFirstToken(_)
-                    | AgentEvent::StepEnd(_)
-                    | AgentEvent::Usage(_) => {}
-                });
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || drop(guard))))
-            })?;
-
-            // 3. 注册 `subagent` 工具（随插件卸载自动注销）
-            let rt_tool = Arc::clone(&self);
-            let tools_reg = Arc::clone(&tools);
-            ctx.effect("subagent.register-tool", move || {
-                let def = build_subagent_tool_definition(rt_tool);
-                Ok::<_, mizar_tools::ToolError>(Some(tools_reg.register(def)?))
-            })?;
-
-            // 4. 向系统提示词注入精简静态分流契约（order = 60，子代理自身零感知且 KV Cache 前缀 100% 稳定）
-            let sp = Arc::clone(&system_prompt);
-            let rt_prompt = Arc::clone(&self);
-            let active_prompt = Arc::clone(&self.active_children);
-            let sessions_prompt = Arc::clone(&sessions);
-            ctx.effect("subagent.prompt-guidance", move || {
-                let rt_prompt = Arc::clone(&rt_prompt);
-                let active_children = Arc::clone(&active_prompt);
-                let sessions = Arc::clone(&sessions_prompt);
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
-                    "subagent",
-                    60,
-                    move |session_id| {
-                        if !rt_prompt.is_module_enabled() {
-                            return None;
-                        }
-                        if let Some(sid) = session_id
-                            && (active_children.lock().unwrap().contains_key(sid)
-                                || is_subagent_child_session(&sessions, sid))
-                        {
-                            return None;
-                        }
-                        Some(
-                            "Subagent delegation (`subagent` tool, only when available):\n\
-- Balance responsiveness and efficiency: handle quick 1-3 step lookups directly, and delegate heavy, multi-file, log-heavy, or parallel tasks to background subagents (`action: \"spawn\"`, default) so you stay responsive to the user immediately.\n\
-- Launch independent subagents together in one step, give the user a brief acknowledgement, and end your turn instead of sleeping or polling — settled results arrive as follow-up notices.\n\
-- Use `action: \"send\"` (`name`, `prompt`) to steer a running subagent or wake a settled one with its retained session memory; use `action: \"status\"` for live step/tool/idle inspection or `action: \"stop\"` to cancel.\n\
-- When a `subagent-watchdog:*` alert arrives, inspect the snapshot and decide whether to reassure the user and wait, redirect via `send`, or cancel via `stop`."
-                                .to_string(),
-                        )
-                    },
-                ))))
-            })?;
-
-            // 5. 清理句柄：LIFO 卸载时先触发 dispose_token，再停止在飞任务并清零每个父会话状态栏计数
-            let tasks_cleanup = Arc::clone(&self.tasks);
-            let emit_lock_cleanup = Arc::clone(&self.state_emit_lock);
-            let ctx_cleanup = ctx.clone();
-            let dispose_token = self.dispose_token.clone();
-            ctx.effect("subagent.dispose-token", move || {
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || {
-                    dispose_token.cancel();
-                    let stopped_parents = tasks_cleanup.lock().unwrap().cancel_all();
-                    for (parent_session_id, name, child_session_id, mode) in stopped_parents {
-                        let _guard = emit_lock_cleanup.lock().unwrap();
-                        let running_count = tasks_cleanup
-                            .lock()
-                            .unwrap()
-                            .running_count(&parent_session_id);
-                        ctx_cleanup.emit(
-                            EVENT_SUBAGENT_STATE,
-                            SubagentStateEvent {
-                                parent_session_id,
-                                name,
-                                child_session_id,
-                                mode,
-                                status: SubagentRunStatus::Stopped,
-                                running_count,
-                                notice: None,
-                            },
-                        );
-                    }
-                })))
-            })?;
-
-            Ok(())
-        })
-    }
-}
-
-/// 便捷插件别名（与无状态插件调用约定兼容：`ctx.plugin(SubagentPlugin, cfg)`）。
-#[derive(Default, Clone, Copy)]
-pub struct SubagentPlugin;
-
-impl Plugin for SubagentPlugin {
-    type Config = SubagentConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some(SubagentRuntime::plugin_name())
-    }
-
-    fn inject(&self) -> Inject {
-        SubagentRuntime::inject()
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        SubagentRuntime::plugin().apply(ctx, config)
-    }
-}
-
-pub trait SubagentContextExt {
-    fn subagent(&self) -> Result<Arc<SubagentRuntime>, CordisError>;
-}
-
-impl SubagentContextExt for Context {
-    fn subagent(&self) -> Result<Arc<SubagentRuntime>, CordisError> {
-        self.service::<SubagentRuntime>(SERVICE_SUBAGENT)
     }
 }
 

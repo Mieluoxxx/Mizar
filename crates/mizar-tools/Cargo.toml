@@ -3,13 +3,12 @@ name = "mizar-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "工具注册表、三段 waterfall 执行管线、内置编码工具集与 BM25 工具检索（对应 NamiDSH packages/tools）"
+description = "工具注册表、三段瀑布流执行管线、内置编码工具集与 BM25 工具检索"
 
 [lints]
 workspace = true
 
 [dependencies]
-cordis = { workspace = true }
 dirs = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }

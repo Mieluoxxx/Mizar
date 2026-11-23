@@ -1,6 +1,6 @@
 //! 跨终端与桌面（Merak）共享的纯客户端契约、排队队列、文件缓存与算法层。
 //!
-//! 本 crate 严禁引入 `tokio`、`cordis`、`reqwest`、`rquickjs`、`rusqlite`、`ratatui` 或 `crossterm`。
+//! 本 crate 严禁引入 `tokio`、`reqwest`、`rquickjs`、`rusqlite`、`ratatui`、`crossterm` 或 `tracing`。
 
 use serde::{Deserialize, Serialize};
 

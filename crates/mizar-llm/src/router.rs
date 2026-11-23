@@ -22,17 +22,15 @@ use crate::messages::{
 use crate::mock::MockAdapter;
 use crate::responses::{ResponsesAdapter, ResponsesConfig};
 use crate::{
-    BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, Message, ModelInfo,
+    BoxChunkStream, GenerateOptions, LlmAdapter, LlmError, LlmRuntime, Message, ModelInfo,
     ProviderInfo, SessionAffinityMode, detect_session_affinity_mode, push_session_affinity_headers,
 };
 pub use config::{
     CompatConfig, ModelCostConfig, ModelCostTierConfig, ModelOverrideConfig, PromptCacheConfig,
     ProtocolKind, ProviderRouteConfig, RouterConfig, RouterModelConfig, parse_protocol_api,
 };
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service};
 use futures::channel::mpsc;
-
-pub const EVENT_ROUTER_HEADERS: &str = "llm-router/request-headers";
+use mizar_types::hooks::{BoxFuture, WaterfallHook};
 
 #[derive(Debug, Clone)]
 pub struct RouterHeaderInput {
@@ -73,7 +71,7 @@ struct ResolvedModelTarget {
 }
 
 struct RoutedAdapter {
-    ctx: Context,
+    request_headers: Arc<WaterfallHook<RouterHeaderInput, RouterHeaderInput>>,
     provider: String,
     display_name: Option<String>,
     protocol: ProtocolKind,
@@ -285,8 +283,7 @@ impl LlmAdapter for RoutedAdapter {
             return Box::pin(async move { Err(err) });
         }
         resolved_headers.extend(extra_headers.iter().cloned());
-        let out = self.ctx.waterfall(
-            EVENT_ROUTER_HEADERS,
+        let out = self.request_headers.call(
             RouterHeaderInput {
                 provider: self.provider.clone(),
                 protocol: self.protocol,
@@ -306,8 +303,7 @@ impl LlmAdapter for RoutedAdapter {
 
         let target_params = self.resolve_target_params(options.model.as_deref());
         let model = options.model.clone();
-        let out = self.ctx.waterfall(
-            EVENT_ROUTER_HEADERS,
+        let out = self.request_headers.call(
             RouterHeaderInput {
                 provider: self.provider.clone(),
                 protocol: target_params.protocol,
@@ -441,7 +437,7 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
 }
 
 fn build_routed_adapter(
-    ctx: &Context,
+    request_headers: &Arc<WaterfallHook<RouterHeaderInput, RouterHeaderInput>>,
     provider: &str,
     route: &ProviderRouteConfig,
 ) -> RoutedAdapter {
@@ -535,7 +531,7 @@ fn build_routed_adapter(
     }
 
     RoutedAdapter {
-        ctx: ctx.clone(),
+        request_headers: Arc::clone(request_headers),
         provider: provider.to_string(),
         display_name: route.display_name.clone(),
         protocol: route.protocol,
@@ -555,19 +551,35 @@ struct RouterState {
 }
 
 pub struct LlmRouter {
-    ctx: Context,
+    llm: Arc<LlmRuntime>,
+    request_headers: Arc<WaterfallHook<RouterHeaderInput, RouterHeaderInput>>,
     state: Mutex<RouterState>,
 }
 
 impl LlmRouter {
+    pub fn new(llm: Arc<LlmRuntime>, config: RouterConfig) -> Arc<Self> {
+        let router = Arc::new(Self {
+            llm,
+            request_headers: Arc::new(WaterfallHook::new()),
+            state: Mutex::new(RouterState {
+                config: config.clone(),
+                active_routes: Vec::new(),
+            }),
+        });
+        router.apply_config(config);
+        router
+    }
+
+    pub fn request_headers_hook(&self) -> &WaterfallHook<RouterHeaderInput, RouterHeaderInput> {
+        &self.request_headers
+    }
+
     pub fn config(&self) -> RouterConfig {
         self.state.lock().unwrap().config.clone()
     }
 
     /// 原子更新路由表：先在单一锁下计算差量与更新 `config`，解锁后再一次性同步给 `LlmRuntime`（仅触发一次更新事件）。
-    pub fn apply_config(&self, next: RouterConfig) -> Result<(), CordisError> {
-        let llm = self.ctx.llm()?;
-
+    pub fn apply_config(&self, next: RouterConfig) {
         let (removed, upserts) = {
             let mut state = self.state.lock().unwrap();
             let removed: Vec<String> = state
@@ -581,7 +593,7 @@ impl LlmRouter {
             let mut next_active = Vec::with_capacity(next.providers.len());
             for (provider, route) in &next.providers {
                 let adapter: Arc<dyn LlmAdapter> =
-                    Arc::new(build_routed_adapter(&self.ctx, provider, route));
+                    Arc::new(build_routed_adapter(&self.request_headers, provider, route));
                 upserts.push((provider.clone(), adapter));
                 next_active.push(provider.clone());
             }
@@ -591,8 +603,7 @@ impl LlmRouter {
             (removed, upserts)
         };
 
-        llm.sync_adapters(&removed, upserts);
-        Ok(())
+        self.llm.sync_adapters(&removed, upserts);
     }
 
     pub fn clear(&self) {
@@ -600,64 +611,15 @@ impl LlmRouter {
             let mut state = self.state.lock().unwrap();
             std::mem::take(&mut state.active_routes)
         };
-        if let Ok(llm) = self.ctx.llm() {
-            llm.sync_adapters(&keys, Vec::new());
+        if !keys.is_empty() {
+            self.llm.sync_adapters(&keys, Vec::new());
         }
     }
 }
 
-impl Service for LlmRouter {
-    type Config = RouterConfig;
-
-    fn service_name() -> &'static str {
-        "llmRouter"
-    }
-
-    fn plugin_name() -> &'static str {
-        "LlmRouter"
-    }
-
-    fn inject() -> Inject {
-        Inject::from(["llm"])
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            state: Mutex::new(RouterState {
-                config,
-                active_routes: Vec::new(),
-            }),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let router = Arc::clone(&self);
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            let initial = router.config();
-            router.apply_config(initial)?;
-
-            let weak = Arc::downgrade(&router);
-            ctx.effect("llmRouter.routes", move || {
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || {
-                    if let Some(r) = weak.upgrade() {
-                        r.clear();
-                    }
-                })))
-            })?;
-            Ok(())
-        })
-    }
-}
-
-pub trait LlmRouterContextExt {
-    fn llm_router(&self) -> Result<Arc<LlmRouter>, CordisError>;
-}
-
-impl LlmRouterContextExt for Context {
-    fn llm_router(&self) -> Result<Arc<LlmRouter>, CordisError> {
-        self.service::<LlmRouter>("llmRouter")
+impl Drop for LlmRouter {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -670,8 +632,8 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::response::Response;
     use axum::routing::post;
-    use cordis::Next;
     use futures::StreamExt;
+    use mizar_types::hooks::Next;
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -726,17 +688,7 @@ mod tests {
             let _ = axum::serve(listener, server).await;
         });
 
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-
-        app.on_waterfall(
-            EVENT_ROUTER_HEADERS,
-            |mut input: RouterHeaderInput, next: Next<RouterHeaderInput, RouterHeaderInput>| {
-                input.headers.push(("x-trace".into(), "trace-123".into()));
-                next.call(input)
-            },
-        )
-        .unwrap();
+        let llm = LlmRuntime::new();
 
         let base = format!("http://{addr}");
         let mut providers = BTreeMap::new();
@@ -769,11 +721,13 @@ mod tests {
             ProviderRouteConfig::anthropic_messages("DEFINITELY_MISSING_KEY_XYZ"),
         );
 
-        app.plugin(LlmRouter::plugin(), RouterConfig { providers })
-            .await
-            .unwrap();
-
-        let llm = app.llm().unwrap();
+        let router = LlmRouter::new(Arc::clone(&llm), RouterConfig { providers });
+        let _hdr_guard = router.request_headers_hook().register(
+            |mut input: RouterHeaderInput, next: Next<RouterHeaderInput, RouterHeaderInput>| {
+                input.headers.push(("x-trace".into(), "trace-123".into()));
+                next.call(input)
+            },
+        );
         assert_eq!(llm.providers().len(), 4);
 
         for (prov, expected) in [
@@ -809,10 +763,9 @@ mod tests {
         assert_eq!(err.code, LlmErrorCode::MissingCredential);
 
         // 热更新配置移除 p-missing
-        let router = app.llm_router().unwrap();
         let mut updated = router.config();
         updated.providers.remove("p-missing");
-        router.apply_config(updated).unwrap();
+        router.apply_config(updated);
         assert_eq!(llm.providers().len(), 3);
     }
 
@@ -929,11 +882,8 @@ mod tests {
         );
 
         let cfg: RouterConfig = serde_json::from_str(&pi_json).unwrap();
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
-
-        let llm = app.llm().unwrap();
+        let llm = LlmRuntime::new();
+        let _router = LlmRouter::new(Arc::clone(&llm), cfg);
         let infos = llm.provider_infos();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, "magpie");
@@ -1088,14 +1038,12 @@ mod tests {
         );
 
         let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
+        let llm = LlmRuntime::new();
+        let router = LlmRouter::new(Arc::clone(&llm), cfg);
 
         let hook_seen_sess_hdr = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
         let hook_cap = Arc::clone(&hook_seen_sess_hdr);
-        app.on_waterfall(
-            EVENT_ROUTER_HEADERS,
+        let _hdr_guard = router.request_headers_hook().register(
             move |input: RouterHeaderInput, next: Next<RouterHeaderInput, RouterHeaderInput>| {
                 let found = input
                     .headers
@@ -1108,10 +1056,8 @@ mod tests {
                 hook_cap.lock().unwrap().push(found);
                 next.call(input)
             },
-        )
-        .unwrap();
+        );
 
-        let llm = app.llm().unwrap();
         for model_id in ["gpt-long", "gpt-or-hdr"] {
             let mut s = llm
                 .stream(GenerateOptions {
@@ -1208,12 +1154,11 @@ mod tests {
 
         let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
         let route = cfg.providers.get("oai").unwrap().clone();
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
+        let llm = LlmRuntime::new();
+        let router = LlmRouter::new(Arc::clone(&llm), cfg);
 
         // 1. 直接验证 RoutedAdapter::normalize_options 幂等性与元数据传播
-        let adapter = build_routed_adapter(&app, "oai", &route);
+        let adapter = build_routed_adapter(&router.request_headers, "oai", &route);
         let infos = adapter.info().unwrap().models;
         assert!(!infos[0].supports_images());
         assert!(infos[0].force_adaptive_thinking);
@@ -1275,30 +1220,23 @@ mod tests {
             Some("caller-wins")
         );
 
-        // 2. 通过 LlmRuntime::stream 验证 llm/stream 与 llm/after-response 快照一致反映剥离后的载荷
+        // 2. 通过 LlmRuntime::stream 验证 stream_hook 与 after_response 快照一致反映剥离后的载荷
         let waterfall_images = Arc::new(Mutex::new(Vec::<usize>::new()));
         let wf_cap = Arc::clone(&waterfall_images);
-        app.on_waterfall(
-            crate::EVENT_LLM_STREAM,
+        let _wf_guard = llm.stream_hook().register(
             move |opts: GenerateOptions, next: Next<GenerateOptions, BoxChunkStream>| {
                 let imgs: usize = opts.messages.iter().map(|m| m.images().len()).sum();
                 wf_cap.lock().unwrap().push(imgs);
                 next.call(opts)
             },
-        )
-        .unwrap();
+        );
 
         let after_events = Arc::new(Mutex::new(Vec::<crate::LlmAfterResponseEvent>::new()));
         let after_cap = Arc::clone(&after_events);
-        app.on(
-            crate::EVENT_LLM_AFTER_RESPONSE,
-            move |ev: &crate::LlmAfterResponseEvent| {
-                after_cap.lock().unwrap().push(ev.clone());
-            },
-        )
-        .unwrap();
+        let _after_guard = llm.on_after_response(move |ev: &crate::LlmAfterResponseEvent| {
+            after_cap.lock().unwrap().push(ev.clone());
+        });
 
-        let llm = app.llm().unwrap();
         let mut s_text = llm
             .stream(GenerateOptions {
                 provider: Some("oai".into()),
@@ -1402,11 +1340,8 @@ mod tests {
             }}"#
         );
         let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
-
-        let llm = app.llm().unwrap();
+        let llm = LlmRuntime::new();
+        let _router = LlmRouter::new(Arc::clone(&llm), cfg);
         let tool = ToolSchema {
             name: "ping".into(),
             description: "ping".into(),

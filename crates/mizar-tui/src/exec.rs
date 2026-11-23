@@ -1,7 +1,7 @@
 //! 非交互一次性任务执行器（`mizar exec` / `mizar -p` / `mizar --prompt-file`）。
 //!
 //! 职责：
-//! - 复用 `AgentSpinePlugin` + `LlmRouter` + `LlmRetryPlugin` 装配 Agent，但不启动 TUI 与版本检查，也不注入 TUI `reply_guidance` 段落；
+//! - 复用 `MizarRuntime` + `LlmRouter` + `install_retry` 装配 Agent，但不启动 TUI 与版本检查，也不注入 TUI `reply_guidance` 段落；
 //! - 支持 `--isolated` 隔离个人全局配置 / MCP / Skills / 指令与全局会话库；
 //! - 将诊断与警告严格路由至 `stderr` 并完成敏感凭据脱敏，退出码仅在正常收敛（`Stop` 且未截断/未超步/未取消）时为 `0`；
 //! - `stdout` 仅在退出码为 `0` 时输出最终回答全文，失败时 `stdout` 保持完全为空。
@@ -12,30 +12,27 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cordis::{Context, Service};
 use mizar_client::{
-    FileMentionsConfig, FileMentionsPlugin, TracingBridgeGuard, env_log_level_override,
+    FileMentionsConfig, TracingBridgeGuard, env_log_level_override, install_file_mentions,
     install_tracing_handler, ui_log_level_tag,
 };
-use mizar_core::agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
+use mizar_core::agent_loop::{AgentError, RunOptions, StepOutcome, TurnEndReason};
 use mizar_core::spine::{
-    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
+    AgentSpineConfig, AgentToolsMode, CliLlmOverride, EnvLlmOverride, MizarRuntime,
     load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
 };
 use mizar_core::trajectory::{
     DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryExport,
-    TrajectoryRuntime, write_trace_export_atomic,
+    write_trace_export_atomic,
 };
-use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
-use mizar_llm::router::LlmRouter;
+use mizar_llm::retry::RetryConfig;
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
-use mizar_mcp::McpManager;
-use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
+use mizar_session::SessionListQuery;
 use mizar_tools::coding::CodingToolsPreset;
 use mizar_types::client::{ClientEvent, HostExtensionFlags, NoticeLevel, UiLogLevel};
 use tokio_util::sync::CancellationToken;
 
-use crate::runner::{ResumeTarget, wait_for_services};
+use crate::runner::ResumeTarget;
 
 /// 无头输出格式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -731,38 +728,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let ext_flags = HostExtensionFlags::from_disabled_plugins(&spine_cfg.disabled_plugins);
     let restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
 
-    let app = Context::new();
     let _exec_tracing_guard = configure_exec_logger(Arc::clone(&log_secrets));
-
-    app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
-    app.plugin(LlmRouter::plugin(), resolved_llm.router);
-    let mention_fiber = if ext_flags.file_mentions {
-        Some(app.plugin(
-            FileMentionsPlugin,
-            FileMentionsConfig::with_callback(
-                cfg.workspace.clone(),
-                restrict_to_workspace,
-                move |ev| {
-                    if let ClientEvent::Notice { level, text } = ev {
-                        match level {
-                            NoticeLevel::Error => {
-                                tracing::error!(target: "mizar::mentions", "{text}")
-                            }
-                            NoticeLevel::Warn => {
-                                tracing::warn!(target: "mizar::mentions", "{text}")
-                            }
-                            NoticeLevel::Info => {
-                                tracing::info!(target: "mizar::mentions", "{text}")
-                            }
-                        }
-                    }
-                },
-            ),
-        ))
-    } else {
-        None
-    };
 
     let cancel = CancellationToken::new();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -783,222 +749,57 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         biased;
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
-            wait_for_services(&app).await.map_err(|e| e.to_string())?;
-            if let Some(f) = mention_fiber {
-                f.wait_settled().await.map_err(|e| e.to_string())?;
-            }
-            if has_session_db && app.session_persistence().is_none() {
-                let fibers: Vec<cordis::Fiber> = app
-                    .registry()
-                    .values()
-                    .into_iter()
-                    .flat_map(|rt| rt.fibers())
-                    .collect();
-                for f in fibers {
-                    let _ = f.wait_settled().await;
-                }
-                if app.session_persistence().is_none() {
-                    let has_pending = app.registry().values().into_iter().any(|rt| {
-                        rt.fibers().into_iter().any(|f| {
-                            matches!(
-                                f.state(),
-                                cordis::FiberState::Pending | cordis::FiberState::Loading
-                            )
-                        })
-                    });
-                    if has_pending {
-                        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-                        let tx = Arc::new(Mutex::new(Some(tx)));
-                        if let Ok(probe) = app.try_inject(
-                            [mizar_session::SERVICE_SESSION_PERSISTENCE],
-                            move |_| {
-                                let tx = Arc::clone(&tx);
-                                async move {
-                                    if let Some(sender) = tx.lock().unwrap().take() {
-                                        let _ = sender.send(());
+            let runtime = MizarRuntime::build(spine_cfg)
+                .await
+                .map_err(|e| e.to_string())?;
+            runtime.install_retry(RetryConfig::default());
+            runtime.install_router(resolved_llm.router);
+            if ext_flags.file_mentions {
+                let guard = install_file_mentions(
+                    &runtime,
+                    FileMentionsConfig::with_callback(
+                        cfg.workspace.clone(),
+                        restrict_to_workspace,
+                        move |ev| {
+                            if let ClientEvent::Notice { level, text } = ev {
+                                match level {
+                                    NoticeLevel::Error => {
+                                        tracing::error!(target: "mizar::mentions", "{text}")
                                     }
-                                    Ok::<_, cordis::CordisError>(())
+                                    NoticeLevel::Warn => {
+                                        tracing::warn!(target: "mizar::mentions", "{text}")
+                                    }
+                                    NoticeLevel::Info => {
+                                        tracing::info!(target: "mizar::mentions", "{text}")
+                                    }
                                 }
-                            },
-                        ) {
-                            let _ = tokio::time::timeout(Duration::from_secs(5), rx).await;
-                            probe.dispose().await;
-                        }
-                    }
-                }
+                            }
+                        },
+                    ),
+                );
+                runtime.push_guard(guard);
             }
-            if let Some(mcp) = app.get::<McpManager>("mcp") {
+            if let Some(mcp) = runtime.mcp().await {
                 mcp.wait_ready().await;
             }
-            Ok::<(), String>(())
+            Ok::<Arc<MizarRuntime>, String>(runtime)
         } => res,
     };
 
-    if let Err(err_msg) = init_res {
-        let outcome = resolve_cancel_or_error_exit(
-            &timed_out,
-            cfg.timeout_secs,
-            &signal_code,
-            &err_msg,
-            &log_secrets,
-        );
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
-            Some(&app),
-            None,
-            make_meta(
-                outcome.exit_code,
-                outcome.termination_reason,
-                outcome.error,
-                Some(active_provider.clone()),
-                active_model.clone(),
-            ),
-            &log_secrets,
-        );
-        cleanup_exec(&app, signal_handle, timeout_handle).await;
-        return outcome.exit_code;
-    }
-
-    let exit_code = match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
-        (Ok(sessions), Ok(agent_loop)) => {
-            if cfg.resume_session.is_some() && app.session_persistence().is_none() {
-                let msg = "session persistence backend is unavailable for --continue/--resume (code=storage)";
-                eprintln!("error: {msg}");
-                export_exec_trace_best_effort(
-                    cfg.trace_out.as_deref(),
-                    Some(&app),
-                    None,
-                    make_meta(
-                        1,
-                        "storage",
-                        Some(msg.to_string()),
-                        Some(active_provider.clone()),
-                        active_model.clone(),
-                    ),
-                    &log_secrets,
-                );
-                cleanup_exec(&app, signal_handle, timeout_handle).await;
-                return 1;
-            }
-
-            let resolved_session = match &cfg.resume_session {
-                Some(ResumeTarget::Picker) => Err(
-                    "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
-                        .to_string(),
-                ),
-                Some(ResumeTarget::Id(target_id)) => match sessions.get(target_id) {
-                    Some(found) => Ok((found, true)),
-                    None => Err(format!(
-                        "session \"{target_id}\" not found (code=invalid_request)"
-                    )),
-                },
-                Some(ResumeTarget::LatestInWorkspace) => {
-                    let ws_str = cfg.workspace.display().to_string();
-                    let latest_id = sessions
-                        .list_headers(&SessionListQuery {
-                            cwd: Some(ws_str),
-                            limit: Some(1),
-                            exclude_subagents: true,
-                        })
-                        .ok()
-                        .and_then(|mut list| list.drain(..).next())
-                        .map(|h| h.id);
-                    if let Some(id) = latest_id
-                        && let Some(found) = sessions.get(&id)
-                    {
-                        Ok((found, true))
-                    } else {
-                        Ok((sessions.create(None), false))
-                    }
-                }
-                None => Ok((sessions.create(None), false)),
-            };
-
-            let (session, resumed) = match resolved_session {
-                Ok(pair) => pair,
-                Err(msg) => {
-                    eprintln!("error: {msg}");
-                    export_exec_trace_best_effort(
-                        cfg.trace_out.as_deref(),
-                        Some(&app),
-                        None,
-                        make_meta(
-                            1,
-                            "invalid_request",
-                            Some(msg),
-                            Some(active_provider.clone()),
-                            active_model.clone(),
-                        ),
-                        &log_secrets,
-                    );
-                    cleanup_exec(&app, signal_handle, timeout_handle).await;
-                    return 1;
-                }
-            };
-
-            let turn_started = std::time::Instant::now();
-            let opts = RunOptions {
-                provider: Some(active_provider.clone()),
-                model: active_model.clone(),
-                max_steps: configured_max_steps,
-                max_tokens: configured_max_tokens,
-                reasoning_effort: effective_effort,
-                ..Default::default()
-            };
-            let run_res = agent_loop
-                .run_with_report(Arc::clone(&session), cfg.prompt, cancel.clone(), opts)
-                .await;
-            let duration_ms = turn_started.elapsed().as_millis() as u64;
-
-            if has_session_db {
-                let _ = sessions.flush_async(Some(session.id.clone())).await;
-            }
-
-            let json_meta = if cfg.output_format == ExecOutputFormat::Json {
-                Some(build_exec_json_meta(
-                    &app,
-                    &session.id,
-                    resumed,
-                    duration_ms,
-                ))
-            } else {
-                None
-            };
-
-            let outcome = if timed_out.load(Ordering::SeqCst) {
-                let secs = cfg.timeout_secs.unwrap_or(0);
-                let msg = format!("execution timed out after {secs}s (code=timeout)");
-                eprintln!("error: {msg}");
-                TurnExitOutcome {
-                    exit_code: 124,
-                    termination_reason: "timeout",
-                    error: Some(msg),
-                }
-            } else {
-                let sig = signal_code.load(Ordering::SeqCst);
-                if sig != 0 {
-                    let msg = "execution interrupted by signal (code=cancelled)".to_string();
-                    eprintln!("error: {msg}");
-                    TurnExitOutcome {
-                        exit_code: sig,
-                        termination_reason: "cancelled",
-                        error: Some(msg),
-                    }
-                } else {
-                    classify_turn_result(
-                        run_res,
-                        configured_max_steps,
-                        cfg.output_format,
-                        json_meta.as_ref(),
-                        &log_secrets,
-                    )
-                }
-            };
-
+    let runtime = match init_res {
+        Ok(rt) => rt,
+        Err(err_msg) => {
+            let outcome = resolve_cancel_or_error_exit(
+                &timed_out,
+                cfg.timeout_secs,
+                &signal_code,
+                &err_msg,
+                &log_secrets,
+            );
             export_exec_trace_best_effort(
                 cfg.trace_out.as_deref(),
-                Some(&app),
-                Some(&session.id),
+                None,
+                None,
                 make_meta(
                     outcome.exit_code,
                     outcome.termination_reason,
@@ -1008,23 +809,165 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 ),
                 &log_secrets,
             );
-            outcome.exit_code
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            let msg = e.to_string();
-            report_error_with_secrets(&msg, &log_secrets);
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
-                Some(&app),
-                None,
-                make_meta(1, "error", Some(msg), Some(active_provider), active_model),
-                &log_secrets,
-            );
-            1
+            signal_handle.abort();
+            if let Some(handle) = timeout_handle {
+                handle.abort();
+            }
+            return outcome.exit_code;
         }
     };
 
-    cleanup_exec(&app, signal_handle, timeout_handle).await;
+    let exit_code = if cfg.resume_session.is_some() && runtime.persistence.is_none() {
+        let msg =
+            "session persistence backend is unavailable for --continue/--resume (code=storage)";
+        eprintln!("error: {msg}");
+        export_exec_trace_best_effort(
+            cfg.trace_out.as_deref(),
+            Some(&runtime),
+            None,
+            make_meta(
+                1,
+                "storage",
+                Some(msg.to_string()),
+                Some(active_provider.clone()),
+                active_model.clone(),
+            ),
+            &log_secrets,
+        );
+        1
+    } else {
+        let sessions = &runtime.sessions;
+        let resolved_session = match &cfg.resume_session {
+            Some(ResumeTarget::Picker) => Err(
+                "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
+                    .to_string(),
+            ),
+            Some(ResumeTarget::Id(target_id)) => match sessions.get(target_id) {
+                Some(found) => Ok((found, true)),
+                None => Err(format!(
+                    "session \"{target_id}\" not found (code=invalid_request)"
+                )),
+            },
+            Some(ResumeTarget::LatestInWorkspace) => {
+                let ws_str = cfg.workspace.display().to_string();
+                let latest_id = sessions
+                    .list_headers(&SessionListQuery {
+                        cwd: Some(ws_str),
+                        limit: Some(1),
+                        exclude_subagents: true,
+                    })
+                    .ok()
+                    .and_then(|mut list| list.drain(..).next())
+                    .map(|h| h.id);
+                if let Some(id) = latest_id
+                    && let Some(found) = sessions.get(&id)
+                {
+                    Ok((found, true))
+                } else {
+                    Ok((sessions.create(None), false))
+                }
+            }
+            None => Ok((sessions.create(None), false)),
+        };
+
+        match resolved_session {
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                export_exec_trace_best_effort(
+                    cfg.trace_out.as_deref(),
+                    Some(&runtime),
+                    None,
+                    make_meta(
+                        1,
+                        "invalid_request",
+                        Some(msg),
+                        Some(active_provider.clone()),
+                        active_model.clone(),
+                    ),
+                    &log_secrets,
+                );
+                1
+            }
+            Ok((session, resumed)) => {
+                let turn_started = std::time::Instant::now();
+                let opts = RunOptions {
+                    provider: Some(active_provider.clone()),
+                    model: active_model.clone(),
+                    max_steps: configured_max_steps,
+                    max_tokens: configured_max_tokens,
+                    reasoning_effort: effective_effort,
+                    ..Default::default()
+                };
+                let run_res = runtime
+                    .agent_loop
+                    .run_with_report(Arc::clone(&session), cfg.prompt, cancel.clone(), opts)
+                    .await;
+                let duration_ms = turn_started.elapsed().as_millis() as u64;
+
+                if has_session_db {
+                    let _ = sessions.flush_async(Some(session.id.clone())).await;
+                }
+
+                let json_meta = if cfg.output_format == ExecOutputFormat::Json {
+                    Some(build_exec_json_meta(
+                        &runtime,
+                        &session.id,
+                        resumed,
+                        duration_ms,
+                    ))
+                } else {
+                    None
+                };
+
+                let outcome = if timed_out.load(Ordering::SeqCst) {
+                    let secs = cfg.timeout_secs.unwrap_or(0);
+                    let msg = format!("execution timed out after {secs}s (code=timeout)");
+                    eprintln!("error: {msg}");
+                    TurnExitOutcome {
+                        exit_code: 124,
+                        termination_reason: "timeout",
+                        error: Some(msg),
+                    }
+                } else {
+                    let sig = signal_code.load(Ordering::SeqCst);
+                    if sig != 0 {
+                        let msg = "execution interrupted by signal (code=cancelled)".to_string();
+                        eprintln!("error: {msg}");
+                        TurnExitOutcome {
+                            exit_code: sig,
+                            termination_reason: "cancelled",
+                            error: Some(msg),
+                        }
+                    } else {
+                        classify_turn_result(
+                            run_res,
+                            configured_max_steps,
+                            cfg.output_format,
+                            json_meta.as_ref(),
+                            &log_secrets,
+                        )
+                    }
+                };
+
+                export_exec_trace_best_effort(
+                    cfg.trace_out.as_deref(),
+                    Some(&runtime),
+                    Some(&session.id),
+                    make_meta(
+                        outcome.exit_code,
+                        outcome.termination_reason,
+                        outcome.error,
+                        Some(active_provider.clone()),
+                        active_model.clone(),
+                    ),
+                    &log_secrets,
+                );
+                outcome.exit_code
+            }
+        }
+    };
+
+    cleanup_exec(&runtime, signal_handle, timeout_handle).await;
     exit_code
 }
 
@@ -1041,13 +984,14 @@ struct ExecJsonMeta {
 }
 
 fn build_exec_json_meta(
-    app: &Context,
+    runtime: &MizarRuntime,
     session_id: &str,
     resumed: bool,
     duration_ms: u64,
 ) -> ExecJsonMeta {
-    let report = app
-        .get::<TrajectoryRuntime>("trajectory")
+    let report = runtime
+        .trajectory
+        .as_ref()
         .and_then(|traj| traj.inspect(session_id, TimelineMode::Sequence));
     if let Some(rep) = report {
         let last_turn = rep.snapshot.turns.last();
@@ -1101,7 +1045,7 @@ struct TurnExitOutcome {
 
 fn export_exec_trace_best_effort(
     trace_out: Option<&Path>,
-    app: Option<&Context>,
+    runtime: Option<&MizarRuntime>,
     session_id: Option<&str>,
     mut meta: TraceExportMeta,
     secrets: &Arc<Mutex<Vec<String>>>,
@@ -1115,9 +1059,9 @@ fn export_exec_trace_best_effort(
         meta.error = Some(single_line(&sanitize_diagnostic_text(err_msg, &guard)));
     }
 
-    let export = match (app, session_id) {
-        (Some(ctx), Some(sid)) => {
-            if let Ok(traj) = ctx.get::<TrajectoryRuntime>("trajectory").ok_or(()) {
+    let export = match (runtime, session_id) {
+        (Some(rt), Some(sid)) => {
+            if let Some(traj) = rt.trajectory.as_ref() {
                 traj.build_trace_export(
                     sid,
                     TimelineMode::Sequence,
@@ -1312,7 +1256,7 @@ fn classify_turn_result(
 }
 
 async fn cleanup_exec(
-    app: &Context,
+    runtime: &MizarRuntime,
     signal_handle: tokio::task::JoinHandle<()>,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
@@ -1320,7 +1264,7 @@ async fn cleanup_exec(
     if let Some(handle) = timeout_handle {
         handle.abort();
     }
-    let _ = tokio::time::timeout(Duration::from_secs(3), app.fiber().dispose()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), runtime.shutdown()).await;
 }
 
 fn spawn_signal_watcher(

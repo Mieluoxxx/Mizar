@@ -1,17 +1,12 @@
 //! 会话持久化抽象接口（Seam）：把领域层 `mizar-session` 与具体存储引擎（如 SQLite / JSONL）解耦。
 
-use std::ops::Deref;
-use std::sync::Arc;
-
-use cordis::{BoxFuture, Context};
+use mizar_types::hooks::BoxFuture;
 use thiserror::Error;
 
 use crate::model::{
     LoadedSession, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionHeader,
     SessionHeaderPatch, SessionListQuery, SessionSelection,
 };
-
-pub const SERVICE_SESSION_PERSISTENCE: &str = "sessionPersistence";
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
@@ -122,39 +117,5 @@ pub trait SessionPersistence: Send + Sync + 'static {
     ) -> BoxFuture<'static, PersistenceResult<Option<Vec<RecallSearchHit>>>> {
         let res = self.search_recall(&query);
         Box::pin(async move { res })
-    }
-}
-
-/// 包装 `Arc<dyn SessionPersistence>` 以便通过 Cordis `ctx.provide` 注册与查找。
-#[derive(Clone)]
-pub struct SessionPersistenceHandle {
-    backend: Arc<dyn SessionPersistence>,
-}
-
-impl SessionPersistenceHandle {
-    pub fn new(backend: Arc<dyn SessionPersistence>) -> Self {
-        Self { backend }
-    }
-
-    pub fn backend(&self) -> &Arc<dyn SessionPersistence> {
-        &self.backend
-    }
-}
-
-impl Deref for SessionPersistenceHandle {
-    type Target = dyn SessionPersistence;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.backend
-    }
-}
-
-pub trait SessionPersistenceContextExt {
-    fn session_persistence(&self) -> Option<Arc<SessionPersistenceHandle>>;
-}
-
-impl SessionPersistenceContextExt for Context {
-    fn session_persistence(&self) -> Option<Arc<SessionPersistenceHandle>> {
-        self.get::<SessionPersistenceHandle>(SERVICE_SESSION_PERSISTENCE)
     }
 }

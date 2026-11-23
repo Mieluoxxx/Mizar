@@ -7,28 +7,24 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, Fiber, PluginDef, Service};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{
-    AgentLoop, AgentLoopConfig, AgentLoopContextExt, RunOptions, TurnInput,
-};
+use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, RunOptions, TurnInput};
 use mizar_core::session_title::{SessionTitleConfig, SessionTitleRuntime};
 use mizar_core::subagent::{
-    EVENT_SUBAGENT_STATE, SUBAGENT_TOOL_NAME, SubagentConfig, SubagentContextExt, SubagentMode,
-    SubagentPlugin, SubagentRunStatus, SubagentStateEvent,
+    SUBAGENT_TOOL_NAME, SubagentConfig, SubagentMode, SubagentRunStatus, SubagentRuntime,
+    SubagentStateEvent,
 };
-use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
+use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt,
-    LlmError, Message, ModelInfo, ProviderInfo, RequestOrigin, StreamChunk, ToolCall,
+    BoxChunkStream, ContentBlock, FinishReason, GenerateOptions, LlmAdapter, LlmError, LlmRuntime,
+    Message, ModelInfo, ProviderInfo, RequestOrigin, StreamChunk, ToolCall,
 };
-use mizar_session::recall::{RecallConfig, RecallPlugin};
-use mizar_session::sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
-use mizar_session::{SessionContextExt, SessionOrigin, SessionStore, TitleSource};
-use mizar_tools::coding::{CodingToolsConfig, CodingToolsPlugin};
-use mizar_tools::{
-    ToolAnnotations, ToolDefinition, ToolExecution, ToolExposure, ToolRuntime, ToolsContextExt,
-};
+use mizar_session::recall::{RecallConfig, register_recall_tool};
+use mizar_session::sqlite::SqliteSessionPersistence;
+use mizar_session::{SessionOrigin, SessionPersistence, SessionStore, TitleSource};
+use mizar_tools::coding::{CodingToolsConfig, register_coding_tools};
+use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecution, ToolExposure, ToolRuntime};
+use mizar_types::HookGuard;
 use serde_json::json;
 use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
@@ -65,25 +61,23 @@ struct StateWatch {
     events: Arc<Mutex<Vec<SubagentStateEvent>>>,
     seq_rx: tokio::sync::watch::Receiver<u64>,
     cursor: usize,
-    _handle: cordis::DisposableHandle,
+    _handle: HookGuard,
 }
 
 impl StateWatch {
-    fn attach(app: &Context, parent_id: &str) -> Self {
+    fn attach(app: &SubagentHarness, parent_id: &str) -> Self {
         let events = Arc::new(Mutex::new(Vec::<SubagentStateEvent>::new()));
         let (seq_tx, seq_rx) = tokio::sync::watch::channel(0u64);
         let events_cb = Arc::clone(&events);
         let target_parent = parent_id.to_string();
         let seq_counter = Arc::new(AtomicUsize::new(0));
-        let handle = app
-            .on(EVENT_SUBAGENT_STATE, move |ev: &SubagentStateEvent| {
-                if ev.parent_session_id == target_parent {
-                    events_cb.lock().unwrap().push(ev.clone());
-                    let next = seq_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = seq_tx.send(next as u64);
-                }
-            })
-            .unwrap();
+        let handle = app.subagent().on_state(move |ev: &SubagentStateEvent| {
+            if ev.parent_session_id == target_parent {
+                events_cb.lock().unwrap().push(ev.clone());
+                let next = seq_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = seq_tx.send(next as u64);
+            }
+        });
         Self {
             events,
             seq_rx,
@@ -132,57 +126,118 @@ impl StateWatch {
     }
 }
 
+struct SubagentHarness {
+    llm: Arc<LlmRuntime>,
+    persistence: Option<Arc<SqliteSessionPersistence>>,
+    sessions: Arc<SessionStore>,
+    tools: Arc<ToolRuntime>,
+    system_prompt: Arc<SystemPrompt>,
+    agent_loop: Arc<AgentLoop>,
+    subagent: Arc<SubagentRuntime>,
+    guards: Mutex<Vec<HookGuard>>,
+    sub_guard: Mutex<Option<HookGuard>>,
+}
+
+impl SubagentHarness {
+    fn llm(&self) -> Arc<LlmRuntime> {
+        Arc::clone(&self.llm)
+    }
+
+    fn sessions(&self) -> Arc<SessionStore> {
+        Arc::clone(&self.sessions)
+    }
+
+    fn tools(&self) -> Arc<ToolRuntime> {
+        Arc::clone(&self.tools)
+    }
+
+    fn system_prompt(&self) -> Arc<SystemPrompt> {
+        Arc::clone(&self.system_prompt)
+    }
+
+    fn agent_loop(&self) -> Arc<AgentLoop> {
+        Arc::clone(&self.agent_loop)
+    }
+
+    fn subagent(&self) -> Arc<SubagentRuntime> {
+        Arc::clone(&self.subagent)
+    }
+
+    fn push_guard(&self, guard: HookGuard) {
+        self.guards.lock().unwrap().push(guard);
+    }
+
+    fn dispose_subagent(&self) {
+        self.sub_guard.lock().unwrap().take();
+    }
+
+    async fn dispose(&self) {
+        self.sub_guard.lock().unwrap().take();
+        let drained: Vec<HookGuard> = self.guards.lock().unwrap().drain(..).collect();
+        drop(drained);
+        if let Some(persistence) = &self.persistence {
+            let _ = persistence.shutdown();
+        }
+    }
+}
+
 async fn setup_base_app(
     ws: &PathBuf,
     sub_cfg: SubagentConfig,
     use_sqlite: bool,
-) -> (Context, Option<PathBuf>) {
-    let (app, db_path, _sub_fiber) =
-        setup_base_app_with_subagent_fiber(ws, sub_cfg, use_sqlite).await;
-    (app, db_path)
-}
-
-async fn setup_base_app_with_subagent_fiber(
-    ws: &PathBuf,
-    sub_cfg: SubagentConfig,
-    use_sqlite: bool,
-) -> (Context, Option<PathBuf>, Fiber) {
-    let app = Context::new();
-    app.plugin(mizar_llm::LlmRuntime::plugin(), ())
-        .await
-        .unwrap();
-    let db_path = if use_sqlite {
+) -> (SubagentHarness, Option<PathBuf>) {
+    let llm = LlmRuntime::new();
+    let (persistence, db_path) = if use_sqlite {
         let p = ws.join("sessions.sqlite");
-        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&p))
-            .await
-            .unwrap();
-        Some(p)
+        let sq = SqliteSessionPersistence::open_async(&p).await.unwrap();
+        (Some(sq), Some(p))
     } else {
-        None
+        (None, None)
     };
-    app.plugin(SessionStore::plugin(), ()).await.unwrap();
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    app.plugin(
-        AgentLoop::plugin(),
+    let sessions = if let Some(p) = &persistence {
+        SessionStore::with_persistence(Arc::clone(p) as Arc<dyn SessionPersistence>)
+    } else {
+        SessionStore::new()
+    };
+    sessions.set_default_cwd(Some(ws.display().to_string()));
+    let tools = ToolRuntime::new();
+    let system_prompt = SystemPrompt::new(SystemPromptConfig::default());
+    let agent_loop = AgentLoop::new(
+        Arc::clone(&llm),
+        Arc::clone(&tools),
+        Arc::clone(&sessions),
+        Arc::clone(&system_prompt),
         AgentLoopConfig {
             provider: Some("main".into()),
             model: Some("main-1".into()),
             ..Default::default()
         },
+    );
+    let mut guards = register_coding_tools(&tools, &CodingToolsConfig::new(ws)).unwrap();
+    let (subagent, sub_guard) = SubagentRuntime::install(
+        Arc::clone(&llm),
+        Arc::clone(&tools),
+        Arc::clone(&sessions),
+        Arc::clone(&agent_loop),
+        &system_prompt,
+        sub_cfg,
     )
-    .await
     .unwrap();
-    app.plugin(CodingToolsPlugin, CodingToolsConfig::new(ws))
-        .await
-        .unwrap();
-    let sub_fiber = app.plugin(SubagentPlugin, sub_cfg).await.unwrap();
-    app.sessions()
-        .unwrap()
-        .set_default_cwd(Some(ws.display().to_string()));
-    (app, db_path, sub_fiber)
+    let harness = SubagentHarness {
+        llm,
+        persistence,
+        sessions,
+        tools,
+        system_prompt,
+        agent_loop,
+        subagent,
+        guards: Mutex::new(Vec::new()),
+        sub_guard: Mutex::new(Some(sub_guard)),
+    };
+    for g in guards.drain(..) {
+        harness.push_guard(g);
+    }
+    (harness, db_path)
 }
 
 #[tokio::test]
@@ -195,94 +250,71 @@ async fn parallel_read_only_subagents_isolate_history_and_persist_lineage() {
 
     let (app, _db) = setup_base_app(&ws, SubagentConfig::default(), true).await;
     let ws_ro = ws.clone();
-    app.plugin(
-        PluginDef::sync("test-ro-legacy-shapes", move |ctx, ()| {
-            let tools = ctx.tools()?;
-            let ro = ToolAnnotations {
-                read_only: true,
-                ..Default::default()
-            };
-            let gt = ToolDefinition::sync_tool(
-                "get_time",
-                "Get time",
-                json!({"type": "object", "properties": {}}),
-                |_, _| Ok::<_, mizar_tools::ToolError>("2026-01-01 12:00:00".to_string()),
-            )
-            .with_annotations(ro);
-            let ld = ToolDefinition::sync_tool(
-                "list_dir",
-                "List dir",
-                json!({"type": "object", "properties": {}}),
-                |_, _| Ok::<_, mizar_tools::ToolError>("alpha.txt\nbeta.txt".to_string()),
-            )
-            .with_annotations(ro);
-            let ws_read = ws_ro.clone();
-            let rf = ToolDefinition::sync_tool(
-                "read_file",
-                "Read file",
-                json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-                move |args, _| {
-                    let p = args["path"].as_str().unwrap_or("");
-                    let content = std::fs::read_to_string(ws_read.join(p))
-                        .map_err(|e| mizar_tools::ToolError::DuplicateTool(e.to_string()))?;
-                    Ok::<_, mizar_tools::ToolError>(content)
-                },
-            )
-            .with_annotations(ro);
-            ctx.effect("test-ro.gt", {
-                let t = Arc::clone(&tools);
-                move || Ok::<_, mizar_tools::ToolError>(Some(t.register(gt)?))
-            })?;
-            ctx.effect("test-ro.ld", {
-                let t = Arc::clone(&tools);
-                move || Ok::<_, mizar_tools::ToolError>(Some(t.register(ld)?))
-            })?;
-            ctx.effect("test-ro.rf", {
-                let t = Arc::clone(&tools);
-                move || Ok::<_, mizar_tools::ToolError>(Some(t.register(rf)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["tools"]),
-        (),
-    )
-    .await
-    .unwrap();
-    app.plugin(RecallPlugin, RecallConfig::default())
-        .await
-        .unwrap();
-    app.plugin(SessionTitleRuntime::plugin(), SessionTitleConfig::default())
-        .await
-        .unwrap();
+    {
+        let tools = app.tools();
+        let ro = ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        };
+        let gt = ToolDefinition::sync_tool(
+            "get_time",
+            "Get time",
+            json!({"type": "object", "properties": {}}),
+            |_, _| Ok::<_, mizar_tools::ToolError>("2026-01-01 12:00:00".to_string()),
+        )
+        .with_annotations(ro);
+        let ld = ToolDefinition::sync_tool(
+            "list_dir",
+            "List dir",
+            json!({"type": "object", "properties": {}}),
+            |_, _| Ok::<_, mizar_tools::ToolError>("alpha.txt\nbeta.txt".to_string()),
+        )
+        .with_annotations(ro);
+        let ws_read = ws_ro.clone();
+        let rf = ToolDefinition::sync_tool(
+            "read_file",
+            "Read file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            move |args, _| {
+                let p = args["path"].as_str().unwrap_or("");
+                let content = std::fs::read_to_string(ws_read.join(p))
+                    .map_err(|e| mizar_tools::ToolError::DuplicateTool(e.to_string()))?;
+                Ok::<_, mizar_tools::ToolError>(content)
+            },
+        )
+        .with_annotations(ro);
+        app.push_guard(tools.register(gt).unwrap());
+        app.push_guard(tools.register(ld).unwrap());
+        app.push_guard(tools.register(rf).unwrap());
+    }
+    if let Some(recall_g) =
+        register_recall_tool(&app.tools(), app.sessions(), RecallConfig::default()).unwrap()
+    {
+        app.push_guard(recall_g);
+    }
+    let (_title_rt, title_g) =
+        SessionTitleRuntime::install(app.llm(), &app.agent_loop(), SessionTitleConfig::default());
+    app.push_guard(title_g);
     let custom_ro_calls = Arc::new(AtomicUsize::new(0));
     let custom_ro_ref = Arc::clone(&custom_ro_calls);
-    app.plugin(
-        PluginDef::sync("custom-ro", move |ctx, ()| {
-            let tools = ctx.tools()?;
-            let c = Arc::clone(&custom_ro_ref);
-            let def = ToolDefinition::sync_tool(
-                "custom_inspect",
-                "Read-only custom inspection tool",
-                json!({"type": "object", "properties": {}}),
-                move |_, _| {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, mizar_tools::ToolError>("custom-ro-ok".to_string())
-                },
-            )
-            .with_annotations(ToolAnnotations {
-                read_only: true,
-                ..Default::default()
-            });
-            ctx.effect("custom-ro.reg", move || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(def)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["tools"]),
-        (),
-    )
-    .await
-    .unwrap();
+    {
+        let tools = app.tools();
+        let c = Arc::clone(&custom_ro_ref);
+        let def = ToolDefinition::sync_tool(
+            "custom_inspect",
+            "Read-only custom inspection tool",
+            json!({"type": "object", "properties": {}}),
+            move |_, _| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, mizar_tools::ToolError>("custom-ro-ok".to_string())
+            },
+        )
+        .with_annotations(ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        });
+        app.push_guard(tools.register(def).unwrap());
+    }
 
     let recorded = Arc::new(Mutex::new(Vec::<RecordedCall>::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -456,20 +488,16 @@ async fn parallel_read_only_subagents_isolate_history_and_persist_lineage() {
         child_barrier: Arc::clone(&child_barrier),
         parent_step: Arc::clone(&parent_step),
     });
-    let _llm_cleanup = app
-        .llm()
-        .unwrap()
-        .register_adapter("main", adapter)
-        .unwrap();
+    let _llm_cleanup = app.llm().register_adapter("main", adapter).unwrap();
 
-    let sessions = app.sessions().unwrap();
+    let sessions = app.sessions();
     let parent = sessions.create_with(mizar_session::SessionCreateOptions {
         id: Some("parent-parallel".into()),
         cwd: Some(ws.display().to_string()),
         ..Default::default()
     });
     let mut watch = StateWatch::attach(&app, &parent.id);
-    let agent_loop = app.agent_loop().unwrap();
+    let agent_loop = app.agent_loop();
 
     let first_reply = agent_loop
         .run(
@@ -581,8 +609,8 @@ async fn parallel_read_only_subagents_isolate_history_and_persist_lineage() {
         }
     }
 
-    assert_eq!(app.subagent().unwrap().active_child_count(), 0);
-    app.fiber().dispose().await;
+    assert_eq!(app.subagent().active_child_count(), 0);
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -595,7 +623,7 @@ async fn depth_one_guardrail_blocks_subagent_and_write_tools_in_read_only_mode()
 
     let child_seen_tools = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
     let nested_denied_seen = Arc::new(AtomicBool::new(false));
-    let tools_ref = app.tools().unwrap();
+    let tools_ref = app.tools();
 
     // 验证 subagent 暴露级别收紧为 ModelOnly（与 codemode 平级隔离）
     let sub_def = tools_ref
@@ -699,13 +727,9 @@ async fn depth_one_guardrail_blocks_subagent_and_write_tools_in_read_only_mode()
         tools: Arc::clone(&tools_ref),
         nested_denied_seen: Arc::clone(&nested_denied_seen),
     });
-    let _reg = app
-        .llm()
-        .unwrap()
-        .register_adapter("main", adapter)
-        .unwrap();
+    let _reg = app.llm().register_adapter("main", adapter).unwrap();
 
-    let parent = app.sessions().unwrap().create(None);
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
     let res = tools_ref
         .execute(ToolExecution::new(
@@ -723,7 +747,6 @@ async fn depth_one_guardrail_blocks_subagent_and_write_tools_in_read_only_mode()
     watch.wait_all_settled(5).await;
     let followup = app
         .agent_loop()
-        .unwrap()
         .inbox()
         .pop_followup(&parent.id)
         .expect("settled notice expected");
@@ -766,8 +789,8 @@ async fn depth_one_guardrail_blocks_subagent_and_write_tools_in_read_only_mode()
     assert!(replay_res.is_error);
     assert!(replay_res.blocked);
 
-    assert_eq!(app.subagent().unwrap().active_child_count(), 0);
-    app.fiber().dispose().await;
+    assert_eq!(app.subagent().active_child_count(), 0);
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -861,7 +884,6 @@ async fn edit_mode_allows_write_and_model_override_while_blocking_subagent_recur
     let seen = Arc::new(Mutex::new(Vec::new()));
     let _r1 = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(DualAdapter {
@@ -873,7 +895,6 @@ async fn edit_mode_allows_write_and_model_override_while_blocking_subagent_recur
         .unwrap();
     let _r2 = app
         .llm()
-        .unwrap()
         .register_adapter(
             "alt",
             Arc::new(DualAdapter {
@@ -884,11 +905,10 @@ async fn edit_mode_allows_write_and_model_override_while_blocking_subagent_recur
         )
         .unwrap();
 
-    let parent = app.sessions().unwrap().create(None);
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
     let res = app
         .tools()
-        .unwrap()
         .execute(ToolExecution::new(
             SUBAGENT_TOOL_NAME,
             json!({
@@ -904,7 +924,6 @@ async fn edit_mode_allows_write_and_model_override_while_blocking_subagent_recur
     watch.wait_all_settled(5).await;
     let followup = app
         .agent_loop()
-        .unwrap()
         .inbox()
         .pop_followup(&parent.id)
         .expect("edit notice expected");
@@ -927,8 +946,8 @@ async fn edit_mode_allows_write_and_model_override_while_blocking_subagent_recur
         assert!(!recorded[0].2.contains(&"subagent".to_string()));
     }
 
-    assert_eq!(app.subagent().unwrap().active_child_count(), 0);
-    app.fiber().dispose().await;
+    assert_eq!(app.subagent().active_child_count(), 0);
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -964,7 +983,6 @@ async fn pre_cancelled_spawn_is_rejected_and_parent_cleanup_cancels_worker() {
 
     let _reg = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(SlowAdapter {
@@ -974,9 +992,9 @@ async fn pre_cancelled_spawn_is_rejected_and_parent_cleanup_cancels_worker() {
         )
         .unwrap();
 
-    let parent = app.sessions().unwrap().create(None);
-    let tools = app.tools().unwrap();
-    let sub = app.subagent().unwrap();
+    let parent = app.sessions().create(None);
+    let tools = app.tools();
+    let sub = app.subagent();
 
     // 1. 传入已取消的 call_ctx.cancel 直接拒绝启动
     let pre_cancel = CancellationToken::new();
@@ -1020,7 +1038,7 @@ async fn pre_cancelled_spawn_is_rejected_and_parent_cleanup_cancels_worker() {
     .await
     .expect("parent cleanup must cancel worker and clean active children");
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -1081,7 +1099,6 @@ async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
     let step_calls = Arc::new(AtomicUsize::new(0));
     let _reg1 = app1
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(EndlessToolAdapter {
@@ -1090,8 +1107,8 @@ async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
         )
         .unwrap();
 
-    let tools1 = app1.tools().unwrap();
-    let parent1 = app1.sessions().unwrap().create(None);
+    let tools1 = app1.tools();
+    let parent1 = app1.sessions().create(None);
 
     let bad_prompt = tools1
         .execute(ToolExecution::new(
@@ -1133,19 +1150,14 @@ async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
         ev1.notice
     );
     assert_eq!(step_calls.load(Ordering::SeqCst), 2);
-    let f1 = app1
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent1.id)
-        .unwrap();
+    let f1 = app1.agent_loop().inbox().pop_followup(&parent1.id).unwrap();
     assert!(
         f1.text().contains("Reached max_steps limit (2/2)"),
         "{}",
         f1.text()
     );
-    assert_eq!(app1.subagent().unwrap().active_child_count(), 0);
-    app1.fiber().dispose().await;
+    assert_eq!(app1.subagent().active_child_count(), 0);
+    app1.dispose().await;
 
     // 2. timeout_secs 超时封顶验证
     let ws2 = temp_dir("timeout");
@@ -1182,15 +1194,13 @@ async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
 
     let _reg2 = app2
         .llm()
-        .unwrap()
         .register_adapter("main", Arc::new(HangingAdapter))
         .unwrap();
-    let parent2 = app2.sessions().unwrap().create(None);
+    let parent2 = app2.sessions().create(None);
     let mut watch2 = StateWatch::attach(&app2, &parent2.id);
 
     let t_spawn = app2
         .tools()
-        .unwrap()
         .execute(ToolExecution::new(
             SUBAGENT_TOOL_NAME,
             json!({ "prompt": "hang" }),
@@ -1201,19 +1211,14 @@ async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
 
     let ev2 = watch2.wait_all_settled(5).await;
     assert_eq!(ev2.status, SubagentRunStatus::TimedOut);
-    let f2 = app2
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent2.id)
-        .unwrap();
+    let f2 = app2.agent_loop().inbox().pop_followup(&parent2.id).unwrap();
     assert!(
         f2.text().contains("timed out after 1s limit"),
         "{}",
         f2.text()
     );
-    assert_eq!(app2.subagent().unwrap().active_child_count(), 0);
-    app2.fiber().dispose().await;
+    assert_eq!(app2.subagent().active_child_count(), 0);
+    app2.dispose().await;
 }
 
 #[tokio::test]
@@ -1289,7 +1294,6 @@ async fn parent_turn_route_is_inherited_without_session_selection() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let _r1 = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(RouteCheckAdapter {
@@ -1300,7 +1304,6 @@ async fn parent_turn_route_is_inherited_without_session_selection() {
         .unwrap();
     let _r2 = app
         .llm()
-        .unwrap()
         .register_adapter(
             "custom",
             Arc::new(RouteCheckAdapter {
@@ -1310,11 +1313,10 @@ async fn parent_turn_route_is_inherited_without_session_selection() {
         )
         .unwrap();
 
-    let parent = app.sessions().unwrap().create(None);
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
     let reply = app
         .agent_loop()
-        .unwrap()
         .run_with_options(
             Arc::clone(&parent),
             "test inherit",
@@ -1341,7 +1343,7 @@ async fn parent_turn_route_is_inherited_without_session_selection() {
         assert_eq!(child_call.1.as_deref(), Some("custom-m"));
     }
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -1354,7 +1356,7 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
 
     let (app, _db) = setup_base_app(&ws, SubagentConfig::default(), true).await;
 
-    let sys_prompt = app.system_prompt().unwrap().build();
+    let sys_prompt = app.system_prompt().build();
     assert!(
         sys_prompt.contains("end your turn instead of sleeping or polling"),
         "system prompt missing background contract:\n{sys_prompt}"
@@ -1502,7 +1504,6 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
     let seen_followup = Arc::new(Mutex::new(None));
     let _llm_reg = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(BgAdapter {
@@ -1516,9 +1517,9 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
         )
         .unwrap();
 
-    let agent_loop = app.agent_loop().unwrap();
+    let agent_loop = app.agent_loop();
     let mut wake_rx = agent_loop.inbox().subscribe_wake();
-    let parent = app.sessions().unwrap().create(None);
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
 
     let first_reply = agent_loop
@@ -1536,12 +1537,7 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
         .await
         .expect("both background children should start running")
         .unwrap();
-    assert_eq!(
-        app.subagent()
-            .unwrap()
-            .running_subagents_for_parent(&parent.id),
-        2
-    );
+    assert_eq!(app.subagent().running_subagents_for_parent(&parent.id), 2);
     {
         let imm = seen_immediate.lock().unwrap();
         assert_eq!(imm.len(), 2);
@@ -1551,13 +1547,8 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
 
     let _ = gate_tx.send(true);
     watch.wait_all_settled(5).await;
-    assert_eq!(
-        app.subagent()
-            .unwrap()
-            .running_subagents_for_parent(&parent.id),
-        0
-    );
-    assert_eq!(app.subagent().unwrap().active_child_count(), 0);
+    assert_eq!(app.subagent().running_subagents_for_parent(&parent.id), 0);
+    assert_eq!(app.subagent().active_child_count(), 0);
 
     let woken_sid = tokio::time::timeout(Duration::from_secs(3), wake_rx.recv())
         .await
@@ -1600,10 +1591,7 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
             .is_some_and(|t| t.contains("ALPHA_OK") && t.contains("BETA_OK"))
     );
 
-    let snapshots = app
-        .subagent()
-        .unwrap()
-        .list_subagents_for_parent(&parent.id);
+    let snapshots = app.subagent().list_subagents_for_parent(&parent.id);
     assert_eq!(snapshots.len(), 2);
     assert!(
         snapshots
@@ -1613,7 +1601,6 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
 
     let status_out = app
         .tools()
-        .unwrap()
         .execute(ToolExecution::new(
             SUBAGENT_TOOL_NAME,
             json!({ "action": "status" }),
@@ -1635,7 +1622,7 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
         .unwrap_or(0);
     assert_eq!(max_running_seen, 2);
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -1707,7 +1694,6 @@ async fn background_subagent_survives_parent_turn_cancel_and_supports_status_and
 
     let _llm_reg = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(SurviveStopAdapter {
@@ -1719,9 +1705,9 @@ async fn background_subagent_survives_parent_turn_cancel_and_supports_status_and
         )
         .unwrap();
 
-    let agent_loop = app.agent_loop().unwrap();
-    let tools = app.tools().unwrap();
-    let parent = app.sessions().unwrap().create(None);
+    let agent_loop = app.agent_loop();
+    let tools = app.tools();
+    let parent = app.sessions().create(None);
     let parent_cancel = CancellationToken::new();
 
     let parent_loop = Arc::clone(&agent_loop);
@@ -1755,12 +1741,7 @@ async fn background_subagent_survives_parent_turn_cancel_and_supports_status_and
         !child_cancelled.load(Ordering::SeqCst),
         "cancelling foreground parent turn must not kill background subagent"
     );
-    assert_eq!(
-        app.subagent()
-            .unwrap()
-            .running_subagents_for_parent(&parent.id),
-        1
-    );
+    assert_eq!(app.subagent().running_subagents_for_parent(&parent.id), 1);
 
     let status_out = tools
         .execute(ToolExecution::new(
@@ -1782,12 +1763,7 @@ async fn background_subagent_survives_parent_turn_cancel_and_supports_status_and
         .await;
     assert!(!stop_out.is_error, "{}", stop_out.content);
     assert!(stop_out.content.contains("Stopped subagent(s): worker-x"));
-    assert_eq!(
-        app.subagent()
-            .unwrap()
-            .running_subagents_for_parent(&parent.id),
-        0
-    );
+    assert_eq!(app.subagent().running_subagents_for_parent(&parent.id), 0);
 
     tokio::time::timeout(Duration::from_secs(3), async {
         while !child_cancelled.load(Ordering::SeqCst) {
@@ -1799,7 +1775,7 @@ async fn background_subagent_survives_parent_turn_cancel_and_supports_status_and
 
     assert!(agent_loop.inbox().pop_followup(&parent.id).is_none());
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -1808,7 +1784,7 @@ async fn background_concurrency_limit_and_parent_session_switch_cleanup() {
     let _guard = DirGuard(ws.clone());
     std::fs::create_dir_all(&ws).unwrap();
 
-    let (app, _, sub_fiber) = setup_base_app_with_subagent_fiber(
+    let (app, _) = setup_base_app(
         &ws,
         SubagentConfig {
             max_concurrent_per_parent: 2,
@@ -1842,7 +1818,6 @@ async fn background_concurrency_limit_and_parent_session_switch_cleanup() {
     let cancelled = Arc::new(AtomicUsize::new(0));
     let _llm_reg = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(BlockingChildAdapter {
@@ -1852,20 +1827,18 @@ async fn background_concurrency_limit_and_parent_session_switch_cleanup() {
         )
         .unwrap();
 
-    let tools = app.tools().unwrap();
-    let sessions = app.sessions().unwrap();
+    let tools = app.tools();
+    let sessions = app.sessions();
     let parent1 = sessions.create(None);
     let parent2 = sessions.create(None);
     let dispose_events = Arc::new(Mutex::new(Vec::<SubagentStateEvent>::new()));
     let dispose_events_cb = Arc::clone(&dispose_events);
     let parent2_id = parent2.id.clone();
-    let _dispose_state_h = app
-        .on(EVENT_SUBAGENT_STATE, move |ev: &SubagentStateEvent| {
-            if ev.parent_session_id == parent2_id {
-                dispose_events_cb.lock().unwrap().push(ev.clone());
-            }
-        })
-        .unwrap();
+    let _dispose_state_h = app.subagent().on_state(move |ev: &SubagentStateEvent| {
+        if ev.parent_session_id == parent2_id {
+            dispose_events_cb.lock().unwrap().push(ev.clone());
+        }
+    });
 
     let r1 = tools
         .execute(ToolExecution::new(
@@ -1932,22 +1905,9 @@ async fn background_concurrency_limit_and_parent_session_switch_cleanup() {
     .await
     .unwrap();
 
-    assert_eq!(
-        app.subagent().unwrap().cancel_parent_subagents(&parent1.id),
-        2
-    );
-    assert_eq!(
-        app.subagent()
-            .unwrap()
-            .running_subagents_for_parent(&parent1.id),
-        0
-    );
-    assert_eq!(
-        app.subagent()
-            .unwrap()
-            .running_subagents_for_parent(&parent2.id),
-        1
-    );
+    assert_eq!(app.subagent().cancel_parent_subagents(&parent1.id), 2);
+    assert_eq!(app.subagent().running_subagents_for_parent(&parent1.id), 0);
+    assert_eq!(app.subagent().running_subagents_for_parent(&parent2.id), 1);
 
     tokio::time::timeout(Duration::from_secs(3), async {
         while cancelled.load(Ordering::SeqCst) < 2 {
@@ -1958,7 +1918,7 @@ async fn background_concurrency_limit_and_parent_session_switch_cleanup() {
     .unwrap();
     assert_eq!(cancelled.load(Ordering::SeqCst), 2);
 
-    sub_fiber.dispose().await;
+    app.dispose_subagent();
     assert!(
         dispose_events
             .lock()
@@ -1975,7 +1935,7 @@ async fn background_concurrency_limit_and_parent_session_switch_cleanup() {
     })
     .await
     .unwrap();
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -2087,7 +2047,6 @@ async fn send_wakes_settled_subagent_preserving_memory_enforces_mode_and_concurr
     let (hold_tx, hold_rx) = tokio::sync::watch::channel(false);
     let _llm = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(MemoryAdapter {
@@ -2097,8 +2056,8 @@ async fn send_wakes_settled_subagent_preserving_memory_enforces_mode_and_concurr
         )
         .unwrap();
 
-    let tools = app.tools().unwrap();
-    let parent = app.sessions().unwrap().create(None);
+    let tools = app.tools();
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
 
     // 1. 首轮 spawn 记住 MAGIC-42
@@ -2115,7 +2074,7 @@ async fn send_wakes_settled_subagent_preserving_memory_enforces_mode_and_concurr
         .unwrap()
         .to_string();
     watch.wait_all_settled(5).await;
-    let _ = app.agent_loop().unwrap().inbox().pop_followup(&parent.id);
+    let _ = app.agent_loop().inbox().pop_followup(&parent.id);
 
     // 2. 尝试通过 send 提权到 edit 必须报错拒绝
     let escalate_err = tools
@@ -2142,17 +2101,9 @@ async fn send_wakes_settled_subagent_preserving_memory_enforces_mode_and_concurr
     assert_eq!(send_details["childSessionId"], child_id_1);
 
     watch.wait_all_settled(5).await;
-    let f2 = app
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent.id)
-        .unwrap();
+    let f2 = app.agent_loop().inbox().pop_followup(&parent.id).unwrap();
     assert!(f2.text().contains("RECALLED_MAGIC_42"), "{}", f2.text());
-    let snaps = app
-        .subagent()
-        .unwrap()
-        .list_subagents_for_parent(&parent.id);
+    let snaps = app.subagent().list_subagents_for_parent(&parent.id);
     assert_eq!(
         snaps[0].steps, 2,
         "cumulative steps must add across resumes"
@@ -2187,12 +2138,7 @@ async fn send_wakes_settled_subagent_preserving_memory_enforces_mode_and_concurr
     assert_eq!(deliveries, vec!["resume".to_string(), "steer".to_string()]);
 
     watch.wait_all_settled(5).await;
-    let f_conc = app
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent.id)
-        .unwrap();
+    let f_conc = app.agent_loop().inbox().pop_followup(&parent.id).unwrap();
     assert!(
         f_conc
             .text()
@@ -2224,7 +2170,7 @@ async fn send_wakes_settled_subagent_preserving_memory_enforces_mode_and_concurr
 
     let _ = hold_tx.send(true);
     watch.wait_all_settled(5).await;
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -2275,7 +2221,6 @@ async fn stop_while_winding_down_blocks_send_with_stopping_in_progress_then_allo
 
     let _llm = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(WindingAdapter {
@@ -2287,8 +2232,8 @@ async fn stop_while_winding_down_blocks_send_with_stopping_in_progress_then_allo
         )
         .unwrap();
 
-    let tools = app.tools().unwrap();
-    let parent = app.sessions().unwrap().create(None);
+    let tools = app.tools();
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
 
     let sp = tools
@@ -2332,7 +2277,7 @@ async fn stop_while_winding_down_blocks_send_with_stopping_in_progress_then_allo
     // 放行收尾并等待原 Worker 清理完守卫与 active_run_id，随后 send 可干净唤醒续跑
     let _ = release_cancel_tx.send(true);
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !exited.load(Ordering::SeqCst) || app.subagent().unwrap().active_child_count() > 0 {
+        while !exited.load(Ordering::SeqCst) || app.subagent().active_child_count() > 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -2351,19 +2296,14 @@ async fn stop_while_winding_down_blocks_send_with_stopping_in_progress_then_allo
     assert!(!after_wind_down.is_error, "{}", after_wind_down.content);
 
     watch.wait_all_settled(5).await;
-    let followup = app
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent.id)
-        .unwrap();
+    let followup = app.agent_loop().inbox().pop_followup(&parent.id).unwrap();
     assert!(
         followup.text().contains("RESUMED_AFTER_WIND_DOWN"),
         "{}",
         followup.text()
     );
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -2421,7 +2361,6 @@ async fn send_steers_running_subagent_in_completion_window_and_rejects_model_cha
 
     let _llm = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(SteerAdapter {
@@ -2432,8 +2371,8 @@ async fn send_steers_running_subagent_in_completion_window_and_rejects_model_cha
         )
         .unwrap();
 
-    let tools = app.tools().unwrap();
-    let parent = app.sessions().unwrap().create(None);
+    let tools = app.tools();
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
 
     let sp = tools
@@ -2475,32 +2414,18 @@ async fn send_steers_running_subagent_in_completion_window_and_rejects_model_cha
     let ev = watch.wait_all_settled(5).await;
     assert_eq!(ev.status, SubagentRunStatus::Completed);
 
-    let followup = app
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent.id)
-        .unwrap();
+    let followup = app.agent_loop().inbox().pop_followup(&parent.id).unwrap();
     assert!(
         followup.text().contains("STEER_WINDOW_OK"),
         "{}",
         followup.text()
     );
-    assert!(
-        app.agent_loop()
-            .unwrap()
-            .inbox()
-            .pop_followup(&parent.id)
-            .is_none()
-    );
+    assert!(app.agent_loop().inbox().pop_followup(&parent.id).is_none());
 
-    let snaps = app
-        .subagent()
-        .unwrap()
-        .list_subagents_for_parent(&parent.id);
+    let snaps = app.subagent().list_subagents_for_parent(&parent.id);
     assert_eq!(snaps[0].steps, 2);
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -2521,7 +2446,7 @@ async fn timeout_repairs_dangling_tool_call_enabling_clean_send_resume() {
     .await;
 
     // 注册一个永不返回的慢工具（阻塞在未触发的 Notify 上）模拟超时强停留下悬挂 ToolCall
-    let tools_reg = app.tools().unwrap();
+    let tools_reg = app.tools();
     let slow_def = ToolDefinition::async_rich_tool(
         "slow_readonly",
         "Always stalls until cancelled",
@@ -2592,7 +2517,6 @@ async fn timeout_repairs_dangling_tool_call_enabling_clean_send_resume() {
 
     let _llm = app
         .llm()
-        .unwrap()
         .register_adapter(
             "main",
             Arc::new(TimeoutResumeAdapter {
@@ -2602,7 +2526,7 @@ async fn timeout_repairs_dangling_tool_call_enabling_clean_send_resume() {
         )
         .unwrap();
 
-    let parent = app.sessions().unwrap().create(None);
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
 
     let sp = tools_reg
@@ -2616,7 +2540,7 @@ async fn timeout_repairs_dangling_tool_call_enabling_clean_send_resume() {
 
     let ev_to = watch.wait_all_settled(5).await;
     assert_eq!(ev_to.status, SubagentRunStatus::TimedOut);
-    let _ = app.agent_loop().unwrap().inbox().pop_followup(&parent.id);
+    let _ = app.agent_loop().inbox().pop_followup(&parent.id);
 
     // 唤醒 TimedOut 会话：不得因悬挂 ToolCall 导致协议异常
     let resume = tools_reg
@@ -2634,19 +2558,14 @@ async fn timeout_repairs_dangling_tool_call_enabling_clean_send_resume() {
         resumed_saw_repaired_tool.load(Ordering::SeqCst),
         "resumed child session must have synthetic TOOL_OUTCOME_UNKNOWN pairing call_hang_1"
     );
-    let followup = app
-        .agent_loop()
-        .unwrap()
-        .inbox()
-        .pop_followup(&parent.id)
-        .unwrap();
+    let followup = app.agent_loop().inbox().pop_followup(&parent.id).unwrap();
     assert!(
         followup.text().contains("CLEAN_AFTER_TIMEOUT"),
         "{}",
         followup.text()
     );
 
-    app.fiber().dispose().await;
+    app.dispose().await;
 }
 
 #[tokio::test]
@@ -2692,12 +2611,11 @@ async fn watchdog_alerts_on_stall_reserves_last_wake_budget_and_skips_active_chi
 
     let _llm1 = app1
         .llm()
-        .unwrap()
         .register_adapter("main", Arc::new(StallThenFinishAdapter { wd_release_rx }))
         .unwrap();
 
-    let parent1 = app1.sessions().unwrap().create(None);
-    let loop1 = app1.agent_loop().unwrap();
+    let parent1 = app1.sessions().create(None);
+    let loop1 = app1.agent_loop();
     let inbox1 = loop1.inbox();
     // 设限为 2：第 1 次看门狗消耗 1 格剩 1 格；消费后剩 1 格时第 2 次看门狗必须降级为 Inject，把最后 1 格留给结算
     inbox1.set_auto_wake_limit(&parent1.id, 2);
@@ -2705,7 +2623,6 @@ async fn watchdog_alerts_on_stall_reserves_last_wake_budget_and_skips_active_chi
 
     let sp = app1
         .tools()
-        .unwrap()
         .execute(ToolExecution::new(
             SUBAGENT_TOOL_NAME,
             json!({ "name": "wd-worker", "prompt": "slow stall check" }),
@@ -2754,7 +2671,7 @@ async fn watchdog_alerts_on_stall_reserves_last_wake_budget_and_skips_active_chi
     assert!(settled_msg.text().contains("FINAL_SETTLED_AFTER_WD"));
     assert_eq!(inbox1.remaining_auto_wakes(&parent1.id), 0);
 
-    app1.fiber().dispose().await;
+    app1.dispose().await;
 
     // Part B: 持续有流输出的活跃子代理超过 stall_timeout_secs 也绝不误报看门狗
     let ws2 = temp_dir("watchdog_active_no_false_alarm");
@@ -2794,15 +2711,13 @@ async fn watchdog_alerts_on_stall_reserves_last_wake_budget_and_skips_active_chi
 
     let _llm2 = app2
         .llm()
-        .unwrap()
         .register_adapter("main", Arc::new(TrickleActiveAdapter))
         .unwrap();
-    let parent2 = app2.sessions().unwrap().create(None);
+    let parent2 = app2.sessions().create(None);
     let mut watch2 = StateWatch::attach(&app2, &parent2.id);
 
     let sp2 = app2
         .tools()
-        .unwrap()
         .execute(ToolExecution::new(
             SUBAGENT_TOOL_NAME,
             json!({ "name": "active-w", "prompt": "stream steadily" }),
@@ -2812,10 +2727,7 @@ async fn watchdog_alerts_on_stall_reserves_last_wake_budget_and_skips_active_chi
     assert!(!sp2.is_error, "{}", sp2.content);
 
     watch2.wait_all_settled(5).await;
-    let snaps2 = app2
-        .subagent()
-        .unwrap()
-        .list_subagents_for_parent(&parent2.id);
+    let snaps2 = app2.subagent().list_subagents_for_parent(&parent2.id);
     assert_eq!(snaps2[0].watchdog_alerts, 0);
     assert!(
         !watch2
@@ -2825,7 +2737,7 @@ async fn watchdog_alerts_on_stall_reserves_last_wake_budget_and_skips_active_chi
         "active streaming child must never trigger false watchdog alerts"
     );
 
-    app2.fiber().dispose().await;
+    app2.dispose().await;
 }
 
 #[tokio::test]
@@ -2838,7 +2750,7 @@ async fn status_exposes_live_step_tool_and_idle_seconds() {
 
     let (in_tool_tx, mut in_tool_rx) = tokio::sync::watch::channel(false);
     let (release_tool_tx, release_tool_rx) = tokio::sync::watch::channel(false);
-    let tools_reg = app.tools().unwrap();
+    let tools_reg = app.tools();
     let live_probe_def = ToolDefinition::async_rich_tool(
         "probe_ro",
         "Holds until test checks status",
@@ -2891,10 +2803,9 @@ async fn status_exposes_live_step_tool_and_idle_seconds() {
 
     let _llm = app
         .llm()
-        .unwrap()
         .register_adapter("main", Arc::new(LiveStatusAdapter))
         .unwrap();
-    let parent = app.sessions().unwrap().create(None);
+    let parent = app.sessions().create(None);
     let mut watch = StateWatch::attach(&app, &parent.id);
 
     let sp = tools_reg
@@ -2943,5 +2854,5 @@ async fn status_exposes_live_step_tool_and_idle_seconds() {
 
     let _ = release_tool_tx.send(true);
     watch.wait_all_settled(5).await;
-    app.fiber().dispose().await;
+    app.dispose().await;
 }

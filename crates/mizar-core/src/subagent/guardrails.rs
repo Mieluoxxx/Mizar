@@ -411,16 +411,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn check_pre_execute_readonly_uses_allowlist_and_single_tool_lookup() {
-        use cordis::{BoxError, Context, Service};
-        use mizar_session::SessionContextExt;
-        use mizar_tools::{ToolDefinition, ToolsContextExt};
+    #[test]
+    fn check_pre_execute_readonly_uses_allowlist_and_single_tool_lookup() {
+        use mizar_tools::ToolDefinition;
+        use mizar_types::BoxError;
 
-        let app = Context::new();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let sessions = SessionStore::new();
+        let tools = ToolRuntime::new();
         let _ro = tools
             .register(
                 ToolDefinition::sync_tool("custom_ro", "ro", json!({}), |_, _| {
@@ -453,7 +450,6 @@ mod tests {
             .unwrap();
         tools.set_tool_selection(None, vec!["excluded_ro".to_string()]);
 
-        let sessions = app.sessions().unwrap();
         let active = Mutex::new(HashMap::from([(
             "child-ro".to_string(),
             (1u64, SubagentMode::ReadOnly),

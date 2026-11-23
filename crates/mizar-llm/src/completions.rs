@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions 兼容协议适配器。
 //!
-//! 通过 `CompletionsPlugin` 与 `CompletionsCompat` 方言开关接入任何 Chat Completions
+//! 通过 `register_completions_adapter` 与 `CompletionsCompat` 方言开关接入任何 Chat Completions
 //! 协议端点（OpenAI / DeepSeek / OpenRouter / vLLM / Qwen 等）。
 
 use std::collections::HashMap;
@@ -13,13 +13,13 @@ use crate::http::{
 };
 use crate::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    LlmAdapter, LlmError, LlmErrorCode, LlmRuntime, Message, ModelInfo, ProviderInfo,
     ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
     clamp_openai_prompt_cache_key, detect_session_affinity_mode, push_session_affinity_headers,
     resolve_cache_retention,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
+use mizar_types::hooks::{BoxFuture, HookGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -845,36 +845,12 @@ impl LlmAdapter for CompletionsAdapter {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct CompletionsPlugin;
-
-impl Plugin for CompletionsPlugin {
-    type Config = CompletionsConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("llm-completions")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["llm"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let llm = ctx.llm()?;
-            let provider = config.provider.clone();
-            ctx.effect("llm-completions.registerAdapter", || {
-                Ok::<_, LlmError>(Some(
-                    llm.register_adapter(provider, Arc::new(CompletionsAdapter::new(config)))?,
-                ))
-            })?;
-            Ok(None)
-        })
-    }
+pub fn register_completions_adapter(
+    llm: &Arc<LlmRuntime>,
+    config: CompletionsConfig,
+) -> Result<HookGuard, LlmError> {
+    let provider = config.provider.clone();
+    llm.register_adapter(provider, Arc::new(CompletionsAdapter::new(config)))
 }
 
 #[cfg(test)]

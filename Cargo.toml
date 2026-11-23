@@ -36,7 +36,6 @@ unicode-normalization = "0.1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
-cordis = { path = "crates/cordis" }
 mizar-types = { path = "crates/mizar-types" }
 mizar-llm = { path = "crates/mizar-llm" }
 mizar-tools = { path = "crates/mizar-tools" }

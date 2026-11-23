@@ -1,18 +1,14 @@
-//! 工具执行前危险操作审批门禁（`tools/pre-execute` 瀑布流钩子与 `ApprovalGatePlugin`）。
+//! 工具执行前危险操作审批门禁（`tools.pre_execute_hook()` 瀑布流钩子与 `install_approval_gate`）。
 
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 
-use cordis::{
-    BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Next, Plugin,
-};
-use mizar_tools::{
-    EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolRuntime, ToolsContextExt,
-};
-use mizar_types::client::{
-    ApprovalDecision, ApprovalMode, ClientEvent, PLUGIN_APPROVAL_GATE, truncate_display,
-};
+use mizar_core::spine::MizarRuntime;
+use mizar_session::SessionStore;
+use mizar_tools::{PreExecuteDecision, ToolExecution, ToolRuntime};
+use mizar_types::client::{ApprovalDecision, ApprovalMode, ClientEvent, truncate_display};
+use mizar_types::{BoxFuture, HookGuard, Next};
 use tokio::sync::mpsc;
 
 /// 运行期共享审批策略快照（供异步工具执行前瀑布流无锁检查）。
@@ -22,7 +18,7 @@ pub struct ApprovalSnapshot {
     pub always_allowed: HashSet<String>,
 }
 
-/// `ApprovalGatePlugin` 插件配置：关联活跃会话 ID、审批策略快照与事件回调。
+/// 危险操作审批门禁配置：关联活跃会话 ID、审批策略快照与事件回调。
 #[derive(Clone)]
 pub struct ApprovalGateConfig {
     pub active_session_id: Arc<RwLock<String>>,
@@ -66,51 +62,21 @@ impl ApprovalGateConfig {
     }
 }
 
-/// 官方危险工具审批门禁 Cordis 插件（依赖 `tools` 服务，在卸载时自动撤销拦截钩子）。
-#[derive(Default, Clone, Copy)]
-pub struct ApprovalGatePlugin;
-
-impl Plugin for ApprovalGatePlugin {
-    type Config = ApprovalGateConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some(PLUGIN_APPROVAL_GATE)
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let _ = ctx.tools()?;
-            let c = ctx.clone();
-            ctx.effect("mizar-client-approval-gate", move || {
-                let emit = Arc::clone(&config.emit);
-                let handle = register_approval_hook_with(
-                    &c,
-                    config.active_session_id,
-                    config.snapshot,
-                    move |ev| emit(ev),
-                )?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    handle.dispose().await;
-                })))
-            })?;
-            Ok(None)
-        })
-    }
+/// 将交互式工具执行前审批门禁挂载到 `MizarRuntime` 上，返回 RAII `HookGuard`。
+pub fn install_approval_gate(runtime: &MizarRuntime, config: ApprovalGateConfig) -> HookGuard {
+    let emit = Arc::clone(&config.emit);
+    register_approval_hook_with(
+        &runtime.tools,
+        Some(Arc::clone(&runtime.sessions)),
+        config.active_session_id,
+        config.snapshot,
+        move |ev| emit(ev),
+    )
 }
 
 /// 判断给定工具在 `Ask` 模式下是否需要向用户请求交互审批（只读工具自动豁免）。
-pub fn tool_needs_approval(ctx: &Context, tool_name: &str) -> bool {
-    if let Some(rt) = ctx.get::<ToolRuntime>("tools")
-        && let Some(info) = rt.list_all().into_iter().find(|i| i.name == tool_name)
-    {
+pub fn tool_needs_approval(tools: &ToolRuntime, tool_name: &str) -> bool {
+    if let Some(info) = tools.list_all().into_iter().find(|i| i.name == tool_name) {
         return !info.annotations.read_only;
     }
     !matches!(
@@ -126,37 +92,39 @@ pub fn tool_needs_approval(ctx: &Context, tool_name: &str) -> bool {
     )
 }
 
-/// 注册 `tools/pre-execute` 审批瀑布流钩子，并通过 `mpsc::UnboundedSender<ClientEvent>` 投递弹窗请求。
+/// 注册 `tools.pre_execute_hook()` 审批瀑布流钩子，并通过 `mpsc::UnboundedSender<ClientEvent>` 投递弹窗请求。
 pub fn register_approval_hook(
-    ctx: &Context,
+    tools: &Arc<ToolRuntime>,
+    sessions: Option<Arc<SessionStore>>,
     tx: mpsc::UnboundedSender<ClientEvent>,
     active_sid: Arc<RwLock<String>>,
     approval_snap: Arc<RwLock<ApprovalSnapshot>>,
-) -> Result<DisposableHandle, CordisError> {
-    register_approval_hook_with(ctx, active_sid, approval_snap, move |ev| {
+) -> HookGuard {
+    register_approval_hook_with(tools, sessions, active_sid, approval_snap, move |ev| {
         let _ = tx.send(ev);
     })
 }
 
-/// 注册 `tools/pre-execute` 审批瀑布流钩子，向自定义回调投递 `ClientEvent::ApprovalRequested`。
+/// 注册 `tools.pre_execute_hook()` 审批瀑布流钩子，向自定义回调投递 `ClientEvent::ApprovalRequested`。
 pub fn register_approval_hook_with<F>(
-    ctx: &Context,
+    tools: &Arc<ToolRuntime>,
+    sessions: Option<Arc<SessionStore>>,
     active_sid: Arc<RwLock<String>>,
     approval_snap: Arc<RwLock<ApprovalSnapshot>>,
     emit: F,
-) -> Result<DisposableHandle, CordisError>
+) -> HookGuard
 where
     F: Fn(ClientEvent) + Clone + Send + Sync + 'static,
 {
-    let ctx_lookup = ctx.clone();
-    ctx.on_waterfall(
-        EVENT_TOOLS_PRE_EXECUTE,
+    let tools_ref = Arc::clone(tools);
+    tools.pre_execute_hook().register(
         move |exec: ToolExecution,
               next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
             let emit = emit.clone();
             let active_sid = Arc::clone(&active_sid);
             let snap_lock = Arc::clone(&approval_snap);
-            let ctx_inner = ctx_lookup.clone();
+            let tools_inner = Arc::clone(&tools_ref);
+            let sessions_inner = sessions.clone();
             Box::pin(async move {
                 let needs_prompt = {
                     let guard = snap_lock.read().ok();
@@ -165,7 +133,7 @@ where
                             if g.mode == ApprovalMode::Ask
                                 && !g.always_allowed.contains(&exec.name) =>
                         {
-                            tool_needs_approval(&ctx_inner, &exec.name)
+                            tool_needs_approval(&tools_inner, &exec.name)
                         }
                         _ => false,
                     }
@@ -179,8 +147,7 @@ where
                 if let Some(sid) = exec.session_id.as_deref() {
                     let active_id = active_sid.read().unwrap().clone();
                     if sid != active_id {
-                        if let Some(store) =
-                            ctx_inner.get::<mizar_session::SessionStore>("sessions")
+                        if let Some(store) = sessions_inner.as_ref()
                             && let Some(loaded) = store.inspect_readonly(sid)
                             && loaded.header.is_subagent_child()
                             && loaded.header.parent_id.as_deref() == Some(active_id.as_str())
@@ -221,18 +188,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use cordis::Service;
     use mizar_tools::{ToolAnnotations, ToolDefinition};
+    use mizar_types::BoxError;
     use serde_json::json;
 
     use super::*;
 
     #[tokio::test]
-    async fn approval_gate_plugin_enforces_ask_mode_exemptions_and_cleanup() {
-        let ctx = Context::new();
-        ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = ctx.tools().unwrap();
-        tools
+    async fn approval_gate_enforces_ask_mode_exemptions_and_cleanup() {
+        let tools = ToolRuntime::new();
+        let sessions = SessionStore::new();
+        let _safe_g = tools
             .register(
                 ToolDefinition::sync_tool("safe_read", "read only", json!({}), |_, _| {
                     Ok::<_, BoxError>("ok".to_string())
@@ -243,7 +209,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        tools
+        let _danger_g = tools
             .register(
                 ToolDefinition::sync_tool("danger_write", "write op", json!({}), |_, _| {
                     Ok::<_, BoxError>("written".to_string())
@@ -261,13 +227,15 @@ mod tests {
             always_allowed: HashSet::new(),
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let plugin_fiber = ctx
-            .plugin(
-                ApprovalGatePlugin,
-                ApprovalGateConfig::new(Arc::clone(&active_sid), Arc::clone(&snap), tx),
-            )
-            .await
-            .unwrap();
+        let config = ApprovalGateConfig::new(Arc::clone(&active_sid), Arc::clone(&snap), tx);
+        let emit = Arc::clone(&config.emit);
+        let hook_guard = register_approval_hook_with(
+            &tools,
+            Some(Arc::clone(&sessions)),
+            config.active_session_id,
+            config.snapshot,
+            move |ev| emit(ev),
+        );
 
         // 1. 只读工具无需弹窗审批
         let read_out = tools
@@ -291,17 +259,10 @@ mod tests {
         assert!(stale_out.is_error);
         assert!(stale_out.content.contains("会话已切换"));
 
-        use mizar_session::SessionContextExt;
-        ctx.plugin(mizar_session::SessionStore::plugin(), ())
-            .await
-            .unwrap();
-        let child_sess = ctx
-            .sessions()
-            .unwrap()
-            .create_with(mizar_session::SessionCreateOptions {
-                parent_id: Some("sess-1".into()),
-                ..Default::default()
-            });
+        let child_sess = sessions.create_with(mizar_session::SessionCreateOptions {
+            parent_id: Some("sess-1".into()),
+            ..Default::default()
+        });
         let child_out = tools
             .execute(ToolExecution::new(
                 "danger_write",
@@ -349,8 +310,8 @@ mod tests {
         assert!(!write_out.is_error);
         assert_eq!(write_out.content, "written");
 
-        // 4. 卸载插件后钩子失效，直接放行
-        plugin_fiber.dispose().await;
+        // 4. 释放守卫后钩子失效，直接放行
+        drop(hook_guard);
         let post_dispose = tools
             .execute(ToolExecution::new(
                 "danger_write",
@@ -360,7 +321,5 @@ mod tests {
             .await;
         assert!(!post_dispose.is_error);
         assert_eq!(post_dispose.content, "written");
-
-        ctx.fiber().dispose().await;
     }
 }

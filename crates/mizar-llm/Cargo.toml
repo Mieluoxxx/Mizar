@@ -3,13 +3,12 @@ name = "mizar-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "抽象 LLM 服务 ctx.llm、HTTP/SSE 传输、三大协议适配器、路由与流式重试（对应 NamiDSH packages/llm*）"
+description = "抽象 LLM 运行时、HTTP/SSE 传输、三大协议适配器、路由与流式重试"
 
 [lints]
 workspace = true
 
 [dependencies]
-cordis = { workspace = true }
 futures = { workspace = true }
 mizar-types = { workspace = true }
 reqwest = { workspace = true }

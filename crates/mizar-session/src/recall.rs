@@ -8,13 +8,13 @@
 use std::sync::Arc;
 
 use crate::{
-    RecallSearchHit, RecallSearchQuery, SessionContextExt, SessionEntry, SessionEvent,
-    SessionListQuery, SessionStore,
+    RecallSearchHit, RecallSearchQuery, SessionEntry, SessionEvent, SessionListQuery, SessionStore,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use mizar_tools::{
-    ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput, ToolsContextExt,
+    ToolAnnotations, ToolDefinition, ToolError, ToolExecutionMode, ToolExposure, ToolOutput,
+    ToolRuntime,
 };
+use mizar_types::hooks::{BoxError, HookGuard};
 use mizar_types::llm::ContentBlock;
 use serde_json::{Value, json};
 
@@ -708,73 +708,42 @@ fn build_recall_tool(
     .with_prompt_snippet("Search or read preserved verbatim session history across compaction boundaries")
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct RecallPlugin;
-
-impl Plugin for RecallPlugin {
-    type Config = RecallConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("recall")
+/// 注册 `recall` 工具到 `ToolRuntime`；`config.enabled == false` 时返回 `Ok(None)`。
+pub fn register_recall_tool(
+    tools: &Arc<ToolRuntime>,
+    sessions: Arc<SessionStore>,
+    config: RecallConfig,
+) -> Result<Option<HookGuard>, ToolError> {
+    if !config.enabled {
+        return Ok(None);
     }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["sessions", "tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            if !config.enabled {
-                return Ok(None);
-            }
-            let sessions = ctx.sessions()?;
-            let tools = ctx.tools()?;
-            let search_limit = config.default_search_limit;
-            let char_limit = config.read_char_limit;
-            let handle = ctx.effect("recall.register", move || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(build_recall_tool(
-                    sessions,
-                    search_limit,
-                    char_limit,
-                ))?))
-            })?;
-
-            Ok(Some(Cleanup::async_fn(move || async move {
-                handle.dispose().await;
-            })))
-        })
-    }
+    let guard = tools.register(build_recall_tool(
+        sessions,
+        config.default_search_limit,
+        config.read_char_limit,
+    ))?;
+    Ok(Some(guard))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
+    use crate::sqlite::SqliteSessionPersistence;
     use crate::{SessionCreateOptions, SessionStore};
-    use cordis::Service;
     use mizar_tools::{ToolExecution, ToolRuntime};
+    use mizar_types::hooks::BoxFuture;
 
     #[tokio::test]
     async fn static_recall_freezes_tool_list_across_compaction_and_reads_compacted_verbatim_text() {
-        let app = Context::new();
-        app.plugin(
-            SqlitePersistencePlugin,
-            SqlitePersistenceConfig::new(":memory:"),
-        )
-        .await
-        .unwrap();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(RecallPlugin, RecallConfig::default())
+        let backend = SqliteSessionPersistence::open_async(":memory:")
             .await
             .unwrap();
-
-        let store = app.sessions().unwrap();
-        let tools = app.tools().unwrap();
+        let store = SessionStore::with_persistence(backend.clone());
+        let tools = ToolRuntime::new();
+        let _recall_guard =
+            register_recall_tool(&tools, Arc::clone(&store), RecallConfig::default())
+                .unwrap()
+                .unwrap();
 
         let s = store.create_with(SessionCreateOptions {
             id: Some("rec-1".into()),
@@ -887,20 +856,18 @@ mod tests {
             page_res.content
         );
 
-        app.fiber().dispose().await;
+        let _ = store.flush_async(None).await;
+        let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
     }
 
     #[tokio::test]
     async fn blocks_cross_workspace_session_read_but_allows_lineage() {
-        let app = Context::new();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(RecallPlugin, RecallConfig::default())
-            .await
-            .unwrap();
-
-        let store = app.sessions().unwrap();
-        let tools = app.tools().unwrap();
+        let store = SessionStore::new();
+        let tools = ToolRuntime::new();
+        let _recall_guard =
+            register_recall_tool(&tools, Arc::clone(&store), RecallConfig::default())
+                .unwrap()
+                .unwrap();
 
         let parent = store.create_with(SessionCreateOptions {
             id: Some("parent-s".into()),
@@ -939,8 +906,6 @@ mod tests {
             .await;
         assert!(!allowed.is_error, "{}", allowed.content);
         assert!(allowed.content.contains("alpha_secret"));
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -959,15 +924,10 @@ mod tests {
 
         // 1. 首轮进程创建一个含压缩历史与悬挂工具调用的会话并落盘
         {
-            let app1 = Context::new();
-            app1.plugin(
-                SqlitePersistencePlugin,
-                SqlitePersistenceConfig::new(&db_path),
-            )
-            .await
-            .unwrap();
-            app1.plugin(SessionStore::plugin(), ()).await.unwrap();
-            let store1 = app1.sessions().unwrap();
+            let backend1 = SqliteSessionPersistence::open_async(&db_path)
+                .await
+                .unwrap();
+            let store1 = SessionStore::with_persistence(backend1.clone());
             let s1 = store1.create_with(SessionCreateOptions {
                 id: Some("cold-arch".into()),
                 cwd: Some("/ws/ro".into()),
@@ -985,25 +945,19 @@ mod tests {
             });
             s1.compact("压缩冷会话", 2, Some(100));
             s1.flush_async().await.unwrap();
-            app1.fiber().dispose().await;
+            let _ = tokio::task::spawn_blocking(move || backend1.shutdown()).await;
         }
 
-        // 2. 新进程挂载 RecallPlugin：从同工作区另一会话查询 cold-arch，不得水合也不得修补落盘
-        let app2 = Context::new();
-        app2.plugin(
-            SqlitePersistencePlugin,
-            SqlitePersistenceConfig::new(&db_path),
-        )
-        .await
-        .unwrap();
-        app2.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app2.plugin(RecallPlugin, RecallConfig::default())
+        // 2. 新进程挂载 recall 工具：从同工作区另一会话查询 cold-arch，不得水合也不得修补落盘
+        let backend2 = SqliteSessionPersistence::open_async(&db_path)
             .await
             .unwrap();
-
-        let store2 = app2.sessions().unwrap();
-        let tools2 = app2.tools().unwrap();
+        let store2 = SessionStore::with_persistence(backend2.clone());
+        let tools2 = ToolRuntime::new();
+        let _recall_guard =
+            register_recall_tool(&tools2, Arc::clone(&store2), RecallConfig::default())
+                .unwrap()
+                .unwrap();
         let caller = store2.create_with(SessionCreateOptions {
             id: Some("caller-ro".into()),
             cwd: Some("/ws/ro".into()),
@@ -1034,15 +988,16 @@ mod tests {
                 .any(|t| t.name == RECALL_TOOL_NAME)
         );
 
-        app2.fiber().dispose().await;
+        let _ = store2.flush_async(None).await;
+        let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn empty_fts5_search_does_not_fallback_to_cold_scan() {
         use crate::{
-            LoadedSession, PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE,
-            SessionHeader, SessionHeaderPatch, SessionPersistence, SessionPersistenceHandle,
+            LoadedSession, PersistenceError, PersistenceResult, SessionHeader, SessionHeaderPatch,
+            SessionPersistence,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1102,20 +1057,12 @@ mod tests {
             search_calls: AtomicUsize::new(0),
         });
 
-        let app = Context::new();
-        app.provide(
-            SERVICE_SESSION_PERSISTENCE,
-            Arc::new(SessionPersistenceHandle::new(backend.clone())),
-        )
-        .unwrap();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(RecallPlugin, RecallConfig::default())
-            .await
-            .unwrap();
-
-        let store = app.sessions().unwrap();
-        let tools = app.tools().unwrap();
+        let store = SessionStore::with_persistence(backend.clone());
+        let tools = ToolRuntime::new();
+        let _recall_guard =
+            register_recall_tool(&tools, Arc::clone(&store), RecallConfig::default())
+                .unwrap()
+                .unwrap();
         let caller = store.create_with(SessionCreateOptions {
             id: Some("fts-empty-caller".into()),
             cwd: Some("/ws/empty-fts".into()),
@@ -1135,15 +1082,13 @@ mod tests {
         assert_eq!(backend.search_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.list_calls.load(Ordering::SeqCst), 0);
         assert_eq!(backend.load_calls.load(Ordering::SeqCst), 0);
-
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn fallback_runs_only_when_persistence_absent_or_errors_and_enforces_caps() {
         use crate::{
-            LoadedSession, PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE,
-            SessionHeader, SessionHeaderPatch, SessionPersistence, SessionPersistenceHandle,
+            LoadedSession, PersistenceError, PersistenceResult, SessionHeader, SessionHeaderPatch,
+            SessionPersistence,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1193,20 +1138,12 @@ mod tests {
         let backend = Arc::new(ErrorFtsBackend {
             search_calls: AtomicUsize::new(0),
         });
-        let app = Context::new();
-        app.provide(
-            SERVICE_SESSION_PERSISTENCE,
-            Arc::new(SessionPersistenceHandle::new(backend.clone())),
-        )
-        .unwrap();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(RecallPlugin, RecallConfig::default())
-            .await
-            .unwrap();
-
-        let store = app.sessions().unwrap();
-        let tools = app.tools().unwrap();
+        let store = SessionStore::with_persistence(backend.clone());
+        let tools = ToolRuntime::new();
+        let _recall_guard =
+            register_recall_tool(&tools, Arc::clone(&store), RecallConfig::default())
+                .unwrap()
+                .unwrap();
         let s = store.create_with(SessionCreateOptions {
             id: Some("cap-sess".into()),
             cwd: Some("/ws/caps".into()),
@@ -1258,7 +1195,5 @@ mod tests {
                 .and_then(Value::as_u64)
                 .is_some()
         );
-
-        app.fiber().dispose().await;
     }
 }

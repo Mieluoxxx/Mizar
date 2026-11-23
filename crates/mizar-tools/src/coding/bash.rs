@@ -578,7 +578,7 @@ pub fn create_bash_tool(cwd: PathBuf) -> ToolDefinition {
                     .to_string();
                 let raw_timeout = args.get("timeout").and_then(Value::as_f64);
                 let effective_timeout = clamp_tool_timeout(raw_timeout)
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
 
                 if call_ctx.cancel.is_cancelled() {
                     return Err("Command aborted".into());
@@ -659,7 +659,7 @@ mod tests {
             exec: ToolExecution::new("bash", args.clone(), None),
             cancel: CancellationToken::new(),
             on_update: None,
-            ctx: cordis::Context::new(),
+            tools: crate::ToolRuntime::new(),
         }
     }
 

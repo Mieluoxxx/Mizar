@@ -1,15 +1,12 @@
-//! 内置模块控制器（`"spinePlugins"`）：
+//! 内置模块控制器（`SpinePlugins`）：
 //!
-//! 在启动阶段静态挂载全部可选内置模块后，以轻量 `AtomicBool` 门控与 `ToolRuntime` 分组屏蔽实现零销毁运行期启停
+//! 在启动阶段静态装配全部可选内置模块后，以轻量 `AtomicBool` 门控与 `ToolRuntime` 分组屏蔽实现零销毁运行期启停
 //! （仅重量级外部进程 `mcp` 在启动禁用时延迟到首次启用再初始化），并对核心内核服务实施 Gate 2 自保护。
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(any(feature = "mcp", test))]
-use cordis::Service;
-use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Plugin};
 use thiserror::Error;
 #[cfg(feature = "mcp")]
 use tokio::sync::Mutex as AsyncMutex;
@@ -20,14 +17,10 @@ use crate::session_title::SessionTitleRuntime;
 use crate::skills::SkillRegistry;
 use crate::spine::config::normalize_disabled_plugins;
 use crate::subagent::SubagentRuntime;
-use crate::system_prompt::{PromptSection, SystemPrompt};
 use crate::trajectory::TrajectoryRuntime;
 #[cfg(feature = "mcp")]
 use mizar_mcp::{McpManager, McpPluginConfig};
-use mizar_tools::coding::build_tools_guide;
-use mizar_tools::{ToolRuntime, ToolsContextExt};
-
-pub const SERVICE_SPINE_PLUGINS: &str = "spinePlugins";
+use mizar_tools::ToolRuntime;
 
 /// 受 Gate 2 自保护的核心服务 ID：任何情况下均不允许禁用。
 const PROTECTED_MODULES: &[(&str, &str, &str)] = &[
@@ -111,8 +104,6 @@ pub enum SpinePluginError {
     ProtectedModule(String),
     #[error("模块 `{id}` 生命周期切换失败：{reason}")]
     Lifecycle { id: String, reason: String },
-    #[error(transparent)]
-    Cordis(#[from] CordisError),
 }
 
 #[derive(Debug, Clone)]
@@ -122,62 +113,14 @@ pub(crate) struct SpineModuleMeta {
     pub description: String,
 }
 
-/// 向 `SystemPrompt` 动态注册 `order = 20` 的 `"tools_guide"` 段落（按当前会话已声明工具过滤）。
-#[derive(Default, Clone, Copy)]
-pub struct ToolsGuidePromptPlugin;
-
-impl Plugin for ToolsGuidePromptPlugin {
-    type Config = ();
-
-    fn name(&self) -> Option<&str> {
-        Some("tools-guide-prompt")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        (): Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let tools = ctx.tools()?;
-            let prompt_handle = ctx.try_inject(["systemPrompt"], move |c| {
-                let tools = Arc::clone(&tools);
-                async move {
-                    let sp = c.service::<SystemPrompt>("systemPrompt")?;
-                    let gate_ctx = c.clone();
-                    c.effect("tools-coding.system-prompt", move || {
-                        Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
-                            "tools_guide",
-                            20,
-                            move |session_id| {
-                                if let Some(plugins) =
-                                    gate_ctx.get::<SpinePlugins>(SERVICE_SPINE_PLUGINS)
-                                    && !plugins.is_enabled("tools-coding")
-                                {
-                                    return None;
-                                }
-                                build_tools_guide(&tools.list_declared_infos(session_id))
-                            },
-                        ))))
-                    })?;
-                    Ok::<_, CordisError>(())
-                }
-            })?;
-            if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
-                prompt_handle.wait_settled().await?;
-            }
-            Ok(Some(Cleanup::async_fn(move || async move {
-                prompt_handle.dispose().await;
-            })))
-        })
-    }
+#[cfg(feature = "mcp")]
+#[derive(Default)]
+pub(crate) struct McpSlot {
+    pub active: Option<Arc<McpManager>>,
+    pub pending: Option<McpPluginConfig>,
 }
 
-struct ModuleToggle {
+pub(crate) struct ModuleToggle {
     meta: SpineModuleMeta,
     enabled: Arc<AtomicBool>,
 }
@@ -222,69 +165,25 @@ fn tool_group_for_module(id: &str) -> Option<(&'static [&'static str], &'static 
     }
 }
 
-fn service_name_for_module(id: &str) -> Option<&'static str> {
-    match id {
-        "compaction" => Some("compaction"),
-        "instructions" => Some("agentInstructions"),
-        "skills" => Some("skills"),
-        "session-title" => Some("sessionTitle"),
-        "subagent" => Some("subagent"),
-        "trajectory" => Some("trajectory"),
-        _ => None,
-    }
-}
-
-fn sync_service_gate(ctx: &Context, id: &str, enabled: bool) {
-    match id {
-        "compaction" => {
-            if let Some(rt) = ctx.get::<CompactionRuntime>("compaction") {
-                rt.set_module_enabled(enabled);
-            }
-        }
-        "instructions" => {
-            if let Some(rt) = ctx.get::<AgentInstructions>("agentInstructions") {
-                rt.set_enabled(enabled);
-            }
-        }
-        "skills" => {
-            if let Some(rt) = ctx.get::<SkillRegistry>("skills") {
-                rt.set_enabled(enabled);
-            }
-        }
-        "session-title" => {
-            if let Some(rt) = ctx.get::<SessionTitleRuntime>("sessionTitle") {
-                rt.set_module_enabled(enabled);
-            }
-        }
-        "subagent" => {
-            if let Some(rt) = ctx.get::<SubagentRuntime>("subagent") {
-                rt.set_module_enabled(enabled);
-            }
-        }
-        "trajectory" => {
-            if let Some(rt) = ctx.get::<TrajectoryRuntime>("trajectory") {
-                rt.set_enabled(enabled);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 内置模块控制器服务（`"spinePlugins"`）。
-pub struct SpinePlugins {
-    ctx: Context,
-    modules: Vec<ModuleToggle>,
-    startup_errors: Vec<String>,
+pub(crate) struct SpineServiceRefs {
+    pub tools: Arc<ToolRuntime>,
+    pub compaction: Option<Arc<CompactionRuntime>>,
+    pub instructions: Option<Arc<AgentInstructions>>,
+    pub skills: Option<Arc<SkillRegistry>>,
+    pub session_title: Option<Arc<SessionTitleRuntime>>,
+    pub subagent: Option<Arc<SubagentRuntime>>,
+    pub trajectory: Option<Arc<TrajectoryRuntime>>,
     #[cfg(feature = "mcp")]
-    mcp_pending: AsyncMutex<Option<McpPluginConfig>>,
+    pub mcp_slot: Arc<AsyncMutex<McpSlot>>,
 }
 
-impl SpinePlugins {
-    pub(crate) fn initialize(
-        ctx: Context,
-        metas: Vec<SpineModuleMeta>,
-        raw_disabled: Vec<String>,
-    ) -> Arc<Self> {
+pub(crate) struct PreparedToggles {
+    pub modules: Vec<ModuleToggle>,
+    pub startup_errors: Vec<String>,
+}
+
+impl PreparedToggles {
+    pub fn prepare(metas: Vec<SpineModuleMeta>, raw_disabled: Vec<String>) -> Self {
         let normalized_disabled = normalize_disabled_plugins(raw_disabled);
         let available_ids: HashSet<&str> = metas.iter().map(|m| m.id.as_str()).collect();
         let mut disabled_set: HashSet<String> = HashSet::new();
@@ -318,75 +217,109 @@ impl SpinePlugins {
             })
             .collect();
 
-        Arc::new(Self {
-            ctx,
+        Self {
             modules,
             startup_errors,
-            #[cfg(feature = "mcp")]
-            mcp_pending: AsyncMutex::new(None),
-        })
-    }
-
-    #[cfg(feature = "mcp")]
-    pub(crate) fn defer_mcp_mount(&self, cfg: McpPluginConfig) {
-        if let Ok(mut guard) = self.mcp_pending.try_lock() {
-            *guard = Some(cfg);
         }
     }
 
-    pub(crate) fn flag_for(&self, id: &str) -> Option<Arc<AtomicBool>> {
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn is_enabled(&self, id: &str) -> bool {
+        self.modules
+            .iter()
+            .find(|m| m.meta.id == id)
+            .is_some_and(ModuleToggle::is_enabled)
+    }
+
+    pub fn flag_for(&self, id: &str) -> Option<Arc<AtomicBool>> {
         self.modules
             .iter()
             .find(|m| m.meta.id == id)
             .map(|m| Arc::clone(&m.enabled))
     }
+}
 
-    /// 对启动阶段被屏蔽的可选模块挂接一次性状态同步，在对应服务就绪后读取实时开关。
-    pub(crate) fn attach_initial_gates(&self) -> Result<(), CordisError> {
-        let disabled_tool_modules: Vec<(String, Arc<AtomicBool>)> = self
-            .modules
-            .iter()
-            .filter(|m| !m.is_enabled() && tool_group_for_module(&m.meta.id).is_some())
-            .map(|m| (m.meta.id.clone(), Arc::clone(&m.enabled)))
-            .collect();
+/// 内置模块控制器（持有直接的运行时引用与原子开关，零动态查表）。
+pub struct SpinePlugins {
+    tools: Arc<ToolRuntime>,
+    compaction: Option<Arc<CompactionRuntime>>,
+    instructions: Option<Arc<AgentInstructions>>,
+    skills: Option<Arc<SkillRegistry>>,
+    session_title: Option<Arc<SessionTitleRuntime>>,
+    subagent: Option<Arc<SubagentRuntime>>,
+    trajectory: Option<Arc<TrajectoryRuntime>>,
+    modules: Vec<ModuleToggle>,
+    startup_errors: Vec<String>,
+    #[cfg(feature = "mcp")]
+    mcp_slot: Arc<AsyncMutex<McpSlot>>,
+}
 
-        if !disabled_tool_modules.is_empty() {
-            self.ctx.try_inject(["tools"], move |c| {
-                let groups = disabled_tool_modules.clone();
-                async move {
-                    if let Ok(tools) = c.tools() {
-                        for (id, flag) in groups {
-                            if !flag.load(Ordering::Acquire)
-                                && let Some((names, prefixes)) = tool_group_for_module(&id)
-                            {
-                                tools.set_disabled_tool_group(&id, names, prefixes, true);
-                            }
-                        }
-                    }
-                    Ok::<_, CordisError>(())
+impl SpinePlugins {
+    pub(crate) fn from_prepared(prepared: PreparedToggles, refs: SpineServiceRefs) -> Arc<Self> {
+        Arc::new(Self {
+            tools: refs.tools,
+            compaction: refs.compaction,
+            instructions: refs.instructions,
+            skills: refs.skills,
+            session_title: refs.session_title,
+            subagent: refs.subagent,
+            trajectory: refs.trajectory,
+            modules: prepared.modules,
+            startup_errors: prepared.startup_errors,
+            #[cfg(feature = "mcp")]
+            mcp_slot: refs.mcp_slot,
+        })
+    }
+
+    fn sync_service_gate(&self, id: &str, enabled: bool) {
+        match id {
+            "compaction" => {
+                if let Some(rt) = &self.compaction {
+                    rt.set_module_enabled(enabled);
                 }
-            })?;
+            }
+            "instructions" => {
+                if let Some(rt) = &self.instructions {
+                    rt.set_enabled(enabled);
+                }
+            }
+            "skills" => {
+                if let Some(rt) = &self.skills {
+                    rt.set_enabled(enabled);
+                }
+            }
+            "session-title" => {
+                if let Some(rt) = &self.session_title {
+                    rt.set_module_enabled(enabled);
+                }
+            }
+            "subagent" => {
+                if let Some(rt) = &self.subagent {
+                    rt.set_module_enabled(enabled);
+                }
+            }
+            "trajectory" => {
+                if let Some(rt) = &self.trajectory {
+                    rt.set_enabled(enabled);
+                }
+            }
+            _ => {}
         }
+    }
 
+    /// 同步将启动期处于禁用状态的工具分组与模块开关应用到运行时。
+    pub(crate) fn apply_initial_gates(&self) {
         for m in &self.modules {
             if m.is_enabled() {
                 continue;
             }
-            let Some(svc) = service_name_for_module(&m.meta.id) else {
-                continue;
-            };
-            let id = m.meta.id.clone();
-            let flag = Arc::clone(&m.enabled);
-            self.ctx.try_inject([svc], move |c| {
-                let id = id.clone();
-                let flag = Arc::clone(&flag);
-                async move {
-                    sync_service_gate(&c, &id, flag.load(Ordering::Acquire));
-                    Ok::<_, CordisError>(())
-                }
-            })?;
+            let id = &m.meta.id;
+            if let Some((names, prefixes)) = tool_group_for_module(id) {
+                self.tools
+                    .set_disabled_tool_group(id, names, prefixes, true);
+            }
+            self.sync_service_gate(id, false);
         }
-        Ok(())
     }
 
     /// 启动阶段校验 `disabledPlugins` 时记录的拒绝或告警信息。
@@ -436,6 +369,7 @@ impl SpinePlugins {
         is_protected_module_id(id)
     }
 
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn is_enabled(&self, id: &str) -> bool {
         if is_protected_module_id(id) {
             return true;
@@ -457,12 +391,11 @@ impl SpinePlugins {
     }
 
     fn apply_runtime_state(&self, id: &str, enabled: bool) {
-        if let Some((names, prefixes)) = tool_group_for_module(id)
-            && let Some(tools) = self.ctx.get::<ToolRuntime>("tools")
-        {
-            tools.set_disabled_tool_group(id, names, prefixes, !enabled);
+        if let Some((names, prefixes)) = tool_group_for_module(id) {
+            self.tools
+                .set_disabled_tool_group(id, names, prefixes, !enabled);
         }
-        sync_service_gate(&self.ctx, id, enabled);
+        self.sync_service_gate(id, enabled);
     }
 
     /// 热切换指定可选内置模块的启用状态。
@@ -485,17 +418,10 @@ impl SpinePlugins {
 
         #[cfg(feature = "mcp")]
         if id == "mcp" && enabled {
-            let mut guard = self.mcp_pending.lock().await;
-            if let Some(cfg) = guard.clone() {
-                let handle = self.ctx.try_plugin(McpManager::plugin(), cfg)?;
-                if let Err(err) = handle.wait_settled().await {
-                    handle.dispose().await;
-                    return Err(SpinePluginError::Lifecycle {
-                        id: id.to_string(),
-                        reason: err.to_string(),
-                    });
-                }
-                *guard = None;
+            let mut guard = self.mcp_slot.lock().await;
+            if let Some(cfg) = guard.pending.take() {
+                let mgr = McpManager::start(Arc::clone(&self.tools), cfg).await;
+                guard.active = Some(mgr);
             }
         }
 
@@ -505,32 +431,16 @@ impl SpinePlugins {
     }
 }
 
-pub trait SpinePluginsContextExt {
-    fn spine_plugins(&self) -> Result<Arc<SpinePlugins>, CordisError>;
-}
-
-impl SpinePluginsContextExt for Context {
-    fn spine_plugins(&self) -> Result<Arc<SpinePlugins>, CordisError> {
-        self.service::<SpinePlugins>(SERVICE_SPINE_PLUGINS)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::AgentLoopContextExt;
-    use crate::spine::{AgentSpineConfig, AgentSpinePlugin};
-    use crate::system_prompt::SystemPromptContextExt;
-    use cordis::Context;
-    use mizar_llm::LlmContextExt;
-    use mizar_session::SessionContextExt;
-    use mizar_tools::ToolsContextExt;
-    use mizar_tools::coding::{CodingToolsConfig, CodingToolsPlugin};
+    use crate::spine::{AgentSpineConfig, MizarRuntime};
+    use crate::system_prompt::{PromptSection, SystemPrompt, SystemPromptConfig};
+    use mizar_tools::ToolRuntime;
+    use mizar_tools::coding::{CodingToolsConfig, build_tools_guide, register_coding_tools};
 
     #[tokio::test]
     async fn core_modules_are_protected_under_minimal_features() {
-        let app = Context::new();
-
         let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins([
             "llm",
             "sessions",
@@ -540,19 +450,8 @@ mod tests {
             "spinePlugins",
             "unknown-mod",
         ]);
-        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-
-        let ctrl = app.spine_plugins().unwrap();
-        assert!(app.llm().is_ok());
-        assert!(app.sessions().is_ok());
-        assert!(app.tools().is_ok());
-        assert!(app.system_prompt().is_ok());
-        assert!(app.agent_loop().is_ok());
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
+        let ctrl = &runtime.modules;
 
         let errs = ctrl.startup_errors();
         for core in [
@@ -584,24 +483,17 @@ mod tests {
             Err(SpinePluginError::UnknownModule(_))
         ));
 
-        app.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn known_host_extension_ids_are_skipped_without_startup_errors() {
-        let app = Context::new();
-
         let mut disabled: Vec<&str> = KNOWN_HOST_EXTENSION_IDS.to_vec();
         disabled.push("still-unknown-id");
         let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins(disabled);
-        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let ctrl = app.spine_plugins().unwrap();
+        let ctrl = &runtime.modules;
         let errs = ctrl.startup_errors();
         assert_eq!(
             errs.len(),
@@ -611,13 +503,11 @@ mod tests {
         assert!(errs[0].contains("still-unknown-id"), "got: {errs:?}");
         assert!(ctrl.disabled_ids().is_empty());
 
-        app.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn coding_mode_toggles_tools_coding_with_tools_guide_and_tool_search() {
-        let app = Context::new();
-
         let ws =
             std::env::temp_dir().join(format!("mizar_spine_coding_toggle_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
@@ -626,16 +516,11 @@ mod tests {
         let mut cfg =
             AgentSpineConfig::coding(&ws).with_disabled_plugins(["tool-search", "mcp", "codemode"]);
         cfg.subagent = None;
-        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let ctrl = app.spine_plugins().unwrap();
-        let tools = app.tools().unwrap();
-        let prompt = app.system_prompt().unwrap();
+        let ctrl = &runtime.modules;
+        let tools = &runtime.tools;
+        let prompt = &runtime.system_prompt;
         assert!(!ctrl.is_enabled("tool-search"));
         assert!(ctrl.is_enabled("tools-coding"));
         assert!(!tools.list_all().iter().any(|t| t.name == "tool_search"));
@@ -658,15 +543,12 @@ mod tests {
         assert!(tools.list().iter().any(|t| t.name == "read"));
         assert!(prompt.build().contains("Available tools:"));
 
+        runtime.shutdown().await;
         let _ = std::fs::remove_dir_all(&ws);
-        app.fiber().dispose().await;
     }
 
-    #[tokio::test]
-    async fn registers_tools_guide_when_system_prompt_mounts_after_tools_guide_plugin() {
-        use crate::system_prompt::SystemPromptConfig;
-        use mizar_tools::ToolRuntime;
-
+    #[test]
+    fn tools_guide_renders_english_guidance_and_respects_session_tool_scope() {
         let root = std::env::temp_dir().join(format!(
             "mizar_coding_late_prompt_test_{}",
             std::process::id()
@@ -674,26 +556,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = ToolRuntime::new();
+        let _tool_guards = register_coding_tools(&tools, &CodingToolsConfig::new(&root)).unwrap();
+        let prompt = SystemPrompt::new(SystemPromptConfig::default());
 
-        // 先挂载 CodingToolsPlugin 与 ToolsGuidePromptPlugin，再挂载 SystemPrompt
-        let coding = app.plugin(CodingToolsPlugin, CodingToolsConfig::new(&root));
-        let guide = app.plugin(ToolsGuidePromptPlugin, ());
-        coding.wait_settled().await.unwrap();
-        guide.wait_settled().await.unwrap();
-        assert!(app.get::<SystemPrompt>("systemPrompt").is_none());
+        let tools_for_section = Arc::clone(&tools);
+        let guide_guard = prompt.section(PromptSection::new_for_session(
+            "tools_guide",
+            20,
+            move |session_id| build_tools_guide(&tools_for_section.list_declared_infos(session_id)),
+        ));
 
-        app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-            .await
-            .unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-
-        let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap();
         let built = prompt.build();
         assert!(built.contains("Available tools:"), "prompt:\n{built}");
         assert!(built.contains("Tool usage:"), "prompt:\n{built}");
@@ -713,7 +586,6 @@ mod tests {
             "tools_guide must be pure English:\n{built}"
         );
 
-        let tools = app.tools().unwrap();
         tools.set_active_tools("s-ro", &["read".into()]);
         let built_ro = prompt.build_for_session(Some("s-ro"));
         assert!(built_ro.contains("- `read`:"), "s-ro:\n{built_ro}");
@@ -724,10 +596,9 @@ mod tests {
                 .contains("- `bash`:")
         );
 
-        guide.dispose().await;
+        drop(guide_guard);
         assert!(!prompt.build().contains("Available tools:"));
 
         let _ = std::fs::remove_dir_all(&root);
-        app.fiber().dispose().await;
     }
 }

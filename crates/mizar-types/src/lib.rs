@@ -1,11 +1,16 @@
-//! Mizar 纯核心数据结构、轨迹模型与跨端纯客户端契约层。
+//! Mizar 纯核心数据结构、轻量钩子、轨迹模型与跨端纯客户端契约层。
 //!
-//! 本 crate 严禁引入 `tokio`、`cordis`、`reqwest`、`rquickjs`、`rusqlite`、`ratatui` 或 `crossterm`，
+//! 本 crate 严禁引入 `tokio`、`reqwest`、`rquickjs`、`rusqlite`、`ratatui`、`crossterm` 或 `tracing`，
 //! 供核心运行时、纯 UI 层与 Merak Desktop 共用。
 
 pub mod client;
+pub mod hooks;
 pub mod llm;
 pub mod trajectory;
+
+pub use hooks::{
+    BoxError, BoxFuture, HookGuard, HookOptions, Next, SerialHook, SyncEventBus, WaterfallHook,
+};
 
 pub use client::{
     ActivityState, ApprovalDecision, ApprovalMode, BashInputMode, ClientEvent,

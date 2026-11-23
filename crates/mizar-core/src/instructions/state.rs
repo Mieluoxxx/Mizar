@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput};
-use cordis::{BoxFuture, Context, CordisError, Next, Service};
+use crate::agent_loop::{AgentLoop, AgentPreStepDecision, AgentPreStepInput, TurnInput};
 use mizar_session::{Session, SessionEvent};
-use mizar_tools::{EVENT_TOOLS_RESULT, ToolResultEvent};
+use mizar_tools::{ToolResultEvent, ToolRuntime};
+use mizar_types::{BoxFuture, HookGuard, Next};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -96,6 +96,66 @@ pub struct AgentInstructions {
 }
 
 impl AgentInstructions {
+    pub fn new(config: InstructionsConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            module_enabled: AtomicBool::new(true),
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn install(
+        tools: &Arc<ToolRuntime>,
+        agent_loop: &Arc<AgentLoop>,
+        config: InstructionsConfig,
+    ) -> (Arc<Self>, HookGuard) {
+        let enabled = config.enabled;
+        let svc = Self::new(config);
+        if !enabled {
+            return (svc, HookGuard::noop());
+        }
+
+        let mut guards = Vec::new();
+
+        let weak_touch = Arc::downgrade(&svc);
+        guards.push(tools.on_result(move |ev| {
+            if let Some(s) = weak_touch.upgrade() {
+                s.record_tool_touch(ev);
+            }
+        }));
+
+        let weak_step = Arc::downgrade(&svc);
+        guards.push(agent_loop.pre_step_hook().register(
+            move |input: AgentPreStepInput,
+                  next: Next<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>| {
+                let weak = weak_step.clone();
+                let session = Arc::clone(&input.session);
+                let cancel = input.cancel.clone();
+                Box::pin(async move {
+                    if cancel.is_cancelled() {
+                        return AgentPreStepDecision::Reject {
+                            reason: "cancelled".to_string(),
+                        };
+                    }
+                    let AgentPreStepDecision::Enter { mut inputs } = next.call(input).await else {
+                        return AgentPreStepDecision::Reject {
+                            reason: "rejected".to_string(),
+                        };
+                    };
+                    if !cancel.is_cancelled()
+                        && let Some(s) = weak.upgrade()
+                        && let Some(notice) = s.reconcile_pre_step_async(&session, &cancel).await
+                    {
+                        inputs.insert(0, notice);
+                    }
+                    AgentPreStepDecision::Enter { inputs }
+                }) as BoxFuture<'static, AgentPreStepDecision>
+            },
+        ));
+
+        (svc, HookGuard::group(guards))
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.config.enabled && self.module_enabled.load(Ordering::Acquire)
     }
@@ -658,7 +718,6 @@ impl AgentInstructions {
 
     pub async fn reconcile_pre_step_async(
         self: &Arc<Self>,
-        _ctx: &Context,
         session: &Arc<Session>,
         cancel: &CancellationToken,
     ) -> Option<TurnInput> {
@@ -766,7 +825,6 @@ impl AgentInstructions {
 
     pub fn reconcile_pre_step(
         &self,
-        _ctx: &Context,
         session: &Arc<Session>,
         cancel: &CancellationToken,
     ) -> Option<TurnInput> {
@@ -856,79 +914,6 @@ impl AgentInstructions {
     }
 }
 
-impl Service for AgentInstructions {
-    type Config = InstructionsConfig;
-
-    fn service_name() -> &'static str {
-        "agentInstructions"
-    }
-
-    fn plugin_name() -> &'static str {
-        "agent-instructions"
-    }
-
-    fn create(_ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            config,
-            module_enabled: AtomicBool::new(true),
-            sessions: Mutex::new(HashMap::new()),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let ctx_clone = ctx.clone();
-        Box::pin(async move {
-            if !self.config.enabled {
-                return Ok(());
-            }
-
-            let for_touch = Arc::clone(&self);
-            ctx_clone.on(EVENT_TOOLS_RESULT, move |ev: &ToolResultEvent| {
-                for_touch.record_tool_touch(ev);
-            })?;
-
-            let for_step = Arc::clone(&self);
-            let ctx_for_step = ctx_clone.clone();
-            ctx_clone.on_waterfall(
-                EVENT_AGENT_PRE_STEP,
-                move |input: AgentPreStepInput,
-                      next: Next<
-                    AgentPreStepInput,
-                    BoxFuture<'static, AgentPreStepDecision>,
-                >| {
-                    let svc = Arc::clone(&for_step);
-                    let ctx_inner = ctx_for_step.clone();
-                    let session = Arc::clone(&input.session);
-                    let cancel = input.cancel.clone();
-                    Box::pin(async move {
-                        if cancel.is_cancelled() {
-                            return AgentPreStepDecision::Reject {
-                                reason: "cancelled".to_string(),
-                            };
-                        }
-                        let AgentPreStepDecision::Enter { mut inputs } = next.call(input).await
-                        else {
-                            return AgentPreStepDecision::Reject {
-                                reason: "rejected".to_string(),
-                            };
-                        };
-                        if !cancel.is_cancelled()
-                            && let Some(notice) =
-                                svc.reconcile_pre_step_async(&ctx_inner, &session, &cancel)
-                                    .await
-                        {
-                            inputs.insert(0, notice);
-                        }
-                        AgentPreStepDecision::Enter { inputs }
-                    }) as BoxFuture<'static, AgentPreStepDecision>
-                },
-            )?;
-
-            Ok(())
-        })
-    }
-}
-
 pub fn scope_root_kind(scope: &ScopeKey) -> &'static str {
     match &scope.root {
         ScopeRoot::MizarGlobal => "mizar-global",
@@ -940,7 +925,7 @@ pub fn scope_root_kind(scope: &ScopeKey) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mizar_session::{SessionContextExt, SessionStore};
+    use mizar_session::SessionStore;
 
     #[tokio::test]
     async fn baseline_seq_latches_and_rebuilds_after_compaction() {
@@ -953,16 +938,15 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("AGENTS.md"), "keep instruction").unwrap();
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let store = SessionStore::new();
         let mut cfg = InstructionsConfig::new(ws.clone());
         cfg.include_default_global = false;
-        let svc = AgentInstructions::create(&ctx, cfg).unwrap();
-        let session = ctx.sessions().unwrap().create(None);
+        let svc = AgentInstructions::new(cfg);
+        let session = store.create(None);
         let cancel = CancellationToken::new();
 
         let first = svc
-            .reconcile_pre_step_async(&ctx, &session, &cancel)
+            .reconcile_pre_step_async(&session, &cancel)
             .await
             .expect("initial baseline");
         session.append(SessionEvent::ContextNotice {
@@ -982,7 +966,7 @@ mod tests {
 
         // 下一步触发 seq 锁存，且文件未改动时无重复注入
         assert!(
-            svc.reconcile_pre_step_async(&ctx, &session, &cancel)
+            svc.reconcile_pre_step_async(&session, &cancel)
                 .await
                 .is_none()
         );
@@ -999,7 +983,7 @@ mod tests {
         session.append(SessionEvent::user("after"));
         session.compact("summary", 1, None);
         let rebuilt = svc
-            .reconcile_pre_step_async(&ctx, &session, &cancel)
+            .reconcile_pre_step_async(&session, &cancel)
             .await
             .expect("rebuilt baseline after compaction");
         assert!(rebuilt.text().contains("keep instruction"));

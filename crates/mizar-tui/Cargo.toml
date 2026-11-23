@@ -15,7 +15,6 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }
-cordis = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures = { workspace = true }
 mizar-client = { workspace = true }

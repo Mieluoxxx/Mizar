@@ -6,9 +6,8 @@ pub mod export;
 pub mod guard;
 
 pub use collector::{
-    EVENT_TRAJECTORY_ANOMALY, EVENT_TRAJECTORY_EVENT, TrajectoryAnomalyEvent, TrajectoryConfig,
-    TrajectoryContextExt, TrajectoryEventEmitted, TrajectoryRuntime, trace_events_from_entries,
-    trace_events_from_session,
+    TrajectoryAnomalyEvent, TrajectoryConfig, TrajectoryEventEmitted, TrajectoryRuntime,
+    trace_events_from_entries, trace_events_from_session,
 };
 pub use export::{
     DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TRAJECTORY_EXPORT_SCHEMA_VERSION, TraceCompactionEvent,
@@ -17,7 +16,10 @@ pub use export::{
     extract_compaction_events_from_entries, truncate_tool_result_summary,
     write_trace_export_atomic,
 };
-pub use guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent, RepeatGuardConfig, RepeatToolGuardPlugin};
+pub use guard::{
+    GuardRepeatEvent, RepeatGuardConfig, RepeatGuardValidationError, install_repeat_guard,
+    validate_repeat_guard_config,
+};
 pub use mizar_types::trajectory::{
     DetectorConfig, RecordKind, SessionStats, Severity, TimelineMode, TimelineModel, TimelineSpan,
     TimelineTurnBoundary, TraceEvent, TraceEventKind, TrajectoryFinding, TrajectoryRecord,

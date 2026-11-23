@@ -1,6 +1,6 @@
 //! 统一 `write` 写前读守卫（收口 D5 首读要求 + 压后陈旧整文件覆写拦截）。
 //!
-//! 挂载在 Cordis 的 `tools/pre-execute` 与 `tools/post-execute` waterfall 上，零侵入 `mizar-tools-coding`：
+//! 挂载在 `tools.pre_execute_hook()` 与 `tools.post_execute_hook()` 上，零侵入 `mizar-tools` 编码工具：
 //! 1. **新建与小文件放行**：目标文件尚不存在，或已存在文件行数 `<= 50` 时允许直接 `write`；
 //! 2. **已存在且超过 50 行的文件**：本会话尚未成功 `read` 过、或最近一次有效 `read`/`write`
 //!    已被压缩出当前上下文（`seq < compacted_up_to_seq`）时，拦截整文件 `write` 并提示先 `read` 或改用 `edit`；
@@ -24,7 +24,7 @@ struct SessionFileGuardState {
     initialized: bool,
     /// 每个规范路径最近一次成功 `read` / `write` 的事件序号。
     last_read_seq: HashMap<PathBuf, u64>,
-    /// 待与 `EVENT_SESSION_EVENT` 实际落盘序号对齐的近期工具调用。
+    /// 待与 `SessionStore::on_event` 实际落盘序号对齐的近期工具调用。
     pending_calls: HashMap<String, PathBuf>,
 }
 
@@ -147,7 +147,7 @@ impl FileGuardTracker {
         Self::default()
     }
 
-    /// 由 `EVENT_SESSION_EVENT` 将工具写入会话后的真实 `Entry.seq` 回填至 `last_read_seq`。
+    /// 由 `SessionStore::on_event` 将工具写入会话后的真实 `Entry.seq` 回填至 `last_read_seq`。
     pub fn reconcile_tool_result_seq(&self, session_id: &str, tool_call_id: &str, actual_seq: u64) {
         if tool_call_id.is_empty() {
             return;

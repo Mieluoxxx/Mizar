@@ -10,13 +10,13 @@ use crate::http::{
 };
 use crate::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    LlmAdapter, LlmError, LlmErrorCode, LlmRuntime, Message, ModelInfo, ProviderInfo,
     ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
     ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,
     push_session_affinity_headers, resolve_cache_retention,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
+use mizar_types::hooks::{BoxFuture, HookGuard};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_RESPONSES: &str = "openai-responses";
@@ -2347,36 +2347,12 @@ impl LlmAdapter for ResponsesAdapter {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct ResponsesPlugin;
-
-impl Plugin for ResponsesPlugin {
-    type Config = ResponsesConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("llm-responses")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["llm"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let llm = ctx.llm()?;
-            let provider = config.provider.clone();
-            ctx.effect("llm-responses.registerAdapter", || {
-                Ok::<_, LlmError>(Some(
-                    llm.register_adapter(provider, Arc::new(ResponsesAdapter::new(config)))?,
-                ))
-            })?;
-            Ok(None)
-        })
-    }
+pub fn register_responses_adapter(
+    llm: &Arc<LlmRuntime>,
+    config: ResponsesConfig,
+) -> Result<HookGuard, LlmError> {
+    let provider = config.provider.clone();
+    llm.register_adapter(provider, Arc::new(ResponsesAdapter::new(config)))
 }
 
 #[cfg(test)]

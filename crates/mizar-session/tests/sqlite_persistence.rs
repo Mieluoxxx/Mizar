@@ -1,11 +1,9 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, Service};
-use mizar_session::sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
 use mizar_session::{
-    SessionContextExt, SessionCreateOptions, SessionEvent, SessionListQuery,
-    SessionPersistenceContextExt, SessionStore, SessionTraceEvent, TitleSource, TraceSeverity,
+    SessionCreateOptions, SessionEvent, SessionListQuery, SessionPersistence, SessionStore,
+    SessionTraceEvent, SqliteSessionPersistence, TitleSource, TraceSeverity,
 };
 use mizar_types::llm::{ContentBlock, Message, ReplayEnvelope, TokenUsage};
 
@@ -37,22 +35,10 @@ async fn persists_and_hydrates_sessions_across_restarts() {
     let db_path = temp_db_path("restart");
     let _guard = TempDbGuard(db_path.clone());
 
-    let app1 = Context::new();
-    app1.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app1.plugin(SessionStore::plugin(), ());
-    app1.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store1 = app1.sessions().unwrap();
+    let backend1 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store1 = SessionStore::with_persistence(backend1.clone());
     let s1 = store1.create_with(SessionCreateOptions {
         id: Some("s-persist".into()),
         cwd: Some("/work/repo-a".into()),
@@ -92,25 +78,14 @@ async fn persists_and_hydrates_sessions_across_restarts() {
         reason: "completed".into(),
     });
     s1.flush_async().await.unwrap();
-    app1.fiber().dispose().await;
+    drop(store1);
+    let _ = tokio::task::spawn_blocking(move || backend1.shutdown()).await;
 
     // 模拟全新进程重启，重新打开同一个 SQLite 文件
-    let app2 = Context::new();
-    app2.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app2.plugin(SessionStore::plugin(), ());
-    app2.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store2 = app2.sessions().unwrap();
+    let backend2 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
     let headers = store2
         .list_headers(&SessionListQuery {
             cwd: Some("/work/repo-a".into()),
@@ -139,7 +114,9 @@ async fn persists_and_hydrates_sessions_across_restarts() {
         other => panic!("unexpected message: {other:?}"),
     }
 
-    app2.fiber().dispose().await;
+    let _ = store2.flush_async(None).await;
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }
 
 #[tokio::test]
@@ -147,22 +124,10 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
     let db_path = temp_db_path("fork_compact");
     let _guard = TempDbGuard(db_path.clone());
 
-    let app = Context::new();
-    app.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app.plugin(SessionStore::plugin(), ());
-    app.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store = app.sessions().unwrap();
+    let backend = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store = SessionStore::with_persistence(backend.clone());
     let parent = store.create_with(SessionCreateOptions {
         id: Some("parent".into()),
         cwd: Some("/repo/b".into()),
@@ -214,50 +179,30 @@ async fn supports_fork_compaction_and_crash_recovery_in_sqlite() {
     // Compaction 保留最近 1 条时自动回退保留完整的 (Assistant(ToolCall), ToolResult) 对，加上新 Q3 共 4 条
     assert_eq!(child.visible_log().len(), 4);
 
-    app.fiber().dispose().await;
+    let _ = store.flush_async(None).await;
+    drop(store);
+    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
 
     // 重启验证 child 的 compaction 与 repaired tool_result 都落了盘
-    let app2 = Context::new();
-    app2.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app2.plugin(SessionStore::plugin(), ());
-    app2.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store2 = app2.sessions().unwrap();
+    let backend2 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
     let child_reloaded = store2.get("child").unwrap();
     assert_eq!(child_reloaded.header().parent_id.as_deref(), Some("parent"));
     assert_eq!(child_reloaded.visible_log().len(), 4);
     assert!(child_reloaded.header().compacted_up_to_seq.is_some());
-    app2.fiber().dispose().await;
+    let _ = store2.flush_async(None).await;
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }
 
 #[tokio::test]
 async fn works_with_in_memory_sqlite_config() {
-    let app = Context::new();
-    app.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(":memory:"),
-    )
-    .await
-    .unwrap();
-    app.plugin(SessionStore::plugin(), ());
-    app.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store = app.sessions().unwrap();
+    let backend = SqliteSessionPersistence::open_async(":memory:")
+        .await
+        .unwrap();
+    let store = SessionStore::with_persistence(backend.clone());
     let s = store.create_with(SessionCreateOptions {
         id: Some("mem-1".into()),
         cwd: Some("/mem".into()),
@@ -270,7 +215,9 @@ async fn works_with_in_memory_sqlite_config() {
     store.clear();
     let hydrated = store.get("mem-1").expect("should load from :memory: db");
     assert_eq!(hydrated.log().len(), 1);
-    app.fiber().dispose().await;
+    let _ = store.flush_async(None).await;
+    drop(store);
+    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
 }
 
 #[tokio::test]
@@ -279,19 +226,8 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
     let _guard = TempDbGuard(db.clone());
 
     {
-        let app = Context::new();
-        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
-            .await
-            .unwrap();
-        app.plugin(SessionStore::plugin(), ());
-        app.plugin(
-            cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-            (),
-        )
-        .await
-        .unwrap();
-
-        let store = app.sessions().unwrap();
+        let backend = SqliteSessionPersistence::open_async(&db).await.unwrap();
+        let store = SessionStore::with_persistence(backend.clone());
         let s = store.create_with(SessionCreateOptions {
             id: Some("bash-db-1".into()),
             cwd: Some("/repo".into()),
@@ -313,22 +249,12 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
         });
         s.append(SessionEvent::user("请总结"));
         s.flush_async().await.unwrap();
-        app.fiber().dispose().await;
+        drop(store);
+        let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
     }
 
-    let app2 = Context::new();
-    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
-        .await
-        .unwrap();
-    app2.plugin(SessionStore::plugin(), ());
-    app2.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store2 = app2.sessions().unwrap();
+    let backend2 = SqliteSessionPersistence::open_async(&db).await.unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
     let reloaded = store2
         .get("bash-db-1")
         .expect("should reload session with bash executions");
@@ -358,7 +284,9 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
     ));
     assert!(!format!("{msgs:?}").contains("secret_local"));
 
-    app2.fiber().dispose().await;
+    let _ = store2.flush_async(None).await;
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }
 
 #[tokio::test]
@@ -368,19 +296,8 @@ async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
     let db = temp_db_path("recall_fts5");
     let _guard = TempDbGuard(db.clone());
 
-    let app = Context::new();
-    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
-        .await
-        .unwrap();
-    app.plugin(SessionStore::plugin(), ());
-    app.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store = app.sessions().unwrap();
+    let backend = SqliteSessionPersistence::open_async(&db).await.unwrap();
+    let store = SessionStore::with_persistence(backend.clone());
     let s1 = store.create_with(SessionCreateOptions {
         id: Some("s1".into()),
         cwd: Some("/ws/alpha".into()),
@@ -455,7 +372,9 @@ async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
         "expected tool result hit across compaction, got: {hits_tool:?}"
     );
 
-    app.fiber().dispose().await;
+    let _ = store.flush_async(None).await;
+    drop(store);
+    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
 }
 
 #[tokio::test]
@@ -472,19 +391,8 @@ async fn persists_and_derives_user_images_through_sqlite() {
     };
 
     {
-        let app = Context::new();
-        app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
-            .await
-            .unwrap();
-        app.plugin(SessionStore::plugin(), ());
-        app.plugin(
-            cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-            (),
-        )
-        .await
-        .unwrap();
-
-        let store = app.sessions().unwrap();
+        let backend = SqliteSessionPersistence::open_async(&db).await.unwrap();
+        let store = SessionStore::with_persistence(backend.clone());
         let s = store.create_with(SessionCreateOptions {
             id: Some("img-db-1".into()),
             ..Default::default()
@@ -494,22 +402,12 @@ async fn persists_and_derives_user_images_through_sqlite() {
             vec![img.clone()],
         ));
         s.flush_async().await.unwrap();
-        app.fiber().dispose().await;
+        drop(store);
+        let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
     }
 
-    let app2 = Context::new();
-    app2.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&db))
-        .await
-        .unwrap();
-    app2.plugin(SessionStore::plugin(), ());
-    app2.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store2 = app2.sessions().unwrap();
+    let backend2 = SqliteSessionPersistence::open_async(&db).await.unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
     let reloaded = store2
         .get("img-db-1")
         .expect("should reload image session from sqlite");
@@ -518,7 +416,8 @@ async fn persists_and_derives_user_images_through_sqlite() {
         msgs,
         vec![Message::user_with_images("看图定位异常", vec![img])]
     );
-    app2.fiber().dispose().await;
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }
 
 #[tokio::test]
@@ -570,21 +469,11 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         .unwrap();
     }
 
-    // 2. 启动插件触发迁移，验证 user_version=2 与 title_source 读写
-    let app1 = Context::new();
-    app1.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app1.plugin(SessionStore::plugin(), ());
-    app1.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
+    // 2. 启动迁移，验证 user_version=3 与 title_source 读写
+    let backend1 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store1 = SessionStore::with_persistence(backend1.clone());
 
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -594,7 +483,6 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         assert_eq!(ver, 3);
     }
 
-    let store1 = app1.sessions().unwrap();
     let migrated = store1.get("v1-sess").unwrap();
     assert_eq!(migrated.header().title.as_deref(), Some("legacy title"));
     assert_eq!(migrated.header().title_source, None);
@@ -622,30 +510,15 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         ..Default::default()
     });
     assert!(s2.set_title_with_source("0320｜FEA｜自动生成标题", TitleSource::Auto));
-    app1.session_persistence()
-        .unwrap()
-        .flush_async(None)
-        .await
-        .unwrap();
-    app1.fiber().dispose().await;
+    store1.flush_async(None).await.unwrap();
+    drop(store1);
+    let _ = tokio::task::spawn_blocking(move || backend1.shutdown()).await;
 
     // 3. 重启后确认 Clear 与 Auto title_source 均被正确持久化
-    let app2 = Context::new();
-    app2.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app2.plugin(SessionStore::plugin(), ());
-    app2.plugin(
-        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-        (),
-    )
-    .await
-    .unwrap();
-
-    let store2 = app2.sessions().unwrap();
+    let backend2 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
     let v1_reloaded = store2.get("v1-sess").unwrap();
     assert_eq!(v1_reloaded.header().title, None);
     assert_eq!(v1_reloaded.header().title_source, None);
@@ -674,7 +547,9 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         "v1->v2 migration must backfill FTS5 recall docs: {v1_hits:?}"
     );
 
-    app2.fiber().dispose().await;
+    let _ = store2.flush_async(None).await;
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }
 
 #[tokio::test]
@@ -798,21 +673,10 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
                     .map_err(|e| e.to_string())?;
                 b.wait();
                 rt.block_on(async move {
-                    let app = Context::new();
-                    app.plugin(SqlitePersistencePlugin, SqlitePersistenceConfig::new(&path))
+                    let backend = SqliteSessionPersistence::open_async(&path)
                         .await
                         .map_err(|e| format!("sqlite boot failed: {e}"))?;
-                    app.plugin(SessionStore::plugin(), ());
-                    app.plugin(
-                        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-                        (),
-                    )
-                    .await
-                    .map_err(|e| format!("boot failed: {e}"))?;
-
-                    let store = app
-                        .sessions()
-                        .map_err(|e| format!("sessions failed: {e}"))?;
+                    let store = SessionStore::with_persistence(backend.clone());
                     let sid = format!("s_{idx}");
                     let s = store.create_with(SessionCreateOptions {
                         id: Some(sid),
@@ -823,7 +687,8 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
                     s.flush_async()
                         .await
                         .map_err(|e| format!("flush failed: {e}"))?;
-                    app.fiber().dispose().await;
+                    drop(store);
+                    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
                     Ok(())
                 })
             }));
@@ -839,32 +704,17 @@ fn concurrent_cold_open_and_writes_do_not_fail_with_database_locked() {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let check = Context::new();
-                check
-                    .plugin(
-                        SqlitePersistencePlugin,
-                        SqlitePersistenceConfig::new(&db_path),
-                    )
+                let backend = SqliteSessionPersistence::open_async(&db_path)
                     .await
                     .unwrap();
-                check.plugin(SessionStore::plugin(), ());
-                check
-                    .plugin(
-                        cordis::PluginDef::sync("noop", |_, ()| Ok::<_, cordis::CordisError>(())),
-                        (),
-                    )
-                    .await
-                    .unwrap();
-                let headers = check
-                    .session_persistence()
-                    .unwrap()
+                let headers = backend
                     .list_sessions(&SessionListQuery {
                         cwd: None,
                         limit: Some(20),
                         ..Default::default()
                     })
                     .unwrap();
-                check.fiber().dispose().await;
+                let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
                 headers
             })
         })
@@ -895,18 +745,11 @@ async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_
         reasoning_tokens: None,
     };
 
-    let app1 = Context::new();
-    app1.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app1.plugin(SessionStore::plugin(), ()).await.unwrap();
-    let s1 = app1
-        .sessions()
-        .unwrap()
-        .create(Some("usage-persist".into()));
+    let backend1 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store1 = SessionStore::with_persistence(backend1.clone());
+    let s1 = store1.create(Some("usage-persist".into()));
     s1.append(SessionEvent::user("hello"));
     s1.append(SessionEvent::usage(
         "cache_warm",
@@ -916,7 +759,8 @@ async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_
         Some("keepalive".into()),
     ));
     s1.flush_async().await.unwrap();
-    app1.fiber().dispose().await;
+    drop(store1);
+    let _ = tokio::task::spawn_blocking(move || backend1.shutdown()).await;
 
     // 校验 SQLite 表结构仍为现有 schema 版本 2 且 kind/visibility/payload_json 正确落盘
     {
@@ -936,15 +780,11 @@ async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_
         assert_eq!(kind, "usage");
     }
 
-    let app2 = Context::new();
-    app2.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
-    let reloaded = app2.sessions().unwrap().get("usage-persist").unwrap();
+    let backend2 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
+    let reloaded = store2.get("usage-persist").unwrap();
 
     assert_eq!(reloaded.header().event_count, 2);
     assert_eq!(reloaded.header().surface_count, 1);
@@ -966,7 +806,9 @@ async fn usage_event_persists_and_reloads_without_schema_migration_and_excludes_
     ));
     assert_eq!(reloaded.derive_messages(), vec![Message::user("hello")]);
 
-    app2.fiber().dispose().await;
+    let _ = store2.flush_async(None).await;
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -975,16 +817,10 @@ async fn list_sessions_exclude_subagents_skips_newer_child_for_continue() {
     let db_path = temp_db_path("exclude_subagents");
     let _guard = TempDbGuard(db_path.clone());
 
-    let app = Context::new();
-    app.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app.plugin(SessionStore::plugin(), ()).await.unwrap();
-
-    let store = app.sessions().unwrap();
+    let backend = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store = SessionStore::with_persistence(backend.clone());
     let root = store.create_with(SessionCreateOptions {
         id: Some("parent-sess".into()),
         cwd: Some("/work/repo-sub".into()),
@@ -1034,7 +870,9 @@ async fn list_sessions_exclude_subagents_skips_newer_child_for_continue() {
     assert_ne!(filtered[0].id, "subagent-child");
     assert_eq!(filtered[0].id, "fork-sess");
 
-    app.fiber().dispose().await;
+    let _ = store.flush_async(None).await;
+    drop(store);
+    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
 }
 
 #[tokio::test]
@@ -1093,14 +931,10 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
     }
 
     // 2. 启动迁移到 v3 并核验回填结果
-    let app = Context::new();
-    app.plugin(
-        SqlitePersistencePlugin,
-        SqlitePersistenceConfig::new(&db_path),
-    )
-    .await
-    .unwrap();
-    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let backend = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store = SessionStore::with_persistence(backend.clone());
 
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1110,7 +944,6 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
         assert_eq!(ver, 3);
     }
 
-    let store = app.sessions().unwrap();
     assert_eq!(
         store.get("v2-root").unwrap().header().origin,
         Some(mizar_session::SessionOrigin::User)
@@ -1148,7 +981,9 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
     assert!(!ids.contains(&"v2-child"));
     assert!(!ids.contains(&"explicit-sub-fork"));
 
-    app.fiber().dispose().await;
+    let _ = store.flush_async(None).await;
+    drop(store);
+    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
 }
 
 #[tokio::test]

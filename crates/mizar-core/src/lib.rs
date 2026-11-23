@@ -14,26 +14,23 @@ pub mod system_prompt;
 pub mod trajectory;
 
 pub use agent_loop::{
-    AgentError, AgentEvent, AgentEventGuard, AgentLoop, AgentLoopConfig, AgentLoopContextExt,
-    AgentPreStepDecision, AgentPreStepInput, AgentReasoningDeltaEvent, AgentRequestEvent,
-    AgentStatus, AgentStatusEvent, AgentStepEndEvent, AgentStepFirstTokenEvent,
-    AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent, AgentToolResultEvent,
-    AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnInputEvent, AgentTurnStartEvent,
-    AgentUsageEvent, DEFAULT_AUTO_WAKE_LIMIT, DeliveryMode, EVENT_AGENT_PRE_STEP,
-    EVENT_AGENT_REQUEST_ERROR, EVENT_AGENT_TURN_STOPPING, RunOptions, SessionInbox, StepOutcome,
-    TurnEndReason, TurnInput, TurnRunReport,
+    AgentError, AgentEvent, AgentEventGuard, AgentLoop, AgentLoopConfig, AgentPreStepDecision,
+    AgentPreStepInput, AgentReasoningDeltaEvent, AgentRequestEvent, AgentStatus, AgentStatusEvent,
+    AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent,
+    AgentToolCallEvent, AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent,
+    AgentTurnInputEvent, AgentTurnStartEvent, AgentUsageEvent, DEFAULT_AUTO_WAKE_LIMIT,
+    DeliveryMode, RunOptions, SessionInbox, StepOutcome, TurnEndReason, TurnInput, TurnRunReport,
 };
 pub use skills::{
-    EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillProvider, SkillRegistry, SkillRegistryConfig,
-    SkillsConfig, SkillsContextExt, SkillsPlugin,
+    SkillLookupOptions, SkillProvider, SkillRegistry, SkillRegistryConfig, SkillsConfig,
+    install_skills,
 };
 pub use spine::*;
 pub use system_prompt::{
     DEFAULT_PERSONA, DEFAULT_RUNTIME_PROTOCOL, PromptSection, SystemPrompt, SystemPromptConfig,
-    SystemPromptContextExt,
 };
 pub use trajectory::{
-    EVENT_GUARD_REPEAT, EVENT_TRAJECTORY_ANOMALY, EVENT_TRAJECTORY_EVENT, GuardRepeatEvent,
-    RepeatGuardConfig, RepeatToolGuardPlugin, TrajectoryAnomalyEvent, TrajectoryConfig,
-    TrajectoryContextExt, TrajectoryExport, TrajectoryRuntime,
+    GuardRepeatEvent, RepeatGuardConfig, RepeatGuardValidationError, TrajectoryAnomalyEvent,
+    TrajectoryConfig, TrajectoryEventEmitted, TrajectoryExport, TrajectoryRuntime,
+    install_repeat_guard, validate_repeat_guard_config,
 };

@@ -304,16 +304,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cordis"
-version = "0.2.0"
-dependencies = [
- "futures",
- "loom",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,7 +1503,6 @@ version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
- "cordis",
  "futures",
  "image",
  "mizar-core",
@@ -1533,7 +1522,6 @@ dependencies = [
 name = "mizar-codemode"
 version = "0.2.0"
 dependencies = [
- "cordis",
  "mizar-tools",
  "mizar-types",
  "rquickjs",
@@ -1549,7 +1537,6 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "chrono",
- "cordis",
  "dirs",
  "futures",
  "loom",
@@ -1572,7 +1559,6 @@ name = "mizar-llm"
 version = "0.2.0"
 dependencies = [
  "axum",
- "cordis",
  "futures",
  "mizar-types",
  "reqwest",
@@ -1586,7 +1572,6 @@ dependencies = [
 name = "mizar-mcp"
 version = "0.2.0"
 dependencies = [
- "cordis",
  "dirs",
  "mizar-llm",
  "mizar-tools",
@@ -1604,7 +1589,6 @@ dependencies = [
 name = "mizar-session"
 version = "0.2.0"
 dependencies = [
- "cordis",
  "mizar-tools",
  "mizar-types",
  "rusqlite",
@@ -1621,7 +1605,6 @@ dependencies = [
 name = "mizar-tools"
 version = "0.2.0"
 dependencies = [
- "cordis",
  "dirs",
  "globset",
  "ignore",
@@ -1646,7 +1629,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "cordis",
  "crossterm",
  "futures",
  "image",

@@ -5,17 +5,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cordis::{Context, CordisError, PluginDef};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentEvent, AgentLoopContextExt};
-use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
-use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
+use mizar_core::agent_loop::AgentEvent;
+use mizar_core::spine::{AgentSpineConfig, AgentToolsMode, MizarRuntime};
+use mizar_llm::retry::RetryConfig;
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
-    StreamChunk, ToolCall,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmError, StreamChunk, ToolCall,
 };
-use mizar_mcp::{McpExposure, McpManager, McpServerConfig};
-use mizar_session::SessionContextExt;
+use mizar_mcp::{McpExposure, McpServerConfig};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -223,45 +220,21 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     let seen_tools = Arc::new(Mutex::new(Vec::new()));
     let results_log = Arc::new(Mutex::new(Vec::<(String, bool, String)>::new()));
 
-    let app = Context::new();
-    app.plugin(AgentSpinePlugin, cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
+    let runtime = MizarRuntime::build(cfg).await.unwrap();
+    runtime.install_retry(RetryConfig::default());
 
     let adapter = Arc::new(ScriptedAdapter {
         attempt: AtomicUsize::new(0),
         seen_tools_per_step: Arc::clone(&seen_tools),
     });
-    app.plugin(
-        PluginDef::sync("scripted", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter);
-            ctx.effect("scripted.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("scripted", a)?))
-            })?;
-            Ok::<_, CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    );
+    runtime.register_adapter("scripted", adapter).unwrap();
 
-    // 等待全部依赖和 McpManager 就绪
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
-    if let Some(mgr) = app.get::<McpManager>("mcp") {
+    if let Some(mgr) = runtime.mcp().await {
         mgr.wait_ready().await;
     }
 
     let results_sub = Arc::clone(&results_log);
-    let _tool_result_guard = app.agent_loop().unwrap().on_event(move |ev| {
+    let _tool_result_guard = runtime.agent_loop.on_event(move |ev| {
         if let AgentEvent::ToolResult(ev) = ev {
             results_sub
                 .lock()
@@ -271,16 +244,13 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     });
 
     // MCP 不应向静态 SystemPrompt 注入动态 mcp_servers 段落（保持前缀字节冻结）
-    let prompt = mizar_core::system_prompt::SystemPromptContextExt::system_prompt(&app)
-        .unwrap()
-        .build();
+    let prompt = runtime.system_prompt.build();
     assert!(!prompt.contains("mcp_servers"), "prompt:\n{prompt}");
     assert!(!prompt.contains("mcp__fff"), "prompt:\n{prompt}");
 
-    let session = app.sessions().unwrap().create(None);
-    let reply = app
-        .agent_loop()
-        .unwrap()
+    let session = runtime.sessions.create(None);
+    let reply = runtime
+        .agent_loop
         .run(
             Arc::clone(&session),
             "verify full stack",
@@ -327,6 +297,6 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
         assert!(!steps[2].contains(&"mcp__fff__multi_grep".to_string()));
     }
 
+    runtime.shutdown().await;
     let _ = std::fs::remove_dir_all(&ws);
-    app.fiber().dispose().await;
 }
