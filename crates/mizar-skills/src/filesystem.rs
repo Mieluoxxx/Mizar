@@ -1,11 +1,11 @@
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use cordis::Context;
 
@@ -20,6 +20,7 @@ pub const PROJECT_AGENTS_RANK: u32 = 200;
 pub const CUSTOM_RANK: u32 = 300;
 pub const USER_AGENTS_RANK: u32 = 500;
 const MAX_SKILL_SCAN_DEPTH: usize = 8;
+const FINGERPRINT_SCAN_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct FilesystemSkillConfig {
@@ -114,10 +115,26 @@ pub fn is_potential_skill_path(root: &Path, target: &Path) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFingerprintEntry {
+    scanned_at: Instant,
+    root_stamps: Vec<(PathBuf, Option<FileStamp>)>,
+    file_stamps: Vec<(PathBuf, Option<FileStamp>)>,
+    fingerprint: u64,
+}
+
 pub struct FilesystemSkillProvider {
     ctx: Context,
     config: FilesystemSkillConfig,
     default_cwd: Option<PathBuf>,
+    fp_cache: Arc<Mutex<HashMap<Option<PathBuf>, CachedFingerprintEntry>>>,
 }
 
 impl FilesystemSkillProvider {
@@ -126,115 +143,133 @@ impl FilesystemSkillProvider {
             ctx,
             config,
             default_cwd,
+            fp_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn resolve_roots(&self, cwd: Option<&Path>) -> Vec<SkillRoot> {
-        let mut roots = Vec::new();
-        let mut seen_paths = HashSet::new();
-
-        let excluded_user_key = self
-            .config
-            .include_default_roots
-            .then(|| {
-                resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills"))
-            })
-            .flatten()
-            .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
-        let user_agents_dir = (self.config.include_default_roots && self.config.include_user_roots)
-            .then(|| {
-                resolve_agents_home(self.config.agents_home.as_deref()).map(|h| h.join("skills"))
-            })
-            .flatten();
-        let user_agents_key = excluded_user_key;
-
-        let effective_cwd = cwd.or(self.default_cwd.as_deref());
-        if self.config.include_default_roots
-            && let Some(dir) = effective_cwd
-        {
-            let abs_cwd = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            let project_root = find_project_root(&abs_cwd);
-            let mut candidates = Vec::new();
-            if abs_cwd != project_root {
-                candidates.push(abs_cwd.join(".agents").join("skills"));
-            }
-            candidates.push(project_root.join(".agents").join("skills"));
-            for path in candidates {
-                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                if user_agents_key.as_ref() == Some(&key) {
-                    continue;
-                }
-                if seen_paths.insert(key) {
-                    roots.push(SkillRoot {
-                        path,
-                        source: SkillSource::ProjectAgents,
-                        rank: PROJECT_AGENTS_RANK,
-                    });
-                }
-            }
-        }
-
-        for dir in &self.config.custom_skill_dirs {
-            let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-            if seen_paths.insert(key) {
-                roots.push(SkillRoot {
-                    path: dir.clone(),
-                    source: SkillSource::Custom,
-                    rank: CUSTOM_RANK,
-                });
-            }
-        }
-
-        if let Some(path) = user_agents_dir {
-            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if seen_paths.insert(key) {
-                roots.push(SkillRoot {
-                    path,
-                    source: SkillSource::UserAgents,
-                    rank: USER_AGENTS_RANK,
-                });
-            }
-        }
-
-        let bundled = self.config.bundled_skill_dir.clone().or_else(|| {
-            self.config
-                .include_default_roots
-                .then(|| std::env::var("MIZAR_BUNDLED_SKILL_DIR").ok())
-                .flatten()
-                .filter(|s| !s.trim().is_empty())
-                .map(PathBuf::from)
-        });
-        if let Some(bundled_dir) = bundled {
-            let key = std::fs::canonicalize(&bundled_dir).unwrap_or_else(|_| bundled_dir.clone());
-            if seen_paths.insert(key) {
-                roots.push(SkillRoot {
-                    path: bundled_dir,
-                    source: SkillSource::Bundled,
-                    rank: BUNDLED_SKILL_RANK,
-                });
-            }
-        }
-
-        roots
+        resolve_roots_for(&self.config, self.default_cwd.as_deref(), cwd)
     }
 
     pub fn matches_mutation_path(&self, target: &Path, cwd: Option<&Path>) -> bool {
         let abs_target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-        self.resolve_roots(cwd).into_iter().any(|root| {
+        let matched = self.resolve_roots(cwd).into_iter().any(|root| {
             let root_abs = std::fs::canonicalize(&root.path).unwrap_or(root.path);
             is_potential_skill_path(&root_abs, &abs_target)
-        })
+        });
+        if matched {
+            self.fp_cache.lock().unwrap().clear();
+        }
+        matched
     }
 }
 
-fn hash_mtime(meta: &std::fs::Metadata, hasher: &mut DefaultHasher) {
-    meta.len().hash(hasher);
-    if let Ok(mtime) = meta.modified()
-        && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
+fn resolve_roots_for(
+    config: &FilesystemSkillConfig,
+    default_cwd: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<SkillRoot> {
+    let mut roots = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    let excluded_user_key = config
+        .include_default_roots
+        .then(|| resolve_agents_home(config.agents_home.as_deref()).map(|h| h.join("skills")))
+        .flatten()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    let user_agents_dir = (config.include_default_roots && config.include_user_roots)
+        .then(|| resolve_agents_home(config.agents_home.as_deref()).map(|h| h.join("skills")))
+        .flatten();
+    let user_agents_key = excluded_user_key;
+
+    let effective_cwd = cwd.or(default_cwd);
+    if config.include_default_roots
+        && let Some(dir) = effective_cwd
     {
-        dur.as_secs().hash(hasher);
-        dur.subsec_nanos().hash(hasher);
+        let abs_cwd = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let project_root = find_project_root(&abs_cwd);
+        let mut candidates = Vec::new();
+        if abs_cwd != project_root {
+            candidates.push(abs_cwd.join(".agents").join("skills"));
+        }
+        candidates.push(project_root.join(".agents").join("skills"));
+        for path in candidates {
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if user_agents_key.as_ref() == Some(&key) {
+                continue;
+            }
+            if seen_paths.insert(key) {
+                roots.push(SkillRoot {
+                    path,
+                    source: SkillSource::ProjectAgents,
+                    rank: PROJECT_AGENTS_RANK,
+                });
+            }
+        }
     }
+
+    for dir in &config.custom_skill_dirs {
+        let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if seen_paths.insert(key) {
+            roots.push(SkillRoot {
+                path: dir.clone(),
+                source: SkillSource::Custom,
+                rank: CUSTOM_RANK,
+            });
+        }
+    }
+
+    if let Some(path) = user_agents_dir {
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen_paths.insert(key) {
+            roots.push(SkillRoot {
+                path,
+                source: SkillSource::UserAgents,
+                rank: USER_AGENTS_RANK,
+            });
+        }
+    }
+
+    let bundled = config.bundled_skill_dir.clone().or_else(|| {
+        config
+            .include_default_roots
+            .then(|| std::env::var("MIZAR_BUNDLED_SKILL_DIR").ok())
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(bundled_dir) = bundled {
+        let key = std::fs::canonicalize(&bundled_dir).unwrap_or_else(|_| bundled_dir.clone());
+        if seen_paths.insert(key) {
+            roots.push(SkillRoot {
+                path: bundled_dir,
+                source: SkillSource::Bundled,
+                rank: BUNDLED_SKILL_RANK,
+            });
+        }
+    }
+
+    roots
+}
+
+fn read_file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let (mtime_secs, mtime_nanos) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
+    Some(FileStamp {
+        len: meta.len(),
+        mtime_secs,
+        mtime_nanos,
+    })
+}
+
+fn hash_stamp(stamp: &FileStamp, hasher: &mut DefaultHasher) {
+    stamp.len.hash(hasher);
+    stamp.mtime_secs.hash(hasher);
+    stamp.mtime_nanos.hash(hasher);
 }
 
 /// 扫描单个技能根目录，返回排序后的 `(skill_md_path, resource_base_dir)` 列表。
@@ -296,27 +331,52 @@ fn scan_root_skill_files(root_path: &Path) -> Result<Vec<(PathBuf, PathBuf)>, St
     Ok(discovered)
 }
 
-fn compute_roots_fingerprint(roots: &[SkillRoot]) -> u64 {
+fn compute_roots_fingerprint(roots: &[SkillRoot]) -> CachedFingerprintEntry {
     let mut hasher = DefaultHasher::new();
+    let mut root_stamps = Vec::with_capacity(roots.len());
+    let mut file_stamps = Vec::new();
     for root in roots {
         root.path.hash(&mut hasher);
-        let Ok(root_meta) = std::fs::metadata(&root.path) else {
+        let root_stamp = read_file_stamp(&root.path);
+        root_stamps.push((root.path.clone(), root_stamp.clone()));
+        let Some(ref rs) = root_stamp else {
             false.hash(&mut hasher);
             continue;
         };
         true.hash(&mut hasher);
-        hash_mtime(&root_meta, &mut hasher);
+        hash_stamp(rs, &mut hasher);
         let Ok(files) = scan_root_skill_files(&root.path) else {
             continue;
         };
         for (file_path, _) in files {
-            if let Ok(meta) = std::fs::metadata(&file_path) {
+            let stamp = read_file_stamp(&file_path);
+            if let Some(ref st) = stamp {
                 file_path.hash(&mut hasher);
-                hash_mtime(&meta, &mut hasher);
+                hash_stamp(st, &mut hasher);
             }
+            file_stamps.push((file_path, stamp));
         }
     }
-    hasher.finish()
+    CachedFingerprintEntry {
+        scanned_at: Instant::now(),
+        root_stamps,
+        file_stamps,
+        fingerprint: hasher.finish(),
+    }
+}
+
+fn cached_stamps_still_valid(entry: &CachedFingerprintEntry) -> bool {
+    if entry.scanned_at.elapsed() >= FINGERPRINT_SCAN_TTL {
+        return false;
+    }
+    entry
+        .root_stamps
+        .iter()
+        .all(|(p, prev)| read_file_stamp(p) == *prev)
+        && entry
+            .file_stamps
+            .iter()
+            .all(|(p, prev)| read_file_stamp(p) == *prev)
 }
 
 async fn discover_root(
@@ -410,8 +470,33 @@ impl SkillProvider for FilesystemSkillProvider {
         &self,
         options: &SkillLookupOptions,
     ) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
-        let roots = self.resolve_roots(options.cwd.as_deref());
-        Box::pin(async move { Some(compute_roots_fingerprint(&roots)) })
+        let config = self.config.clone();
+        let default_cwd = self.default_cwd.clone();
+        let cwd = options.cwd.clone();
+        let fp_cache = Arc::clone(&self.fp_cache);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                // 仅在锁内克隆缓存条目，文件系统 stat 与递归扫描完全在锁外执行
+                let cached = { fp_cache.lock().unwrap().get(&cwd).cloned() };
+                if let Some(entry) = cached
+                    && cached_stamps_still_valid(&entry)
+                {
+                    return entry.fingerprint;
+                }
+
+                let roots = resolve_roots_for(&config, default_cwd.as_deref(), cwd.as_deref());
+                let entry = compute_roots_fingerprint(&roots);
+                let fp = entry.fingerprint;
+                let mut guard = fp_cache.lock().unwrap();
+                if guard.len() >= 16 && !guard.contains_key(&cwd) {
+                    guard.clear();
+                }
+                guard.insert(cwd, entry);
+                fp
+            })
+            .await
+            .ok()
+        })
     }
 
     fn list(
@@ -419,7 +504,14 @@ impl SkillProvider for FilesystemSkillProvider {
         options: SkillLookupOptions,
     ) -> BoxFuture<'_, Result<SkillProviderObservation, String>> {
         Box::pin(async move {
-            let roots = self.resolve_roots(options.cwd.as_deref());
+            let config = self.config.clone();
+            let default_cwd = self.default_cwd.clone();
+            let cwd = options.cwd.clone();
+            let roots = tokio::task::spawn_blocking(move || {
+                resolve_roots_for(&config, default_cwd.as_deref(), cwd.as_deref())
+            })
+            .await
+            .map_err(|err| format!("resolve_roots join error: {err}"))?;
             let mut candidates = Vec::new();
             let mut complete = true;
 
@@ -485,5 +577,68 @@ impl SkillProvider for FilesystemSkillProvider {
                 metadata: parsed.metadata,
             }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn fingerprint_uses_ttl_cache_without_missing_direct_skill_edits() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("mizar_skills_fp_{}_{uniq}", std::process::id()));
+        let skill_dir = base.join(".agents/skills/alpha");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_file, "---\nname: alpha\ndescription: v1\n---\nv1").unwrap();
+
+        let ctx = Context::new();
+        let cfg = FilesystemSkillConfig {
+            include_user_roots: false,
+            ..Default::default()
+        };
+        let provider = FilesystemSkillProvider::new(ctx, cfg, Some(base.clone()));
+        let opts = SkillLookupOptions {
+            cwd: Some(base.clone()),
+            cancel: CancellationToken::new(),
+        };
+
+        let fp1 = provider.fingerprint(&opts).await.unwrap();
+        let scanned_at_1 = provider
+            .fp_cache
+            .lock()
+            .unwrap()
+            .get(&Some(base.clone()))
+            .unwrap()
+            .scanned_at;
+
+        // TTL 内再次查询应命中缓存（不重新全量扫盘）
+        let fp2 = provider.fingerprint(&opts).await.unwrap();
+        assert_eq!(fp1, fp2);
+        let scanned_at_2 = provider
+            .fp_cache
+            .lock()
+            .unwrap()
+            .get(&Some(base.clone()))
+            .unwrap()
+            .scanned_at;
+        assert_eq!(scanned_at_1, scanned_at_2);
+
+        // 直接改写已存在 SKILL.md 后（不同长度触发 stamp 变更），即使在 TTL 内也必须立即刷新指纹
+        std::fs::write(
+            &skill_file,
+            "---\nname: alpha\ndescription: v2 longer\n---\nv2 longer body",
+        )
+        .unwrap();
+        let fp3 = provider.fingerprint(&opts).await.unwrap();
+        assert_ne!(fp1, fp3);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

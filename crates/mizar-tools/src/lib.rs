@@ -584,8 +584,16 @@ enum SessionToolPolicy {
     Explicit(Vec<String>),
 }
 
+#[derive(Clone)]
+struct CachedDeclaredLoadout {
+    version: u64,
+    infos: Arc<[ToolRuntimeInfo]>,
+    active_names: Arc<HashSet<String>>,
+}
+
 #[derive(Default)]
 struct ToolState {
+    version: u64,
     tools: Vec<ToolDefinition>,
     /// 显式全局覆盖（例如手动覆盖默认激活或无会话上下文下动态启用）。
     global_active_overrides: HashMap<String, bool>,
@@ -597,9 +605,18 @@ struct ToolState {
     exclude_patterns: Vec<String>,
     /// 按会话管理的工具激活策略。
     session_policies: HashMap<String, SessionToolPolicy>,
+    /// 无特定会话上下文时的声明清单缓存（随 `version` 递增失效）。
+    default_declared_cache: Option<CachedDeclaredLoadout>,
+    /// 按会话缓存的声明清单（随 `version` 递增整体失效）。
+    session_declared_cache: HashMap<String, CachedDeclaredLoadout>,
 }
 
 impl ToolState {
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
+        self.default_declared_cache = None;
+        self.session_declared_cache.clear();
+    }
     fn is_excluded(&self, name: &str) -> bool {
         self.exclude_patterns
             .iter()
@@ -745,6 +762,7 @@ impl ToolRuntime {
                     .cmp(&b.exposure.sort_rank())
                     .then_with(|| a.name.cmp(&b.name))
             });
+            st.bump_version();
         }
         self.ctx.emit(EVENT_TOOLS_CHANGE, ());
 
@@ -766,6 +784,7 @@ impl ToolRuntime {
                             }
                         }
                     }
+                    st.bump_version();
                 }
                 rt.ctx.emit(EVENT_TOOLS_CHANGE, ());
             }
@@ -779,6 +798,9 @@ impl ToolRuntime {
             let same = st.include_patterns == include && st.exclude_patterns == exclude;
             st.include_patterns = include;
             st.exclude_patterns = exclude;
+            if !same {
+                st.bump_version();
+            }
             !same
         };
         if changed {
@@ -790,7 +812,12 @@ impl ToolRuntime {
     pub fn set_global_active_override(&self, name: &str, active: bool) {
         let changed = {
             let mut st = self.state.lock().unwrap();
-            st.global_active_overrides.insert(name.to_string(), active) != Some(active)
+            let changed =
+                st.global_active_overrides.insert(name.to_string(), active) != Some(active);
+            if changed {
+                st.bump_version();
+            }
+            changed
         };
         if changed {
             self.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -805,7 +832,11 @@ impl ToolRuntime {
                 Some(v) => st.auto_default_active.insert(name.to_string(), v),
                 None => st.auto_default_active.remove(name),
             };
-            prev != active
+            let changed = prev != active;
+            if changed {
+                st.bump_version();
+            }
+            changed
         };
         if changed {
             self.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -854,6 +885,7 @@ impl ToolRuntime {
                 session_id.to_string(),
                 SessionToolPolicy::Explicit(valid.clone()),
             );
+            st.bump_version();
             valid
         };
         self.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -894,6 +926,7 @@ impl ToolRuntime {
                         list.extend(newly_added.iter().cloned());
                     }
                 }
+                st.bump_version();
             }
             newly_added
         };
@@ -908,7 +941,11 @@ impl ToolRuntime {
     pub fn reset_session_activations(&self, session_id: &str) -> bool {
         let changed = {
             let mut st = self.state.lock().unwrap();
-            st.session_policies.remove(session_id).is_some()
+            let removed = st.session_policies.remove(session_id).is_some();
+            if removed {
+                st.bump_version();
+            }
+            removed
         };
         if changed {
             self.ctx.emit(EVENT_TOOLS_CHANGE, ());
@@ -929,14 +966,24 @@ impl ToolRuntime {
             .collect()
     }
 
-    pub fn list_declared_infos(&self, session_id: Option<&str>) -> Vec<ToolRuntimeInfo> {
-        let (active_defs, callable, registered) = {
+    fn list_declared_cached(&self, session_id: Option<&str>) -> CachedDeclaredLoadout {
+        let (snapshot_version, active_defs, callable, registered) = {
             let st = self.state.lock().unwrap();
+            let cached = match session_id {
+                None => st.default_declared_cache.as_ref(),
+                Some(sid) => st.session_declared_cache.get(sid),
+            };
+            if let Some(entry) = cached
+                && entry.version == st.version
+            {
+                return entry.clone();
+            }
+
             let active_defs = st.resolve_active_defs(session_id);
             let callable = st.resolve_callable_infos(&active_defs);
             let registered: Vec<ToolRuntimeInfo> =
                 st.tools.iter().map(ToolDefinition::info).collect();
-            (active_defs, callable, registered)
+            (st.version, active_defs, callable, registered)
         };
 
         let declared_infos: Vec<ToolRuntimeInfo> =
@@ -946,39 +993,86 @@ impl ToolRuntime {
             .filter_map(|t| t.prepare_loadout.clone())
             .collect();
 
-        if hooks.is_empty() {
-            return declared_infos;
-        }
+        let final_infos = if hooks.is_empty() {
+            declared_infos
+        } else {
+            let loadout = ToolLoadout {
+                declared: declared_infos.clone(),
+                callable,
+                registered,
+            };
+            let mut description_overrides: HashMap<String, String> = HashMap::new();
+            let mut hidden: HashSet<String> = HashSet::new();
 
-        let loadout = ToolLoadout {
-            declared: declared_infos.clone(),
-            callable,
-            registered,
-        };
-        let mut description_overrides: HashMap<String, String> = HashMap::new();
-        let mut hidden: HashSet<String> = HashSet::new();
-
-        for hook in hooks {
-            if let Some(changes) = hook(&loadout) {
-                for (name, desc) in changes.descriptions {
-                    description_overrides.insert(name, desc);
+            for hook in hooks {
+                if let Some(changes) = hook(&loadout) {
+                    for (name, desc) in changes.descriptions {
+                        description_overrides.insert(name, desc);
+                    }
+                    for name in changes.hidden_declarations {
+                        hidden.insert(name);
+                    }
                 }
-                for name in changes.hidden_declarations {
-                    hidden.insert(name);
+            }
+
+            declared_infos
+                .into_iter()
+                .filter(|info| !hidden.contains(&info.name))
+                .map(|mut info| {
+                    if let Some(desc) = description_overrides.remove(&info.name) {
+                        info.description = desc;
+                    }
+                    info
+                })
+                .collect()
+        };
+
+        let active_names: HashSet<String> = final_infos.iter().map(|i| i.name.clone()).collect();
+        let entry = CachedDeclaredLoadout {
+            version: snapshot_version,
+            infos: Arc::from(final_infos),
+            active_names: Arc::new(active_names),
+        };
+
+        let mut st = self.state.lock().unwrap();
+        if st.version == snapshot_version {
+            match session_id {
+                None => st.default_declared_cache = Some(entry.clone()),
+                Some(sid) => {
+                    if st.session_declared_cache.len() >= 64
+                        && !st.session_declared_cache.contains_key(sid)
+                    {
+                        st.session_declared_cache.clear();
+                    }
+                    st.session_declared_cache
+                        .insert(sid.to_string(), entry.clone());
                 }
             }
         }
+        entry
+    }
 
-        declared_infos
-            .into_iter()
-            .filter(|info| !hidden.contains(&info.name))
-            .map(|mut info| {
-                if let Some(desc) = description_overrides.remove(&info.name) {
-                    info.description = desc;
-                }
-                info
-            })
-            .collect()
+    pub fn list_declared_infos(&self, session_id: Option<&str>) -> Vec<ToolRuntimeInfo> {
+        self.list_declared_cached(session_id).infos.to_vec()
+    }
+
+    /// O(1) 判断某工具在当前声明装配集中是否处于激活状态。
+    pub fn is_tool_active(&self, session_id: Option<&str>, name: &str) -> bool {
+        self.list_declared_cached(session_id)
+            .active_names
+            .contains(name)
+    }
+
+    /// 按工具名精确查询单个未屏蔽工具的元数据（避免为单项校验克隆全量列表）。
+    pub fn get_tool_info(&self, name: &str) -> Option<ToolRuntimeInfo> {
+        let st = self.state.lock().unwrap();
+        if st.is_excluded(name) {
+            return None;
+        }
+        st.tools
+            .iter()
+            .find(|t| t.name == name)
+            .map(ToolDefinition::info)
     }
 
     /// 供 `codemode` 沙箱使用的可调用工具列表（包含当前活跃 `Direct` 工具以及所有 `Codemode`/`Deferred` 工具）。
@@ -1396,5 +1490,79 @@ mod tests {
             after_activate,
             vec!["read", "write", "codemode", "tool_search", "mcp_b"]
         );
+    }
+
+    #[tokio::test]
+    async fn caches_declared_loadout_across_calls_and_invalidates_on_mutations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = app.tools().unwrap();
+
+        let hook_runs = Arc::new(AtomicUsize::new(0));
+        let hook_runs_c = Arc::clone(&hook_runs);
+
+        let _cm = tools
+            .register(
+                ToolDefinition::sync_tool("codemode", "base", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly)
+                .with_prepare_loadout(move |loadout| {
+                    hook_runs_c.fetch_add(1, Ordering::SeqCst);
+                    let mut changes = ToolLoadoutChanges::default();
+                    if loadout.declared.iter().any(|t| t.name == "read") {
+                        changes.hidden_declarations.push("read".to_string());
+                    }
+                    Some(changes)
+                }),
+            )
+            .unwrap();
+        let _r = tools
+            .register(ToolDefinition::sync_tool(
+                "read",
+                "read",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _d = tools
+            .register(
+                ToolDefinition::sync_tool("extra", "extra", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+
+        // 同版本多次查询 list_declared_infos / is_tool_active 只触发 1 次 prepare_loadout
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 0);
+        let infos = tools.list_declared_infos(Some("s1"));
+        assert_eq!(infos.len(), 1);
+        assert!(tools.is_tool_active(Some("s1"), "codemode"));
+        assert!(!tools.is_tool_active(Some("s1"), "read"));
+        assert!(!tools.is_tool_active(Some("s1"), "extra"));
+        let _ = tools.list_declared_infos(Some("s1"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 1);
+
+        // activate_tools / reset / selection / global override / auto_default / register / unregister 均使缓存失效
+        tools.activate_tools("s1", &["extra".to_string()]);
+        assert!(tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 2);
+
+        assert!(tools.reset_session_activations("s1"));
+        assert!(!tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 3);
+
+        tools.set_global_active_override("extra", true);
+        assert!(tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 4);
+
+        tools.set_tool_selection(None, vec!["extra".to_string()]);
+        assert!(tools.get_tool_info("extra").is_none());
+        assert!(tools.get_tool_info("read").is_some());
+        assert!(!tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 5);
     }
 }

@@ -220,23 +220,8 @@ pub async fn execute_codemode_script(
     let timeout = Duration::from_millis(timeout_ms);
     let started = Instant::now();
 
-    let rt = AsyncRuntime::new().map_err(|e| format!("Failed to init QuickJS runtime: {e}"))?;
-    rt.set_memory_limit(CODEMODE_MEMORY_LIMIT_BYTES).await;
-    rt.set_max_stack_size(CODEMODE_STACK_SIZE_BYTES).await;
-
-    let cancel_interrupt = script_cancel.clone();
-    rt.set_interrupt_handler(Some(Box::new(move || {
-        cancel_interrupt.is_cancelled() || started.elapsed() >= timeout
-    })))
-    .await;
-
-    let qctx = AsyncContext::full(&rt)
-        .await
-        .map_err(|e| format!("Failed to init QuickJS context: {e}"))?;
-
-    let callable_for_search = callable.clone();
-    let callable_for_desc = callable.clone();
-    let callable_for_ns = callable.clone();
+    let host_handle = tokio::runtime::Handle::current();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<Option<String>, String>>();
 
     let logs_host = Arc::clone(&logs);
     let store_get = Arc::clone(&store_state);
@@ -245,290 +230,374 @@ pub async fn execute_codemode_script(
     let seq_host = Arc::clone(&nested_seq);
     let tools_host = Arc::clone(&tools_rt);
     let call_ctx_host = call_ctx.clone();
-    let nested_cancel = script_cancel.clone();
     let exit_host = Arc::clone(&exit_signal);
+    let parent_cancel_thread = call_ctx.cancel.clone();
+    let script_cancel_thread = script_cancel.clone();
+    let timed_out_thread = Arc::clone(&timed_out_hit);
+    let callable_thread = callable.clone();
 
-    let deadline = tokio::time::Instant::from_std(started) + timeout;
-    let script_outcome: Result<Option<String>, String> = {
-        let mut eval_fut = Box::pin(qctx.async_with(async |ctx| {
-            let globals = ctx.globals();
-            globals
-                .set("__ID_TO_RAW_JSON", id_to_raw_json.as_str())
-                .map_err(|e| e.to_string())?;
-            globals
-                .set("__ALL_TOOLS_JSON", all_tools_json.as_str())
-                .map_err(|e| e.to_string())?;
+    // QuickJS 同步执行与 GC 隔离到独立 OS 线程，防止阻塞 Tokio worker 线程
+    std::thread::Builder::new()
+        .name("mizar-codemode-js".to_string())
+        .spawn(move || {
+            let local_rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = result_tx.send(Err(format!("Failed to init JS thread runtime: {err}")));
+                    return;
+                }
+            };
 
-            let exit_cb = Arc::clone(&exit_host);
-            globals
-                .set(
-                    "__host_exit",
-                    Func::from(move |msg: Option<String>| {
-                        *exit_cb.lock().unwrap() = ScriptExitSignal::Requested(msg);
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+            local_rt.block_on(async move {
+                let rt = match AsyncRuntime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = result_tx.send(Err(format!("Failed to init QuickJS runtime: {e}")));
+                        return;
+                    }
+                };
+                rt.set_memory_limit(CODEMODE_MEMORY_LIMIT_BYTES).await;
+                rt.set_max_stack_size(CODEMODE_STACK_SIZE_BYTES).await;
 
-            let logs_cb = Arc::clone(&logs_host);
-            globals
-                .set(
-                    "__host_log",
-                    Func::from(move |kind: String, text: String| {
-                        let line = if kind == "warn" {
-                            format!("[warn] {text}")
-                        } else if kind == "error" {
-                            format!("[error] {text}")
-                        } else {
-                            text
-                        };
-                        logs_cb.lock().unwrap().push(line);
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+                let cancel_interrupt = script_cancel_thread.clone();
+                rt.set_interrupt_handler(Some(Box::new(move || {
+                    cancel_interrupt.is_cancelled() || started.elapsed() >= timeout
+                })))
+                .await;
 
-            globals
-                .set(
-                    "__host_store_get",
-                    Func::from(move |key: String| -> Option<String> {
-                        store_get
-                            .lock()
-                            .unwrap()
-                            .get(&key)
-                            .and_then(|v| serde_json::to_string(v).ok())
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+                let qctx = match AsyncContext::full(&rt).await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        let _ = result_tx.send(Err(format!("Failed to init QuickJS context: {e}")));
+                        return;
+                    }
+                };
 
-            globals
-                .set(
-                    "__host_store_set",
-                    Func::from(move |key: String, json_opt: Option<String>| {
-                        let mut map = store_set.lock().unwrap();
-                        match json_opt {
-                            None => {
-                                map.remove(&key);
-                            }
-                            Some(raw) => {
-                                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                                    map.insert(key, v);
-                                }
-                            }
-                        }
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+                let callable_for_search = callable_thread.clone();
+                let callable_for_desc = callable_thread.clone();
+                let callable_for_ns = callable_thread;
+                let nested_cancel = script_cancel_thread.clone();
 
-            globals
-                .set(
-                    "__host_search_tools",
-                    Func::from(move |query: String, limit: usize, ns: Option<String>| -> String {
-                        let filtered: Vec<&ToolRuntimeInfo> = callable_for_search
-                            .iter()
-                            .filter(|t| {
-                                ns.as_deref().is_none_or(|want| {
-                                    t.namespace.as_ref().is_some_and(|n| {
-                                        n.name == want || n.aliases.iter().any(|a| a == want)
-                                    })
-                                })
-                            })
-                            .collect();
-                        let docs: Vec<ToolSearchDocument> = filtered
-                            .iter()
-                            .map(|t| create_tool_search_document(t))
-                            .collect();
-                        let matches = Bm25Ranker::default().rank(&query, &docs, limit.clamp(1, 32));
-                        let out: Vec<Value> = matches
-                            .into_iter()
-                            .filter_map(|m| filtered.iter().find(|t| t.name == m.name))
-                            .map(|t| {
-                                json!({
-                                    "name": t.name,
-                                    "id": to_codemode_identifier(&t.name),
-                                    "description": t.description,
-                                    "inputSchema": t.parameters,
-                                    "outputSchema": t.output_schema,
-                                })
-                            })
-                            .collect();
-                        serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+                let deadline = tokio::time::Instant::from_std(started) + timeout;
+                let script_outcome: Result<Option<String>, String> = {
+                    let mut eval_fut = Box::pin(qctx.async_with(async |ctx| {
+                        let globals = ctx.globals();
+                        globals
+                            .set("__ID_TO_RAW_JSON", id_to_raw_json.as_str())
+                            .map_err(|e| e.to_string())?;
+                        globals
+                            .set("__ALL_TOOLS_JSON", all_tools_json.as_str())
+                            .map_err(|e| e.to_string())?;
 
-            globals
-                .set(
-                    "__host_describe_tool",
-                    Func::from(move |name: String| -> Option<String> {
-                        callable_for_desc
-                            .iter()
-                            .find(|t| t.name == name || to_codemode_identifier(&t.name) == name)
-                            .and_then(|t| {
-                                serde_json::to_string(&json!({
-                                    "name": t.name,
-                                    "id": to_codemode_identifier(&t.name),
-                                    "description": t.description,
-                                    "inputSchema": t.parameters,
-                                    "outputSchema": t.output_schema,
-                                    "guidelines": t.prompt_guidelines,
-                                }))
-                                .ok()
-                            })
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+                        let exit_cb = Arc::clone(&exit_host);
+                        globals
+                            .set(
+                                "__host_exit",
+                                Func::from(move |msg: Option<String>| {
+                                    *exit_cb.lock().unwrap() = ScriptExitSignal::Requested(msg);
+                                }),
+                            )
+                            .map_err(|e| e.to_string())?;
 
-            globals
-                .set(
-                    "__host_describe_namespace",
-                    Func::from(move |name: String| -> Option<String> {
-                        let matching: Vec<&ToolRuntimeInfo> = callable_for_ns
-                            .iter()
-                            .filter(|t| {
-                                t.namespace.as_ref().is_some_and(|n| {
-                                    n.name == name || n.aliases.iter().any(|a| a == &name)
-                                })
-                            })
-                            .collect();
-                        if matching.is_empty() {
-                            return None;
-                        }
-                        let ns_info = matching[0].namespace.as_ref().unwrap();
-                        serde_json::to_string(&json!({
-                            "name": ns_info.name,
-                            "description": ns_info.description,
-                            "instructions": ns_info.instructions,
-                            "tools": matching.iter().map(|t| json!({
-                                "name": t.name,
-                                "id": to_codemode_identifier(&t.name),
-                                "description": t.description,
-                            })).collect::<Vec<_>>(),
-                        }))
-                        .ok()
-                    }),
-                )
-                .map_err(|e| e.to_string())?;
+                        let logs_cb = Arc::clone(&logs_host);
+                        globals
+                            .set(
+                                "__host_log",
+                                Func::from(move |kind: String, text: String| {
+                                    let line = if kind == "warn" {
+                                        format!("[warn] {text}")
+                                    } else if kind == "error" {
+                                        format!("[error] {text}")
+                                    } else {
+                                        text
+                                    };
+                                    logs_cb.lock().unwrap().push(line);
+                                }),
+                            )
+                            .map_err(|e| e.to_string())?;
 
-            let call_fn = Function::new(
-                ctx.clone(),
-                Async(move |raw_name: String, args_json: String| {
-                    let tools = Arc::clone(&tools_host);
-                    let parent_ctx = call_ctx_host.clone();
-                    let child_cancel = nested_cancel.clone();
-                    let nested = Arc::clone(&nested_host);
-                    let seq = Arc::clone(&seq_host);
-                    async move {
-                        let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
-                        let call_id = format!("cm/{n}");
-                        let parsed_args: Value =
-                            serde_json::from_str(&args_json).unwrap_or_else(|_| json!({}));
-                        let args_preview = preview_json(&parsed_args, ARGS_PREVIEW_CHARS);
+                        globals
+                            .set(
+                                "__host_store_get",
+                                Func::from(move |key: String| -> Option<String> {
+                                    store_get
+                                        .lock()
+                                        .unwrap()
+                                        .get(&key)
+                                        .and_then(|v| serde_json::to_string(v).ok())
+                                }),
+                            )
+                            .map_err(|e| e.to_string())?;
 
-                        {
-                            let mut list = nested.lock().unwrap();
-                            list.push(CodemodeNestedCall {
-                                id: call_id.clone(),
-                                name: raw_name.clone(),
-                                args_preview: args_preview.clone(),
-                                status: "⏳".into(),
-                                duration_ms: 0,
-                            });
-                            parent_ctx.emit_update(format_preview_calls(&list), None);
-                        }
+                        globals
+                            .set(
+                                "__host_store_set",
+                                Func::from(move |key: String, json_opt: Option<String>| {
+                                    let mut map = store_set.lock().unwrap();
+                                    match json_opt {
+                                        None => {
+                                            map.remove(&key);
+                                        }
+                                        Some(raw) => {
+                                            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                                                map.insert(key, v);
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                            .map_err(|e| e.to_string())?;
 
-                        let t0 = Instant::now();
-                        let res = tools
-                            .execute_nested(
-                                ToolExecution::new(
-                                    raw_name.clone(),
-                                    parsed_args,
-                                    parent_ctx.exec.session_id.clone(),
+                        globals
+                            .set(
+                                "__host_search_tools",
+                                Func::from(
+                                    move |query: String, limit: usize, ns: Option<String>| -> String {
+                                        let filtered: Vec<&ToolRuntimeInfo> = callable_for_search
+                                            .iter()
+                                            .filter(|t| {
+                                                ns.as_deref().is_none_or(|want| {
+                                                    t.namespace.as_ref().is_some_and(|n| {
+                                                        n.name == want
+                                                            || n.aliases.iter().any(|a| a == want)
+                                                    })
+                                                })
+                                            })
+                                            .collect();
+                                        let docs: Vec<ToolSearchDocument> = filtered
+                                            .iter()
+                                            .map(|t| create_tool_search_document(t))
+                                            .collect();
+                                        let matches = Bm25Ranker::default()
+                                            .rank(&query, &docs, limit.clamp(1, 32));
+                                        let out: Vec<Value> = matches
+                                            .into_iter()
+                                            .filter_map(|m| {
+                                                filtered.iter().find(|t| t.name == m.name)
+                                            })
+                                            .map(|t| {
+                                                json!({
+                                                    "name": t.name,
+                                                    "id": to_codemode_identifier(&t.name),
+                                                    "description": t.description,
+                                                    "inputSchema": t.parameters,
+                                                    "outputSchema": t.output_schema,
+                                                })
+                                            })
+                                            .collect();
+                                        serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
+                                    },
                                 ),
-                                child_cancel,
-                                None,
                             )
-                            .await;
-                        let elapsed = t0.elapsed().as_millis() as u64;
+                            .map_err(|e| e.to_string())?;
 
-                        {
-                            let mut list = nested.lock().unwrap();
-                            if let Some(entry) = list.iter_mut().find(|c| c.id == call_id) {
-                                entry.status = if res.is_error {
-                                    "✗".into()
-                                } else {
-                                    "✓".into()
-                                };
-                                entry.duration_ms = elapsed;
-                            }
-                            parent_ctx.emit_update(format_preview_calls(&list), None);
-                        }
-
-                        if res.is_error {
-                            Ok::<_, rquickjs::Error>(
-                                json!({ "ok": false, "error": res.content }).to_string(),
+                        globals
+                            .set(
+                                "__host_describe_tool",
+                                Func::from(move |name: String| -> Option<String> {
+                                    callable_for_desc
+                                        .iter()
+                                        .find(|t| {
+                                            t.name == name
+                                                || to_codemode_identifier(&t.name) == name
+                                        })
+                                        .and_then(|t| {
+                                            serde_json::to_string(&json!({
+                                                "name": t.name,
+                                                "id": to_codemode_identifier(&t.name),
+                                                "description": t.description,
+                                                "inputSchema": t.parameters,
+                                                "outputSchema": t.output_schema,
+                                                "guidelines": t.prompt_guidelines,
+                                            }))
+                                            .ok()
+                                        })
+                                }),
                             )
+                            .map_err(|e| e.to_string())?;
+
+                        globals
+                            .set(
+                                "__host_describe_namespace",
+                                Func::from(move |name: String| -> Option<String> {
+                                    let matching: Vec<&ToolRuntimeInfo> = callable_for_ns
+                                        .iter()
+                                        .filter(|t| {
+                                            t.namespace.as_ref().is_some_and(|n| {
+                                                n.name == name || n.aliases.iter().any(|a| a == &name)
+                                            })
+                                        })
+                                        .collect();
+                                    if matching.is_empty() {
+                                        return None;
+                                    }
+                                    let ns_info = matching[0].namespace.as_ref().unwrap();
+                                    serde_json::to_string(&json!({
+                                        "name": ns_info.name,
+                                        "description": ns_info.description,
+                                        "instructions": ns_info.instructions,
+                                        "tools": matching.iter().map(|t| json!({
+                                            "name": t.name,
+                                            "id": to_codemode_identifier(&t.name),
+                                            "description": t.description,
+                                        })).collect::<Vec<_>>(),
+                                    }))
+                                    .ok()
+                                }),
+                            )
+                            .map_err(|e| e.to_string())?;
+
+                        let host_rt = host_handle.clone();
+                        let call_fn = Function::new(
+                            ctx.clone(),
+                            Async(move |raw_name: String, args_json: String| {
+                                let tools = Arc::clone(&tools_host);
+                                let parent_ctx = call_ctx_host.clone();
+                                let child_cancel = nested_cancel.clone();
+                                let nested = Arc::clone(&nested_host);
+                                let seq = Arc::clone(&seq_host);
+                                let host_rt = host_rt.clone();
+                                async move {
+                                    let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let call_id = format!("cm/{n}");
+                                    let parsed_args: Value = serde_json::from_str(&args_json)
+                                        .unwrap_or_else(|_| json!({}));
+                                    let args_preview =
+                                        preview_json(&parsed_args, ARGS_PREVIEW_CHARS);
+
+                                    {
+                                        let mut list = nested.lock().unwrap();
+                                        list.push(CodemodeNestedCall {
+                                            id: call_id.clone(),
+                                            name: raw_name.clone(),
+                                            args_preview: args_preview.clone(),
+                                            status: "⏳".into(),
+                                            duration_ms: 0,
+                                        });
+                                        parent_ctx.emit_update(format_preview_calls(&list), None);
+                                    }
+
+                                    let t0 = Instant::now();
+                                    let exec_name = raw_name.clone();
+                                    let session_id = parent_ctx.exec.session_id.clone();
+                                    let res = match host_rt
+                                        .spawn(async move {
+                                            tools
+                                                .execute_nested(
+                                                    ToolExecution::new(
+                                                        exec_name,
+                                                        parsed_args,
+                                                        session_id,
+                                                    ),
+                                                    child_cancel,
+                                                    None,
+                                                )
+                                                .await
+                                        })
+                                        .await
+                                    {
+                                        Ok(res) => res,
+                                        Err(join_err) => mizar_tools::ToolResult::err(format!(
+                                            "Nested tool execution failed: {join_err}"
+                                        )),
+                                    };
+                                    let elapsed = t0.elapsed().as_millis() as u64;
+
+                                    {
+                                        let mut list = nested.lock().unwrap();
+                                        if let Some(entry) = list.iter_mut().find(|c| c.id == call_id)
+                                        {
+                                            entry.status = if res.is_error {
+                                                "✗".into()
+                                            } else {
+                                                "✓".into()
+                                            };
+                                            entry.duration_ms = elapsed;
+                                        }
+                                        parent_ctx.emit_update(format_preview_calls(&list), None);
+                                    }
+
+                                    if res.is_error {
+                                        Ok::<_, rquickjs::Error>(
+                                            json!({ "ok": false, "error": res.content }).to_string(),
+                                        )
+                                    } else {
+                                        let val = res
+                                            .structured_content
+                                            .unwrap_or(Value::String(res.content));
+                                        Ok::<_, rquickjs::Error>(
+                                            json!({ "ok": true, "value": val }).to_string(),
+                                        )
+                                    }
+                                }
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        globals
+                            .set("__host_call_tool", call_fn)
+                            .map_err(|e| e.to_string())?;
+
+                        ctx.eval::<(), _>(PRELUDE_JS)
+                            .catch(&ctx)
+                            .map_err(|e| format!("Prelude error: {e}"))?;
+
+                        let wrapped = format!(
+                            "(async () => {{\n{}\n}})().then(__v => __v === undefined ? null : JSON.stringify(__v))",
+                            code
+                        );
+                        let mut opts = EvalOptions::default();
+                        opts.promise = false;
+                        opts.strict = false;
+                        let promise: Promise = ctx
+                            .eval_with_options(wrapped, opts)
+                            .catch(&ctx)
+                            .map_err(|e| format!("{e}"))?;
+
+                        let awaited: JsValue = promise
+                            .into_future::<JsValue>()
+                            .await
+                            .catch(&ctx)
+                            .map_err(|e| format!("{e}"))?;
+
+                        let ret_str = if awaited.is_null() || awaited.is_undefined() {
+                            None
+                        } else if let Some(s) = awaited.as_string() {
+                            s.to_string().ok()
                         } else {
-                            let val = res
-                                .structured_content
-                                .unwrap_or(Value::String(res.content));
-                            Ok::<_, rquickjs::Error>(
-                                json!({ "ok": true, "value": val }).to_string(),
-                            )
+                            None
+                        };
+                        Ok(ret_str)
+                    }));
+                    tokio::select! {
+                        biased;
+                        res = &mut eval_fut => res,
+                        _ = parent_cancel_thread.cancelled() => {
+                            script_cancel_thread.cancel();
+                            Err("Script aborted".to_string())
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {
+                            timed_out_thread.store(true, Ordering::SeqCst);
+                            script_cancel_thread.cancel();
+                            Err(format!("Script timed out after {timeout_ms}ms"))
                         }
                     }
-                }),
-            )
-            .map_err(|e| e.to_string())?;
-            globals
-                .set("__host_call_tool", call_fn)
-                .map_err(|e| e.to_string())?;
+                };
 
-            ctx.eval::<(), _>(PRELUDE_JS)
-                .catch(&ctx)
-                .map_err(|e| format!("Prelude error: {e}"))?;
+                // 超时/取消后限制 idle 等待上限为 200ms，防止未决 Promise 永久挂死沙箱线程
+                let _ = tokio::time::timeout(Duration::from_millis(200), rt.idle()).await;
+                drop(qctx);
+                drop(rt);
+                let _ = result_tx.send(script_outcome);
+            });
+        })
+        .map_err(|e| format!("Failed to spawn QuickJS thread: {e}"))?;
 
-            let wrapped = format!(
-                "(async () => {{\n{}\n}})().then(__v => __v === undefined ? null : JSON.stringify(__v))",
-                code
-            );
-            let mut opts = EvalOptions::default();
-            opts.promise = false;
-            opts.strict = false;
-            let promise: Promise = ctx
-                .eval_with_options(wrapped, opts)
-                .catch(&ctx)
-                .map_err(|e| format!("{e}"))?;
-
-            let awaited: JsValue = promise
-                .into_future::<JsValue>()
-                .await
-                .catch(&ctx)
-                .map_err(|e| format!("{e}"))?;
-
-            let ret_str = if awaited.is_null() || awaited.is_undefined() {
-                None
-            } else if let Some(s) = awaited.as_string() {
-                s.to_string().ok()
-            } else {
-                None
-            };
-            Ok(ret_str)
-        }));
-        tokio::select! {
-            biased;
-            res = &mut eval_fut => res,
-            _ = call_ctx.cancel.cancelled() => {
-                script_cancel.cancel();
-                Err("Script aborted".to_string())
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                timed_out_hit.store(true, Ordering::SeqCst);
-                script_cancel.cancel();
-                Err(format!("Script timed out after {timeout_ms}ms"))
-            }
-        }
-    };
-
-    rt.idle().await;
+    let script_outcome = result_rx
+        .await
+        .unwrap_or_else(|_| Err("QuickJS worker thread terminated unexpectedly".to_string()));
 
     let calls_snapshot = nested_calls.lock().unwrap().clone();
     let mut logs_snapshot = logs.lock().unwrap().clone();
@@ -628,4 +697,104 @@ pub async fn execute_codemode_script(
         structured_content: structured,
         details: Some(details),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordis::{BoxError, Context, Service};
+    use mizar_tools::{ToolDefinition, ToolExposure, ToolsContextExt};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn sandbox_runs_on_dedicated_os_thread_and_bounds_idle_after_timeout() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = app.tools().unwrap();
+
+        let caller_thread_id = std::thread::current().id();
+        let observed_name = Arc::new(Mutex::new(None::<String>));
+        let observed_name_c = Arc::clone(&observed_name);
+
+        let _probe = tools
+            .register(
+                ToolDefinition::sync_tool("thread_probe", "probe", json!({}), move |_, _| {
+                    *observed_name_c.lock().unwrap() =
+                        std::thread::current().name().map(str::to_string);
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Codemode),
+            )
+            .unwrap();
+
+        let session_store = Arc::new(Mutex::new(HashMap::new()));
+        let sem = Arc::new(Semaphore::new(2));
+
+        // 1. 工具调用本身走主 runtime，而同步 JS 忙等跑在独立 OS 线程（不阻塞 Tokio 异步定时器）
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_bg = Arc::clone(&ticks);
+        let ticker_cancel = CancellationToken::new();
+        let ticker_cancel_bg = ticker_cancel.clone();
+        let ticker = tokio::spawn(async move {
+            while !ticker_cancel_bg.is_cancelled() {
+                ticks_bg.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        });
+
+        let call_ctx = ToolCallContext {
+            ctx: app.clone(),
+            exec: ToolExecution::new("codemode", json!({}), Some("s1".into())),
+            cancel: CancellationToken::new(),
+            on_update: None,
+        };
+        let ok_out = execute_codemode_script(
+            "const end = Date.now() + 90; while (Date.now() < end) {} await tools.thread_probe({}); return 42;".into(),
+            call_ctx,
+            tools.clone(),
+            Arc::clone(&session_store),
+            Arc::clone(&sem),
+            5_000,
+        )
+        .await
+        .unwrap();
+        ticker_cancel.cancel();
+        let _ = ticker.await;
+        assert!(!ok_out.is_error);
+        assert!(ok_out.content.contains("42"));
+        assert!(observed_name.lock().unwrap().is_some());
+        assert_ne!(
+            observed_name.lock().unwrap().as_deref(),
+            Some("mizar-codemode-js")
+        );
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 3,
+            "Tokio runtime should keep ticking while sync JS runs on dedicated thread"
+        );
+
+        // 2. 死循环或未决 Promise 超时后，rt.idle() 受 200ms 上限保护，迅速返回超时错误
+        let t0 = Instant::now();
+        let timeout_ctx = ToolCallContext {
+            ctx: app.clone(),
+            exec: ToolExecution::new("codemode", json!({}), Some("s1".into())),
+            cancel: CancellationToken::new(),
+            on_update: None,
+        };
+        let timeout_out = execute_codemode_script(
+            "// @options: {\"timeoutMs\": 120}\nawait new Promise(() => {});".into(),
+            timeout_ctx,
+            tools,
+            session_store,
+            sem,
+            5_000,
+        )
+        .await
+        .unwrap();
+        assert!(timeout_out.is_error);
+        assert!(timeout_out.content.contains("timed out"));
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::thread::current().id(), caller_thread_id);
+
+        app.fiber().dispose().await;
+    }
 }

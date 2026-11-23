@@ -262,7 +262,7 @@ impl McpManager {
         Some(parts.join("\n"))
     }
 
-    pub async fn connect_configured(&self) {
+    pub async fn connect_configured(self: &Arc<Self>) {
         let _guard = self.connect_lock.lock().await;
         if self.is_closing_or_closed() {
             self.ready_notify.notify_waiters();
@@ -325,6 +325,8 @@ impl McpManager {
             }
         }
 
+        // 并发连接各启用的 MCP Server，消除单点慢服务导致的 30s+ 队头阻塞
+        let mut join_set = tokio::task::JoinSet::new();
         for entry in entries {
             if self.is_closing_or_closed() {
                 break;
@@ -332,15 +334,27 @@ impl McpManager {
             if !entry.config.enabled {
                 continue;
             }
-            if let Err(err) = self.connect_one(entry.clone()).await {
-                if self.is_closing_or_closed() {
-                    break;
+            let mgr = Arc::clone(self);
+            join_set.spawn(async move {
+                if mgr.is_closing_or_closed() {
+                    return;
                 }
+                if let Err(err) = mgr.connect_one(entry.clone()).await {
+                    if mgr.is_closing_or_closed() {
+                        return;
+                    }
+                    mgr.logger()
+                        .warn(format!("MCP server `{}` failed: {err}", entry.name));
+                    if let Some(st) = mgr.statuses.lock().unwrap().get_mut(&entry.name) {
+                        st.state = McpConnectionState::Failed(err);
+                    }
+                }
+            });
+        }
+        while let Some(res) = join_set.join_next().await {
+            if let Err(err) = res {
                 self.logger()
-                    .warn(format!("MCP server `{}` failed: {err}", entry.name));
-                if let Some(st) = self.statuses.lock().unwrap().get_mut(&entry.name) {
-                    st.state = McpConnectionState::Failed(err);
-                }
+                    .warn(format!("MCP connect task failed: {err}"));
             }
         }
 
@@ -433,6 +447,14 @@ impl McpManager {
                         .warn(format!("skipping MCP tool `{full_name}`: {err}"));
                 }
             }
+        }
+
+        if self.is_closing_or_closed() {
+            for c in cleanups {
+                run_cleanup(c).await;
+            }
+            client.close().await;
+            return Err("MCP manager closed".to_string());
         }
 
         let state = McpConnectionState::Connected {
@@ -601,6 +623,26 @@ fn make_mcp_tool_def(
     def
 }
 
+async fn format_truncated_output(spill_prefix: &str, raw_text: &str) -> String {
+    let trunc = truncate_head(raw_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if trunc.truncated {
+        let spilled = write_temp_output(spill_prefix, raw_text)
+            .await
+            .ok()
+            .map(|p| format!(" Full output saved to: {}", p.display()))
+            .unwrap_or_default();
+        format!(
+            "{}\n\n[Truncated to {} lines / {}.{}]",
+            trunc.content,
+            trunc.output_lines,
+            format_size(DEFAULT_MAX_BYTES),
+            spilled
+        )
+    } else {
+        trunc.content
+    }
+}
+
 async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
     let is_error = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
     let structured = res.get("structuredContent").cloned();
@@ -640,23 +682,7 @@ async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
         parts.join("\n")
     };
 
-    let trunc = truncate_head(&raw_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    let content = if trunc.truncated {
-        let spilled = write_temp_output("mizar-mcp-", &raw_text)
-            .await
-            .ok()
-            .map(|p| format!(" Full output saved to: {}", p.display()))
-            .unwrap_or_default();
-        format!(
-            "{}\n\n[Truncated to {} lines / {}.{}]",
-            trunc.content,
-            trunc.output_lines,
-            format_size(DEFAULT_MAX_BYTES),
-            spilled
-        )
-    } else {
-        trunc.content
-    };
+    let content = format_truncated_output("mizar-mcp-", &raw_text).await;
 
     Ok(ToolOutput {
         content,
@@ -791,11 +817,12 @@ fn make_read_resource_def() -> ToolDefinition {
                     }
                 }
             }
-            let text = if texts.is_empty() {
+            let raw_text = if texts.is_empty() {
                 res.to_string()
             } else {
                 texts.join("\n")
             };
+            let text = format_truncated_output("mizar-mcp-resource-", &raw_text).await;
             Ok(ToolOutput::text(text).with_structured(res))
         },
     )
@@ -910,6 +937,60 @@ mod tests {
         mgr.close_all().await;
         mgr.connect_configured().await;
         assert_eq!(*mgr.phase.lock().unwrap(), McpManagerPhase::Closed);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn format_truncated_output_truncates_large_resource_and_spills_to_temp_file() {
+        let huge = "x".repeat(DEFAULT_MAX_BYTES + 4096);
+        let formatted = format_truncated_output("mizar-mcp-resource-", &huge).await;
+        assert!(formatted.contains("[Truncated to "));
+        assert!(formatted.contains("Full output saved to: "));
+        assert!(formatted.len() < huge.len());
+        if let Some((_, rest)) = formatted.split_once("Full output saved to: ")
+            && let Some(path_str) = rest.strip_suffix(']')
+        {
+            let path = std::path::Path::new(path_str);
+            assert!(path.exists());
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_configured_connects_servers_concurrently() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let mut cfg = McpPluginConfig::new(".");
+        cfg.load_config_files = false;
+        cfg.background_connect = false;
+        for name in ["slow_a", "slow_b", "slow_c"] {
+            let mut srv = McpServerConfig::stdio(
+                "sh",
+                vec!["-c".to_string(), "sleep 0.25; exit 1".to_string()],
+            );
+            srv.timeout_ms = Some(2_000);
+            cfg.servers.insert(name.to_string(), srv);
+        }
+
+        let t0 = std::time::Instant::now();
+        app.plugin(McpManager::plugin(), cfg).await.unwrap();
+        let elapsed = t0.elapsed();
+
+        let mgr = app.mcp().unwrap();
+        let statuses = mgr.statuses();
+        assert_eq!(statuses.len(), 3);
+        assert!(
+            statuses
+                .iter()
+                .all(|s| matches!(s.state, McpConnectionState::Failed(_)))
+        );
+        // 3 个各耗时 250ms 的服务若串行至少 750ms；并发应显著低于 600ms
+        assert!(
+            elapsed < std::time::Duration::from_millis(600),
+            "expected concurrent MCP connect, elapsed {elapsed:?}"
+        );
 
         app.fiber().dispose().await;
     }

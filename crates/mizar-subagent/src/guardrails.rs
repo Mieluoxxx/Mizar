@@ -80,10 +80,10 @@ pub fn check_pre_execute(
         if exec.name == SUBAGENT_TOOL_NAME {
             return PreExecuteDecision::deny("子代理严禁嵌套调用 subagent（深度严格限制为 1）");
         }
-        if mode == SubagentMode::ReadOnly {
-            let all_infos = tools.list_all();
-            let info = all_infos.iter().find(|t| t.name == exec.name);
-            if !is_read_only_tool(&exec.name, info) {
+        if mode == SubagentMode::ReadOnly && !READ_ONLY_TOOL_ALLOWLIST.contains(&exec.name.as_str())
+        {
+            let info = tools.get_tool_info(&exec.name);
+            if !is_read_only_tool(&exec.name, info.as_ref()) {
                 return PreExecuteDecision::deny(format!(
                     "只读模式子代理禁止调用非只读工具 {}",
                     exec.name
@@ -408,6 +408,92 @@ mod tests {
                 &providers
             ),
             (Some("deepseek".into()), Some("deepseek-chat".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn check_pre_execute_readonly_uses_allowlist_and_single_tool_lookup() {
+        use cordis::{BoxError, Context, Service};
+        use mizar_session::SessionContextExt;
+        use mizar_tools::{ToolDefinition, ToolsContextExt};
+
+        let app = Context::new();
+        app.plugin(SessionStore::plugin(), ()).await.unwrap();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = app.tools().unwrap();
+        let _ro = tools
+            .register(
+                ToolDefinition::sync_tool("custom_ro", "ro", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_annotations(ToolAnnotations {
+                    read_only: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let _rw = tools
+            .register(ToolDefinition::sync_tool(
+                "custom_rw",
+                "rw",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _excl = tools
+            .register(
+                ToolDefinition::sync_tool("excluded_ro", "ro", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_annotations(ToolAnnotations {
+                    read_only: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        tools.set_tool_selection(None, vec!["excluded_ro".to_string()]);
+
+        let sessions = app.sessions().unwrap();
+        let active = Mutex::new(HashMap::from([(
+            "child-ro".to_string(),
+            (1u64, SubagentMode::ReadOnly),
+        )]));
+
+        assert!(
+            check_pre_execute(
+                &ToolExecution::new("read", json!({}), Some("child-ro".into())),
+                &active,
+                &tools,
+                &sessions,
+            )
+            .allow
+        );
+        assert!(
+            check_pre_execute(
+                &ToolExecution::new("custom_ro", json!({}), Some("child-ro".into())),
+                &active,
+                &tools,
+                &sessions,
+            )
+            .allow
+        );
+        assert!(
+            !check_pre_execute(
+                &ToolExecution::new("custom_rw", json!({}), Some("child-ro".into())),
+                &active,
+                &tools,
+                &sessions,
+            )
+            .allow
+        );
+        assert!(
+            !check_pre_execute(
+                &ToolExecution::new("excluded_ro", json!({}), Some("child-ro".into())),
+                &active,
+                &tools,
+                &sessions,
+            )
+            .allow
         );
     }
 }
