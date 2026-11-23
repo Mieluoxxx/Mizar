@@ -393,6 +393,9 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 model: spec.default_model.map(ToString::to_string),
                 headers: Default::default(),
                 supports_max_output_tokens: supports_max_output,
+                supports_developer_role: compat_cfg.supports_developer_role.unwrap_or(true),
+                use_top_level_instructions: compat_cfg.use_top_level_instructions.unwrap_or(false),
+                supports_strict_mode: compat_cfg.supports_strict_mode.unwrap_or(false),
                 send_session_affinity_headers: compat_cfg.send_session_affinity_headers,
                 session_affinity_mode: compat_cfg.parsed_session_affinity_mode(),
                 supports_long_cache_retention: compat_cfg
@@ -1331,5 +1334,113 @@ mod tests {
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0]["messages"][0]["content"].is_string());
         assert!(bodies[1]["messages"][0]["content"].is_array());
+    }
+
+    #[tokio::test]
+    async fn forwards_responses_compat_flags_to_request_body() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::response::Response;
+        use axum::routing::post;
+        use futures::StreamExt;
+        use mizar_llm::ToolSchema;
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        let seen_bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let cap = Arc::clone(&seen_bodies);
+        let app_router = Router::new().route(
+            "/responses",
+            post(move |body: axum::Json<serde_json::Value>| {
+                let cap = Arc::clone(&cap);
+                async move {
+                    cap.lock().unwrap().push(body.0);
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r\"}}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app_router).await;
+        });
+
+        let cfg_json = format!(
+            r#"{{
+              "providers": {{
+                "oai-resp": {{
+                  "baseUrl": "http://{addr}",
+                  "api": "openai-responses",
+                  "apiKey": "k-resp",
+                  "compat": {{
+                    "supportsDeveloperRole": true,
+                    "supportsStrictMode": true
+                  }},
+                  "models": [
+                    {{ "id": "m-strict-dev" }},
+                    {{
+                      "id": "m-no-dev-top",
+                      "compat": {{
+                        "supportsDeveloperRole": false,
+                        "supportsStrictMode": false,
+                        "useTopLevelInstructions": true
+                      }}
+                    }}
+                  ]
+                }}
+              }}
+            }}"#
+        );
+        let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
+        let app = Context::new();
+        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        app.plugin(LlmRouter::plugin(), cfg).await.unwrap();
+
+        let llm = app.llm().unwrap();
+        let tool = ToolSchema {
+            name: "ping".into(),
+            description: "ping".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "host": { "type": "string" } },
+                "required": ["host"]
+            }),
+        };
+
+        for model_id in ["m-strict-dev", "m-no-dev-top"] {
+            let mut s = llm
+                .stream(GenerateOptions {
+                    provider: Some("oai-resp".into()),
+                    model: Some(model_id.into()),
+                    messages: vec![Message::system("be crisp"), Message::user("hi")],
+                    tools: vec![tool.clone()],
+                    ..Default::default()
+                })
+                .unwrap();
+            while let Some(chunk) = s.next().await {
+                let _ = chunk.unwrap();
+            }
+        }
+
+        let bodies = seen_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        // 模型 1 继承 provider compat：developer 内联 + strict: true
+        assert!(bodies[0].get("instructions").is_none());
+        assert_eq!(bodies[0]["input"][0]["role"], "developer");
+        assert_eq!(bodies[0]["tools"][0]["strict"], true);
+        assert_eq!(
+            bodies[0]["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+
+        // 模型 2 覆盖 compat：顶层 instructions + strict: false
+        assert_eq!(bodies[1]["instructions"], "be crisp");
+        assert_eq!(bodies[1]["input"][0]["role"], "user");
+        assert_eq!(bodies[1]["tools"][0]["strict"], false);
     }
 }

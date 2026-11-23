@@ -489,11 +489,39 @@ impl Drop for StepGuard {
     }
 }
 
+const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
+
 struct TurnRecoveryState {
     last_overflow_step: Option<usize>,
     overflow_recoveries: usize,
     error_retries: usize,
+    empty_response_retries: usize,
     consecutive_short_cutoffs: usize,
+}
+
+fn parse_tool_arguments(tool_name: &str, raw_arguments: &str) -> Result<Value, String> {
+    if raw_arguments.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    match serde_json::from_str::<Value>(raw_arguments) {
+        Ok(val) if val.is_object() => Ok(val),
+        Ok(val) => {
+            let kind = match val {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            Err(format!(
+                "Invalid arguments for tool '{tool_name}': expected a JSON object, got {kind}. Please retry with a valid JSON object matching the tool schema."
+            ))
+        }
+        Err(err) => Err(format!(
+            "Invalid JSON arguments for tool '{tool_name}': {err}. Please fix the JSON syntax and retry with a valid JSON object."
+        )),
+    }
 }
 
 pub struct AgentLoop {
@@ -728,6 +756,7 @@ impl AgentLoop {
             last_overflow_step: None,
             overflow_recoveries: 0,
             error_retries: 0,
+            empty_response_retries: 0,
             consecutive_short_cutoffs: initial_cutoffs,
         };
         loop {
@@ -979,6 +1008,47 @@ impl AgentLoop {
                             },
                         );
                     }
+                    StreamChunk::ToolCallDelta {
+                        id,
+                        name,
+                        arguments_delta,
+                        ..
+                    } if !arguments_delta.is_empty()
+                        || id.as_deref().is_some_and(|s| !s.is_empty())
+                        || name.as_deref().is_some_and(|s| !s.is_empty()) =>
+                    {
+                        if !first_token_emitted {
+                            first_token_emitted = true;
+                            session.append_trace(SessionTraceEvent::FirstToken { turn, step });
+                            self.ctx.emit(
+                                EVENT_AGENT_STEP_FIRST_TOKEN,
+                                AgentStepFirstTokenEvent {
+                                    session: Arc::clone(&session),
+                                    turn,
+                                    step,
+                                    ts_ms: now_millis(),
+                                },
+                            );
+                        }
+                    }
+                    StreamChunk::BlockEnd {
+                        block: mizar_llm::ContentBlock::ToolCall { .. },
+                        ..
+                    } => {
+                        if !first_token_emitted {
+                            first_token_emitted = true;
+                            session.append_trace(SessionTraceEvent::FirstToken { turn, step });
+                            self.ctx.emit(
+                                EVENT_AGENT_STEP_FIRST_TOKEN,
+                                AgentStepFirstTokenEvent {
+                                    session: Arc::clone(&session),
+                                    turn,
+                                    step,
+                                    ts_ms: now_millis(),
+                                },
+                            );
+                        }
+                    }
                     StreamChunk::Usage { usage } => {
                         self.ctx.emit(
                             EVENT_AGENT_USAGE,
@@ -1012,7 +1082,13 @@ impl AgentLoop {
                         &mut recovery,
                     )
                     .await
+                    || (!cancel.is_cancelled()
+                        && err.code == LlmErrorCode::EmptyResponse
+                        && recovery.empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES)
                 {
+                    if err.code == LlmErrorCode::EmptyResponse {
+                        recovery.empty_response_retries += 1;
+                    }
                     step_guard.finish(
                         StepOutcome::Error {
                             message: "stream error recovered; retrying".to_string(),
@@ -1078,7 +1154,13 @@ impl AgentLoop {
                             &mut recovery,
                         )
                         .await
+                        || (!cancel.is_cancelled()
+                            && err.code == LlmErrorCode::EmptyResponse
+                            && recovery.empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES)
                     {
+                        if err.code == LlmErrorCode::EmptyResponse {
+                            recovery.empty_response_retries += 1;
+                        }
                         let outcome = StepOutcome::Error {
                             message: "request error recovered; retrying".to_string(),
                         };
@@ -1175,6 +1257,32 @@ impl AgentLoop {
                 } else {
                     "model output contained only reasoning without visible text or tool calls"
                 };
+                if self
+                    .try_recover_request_error(
+                        &session,
+                        turn,
+                        step,
+                        &provider,
+                        &model,
+                        &cancel,
+                        AgentRequestErrorKind::StreamError,
+                        detail.to_string(),
+                        &mut recovery,
+                    )
+                    .await
+                    || (!cancel.is_cancelled()
+                        && recovery.empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES)
+                {
+                    recovery.empty_response_retries += 1;
+                    let outcome = StepOutcome::Error {
+                        message: "empty response; retrying".to_string(),
+                    };
+                    last_step_outcome = Some(outcome.clone());
+                    step_guard.finish(outcome, usage);
+                    drop(step_guard);
+                    step = step.saturating_sub(1);
+                    continue;
+                }
                 let err = LlmError::new(LlmErrorCode::EmptyResponse, detail);
                 let msg = err.to_string();
                 step_guard.finish(
@@ -1187,6 +1295,7 @@ impl AgentLoop {
                 return Err(AgentError::Llm(err));
             }
 
+            recovery.empty_response_retries = 0;
             session.append(SessionEvent::Assistant {
                 blocks,
                 replay,
@@ -1283,13 +1392,10 @@ impl AgentLoop {
                     return Err(AgentError::Llm(LlmError::cancelled()));
                 }
 
-                let mut futs = Vec::with_capacity(batch.len());
-                for call in batch {
-                    let args: Value = if call.arguments.trim().is_empty() {
-                        json!({})
-                    } else {
-                        serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}))
-                    };
+                let mut results: Vec<Option<ToolResult>> = vec![None; batch.len()];
+                let mut futs = Vec::new();
+                let mut fut_indices = Vec::new();
+                for (idx, call) in batch.iter().enumerate() {
                     session.append_trace(SessionTraceEvent::ToolCall {
                         turn,
                         step,
@@ -1304,6 +1410,14 @@ impl AgentLoop {
                             call: call.clone(),
                         },
                     );
+                    let args = match parse_tool_arguments(&call.name, &call.arguments) {
+                        Ok(args) => args,
+                        Err(msg) => {
+                            // 畸形工具参数不再吞成 `{}`，直接返回校验错误供模型自我修正重试。
+                            results[idx] = Some(ToolResult::err(msg));
+                            continue;
+                        }
+                    };
                     let update_ctx = self.ctx.clone();
                     let update_session = Arc::clone(&session);
                     let call_id_for_upd = call.id.clone();
@@ -1320,6 +1434,7 @@ impl AgentLoop {
                             },
                         );
                     });
+                    fut_indices.push(idx);
                     futs.push(
                         tools.execute_with(
                             ToolExecution::new(call.name.clone(), args, Some(session.id.clone()))
@@ -1330,11 +1445,18 @@ impl AgentLoop {
                     );
                 }
 
-                let results: Vec<ToolResult> = if futs.len() == 1 {
-                    vec![futs.into_iter().next().unwrap().await]
-                } else {
-                    join_all(futs).await
-                };
+                if futs.len() == 1 {
+                    let idx = fut_indices[0];
+                    results[idx] = Some(futs.into_iter().next().unwrap().await);
+                } else if !futs.is_empty() {
+                    for (idx, res) in fut_indices.into_iter().zip(join_all(futs).await) {
+                        results[idx] = Some(res);
+                    }
+                }
+                let results: Vec<ToolResult> = results
+                    .into_iter()
+                    .map(|r| r.expect("tool result populated"))
+                    .collect();
 
                 for (call, result) in batch.iter().zip(results) {
                     let extra_contexts = result.additional_contexts.clone();
@@ -2199,7 +2321,7 @@ mod tests {
                         index: 0,
                         text: "internal chain of thought only".into(),
                     }));
-                    let reason = if n == 0 {
+                    let reason = if n <= MAX_EMPTY_RESPONSE_RETRIES {
                         FinishReason::Stop
                     } else {
                         FinishReason::MaxTokens
@@ -2720,5 +2842,293 @@ mod tests {
         assert!(recorded[0].1.contains("transient upstream 503"));
 
         app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn emits_first_token_on_tool_call_delta_without_text() {
+        struct ToolFirstTokenAdapter(AtomicUsize);
+        impl LlmAdapter for ToolFirstTokenAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let step = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if step == 0 {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::BlockStart {
+                            index: 0,
+                            kind: mizar_llm::ContentBlockKind::ToolCall,
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::ToolCallDelta {
+                            index: 0,
+                            id: Some("call_ttft".into()),
+                            name: Some("echo".into()),
+                            arguments_delta: "{}".into(),
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::BlockEnd {
+                            index: 0,
+                            block: mizar_llm::ContentBlock::ToolCall {
+                                id: "call_ttft".into(),
+                                name: "echo".into(),
+                                arguments: "{}".into(),
+                            },
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("done")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(ToolFirstTokenAdapter(AtomicUsize::new(0))).await;
+        let _reg = app
+            .tools()
+            .unwrap()
+            .register(ToolDefinition::sync_tool(
+                "echo",
+                "echo",
+                json!({ "type": "object", "properties": {} }),
+                |_, _| Ok::<_, cordis::BoxError>("ok".to_string()),
+            ))
+            .unwrap();
+
+        let first_tokens = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let ft_cap = Arc::clone(&first_tokens);
+        app.on(
+            EVENT_AGENT_STEP_FIRST_TOKEN,
+            move |ev: &AgentStepFirstTokenEvent| {
+                ft_cap.lock().unwrap().push(ev.step);
+            },
+        )
+        .unwrap();
+
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+        let text = agent
+            .run(Arc::clone(&sess), "call tool", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(text, "done");
+        assert_eq!(*first_tokens.lock().unwrap(), vec![1, 2]);
+        let trace_ft: Vec<usize> = sess
+            .all_entries()
+            .into_iter()
+            .filter_map(|e| match e.event {
+                SessionEvent::Trace {
+                    detail: SessionTraceEvent::FirstToken { step, .. },
+                } => Some(step),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trace_ft, vec![1, 2]);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_return_validation_error_without_executing_tool() {
+        struct MalformedArgsAdapter(AtomicUsize);
+        impl LlmAdapter for MalformedArgsAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let step = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    match step {
+                        0 => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                                0,
+                                ToolCall {
+                                    id: "c_bad_syntax".into(),
+                                    name: "write_item".into(),
+                                    arguments: "{\"path\":".into(),
+                                },
+                            )));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                                1,
+                                ToolCall {
+                                    id: "c_non_obj".into(),
+                                    name: "write_item".into(),
+                                    arguments: "[1, 2]".into(),
+                                },
+                            )));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::ToolCalls,
+                                replay: None,
+                            }));
+                        }
+                        1 => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                                0,
+                                ToolCall {
+                                    id: "c_fixed".into(),
+                                    name: "write_item".into(),
+                                    arguments: "{\"path\":\"ok.txt\"}".into(),
+                                },
+                            )));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::ToolCalls,
+                                replay: None,
+                            }));
+                        }
+                        _ => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::text("fixed and completed")));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::Stop,
+                                replay: None,
+                            }));
+                        }
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(MalformedArgsAdapter(AtomicUsize::new(0))).await;
+        let executed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let exec_cap = Arc::clone(&executed);
+        let _reg = app
+            .tools()
+            .unwrap()
+            .register(ToolDefinition::sync_tool(
+                "write_item",
+                "write item",
+                json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+                move |args, _| {
+                    exec_cap.lock().unwrap().push(args);
+                    Ok::<_, cordis::BoxError>("wrote ok.txt".to_string())
+                },
+            ))
+            .unwrap();
+
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+        let text = agent
+            .run(Arc::clone(&sess), "do write", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(text, "fixed and completed");
+
+        // 畸形参数调用绝不能执行底层工具，只有修正后的第三次调用命中 handler
+        let calls = executed.lock().unwrap().clone();
+        assert_eq!(calls, vec![json!({ "path": "ok.txt" })]);
+
+        let tool_results: Vec<(String, String, bool)> = sess
+            .log()
+            .into_iter()
+            .filter_map(|e| match e.event {
+                SessionEvent::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                    ..
+                } => Some((tool_call_id, content, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 3);
+        assert_eq!(tool_results[0].0, "c_bad_syntax");
+        assert!(tool_results[0].2);
+        assert!(tool_results[0].1.contains("Invalid JSON arguments"));
+        assert_eq!(tool_results[1].0, "c_non_obj");
+        assert!(tool_results[1].2);
+        assert!(tool_results[1].1.contains("expected a JSON object"));
+        assert_eq!(tool_results[2].0, "c_fixed");
+        assert!(!tool_results[2].2);
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn retries_reasoning_only_empty_response_with_and_without_retry_plugin() {
+        struct ReasoningThenAnswerAdapter(AtomicUsize);
+        impl LlmAdapter for ReasoningThenAnswerAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if n == 0 {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::ReasoningDelta {
+                            index: 0,
+                            text: "thinking without output".into(),
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("final answer")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        // 1. 未装配 LlmRetryPlugin 时，AgentLoop 内部自动重试并成功
+        let app_no_retry =
+            setup_app_with_adapter(ReasoningThenAnswerAdapter(AtomicUsize::new(0))).await;
+        let sess1 = app_no_retry.sessions().unwrap().create(None);
+        let text1 = app_no_retry
+            .agent_loop()
+            .unwrap()
+            .run(Arc::clone(&sess1), "hi", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(text1, "final answer");
+        app_no_retry.fiber().dispose().await;
+
+        // 2. 模拟 LlmRetryPlugin 对仅推理流返回 Err(EmptyResponse) 时，AgentLoop 同样自动重试并成功
+        struct StreamEmptyErrThenAnswerAdapter(AtomicUsize);
+        impl LlmAdapter for StreamEmptyErrThenAnswerAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if n == 0 {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::ReasoningDelta {
+                            index: 0,
+                            text: "streamed reasoning".into(),
+                        }));
+                        let _ = tx.unbounded_send(Err(LlmError::new(
+                            LlmErrorCode::EmptyResponse,
+                            "model output contained only reasoning without visible text or tool calls",
+                        )));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("recovered answer")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app_stream_err =
+            setup_app_with_adapter(StreamEmptyErrThenAnswerAdapter(AtomicUsize::new(0))).await;
+        let sess2 = app_stream_err.sessions().unwrap().create(None);
+        let text2 = app_stream_err
+            .agent_loop()
+            .unwrap()
+            .run(Arc::clone(&sess2), "hi", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(text2, "recovered answer");
+        app_stream_err.fiber().dispose().await;
     }
 }

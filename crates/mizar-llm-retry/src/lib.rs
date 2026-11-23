@@ -13,8 +13,8 @@ use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, EVENT_LLM_STREAM, FinishReason, GenerateOptions, LlmContextExt, LlmError,
-    LlmErrorCode, LlmRuntime, StreamChunk,
+    BoxChunkStream, ContentBlock, EVENT_LLM_STREAM, FinishReason, GenerateOptions, LlmContextExt,
+    LlmError, LlmErrorCode, LlmRuntime, StreamChunk,
 };
 
 #[derive(Debug, Clone)]
@@ -56,24 +56,45 @@ impl RetryConfig {
     }
 }
 
-fn is_visible_content_chunk(chunk: &StreamChunk) -> bool {
-    matches!(
-        chunk,
-        StreamChunk::TextDelta { .. }
-            | StreamChunk::ReasoningDelta { .. }
-            | StreamChunk::ToolCallDelta { .. }
-            | StreamChunk::BlockEnd { .. }
-    )
+fn is_substantive_content_chunk(chunk: &StreamChunk) -> bool {
+    match chunk {
+        StreamChunk::TextDelta { text, .. } => !text.trim().is_empty(),
+        StreamChunk::ToolCallDelta {
+            id,
+            name,
+            arguments_delta,
+            ..
+        } => {
+            !arguments_delta.is_empty()
+                || id.as_deref().is_some_and(|s| !s.is_empty())
+                || name.as_deref().is_some_and(|s| !s.is_empty())
+        }
+        StreamChunk::BlockEnd { block, .. } => match block {
+            ContentBlock::ToolCall { .. } => true,
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            ContentBlock::Reasoning { .. } => false,
+        },
+        StreamChunk::BlockStart { .. }
+        | StreamChunk::ReasoningDelta { .. }
+        | StreamChunk::Usage { .. }
+        | StreamChunk::Finish { .. } => false,
+    }
+}
+
+fn is_reasoning_delta_chunk(chunk: &StreamChunk) -> bool {
+    matches!(chunk, StreamChunk::ReasoningDelta { text, .. } if !text.is_empty())
 }
 
 enum AttemptState {
     Buffering {
         buffered_non_content: Vec<StreamChunk>,
     },
+    /// 已透传 `ReasoningDelta` 以保住 TTFT，但尚未收到正文或工具调用。
+    StreamingReasoningOnly,
     TerminalFinishBuffered {
         buffered_non_content: Vec<StreamChunk>,
     },
-    StreamingThrough,
+    StreamingSubstantive,
 }
 
 enum AttemptOutcome {
@@ -102,8 +123,9 @@ fn wrap_with_retry(
             while let Some(item) = current_stream.next().await {
                 match item {
                     Ok(chunk) => {
-                        if is_visible_content_chunk(&chunk) {
-                            match std::mem::replace(&mut state, AttemptState::StreamingThrough) {
+                        if is_substantive_content_chunk(&chunk) {
+                            match std::mem::replace(&mut state, AttemptState::StreamingSubstantive)
+                            {
                                 AttemptState::Buffering {
                                     buffered_non_content,
                                 }
@@ -116,7 +138,29 @@ fn wrap_with_retry(
                                         }
                                     }
                                 }
-                                AttemptState::StreamingThrough => {}
+                                AttemptState::StreamingReasoningOnly
+                                | AttemptState::StreamingSubstantive => {}
+                            }
+                            if tx.unbounded_send(Ok(chunk)).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        if matches!(state, AttemptState::Buffering { .. })
+                            && is_reasoning_delta_chunk(&chunk)
+                        {
+                            // 为保住 TTFT，收到推理流增量立即刷出并透传；若最终无实质输出再转 EmptyResponse 交给上层整步重试。
+                            if let AttemptState::Buffering {
+                                buffered_non_content,
+                            } =
+                                std::mem::replace(&mut state, AttemptState::StreamingReasoningOnly)
+                            {
+                                for pending in buffered_non_content {
+                                    if tx.unbounded_send(Ok(pending)).is_err() {
+                                        return;
+                                    }
+                                }
                             }
                             if tx.unbounded_send(Ok(chunk)).is_err() {
                                 return;
@@ -125,9 +169,31 @@ fn wrap_with_retry(
                         }
 
                         match &mut state {
-                            AttemptState::StreamingThrough => {
+                            AttemptState::StreamingSubstantive => {
                                 if tx.unbounded_send(Ok(chunk)).is_err() {
                                     return;
+                                }
+                            }
+                            AttemptState::StreamingReasoningOnly => {
+                                if let StreamChunk::Finish {
+                                    reason: FinishReason::Stop,
+                                    ..
+                                } = chunk
+                                    && cfg.retry_on_empty_response
+                                {
+                                    let _ = tx.unbounded_send(Err(LlmError::new(
+                                        LlmErrorCode::EmptyResponse,
+                                        "model output contained only reasoning without visible text or tool calls",
+                                    )));
+                                    outcome = Some(AttemptOutcome::TerminalErr);
+                                    break;
+                                }
+                                let is_finish = matches!(chunk, StreamChunk::Finish { .. });
+                                if tx.unbounded_send(Ok(chunk)).is_err() {
+                                    return;
+                                }
+                                if is_finish {
+                                    state = AttemptState::StreamingSubstantive;
                                 }
                             }
                             AttemptState::TerminalFinishBuffered {
@@ -198,7 +264,8 @@ fn wrap_with_retry(
                             AttemptState::TerminalFinishBuffered {
                                 buffered_non_content,
                             } => std::mem::take(buffered_non_content),
-                            AttemptState::StreamingThrough => Vec::new(),
+                            AttemptState::StreamingReasoningOnly
+                            | AttemptState::StreamingSubstantive => Vec::new(),
                         };
                         for pending in buffered {
                             if tx.unbounded_send(Ok(pending)).is_err() {
@@ -230,6 +297,17 @@ fn wrap_with_retry(
                         AttemptOutcome::Done
                     }
                 }
+                AttemptState::StreamingReasoningOnly => {
+                    if cfg.retry_on_empty_response {
+                        let _ = tx.unbounded_send(Err(LlmError::new(
+                            LlmErrorCode::EmptyResponse,
+                            "model stream ended with only reasoning without visible text or tool calls",
+                        )));
+                        AttemptOutcome::TerminalErr
+                    } else {
+                        AttemptOutcome::Done
+                    }
+                }
                 AttemptState::TerminalFinishBuffered {
                     buffered_non_content,
                 } => {
@@ -240,7 +318,7 @@ fn wrap_with_retry(
                     }
                     AttemptOutcome::Done
                 }
-                AttemptState::StreamingThrough => AttemptOutcome::Done,
+                AttemptState::StreamingSubstantive => AttemptOutcome::Done,
             });
 
             match resolved {
@@ -449,5 +527,142 @@ mod tests {
             chunks[1].as_ref().unwrap_err().code,
             LlmErrorCode::RateLimit
         );
+    }
+
+    #[tokio::test]
+    async fn retries_buffered_reasoning_only_stop_and_flags_streamed_reasoning_only() {
+        struct BufferedReasoningOnlyAdapter(Arc<AtomicUsize>);
+        impl LlmAdapter for BufferedReasoningOnlyAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                if n == 0 {
+                    // 无 ReasoningDelta，仅 BlockEnd(Reasoning) + Stop -> 仍在 Buffering，直接内部无感重试
+                    let _ = tx.unbounded_send(Ok(StreamChunk::BlockEnd {
+                        index: 0,
+                        block: ContentBlock::Reasoning {
+                            text: "silent thought".into(),
+                        },
+                    }));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                } else {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text("ok after retry")));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                }
+                Box::pin(rx)
+            }
+        }
+
+        struct StreamedReasoningOnlyAdapter {
+            finish_reason: FinishReason,
+        }
+        impl LlmAdapter for StreamedReasoningOnlyAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let (tx, rx) = mpsc::unbounded();
+                let _ = tx.unbounded_send(Ok(StreamChunk::ReasoningDelta {
+                    index: 0,
+                    text: "streaming thought".into(),
+                }));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: self.finish_reason.clone(),
+                    replay: None,
+                }));
+                Box::pin(rx)
+            }
+        }
+
+        let app = Context::new();
+        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        app.plugin(
+            LlmRetryPlugin,
+            RetryConfig {
+                max_retries: 2,
+                initial_delay: Duration::from_millis(5),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let llm = app.llm().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let _r1 = llm
+            .register_adapter(
+                "buf-reasoning",
+                Arc::new(BufferedReasoningOnlyAdapter(Arc::clone(&attempts))),
+            )
+            .unwrap();
+        let mut s1 = llm
+            .stream(GenerateOptions {
+                provider: Some("buf-reasoning".into()),
+                messages: vec![Message::user("q")],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut asm = BlockAssembler::new();
+        while let Some(item) = s1.next().await {
+            asm.push(item.unwrap());
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(asm.text(), "ok after retry");
+
+        // 已透传 ReasoningDelta 后遇到 Stop：保持 ReasoningDelta 立即透传并在末尾转为 Err(EmptyResponse)
+        let _r2 = llm
+            .register_adapter(
+                "stream-reasoning-stop",
+                Arc::new(StreamedReasoningOnlyAdapter {
+                    finish_reason: FinishReason::Stop,
+                }),
+            )
+            .unwrap();
+        let mut s2 = llm
+            .stream(GenerateOptions {
+                provider: Some("stream-reasoning-stop".into()),
+                messages: vec![Message::user("q")],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut s2_chunks = Vec::new();
+        while let Some(item) = s2.next().await {
+            s2_chunks.push(item);
+        }
+        assert_eq!(s2_chunks.len(), 2);
+        assert!(matches!(
+            s2_chunks[0],
+            Ok(StreamChunk::ReasoningDelta { .. })
+        ));
+        assert_eq!(
+            s2_chunks[1].as_ref().unwrap_err().code,
+            LlmErrorCode::EmptyResponse
+        );
+
+        // 已透传 ReasoningDelta 后遇到 MaxTokens：原样保留 MaxTokens，不转 EmptyResponse
+        let _r3 = llm
+            .register_adapter(
+                "stream-reasoning-max",
+                Arc::new(StreamedReasoningOnlyAdapter {
+                    finish_reason: FinishReason::MaxTokens,
+                }),
+            )
+            .unwrap();
+        let mut s3 = llm
+            .stream(GenerateOptions {
+                provider: Some("stream-reasoning-max".into()),
+                messages: vec![Message::user("q")],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut asm3 = BlockAssembler::new();
+        while let Some(item) = s3.next().await {
+            asm3.push(item.unwrap());
+        }
+        assert_eq!(asm3.reasoning(), "streaming thought");
+        assert_eq!(asm3.finish(), FinishReason::MaxTokens);
     }
 }
