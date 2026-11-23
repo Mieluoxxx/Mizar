@@ -128,7 +128,7 @@ impl CompactionRuntime {
         let system_prompt = self
             .ctx
             .system_prompt()
-            .map(|sp| sp.build())
+            .map(|sp| sp.build_for_session(Some(session_id)))
             .unwrap_or_default();
         let tools = self
             .ctx

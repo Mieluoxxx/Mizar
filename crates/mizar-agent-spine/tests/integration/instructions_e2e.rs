@@ -192,7 +192,28 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
     {
         let steps = seen1.lock().unwrap();
         assert_eq!(steps.len(), 2);
-        let step0 = steps[0].join("\n");
+        let step0_msgs = &steps[0];
+        let pos_env = step0_msgs
+            .iter()
+            .position(|m| m.contains("<environment_context>"))
+            .expect("missing <environment_context>");
+        let pos_instr = step0_msgs
+            .iter()
+            .position(|m| m.contains("GLOBAL_MIZAR_RULE"))
+            .expect("missing GLOBAL_MIZAR_RULE");
+        let pos_skill = step0_msgs
+            .iter()
+            .position(|m| m.contains("DEPLOY_SKILL_BODY"))
+            .expect("missing DEPLOY_SKILL_BODY");
+        let pos_user = step0_msgs
+            .iter()
+            .position(|m| m.contains("/deploy 请读取 sub/target.txt"))
+            .expect("missing user message");
+        assert!(
+            pos_env < pos_instr && pos_instr < pos_skill && pos_skill < pos_user,
+            "unexpected Turn-0 ContextNotice ordering: env={pos_env}, instr={pos_instr}, skill={pos_skill}, user={pos_user}, msgs={step0_msgs:?}"
+        );
+        let step0 = step0_msgs.join("\n");
         assert!(step0.contains("GLOBAL_MIZAR_RULE"), "step0:\n{step0}");
         assert!(step0.contains("WS_AGENTS_RULE"), "step0:\n{step0}");
         assert!(step0.contains("WS_CLAUDE_RULE"), "step0:\n{step0}");

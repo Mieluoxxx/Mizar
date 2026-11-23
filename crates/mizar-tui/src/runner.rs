@@ -195,7 +195,7 @@ impl Drop for LoggerRestoreGuard {
     }
 }
 
-/// 将交互式 TUI 回复视觉语法提示段挂载到系统提示词注册表。
+/// 将交互式 TUI 回复视觉语法提示段挂载到系统提示词注册表（`order = 60`，子代理会话自动跳过）。
 pub fn mount_reply_guidance_section(
     ctx: &Context,
     emphasis: &EmphasisConfig,
@@ -206,11 +206,21 @@ pub fn mount_reply_guidance_section(
     if !(emphasis.enabled && emphasis.guidance) {
         return Ok(None);
     }
+    let sessions = ctx.get::<mizar_session::SessionStore>("sessions");
     let prompt = reply_guidance_prompt();
-    Ok(Some(sp.section(PromptSection::new(
+    Ok(Some(sp.section(PromptSection::new_for_session(
         "tui_reply_guidance",
-        95,
-        move || Some(prompt.clone()),
+        60,
+        move |session_id| {
+            if let (Some(sid), Some(store)) = (session_id, sessions.as_ref())
+                && store
+                    .get(sid)
+                    .is_some_and(|s| s.header().is_subagent_child())
+            {
+                return None;
+            }
+            Some(prompt.clone())
+        },
     ))))
 }
 
@@ -1651,6 +1661,30 @@ mod tests {
 
         plugin_fiber.dispose().await;
         assert!(!sp.build().contains("These rules shape replies"));
+
+        // 3. 子代理会话调用 build_for_session 时，不得收到 TUI 回复样式引导
+        use mizar_session::SessionContextExt;
+        ctx.plugin(mizar_session::SessionStore::plugin(), ())
+            .await
+            .unwrap();
+        let sessions = ctx.sessions().unwrap();
+        let root_sess = sessions.create(Some("tui-root".into()));
+        let child_sess = sessions.create_with(mizar_session::SessionCreateOptions {
+            id: Some("tui-child".into()),
+            parent_id: Some(root_sess.id.clone()),
+            origin: Some(mizar_session::SessionOrigin::Subagent),
+            ..Default::default()
+        });
+        let plugin_fiber2 = ctx.plugin(TuiEmphasisPlugin, enabled_cfg).await.unwrap();
+        assert!(
+            sp.build_for_session(Some(&root_sess.id))
+                .contains("These rules shape replies")
+        );
+        assert!(
+            !sp.build_for_session(Some(&child_sess.id))
+                .contains("These rules shape replies")
+        );
+        plugin_fiber2.dispose().await;
 
         ctx.fiber().dispose().await;
     }

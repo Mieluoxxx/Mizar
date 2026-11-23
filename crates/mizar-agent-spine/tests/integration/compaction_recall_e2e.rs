@@ -137,7 +137,7 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
 
     // 2. 首步 pre-step 应注入 AGENTS.md
     session.append(SessionEvent::user("早期关键约束：暗号为 星尘压缩密钥_2026"));
-    let _ = app
+    if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
             AgentPreStepInput {
@@ -153,7 +153,12 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
                 Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
-        .await;
+        .await
+    {
+        for item in inputs {
+            session.append(item.into_session_event());
+        }
+    }
     assert!(
         session
             .visible_log()
@@ -193,7 +198,7 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
     );
 
     // 4. 压后下一步 pre-step：mizar-instructions 应立即重注 AGENTS.md
-    let _ = app
+    if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
             AgentPreStepInput {
@@ -209,7 +214,12 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
                 Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
-        .await;
+        .await
+    {
+        for item in inputs {
+            session.append(item.into_session_event());
+        }
+    }
     assert!(
         session
             .visible_log()

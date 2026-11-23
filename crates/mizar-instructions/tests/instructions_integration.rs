@@ -30,7 +30,7 @@ impl Drop for DirGuard {
 }
 
 async fn emit_pre_step(ctx: &Context, session: &Arc<mizar_session::Session>, step: usize) {
-    let _ = ctx
+    if let AgentPreStepDecision::Enter { inputs } = ctx
         .waterfall(
             EVENT_AGENT_PRE_STEP,
             AgentPreStepInput {
@@ -46,7 +46,12 @@ async fn emit_pre_step(ctx: &Context, session: &Arc<mizar_session::Session>, ste
                 Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
-        .await;
+        .await
+    {
+        for item in inputs {
+            session.append(item.into_session_event());
+        }
+    }
 }
 
 #[tokio::test]

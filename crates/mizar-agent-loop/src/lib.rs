@@ -837,7 +837,7 @@ impl AgentLoop {
                 },
             );
 
-            let prompt_text = system_prompt.build();
+            let prompt_text = system_prompt.build_for_session(Some(&session.id));
             let tool_list = tools.list_declared(Some(&session.id));
             let system_prompt_chars = prompt_text.chars().count();
             let tools_count = tool_list.len();

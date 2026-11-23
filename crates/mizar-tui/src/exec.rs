@@ -18,6 +18,8 @@ use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
     load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
 };
+use mizar_client::{FileMentionsConfig, FileMentionsPlugin};
+use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
 use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
@@ -677,13 +679,6 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     }
     // 一次性无头 exec 由 codemode 承担确定性并行与上下文减负，关闭异步交互分身插件
     disable_exec_subagent(&mut spine_cfg);
-    if !spine_cfg
-        .disabled_plugins
-        .iter()
-        .any(|id| id == "session-title")
-    {
-        spine_cfg.disabled_plugins.push("session-title".to_string());
-    }
     if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.session_db.is_none()) {
         spine_cfg.session_db_path = None;
     }
@@ -746,6 +741,8 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
     let active_provider = resolved_llm.active_provider.clone();
     let active_model = resolved_llm.active_model.clone();
+    let ext_flags = HostExtensionFlags::from_disabled_plugins(&spine_cfg.disabled_plugins);
+    let restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
 
     let app = Context::new();
     configure_exec_logger(&app, Arc::clone(&log_secrets));
@@ -753,6 +750,27 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     app.plugin(AgentSpinePlugin, spine_cfg);
     app.plugin(LlmRetryPlugin, RetryConfig::default());
     app.plugin(LlmRouter::plugin(), resolved_llm.router);
+    let mention_fiber = if ext_flags.file_mentions {
+        let mention_logger = app.logger_named("mentions");
+        Some(app.plugin(
+            FileMentionsPlugin,
+            FileMentionsConfig::with_callback(
+                cfg.workspace.clone(),
+                restrict_to_workspace,
+                move |ev| {
+                    if let ClientEvent::Notice { level, text } = ev {
+                        match level {
+                            NoticeLevel::Error => mention_logger.error(text),
+                            NoticeLevel::Warn => mention_logger.warn(text),
+                            NoticeLevel::Info => mention_logger.info(text),
+                        }
+                    }
+                },
+            ),
+        ))
+    } else {
+        None
+    };
 
     let cancel = CancellationToken::new();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -774,6 +792,9 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
             wait_for_services(&app).await.map_err(|e| e.to_string())?;
+            if let Some(f) = mention_fiber {
+                f.wait_settled().await.map_err(|e| e.to_string())?;
+            }
             if has_session_db && app.session_persistence().is_none() {
                 for _ in 0..25 {
                     if app.session_persistence().is_some() {
@@ -1421,8 +1442,9 @@ mod tests {
     }
 
     #[test]
-    fn exec_mode_disables_subagent_in_favor_of_codemode() {
+    fn exec_mode_disables_subagent_and_leaves_session_title_off() {
         let mut spine = AgentSpineConfig::coding(PathBuf::from("/tmp"));
+        assert!(spine.session_title.is_none());
         assert!(spine.subagent.is_some());
         disable_exec_subagent(&mut spine);
         assert!(spine.subagent.is_none());

@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use guardrails::{
     ActiveChildrenMap, ActivityTrackersMap, check_pre_execute, format_tool_activity_label,
+    is_subagent_child_session,
 };
 use tasks::{BackgroundTaskRegistry, ChildActivityTracker};
 pub use tasks::{
@@ -458,13 +459,23 @@ impl Service for SubagentRuntime {
                 Ok::<_, mizar_tools::ToolError>(Some(tools_reg.register(def)?))
             })?;
 
-            // 4. 向系统提示词注入精简静态分流契约（KV Cache 前缀 100% 稳定，禁止无意义轮询等待）
+            // 4. 向系统提示词注入精简静态分流契约（order = 60，子代理自身零感知且 KV Cache 前缀 100% 稳定）
             let sp = Arc::clone(&system_prompt);
+            let active_prompt = Arc::clone(&self.active_children);
+            let sessions_prompt = Arc::clone(&sessions);
             ctx.effect("subagent.prompt-guidance", move || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
+                let active_children = Arc::clone(&active_prompt);
+                let sessions = Arc::clone(&sessions_prompt);
+                Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
                     "subagent",
-                    45,
-                    || {
+                    60,
+                    move |session_id| {
+                        if let Some(sid) = session_id
+                            && (active_children.lock().unwrap().contains_key(sid)
+                                || is_subagent_child_session(&sessions, sid))
+                        {
+                            return None;
+                        }
                         Some(
                             "Subagent delegation (`subagent` tool, only when available):\n\
 - Balance responsiveness and efficiency: handle quick 1-3 step lookups directly, and delegate heavy, multi-file, log-heavy, or parallel tasks to background subagents (`action: \"spawn\"`, default) so you stay responsive to the user immediately.\n\

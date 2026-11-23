@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxFuture, Context, CordisError, Next, Service};
-use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
+use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput};
 use mizar_session::{Session, SessionEvent};
 use mizar_tools::{EVENT_TOOLS_RESULT, ToolResultEvent};
 use serde_json::Value;
@@ -34,7 +34,7 @@ struct TrackedFile {
 #[derive(Debug, Default)]
 struct SessionInstructionState {
     baseline_checked: bool,
-    baseline_seq: Option<u64>,
+    baseline_text: Option<String>,
     baseline_identity: String,
     represented: HashMap<ScopeKey, TrackedFile>,
     omitted: HashSet<ScopeKey>,
@@ -225,15 +225,15 @@ impl AgentInstructions {
         ctx: &Context,
         session: &Arc<Session>,
         cancel: &CancellationToken,
-    ) {
+    ) -> Option<TurnInput> {
         if !self.config.enabled || self.config.max_bytes == 0 || cancel.is_cancelled() {
-            return;
+            return None;
         }
 
         let sid = session.id.clone();
         let (
             mem_baseline_checked,
-            mem_baseline_seq,
+            mem_baseline_text,
             mem_identity,
             pending_subdirs,
             known_subdirs,
@@ -243,7 +243,7 @@ impl AgentInstructions {
             match guard.get(&sid) {
                 Some(st) => (
                     st.baseline_checked,
-                    st.baseline_seq,
+                    st.baseline_text.clone(),
                     st.baseline_identity.clone(),
                     st.pending_subdirs.clone(),
                     st.known_subdirs.clone(),
@@ -269,10 +269,13 @@ impl AgentInstructions {
                     .collect()
             });
 
-        let baseline_visible = mem_baseline_seq
-            .is_some_and(|seq| visible_instruction_notices.iter().any(|(s, _)| *s == seq));
+        let baseline_visible = mem_baseline_text.as_ref().is_some_and(|bt| {
+            visible_instruction_notices
+                .iter()
+                .any(|(_, text)| text == bt)
+        });
 
-        if !mem_baseline_checked || (mem_baseline_seq.is_some() && !baseline_visible) {
+        if !mem_baseline_checked || (mem_baseline_text.is_some() && !baseline_visible) {
             let mut merged_subdirs = known_subdirs;
             for sub in pending_subdirs {
                 if !merged_subdirs.contains(&sub) {
@@ -291,27 +294,25 @@ impl AgentInstructions {
             let watched = self.collect_watched_paths(&merged_subdirs);
 
             // 若刚从持久化恢复（内存态为空但日志里已存在相同基线），无需重复追加
-            let hydrated_seq = if mem_baseline_seq.is_none() {
+            let hydrated_text = if mem_baseline_text.is_none() {
                 rendered.as_ref().and_then(|r| {
                     visible_instruction_notices
                         .iter()
                         .rfind(|(_, text)| *text == r.text)
-                        .map(|(seq, _)| *seq)
+                        .map(|(_, t)| t.clone())
                 })
             } else {
                 None
             };
-            let already_hydrated = hydrated_seq.is_some();
+            let already_hydrated = hydrated_text.is_some();
 
-            let mut emitted_seq = hydrated_seq;
+            let mut emitted_baseline_text = hydrated_text;
+            let mut emitted_notice: Option<String> = None;
 
             if !already_hydrated {
                 if let Some(ref r) = rendered {
-                    session.append(SessionEvent::context_notice(
-                        AGENT_INSTRUCTIONS_SOURCE,
-                        &r.text,
-                    ));
-                    emitted_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
+                    emitted_notice = Some(r.text.clone());
+                    emitted_baseline_text = Some(r.text.clone());
                 } else if !visible_instruction_notices.is_empty() {
                     // 以前加载过指令，现在文件全被删空且恢复后身份发生变化，发送清理通知
                     let items: Vec<DeltaItem> = {
@@ -333,18 +334,13 @@ impl AgentInstructions {
                             .unwrap_or_default()
                     };
                     if let Some(delta_text) = render_delta_message(&items, self.config.max_bytes) {
-                        session.append(SessionEvent::context_notice(
-                            AGENT_INSTRUCTIONS_SOURCE,
-                            delta_text,
-                        ));
-                        emitted_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
-                    } else if mem_baseline_seq.is_none() {
+                        emitted_notice = Some(delta_text.clone());
+                        emitted_baseline_text = Some(delta_text);
+                    } else if mem_baseline_text.is_none() {
                         // 离线恢复时此前有基线，但本地指令文件已全部删除
-                        session.append(SessionEvent::context_notice(
-                            AGENT_INSTRUCTIONS_SOURCE,
-                            "<system-reminder>\nInstructions removed: previously loaded instruction files are no longer present.\n</system-reminder>",
-                        ));
-                        emitted_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
+                        let msg = "<system-reminder>\nInstructions removed: previously loaded instruction files are no longer present.\n</system-reminder>".to_string();
+                        emitted_notice = Some(msg.clone());
+                        emitted_baseline_text = Some(msg);
                     }
                 }
             }
@@ -385,7 +381,7 @@ impl AgentInstructions {
             let mut guard = self.sessions.lock().unwrap();
             let st = guard.entry(sid).or_default();
             st.baseline_checked = true;
-            st.baseline_seq = emitted_seq;
+            st.baseline_text = emitted_baseline_text;
             st.baseline_identity = identity;
             st.represented = next_rep;
             st.omitted = next_omitted;
@@ -400,12 +396,12 @@ impl AgentInstructions {
                 scopes: statuses,
                 warnings: disc.warnings,
             };
-            return;
+            return emitted_notice.map(|text| TurnInput::notice(AGENT_INSTRUCTIONS_SOURCE, text));
         }
 
         // 快速路径：无待扫子目录且任何探测文件元数据都未变化
         if pending_subdirs.is_empty() && !watched_empty_or_changed {
-            return;
+            return None;
         }
 
         let mut merged_subdirs = known_subdirs;
@@ -422,16 +418,13 @@ impl AgentInstructions {
 
         if identity != mem_identity {
             // 极少见：workspace root/配置发生变化，重新生成完整基线
+            let mut emitted_notice: Option<String> = None;
             if let Some(r) = render_baseline_message(
                 &disc.global_files,
                 &disc.project_files,
                 self.config.max_bytes,
             ) {
-                session.append(SessionEvent::context_notice(
-                    AGENT_INSTRUCTIONS_SOURCE,
-                    &r.text,
-                ));
-                let new_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
+                emitted_notice = Some(r.text.clone());
                 let mut next_rep = HashMap::new();
                 let mut next_omitted = HashSet::new();
                 let mut next_truncated = HashSet::new();
@@ -463,7 +456,7 @@ impl AgentInstructions {
                 let mut guard = self.sessions.lock().unwrap();
                 let st = guard.entry(sid).or_default();
                 st.baseline_checked = true;
-                st.baseline_seq = new_seq;
+                st.baseline_text = Some(r.text);
                 st.baseline_identity = identity;
                 st.represented = next_rep;
                 st.omitted = next_omitted;
@@ -479,7 +472,7 @@ impl AgentInstructions {
                     warnings: disc.warnings,
                 };
             }
-            return;
+            return emitted_notice.map(|text| TurnInput::notice(AGENT_INSTRUCTIONS_SOURCE, text));
         }
 
         // 计算与上一次已加载集合的增量 diff
@@ -498,7 +491,7 @@ impl AgentInstructions {
                 st.represented.clone(),
                 st.omitted.clone(),
                 st.truncated.clone(),
-                st.baseline_seq.is_some(),
+                st.baseline_text.is_some(),
             )
         };
 
@@ -560,14 +553,7 @@ impl AgentInstructions {
         }
 
         let rendered_delta = render_delta_message_detailed(&delta_items, self.config.max_bytes);
-        let mut emitted_delta_seq = None;
-        if let Some(ref d) = rendered_delta {
-            session.append(SessionEvent::context_notice(
-                AGENT_INSTRUCTIONS_SOURCE,
-                &d.text,
-            ));
-            emitted_delta_seq = session.with_visible_entries(|e| e.last().map(|x| x.seq));
-        }
+        let emitted_notice = rendered_delta.as_ref().map(|d| d.text.clone());
 
         let mut next_rep = HashMap::new();
         let mut next_omitted = HashSet::new();
@@ -623,8 +609,8 @@ impl AgentInstructions {
 
         let mut guard = self.sessions.lock().unwrap();
         let st = guard.entry(sid).or_default();
-        if !had_baseline && emitted_delta_seq.is_some() {
-            st.baseline_seq = emitted_delta_seq;
+        if !had_baseline && let Some(ref text) = emitted_notice {
+            st.baseline_text = Some(text.clone());
         }
         st.represented = next_rep;
         st.omitted = next_omitted;
@@ -639,6 +625,7 @@ impl AgentInstructions {
             scopes: next_statuses,
             warnings: disc.warnings,
         };
+        emitted_notice.map(|text| TurnInput::notice(AGENT_INSTRUCTIONS_SOURCE, text))
     }
 }
 
@@ -691,13 +678,19 @@ impl Service for AgentInstructions {
                                 reason: "cancelled".to_string(),
                             };
                         }
-                        let decision = next.call(input).await;
-                        if matches!(decision, AgentPreStepDecision::Enter { .. })
-                            && !cancel.is_cancelled()
+                        let AgentPreStepDecision::Enter { mut inputs } = next.call(input).await
+                        else {
+                            return AgentPreStepDecision::Reject {
+                                reason: "rejected".to_string(),
+                            };
+                        };
+                        if !cancel.is_cancelled()
+                            && let Some(notice) =
+                                svc.reconcile_pre_step(&ctx_inner, &session, &cancel)
                         {
-                            svc.reconcile_pre_step(&ctx_inner, &session, &cancel);
+                            inputs.insert(0, notice);
                         }
-                        decision
+                        AgentPreStepDecision::Enter { inputs }
                     }) as BoxFuture<'static, AgentPreStepDecision>
                 },
             )?;
