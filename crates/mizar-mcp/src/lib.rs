@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Logger, Service};
+use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Service};
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head, write_temp_output,
 };
@@ -137,10 +137,6 @@ pub struct McpManager {
 }
 
 impl McpManager {
-    fn logger(&self) -> Logger {
-        self.ctx.logger_named("mcp")
-    }
-
     fn is_closing_or_closed(&self) -> bool {
         self.phase.lock().unwrap().is_closing_or_closed() || self.connect_cancel.is_cancelled()
     }
@@ -281,7 +277,7 @@ impl McpManager {
             };
             let loaded = load_mcp_config_with_global(&self.config.workspace, global_dir.as_deref());
             for err in loaded.errors {
-                self.logger().warn(err);
+                tracing::warn!(target: "mizar::mcp", "{err}");
             }
             for entry in loaded.entries {
                 entries_map.insert(entry.name.clone(), entry);
@@ -343,8 +339,7 @@ impl McpManager {
                     if mgr.is_closing_or_closed() {
                         return;
                     }
-                    mgr.logger()
-                        .warn(format!("MCP server `{}` failed: {err}", entry.name));
+                    tracing::warn!(target: "mizar::mcp", "MCP server `{}` failed: {err}", entry.name);
                     if let Some(st) = mgr.statuses.lock().unwrap().get_mut(&entry.name) {
                         st.state = McpConnectionState::Failed(err);
                     }
@@ -353,8 +348,7 @@ impl McpManager {
         }
         while let Some(res) = join_set.join_next().await {
             if let Err(err) = res {
-                self.logger()
-                    .warn(format!("MCP connect task failed: {err}"));
+                tracing::warn!(target: "mizar::mcp", "MCP connect task failed: {err}");
             }
         }
 
@@ -373,15 +367,9 @@ impl McpManager {
     async fn connect_one(&self, entry: LoadedMcpEntry) -> Result<(), String> {
         let cancel = self.connect_cancel.clone();
         let client = Arc::new(
-            McpClient::connect(
-                &entry.name,
-                &entry.config,
-                &self.config.workspace,
-                self.logger(),
-                &cancel,
-            )
-            .await
-            .map_err(|e| e.to_string())?,
+            McpClient::connect(&entry.name, &entry.config, &self.config.workspace, &cancel)
+                .await
+                .map_err(|e| e.to_string())?,
         );
 
         let remote_tools = match client.list_all_tools(&cancel).await {
@@ -443,8 +431,7 @@ impl McpManager {
                     registered_tools.push((full_name, exposure));
                 }
                 Err(err) => {
-                    self.logger()
-                        .warn(format!("skipping MCP tool `{full_name}`: {err}"));
+                    tracing::warn!(target: "mizar::mcp", "skipping MCP tool `{full_name}`: {err}");
                 }
             }
         }

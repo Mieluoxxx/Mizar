@@ -426,20 +426,19 @@ impl SpinePlugins {
         let available_ids: HashSet<&str> = specs.iter().map(|(m, _)| m.id.as_str()).collect();
         let mut disabled_set: HashSet<String> = HashSet::new();
         let mut startup_errors = Vec::new();
-        let logger = ctx.logger_named("spine-plugins");
 
         for id in normalized_disabled {
             if is_protected_module_id(&id) {
                 let msg =
                     format!("核心受保护模块 `{id}` 禁止禁用，已忽略 disabledPlugins 中的屏蔽项");
-                logger.warn(msg.clone());
+                tracing::warn!(target: "mizar::spine-plugins", "{msg}");
                 startup_errors.push(msg);
             } else if available_ids.contains(id.as_str()) {
                 disabled_set.insert(id);
             } else if !is_known_optional_id(&id) && !KNOWN_HOST_EXTENSION_IDS.contains(&id.as_str())
             {
                 let msg = format!("未知内置模块 `{id}`，已忽略 disabledPlugins 中的配置");
-                logger.warn(msg.clone());
+                tracing::warn!(target: "mizar::spine-plugins", "{msg}");
                 startup_errors.push(msg);
             }
         }
@@ -664,7 +663,6 @@ mod tests {
     #[tokio::test]
     async fn core_modules_are_protected_under_minimal_features() {
         let app = Context::new();
-        app.logger().set_silent();
 
         let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins([
             "llm",
@@ -725,7 +723,6 @@ mod tests {
     #[tokio::test]
     async fn known_host_extension_ids_are_skipped_without_startup_errors() {
         let app = Context::new();
-        app.logger().set_silent();
 
         let mut disabled: Vec<&str> = KNOWN_HOST_EXTENSION_IDS.to_vec();
         disabled.push("still-unknown-id");
@@ -753,7 +750,6 @@ mod tests {
     #[tokio::test]
     async fn coding_mode_toggles_tools_coding_with_tools_guide_and_tool_search() {
         let app = Context::new();
-        app.logger().set_silent();
 
         let ws =
             std::env::temp_dir().join(format!("mizar_spine_coding_toggle_{}", std::process::id()));

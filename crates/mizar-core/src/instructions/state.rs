@@ -253,13 +253,9 @@ impl AgentInstructions {
         }
     }
 
-    fn log_warnings(ctx: &Context, warnings: &[String]) {
-        if warnings.is_empty() {
-            return;
-        }
-        let logger = ctx.logger_named("instructions");
+    fn log_warnings(warnings: &[String]) {
         for w in warnings {
-            logger.warn(w.clone());
+            tracing::warn!(target: "mizar::instructions", "{w}");
         }
     }
 
@@ -294,7 +290,6 @@ impl AgentInstructions {
     #[allow(clippy::too_many_arguments)]
     fn apply_baseline_result(
         &self,
-        ctx: &Context,
         session: &Session,
         sid: String,
         mem_baseline_text: Option<Arc<str>>,
@@ -303,7 +298,7 @@ impl AgentInstructions {
         disc: crate::instructions::files::DiscoveryResult,
         watched: HashMap<PathBuf, Option<FsFingerprint>>,
     ) -> Option<TurnInput> {
-        Self::log_warnings(ctx, &disc.warnings);
+        Self::log_warnings(&disc.warnings);
         let identity = self.compute_baseline_identity(&disc.project_root);
         let rendered = render_baseline_message(
             &disc.global_files,
@@ -431,14 +426,13 @@ impl AgentInstructions {
 
     fn apply_delta_result(
         &self,
-        ctx: &Context,
         sid: String,
         mem_identity: &str,
         merged_subdirs: Vec<PathBuf>,
         disc: crate::instructions::files::DiscoveryResult,
         watched: HashMap<PathBuf, Option<FsFingerprint>>,
     ) -> Option<TurnInput> {
-        Self::log_warnings(ctx, &disc.warnings);
+        Self::log_warnings(&disc.warnings);
         let identity = self.compute_baseline_identity(&disc.project_root);
 
         if identity != mem_identity {
@@ -658,7 +652,7 @@ impl AgentInstructions {
 
     pub async fn reconcile_pre_step_async(
         self: &Arc<Self>,
-        ctx: &Context,
+        _ctx: &Context,
         session: &Arc<Session>,
         cancel: &CancellationToken,
     ) -> Option<TurnInput> {
@@ -725,7 +719,6 @@ impl AgentInstructions {
             })
             .await;
             return self.apply_baseline_result(
-                ctx,
                 session,
                 sid,
                 mem_baseline_text,
@@ -762,12 +755,12 @@ impl AgentInstructions {
             (disc, watched)
         })
         .await;
-        self.apply_delta_result(ctx, sid, &mem_identity, merged_subdirs, disc, watched)
+        self.apply_delta_result(sid, &mem_identity, merged_subdirs, disc, watched)
     }
 
     pub fn reconcile_pre_step(
         &self,
-        ctx: &Context,
+        _ctx: &Context,
         session: &Arc<Session>,
         cancel: &CancellationToken,
     ) -> Option<TurnInput> {
@@ -827,7 +820,6 @@ impl AgentInstructions {
             let disc = discover_instructions(&self.config, &merged_subdirs);
             let watched = self.collect_watched_paths(&merged_subdirs);
             return self.apply_baseline_result(
-                ctx,
                 session,
                 sid,
                 mem_baseline_text,
@@ -854,7 +846,7 @@ impl AgentInstructions {
         }
         let disc = discover_instructions(&self.config, &merged_subdirs);
         let watched = self.collect_watched_paths(&merged_subdirs);
-        self.apply_delta_result(ctx, sid, &mem_identity, merged_subdirs, disc, watched)
+        self.apply_delta_result(sid, &mem_identity, merged_subdirs, disc, watched)
     }
 }
 

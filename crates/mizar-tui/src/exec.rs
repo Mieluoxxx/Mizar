@@ -12,8 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cordis::{Context, LogLevel, Service};
-use mizar_client::{FileMentionsConfig, FileMentionsPlugin};
+use cordis::{Context, Service};
+use mizar_client::{
+    FileMentionsConfig, FileMentionsPlugin, TracingBridgeGuard, env_log_level_override,
+    install_tracing_handler, ui_log_level_tag,
+};
 use mizar_core::agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
 use mizar_core::spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
@@ -29,7 +32,7 @@ use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
 use mizar_mcp::McpManager;
 use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
 use mizar_tools::coding::CodingToolsPreset;
-use mizar_types::client::{ClientEvent, HostExtensionFlags, NoticeLevel};
+use mizar_types::client::{ClientEvent, HostExtensionFlags, NoticeLevel, UiLogLevel};
 use tokio_util::sync::CancellationToken;
 
 use crate::runner::{ResumeTarget, wait_for_services};
@@ -452,15 +455,13 @@ pub fn format_llm_error_diagnostic(err: &LlmError, secrets: &[String]) -> String
     }
 }
 
-fn configure_exec_logger(app: &Context, secrets: Arc<Mutex<Vec<String>>>) {
-    app.logger().set_level(LogLevel::Warn);
-    app.logger().set_handler(move |rec| {
-        if matches!(rec.level, LogLevel::Warn | LogLevel::Error) {
-            let current_secrets = secrets.lock().unwrap().clone();
-            let clean = single_line(&sanitize_diagnostic_text(&rec.message, &current_secrets));
-            eprintln!("[{} {}] {}", rec.tag, rec.name, clean);
-        }
-    });
+fn configure_exec_logger(secrets: Arc<Mutex<Vec<String>>>) -> TracingBridgeGuard {
+    let threshold = env_log_level_override().unwrap_or(UiLogLevel::Warn);
+    install_tracing_handler(threshold, move |rec| {
+        let current_secrets = secrets.lock().unwrap().clone();
+        let clean = single_line(&sanitize_diagnostic_text(&rec.message, &current_secrets));
+        eprintln!("[{} {}] {}", ui_log_level_tag(rec.level), rec.name, clean);
+    })
 }
 
 fn report_error_with_secrets(msg: &str, secrets: &Arc<Mutex<Vec<String>>>) {
@@ -731,13 +732,12 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
 
     let app = Context::new();
-    configure_exec_logger(&app, Arc::clone(&log_secrets));
+    let _exec_tracing_guard = configure_exec_logger(Arc::clone(&log_secrets));
 
     app.plugin(AgentSpinePlugin, spine_cfg);
     app.plugin(LlmRetryPlugin, RetryConfig::default());
     app.plugin(LlmRouter::plugin(), resolved_llm.router);
     let mention_fiber = if ext_flags.file_mentions {
-        let mention_logger = app.logger_named("mentions");
         Some(app.plugin(
             FileMentionsPlugin,
             FileMentionsConfig::with_callback(
@@ -746,9 +746,15 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 move |ev| {
                     if let ClientEvent::Notice { level, text } = ev {
                         match level {
-                            NoticeLevel::Error => mention_logger.error(text),
-                            NoticeLevel::Warn => mention_logger.warn(text),
-                            NoticeLevel::Info => mention_logger.info(text),
+                            NoticeLevel::Error => {
+                                tracing::error!(target: "mizar::mentions", "{text}")
+                            }
+                            NoticeLevel::Warn => {
+                                tracing::warn!(target: "mizar::mentions", "{text}")
+                            }
+                            NoticeLevel::Info => {
+                                tracing::info!(target: "mizar::mentions", "{text}")
+                            }
                         }
                     }
                 },

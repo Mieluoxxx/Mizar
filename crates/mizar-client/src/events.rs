@@ -3,16 +3,10 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use cordis::{Context, CordisError, DisposableHandle, LogLevel, LogRecord};
+use cordis::{Cleanup, Context, CordisError, DisposableHandle};
 use mizar_core::agent_loop::{
-    AgentLoop, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
-    AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
-    AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
-    AgentUsageEvent, DeliveryMode, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS,
-    EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
-    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
-    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
-    InboxPushResult, StepOutcome, TurnEndReason, TurnInput,
+    AgentEvent, AgentLoop, AgentLoopContextExt, AgentStatus, DeliveryMode, InboxPushResult,
+    StepOutcome, TurnEndReason, TurnInput,
 };
 use mizar_core::spine::{
     CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent, CompactionTrigger,
@@ -22,9 +16,7 @@ use mizar_core::subagent::{EVENT_SUBAGENT_STATE, SubagentStateEvent};
 use mizar_core::trajectory::{EVENT_TRAJECTORY_ANOMALY, TrajectoryAnomalyEvent};
 use mizar_llm::LlmRuntime;
 use mizar_session::{EVENT_SESSION_TITLE_UPDATED, SessionStore, SessionTitleUpdatedPayload};
-use mizar_types::client::{
-    ClientEvent, UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
-};
+use mizar_types::client::{ClientEvent, UiAgentStatus, UiStepOutcome, UiTurnEndReason};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -66,21 +58,6 @@ pub fn to_ui_step_outcome(outcome: &StepOutcome) -> UiStepOutcome {
         StepOutcome::Error { message } => UiStepOutcome::Error {
             message: message.clone(),
         },
-    }
-}
-
-pub fn to_ui_log_record(record: &LogRecord) -> UiLogRecord {
-    let level = match record.level {
-        LogLevel::Silent => UiLogLevel::Silent,
-        LogLevel::Error => UiLogLevel::Error,
-        LogLevel::Warn => UiLogLevel::Warn,
-        LogLevel::Info => UiLogLevel::Info,
-        LogLevel::Debug => UiLogLevel::Debug,
-    };
-    UiLogRecord {
-        level,
-        name: record.name.clone(),
-        message: record.message.clone(),
     }
 }
 
@@ -237,136 +214,61 @@ where
 {
     let mut handles = Vec::new();
     let is_current = move |sid: &str| *session_id_rx.read().unwrap() == sid;
+    let agent_loop = ctx.agent_loop()?;
 
     {
         let send = send.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_STATUS, move |ev: &AgentStatusEvent| {
-            if check(&ev.session.id) {
-                send(ClientEvent::Status(to_ui_status(ev.status)));
-            }
-        })?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
-                if check(&ev.session.id) {
+        handles.push(ctx.effect("client.agent-events", move || {
+            let guard = agent_loop.on_event(move |ev| match ev {
+                AgentEvent::Status(ev) if check(&ev.session.id) => {
+                    send(ClientEvent::Status(to_ui_status(ev.status)));
+                }
+                AgentEvent::TurnStart(ev) if check(&ev.session.id) => {
                     send(ClientEvent::TurnStart { turn: ev.turn });
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
-            if check(&ev.session.id) {
-                send(ClientEvent::TurnEnd {
-                    reason: to_ui_turn_end_reason(ev.reason.clone()),
-                });
-            }
-        })?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::TurnEnd(ev) if check(&ev.session.id) => {
+                    send(ClientEvent::TurnEnd {
+                        reason: to_ui_turn_end_reason(ev.reason.clone()),
+                    });
+                }
+                AgentEvent::StepStart(ev) if check(&ev.session.id) => {
                     send(ClientEvent::StepStart { ts_ms: ev.ts_ms });
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_AGENT_STEP_FIRST_TOKEN,
-            move |ev: &AgentStepFirstTokenEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::StepFirstToken(ev) if check(&ev.session.id) => {
                     send(ClientEvent::FirstToken { ts_ms: ev.ts_ms });
                 }
-            },
-        )?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
-            if check(&ev.session.id) {
-                send(ClientEvent::StepEnd {
-                    step: ev.step,
-                    ts_ms: ev.ts_ms,
-                    outcome: to_ui_step_outcome(&ev.outcome),
-                    usage: ev.usage,
-                });
-            }
-        })?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::StepEnd(ev) if check(&ev.session.id) => {
+                    send(ClientEvent::StepEnd {
+                        step: ev.step,
+                        ts_ms: ev.ts_ms,
+                        outcome: to_ui_step_outcome(&ev.outcome),
+                        usage: ev.usage,
+                    });
+                }
+                AgentEvent::TextDelta(ev) if check(&ev.session.id) => {
                     send(ClientEvent::TextDelta {
                         text: ev.text.clone(),
                         ts_ms: ev.ts_ms,
                     });
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_AGENT_REASONING_DELTA,
-            move |ev: &AgentReasoningDeltaEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::ReasoningDelta(ev) if check(&ev.session.id) => {
                     send(ClientEvent::ReasoningDelta {
                         text: ev.text.clone(),
                         ts_ms: ev.ts_ms,
                     });
                 }
-            },
-        )?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::ToolCall(ev) if check(&ev.session.id) => {
                     send(ClientEvent::ToolCall(ev.call.clone()));
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::ToolUpdate(ev) if check(&ev.session.id) => {
                     send(ClientEvent::ToolUpdate {
                         call_id: ev.tool_call_id.clone(),
                         name: ev.name.clone(),
                         preview: ev.preview.clone(),
                     });
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
-                if check(&ev.session.id) {
+                AgentEvent::ToolResult(ev) if check(&ev.session.id) => {
                     send(ClientEvent::ToolResult {
                         call_id: ev.tool_call_id.clone(),
                         name: ev.name.clone(),
@@ -376,16 +278,25 @@ where
                         details: ev.details.clone(),
                     });
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_USAGE, move |ev: &AgentUsageEvent| {
-            if check(&ev.session.id) {
-                send(ClientEvent::Usage(ev.usage));
-            }
+                AgentEvent::Usage(ev) if check(&ev.session.id) => {
+                    send(ClientEvent::Usage(ev.usage));
+                }
+                AgentEvent::Status(_)
+                | AgentEvent::Request(_)
+                | AgentEvent::TurnStart(_)
+                | AgentEvent::TurnInput(_)
+                | AgentEvent::TurnEnd(_)
+                | AgentEvent::StepStart(_)
+                | AgentEvent::StepFirstToken(_)
+                | AgentEvent::StepEnd(_)
+                | AgentEvent::TextDelta(_)
+                | AgentEvent::ReasoningDelta(_)
+                | AgentEvent::ToolCall(_)
+                | AgentEvent::ToolUpdate(_)
+                | AgentEvent::ToolResult(_)
+                | AgentEvent::Usage(_) => {}
+            });
+            Ok::<_, CordisError>(Some(Cleanup::sync(move || drop(guard))))
         })?);
     }
     {
@@ -598,7 +509,6 @@ mod tests {
         use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
 
         let ctx = Context::new();
-        ctx.logger().set_silent();
         let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         if let AgentToolsMode::Coding {
             ref mut mcp,

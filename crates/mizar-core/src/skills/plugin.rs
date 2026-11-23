@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{
-    AgentPreStepDecision, AgentPreStepInput, AgentToolResultEvent, EVENT_AGENT_PRE_STEP,
-    EVENT_AGENT_TOOL_RESULT, TurnInput,
+    AgentEvent, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput,
+    subscribe_agent_events_when_ready,
 };
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
 use mizar_session::SessionEvent;
@@ -338,7 +338,10 @@ impl Plugin for SkillsPlugin {
                 let reg_for_mut = Arc::clone(&registry);
                 let fs_for_mut = Arc::clone(&fs_provider);
                 let ws_for_mut = config.workspace.clone();
-                ctx.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
+                subscribe_agent_events_when_ready(&ctx, "skills.tool-result", move |ev| {
+                    let AgentEvent::ToolResult(ev) = ev else {
+                        return;
+                    };
                     if ev.is_error || !matches!(ev.name.as_str(), "write" | "edit") {
                         return;
                     }
@@ -357,7 +360,8 @@ impl Plugin for SkillsPlugin {
                             reg_for_mut.invalidate_cache();
                         }
                     }
-                })?;
+                })
+                .await?;
             }
 
             // 在每步发送模型请求前：1）增量注入 <available_skills> 目录；2）展开用户 /<name> 技能手势

@@ -148,7 +148,6 @@ async fn setup_base_app_with_subagent_fiber(
     use_sqlite: bool,
 ) -> (Context, Option<PathBuf>, Fiber) {
     let app = Context::new();
-    app.logger().set_silent();
     app.plugin(mizar_llm::LlmRuntime::plugin(), ())
         .await
         .unwrap();
