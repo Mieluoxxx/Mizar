@@ -48,6 +48,54 @@ pub fn expand_user_path(raw: &str) -> PathBuf {
     PathBuf::from(without_at)
 }
 
+/// 向上追溯至最近已存在祖先并解析真实规范路径（支持尚不存在的尾路径及悬空/循环符号链接）。
+fn resolve_canonical_target(target: &Path) -> Result<Option<PathBuf>, ()> {
+    let mut cur = target.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut hops = 0usize;
+
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&cur) {
+            let mut rebuilt = canon;
+            for seg in tail.iter().rev() {
+                rebuilt.push(seg);
+            }
+            return Ok(Some(normalize_lexical(&rebuilt)));
+        }
+
+        if let Ok(meta) = std::fs::symlink_metadata(&cur)
+            && meta.file_type().is_symlink()
+        {
+            if hops >= 40 {
+                return Err(());
+            }
+            let link_target = std::fs::read_link(&cur).map_err(|_| ())?;
+            let base = cur.parent().unwrap_or_else(|| Path::new("/"));
+            let mut next = if link_target.is_absolute() {
+                link_target
+            } else {
+                base.join(link_target)
+            };
+            for seg in tail.iter().rev() {
+                next.push(seg);
+            }
+            cur = normalize_lexical(&next);
+            tail.clear();
+            hops += 1;
+            continue;
+        }
+
+        let Some(name) = cur.file_name() else {
+            return Ok(None);
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            return Ok(None);
+        };
+        cur = parent.to_path_buf();
+    }
+}
+
 pub fn resolve_to_cwd(
     cwd: &Path,
     raw: &str,
@@ -73,11 +121,14 @@ pub fn resolve_to_cwd(
         if !norm_target.starts_with(&norm_root) {
             return Err(format!("不允许访问工作区以外的路径：{raw}"));
         }
-        if let Ok(canon_root) = std::fs::canonicalize(&norm_root)
-            && let Ok(canon_target) = std::fs::canonicalize(&norm_target)
-            && !canon_target.starts_with(&canon_root)
-        {
-            return Err(format!("不允许访问工作区以外的路径：{raw}"));
+        if let Ok(canon_root) = std::fs::canonicalize(&norm_root) {
+            let resolved = resolve_canonical_target(&norm_target)
+                .map_err(|()| format!("不允许访问工作区以外的路径：{raw}"))?;
+            if let Some(canon_target) = resolved
+                && !canon_target.starts_with(&canon_root)
+            {
+                return Err(format!("不允许访问工作区以外的路径：{raw}"));
+            }
         }
     }
 
@@ -118,5 +169,59 @@ fn is_within_root(root: &Path, target: &Path) -> bool {
             .map(|c| normalize_lexical(&c.join(root)))
             .unwrap_or_else(|_| normalize_lexical(root))
     };
-    normalize_lexical(target).starts_with(abs_root)
+    let norm_target = normalize_lexical(target);
+    if !norm_target.starts_with(&abs_root) {
+        return false;
+    }
+    if let Ok(canon_root) = std::fs::canonicalize(&abs_root) {
+        match resolve_canonical_target(&norm_target) {
+            Ok(Some(canon_target)) => canon_target.starts_with(&canon_root),
+            Ok(None) => true,
+            Err(()) => false,
+        }
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_to_workspace_rejects_existing_and_non_existing_symlink_escapes() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("mizar_path_utils_{}_{uniq}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top-secret").unwrap();
+
+        std::os::unix::fs::symlink(&outside, ws.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("not_created"), ws.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(ws.join("sub"), ws.join("in_link")).unwrap();
+
+        // 已存在目标逃逸
+        assert!(resolve_to_cwd(&ws, "link/secret.txt", true).is_err());
+        // 尚不存在的尾路径（单层与多层）通过符号链接逃逸
+        assert!(resolve_to_cwd(&ws, "link/new.txt", true).is_err());
+        assert!(resolve_to_cwd(&ws, "link/a/b/new.txt", true).is_err());
+        // 悬空符号链接逃逸
+        assert!(resolve_to_cwd(&ws, "dangling", true).is_err());
+        assert!(resolve_to_cwd(&ws, "dangling/sub.txt", true).is_err());
+
+        // 指向工作区内部的符号链接（含未创建文件）应放行
+        assert!(resolve_to_cwd(&ws, "in_link/new.txt", true).is_ok());
+
+        // 非限制模式应放行外部符号链接
+        assert!(resolve_to_cwd(&ws, "link/new.txt", false).is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

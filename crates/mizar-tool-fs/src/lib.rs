@@ -33,7 +33,12 @@ fn normalize_lexical(path: &Path) -> PathBuf {
             Component::RootDir => out.push(comp.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
                     out.push(Component::ParentDir);
                 }
             }
@@ -43,7 +48,55 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// 防止 `../` 或绝对路径跳出根目录，同时校验已存在路径的符号链接不逃逸。
+/// 向上追溯至最近已存在祖先并解析真实规范路径（防止未创建路径及悬空符号链接逃逸）。
+fn resolve_canonical_target(target: &Path) -> Result<Option<PathBuf>, ()> {
+    let mut cur = target.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut hops = 0usize;
+
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&cur) {
+            let mut rebuilt = canon;
+            for seg in tail.iter().rev() {
+                rebuilt.push(seg);
+            }
+            return Ok(Some(normalize_lexical(&rebuilt)));
+        }
+
+        if let Ok(meta) = std::fs::symlink_metadata(&cur)
+            && meta.file_type().is_symlink()
+        {
+            if hops >= 40 {
+                return Err(());
+            }
+            let link_target = std::fs::read_link(&cur).map_err(|_| ())?;
+            let base = cur.parent().unwrap_or_else(|| Path::new("/"));
+            let mut next = if link_target.is_absolute() {
+                link_target
+            } else {
+                base.join(link_target)
+            };
+            for seg in tail.iter().rev() {
+                next.push(seg);
+            }
+            cur = normalize_lexical(&next);
+            tail.clear();
+            hops += 1;
+            continue;
+        }
+
+        let Some(name) = cur.file_name() else {
+            return Ok(None);
+        };
+        tail.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            return Ok(None);
+        };
+        cur = parent.to_path_buf();
+    }
+}
+
+/// 防止 `../` 或绝对路径跳出根目录，同时校验已存在与未创建目标的符号链接均不逃逸。
 pub fn safe_path(root: &Path, req_path: &str) -> Result<PathBuf, String> {
     let abs_root = if root.is_absolute() {
         root.to_path_buf()
@@ -64,11 +117,14 @@ pub fn safe_path(root: &Path, req_path: &str) -> Result<PathBuf, String> {
         return Err(format!("不允许访问根目录以外的路径：{req_path}"));
     }
 
-    if let Ok(canon_root) = std::fs::canonicalize(&norm_root)
-        && let Ok(canon_target) = std::fs::canonicalize(&norm_target)
-        && !canon_target.starts_with(&canon_root)
-    {
-        return Err(format!("不允许访问根目录以外的路径：{req_path}"));
+    if let Ok(canon_root) = std::fs::canonicalize(&norm_root) {
+        let resolved = resolve_canonical_target(&norm_target)
+            .map_err(|()| format!("不允许访问根目录以外的路径：{req_path}"))?;
+        if let Some(canon_target) = resolved
+            && !canon_target.starts_with(&canon_root)
+        {
+            return Err(format!("不允许访问根目录以外的路径：{req_path}"));
+        }
     }
 
     Ok(norm_target)
@@ -254,5 +310,34 @@ mod tests {
         assert!(escape_res.content.contains("不允许访问根目录以外的路径"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocks_existing_and_non_existing_symlink_escapes() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("mizar_tool_fs_sym_{}_{uniq}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top-secret").unwrap();
+
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("not_created"), root.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("in_link")).unwrap();
+
+        assert!(safe_path(&root, "link/secret.txt").is_err());
+        assert!(safe_path(&root, "link/new.txt").is_err());
+        assert!(safe_path(&root, "link/a/b/new.txt").is_err());
+        assert!(safe_path(&root, "dangling").is_err());
+        assert!(safe_path(&root, "dangling/sub.txt").is_err());
+        assert!(safe_path(&root, "in_link/new.txt").is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

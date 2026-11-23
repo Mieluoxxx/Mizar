@@ -67,79 +67,81 @@ impl SubagentRuntime {
 
             loop {
                 let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-                let mut alerts_sent = 0usize;
-                let mut last_alert_at: Option<Instant> = None;
+                let inner_outcome = {
+                    let mut alerts_sent = 0usize;
+                    let mut last_alert_at: Option<Instant> = None;
 
-                let run_fut = agent_loop.run_with_report(
-                    Arc::clone(&child_session),
-                    next_input,
-                    child_cancel.clone(),
-                    run_opts.clone(),
-                );
-                tokio::pin!(run_fut);
+                    let run_fut = agent_loop.run_with_report(
+                        Arc::clone(&child_session),
+                        next_input,
+                        child_cancel.clone(),
+                        run_opts.clone(),
+                    );
+                    tokio::pin!(run_fut);
 
-                let inner_outcome = loop {
-                    let watchdog_sleep =
-                        if stall_timeout_secs > 0 && alerts_sent < max_watchdog_alerts {
-                            let stall = Duration::from_secs(stall_timeout_secs);
-                            let base = match last_alert_at {
-                                Some(t) => activity.last_activity_instant().max(t),
-                                None => activity.last_activity_instant(),
+                    loop {
+                        let watchdog_sleep =
+                            if stall_timeout_secs > 0 && alerts_sent < max_watchdog_alerts {
+                                let stall = Duration::from_secs(stall_timeout_secs);
+                                let base = match last_alert_at {
+                                    Some(t) => activity.last_activity_instant().max(t),
+                                    None => activity.last_activity_instant(),
+                                };
+                                let wake_at = base.checked_add(stall).unwrap_or(base);
+                                let remaining = wake_at.saturating_duration_since(Instant::now());
+                                Some(tokio::time::sleep(remaining))
+                            } else {
+                                None
                             };
-                            let wake_at = base.checked_add(stall).unwrap_or(base);
-                            let remaining = wake_at.saturating_duration_since(Instant::now());
-                            Some(tokio::time::sleep(remaining))
-                        } else {
-                            None
+
+                        let watchdog_fut = async {
+                            match watchdog_sleep {
+                                Some(sleep) => sleep.await,
+                                None => std::future::pending::<()>().await,
+                            }
                         };
 
-                    let watchdog_fut = async {
-                        match watchdog_sleep {
-                            Some(sleep) => sleep.await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    };
-
-                    tokio::select! {
-                        biased;
-                        _ = rt.dispose_token.cancelled() => {
-                            break InnerTurnOutcome::Disposed;
-                        }
-                        res = &mut run_fut => {
-                            break InnerTurnOutcome::Finished(res);
-                        }
-                        _ = tokio::time::sleep_until(hard_deadline) => {
-                            child_cancel.cancel();
-                            let _ = tokio::time::timeout(Duration::from_millis(200), &mut run_fut).await;
-                            break InnerTurnOutcome::TimedOut;
-                        }
-                        _ = watchdog_fut => {
-                            let stall = Duration::from_secs(stall_timeout_secs);
-                            let idle = activity.idle_duration();
-                            let since_last_alert = last_alert_at.map_or(stall, |t| t.elapsed());
-                            if idle >= stall
-                                && since_last_alert >= stall
-                                && !child_cancel.is_cancelled()
-                                && !rt.dispose_token.is_cancelled()
-                            {
-                                alerts_sent += 1;
-                                last_alert_at = Some(Instant::now());
-                                rt.fire_watchdog_alert(
-                                    run_id,
-                                    &parent_id,
-                                    &assigned_name,
-                                    &child_id,
-                                    mode,
-                                    &activity,
-                                    &agent_loop,
-                                    alerts_sent,
-                                    max_watchdog_alerts,
-                                );
-                            } else if !child_cancel.is_cancelled() && !rt.dispose_token.is_cancelled() {
-                                // 亚毫秒精度边界微小余量，小睡 1ms 防 0-duration 忙循环
-                                let wait_left = stall.saturating_sub(idle.min(since_last_alert));
-                                if wait_left.is_zero() {
-                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                        tokio::select! {
+                            biased;
+                            _ = rt.dispose_token.cancelled() => {
+                                break InnerTurnOutcome::Disposed;
+                            }
+                            res = &mut run_fut => {
+                                break InnerTurnOutcome::Finished(res);
+                            }
+                            _ = tokio::time::sleep_until(hard_deadline) => {
+                                child_cancel.cancel();
+                                let _ = tokio::time::timeout(Duration::from_millis(200), &mut run_fut).await;
+                                break InnerTurnOutcome::TimedOut;
+                            }
+                            _ = watchdog_fut => {
+                                let stall = Duration::from_secs(stall_timeout_secs);
+                                let idle = activity.idle_duration();
+                                let since_last_alert = last_alert_at.map_or(stall, |t| t.elapsed());
+                                if idle >= stall
+                                    && since_last_alert >= stall
+                                    && !child_cancel.is_cancelled()
+                                    && !rt.dispose_token.is_cancelled()
+                                {
+                                    alerts_sent += 1;
+                                    last_alert_at = Some(Instant::now());
+                                    rt.fire_watchdog_alert(
+                                        run_id,
+                                        &parent_id,
+                                        &assigned_name,
+                                        &child_id,
+                                        mode,
+                                        &activity,
+                                        &agent_loop,
+                                        alerts_sent,
+                                        max_watchdog_alerts,
+                                    );
+                                } else if !child_cancel.is_cancelled() && !rt.dispose_token.is_cancelled() {
+                                    // 亚毫秒精度边界微小余量，小睡 1ms 防 0-duration 忙循环
+                                    let wait_left = stall.saturating_sub(idle.min(since_last_alert));
+                                    if wait_left.is_zero() {
+                                        tokio::time::sleep(Duration::from_millis(1)).await;
+                                    }
                                 }
                             }
                         }

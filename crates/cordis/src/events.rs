@@ -6,8 +6,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use futures::future::join_all;
 
@@ -129,9 +129,16 @@ struct HookEntry {
     kind: HookKind,
 }
 
+struct HookBucket {
+    entries: Vec<HookEntry>,
+    snapshot: Arc<[HookKind]>,
+}
+
 pub struct EventsService {
     next_id: AtomicU64,
-    hooks: Mutex<HashMap<String, Vec<HookEntry>>>,
+    internal_dispatch_subscribers: AtomicUsize,
+    empty_snapshot: Arc<[HookKind]>,
+    hooks: RwLock<HashMap<String, HookBucket>>,
 }
 
 impl Default for EventsService {
@@ -144,14 +151,18 @@ impl EventsService {
     pub fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            hooks: Mutex::new(HashMap::new()),
+            internal_dispatch_subscribers: AtomicUsize::new(0),
+            empty_snapshot: Arc::from([]),
+            hooks: RwLock::new(HashMap::new()),
         }
     }
 
     /// 取出某个事件的当前监听列表快照，并按需触发 `internal/dispatch`。
     /// 锁在返回前立即释放，避免监听函数内部再次操作事件总线时死锁。
-    fn dispatch(&self, mode: DispatchMode, name: &str) -> Vec<HookKind> {
-        if !name.starts_with("internal/") {
+    fn dispatch(&self, mode: DispatchMode, name: &str) -> Arc<[HookKind]> {
+        if !name.starts_with("internal/")
+            && self.internal_dispatch_subscribers.load(Ordering::Acquire) > 0
+        {
             self.emit(
                 INTERNAL_DISPATCH,
                 InternalDispatchEvent {
@@ -160,17 +171,18 @@ impl EventsService {
                 },
             );
         }
-        let hooks = self.hooks.lock().unwrap();
+        let hooks = self.hooks.read().unwrap();
         hooks
             .get(name)
-            .map(|list| list.iter().map(|entry| entry.kind.clone()).collect())
-            .unwrap_or_default()
+            .map(|bucket| Arc::clone(&bucket.snapshot))
+            .unwrap_or_else(|| Arc::clone(&self.empty_snapshot))
     }
 
     /// 广播：同步调用所有监听者，不管返回值。
     pub fn emit<P: Any>(&self, name: &str, payload: P) {
         let any: &dyn Any = &payload;
-        for kind in self.dispatch(DispatchMode::Emit, name) {
+        let snapshot = self.dispatch(DispatchMode::Emit, name);
+        for kind in snapshot.iter() {
             match kind {
                 HookKind::Emit(cb) => cb(any),
                 HookKind::EmitSignal(cb) => cb(),
@@ -182,7 +194,8 @@ impl EventsService {
     /// 同步版 `serial`：按顺序调用，谁返回 `Some(result)` 就停下并返回它。
     pub fn bail<P: Any, R: 'static>(&self, name: &str, payload: P) -> Option<R> {
         let any: &dyn Any = &payload;
-        for kind in self.dispatch(DispatchMode::Bail, name) {
+        let snapshot = self.dispatch(DispatchMode::Bail, name);
+        for kind in snapshot.iter() {
             if let HookKind::Bail(cb) = kind
                 && let Some(boxed) = cb(any)
             {
@@ -195,19 +208,17 @@ impl EventsService {
         None
     }
 
-    /// 串行异步：逐个 await，谁返回 `Some(result)` 就停下并返回它。
+    /// 串行异步：按序惰性调用并逐个 await，谁返回 `Some(result)` 就立刻短路不再触发后续闭包。
     pub async fn serial<P: Any, R: 'static>(&self, name: &str, payload: P) -> Option<R> {
-        let futs: Vec<_> = {
-            let any: &dyn Any = &payload;
-            self.dispatch(DispatchMode::Serial, name)
-                .into_iter()
-                .filter_map(|kind| match kind {
-                    HookKind::Serial(cb) => Some(cb(any)),
-                    _ => None,
-                })
-                .collect()
-        };
-        for fut in futs {
+        let hooks = self.dispatch(DispatchMode::Serial, name);
+        for idx in 0..hooks.len() {
+            let fut = match &hooks[idx] {
+                HookKind::Serial(cb) => {
+                    let any: &dyn Any = &payload;
+                    cb(any)
+                }
+                _ => continue,
+            };
             if let Some(boxed) = fut.await {
                 let res = *boxed
                     .downcast::<R>()
@@ -223,7 +234,7 @@ impl EventsService {
         let futs: Vec<_> = {
             let any: &dyn Any = &payload;
             self.dispatch(DispatchMode::Parallel, name)
-                .into_iter()
+                .iter()
                 .filter_map(|kind| match kind {
                     HookKind::Parallel(cb) => Some(cb(any)),
                     _ => None,
@@ -249,9 +260,9 @@ impl EventsService {
     {
         let hooks: Vec<WaterfallFn> = self
             .dispatch(DispatchMode::Waterfall, name)
-            .into_iter()
+            .iter()
             .filter_map(|kind| match kind {
-                HookKind::Waterfall(cb) => Some(cb),
+                HookKind::Waterfall(cb) => Some(Arc::clone(cb)),
                 _ => None,
             })
             .collect();
@@ -301,8 +312,12 @@ impl EventsService {
 
         ctx.fiber().effect(&label, move || {
             {
-                let mut hooks = events.hooks.lock().unwrap();
-                let list = hooks.entry(name.clone()).or_default();
+                let mut hooks = events.hooks.write().unwrap();
+                let bucket = hooks.entry(name.clone()).or_insert_with(|| HookBucket {
+                    entries: Vec::new(),
+                    snapshot: Arc::clone(&events.empty_snapshot),
+                });
+                let list = &mut bucket.entries;
                 let entry = HookEntry {
                     id,
                     priority: options.priority,
@@ -318,17 +333,43 @@ impl EventsService {
                         .unwrap_or(list.len())
                 };
                 list.insert(insert_idx, entry);
+                bucket.snapshot =
+                    Arc::from(list.iter().map(|e| e.kind.clone()).collect::<Vec<_>>());
+                if name == INTERNAL_DISPATCH {
+                    events
+                        .internal_dispatch_subscribers
+                        .fetch_add(1, Ordering::Release);
+                }
             }
             let events_cleanup = Arc::clone(&events);
             Ok::<_, CordisError>(Some(crate::fiber::Cleanup::sync(move || {
-                let mut hooks = events_cleanup.hooks.lock().unwrap();
-                if let Some(list) = hooks.get_mut(&name) {
-                    if let Some(idx) = list.iter().position(|e| e.id == id) {
-                        list.remove(idx);
+                let mut hooks = events_cleanup.hooks.write().unwrap();
+                let mut removed = false;
+                let should_remove_bucket = if let Some(bucket) = hooks.get_mut(&name) {
+                    if let Some(idx) = bucket.entries.iter().position(|e| e.id == id) {
+                        bucket.entries.remove(idx);
+                        removed = true;
+                        if !bucket.entries.is_empty() {
+                            bucket.snapshot = Arc::from(
+                                bucket
+                                    .entries
+                                    .iter()
+                                    .map(|e| e.kind.clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
                     }
-                    if list.is_empty() {
-                        hooks.remove(&name);
-                    }
+                    bucket.entries.is_empty()
+                } else {
+                    false
+                };
+                if should_remove_bucket {
+                    hooks.remove(&name);
+                }
+                if removed && name == INTERNAL_DISPATCH {
+                    events_cleanup
+                        .internal_dispatch_subscribers
+                        .fetch_sub(1, Ordering::AcqRel);
                 }
             })))
         })
@@ -550,6 +591,94 @@ mod tests {
             *trace.lock().unwrap(),
             vec!["compact2:-20", "mid-prepend:0", "mid1:0", "recall:20"]
         );
+
+        ctx.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn serial_short_circuits_lazily_without_invoking_subsequent_closures() {
+        let ctx = Context::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+
+        let c1 = Arc::clone(&calls);
+        let _h1 = ctx
+            .on_serial("step", move |_: ()| {
+                c1.lock().unwrap().push("h1-closure");
+                let c1_inner = Arc::clone(&c1);
+                async move {
+                    c1_inner.lock().unwrap().push("h1-async");
+                    None::<&'static str>
+                }
+            })
+            .unwrap();
+
+        let c2 = Arc::clone(&calls);
+        let _h2 = ctx
+            .on_serial("step", move |_: ()| {
+                c2.lock().unwrap().push("h2-closure");
+                let c2_inner = Arc::clone(&c2);
+                async move {
+                    c2_inner.lock().unwrap().push("h2-async");
+                    Some("winner")
+                }
+            })
+            .unwrap();
+
+        let c3 = Arc::clone(&calls);
+        let _h3 = ctx
+            .on_serial("step", move |_: ()| {
+                c3.lock().unwrap().push("h3-closure");
+                async { Some("never") }
+            })
+            .unwrap();
+
+        let result: Option<&'static str> = ctx.events().serial("step", ()).await;
+        assert_eq!(result, Some("winner"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["h1-closure", "h1-async", "h2-closure", "h2-async"]
+        );
+
+        ctx.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn internal_dispatch_fast_path_tracks_subscribers_across_register_and_dispose() {
+        let ctx = Context::new();
+        assert_eq!(
+            ctx.events()
+                .internal_dispatch_subscribers
+                .load(Ordering::Acquire),
+            0
+        );
+        ctx.events().emit("custom/ping", 1usize);
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_c = Arc::clone(&seen);
+        let handle = ctx
+            .on(INTERNAL_DISPATCH, move |ev: &InternalDispatchEvent| {
+                seen_c.lock().unwrap().push(ev.name.clone());
+            })
+            .unwrap();
+
+        assert_eq!(
+            ctx.events()
+                .internal_dispatch_subscribers
+                .load(Ordering::Acquire),
+            1
+        );
+        ctx.events().emit("custom/ping", 2usize);
+        assert_eq!(*seen.lock().unwrap(), vec!["custom/ping".to_string()]);
+
+        handle.dispose().await;
+        assert_eq!(
+            ctx.events()
+                .internal_dispatch_subscribers
+                .load(Ordering::Acquire),
+            0
+        );
+        ctx.events().emit("custom/ping", 3usize);
+        assert_eq!(*seen.lock().unwrap(), vec!["custom/ping".to_string()]);
 
         ctx.fiber().dispose().await;
     }

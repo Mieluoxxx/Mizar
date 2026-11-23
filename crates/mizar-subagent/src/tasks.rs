@@ -301,8 +301,8 @@ impl BackgroundTaskRegistry {
         max_concurrent: usize,
     ) -> Result<(), SubagentError> {
         let cap = max_concurrent.max(1);
-        let running = self.running_count(parent_id);
-        if running >= cap {
+        let active = self.active_run_count(parent_id);
+        if active >= cap {
             return Err(SubagentError::ConcurrencyLimitReached(cap));
         }
         if let Some(raw) = requested_name {
@@ -407,7 +407,7 @@ impl BackgroundTaskRegistry {
     ) -> Result<SendOutcome, SubagentError> {
         let name = validate_custom_name(raw_name)?;
         let cap = max_concurrent.max(1);
-        let running = self.running_count(parent_id);
+        let active = self.active_run_count(parent_id);
 
         let Some(list) = self.entries.get_mut(parent_id) else {
             return Err(SubagentError::SubagentNotFound(name));
@@ -450,7 +450,7 @@ impl BackgroundTaskRegistry {
             return Err(SubagentError::StoppingInProgress(list[idx].name.clone()));
         }
 
-        if running >= cap {
+        if active >= cap {
             return Err(SubagentError::ConcurrencyLimitReached(cap));
         }
 
@@ -767,6 +767,13 @@ impl BackgroundTaskRegistry {
         })
     }
 
+    /// 统计当前仍在占用真实后台执行槽位的任务数（含处于 stop 过渡期、尚未清空 `active_run_id` 的任务）。
+    pub fn active_run_count(&self, parent_id: &str) -> usize {
+        self.entries.get(parent_id).map_or(0, |list| {
+            list.iter().filter(|t| t.active_run_id.is_some()).count()
+        })
+    }
+
     pub fn snapshots(
         &self,
         parent_id: &str,
@@ -889,5 +896,103 @@ mod tests {
             }
             SendOutcome::SteeredRunning { .. } => panic!("expected reactivation"),
         }
+    }
+
+    #[test]
+    fn stopping_transition_still_counts_toward_concurrency_limit_until_settled() {
+        let mut reg = BackgroundTaskRegistry::default();
+        let inbox = SessionInbox::new();
+        let dispose = CancellationToken::new();
+
+        // 预先放入一个已结算的休眠任务 worker-idle 供后续 prepare_send 测试
+        let (run0, _, _, _) = reg
+            .register_running(
+                "parent-1",
+                Some("worker-idle"),
+                "child-0".into(),
+                SubagentMode::ReadOnly,
+                None,
+                None,
+                "idle".into(),
+                dispose.child_token(),
+                1,
+            )
+            .unwrap();
+        reg.mark_settled(
+            "parent-1",
+            "worker-idle",
+            "child-0",
+            run0,
+            SubagentRunStatus::Completed,
+            1,
+            None,
+        )
+        .unwrap();
+
+        let (run1, _, _, _) = reg
+            .register_running(
+                "parent-1",
+                Some("worker-1"),
+                "child-1".into(),
+                SubagentMode::ReadOnly,
+                None,
+                None,
+                "first".into(),
+                dispose.child_token(),
+                1,
+            )
+            .unwrap();
+
+        let stopped = reg.request_stop("parent-1", "worker-1");
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(reg.running_count("parent-1"), 0);
+        assert_eq!(reg.active_run_count("parent-1"), 1);
+
+        // stop 过渡期 worker-1 仍占槽位，禁止新 spawn 或重激活第二个任务击穿 cap=1
+        assert!(matches!(
+            reg.preflight_spawn("parent-1", Some("worker-2"), 1),
+            Err(SubagentError::ConcurrencyLimitReached(1))
+        ));
+        assert!(matches!(
+            reg.prepare_send(
+                "parent-1",
+                "worker-idle",
+                "resume".into(),
+                None,
+                None,
+                &inbox,
+                "resume",
+                1,
+                &dispose,
+            ),
+            Err(SubagentError::ConcurrencyLimitReached(1))
+        ));
+
+        // 结算清掉 active_run_id 后，槽位真正释放
+        reg.mark_settled(
+            "parent-1",
+            "worker-1",
+            "child-1",
+            run1,
+            SubagentRunStatus::Stopped,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reg.active_run_count("parent-1"), 0);
+        assert!(
+            reg.register_running(
+                "parent-1",
+                Some("worker-2"),
+                "child-2".into(),
+                SubagentMode::ReadOnly,
+                None,
+                None,
+                "second".into(),
+                dispose.child_token(),
+                1,
+            )
+            .is_ok()
+        );
     }
 }

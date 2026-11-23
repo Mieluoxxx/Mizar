@@ -219,6 +219,10 @@ fn apply_chain_budget(files: &[DiscoveredFile], budget_bytes: usize) -> ChainBud
     }
 }
 
+fn joined_sections_bytes(sections: &[String]) -> usize {
+    sections.iter().map(String::len).sum::<usize>() + sections.len().saturating_sub(1) * 2
+}
+
 pub fn render_baseline_message(
     global_files: &[DiscoveredFile],
     project_files: &[DiscoveredFile],
@@ -230,10 +234,17 @@ pub fn render_baseline_message(
 
     let wrapper_overhead =
         "<system-reminder>\n".len() + BASELINE_INTRO.len() + 2 + "\n</system-reminder>".len();
-    let per_chain_budget = max_bytes.saturating_sub(wrapper_overhead / 2);
+    let total_body_budget = max_bytes.saturating_sub(wrapper_overhead);
 
-    let g_out = apply_chain_budget(global_files, per_chain_budget);
-    let p_out = apply_chain_budget(project_files, per_chain_budget);
+    // 两条链共享同一份总预算：更具体的项目链优先吃预算，剩余部分再分给全局链
+    let p_out = apply_chain_budget(project_files, total_body_budget);
+    let p_bytes = joined_sections_bytes(&p_out.sections);
+    let global_budget = if p_out.sections.is_empty() {
+        total_body_budget
+    } else {
+        total_body_budget.saturating_sub(p_bytes.saturating_add(2))
+    };
+    let g_out = apply_chain_budget(global_files, global_budget);
 
     let mut body_sections = Vec::new();
     body_sections.extend(g_out.sections);
@@ -454,5 +465,32 @@ mod tests {
         assert!(out.text.contains("narrow/AGENTS.md"));
         assert!(out.statuses[0].omitted);
         assert!(out.statuses[1].truncated);
+    }
+
+    #[test]
+    fn shared_budget_caps_combined_global_and_project_chains_to_max_bytes() {
+        // 40KB global + 40KB project 在 64KB 单预算下总输出不得翻倍到 80KB/128KB
+        let max_bytes = 65_536;
+        let global = mock_file("global", &"G".repeat(40_000), ChainKind::UserGlobal);
+        let project = mock_file("project", &"P".repeat(40_000), ChainKind::Project);
+        let out = render_baseline_message(&[global], &[project], max_bytes).unwrap();
+        assert!(
+            out.text.len() <= max_bytes,
+            "rendered baseline {} bytes exceeded max_bytes {}",
+            out.text.len(),
+            max_bytes
+        );
+        assert!(out.text.contains("project/AGENTS.md"));
+        assert!(!out.statuses[1].omitted);
+        assert!(out.statuses[0].truncated || out.statuses[0].omitted);
+
+        // 两链均可容纳时完整保留且全局在前、项目在后
+        let small_g = mock_file("global", "global rule", ChainKind::UserGlobal);
+        let small_p = mock_file("project", "project rule", ChainKind::Project);
+        let fits = render_baseline_message(&[small_g], &[small_p], max_bytes).unwrap();
+        assert!(fits.text.len() <= max_bytes);
+        let g_idx = fits.text.find("global rule").unwrap();
+        let p_idx = fits.text.find("project rule").unwrap();
+        assert!(g_idx < p_idx);
     }
 }
