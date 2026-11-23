@@ -255,9 +255,6 @@ impl LoadedMizarConfig {
                 if let Some(v) = rec.enabled {
                     dst.enabled = v;
                 }
-                if let Some(v) = rec.auto_activate_on_compaction {
-                    dst.auto_activate_on_compaction = v;
-                }
                 if let Some(v) = rec.default_search_limit {
                     dst.default_search_limit = v;
                 }

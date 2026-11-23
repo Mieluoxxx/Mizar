@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use cordis::{Context, Service};
-use mizar_mcp::{McpExposure, McpManager, McpPluginConfig, McpServerConfig};
+use mizar_mcp::{McpContextExt, McpExposure, McpManager, McpPluginConfig, McpServerConfig};
 use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_tools::{ToolExecution, ToolRuntime, ToolsContextExt};
 use serde_json::json;
@@ -212,15 +212,24 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     assert!(!read_res.is_error, "{}", read_res.content);
     assert!(read_res.content.contains("indexed=42 files"));
 
-    // 存在 codemode 暴露的工具时，SystemPrompt 应生成 mcp_servers 提示段落
+    // MCP 不应向静态 SystemPrompt 注入动态 mcp_servers 段落（保持前缀字节冻结）
     let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap().build();
+    assert!(!prompt.contains("mcp_servers"), "prompt:\n{prompt}");
+    assert!(!prompt.contains("mcp__fff"), "prompt:\n{prompt}");
+
+    // render_servers_section 辅助方法本身仍可按需渲染 MCP server 摘要
+    let section = app
+        .mcp()
+        .unwrap()
+        .render_servers_section()
+        .expect("render_servers_section should summarize codemode servers");
     assert!(
-        prompt.contains("Call the tools of `codemode` servers from codemode scripts."),
-        "prompt:\n{prompt}"
+        section.contains("Call the tools of `codemode` servers from codemode scripts."),
+        "section:\n{section}"
     );
     assert!(
-        prompt.contains("mcp__fff (codemode): Indexed repo search server"),
-        "prompt:\n{prompt}"
+        section.contains("mcp__fff (codemode): Indexed repo search server"),
+        "section:\n{section}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -1,5 +1,5 @@
 //! MCP 插件：连接配置文件与程序注册的 MCP Server，将远程工具以 `mcp__<server>__<tool>` 注册进 `ToolRuntime`，
-//! 并支持 `Direct` / `Codemode` / `Deferred` / `Hidden` 分级暴露、`list_mcp_resources` 资源工具及 `<mcp_servers>` 提示词。
+//! 并支持 `Direct` / `Codemode` / `Deferred` / `Hidden` 分级暴露及 `list_mcp_resources` 资源工具。
 
 pub mod client;
 pub mod config;
@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Logger, Service};
-use mizar_system_prompt::{PromptSection, SystemPrompt};
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head, write_temp_output,
 };
@@ -840,28 +839,9 @@ impl Service for McpManager {
     fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
         let mgr_connect = Arc::clone(&self);
         let mgr_close = Arc::clone(&self);
-        let mgr_prompt = Arc::clone(&self);
         let ctx = ctx.clone();
 
         Box::pin(async move {
-            let prompt_fiber = ctx.try_inject(["systemPrompt"], move |c| {
-                let mgr = Arc::clone(&mgr_prompt);
-                async move {
-                    let sp = c.service::<SystemPrompt>("systemPrompt")?;
-                    c.effect("mcp.system-prompt", move || {
-                        Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                            "mcp_servers",
-                            30,
-                            move || mgr.render_servers_section(),
-                        ))))
-                    })?;
-                    Ok::<_, CordisError>(())
-                }
-            })?;
-            if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
-                prompt_fiber.wait_settled().await?;
-            }
-
             ctx.effect("mcp.close-all", move || {
                 Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
                     mgr_close.close_all().await;

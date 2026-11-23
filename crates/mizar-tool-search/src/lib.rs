@@ -21,7 +21,7 @@ pub const DEFAULT_TOOL_SEARCH_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ToolSearchConfig {
-    /// 当存在任意 `Codemode` 或 `Deferred` 工具时自动激活 `tool_search`（默认 true）。
+    /// 当存在任意外部 MCP `Codemode` 或 `Deferred` 工具时自动激活 `tool_search`（默认 true）。
     pub auto_enable: bool,
     pub default_limit: usize,
 }
@@ -39,6 +39,18 @@ pub fn is_searchable_exposure(exposure: ToolExposure) -> bool {
     matches!(exposure, ToolExposure::Codemode | ToolExposure::Deferred)
 }
 
+pub fn is_external_mcp_tool(info: &ToolRuntimeInfo) -> bool {
+    info.name.starts_with("mcp__")
+        || info
+            .namespace
+            .as_ref()
+            .is_some_and(|ns| ns.name.starts_with("mcp__"))
+}
+
+pub fn is_searchable_tool(info: &ToolRuntimeInfo) -> bool {
+    is_searchable_exposure(info.exposure) && is_external_mcp_tool(info)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoEnableState {
     Inactive,
@@ -46,10 +58,7 @@ enum AutoEnableState {
 }
 
 fn sync_auto_enable(tools: &ToolRuntime, state: &Mutex<AutoEnableState>) {
-    let has_searchable = tools
-        .list_all()
-        .into_iter()
-        .any(|t| is_searchable_exposure(t.exposure));
+    let has_searchable = tools.list_all().into_iter().any(|t| is_searchable_tool(&t));
     let next = if has_searchable {
         AutoEnableState::Active
     } else {
@@ -87,7 +96,7 @@ pub fn search_inactive_tools(
     let candidates: Vec<ToolRuntimeInfo> = tools
         .list_all()
         .into_iter()
-        .filter(|t| is_searchable_exposure(t.exposure) && !active.contains(&t.name))
+        .filter(|t| is_searchable_tool(t) && !active.contains(&t.name))
         .collect();
 
     let docs: Vec<ToolSearchDocument> =
@@ -152,7 +161,7 @@ impl Plugin for ToolSearchPlugin {
                                 .and_then(Value::as_str)
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
-                                .ok_or("query 不能为空")?;
+                                .ok_or("query must not be empty")?;
                             let limit = args
                                 .get("limit")
                                 .and_then(Value::as_u64)
@@ -249,6 +258,23 @@ mod tests {
         assert!(
             tools.list_declared(Some("s1")).is_empty(),
             "tool_search should stay inactive until searchable tools exist"
+        );
+
+        // 非外部 MCP 的 Deferred 工具不应触发 tool_search 注入
+        let _local_deferred = tools
+            .register(
+                ToolDefinition::sync_tool(
+                    "local_deferred_helper",
+                    "Internal deferred helper not from MCP",
+                    json!({"type": "object", "properties": {}}),
+                    |_, _| Ok::<_, BoxError>("ok".into()),
+                )
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+        assert!(
+            tools.list_declared(Some("s1")).is_empty(),
+            "non-MCP deferred tool must not activate tool_search"
         );
 
         let _m1 = tools

@@ -164,7 +164,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
             for pin in &digest.pinned_inputs {
                 out.push_str(&format!("[input seq #{}]", pin.seq));
                 if pin.truncated {
-                    out.push_str(" (truncated; use recall_read for full text)");
+                    out.push_str(" (truncated; use recall for full text)");
                 }
                 out.push('\n');
                 out.push_str(&pin.text);
@@ -176,7 +176,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
     out.push_str("<mizar-summary>\n");
     out.push_str(summary.trim());
     out.push_str("\n</mizar-summary>\n");
-    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall_search` / `recall_read`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
+    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
     out.push_str("</mizar-compaction>");
     out
 }

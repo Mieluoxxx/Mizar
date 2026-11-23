@@ -128,7 +128,7 @@ impl Plugin for CodemodePlugin {
                                 let code = args
                                     .get("code")
                                     .and_then(Value::as_str)
-                                    .ok_or("缺少 code 参数")?
+                                    .ok_or("Missing required `code` parameter.")?
                                     .to_string();
                                 let rt = call_ctx.ctx.tools()?;
                                 execute_codemode_script(
@@ -384,6 +384,71 @@ mod tests {
         assert!(
             *nested_cancelled.lock().unwrap(),
             "script timeout must cancel in-flight nested host tool call"
+        );
+
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn codemode_stays_hidden_without_codemode_tools_and_activates_when_registered() {
+        let app = Context::new();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        app.plugin(CodemodePlugin, CodemodeConfig::default())
+            .await
+            .unwrap();
+
+        let tools = app.tools().unwrap();
+        let _direct = tools
+            .register(
+                ToolDefinition::sync_tool("read", "Read file", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Direct),
+            )
+            .unwrap();
+        let _deferred = tools
+            .register(
+                ToolDefinition::sync_tool("mcp__x__deferred", "Deferred", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+
+        assert!(
+            !tools
+                .list_declared(Some("s1"))
+                .iter()
+                .any(|t| t.name == CODEMODE_TOOL_NAME),
+            "codemode must remain hidden when 0 Codemode tools are registered"
+        );
+
+        let cm_guard = tools
+            .register(
+                ToolDefinition::sync_tool("mcp__x__run", "Codemode tool", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Codemode),
+            )
+            .unwrap();
+        assert!(
+            tools
+                .list_declared(Some("s1"))
+                .iter()
+                .any(|t| t.name == CODEMODE_TOOL_NAME),
+            "codemode must activate once a ToolExposure::Codemode tool is registered"
+        );
+
+        match cm_guard {
+            Cleanup::Sync(f) => f(),
+            Cleanup::Async(f) => f().await,
+        }
+        assert!(
+            !tools
+                .list_declared(Some("s1"))
+                .iter()
+                .any(|t| t.name == CODEMODE_TOOL_NAME),
+            "codemode must deactivate again after Codemode tools unregister"
         );
 
         app.fiber().dispose().await;
