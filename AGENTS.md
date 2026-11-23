@@ -143,4 +143,4 @@ Verified:
 | UI 渲染与状态机 | `crates/mizar-tui-ui/src/`（`ui.rs`、`markdown.rs`、`features.rs`、`app.rs`、`app/{cache,events,input}.rs`） |
 | TUI 宿主循环与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
 | 装配顺序与扩展 ID | `crates/mizar-core/src/spine.rs` 的 `apply` 与 `crates/mizar-core/src/spine/plugins.rs`（`KNOWN_HOST_EXTENSION_IDS`、`ToolsGuidePromptPlugin`） |
-| 配置字段 | `crates/mizar-core/src/spine/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第六节 |
+| 配置字段 | `crates/mizar-core/src/spine/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第七节 |

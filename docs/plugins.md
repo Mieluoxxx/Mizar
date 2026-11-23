@@ -146,7 +146,6 @@
 | `recall` | object | `enabled` / `defaultSearchLimit`（默认 `8`）/ `readCharLimit`（默认 `6000`） |
 | `sessionTitle` | object | `enabled`（默认 `true`）/ `model`（可选 `provider/model`，省略则跟随当前会话模型）/ `thinkingLevel`（默认 `"low"`） |
 | `subagent` | object | `maxSteps`（默认 `20`）/ `maxStepsCap`（默认 `40`）/ `timeoutSecs`（默认 `180`，最小钳位 `1`）/ `maxConcurrent`（默认 `4`）/ `stallTimeoutSecs`（默认 `45`，设为 `0` 关闭看门狗）/ `maxWatchdogAlerts`（默认 `2`） |
-| `showCacheMissNotices` | bool | 是否在对话流显示连续折叠的缓存未命中审计提示（默认 `false`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 
 ### 客户端宿主与 TUI 扩展模块 ID（`disabledPlugins`）
