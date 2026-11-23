@@ -156,16 +156,19 @@ fn render_catalog_message(state: &CatalogState, is_update: bool) -> String {
 /// 从用户消息文本中提取空白定界的 `/<skill-name>` 手势（保持首次出现顺序，避免误匹配 `/usr/bin` 或 `5/8`）。
 pub fn extract_skill_gestures(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
+    let mut iter = text.char_indices().peekable();
+    let mut prev_is_whitespace = true;
 
-    while i < bytes.len() {
-        let is_boundary = i == 0 || (bytes[i - 1] as char).is_whitespace();
-        if is_boundary && bytes[i] == b'/' {
-            let start = i + 1;
+    while let Some((idx, ch)) = iter.next() {
+        if prev_is_whitespace && ch == '/' {
+            let start = idx + ch.len_utf8();
             let mut end = start;
-            while end < bytes.len() && !(bytes[end] as char).is_whitespace() {
-                end += 1;
+            while let Some(&(next_idx, next_ch)) = iter.peek() {
+                if next_ch.is_whitespace() {
+                    break;
+                }
+                end = next_idx + next_ch.len_utf8();
+                iter.next();
             }
             if end > start {
                 let token = &text[start..end];
@@ -173,9 +176,9 @@ pub fn extract_skill_gestures(text: &str) -> Vec<String> {
                     out.push(token.to_string());
                 }
             }
-            i = end;
+            prev_is_whitespace = false;
         } else {
-            i += 1;
+            prev_is_whitespace = ch.is_whitespace();
         }
     }
 
@@ -312,11 +315,20 @@ impl Plugin for SkillsPlugin {
                 Ok::<_, cordis::CordisError>(Some(reg_cleanup))
             })?;
 
-            let tools = ctx.tools()?;
-            let skill_tool = create_skill_tool(Arc::clone(&registry), config.workspace.clone());
-            ctx.effect("skills.skillTool", || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(skill_tool)?))
-            })?;
+            // 仅在发现至少 1 个模型可调用技能时注册 `skill` 工具；0 skills 时保持工具表精简零开销
+            let initial_skills = registry
+                .list(SkillLookupOptions {
+                    cwd: Some(config.workspace.clone()),
+                    cancel: CancellationToken::new(),
+                })
+                .await;
+            if initial_skills.iter().any(|s| s.is_model_invocable()) {
+                let tools = ctx.tools()?;
+                let skill_tool = create_skill_tool(Arc::clone(&registry), config.workspace.clone());
+                ctx.effect("skills.skillTool", || {
+                    Ok::<_, mizar_tools::ToolError>(Some(tools.register(skill_tool)?))
+                })?;
+            }
 
             // 监听 write / edit 工具写入完成，若命中任何技能目录则同步刷新缓存
             {

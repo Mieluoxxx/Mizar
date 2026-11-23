@@ -63,7 +63,6 @@ pub struct CompactionSettings {
 #[serde(rename_all = "camelCase", default)]
 pub struct RecallSettings {
     pub enabled: Option<bool>,
-    pub auto_activate_on_compaction: Option<bool>,
     pub default_search_limit: Option<usize>,
     pub read_char_limit: Option<usize>,
 }
@@ -302,9 +301,6 @@ impl SettingsConfig {
             let dst = self.recall.get_or_insert_with(Default::default);
             if rec.enabled.is_some() {
                 dst.enabled = rec.enabled;
-            }
-            if rec.auto_activate_on_compaction.is_some() {
-                dst.auto_activate_on_compaction = rec.auto_activate_on_compaction;
             }
             if rec.default_search_limit.is_some() {
                 dst.default_search_limit = rec.default_search_limit;

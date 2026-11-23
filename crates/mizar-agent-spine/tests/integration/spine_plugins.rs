@@ -14,7 +14,7 @@ use mizar_agent_loop::{
 use mizar_agent_spine::{
     AgentInstructions, AgentSpineConfig, AgentSpinePlugin, CacheWarmingContextExt,
     CacheWarmingMode, CacheWarmingRuntime, CompactionContextExt, EVENT_SPINE_PLUGINS_CHANGE,
-    RECALL_SEARCH_TOOL_NAME, SERVICE_CACHE_WARMING, SUBAGENT_TOOL_NAME, SessionTitleContextExt,
+    RECALL_TOOL_NAME, SERVICE_CACHE_WARMING, SUBAGENT_TOOL_NAME, SessionTitleContextExt,
     SessionTitleRuntime, SpinePluginError, SpinePluginsChangeEvent, SpinePluginsContextExt,
     SubagentContextExt, SubagentRuntime,
 };
@@ -323,7 +323,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(enabled_tool_names.contains("tool_search"));
     assert!(enabled_tool_names.contains("codemode"));
     assert!(enabled_tool_names.contains("skill"));
-    assert!(enabled_tool_names.contains(RECALL_SEARCH_TOOL_NAME));
+    assert!(enabled_tool_names.contains(RECALL_TOOL_NAME));
 
     // 触发一次 pre-step，验证 instructions 与 skills 监听器均正常向会话注入上下文
     let session = sessions.create(None);

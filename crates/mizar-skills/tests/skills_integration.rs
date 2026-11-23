@@ -65,6 +65,54 @@ metadata:
         ),
         vec!["rust-review".to_string(), "deploy-now".to_string()]
     );
+    // 含 UTF-8 多字节末位 0xA0（你=E4 BD A0）/ 0x85（关=E5 85 B3）及全角空白时不 panic
+    assert_eq!(
+        extract_skill_gestures("请运行 /rust-review你好 关/deploy-now /alpha\u{3000}/beta 谢谢你"),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+    assert_eq!(
+        extract_skill_gestures("你好 /rust-review 请帮我检查"),
+        vec!["rust-review".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn zero_skills_does_not_register_skill_tool() {
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("mizar_skills_empty_{}_{uniq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("repo")).unwrap();
+    std::fs::create_dir_all(base.join("empty-agents")).unwrap();
+
+    let ctx = Context::new();
+    ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    ctx.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
+        .await
+        .unwrap();
+    let mut cfg = SkillsConfig::new(base.join("repo"));
+    cfg.include_user_roots = false;
+    cfg.agents_home = Some(base.join("empty-agents"));
+    ctx.plugin(SkillsPlugin, cfg).await.unwrap();
+
+    let tools = ctx.tools().unwrap();
+    assert!(
+        !tools.list_all().iter().any(|t| t.name == "skill"),
+        "0 skills 时不得注册 skill 工具"
+    );
+    assert!(
+        !tools
+            .list_declared(Some("s1"))
+            .iter()
+            .any(|t| t.name == "skill"),
+        "0 skills 时不得向模型声明 skill 工具"
+    );
+
+    ctx.fiber().dispose().await;
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]

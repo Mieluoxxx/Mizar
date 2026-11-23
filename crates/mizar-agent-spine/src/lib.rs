@@ -38,9 +38,7 @@ pub use mizar_instructions::{
     InstructionsConfig, InstructionsContextExt, SessionInstructionsReport,
 };
 #[cfg(feature = "compaction")]
-pub use mizar_recall::{
-    RECALL_READ_TOOL_NAME, RECALL_SEARCH_TOOL_NAME, RecallConfig, RecallPlugin,
-};
+pub use mizar_recall::{RECALL_TOOL_NAME, RecallConfig, RecallPlugin};
 #[cfg(feature = "session-title")]
 pub use mizar_session_title::{
     DEFAULT_REFRESH_INTERVAL_TURNS, ParsedModelTitle, SERVICE_SESSION_TITLE, SessionTitleConfig,
@@ -126,7 +124,7 @@ pub struct AgentSpineConfig {
     /// 是否启用四级上下文压缩与压后工具守卫服务（默认开启）。
     #[cfg(feature = "compaction")]
     pub compaction: Option<CompactionConfig>,
-    /// 是否启用无损情景回溯工具（`recall_search` / `recall_read`，默认开启且按需自动激活）。
+    /// 是否启用无损情景回溯工具（静态常驻 `recall`，默认开启）。
     #[cfg(feature = "compaction")]
     pub recall: Option<RecallConfig>,
     /// 是否启用基于对话主题的会话标题自动生成服务（默认开启）。
@@ -421,9 +419,7 @@ impl Plugin for AgentSpinePlugin {
                     SpineModuleMeta {
                         id: "recall".to_string(),
                         label: "情景记忆回溯".to_string(),
-                        description:
-                            "压缩后自动激活的历史会话检索工具 (recall_search / recall_read)"
-                                .to_string(),
+                        description: "静态常驻的历史会话检索与回溯工具 (recall)".to_string(),
                     },
                     ModuleSpec::Recall(recall_cfg),
                 ));

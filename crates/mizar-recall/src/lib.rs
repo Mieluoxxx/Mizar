@@ -1,30 +1,25 @@
 //! 无损情景回溯插件（综合 `dim` `Recall` + `maka` N-gram Recall + `obelisk` 防爆护栏）。
 //!
-//! - 注册两个只读工具：`recall_search` 与 `recall_read`；
-//! - 默认暴露级别为 `ToolExposure::Deferred`，短会话零 Schema 上下文开销；
-//! - 一旦会话发生首次 `ToolResultPrune` / `Compaction`，或处于 `parent_id` 分叉/换段谱系中，
-//!   自动将该会话的 `recall_search` / `recall_read` 激活为模型可见；
+//! - 注册单一常驻只读工具：`recall`（固定 `ToolExposure::Direct`，全程冻结工具声明集不动态改表）；
+//! - 同时支持按 `query` 搜索摘要片段（穿透压缩与谱系边界）以及按 `seq`/`session_id` 分页拉取原文；
 //! - 优先调用 SQLite 后端的 FTS5 1..=3 n-gram 索引，未挂载持久化时自动回退至内存扫描；
 //! - 严格限定单次返回字符上限、跨会话作用域校验与 `is_current_session` 标记，防止回溯反向撑爆上下文。
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
-use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
+use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use mizar_llm::ContentBlock;
 use mizar_session::{
-    EVENT_SESSION_CREATED, EVENT_SESSION_EVENT, EVENT_SESSION_LOADED, RecallSearchHit,
-    RecallSearchQuery, Session, SessionContextExt, SessionCreatedPayload, SessionEntry,
-    SessionEvent, SessionEventPayload, SessionListQuery, SessionLoadedPayload, SessionStore,
+    RecallSearchHit, RecallSearchQuery, SessionContextExt, SessionEntry, SessionEvent,
+    SessionListQuery, SessionStore,
 };
 use mizar_tools::{
     ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput, ToolsContextExt,
 };
 use serde_json::{Value, json};
 
-pub const RECALL_SEARCH_TOOL_NAME: &str = "recall_search";
-pub const RECALL_READ_TOOL_NAME: &str = "recall_read";
+pub const RECALL_TOOL_NAME: &str = "recall";
 
 const MAX_SEARCH_LIMIT: usize = 20;
 const MAX_READ_RANGE_ENTRIES: u64 = 12;
@@ -36,8 +31,6 @@ const FALLBACK_SNIPPET_CHARS: usize = 240;
 pub struct RecallConfig {
     /// 是否启用情景回溯工具（默认 true）。
     pub enabled: bool,
-    /// 发生剪枝/压缩或存在父会话谱系时自动向当前会话激活 `recall_*`（默认 true）。
-    pub auto_activate_on_compaction: bool,
     pub default_search_limit: usize,
     pub read_char_limit: usize,
 }
@@ -46,18 +39,10 @@ impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            auto_activate_on_compaction: true,
             default_search_limit: 8,
             read_char_limit: DEFAULT_READ_CHAR_LIMIT,
         }
     }
-}
-
-fn should_activate_recall(session: &Session) -> bool {
-    let header = session.header();
-    header.compacted_up_to_seq.is_some()
-        || header.parent_id.is_some()
-        || !session.pruned_map().is_empty()
 }
 
 fn render_entry_verbatim(entry: &SessionEntry) -> Option<String> {
@@ -67,7 +52,7 @@ fn render_entry_verbatim(entry: &SessionEntry) -> Option<String> {
                 Some(format!("[seq #{} | user]\n{}", entry.seq, text))
             } else {
                 Some(format!(
-                    "[seq #{} | user]\n[图片 {} 张]\n{}",
+                    "[seq #{} | user]\n[{} image(s)]\n{}",
                     entry.seq,
                     images.len(),
                     text
@@ -283,353 +268,381 @@ fn is_session_authorized(store: &SessionStore, caller_sid: Option<&str>, target_
     }
 }
 
-fn build_recall_search_tool(store: Arc<SessionStore>, default_limit: usize) -> ToolDefinition {
+async fn execute_recall_search(
+    store: Arc<SessionStore>,
+    caller_sid: Option<String>,
+    query_str: String,
+    scope: &str,
+    limit: usize,
+) -> Result<ToolOutput, BoxError> {
+    let (session_ids, cwd) = match scope {
+        "current" => match &caller_sid {
+            Some(sid) => (vec![sid.clone()], None),
+            None => (Vec::new(), store.default_cwd()),
+        },
+        "workspace" => {
+            let ws = caller_sid
+                .as_deref()
+                .and_then(|sid| store.inspect_readonly(sid))
+                .and_then(|s| s.header.cwd)
+                .or_else(|| store.default_cwd());
+            (Vec::new(), ws)
+        }
+        _ => match &caller_sid {
+            Some(sid) => (store.lineage_session_ids(sid), None),
+            None => (Vec::new(), store.default_cwd()),
+        },
+    };
+
+    let search_query = RecallSearchQuery {
+        query: query_str.clone(),
+        session_ids,
+        cwd: cwd.clone(),
+        limit,
+    };
+
+    let mut hits = match store.search_recall(&search_query) {
+        Ok(Some(db_hits)) => db_hits,
+        Ok(None) | Err(_) => fallback_in_memory_search(&store, &search_query),
+    };
+
+    // 若在 workspace 范围下但无 SQLite，补扫所有已列出的会话头（已在内存者）
+    if hits.is_empty()
+        && scope == "workspace"
+        && cwd.is_some()
+        && let Ok(headers) = store.list_headers(&SessionListQuery {
+            cwd,
+            limit: Some(50),
+            ..Default::default()
+        })
+    {
+        let mut ids = HashSet::new();
+        for h in headers {
+            ids.insert(h.id);
+        }
+        let q = RecallSearchQuery {
+            query: query_str.clone(),
+            session_ids: ids.into_iter().collect(),
+            cwd: None,
+            limit,
+        };
+        hits = fallback_in_memory_search(&store, &q);
+    }
+
+    if hits.is_empty() {
+        return Ok(ToolOutput::text(format!(
+            "No preserved history matched query {:?} in scope '{scope}'.",
+            query_str
+        ))
+        .with_structured(json!({
+            "mode": "search",
+            "query": query_str,
+            "scope": scope,
+            "hits": []
+        })));
+    }
+
+    let mut lines = Vec::with_capacity(hits.len() + 2);
+    lines.push(format!(
+        "Found {} preserved history hit(s) for {:?} (scope={scope}):",
+        hits.len(),
+        query_str
+    ));
+    let mut structured_hits = Vec::with_capacity(hits.len());
+    for hit in &hits {
+        let is_current = caller_sid.as_deref() == Some(hit.session_id.as_str());
+        let origin = if is_current {
+            "current".to_string()
+        } else {
+            format!("session:{}", hit.session_id)
+        };
+        lines.push(format!(
+            "- [{origin} seq #{} | {}] {}",
+            hit.seq, hit.kind, hit.snippet
+        ));
+        structured_hits.push(json!({
+            "sessionId": hit.session_id,
+            "sessionTitle": hit.session_title,
+            "isCurrentSession": is_current,
+            "seq": hit.seq,
+            "kind": hit.kind,
+            "snippet": hit.snippet,
+        }));
+    }
+    lines.push("Use recall(seq=..., session_id=...) to inspect full verbatim entries.".into());
+
+    let meta = json!({
+        "mode": "search",
+        "query": query_str,
+        "scope": scope,
+        "hits": structured_hits,
+    });
+    Ok(ToolOutput::text(lines.join("\n"))
+        .with_structured(meta.clone())
+        .with_details(meta))
+}
+
+async fn execute_recall_read(
+    store: Arc<SessionStore>,
+    caller_sid: Option<&str>,
+    args: &Value,
+    start_seq: u64,
+    default_char_limit: usize,
+) -> Result<ToolOutput, BoxError> {
+    let requested_end = args
+        .get("end_seq")
+        .and_then(Value::as_u64)
+        .unwrap_or(start_seq)
+        .max(start_seq);
+    let end_seq = requested_end.min(start_seq.saturating_add(MAX_READ_RANGE_ENTRIES - 1));
+    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| (v as usize).clamp(100, MAX_READ_CHAR_LIMIT))
+        .unwrap_or_else(|| default_char_limit.clamp(100, MAX_READ_CHAR_LIMIT));
+    let to_file = args
+        .get("to_file")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let target_sid = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| caller_sid.map(ToString::to_string))
+        .ok_or("Missing `session_id` and no active session.")?;
+
+    if !is_session_authorized(&store, caller_sid, &target_sid) {
+        return Err(format!(
+            "Access denied: session `{target_sid}` is outside current lineage or workspace."
+        )
+        .into());
+    }
+
+    let session = store
+        .inspect_readonly(&target_sid)
+        .ok_or_else(|| format!("Session `{target_sid}` not found."))?;
+
+    let mut rendered_blocks = Vec::new();
+    for entry in &session.entries {
+        if entry.seq < start_seq || entry.seq > end_seq {
+            continue;
+        }
+        if let Some(block) = render_entry_verbatim(entry) {
+            rendered_blocks.push(block);
+        }
+    }
+
+    if rendered_blocks.is_empty() {
+        return Ok(ToolOutput::text(format!(
+            "No readable surface entries found in session `{target_sid}` for seq {start_seq}..={end_seq}."
+        ))
+        .with_structured(json!({
+            "mode": "read",
+            "sessionId": target_sid,
+            "startSeq": start_seq,
+            "endSeq": end_seq,
+            "found": false
+        })));
+    }
+
+    let full_text = rendered_blocks.join("\n\n---\n\n");
+    let total_chars = full_text.chars().count();
+
+    if to_file {
+        let safe_sid: String = target_sid
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(32)
+            .collect();
+        let out_path = std::env::temp_dir().join(format!(
+            "mizar_recall_{safe_sid}_{start_seq}_{end_seq}_{}.txt",
+            std::process::id()
+        ));
+        tokio::fs::write(&out_path, full_text.as_bytes()).await?;
+        let meta = json!({
+            "mode": "read",
+            "sessionId": target_sid,
+            "startSeq": start_seq,
+            "endSeq": end_seq,
+            "totalChars": total_chars,
+            "filePath": out_path.display().to_string(),
+        });
+        return Ok(ToolOutput::text(format!(
+            "Exported {total_chars} chars (session `{target_sid}`, seq {start_seq}..={end_seq}) to: {}\nUse `read` with offset/limit to inspect it without bloating context.",
+            out_path.display()
+        ))
+        .with_structured(meta.clone())
+        .with_details(meta));
+    }
+
+    if offset >= total_chars {
+        return Ok(ToolOutput::text(format!(
+            "Offset {offset} is beyond end of recalled text ({total_chars} chars total)."
+        ))
+        .with_structured(json!({
+            "mode": "read",
+            "sessionId": target_sid,
+            "startSeq": start_seq,
+            "endSeq": end_seq,
+            "totalChars": total_chars,
+            "offset": offset,
+            "truncated": false
+        })));
+    }
+
+    let slice: String = full_text.chars().skip(offset).take(limit).collect();
+    let returned_chars = slice.chars().count();
+    let next_offset = if offset + returned_chars < total_chars {
+        Some(offset + returned_chars)
+    } else {
+        None
+    };
+
+    let mut out = slice;
+    if let Some(next) = next_offset {
+        out.push_str(&format!(
+            "\n\n[Showing chars {offset}..{} of {total_chars}. Call recall(seq={start_seq}, end_seq={end_seq}, offset={next}) to continue, or pass to_file=true.]",
+            offset + returned_chars
+        ));
+    }
+
+    let meta = json!({
+        "mode": "read",
+        "sessionId": target_sid,
+        "startSeq": start_seq,
+        "endSeq": end_seq,
+        "totalChars": total_chars,
+        "offset": offset,
+        "nextOffset": next_offset,
+        "truncated": next_offset.is_some(),
+    });
+    Ok(ToolOutput::text(out)
+        .with_structured(meta.clone())
+        .with_details(meta))
+}
+
+fn build_recall_tool(
+    store: Arc<SessionStore>,
+    default_search_limit: usize,
+    default_read_char_limit: usize,
+) -> ToolDefinition {
     ToolDefinition::async_rich_tool(
-        RECALL_SEARCH_TOOL_NAME,
-        "Search preserved session history across compaction boundaries, pruned tool outputs, parent/forked lineage, or other sessions in the same workspace. Returns compact snippets with session_id and seq handles for recall_read.",
+        RECALL_TOOL_NAME,
+        "Search preserved session history or read verbatim entries by seq across compaction boundaries, pruned tool outputs, lineage, or workspace sessions. Pass `query` to search compact snippets, or `seq` (with optional `end_seq`, `session_id`, `offset`, `limit`, `to_file`) to read verbatim entries.",
         json!({
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords, file paths, symbol names, or Chinese/English phrases to search for"
+                    "description": "Keywords, file paths, or symbols to search across preserved history. Omit when reading by seq."
                 },
                 "scope": {
                     "type": "string",
                     "enum": ["current", "lineage", "workspace"],
-                    "description": "Search scope: 'current' (only this session), 'lineage' (this session + parent/fork ancestors, default), or 'workspace' (all sessions in the same workspace)"
+                    "description": "Search scope when using query: 'current', 'lineage' (default), or 'workspace'."
                 },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20,
-                    "description": "Maximum number of hits to return (default 8, max 20)"
-                }
-            },
-            "required": ["query"]
-        }),
-        move |args, call_ctx| {
-            let store = Arc::clone(&store);
-            async move {
-                let query_str = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or("缺少 query 参数")?
-                    .to_string();
-                let scope = args
-                    .get("scope")
-                    .and_then(Value::as_str)
-                    .unwrap_or("lineage");
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .map(|v| (v as usize).clamp(1, MAX_SEARCH_LIMIT))
-                    .unwrap_or_else(|| default_limit.clamp(1, MAX_SEARCH_LIMIT));
-
-                let caller_sid = call_ctx.session_id().map(ToString::to_string);
-
-            let (session_ids, cwd) = match scope {
-                "current" => match &caller_sid {
-                    Some(sid) => (vec![sid.clone()], None),
-                    None => (Vec::new(), store.default_cwd()),
-                },
-                "workspace" => {
-                    let ws = caller_sid
-                        .as_deref()
-                        .and_then(|sid| store.inspect_readonly(sid))
-                        .and_then(|s| s.header.cwd)
-                        .or_else(|| store.default_cwd());
-                    (Vec::new(), ws)
-                }
-                _ => match &caller_sid {
-                    Some(sid) => (store.lineage_session_ids(sid), None),
-                    None => (Vec::new(), store.default_cwd()),
-                },
-            };
-
-            let search_query = RecallSearchQuery {
-                query: query_str.clone(),
-                session_ids: session_ids.clone(),
-                cwd: cwd.clone(),
-                limit,
-            };
-
-            let mut hits = match store.search_recall(&search_query) {
-                Ok(Some(db_hits)) => db_hits,
-                Ok(None) => fallback_in_memory_search(&store, &search_query),
-                Err(_) => fallback_in_memory_search(&store, &search_query),
-            };
-
-            // 若在 workspace 范围下但无 SQLite，补扫所有已列出的会话头（已在内存者）
-            if hits.is_empty()
-                && scope == "workspace"
-                && cwd.is_some()
-                && let Ok(headers) = store.list_headers(&SessionListQuery {
-                    cwd: cwd.clone(),
-                    limit: Some(50),
-                    ..Default::default()
-                })
-            {
-                let mut ids = HashSet::new();
-                for h in headers {
-                    ids.insert(h.id);
-                }
-                let q = RecallSearchQuery {
-                    query: query_str.clone(),
-                    session_ids: ids.into_iter().collect(),
-                    cwd: None,
-                    limit,
-                };
-                hits = fallback_in_memory_search(&store, &q);
-            }
-
-            if hits.is_empty() {
-                return Ok(ToolOutput::text(format!(
-                    "No preserved history matched query {:?} in scope '{scope}'.",
-                    query_str
-                ))
-                .with_structured(json!({
-                    "query": query_str,
-                    "scope": scope,
-                    "hits": []
-                })));
-            }
-
-            let mut lines = Vec::with_capacity(hits.len() + 2);
-            lines.push(format!(
-                "Found {} preserved history hit(s) for {:?} (scope={scope}):",
-                hits.len(),
-                query_str
-            ));
-            let mut structured_hits = Vec::with_capacity(hits.len());
-            for hit in &hits {
-                let is_current = caller_sid.as_deref() == Some(hit.session_id.as_str());
-                let origin = if is_current {
-                    "current".to_string()
-                } else {
-                    format!("session:{}", hit.session_id)
-                };
-                lines.push(format!(
-                    "- [{origin} seq #{} | {}] {}",
-                    hit.seq, hit.kind, hit.snippet
-                ));
-                structured_hits.push(json!({
-                    "sessionId": hit.session_id,
-                    "sessionTitle": hit.session_title,
-                    "isCurrentSession": is_current,
-                    "seq": hit.seq,
-                    "kind": hit.kind,
-                    "snippet": hit.snippet,
-                }));
-            }
-            lines.push("Use recall_read(seq=..., session_id=...) to inspect full verbatim entries.".into());
-
-            let meta = json!({
-                "query": query_str,
-                "scope": scope,
-                "hits": structured_hits,
-            });
-            Ok(ToolOutput::text(lines.join("\n"))
-                .with_structured(meta.clone())
-                .with_details(meta))
-            }
-        },
-    )
-    .with_exposure(ToolExposure::Deferred)
-    .with_execution_mode(ToolExecutionMode::Parallel)
-    .with_annotations(ToolAnnotations {
-        read_only: true,
-        destructive: false,
-        idempotent: true,
-        open_world: false,
-    })
-    .with_prompt_snippet("Search compacted or archived session history")
-}
-
-fn build_recall_read_tool(store: Arc<SessionStore>, default_char_limit: usize) -> ToolDefinition {
-    ToolDefinition::async_rich_tool(
-        RECALL_READ_TOOL_NAME,
-        "Read preserved verbatim session log entries by seq number or range, including entries that were pruned or compacted out of the active context window. Supports character offset/limit pagination or exporting large entries to a temporary file.",
-        json!({
-            "type": "object",
-            "properties": {
                 "seq": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Starting event seq number to read"
+                    "description": "Starting event seq number to read verbatim."
                 },
                 "end_seq": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional inclusive ending seq number (at most 12 entries per call)"
+                    "description": "Optional inclusive ending seq number when reading (max 12 entries per call)."
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Optional session ID (defaults to current session; must belong to current lineage or workspace)"
+                    "description": "Optional session ID when reading (defaults to current session; restricted to current lineage or workspace)."
                 },
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Character offset into the rendered entry text for pagination (default 0)"
+                    "description": "Character offset into rendered entry text for pagination when reading (default 0)."
                 },
                 "limit": {
                     "type": "integer",
-                    "minimum": 100,
-                    "maximum": 8192,
-                    "description": "Maximum characters to return inline (default 6000, max 8192)"
+                    "minimum": 1,
+                    "description": "Max hits when searching (default 8, max 20), or max inline characters when reading (default 6000, min 100, max 8192)."
                 },
                 "to_file": {
                     "type": "boolean",
-                    "description": "If true, write full verbatim text to a temporary file and return its path instead of inlining it"
+                    "description": "When reading, write full verbatim text to a temp file and return its path instead of inlining."
                 }
-            },
-            "required": ["seq"]
+            }
         }),
         move |args, call_ctx| {
             let store = Arc::clone(&store);
             async move {
-                let start_seq = args
-                    .get("seq")
-                    .and_then(Value::as_u64)
-                    .filter(|&v| v >= 1)
-                    .ok_or("缺少有效的 seq 参数（需 >= 1）")?;
-                let requested_end = args
-                    .get("end_seq")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(start_seq)
-                    .max(start_seq);
-                let end_seq = requested_end.min(start_seq.saturating_add(MAX_READ_RANGE_ENTRIES - 1));
-                let offset = args
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .map(|v| (v as usize).clamp(100, MAX_READ_CHAR_LIMIT))
-                    .unwrap_or_else(|| default_char_limit.clamp(100, MAX_READ_CHAR_LIMIT));
-                let to_file = args
-                    .get("to_file")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let query_opt = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string);
+                let has_seq = args.get("seq").is_some();
+                let seq_opt = if has_seq {
+                    let seq = args
+                        .get("seq")
+                        .and_then(Value::as_u64)
+                        .filter(|&v| v >= 1)
+                        .ok_or("Invalid `seq` parameter: must be an integer >= 1.")?;
+                    Some(seq)
+                } else {
+                    None
+                };
 
-                let caller_sid = call_ctx.session_id();
-            let target_sid = args
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .or_else(|| caller_sid.map(ToString::to_string))
-                .ok_or("缺少 session_id 参数且当前无活跃会话")?;
-
-            if !is_session_authorized(&store, caller_sid, &target_sid) {
-                return Err(format!("无权跨工作区访问会话 `{target_sid}` 的历史记录").into());
-            }
-
-            let session = store
-                .inspect_readonly(&target_sid)
-                .ok_or_else(|| format!("未找到会话 `{target_sid}`"))?;
-
-            let mut rendered_blocks = Vec::new();
-            for entry in &session.entries {
-                if entry.seq < start_seq || entry.seq > end_seq {
-                    continue;
+                match (query_opt, seq_opt) {
+                    (Some(_), Some(_)) => {
+                        Err("Provide either `query` to search or `seq` to read, not both.".into())
+                    }
+                    (None, Some(start_seq)) => {
+                        execute_recall_read(
+                            store,
+                            call_ctx.session_id(),
+                            &args,
+                            start_seq,
+                            default_read_char_limit,
+                        )
+                        .await
+                    }
+                    (Some(query_str), None) => {
+                        let scope = args
+                            .get("scope")
+                            .and_then(Value::as_str)
+                            .unwrap_or("lineage");
+                        let limit = args
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .map(|v| (v as usize).clamp(1, MAX_SEARCH_LIMIT))
+                            .unwrap_or_else(|| default_search_limit.clamp(1, MAX_SEARCH_LIMIT));
+                        execute_recall_search(
+                            store,
+                            call_ctx.session_id().map(ToString::to_string),
+                            query_str,
+                            scope,
+                            limit,
+                        )
+                        .await
+                    }
+                    (None, None) => {
+                        Err("Provide either `query` to search history or `seq` (>= 1) to read verbatim entries.".into())
+                    }
                 }
-                if let Some(block) = render_entry_verbatim(entry) {
-                    rendered_blocks.push(block);
-                }
-            }
-
-            if rendered_blocks.is_empty() {
-                return Ok(ToolOutput::text(format!(
-                    "No readable surface entries found in session `{target_sid}` for seq {start_seq}..={end_seq}."
-                ))
-                .with_structured(json!({
-                    "sessionId": target_sid,
-                    "startSeq": start_seq,
-                    "endSeq": end_seq,
-                    "found": false
-                })));
-            }
-
-            let full_text = rendered_blocks.join("\n\n---\n\n");
-            let total_chars = full_text.chars().count();
-
-            if to_file {
-                let safe_sid: String = target_sid
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                    .take(32)
-                    .collect();
-                let out_path = std::env::temp_dir().join(format!(
-                    "mizar_recall_{safe_sid}_{start_seq}_{end_seq}_{}.txt",
-                    std::process::id()
-                ));
-                tokio::fs::write(&out_path, full_text.as_bytes()).await?;
-                let meta = json!({
-                    "sessionId": target_sid,
-                    "startSeq": start_seq,
-                    "endSeq": end_seq,
-                    "totalChars": total_chars,
-                    "filePath": out_path.display().to_string(),
-                });
-                return Ok(ToolOutput::text(format!(
-                    "Exported {total_chars} chars (session `{target_sid}`, seq {start_seq}..={end_seq}) to: {}\nUse `read` with offset/limit to inspect it without bloating context.",
-                    out_path.display()
-                ))
-                .with_structured(meta.clone())
-                .with_details(meta));
-            }
-
-            if offset >= total_chars {
-                return Ok(ToolOutput::text(format!(
-                    "Offset {offset} is beyond end of recalled text ({total_chars} chars total)."
-                ))
-                .with_structured(json!({
-                    "sessionId": target_sid,
-                    "startSeq": start_seq,
-                    "endSeq": end_seq,
-                    "totalChars": total_chars,
-                    "offset": offset,
-                    "truncated": false
-                })));
-            }
-
-            let slice: String = full_text.chars().skip(offset).take(limit).collect();
-            let returned_chars = slice.chars().count();
-            let next_offset = if offset + returned_chars < total_chars {
-                Some(offset + returned_chars)
-            } else {
-                None
-            };
-
-            let mut out = slice;
-            if let Some(next) = next_offset {
-                out.push_str(&format!(
-                    "\n\n[Showing chars {offset}..{} of {total_chars}. Call recall_read(seq={start_seq}, end_seq={end_seq}, offset={next}) to continue, or pass to_file=true.]",
-                    offset + returned_chars
-                ));
-            }
-
-            let meta = json!({
-                "sessionId": target_sid,
-                "startSeq": start_seq,
-                "endSeq": end_seq,
-                "totalChars": total_chars,
-                "offset": offset,
-                "nextOffset": next_offset,
-                "truncated": next_offset.is_some(),
-            });
-            Ok(ToolOutput::text(out)
-                .with_structured(meta.clone())
-                .with_details(meta))
             }
         },
     )
-    .with_exposure(ToolExposure::Deferred)
+    .with_exposure(ToolExposure::Direct)
     .with_execution_mode(ToolExecutionMode::Parallel)
     .with_annotations(ToolAnnotations {
         read_only: true,
@@ -637,7 +650,7 @@ fn build_recall_read_tool(store: Arc<SessionStore>, default_char_limit: usize) -
         idempotent: true,
         open_world: false,
     })
-    .with_prompt_snippet("Read verbatim historical session entries by seq")
+    .with_prompt_snippet("Search or read preserved verbatim session history across compaction boundaries")
 }
 
 #[derive(Default, Clone, Copy)]
@@ -665,156 +678,18 @@ impl Plugin for RecallPlugin {
             }
             let sessions = ctx.sessions()?;
             let tools = ctx.tools()?;
-            let mut cleanups = Vec::new();
-
-            {
-                let rt = Arc::clone(&tools);
-                let store = Arc::clone(&sessions);
-                let limit = config.default_search_limit;
-                cleanups.push(ctx.effect("recall.register-search", move || {
-                    Ok::<_, mizar_tools::ToolError>(Some(
-                        rt.register(build_recall_search_tool(store, limit))?,
-                    ))
-                })?);
-            }
-            {
-                let rt = Arc::clone(&tools);
-                let store = Arc::clone(&sessions);
-                let char_limit = config.read_char_limit;
-                cleanups.push(ctx.effect("recall.register-read", move || {
-                    Ok::<_, mizar_tools::ToolError>(Some(
-                        rt.register(build_recall_read_tool(store, char_limit))?,
-                    ))
-                })?);
-            }
-
-            for session in sessions.list() {
-                if should_activate_recall(&session) {
-                    tools.activate_tools(
-                        &session.id,
-                        &[
-                            RECALL_SEARCH_TOOL_NAME.to_string(),
-                            RECALL_READ_TOOL_NAME.to_string(),
-                        ],
-                    );
-                }
-            }
-
-            if config.auto_activate_on_compaction {
-                let rt_created = Arc::clone(&tools);
-                let ctx_created = ctx.clone();
-                cleanups.push(ctx.effect("recall.on-session-created", move || {
-                    let h = ctx_created.on(
-                        EVENT_SESSION_CREATED,
-                        move |ev: &SessionCreatedPayload| {
-                            if should_activate_recall(&ev.session) {
-                                rt_created.activate_tools(
-                                    &ev.session.id,
-                                    &[
-                                        RECALL_SEARCH_TOOL_NAME.to_string(),
-                                        RECALL_READ_TOOL_NAME.to_string(),
-                                    ],
-                                );
-                            }
-                        },
-                    )?;
-                    Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?);
-
-                let rt_loaded = Arc::clone(&tools);
-                let ctx_loaded = ctx.clone();
-                cleanups.push(ctx.effect("recall.on-session-loaded", move || {
-                    let h =
-                        ctx_loaded.on(EVENT_SESSION_LOADED, move |ev: &SessionLoadedPayload| {
-                            if should_activate_recall(&ev.session) {
-                                rt_loaded.activate_tools(
-                                    &ev.session.id,
-                                    &[
-                                        RECALL_SEARCH_TOOL_NAME.to_string(),
-                                        RECALL_READ_TOOL_NAME.to_string(),
-                                    ],
-                                );
-                            }
-                        })?;
-                    Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?);
-
-                let rt_ev = Arc::clone(&tools);
-                let ctx_ev = ctx.clone();
-                cleanups.push(ctx.effect("recall.on-session-event", move || {
-                    let h = ctx_ev.on(EVENT_SESSION_EVENT, move |ev: &SessionEventPayload| {
-                        if matches!(
-                            ev.entry.event,
-                            SessionEvent::Compaction { .. } | SessionEvent::ToolResultPrune { .. }
-                        ) {
-                            rt_ev.activate_tools(
-                                &ev.session.id,
-                                &[
-                                    RECALL_SEARCH_TOOL_NAME.to_string(),
-                                    RECALL_READ_TOOL_NAME.to_string(),
-                                ],
-                            );
-                        }
-                    })?;
-                    Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?);
-
-                let rt_step = Arc::clone(&tools);
-                let ctx_step = ctx.clone();
-                cleanups.push(ctx.effect("recall.on-pre-step", move || {
-                    let h = ctx_step.on_waterfall_with(
-                        EVENT_AGENT_PRE_STEP,
-                        move |input: AgentPreStepInput,
-                              next: Next<
-                            AgentPreStepInput,
-                            BoxFuture<'static, AgentPreStepDecision>,
-                        >| {
-                            let rt = Arc::clone(&rt_step);
-                            let session = Arc::clone(&input.session);
-                            let cancel = input.cancel.clone();
-                            Box::pin(async move {
-                                if cancel.is_cancelled() {
-                                    return AgentPreStepDecision::Reject {
-                                        reason: "cancelled".to_string(),
-                                    };
-                                }
-                                let decision = next.call(input).await;
-                                if matches!(decision, AgentPreStepDecision::Enter { .. })
-                                    && should_activate_recall(&session)
-                                {
-                                    rt.activate_tools(
-                                        &session.id,
-                                        &[
-                                            RECALL_SEARCH_TOOL_NAME.to_string(),
-                                            RECALL_READ_TOOL_NAME.to_string(),
-                                        ],
-                                    );
-                                }
-                                decision
-                            })
-                                as BoxFuture<'static, AgentPreStepDecision>
-                        },
-                        cordis::EventOptions {
-                            priority: 20,
-                            ..Default::default()
-                        },
-                    )?;
-                    Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?);
-            }
+            let search_limit = config.default_search_limit;
+            let char_limit = config.read_char_limit;
+            let handle = ctx.effect("recall.register", move || {
+                Ok::<_, mizar_tools::ToolError>(Some(tools.register(build_recall_tool(
+                    sessions,
+                    search_limit,
+                    char_limit,
+                ))?))
+            })?;
 
             Ok(Some(Cleanup::async_fn(move || async move {
-                for h in cleanups {
-                    h.dispose().await;
-                }
+                handle.dispose().await;
             })))
         })
     }
@@ -829,7 +704,7 @@ mod tests {
     use mizar_tools::{ToolExecution, ToolRuntime};
 
     #[tokio::test]
-    async fn auto_activates_on_compaction_and_reads_pruned_verbatim_text() {
+    async fn static_recall_freezes_tool_list_across_compaction_and_reads_pruned_verbatim_text() {
         let app = Context::new();
         app.plugin(
             SqlitePersistencePlugin,
@@ -852,13 +727,13 @@ mod tests {
             ..Default::default()
         });
 
-        // 压缩/剪枝前 recall 工具默认延迟，不占活跃声明集
-        assert!(
-            !tools
-                .list_declared(Some(&s.id))
-                .iter()
-                .any(|t| t.name == RECALL_SEARCH_TOOL_NAME)
-        );
+        // 静态常驻：压缩/剪枝前即已存在于 Declared 列表，全程工具列表冻结不变
+        let declared_before: Vec<String> = tools
+            .list_declared(Some(&s.id))
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(declared_before, vec![RECALL_TOOL_NAME.to_string()]);
 
         s.append(SessionEvent::user("请确认数据库连接池上限与回溯策略"));
         s.append(SessionEvent::ToolResult {
@@ -874,22 +749,20 @@ mod tests {
         }]);
         assert!(prune_seq.is_some());
 
-        // 发生剪枝后自动激活 recall_search 与 recall_read
-        let declared_names: Vec<String> = tools
+        // 再发生 Compaction，Declared 工具列表完全不变（零 KV Cache 破坏）
+        s.compact("前情已压缩", 0, Some(500));
+        s.flush_async().await.unwrap();
+
+        let declared_after: Vec<String> = tools
             .list_declared(Some(&s.id))
             .into_iter()
             .map(|t| t.name)
             .collect();
-        assert!(declared_names.contains(&RECALL_SEARCH_TOOL_NAME.to_string()));
-        assert!(declared_names.contains(&RECALL_READ_TOOL_NAME.to_string()));
-
-        // 再发生 Compaction，依然可穿透搜索并读回被剪枝+被压缩的原始文本
-        s.compact("前情已压缩", 0, Some(500));
-        s.flush_async().await.unwrap();
+        assert_eq!(declared_after, declared_before);
 
         let search_res = tools
             .execute(ToolExecution::new(
-                RECALL_SEARCH_TOOL_NAME,
+                RECALL_TOOL_NAME,
                 json!({ "query": "MAX_POOL_CONNECTIONS", "scope": "current" }),
                 Some(s.id.clone()),
             ))
@@ -900,10 +773,15 @@ mod tests {
             "{}",
             search_res.content
         );
+        assert!(
+            search_res.content.contains("recall(seq="),
+            "{}",
+            search_res.content
+        );
 
         let read_res = tools
             .execute(ToolExecution::new(
-                RECALL_READ_TOOL_NAME,
+                RECALL_TOOL_NAME,
                 json!({ "seq": 2 }),
                 Some(s.id.clone()),
             ))
@@ -915,6 +793,46 @@ mod tests {
                 .contains("MAX_POOL_CONNECTIONS = 64 // 关键配置原文"),
             "{}",
             read_res.content
+        );
+
+        // 校验参数互斥与缺参错误处理
+        let both_err = tools
+            .execute(ToolExecution::new(
+                RECALL_TOOL_NAME,
+                json!({ "query": "MAX_POOL", "seq": 2 }),
+                Some(s.id.clone()),
+            ))
+            .await;
+        assert!(both_err.is_error);
+
+        let empty_err = tools
+            .execute(ToolExecution::new(
+                RECALL_TOOL_NAME,
+                json!({}),
+                Some(s.id.clone()),
+            ))
+            .await;
+        assert!(empty_err.is_error);
+
+        // 校验分页提示使用统一工具名 recall(...)
+        s.append(SessionEvent::ToolResult {
+            tool_call_id: "tc-2".into(),
+            name: "read".into(),
+            content: "X".repeat(350),
+            is_error: false,
+        });
+        let page_res = tools
+            .execute(ToolExecution::new(
+                RECALL_TOOL_NAME,
+                json!({ "seq": 5, "limit": 100 }),
+                Some(s.id.clone()),
+            ))
+            .await;
+        assert!(!page_res.is_error, "{}", page_res.content);
+        assert!(
+            page_res.content.contains("Call recall(seq=5"),
+            "{}",
+            page_res.content
         );
 
         app.fiber().dispose().await;
@@ -952,7 +870,7 @@ mod tests {
         // 跨工作区读取应被拒绝
         let denied = tools
             .execute(ToolExecution::new(
-                RECALL_READ_TOOL_NAME,
+                RECALL_TOOL_NAME,
                 json!({ "seq": 1, "session_id": "other-ws" }),
                 Some(child.id.clone()),
             ))
@@ -962,7 +880,7 @@ mod tests {
         // 同谱系父会话读取应放行
         let allowed = tools
             .execute(ToolExecution::new(
-                RECALL_READ_TOOL_NAME,
+                RECALL_TOOL_NAME,
                 json!({ "seq": 1, "session_id": "parent-s" }),
                 Some(child.id.clone()),
             ))
@@ -974,7 +892,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_queries_do_not_hydrate_or_repair_cold_sessions_and_resume_rearms_tools() {
+    async fn readonly_queries_do_not_hydrate_or_repair_cold_sessions_and_resume_keeps_static_recall()
+     {
         let dir = std::env::temp_dir().join(format!(
             "mizar_recall_readonly_{}_{:?}",
             std::process::id(),
@@ -1041,7 +960,7 @@ mod tests {
 
         let read_res = tools2
             .execute(ToolExecution::new(
-                RECALL_READ_TOOL_NAME,
+                RECALL_TOOL_NAME,
                 json!({ "seq": 1, "session_id": "cold-arch" }),
                 Some(caller.id.clone()),
             ))
@@ -1053,14 +972,14 @@ mod tests {
         let cold_ro = store2.inspect_readonly("cold-arch").unwrap();
         assert_eq!(cold_ro.entries.len(), 3);
 
-        // 3. 真正 resume (get) cold-arch 时，应在未运行任何 Turn 前立即激活 recall 工具
+        // 3. 静态 recall 在 resume 前后均已声明
         let resumed = store2.get("cold-arch").unwrap();
         assert_eq!(resumed.log().len(), 4);
         assert!(
             tools2
                 .list_declared(Some("cold-arch"))
                 .iter()
-                .any(|t| t.name == RECALL_SEARCH_TOOL_NAME)
+                .any(|t| t.name == RECALL_TOOL_NAME)
         );
 
         app2.fiber().dispose().await;

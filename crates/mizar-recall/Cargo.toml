@@ -3,7 +3,7 @@ name = "mizar-recall"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "无损情景回溯插件（recall_search / recall_read，穿透压缩与谱系边界）"
+description = "无损情景回溯插件（统一只读 recall 工具，穿透压缩与谱系边界）"
 
 [lints]
 workspace = true
