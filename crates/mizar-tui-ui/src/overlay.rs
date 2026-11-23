@@ -5,12 +5,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use futures::channel::oneshot;
-pub use mizar_client_core::{
+pub use mizar_types::client::{
     ApprovalDecision, MentionCandidate, MentionCandidateKind, ModelPickerItem, PendingApproval,
     SessionPickerItem, SessionTreeEntry, SettingEntry, SettingItemKind, SkillPickerItem,
     WorkspaceFileCache,
 };
-use mizar_llm_types::{ProviderInfo, ReasoningEffort};
+use mizar_types::llm::{ProviderInfo, ReasoningEffort};
 use ratatui::layout::Rect;
 
 use crate::theme::ThemePreset;

@@ -3,7 +3,7 @@
 给在本仓库工作的 AI coding agent 的说明。
 
 **Mizar** = Rust 重写的终端 AI 编程 Agent：`mizar`（`mizar-tui`）是唯一可执行入口，`cordis` 是自研微内核，
-33 个 crate 靠 `inject` / `provide` 装配成「流式调模型 → 执行工具 → 回写会话」的主循环。
+11 个 crate 靠 `inject` / `provide` 装配成「流式调模型 → 执行工具 → 回写会话」的主循环。
 
 架构权威文本是 **[docs/plugins.md](docs/plugins.md)**。本文件不复述它，只记「反直觉、看代码看不出来」的规则。
 
@@ -11,12 +11,12 @@
 
 ## 一、不可破坏的边界
 
-**这四个 crate 禁止引入 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`**：
-`mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`（其中 `mizar-client-core` **亦禁止**引入 `ratatui` / `crossterm`）。
+**这两个纯核/纯前端 crate 禁止引入 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`**：
+`mizar-types`、`mizar-tui-ui`（其中 `mizar-types` **亦禁止**引入 `ratatui` / `crossterm` 及任何内部 crate）。
 
-加了能编过，但架构就废了。需要异步或运行时能力，上移到 `mizar-client` / `mizar-tui` / `mizar-agent-spine` 宿主层。
+加了能编过，但架构就废了。需要异步或运行时能力，上移到 `mizar-client` / `mizar-tui` / `mizar-core` 宿主层。
 
-**Merak Desktop 直嵌边界**：**`mizar-client`（及 `mizar-client-core`）禁止引入 `ratatui` / `crossterm` / `mizar-tui-ui`**，确保跨端宿主运行时零终端依赖。
+**Merak Desktop 直嵌边界**：**`mizar-client`（及 `mizar-types`）禁止引入 `ratatui` / `crossterm` / `mizar-tui-ui`**，确保跨端宿主运行时零终端依赖。
 
 **workspace 规则**：根 `Cargo.toml` 无 `[package]`；依赖一律进 `[workspace.dependencies]`，crate 内写
 `{ workspace = true }`，不写死版本号；每个 crate 带 `[lints] workspace = true`。Rust 固定 **1.98.0**、edition 2024。
@@ -31,7 +31,7 @@
 ```sh
 cargo check -p mizar-tui-ui     # 改 UI 的快速回路，秒级
 cargo check --workspace       # 全量；改跨 crate 枚举/字段必跑
-cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+cargo check --locked -p mizar-core --no-default-features --all-targets
 cargo test --locked --workspace --no-fail-fast
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -43,10 +43,10 @@ CI 跑后四条，**clippy 的 warning 也算失败**。仓库**没有** xtask /
 
 ## 三、约定
 
-- **不用 `mod.rs`**：`src/foo.rs` + `src/foo/bar.rs`。生产代码 `use crate::xxx`；测试模块内 `use super::*`（41 处都如此）。
-- 每个 crate 应有 `//!` 模块文档（中文），标注对应的 TS 原版路径。现存例外：`mizar-llm-http`。
+- **不用 `mod.rs`**：`src/foo.rs` + `src/foo/bar.rs`。生产代码 `use crate::xxx`；测试模块内 `use super::*`。
+- 每个 crate 与顶层模块应有 `//!` 模块文档（中文），标注对应的 TS 原版路径。现存例外：`mizar-llm/src/http.rs`。
 - 公共错误用 `thiserror`，不用 `anyhow`；统一 `cordis::BoxError`。
-- **`.lock().unwrap()` 是被接受的（204 处）**。Mutex 中毒不处理 —— 别引 `parking_lot`、别包一层、别当技术债去「修」。
+- **`.lock().unwrap()` 是被接受的**。Mutex 中毒不处理 —— 别引 `parking_lot`、别包一层、别当技术债去「修」。
 
 ### 插件
 
@@ -92,7 +92,7 @@ impl Plugin for XxxPlugin {
 ## 四、测试
 
 - **没有 `tempfile`**：用 `std::env::temp_dir().join(format!("mizar_xxx_{}", std::process::id()))`。
-- `mizar-agent-spine` 的集成测试由 `tests/integration/main.rs` 聚合、按 `#[cfg(feature)]` 门控 ——
+- `mizar-core` 的集成测试由 `tests/integration/main.rs` 聚合、按 `#[cfg(feature)]` 门控 ——
   **新加测试要同步改 `main.rs`**，否则不编译。
 - `cordis/tests/compat.rs` 用 `compat_NN_<描述>` 对齐 TS 原版顺序，编号保持连续。
 - 新行为要带回退即失败的断言。别用 `#[ignore]` / 重试掩盖并发不稳。
@@ -117,12 +117,12 @@ Verified:
 
 ## 六、坑
 
-- **改 `mizar-client-core` / `mizar-tui-ui` 的枚举或事件，`mizar-client` / `mizar-tui` 会一起受影响**。`ClientEvent`（`UiEvent`）、`OverlayKind`、`OverlayAction` 跨 crate 传递，一次改完再跑 `cargo check --workspace`，别只 check 单个。
-- **feature 组合会漏编**。`mizar-agent-spine` 有 `legacy`/`coding`/`compaction`/`sqlite`/`session-title`/`trajectory`/`router`，
-  可选依赖的 `use` 必须配 `#[cfg(feature)]`。验最小组合（含测试目标）：`cargo check --locked -p mizar-agent-spine --no-default-features --all-targets`。
+- **改 `mizar-types` / `mizar-tui-ui` 的枚举或事件，`mizar-client` / `mizar-tui` 会一起受影响**。`ClientEvent`（`UiEvent`）、`OverlayKind`、`OverlayAction` 跨 crate 传递，一次改完再跑 `cargo check --workspace`，别只 check 单个。
+- **feature 组合会漏编**。`mizar-core` 有 `codemode` / `mcp` 两个可选 feature（`mizar-session` 有默认开启的 `bundled`），
+  可选依赖的 `use` 必须配 `#[cfg(feature)]`。验最小组合（含测试目标）：`cargo check --locked -p mizar-core --no-default-features --all-targets`。
 - **改 crate 结构 / `inject` / 服务名时，`docs/plugins.md` 的表格与拓扑图要同步改**，否则立刻过期。
 - **沙箱默认关闭**：`restrictToWorkspace` 默认 `false`，`bash` 能碰工作区外。别假设有隔离。
-- **本文件会被 `mizar-instructions` 加载**，预算 65 536 字节，写长了触发祖先淘汰或正文截断。
+- **本文件会被 `mizar-core::instructions` 加载**，预算 65 536 字节，写长了触发祖先淘汰或正文截断。
 - **`pi-emphasis` 是双向契约**：`mizar-tui-ui/src/emphasis.rs` 的 `reply_guidance_prompt()` 生成注入文本，
   同文件渲染器消费它。改一边必须改另一边，测试要同时断言。
 
@@ -133,14 +133,14 @@ Verified:
 | 想做什么 | 看 |
 | :--- | :--- |
 | 整体架构 | `docs/plugins.md` |
-| 跨端纯客户端契约 | `crates/mizar-client-core/src/lib.rs`（`HostExtensionFlags`、`PromptQueue`、`TpsLedger`、`WorkspaceFileCache`、`ClientEvent`） |
+| 跨端纯契约与算法 | `crates/mizar-types/src/{lib,client,llm,trajectory}.rs`（`HostExtensionFlags`、`PromptQueue`、`TpsLedger`、`WorkspaceFileCache`、`ClientEvent`） |
 | 跨端宿主运行时 | `crates/mizar-client/src/lib.rs`（`FileMentionsPlugin`、`ApprovalGatePlugin`、`events`、`settings`、`session_view`、`workspace`） |
-| 加工具（最小样例 41 行） | `crates/mizar-tool-time/src/lib.rs` |
-| 加 LLM 协议适配器 | `crates/mizar-llm-mock/src/lib.rs` |
-| 主循环 | `crates/mizar-agent-loop/src/lib.rs` |
-| 工具管线（三道 waterfall） | `crates/mizar-tools/src/lib.rs` |
+| 加工具 | `crates/mizar-tools/src/{lib,coding,search}.rs` |
+| 加 LLM 协议适配器 / 路由 | `crates/mizar-llm/src/{lib,runtime,http,completions,messages,responses,router,retry,mock}.rs` |
+| 会话日志 / SQLite / Recall | `crates/mizar-session/src/{lib,model,persistence,sqlite,recall}.rs` |
+| 主循环与 Agent 领域核 | `crates/mizar-core/src/{lib,agent_loop,system_prompt,compaction,instructions,skills,trajectory,session_title,subagent}.rs` |
 | 微内核 | `crates/cordis/src/`（`fiber.rs` 状态机、`context.rs` 注入） |
 | UI 渲染与状态机 | `crates/mizar-tui-ui/src/`（`ui.rs`、`markdown.rs`、`features.rs`、`app.rs`、`app/{cache,events,input}.rs`） |
 | TUI 宿主循环与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
-| 装配顺序与扩展 ID | `crates/mizar-agent-spine/src/lib.rs` 的 `apply` 与 `crates/mizar-agent-spine/src/plugins.rs`（`KNOWN_HOST_EXTENSION_IDS`） |
-| 配置字段 | `crates/mizar-agent-spine/src/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第九节 |
+| 装配顺序与扩展 ID | `crates/mizar-core/src/spine.rs` 的 `apply` 与 `crates/mizar-core/src/spine/plugins.rs`（`KNOWN_HOST_EXTENSION_IDS`、`ToolsGuidePromptPlugin`） |
+| 配置字段 | `crates/mizar-core/src/spine/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第六节 |

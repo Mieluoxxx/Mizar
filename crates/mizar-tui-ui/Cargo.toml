@@ -11,9 +11,7 @@ workspace = true
 [dependencies]
 crossterm = { workspace = true }
 futures = { workspace = true }
-mizar-client-core = { workspace = true }
-mizar-llm-types = { workspace = true }
-mizar-trajectory-core = { workspace = true }
+mizar-types = { workspace = true }
 ratatui = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }

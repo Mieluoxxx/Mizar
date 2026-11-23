@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Next, Plugin,
 };
-use mizar_client_core::{
-    ApprovalDecision, ApprovalMode, ClientEvent, PLUGIN_APPROVAL_GATE, truncate_display,
-};
 use mizar_tools::{
     EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution, ToolRuntime, ToolsContextExt,
+};
+use mizar_types::client::{
+    ApprovalDecision, ApprovalMode, ClientEvent, PLUGIN_APPROVAL_GATE, truncate_display,
 };
 use tokio::sync::mpsc;
 

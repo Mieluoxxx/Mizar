@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxFuture, Context, Service};
-use mizar_llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 use mizar_session::{
     EVENT_SESSION_TITLE_UPDATED, EntryVisibility, LoadedSession, PersistenceError,
     PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionContextExt, SessionCreateOptions,
@@ -11,6 +10,7 @@ use mizar_session::{
     SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, derive_session_title,
     repair_dangling_tool_calls,
 };
+use mizar_types::llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 
 #[derive(Default)]
 struct InMemoryMockBackend {
@@ -480,14 +480,14 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert!(s.record_selection(
         Some("magpie".into()),
         Some("mayoru-responses/deepseek-flash".into()),
-        Some(mizar_llm::ReasoningEffort::High),
+        Some(mizar_types::llm::ReasoningEffort::High),
     ));
     assert_eq!(
         s.latest_selection(),
         Some(mizar_session::SessionSelection {
             provider: Some("magpie".into()),
             model: Some("mayoru-responses/deepseek-flash".into()),
-            reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
+            reasoning_effort: Some(mizar_types::llm::ReasoningEffort::High),
         })
     );
 
@@ -495,7 +495,7 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert!(!s.record_selection(
         Some("magpie".into()),
         Some("mayoru-responses/deepseek-flash".into()),
-        Some(mizar_llm::ReasoningEffort::High),
+        Some(mizar_types::llm::ReasoningEffort::High),
     ));
     assert_eq!(s.all_entries().len(), 1);
 
@@ -503,12 +503,12 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert!(s.record_selection(
         Some("magpie".into()),
         Some("mayoru-responses/deepseek-flash".into()),
-        Some(mizar_llm::ReasoningEffort::Max),
+        Some(mizar_types::llm::ReasoningEffort::Max),
     ));
     assert_eq!(s.all_entries().len(), 2);
     assert_eq!(
         s.latest_selection().unwrap().reasoning_effort,
-        Some(mizar_llm::ReasoningEffort::Max)
+        Some(mizar_types::llm::ReasoningEffort::Max)
     );
 
     // LogOnly：不进模型上下文、不出现在 surface 视图里
@@ -1152,7 +1152,7 @@ async fn lightweight_header_and_selection_queries_avoid_full_load_session() {
         SessionSelection {
             provider: Some("openai".into()),
             model: Some("gpt-5".into()),
-            reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
+            reasoning_effort: Some(mizar_types::llm::ReasoningEffort::High),
         },
     );
 
@@ -1204,7 +1204,7 @@ async fn lightweight_header_and_selection_queries_avoid_full_load_session() {
     mem.record_selection(
         Some("anthropic".into()),
         Some("claude-sonnet-4-5".into()),
-        Some(mizar_llm::ReasoningEffort::Medium),
+        Some(mizar_types::llm::ReasoningEffort::Medium),
     );
     assert_eq!(
         store.inspect_header("mem-sess").unwrap().cwd.as_deref(),

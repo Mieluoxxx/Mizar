@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use cordis::{Context, CordisError, DisposableHandle, LogLevel, LogRecord};
-use mizar_agent_loop::{
+use mizar_core::agent_loop::{
     AgentLoop, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
     AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
     AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
@@ -14,17 +14,17 @@ use mizar_agent_loop::{
     EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
     InboxPushResult, StepOutcome, TurnEndReason, TurnInput,
 };
-use mizar_agent_spine::{
+use mizar_core::spine::{
     CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent, CompactionTrigger,
     EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS, EVENT_COMPACTION_START,
 };
-use mizar_client_core::{
-    ClientEvent, UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
-};
+use mizar_core::subagent::{EVENT_SUBAGENT_STATE, SubagentStateEvent};
+use mizar_core::trajectory::{EVENT_TRAJECTORY_ANOMALY, TrajectoryAnomalyEvent};
 use mizar_llm::LlmRuntime;
 use mizar_session::{EVENT_SESSION_TITLE_UPDATED, SessionStore, SessionTitleUpdatedPayload};
-use mizar_subagent::{EVENT_SUBAGENT_STATE, SubagentStateEvent};
-use mizar_trajectory::{EVENT_TRAJECTORY_ANOMALY, TrajectoryAnomalyEvent};
+use mizar_types::client::{
+    ClientEvent, UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -480,7 +480,7 @@ where
 /// 等待 `agentLoop`、`sessions`、`llm` 核心服务以及所有已挂载插件就绪（消除异步挂载竞态）。
 pub async fn wait_for_services(ctx: &Context) -> Result<(), WaitServicesError> {
     if ctx
-        .get::<mizar_agent_loop::AgentLoop>("agentLoop")
+        .get::<mizar_core::agent_loop::AgentLoop>("agentLoop")
         .is_none()
         || ctx.get::<SessionStore>("sessions").is_none()
         || ctx.get::<LlmRuntime>("llm").is_none()
@@ -595,7 +595,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         use cordis::PluginDef;
-        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+        use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
 
         let ctx = Context::new();
         ctx.logger().set_silent();

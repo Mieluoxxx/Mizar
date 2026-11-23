@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use mizar_llm_types::{ImageAttachment, MAX_IMAGES_PER_MESSAGE, ReasoningEffort};
+use mizar_types::llm::{ImageAttachment, MAX_IMAGES_PER_MESSAGE, ReasoningEffort};
 
 use super::{
     AppAction, AppState, ApprovalMode, BashInputMode, LaunchpadQuickAction, NoticeLevel,

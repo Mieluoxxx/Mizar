@@ -1,6 +1,6 @@
 //! TUI 布局与渲染引擎主入口：双栏工作台、全屏轨迹切换、浮层与选区叠绘调度。
 
-use mizar_llm_types::ReasoningEffort;
+use mizar_types::llm::ReasoningEffort;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -238,7 +238,7 @@ mod tests {
             None,
             None,
         );
-        app.apply_ui_event(UiEvent::ToolCall(mizar_llm_types::ToolCall {
+        app.apply_ui_event(UiEvent::ToolCall(mizar_types::llm::ToolCall {
             id: "c1".into(),
             name: "read".into(),
             arguments: r#"{"path":"a.rs"}"#.into(),
@@ -247,7 +247,7 @@ mod tests {
         assert!(frame1.contains("read(a.rs)"), "{frame1}");
 
         // 第二个工具到来后，c1 不再是组尾，必须失效缓存并消除两者之间的空行
-        app.apply_ui_event(UiEvent::ToolCall(mizar_llm_types::ToolCall {
+        app.apply_ui_event(UiEvent::ToolCall(mizar_types::llm::ToolCall {
             id: "c2".into(),
             name: "read".into(),
             arguments: r#"{"path":"b.rs"}"#.into(),

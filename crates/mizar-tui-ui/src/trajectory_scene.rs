@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use mizar_trajectory_core::{
+use mizar_types::trajectory::{
     RecordKind, Severity, TimelineMode, TrajectoryRecord, TrajectoryReport,
 };
 use ratatui::Frame;
@@ -785,7 +785,7 @@ fn clip_text(s: &str, max_w: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mizar_trajectory_core::{TraceEvent, TraceEventKind, derive_timeline, fold_trajectory};
+    use mizar_types::trajectory::{TraceEvent, TraceEventKind, derive_timeline, fold_trajectory};
 
     #[test]
     fn renders_trajectory_scene_and_switches_tabs_and_modes() {

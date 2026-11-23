@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mizar_tool_search::{Bm25Ranker, ToolSearchDocument, create_tool_search_document};
+use mizar_tools::search::{Bm25Ranker, ToolSearchDocument, create_tool_search_document};
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head, write_temp_output,
 };

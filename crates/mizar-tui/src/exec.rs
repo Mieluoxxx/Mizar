@@ -13,23 +13,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cordis::{Context, LogLevel, Service};
-use mizar_agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
-use mizar_agent_spine::{
+use mizar_client::{FileMentionsConfig, FileMentionsPlugin};
+use mizar_core::agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
+use mizar_core::spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
     load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
 };
-use mizar_client::{FileMentionsConfig, FileMentionsPlugin};
-use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
-use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
-use mizar_llm_router::LlmRouter;
-use mizar_mcp::McpManager;
-use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
-use mizar_tools_coding::CodingToolsPreset;
-use mizar_trajectory::{
+use mizar_core::trajectory::{
     DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryExport,
     TrajectoryRuntime, write_trace_export_atomic,
 };
+use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
+use mizar_llm::router::LlmRouter;
+use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
+use mizar_mcp::McpManager;
+use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
+use mizar_tools::coding::CodingToolsPreset;
+use mizar_types::client::{ClientEvent, HostExtensionFlags, NoticeLevel};
 use tokio_util::sync::CancellationToken;
 
 use crate::runner::{ResumeTarget, wait_for_services};
@@ -1056,7 +1056,7 @@ fn build_exec_json_meta(
                     .records
                     .iter()
                     .filter(|r| {
-                        r.kind == mizar_trajectory::RecordKind::Tool && r.turn == Some(tnum)
+                        r.kind == mizar_core::trajectory::RecordKind::Tool && r.turn == Some(tnum)
                     })
                     .count()
             })
@@ -1171,7 +1171,7 @@ fn resolve_cancel_or_error_exit(
 }
 
 fn classify_turn_result(
-    run_res: Result<mizar_agent_loop::TurnRunReport, AgentError>,
+    run_res: Result<mizar_core::agent_loop::TurnRunReport, AgentError>,
     configured_max_steps: Option<usize>,
     output_format: ExecOutputFormat,
     json_meta: Option<&ExecJsonMeta>,

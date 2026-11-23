@@ -1,21 +1,21 @@
 //! 只读会话投影、模型选择优先级解析与会话报告生成（零终端依赖）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use cordis::Context;
-use mizar_agent_spine::strip_summary_wrapper;
-use mizar_client_core::{
-    CacheMissAudit, ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem,
-    SessionSelection, SessionTreeEntry, SessionViewData, UsageAuditSample, abbreviate_home_path,
-    compute_cache_miss_audit, format_tokens, short_id, truncate_display,
-};
+use mizar_core::spine::strip_summary_wrapper;
 use mizar_llm::{ContentBlock, LlmContextExt, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
 use mizar_session::{
     Session, SessionEvent, SessionListQuery, SessionPersistenceContextExt, SessionStore,
     SessionTraceEvent, TraceSeverity,
+};
+use mizar_types::client::{
+    CacheMissAudit, ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem,
+    SessionSelection, SessionTreeEntry, SessionViewData, UsageAuditSample, abbreviate_home_path,
+    compute_cache_miss_audit, format_tokens, short_id, truncate_display,
 };
 
 /// 选择解析的输入：各来源的值与「是否显式指定」标记。
@@ -409,13 +409,11 @@ pub fn build_session_info_report_at_with_cache(
     let mut tool_error_count = 0u64;
     let mut bash_count = 0u64;
     let mut bash_local_count = 0u64;
-    let mut pruned_seqs = HashSet::<u64>::new();
     let mut injection_counts = HashMap::<String, u64>::new();
     let mut compaction_count = 0u64;
     let mut latest_compaction: Option<(u64, Option<u64>, Option<u64>)> = None;
     let mut total_usage = TokenUsage::default();
     let mut latest_context_tokens: Option<u64> = None;
-    let mut saw_prune_after_last_context = false;
     let mut audit = CacheMissAudit::default();
 
     session.with_all_entries(|entries| {
@@ -438,7 +436,6 @@ pub fn build_session_info_report_at_with_cache(
                         let prompt = u.prompt_tokens();
                         if prompt > 0 {
                             latest_context_tokens = Some(prompt);
-                            saw_prune_after_last_context = false;
                         }
                     }
                 }
@@ -458,14 +455,7 @@ pub fn build_session_info_report_at_with_cache(
                     latest_compaction = Some((*first_kept_seq, *tokens_before, *tokens_after));
                     if let Some(after) = tokens_after.filter(|&v| v > 0) {
                         latest_context_tokens = Some(after);
-                        saw_prune_after_last_context = false;
                     }
-                }
-                SessionEvent::ToolResultPrune { pruned } => {
-                    for item in pruned {
-                        pruned_seqs.insert(item.target_seq);
-                    }
-                    saw_prune_after_last_context = true;
                 }
                 SessionEvent::BashExecution {
                     exclude_from_context,
@@ -554,9 +544,6 @@ pub fn build_session_info_report_at_with_cache(
             tool_parts.push(format!("bash {bash_count}"));
         }
     }
-    if !pruned_seqs.is_empty() {
-        tool_parts.push(format!("prune {}", pruned_seqs.len()));
-    }
     lines.push(format!("工具     {}", join_mid_dot(&tool_parts)));
 
     const KNOWN_INJECTION_SOURCES: [(&str, &str); 5] = [
@@ -631,11 +618,7 @@ pub fn build_session_info_report_at_with_cache(
     ));
 
     let window = context_window.max(1);
-    let effective_measured = if saw_prune_after_last_context {
-        last_prompt_tokens.or(latest_context_tokens)
-    } else {
-        latest_context_tokens.or(last_prompt_tokens)
-    };
+    let effective_measured = latest_context_tokens.or(last_prompt_tokens);
     let ctx_summary = if let Some(measured) = effective_measured {
         let pct = (measured as f64 / window as f64) * 100.0;
         format!(
@@ -799,9 +782,7 @@ pub fn project_session_view(
                 }
                 _ => {}
             },
-            SessionEvent::ToolResultPrune { .. }
-            | SessionEvent::Selection { .. }
-            | SessionEvent::Usage { .. } => {}
+            SessionEvent::Selection { .. } | SessionEvent::Usage { .. } => {}
         }
     }
     if saw_usage {
@@ -963,8 +944,7 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
                     can_fork: true,
                 })
             }
-            SessionEvent::ToolResultPrune { .. }
-            | SessionEvent::Selection { .. }
+            SessionEvent::Selection { .. }
             | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => None,
         })
@@ -1168,7 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn project_resume_view_maps_turn_notice_and_truncated_turn_end_to_notice_never_assistant()
     {
-        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+        use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
         use mizar_session::SessionContextExt;
 
         let ctx = Context::new();

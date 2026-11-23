@@ -3,13 +3,13 @@
 use std::path::Path;
 
 use cordis::Context;
-use mizar_agent_spine::{
+use mizar_core::session_title::{SessionTitleContextExt, parse_model_ref};
+use mizar_core::spine::{
     CompactionContextExt, SpinePluginsContextExt, normalize_session_title_thinking_level,
     patch_settings_file, persist_disabled_plugins, resolve_global_settings_path,
 };
-use mizar_client_core::{ApprovalMode, NoticeLevel, SettingEntry, SettingItemKind};
 use mizar_llm::ReasoningEffort;
-use mizar_session_title::{SessionTitleContextExt, parse_model_ref};
+use mizar_types::client::{ApprovalMode, NoticeLevel, SettingEntry, SettingItemKind};
 
 /// 前端传递给设置列表构建器的纯视图状态快照（零终端/UI 结构依赖）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,7 +504,7 @@ pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+    use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
     use mizar_session::SessionContextExt;
 
     use super::*;

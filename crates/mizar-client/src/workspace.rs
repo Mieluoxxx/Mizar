@@ -5,14 +5,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use cordis::Context;
-use mizar_client_core::{
+use mizar_core::instructions::AgentInstructions;
+use mizar_core::skills::{SkillLookupOptions, SkillRegistry};
+use mizar_core::trajectory::TrajectoryRuntime;
+use mizar_mcp::{McpConnectionState, McpManager};
+use mizar_tools::{ToolExposure, ToolRuntime};
+use mizar_types::client::{
     FileTouchRow, InstructionSummaryRow, McpSummaryRow, SidePanelData, ToolSummaryRow,
 };
-use mizar_instructions::AgentInstructions;
-use mizar_mcp::{McpConnectionState, McpManager};
-use mizar_skills::{SkillLookupOptions, SkillRegistry};
-use mizar_tools::{ToolExposure, ToolRuntime};
-use mizar_trajectory::TrajectoryRuntime;
 use tokio_util::sync::CancellationToken;
 
 /// 工作区与后端服务观测数据的纯数据快照，供各端（TUI / Merak）渲染侧栏或仪表盘。

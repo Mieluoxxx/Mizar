@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mizar_instructions::sha256_hex;
+use mizar_core::instructions::sha256_hex;
 use reqwest::redirect::Policy;
 
 pub const DEFAULT_RELEASE_REPO_URL: &str = "https://github.com/Mieluoxxx/Mizar";
@@ -234,7 +234,7 @@ fn extract_tag_from_location_or_url(raw: &str) -> Option<String> {
 }
 
 fn build_release_client(timeout: Duration) -> Result<reqwest::Client, String> {
-    mizar_llm_http::configure_custom_ca_roots(
+    mizar_llm::http::configure_custom_ca_roots(
         reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(format!("mizar/{}", current_version()))

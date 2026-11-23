@@ -5,7 +5,9 @@
 //! - `tools/execute`      → 执行：可包一层超时、监控
 //! - `tools/post-execute` → 执行后：可改写结果或追加上下文提醒
 
+pub mod coding;
 pub mod mutation_queue;
+pub mod search;
 pub mod truncate;
 
 use std::collections::{HashMap, HashSet};
@@ -13,7 +15,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Service};
-use mizar_llm::ToolSchema;
+use mizar_types::llm::ToolSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;

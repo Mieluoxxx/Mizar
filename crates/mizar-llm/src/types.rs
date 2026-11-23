@@ -1,4 +1,4 @@
-pub use mizar_llm_types::{
+pub use mizar_types::llm::{
     CacheRetention, ContentBlock, ContentBlockKind, FinishReason, ImageAttachment,
     MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
     OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, PromptCacheLifetime, ProviderInfo, ReasoningEffort,

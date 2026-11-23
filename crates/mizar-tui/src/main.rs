@@ -49,15 +49,15 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use cordis::{Context, Service};
-use mizar_agent_spine::{
+use mizar_core::spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, load_mizar_config,
     resolve_default_session_db_path,
 };
 use mizar_llm::ReasoningEffort;
-use mizar_llm_mock::MockPlugin;
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
-use mizar_llm_router::LlmRouter;
-use mizar_tools_coding::CodingToolsPreset;
+use mizar_llm::mock::MockPlugin;
+use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
+use mizar_llm::router::LlmRouter;
+use mizar_tools::coding::CodingToolsPreset;
 use mizar_tui::exec::{
     ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
 };
@@ -594,7 +594,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let loaded_cfg = load_mizar_config(&workspace);
     let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());
     // `session-title` 仅归属交互式 TUI 会话（先开启默认配置再应用 settings.json 覆盖）
-    spine_cfg.session_title = Some(mizar_agent_spine::SessionTitleConfig::default());
+    spine_cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
     if !cli.no_persist {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }

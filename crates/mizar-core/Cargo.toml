@@ -1,0 +1,38 @@
+[package]
+name = "mizar-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mizar Agent 核心循环、系统提示词、上下文压缩、指令、技能、轨迹、标题、子代理与统一装配根"
+
+[lints]
+workspace = true
+
+[features]
+default = ["codemode", "mcp"]
+codemode = ["dep:mizar-codemode"]
+mcp = ["dep:mizar-mcp"]
+
+[dependencies]
+chrono = { workspace = true }
+cordis = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+mizar-codemode = { workspace = true, optional = true }
+mizar-llm = { workspace = true }
+mizar-mcp = { workspace = true, optional = true }
+mizar-session = { workspace = true }
+mizar-tools = { workspace = true }
+mizar-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "time"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[target.'cfg(mizar_loom)'.dev-dependencies]
+loom = { workspace = true }

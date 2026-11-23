@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use mizar_trajectory::TrajectoryExport;
+use mizar_core::trajectory::TrajectoryExport;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;

@@ -3,18 +3,26 @@ name = "mizar-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "会话事件日志 ctx.sessions（对应 NamiDSH packages/session）"
+description = "会话日志服务 ctx.sessions、SQLite/FTS5 持久化与无损情景回溯（对应 NamiDSH packages/session）"
 
 [lints]
 workspace = true
 
+[features]
+default = ["bundled"]
+bundled = ["rusqlite/bundled"]
+
 [dependencies]
 cordis = { workspace = true }
-mizar-llm = { workspace = true }
+mizar-tools = { workspace = true }
+mizar-types = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }

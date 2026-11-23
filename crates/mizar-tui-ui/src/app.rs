@@ -4,23 +4,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub use mizar_client_core::tool_format::{
+pub use mizar_types::client::tool_format::{
     abbreviate_home_path, abbreviate_home_with, bash_inline_meta, bash_scope_label,
     clean_bash_output_lines, count_diff_stats, extract_inline_meta, format_bash_display,
     format_diff_stat, format_expanded_tool_args, format_tokens, is_path_arg_tool,
     is_read_only_compact_tool, short_id, single_line_text, summarize_live_preview,
     summarize_tool_args, summarize_tool_result, truncate_display,
 };
-pub use mizar_client_core::{
+pub use mizar_types::client::{
     ActivityState, ApprovalMode, BashInputMode, LocalBashOutput, NoticeLevel, PromptQueue,
     QueuedPrompt, SessionReplayItem, SessionSelection, SessionViewData, ToolExtraMeta, ToolState,
     UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
 };
-use mizar_llm_types::{
+use mizar_types::llm::{
     ContentBlock, ImageAttachment, MAX_IMAGES_PER_MESSAGE, ModelInfo, ProviderInfo,
     ReasoningEffort, TokenUsage,
 };
-use mizar_trajectory_core::{TimelineMode, TrajectoryReport};
+use mizar_types::trajectory::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::Value;
@@ -49,7 +49,7 @@ pub(crate) use cache::StreamingMarkdownPrefixCache;
 pub use cache::{CachedItemLines, ItemRenderKey, MAX_CACHED_RENDER_ITEMS, TranscriptRenderCache};
 
 /// 由后端异步事件与终端外部状态投递给 UI 主循环的消息。
-pub type UiEvent = mizar_client_core::ClientEvent;
+pub type UiEvent = mizar_types::client::ClientEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatItem {
@@ -1272,7 +1272,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use mizar_llm_types::{ModelInfo, ToolCall};
+    use mizar_types::llm::{ModelInfo, ToolCall};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

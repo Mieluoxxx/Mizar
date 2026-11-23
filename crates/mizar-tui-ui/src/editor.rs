@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mizar_llm_types::ImageAttachment;
+use mizar_types::llm::ImageAttachment;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::BashInputMode;
