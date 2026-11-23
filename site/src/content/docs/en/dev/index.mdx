@@ -1,6 +1,6 @@
 ---
 title: Workspace Layering & Isolation Boundaries
-description: Mizar's 30-crate Rust 1.98 microkernel layering, the cordis assembly main loop, and the three zero-runtime pure-core isolation boundaries.
+description: Mizar's 10-crate Rust 1.98 static DAG layering, the MizarRuntime composition root, and pure-core / zero-TUI isolation boundaries.
 group: dev-arch
 order: 18
 ---
@@ -8,37 +8,35 @@ order: 18
 import Callout from '../../../../components/mdx/Callout.astro';
 import DiagramEmbed from '../../../../components/DiagramEmbed.astro';
 
-Mizar is built on **Rust 1.98.0** (edition 2024). The workspace consists of **30 crates** wired together around the custom **`cordis`** microkernel via service injection (`inject` / `provide`) to form the `"stream model call → execute tools → write back to session"` main loop, delivered as a terminal workbench through **`mizar-tui`** (the single binary entry point `mizar`).
+Mizar is built on **Rust 1.98.0** (edition 2024). The workspace is consolidated into **10 coarse-grained crates** wired deterministically via the static **`mizar-core::spine::MizarRuntime` composition root** and **`mizar-types::hooks` typed hooks / `HookGuard`** into the `"stream model call → execute tools → write back to session"` loop, delivered through **`mizar-tui`** (`mizar` binary) and shared with Merak Desktop via **`mizar-client`**.
 
-The authoritative architecture references in the repository are **`docs/plugins.md`** and **`AGENTS.md`**; this section focuses on architectural boundaries, [hands-on plugin development](/en/dev/cordis/), and [engineering conventions](/en/dev/conventions/).
+The authoritative architecture references in the repository are **`docs/plugins.md`** and **`AGENTS.md`**; this section focuses on isolation boundaries, [hands-on runtime & hooks](/en/dev/runtime/), and [engineering conventions](/en/dev/conventions/).
 
 <DiagramEmbed
-  id="cordis-architecture"
-  title="30-Crate Microkernel Layering & Three Isolation Boundaries"
-  caption="Pure core crates must never touch async/I/O/database runtimes; plugin crates request dependencies from the host via camelCase service names; the host layer assembles and hot-controls the runtime via feature flags and spinePlugins."
+  id="runtime-architecture"
+  title="10-Crate Static DAG Layering & Compile Boundaries"
+  caption="Pure core crates (mizar-types / mizar-tui-ui) must never depend on heavy async/I/O/DB runtimes; mizar-client must stay zero-TUI for Merak Desktop embedding; mizar-core::spine::MizarRuntime builds the workspace statically in DAG order."
 />
 
-## Three Zero-Runtime Isolation Boundaries
+## Compilation Isolation Boundaries
 
-The following **3 core crates are strictly prohibited from adding** `tokio`, `cordis`, `reqwest`, `rquickjs`, or `rusqlite` dependencies:
-
-- `mizar-tui-ui`: Pure terminal rendering state machine, Markdown highlighting, themes, and `@` / editor interaction logic;
-- `mizar-llm-types`: Pure model protocol data structures, message blocks, and capability type contracts;
-- `mizar-trajectory-core`: Pure trajectory sampling, three-lane timeline calculation, and hotspot models.
+1. **Pure Core & Pure UI Boundary (2 Crates)**: `mizar-types` and `mizar-tui-ui` are **strictly prohibited from adding** `tokio`, `reqwest`, `rquickjs`, `rusqlite`, or `tracing`:
+   - `mizar-types`: Pure core contracts, `hooks` primitives (`HookGuard` / `SyncEventBus` / `WaterfallHook` / `SerialHook`), LLM DTOs, trajectory models, and client algorithms (also **forbids `ratatui`, `crossterm`, and any internal crate**);
+   - `mizar-tui-ui`: Pure terminal UI state machine, `TuiFeatures`, `pi-emphasis`, and virtualized Markdown rendering.
+2. **Merak Desktop Zero-TUI Boundary**: **`mizar-client` (and `mizar-types`) strictly forbid `ratatui`, `crossterm`, or `mizar-tui-ui`** so desktop hosts embed Mizar with zero terminal dependencies.
 
 <Callout type="warning" title="It will compile, but the boundary must not be broken">
-  Although Cargo technically allows you to add <code>tokio</code> to these three crates, doing so leaks async or I/O side effects into pure state machines and cross-surface data models, breaking snapshot tests and standalone reuse. Any async scheduling, HTTP transport, JS sandbox, or disk persistence must be lifted up into the <code>mizar-tui</code> or <code>mizar-agent-spine</code> host layer.
+  Although Cargo technically allows adding <code>tokio</code> inside pure core crates, doing so leaks async or I/O side effects into pure state machines and cross-surface models, breaking fast checks and shared reuse. Lift async scheduling, HTTP transport, JS sandboxing, and disk persistence into <code>mizar-core</code>, <code>mizar-client</code>, or <code>mizar-tui</code>.
 </Callout>
 
-## Five-Layer Crate Topology Overview
+## Four-Layer 10-Crate Topology Overview
 
-| Layer | Representative Crates | Responsibility Boundary |
+| Layer | Crates | Responsibility Boundary |
 | :--- | :--- | :--- |
-| **Microkernel** | `cordis` | Fiber state machine, service `provide`/`inject`, `ctx.effect` cleanup, and 5 event dispatch modes |
-| **Pure Core** | `mizar-tui-ui` · `mizar-llm-types` · `mizar-trajectory-core` | Zero-runtime pure data/UI state machines supporting fast standalone unit tests and `cargo check` |
-| **LLM Protocols & Routing** | `mizar-llm-http` · `mizar-llm-router` · `mizar-llm-{completions,responses,messages,mock}` | Credential expansion, `completions`/`responses`/`messages` protocol adapters, and mock latency simulation |
-| **Tools, Extensions, Memory & Storage** | `mizar-tools` · `mizar-tools-coding` · `mizar-mcp` · `mizar-codemode` · `mizar-tool-search` · `mizar-instructions` · `mizar-skills` · `mizar-compaction` · `mizar-recall` · `mizar-session` · `mizar-session-sqlite` | Tool exposure/truncation/serialized write queue, MCP/QuickJS sandbox, instruction & skill discovery, L1–L3 compaction & FTS5 recall, and WAL persistence |
-| **Host & Binary Entry** | `mizar-agent-loop` · `mizar-agent-spine` · `mizar-tui` | Main loop orchestration, 30-crate feature-gated assembly (`AgentSpinePlugin` / `spinePlugins` hot toggling), and terminal event host |
+| **Pure Core (2)** | `mizar-types` · `mizar-tui-ui` | Zero heavy-runtime contracts, `hooks`, trajectory math, and pure UI state machine for sub-second `cargo check` |
+| **Base Capabilities (3)** | `mizar-llm` · `mizar-tools` · `mizar-session` | `LlmRuntime` + 3 wire adapters + routing/retry; `ToolRuntime` pipeline + 6 tools + `tool_search`; WAL SQLite, `recall`, and FTS5 |
+| **Isolated Extensions (2)** | `mizar-codemode` · `mizar-mcp` | Optional feature-gated `rquickjs` QuickJS sandbox and external stdio/HTTP MCP client |
+| **Core & Hosts (3)** | `mizar-core` · `mizar-client` · `mizar-tui` | Domain modules & `MizarRuntime::build` composition root; zero-TUI shared host runtime; CLI / `mizar exec` / terminal adapter |
 
 ## Fast Local Verification Commands
 
@@ -48,8 +46,8 @@ Use sub-second single-crate checks when modifying pure UI logic; whenever you to
 # Sub-second check while editing UI logic
 cargo check -p mizar-tui-ui
 
-# Verify minimal feature gates, including test targets
-cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+# Verify minimal feature gates (codemode/mcp disabled), including test targets
+cargo check --locked -p mizar-core --no-default-features --all-targets
 
 # Remaining CI checks
 cargo fmt --all -- --check

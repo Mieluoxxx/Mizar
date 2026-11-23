@@ -71,9 +71,31 @@ mizar --no-persist --no-instructions
 | `--help` | `-h` | Print CLI help and exit |
 | `--version` | `-V` | Print the current version and exit |
 
+## Headless Single-Shot Execution (`mizar exec`) & Trace Export
+
+For CI, automation scripts, or benchmark evaluations, run a single non-interactive task with `mizar exec` (or `-p` / `--prompt-file` on the root command) and export structured execution traces:
+
+```bash title="Headless execution, isolated mode, and trace export"
+# Isolated single-shot run (skips personal ~/.mizar, ~/.agents, MCP, Skills, global rules, and global SQLite)
+mizar exec --isolated -C /path/to/repo --output-format json --trace-out /tmp/trace.json "Fix the failing test and report"
+
+# Read task prompt from stdin
+echo "Summarize README.md" | mizar exec --read-only
+```
+
+| Flag | Purpose |
+| :--- | :--- |
+| `mizar exec [<prompt>]` | Run a single non-interactive headless task (reads stdin to EOF when stdin is non-TTY and no prompt flag is given) |
+| `-p, --prompt <TEXT>` / `--prompt-file <PATH>` | Pass prompt inline or read from a file (works on root or `exec`) |
+| `--isolated` | Skip personal `~/.mizar` / `~/.agents` configs, MCP, Skills, global rules, and global SQLite |
+| `--provider <ID>` / `--model <ID>` / `--protocol <API>` / `--base-url <URL>` | Override provider, model ID, wire protocol (`completions` / `responses` / `messages`), and base URL |
+| `--reasoning-effort <LVL>` / `--max-steps <N>` / `--max-tokens <N>` / `--timeout <SECS>` | Override reasoning effort, step cap, per-call output token cap, and total execution timeout |
+| `--output-format <FMT>` / `--json` | Choose output format (`text` or structured `json`) |
+| `--trace-out <PATH>` | Export structured trajectory JSON before exiting (falls back to `MIZAR_TRACE_OUT`; CLI takes precedence) |
+
 ## Self-Update
 
-On startup, Mizar asynchronously checks for newer GitHub Releases in the background (disable via `MIZAR_SKIP_VERSION_CHECK=1` or `MIZAR_OFFLINE=1`) and posts a non-blocking notice if an update is available. Run:
+Release builds asynchronously check for newer GitHub Releases in the background on startup (skipped automatically for local `/target/` dev builds, Homebrew installs, or when `MIZAR_SKIP_VERSION_CHECK=1` / `MIZAR_OFFLINE=1` is set) and post a non-blocking notice if an update is available. Run:
 
 ```bash
 # Update to the latest release (with SHA256 verification)
@@ -83,7 +105,7 @@ mizar update
 mizar update --check
 
 # Install a specific version (including prereleases)
-mizar update --version v0.1.1
+mizar update --version v0.2.0
 ```
 
 <Callout type="tip">

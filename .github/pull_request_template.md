@@ -15,8 +15,8 @@
 <!-- Check only the items that apply. -->
 
 - [ ] Cross-crate API or type changes: ran `cargo check --locked --workspace`.
-- [ ] `mizar-agent-spine` changes: ran `cargo check --locked -p mizar-agent-spine --no-default-features --all-targets`.
-- [ ] Crate structure, service names, or `inject` changed: updated `docs/plugins.md`.
+- [ ] `mizar-core` changes: ran `cargo check --locked -p mizar-core --no-default-features --all-targets`.
+- [ ] Crate structure, module assembly, or service dependencies changed: updated `docs/plugins.md`.
 - [ ] Reply emphasis changed: updated and tested both the prompt and renderer.
 - [ ] Dependency changes preserve the crate boundaries documented in `AGENTS.md`; no files under `references/` are included.
 - [ ] Docs site changes: ran `pnpm --dir site build`.

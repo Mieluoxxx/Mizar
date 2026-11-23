@@ -23,6 +23,8 @@ Typing `/` at the beginning of the input box opens slash command completion. For
 
 | Command | Description |
 | :--- | :--- |
+| `/resume [id]` | Resume a past session (omit `id` to open the interactive session picker; see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
+| `/rename [title]` | Rename the current session title (leave empty to ask the model to regenerate one) |
 | `/compact [focus]` | Manually trigger checkpoint compaction with an optional focus note (cancelable via `Esc`; see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
 | `/tree` | Open the conversation tree view to fork and explore a new approach from any prior turn (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
 | `/clear` · `/new` | Clear the current viewport and start a brand-new session |
@@ -34,6 +36,7 @@ Typing `/` at the beginning of the input box opens slash command completion. For
 | Command | Shortcut | Description |
 | :--- | :--- | :--- |
 | `/trace` | <kbd>Ctrl</kbd>+<kbd>T</kbd> | Open the full-screen three-lane trajectory analyzer to pinpoint latency hotspots (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)) |
+| `/session` | — | Inspect the current session ID, storage backend, event breakdown, and compaction boundary |
 | `/panel` | <kbd>Ctrl</kbd>+<kbd>B</kbd> | Toggle the right-hand status panel (available when terminal width ≥ 96 columns) |
 | `/view` | <kbd>F3</kbd> | Losslessly switch between Fullscreen and Inline viewports |
 | `/mouse` | <kbd>F2</kbd> | Release or recapture terminal mouse events for native drag-select copying |

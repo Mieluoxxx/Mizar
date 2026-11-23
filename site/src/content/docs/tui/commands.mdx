@@ -23,6 +23,8 @@ import Callout from '../../../components/mdx/Callout.astro';
 
 | 命令 | 说明 |
 | :--- | :--- |
+| `/resume [id]` | 恢复历史会话（省略 `id` 时打开交互式会话选择器，详见 [会话、分叉与性能轨迹](/tui/sessions/)） |
+| `/rename [title]` | 重命名当前会话标题（留空则由模型自动重新归纳标题） |
 | `/compact [focus]` | 手动触发上下文检查点压缩（可附聚焦说明，支持按 `Esc` 取消，详见 [会话、分叉与性能轨迹](/tui/sessions/)） |
 | `/tree` | 打开对话树视图，从任意历史回合分叉探索新思路（详见 [会话、分叉与性能轨迹](/tui/sessions/)） |
 | `/clear` · `/new` | 清空当前视口并开启全新会话 |
@@ -34,6 +36,7 @@ import Callout from '../../../components/mdx/Callout.astro';
 | 命令 | 快捷键 | 作用 |
 | :--- | :--- | :--- |
 | `/trace` | <kbd>Ctrl</kbd>+<kbd>T</kbd> | 打开全屏三泳道轨迹分析器排查耗时热点（详见 [会话、分叉与性能轨迹](/tui/sessions/)） |
+| `/session` | — | 查看当前会话 ID、存储路径、事件构成与压缩边界 |
 | `/panel` | <kbd>Ctrl</kbd>+<kbd>B</kbd> | 切换右侧状态面板（终端 ≥ 96 列时可用） |
 | `/view` | <kbd>F3</kbd> | 无损切换 Fullscreen 全屏与 Inline 内联视口 |
 | `/mouse` | <kbd>F2</kbd> | 放行或接管终端鼠标，便于原生划词复制 |

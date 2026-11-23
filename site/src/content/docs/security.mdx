@@ -52,7 +52,7 @@ import DiagramEmbed from '../../components/DiagramEmbed.astro';
 
 具体来说，这两重控制分别管什么：
 
-- **`restrictToWorkspace: true`**：严格拦截 `read`、`write`、`edit`、`grep`、`find` 以及输入框中的 `@` 文件引用，一旦目标路径解析后跳出当前工作区根目录即刻拒绝。**但它不会沙箱化 `bash` 工具**——因为一条普通构建命令（例如读取 `~/.cargo` 缓存或调用 `/usr/bin/env`）本身就需要访问工作区外路径。
+- **`restrictToWorkspace: true`**：对 `read`、`write`、`edit`、`grep`、`find` 以及输入框 `@` 文件引用执行规范路径解析与符号链接检查（阻止通过 symlink 逃逸出工作区根目录），一旦目标落到工作区外即刻拒绝。**但它不会沙箱化 `bash` 工具**——因为一条普通构建命令（例如读取 `~/.cargo` 缓存或调用 `/usr/bin/env`）本身就需要访问工作区外路径。
 - **`--approve` / [`/approval ask`](/tui/commands/)**：只要模型准备调用**非只读工具**（包含 `write`、`edit`、`bash`，以及外部声明非只读的 MCP / `codemode` 调用），界面就会先挂起并弹出确认框。你可以按本次交互选择：
   - <kbd>y</kbd> / <kbd>Enter</kbd>：仅放行这一次调用；
   - <kbd>a</kbd>：本次会话内信任该工具，后续不再反复询问；

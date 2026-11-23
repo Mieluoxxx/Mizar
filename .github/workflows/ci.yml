@@ -63,8 +63,8 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Check agent spine without default features
-        run: cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+      - name: Check core without default features
+        run: cargo check --locked -p mizar-core --no-default-features --all-targets
 
       - name: Clippy check
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

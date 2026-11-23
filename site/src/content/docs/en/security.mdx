@@ -52,7 +52,7 @@ In Mizar's architecture, **path boundary constraints** and **action execution ap
 
 Specifically, here is what each control enforces:
 
-- **`restrictToWorkspace: true`**: Strictly blocks `read`, `write`, `edit`, `grep`, `find`, and `@` file references in the input box if their resolved path escapes the workspace root. **It does not sandbox the `bash` tool**—because normal build commands (such as reading `~/.cargo` caches or invoking `/usr/bin/env`) legitimately require paths outside the repo.
+- **`restrictToWorkspace: true`**: Enforces canonical path resolution and symlink traversal checks across `read`, `write`, `edit`, `grep`, `find`, and `@` file mentions (blocking symlink escapes outside the workspace root). **It does not sandbox the `bash` tool**—because normal build commands (such as reading `~/.cargo` caches or invoking `/usr/bin/env`) legitimately require paths outside the repo.
 - **`--approve` / [`/approval ask`](/en/tui/commands/)**: Whenever the model attempts to run a **non-read-only tool** (including `write`, `edit`, `bash`, and external MCP or `codemode` calls not marked read-only), the TUI pauses and opens an approval prompt with four choices:
   - <kbd>y</kbd> / <kbd>Enter</kbd>: Allow this single invocation;
   - <kbd>a</kbd>: Trust this tool for the remainder of the current session;

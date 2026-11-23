@@ -139,38 +139,42 @@ In large monorepos, you can expand or tighten the `AGENTS.md` context budget and
 - `followSubdirs` (default `true`) dynamically loads subdirectory rule files when reading or editing files deeper in the tree.
 - `skills.enabled` toggles `.agents/skills` discovery; `customDirs` mounts additional shared team skill directories.
 
-## Context Compaction & Episodic Recall
+## Context Compaction, Episodic Recall & Subagents
 
-Long refactoring runs and verbose tool outputs no longer force a manual `/clear`—fine-tune automatic pruning, checkpoint summarization, and FTS5 recall under `compaction` and `recall` (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)):
+Long refactoring runs and verbose tool outputs no longer force a manual `/clear`—fine-tune single-stage compaction, static FTS5 recall, title generation, and background subagents in `settings.json` (see [Sessions, Branching & Performance Traces](/en/tui/sessions/)):
 
-```json title="Compaction engine and recall controls"
+```json title="Compaction, recall, sessionTitle, and subagent settings"
 {
   "compaction": {
     "enabled": true,
-    "autoPrune": true,
     "autoCompact": true,
-    "softWindowCap": 380000,
+    "defaultContextWindow": 128000,
     "triggerRatio": 0.8,
-    "pruneThresholdChars": 6000,
-    "coldCacheIdleSecs": 300,
-    "reusePrefixCache": true,
-    "disableSummaryReasoning": true,
-    "enableReadDedup": true,
-    "enableWriteAfterCompactGuard": true
+    "keepRecentTokens": 20000
   },
   "recall": {
     "enabled": true,
-    "autoActivateOnCompaction": true,
     "defaultSearchLimit": 8,
     "readCharLimit": 6000
+  },
+  "sessionTitle": {
+    "enabled": true,
+    "thinkingLevel": "low"
+  },
+  "subagent": {
+    "maxSteps": 20,
+    "maxStepsCap": 40,
+    "timeoutSecs": 180,
+    "maxConcurrent": 4,
+    "stallTimeoutSecs": 45,
+    "maxWatchdogAlerts": 2
   }
 }
 ```
 
-- `softWindowCap` (default `380000`): Applies a gentle compaction ceiling even on 1M-token models to preserve attention quality and cache efficiency; set to `0` to disable.
-- `reusePrefixCache` (default `true`) and `disableSummaryReasoning` (default `true`): Append summary instructions at the tail to reuse the main conversation's Prompt Cache and disable hidden reasoning tokens during summarization.
-- `enableWriteAfterCompactGuard` & `enableReadDedup`: Prevent stale whole-file `write` overwrites after compaction (while always permitting targeted `edit` calls) and deduplicate unchanged `read` ranges within the same compaction epoch.
-- `recall`: `recall_search` / `recall_read` stay `Deferred` at zero cost until `autoActivateOnCompaction` (default `true`) activates them after the first prune/compaction or inside a forked lineage.
+- `compaction`: Single-stage checkpoint compaction triggered at `triggerRatio` (default `0.8`) of the model's real usable window (`context_window - reserved_output`, optionally capped via `maxContextTokens`), generating a deterministic `<mizar-digest>` summary with overflow recovery plus built-in post-compaction `read` deduplication and stale whole-file `write` guards (`edit` always stays allowed).
+- `recall` (`enabled: true`, `defaultSearchLimit: 8`, `readCharLimit: 6000`): Exposes a single static `Direct` tool (`recall` with `search` and `read`) backed by SQLite WAL FTS5 indexing across compaction and fork boundaries.
+- `sessionTitle` & `subagent`: `sessionTitle` asynchronously names sessions as `MMDD｜TYPE｜Topic` (respecting manual `/rename`, optional `model` override); `subagent` configures single-layer persistent background workers including step caps, concurrency, timeout, and the zero-token liveness watchdog (`stallTimeoutSecs: 0` disables it).
 
 ## UI Preferences, `/settings` Modal & Module Toggles
 
@@ -191,4 +195,4 @@ Run `/settings` (alias `/config`) inside the TUI to open an interactive overlay 
 }
 ```
 
-- `disabledPlugins`: Declaratively disables built-in optional Cordis module IDs (`tool-time`, `tool-fs`, `tools-coding`, `tool-search`, `codemode`, `mcp`, `skills`, `instructions`, `compaction`, `recall`, `trajectory`, `repeat-guard`). Under the **Modules** group in `/settings`, you can hot-mount or hot-unload modules while idle (toggling is blocked while a turn is running); core services (`llm`, `sessions`, `tools`, `systemPrompt`, `agentLoop`, `spinePlugins`) are self-protected and can never be disabled.
+- `disabledPlugins`: Declaratively disables any of the 12 built-in optional module IDs (`tools-coding`, `tool-search`, `codemode`, `mcp`, `skills`, `instructions`, `compaction`, `recall`, `session-title`, `subagent`, `trajectory`, `repeat-guard`) or 10 official host/TUI extension IDs (`file-mentions`, `local-bash`, `approval-gate`, `tui`, `tui-emphasis`, `tui-side-panel`, `tui-timeline-rail`, `tui-trajectory-view`, `tui-selection`, `tui-clipboard`, where `"tui"` cascades all `tui-*` extensions for desktop hosts like Merak). Under the **Modules** group in `/settings`, `SpinePlugins` toggles modules atomically via lightweight flags without tearing down services (`mcp` initializes lazily on first enable; toggling is blocked mid-turn), while core services (`llm`, `sessions`, `tools`, `systemPrompt`, `agentLoop`, `spinePlugins`) are self-protected and can never be disabled.
