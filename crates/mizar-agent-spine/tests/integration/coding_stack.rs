@@ -126,7 +126,7 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
                             "model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again",
                         )));
                     }
-                    // 第 1 次重试成功，依次调用 write + edit + read + grep + find + bash + codemode + tool_search
+                    // 第 1 次重试成功：先建文件并按需激活延迟 MCP 工具（write/edit 已支持跨文件 Parallel，有依赖步骤分轮发出）
                     1 => {
                         let calls = vec![
                             ToolCall {
@@ -135,10 +135,37 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
                                 arguments: json!({"path": "src/main.rs", "content": "fn main() {\n    println!(\"v1\");\n}\n"}).to_string(),
                             },
                             ToolCall {
+                                id: "t8".into(),
+                                name: "tool_search".into(),
+                                arguments: json!({"query": "fff find_files"}).to_string(),
+                            },
+                        ];
+                        for (idx, c) in calls.into_iter().enumerate() {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(idx, c)));
+                        }
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    }
+                    // 第 2 步：此时 mcp__fff__find_files 已激活；对刚写入的文件执行 edit
+                    2 => {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
                                 id: "t2".into(),
                                 name: "edit".into(),
                                 arguments: json!({"path": "src/main.rs", "edits": [{"oldText": "v1", "newText": "v2"}]}).to_string(),
                             },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    }
+                    // 第 3 步：单轮并发调用 read + grep + find + bash + codemode + mcp__fff__find_files
+                    3 => {
+                        let calls = vec![
                             ToolCall {
                                 id: "t3".into(),
                                 name: "read".into(),
@@ -167,29 +194,14 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
                                 }).to_string(),
                             },
                             ToolCall {
-                                id: "t8".into(),
-                                name: "tool_search".into(),
-                                arguments: json!({"query": "fff find_files"}).to_string(),
+                                id: "t9".into(),
+                                name: "mcp__fff__find_files".into(),
+                                arguments: json!({"query": "main.rs"}).to_string(),
                             },
                         ];
                         for (idx, c) in calls.into_iter().enumerate() {
                             let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(idx, c)));
                         }
-                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
-                            reason: FinishReason::ToolCalls,
-                            replay: None,
-                        }));
-                    }
-                    // 第 2 步：模型应能看到刚刚通过 tool_search 激活的 mcp__fff__find_files，调用后结束
-                    2 => {
-                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
-                            0,
-                            ToolCall {
-                                id: "t9".into(),
-                                name: "mcp__fff__find_files".into(),
-                                arguments: json!({"query": "main.rs"}).to_string(),
-                            },
-                        )));
                         let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
                             reason: FinishReason::ToolCalls,
                             replay: None,

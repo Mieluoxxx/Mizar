@@ -1589,10 +1589,13 @@ async fn exec_supports_multi_turn_continue_resume_json_and_max_tokens() {
     assert!(!o_missing.status.success());
     assert!(o_missing.stdout.is_empty());
 
-    // 5. Reasoning-only 且无可见正文 -> 绝不能静默成功，必须返回非零并带 empty_response 诊断
-    state.set_script(vec![MockStep::CompletionsReasoningOnly(
-        "internal chain of thought without answer".into(),
-    )]);
+    // 5. Reasoning-only 且无可见正文 -> 自动重试耗尽后绝不能静默成功，必须返回非零并带 empty_response 诊断
+    state.set_script(vec![
+        MockStep::CompletionsReasoningOnly(
+            "internal chain of thought without answer".into()
+        );
+        4
+    ]);
     let mut c_reason = clean_env_cmd(
         &home,
         &ws,
@@ -1714,9 +1717,21 @@ async fn exec_responses_multi_turn_preserves_cache_key_affinity_and_static_instr
         reqs[0].body["prompt_cache_key"],
         reqs[1].body["prompt_cache_key"]
     );
-    let instr0 = reqs[0].body["instructions"].as_str().unwrap();
-    let instr1 = reqs[1].body["instructions"].as_str().unwrap();
-    assert_eq!(instr0, instr1, "instructions changed across turns");
+    assert!(
+        reqs[0].body.get("instructions").is_none(),
+        "top-level instructions must not be sent by default: {}",
+        reqs[0].body
+    );
+    assert!(
+        reqs[1].body.get("instructions").is_none(),
+        "top-level instructions must not be sent on turn 2: {}",
+        reqs[1].body
+    );
+    assert_eq!(reqs[0].body["input"][0]["role"], "developer");
+    assert_eq!(reqs[1].body["input"][0]["role"], "developer");
+    let instr0 = reqs[0].body["input"][0]["content"].as_str().unwrap();
+    let instr1 = reqs[1].body["input"][0]["content"].as_str().unwrap();
+    assert_eq!(instr0, instr1, "developer prefix changed across turns");
     assert_eq!(
         reqs[0].body["tools"], reqs[1].body["tools"],
         "tools declaration changed across turns"
@@ -1745,7 +1760,8 @@ async fn exec_responses_multi_turn_preserves_cache_key_affinity_and_static_instr
     };
     assert_eq!(count_env(&reqs[0].body), 1, "{}", reqs[0].body["input"]);
     assert_eq!(count_env(&reqs[1].body), 1, "{}", reqs[1].body["input"]);
-    let env_text = reqs[0].body["input"][0]["content"].as_str().unwrap();
+    assert_eq!(reqs[0].body["input"][1]["role"], "user");
+    let env_text = reqs[0].body["input"][1]["content"].as_str().unwrap();
     assert!(
         env_text.contains(&format!("<cwd>{ws_display}</cwd>")),
         "{env_text}"
@@ -2006,7 +2022,10 @@ async fn exec_trace_out_isolated_error_timeout_signal_and_write_failure() {
     assert_eq!(export_steps.termination_reason, "max_steps");
     assert_eq!(export_steps.tool_calls.len(), 1);
     assert_eq!(export_steps.tool_results.len(), 1);
-    assert_eq!(export_steps.tool_results[0].content_summary, "hello trace");
+    assert_eq!(
+        export_steps.tool_results[0].content_summary,
+        "1\thello trace"
+    );
 
     // C. --timeout 1 超时退出（第 1 步执行工具调用，第 2 步挂起触发超时）
     state.set_script(vec![
