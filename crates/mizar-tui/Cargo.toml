@@ -23,6 +23,7 @@ mizar-client = { workspace = true }
 mizar-client-core = { workspace = true }
 mizar-instructions = { workspace = true }
 mizar-llm = { workspace = true }
+mizar-llm-http = { workspace = true }
 mizar-llm-mock = { workspace = true }
 mizar-llm-retry = { workspace = true }
 mizar-llm-router = { workspace = true }
@@ -42,6 +43,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

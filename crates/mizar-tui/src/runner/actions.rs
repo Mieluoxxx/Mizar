@@ -1,8 +1,9 @@
 //! 工作台动作执行器：派发代理回合、本地 Bash、会话切换/恢复、剪贴板粘贴、侧栏数据采集与设置热更新。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use cordis::Context;
 use crossterm::event::EventStream;
@@ -23,7 +24,7 @@ use mizar_client::settings::{
     apply_runtime_setting_change, persist_setting_change, toggle_spine_module,
 };
 use mizar_client::workspace::{
-    collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
+    WorkspacePanelSnapshot, collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
     collect_workspace_panel_snapshot,
 };
 use mizar_client_core::{HostExtensionFlags, short_id};
@@ -35,7 +36,7 @@ use mizar_session_title::SessionTitleContextExt;
 use mizar_skills::{SkillLookupOptions, SkillRegistry};
 use mizar_tools::{ToolExposure, ToolRuntime};
 use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
-use mizar_tui_ui::app::{AppAction, AppState, NoticeLevel, SessionSelection, UiEvent};
+use mizar_tui_ui::app::{AppAction, AppState, ChatItem, NoticeLevel, SessionSelection, UiEvent};
 use mizar_tui_ui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui_ui::terminal::{
     ScreenMode, apply_terminal_modes, resume_after_external_editor, set_mouse_capture_enabled,
@@ -91,17 +92,24 @@ pub async fn apply_clipboard_content(
         Ok(clipboard::ClipboardContent::Image {
             bytes,
             source_label,
-        }) => match images::process_image_bytes(&bytes) {
-            Ok(processed) => {
-                let suffix = processed.marker_suffix();
-                let _ = app.insert_pasted_image(suffix.as_deref(), processed.attachment);
+        }) => {
+            match tokio::task::spawn_blocking(move || images::process_image_bytes(&bytes)).await {
+                Ok(Ok(processed)) => {
+                    let suffix = processed.marker_suffix();
+                    let _ = app.insert_pasted_image(suffix.as_deref(), processed.attachment);
+                }
+                Ok(Err(err)) => {
+                    let msg = format!("剪贴板图片处理失败（{source_label}）：{err}");
+                    app.set_flash(msg.clone());
+                    app.push_notice(NoticeLevel::Error, msg);
+                }
+                Err(err) => {
+                    let msg = format!("剪贴板图片处理任务异常（{source_label}）：{err}");
+                    app.set_flash(msg.clone());
+                    app.push_notice(NoticeLevel::Error, msg);
+                }
             }
-            Err(err) => {
-                let msg = format!("剪贴板图片处理失败（{source_label}）：{err}");
-                app.set_flash(msg.clone());
-                app.push_notice(NoticeLevel::Error, msg);
-            }
-        },
+        }
         Ok(clipboard::ClipboardContent::Files(paths)) => {
             let mut text_refs = Vec::new();
             for path in paths {
@@ -114,8 +122,10 @@ pub async fn apply_clipboard_content(
                     && let Ok(bytes) = tokio::fs::read(&path).await
                     && images::sniff_image_format(&bytes).is_some()
                 {
-                    match images::process_image_bytes(&bytes) {
-                        Ok(processed) => {
+                    match tokio::task::spawn_blocking(move || images::process_image_bytes(&bytes))
+                        .await
+                    {
+                        Ok(Ok(processed)) => {
                             let suffix = processed.marker_suffix();
                             if app
                                 .insert_pasted_image(suffix.as_deref(), processed.attachment)
@@ -124,8 +134,13 @@ pub async fn apply_clipboard_content(
                                 break;
                             }
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             let msg = format!("图片 `{}` 处理失败：{err}", path.display());
+                            app.set_flash(msg.clone());
+                            app.push_notice(NoticeLevel::Error, msg);
+                        }
+                        Err(err) => {
+                            let msg = format!("图片 `{}` 处理任务异常：{err}", path.display());
                             app.set_flash(msg.clone());
                             app.push_notice(NoticeLevel::Error, msg);
                         }
@@ -389,6 +404,12 @@ pub(super) fn spawn_local_bash_run(
     let update_tx = tx.clone();
 
     tokio::spawn(async move {
+        const LOCAL_BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+        let timeout_cancel = cancel.clone();
+        let timeout_guard = tokio::spawn(async move {
+            tokio::time::sleep(LOCAL_BASH_DEFAULT_TIMEOUT).await;
+            timeout_cancel.cancel();
+        });
         let ev = execute_local_bash_for_session(
             &session,
             call_id,
@@ -409,6 +430,7 @@ pub(super) fn spawn_local_bash_run(
             },
         )
         .await;
+        timeout_guard.abort();
 
         let _ = tx.send(LoopClientMsg::Task {
             run_id,
@@ -416,6 +438,72 @@ pub(super) fn spawn_local_bash_run(
             event: ev,
         });
     });
+}
+
+pub(super) struct SidePanelRefreshController {
+    tx: mpsc::UnboundedSender<(u64, String, WorkspacePanelSnapshot)>,
+    generation: u64,
+    in_flight: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SidePanelRefreshController {
+    pub(super) fn new() -> (
+        Self,
+        mpsc::UnboundedReceiver<(u64, String, WorkspacePanelSnapshot)>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                generation: 0,
+                in_flight: None,
+            },
+            rx,
+        )
+    }
+
+    pub(super) fn current_gen(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn abort(&mut self) {
+        if let Some(handle) = self.in_flight.take() {
+            handle.abort();
+        }
+    }
+}
+
+pub(super) fn schedule_side_panel_refresh(
+    ctx: &Context,
+    app: &mut AppState,
+    panel_ctrl: &mut SidePanelRefreshController,
+) {
+    if !app.features.side_panel || !app.side_panel.open {
+        return;
+    }
+    app.refresh_context_breakdown();
+    app.side_panel_data.files = app.touched_files.clone();
+    panel_ctrl.abort();
+    panel_ctrl.generation = panel_ctrl.generation.wrapping_add(1);
+    let generation = panel_ctrl.generation;
+    let ctx_bg = ctx.clone();
+    let ws_bg = app.workspace.clone();
+    let sid_bg = app.session_id.clone();
+    let tx = panel_ctrl.tx.clone();
+    panel_ctrl.in_flight = Some(tokio::spawn(async move {
+        let snapshot = collect_workspace_panel_snapshot(&ctx_bg, &ws_bg, Some(&sid_bg)).await;
+        let _ = tx.send((generation, sid_bg, snapshot));
+    }));
+}
+
+fn rollback_trailing_user_bubble(app: &mut AppState, expected_text: &str) {
+    if app.items.len() > app.inline_committed_items
+        && matches!(app.items.last(), Some(ChatItem::User { text }) if text == expected_text)
+    {
+        let idx = app.items.len() - 1;
+        app.items.pop();
+        app.item_cache.invalidate_item(idx);
+    }
 }
 
 pub(super) fn populate_tools_and_mcps(ctx: &Context, app: &mut AppState) {
@@ -437,12 +525,24 @@ pub(super) async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) 
     snapshot.apply_to_side_panel(&mut app.side_panel_data, &app.anomalies);
 }
 
+#[cfg(test)]
 pub(super) async fn apply_module_toggle_setting(
     ctx: &Context,
     app: &mut AppState,
     settings_path: Option<&Path>,
     plugin_id: &str,
     enabled: bool,
+) {
+    apply_module_toggle_setting_with_panel(ctx, app, settings_path, plugin_id, enabled, None).await;
+}
+
+pub(super) async fn apply_module_toggle_setting_with_panel(
+    ctx: &Context,
+    app: &mut AppState,
+    settings_path: Option<&Path>,
+    plugin_id: &str,
+    enabled: bool,
+    panel_ctrl: Option<&mut SidePanelRefreshController>,
 ) {
     if app.is_running_activity() {
         app.overlay
@@ -458,7 +558,9 @@ pub(super) async fn apply_module_toggle_setting(
     let outcome = toggle_spine_module(ctx, settings_path, plugin_id, enabled).await;
     if outcome.ok {
         app.user_skill_names = collect_user_skill_names(ctx, &app.workspace).await;
-        if app.features.side_panel {
+        if let Some(ctrl) = panel_ctrl {
+            schedule_side_panel_refresh(ctx, app, ctrl);
+        } else {
             populate_side_panel_data(ctx, app).await;
         }
     }
@@ -476,6 +578,7 @@ pub(super) async fn apply_host_setting_change(
     ctx: &Context,
     app: &mut AppState,
     terminal: &mut BufferedTerminal,
+    panel_ctrl: &mut SidePanelRefreshController,
     key: &str,
     value: &str,
 ) {
@@ -508,9 +611,7 @@ pub(super) async fn apply_host_setting_change(
             let _ = set_mouse_capture_enabled(enabled);
         }
         "ui.sidePanelOpen" => {
-            if app.features.side_panel && app.side_panel.open {
-                populate_side_panel_data(ctx, app).await;
-            }
+            schedule_side_panel_refresh(ctx, app, panel_ctrl);
         }
         k if k.starts_with("compaction.")
             || k.starts_with("sessionTitle.")
@@ -584,6 +685,7 @@ pub(super) async fn handle_action(
     active_sid: &Arc<RwLock<String>>,
     loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
     task_state: &mut RunController,
+    panel_ctrl: &mut SidePanelRefreshController,
     action: AppAction,
 ) {
     match action {
@@ -681,9 +783,7 @@ pub(super) async fn handle_action(
                 *active_sid.write().unwrap() = next.id.clone();
                 app.reset_for_new_session(next.id.clone(), title);
                 *active_session = next;
-                if app.features.side_panel && app.side_panel.open {
-                    populate_side_panel_data(ctx, app).await;
-                }
+                schedule_side_panel_refresh(ctx, app, panel_ctrl);
             }
         }
         AppAction::OpenSessionPicker => {
@@ -710,9 +810,11 @@ pub(super) async fn handle_action(
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            let _ =
-                resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
-                    .await;
+            if resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
+                .await
+            {
+                schedule_side_panel_refresh(ctx, app, panel_ctrl);
+            }
         }
         AppAction::RenameSession(title_arg) => {
             if let Some(new_title) = title_arg {
@@ -770,6 +872,7 @@ pub(super) async fn handle_action(
                 )
                 .await
             {
+                rollback_trailing_user_bubble(app, &prompt);
                 app.input.set_text_end(&prompt);
                 app.reject_unsupported_images_notice();
                 return;
@@ -787,6 +890,7 @@ pub(super) async fn handle_action(
         }
         AppAction::SubmitPromptWithImages { text, images } => {
             if !app.active_model_supports_images() {
+                rollback_trailing_user_bubble(app, &text);
                 app.reject_unsupported_images_notice();
                 return;
             }
@@ -1096,9 +1200,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::RefreshSidePanelData => {
-            if app.features.side_panel && app.side_panel.open {
-                populate_side_panel_data(ctx, app).await;
-            }
+            schedule_side_panel_refresh(ctx, app, panel_ctrl);
         }
         AppAction::RefreshSidePanelTools => {
             if app.features.side_panel && app.side_panel.open {
@@ -1128,17 +1230,18 @@ pub(super) async fn handle_action(
         AppAction::ApplySetting { key, value } => {
             if let Some(plugin_id) = key.strip_prefix("plugin.") {
                 let settings_path = resolve_global_settings_path();
-                apply_module_toggle_setting(
+                apply_module_toggle_setting_with_panel(
                     ctx,
                     app,
                     settings_path.as_deref(),
                     plugin_id,
                     value == "true",
+                    Some(panel_ctrl),
                 )
                 .await;
                 return;
             }
-            apply_host_setting_change(ctx, app, terminal, &key, &value).await;
+            apply_host_setting_change(ctx, app, terminal, panel_ctrl, &key, &value).await;
             if let Err(err) = persist_setting_change(&key, &value) {
                 app.push_notice(
                     NoticeLevel::Warn,
@@ -1194,9 +1297,7 @@ pub(super) async fn handle_action(
                         *active_sid.write().unwrap() = next.id.clone();
                         app.restore_session_view(project_fork_view(&next, target_seq));
                         *active_session = next;
-                        if app.features.side_panel && app.side_panel.open {
-                            populate_side_panel_data(ctx, app).await;
-                        }
+                        schedule_side_panel_refresh(ctx, app, panel_ctrl);
                     }
                     Err(err) => {
                         app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
@@ -1206,9 +1307,9 @@ pub(super) async fn handle_action(
         }
         AppAction::OpenExternalEditor => {
             let draft = app.input.expand_text();
-            let tmp_path =
+            let tmp_path: PathBuf =
                 std::env::temp_dir().join(format!("mizar-draft-{}.md", std::process::id()));
-            if let Err(err) = std::fs::write(&tmp_path, &draft) {
+            if let Err(err) = tokio::fs::write(&tmp_path, &draft).await {
                 app.push_notice(NoticeLevel::Error, format!("写入临时草稿文件失败：{err}"));
                 return;
             }
@@ -1219,18 +1320,26 @@ pub(super) async fn handle_action(
             let bin = parts.next().unwrap_or("vi").to_string();
             let extra_args: Vec<String> = parts.map(ToString::to_string).collect();
 
+            // 挂起前必须释放 EventStream，防止后台 tty 读取线程与外部编辑器争抢按键导致丢键
+            *term_stream = None;
             let _ = suspend_for_external_editor();
-            let status = std::process::Command::new(&bin)
-                .args(&extra_args)
-                .arg(&tmp_path)
-                .status();
+            let bin_owned = bin.clone();
+            let tmp_owned = tmp_path.clone();
+            let status = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(&bin_owned)
+                    .args(&extra_args)
+                    .arg(&tmp_owned)
+                    .status()
+            })
+            .await;
             let _ = resume_after_external_editor(app.screen_mode, app.mouse_capture_enabled);
             if let Ok(rebuilt) = create_terminal(app.screen_mode) {
                 *terminal = rebuilt;
             }
+            *term_stream = Some(EventStream::new());
 
             match status {
-                Ok(s) if s.success() => match std::fs::read_to_string(&tmp_path) {
+                Ok(Ok(s)) if s.success() => match tokio::fs::read_to_string(&tmp_path).await {
                     Ok(edited) => {
                         let clean = edited.strip_suffix('\n').unwrap_or(&edited);
                         app.input.set_text_end(clean);
@@ -1240,20 +1349,26 @@ pub(super) async fn handle_action(
                         app.push_notice(NoticeLevel::Error, format!("读取编辑结果失败：{err}"));
                     }
                 },
-                Ok(s) => {
+                Ok(Ok(s)) => {
                     app.push_notice(
                         NoticeLevel::Warn,
                         format!("外部编辑器 `{bin}` 退出码：{:?}", s.code()),
                     );
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     app.push_notice(
                         NoticeLevel::Error,
                         format!("启动外部编辑器 `{bin}` 失败：{err}"),
                     );
                 }
+                Err(err) => {
+                    app.push_notice(
+                        NoticeLevel::Error,
+                        format!("等待外部编辑器 `{bin}` 任务失败：{err}"),
+                    );
+                }
             }
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
         }
         AppAction::SwitchScreenMode(next_mode) => {
             if next_mode == app.screen_mode {
@@ -1287,5 +1402,76 @@ pub(super) async fn handle_action(
                 app.set_flash("🖱 已暂停鼠标追踪，终端原生划词复制可用 (F2 恢复)");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use mizar_llm::{ModelInfo, ProviderInfo};
+    use mizar_tui_ui::app::{AppAction, AppState, ChatItem};
+
+    use super::{mentions, rollback_trailing_user_bubble};
+
+    #[tokio::test]
+    async fn at_image_rejection_on_non_vision_model_rolls_back_ghost_user_bubble() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ws = std::env::temp_dir().join(format!(
+            "mizar_tui_ghost_bubble_{}_{uniq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("shot.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+
+        let providers = vec![ProviderInfo {
+            id: "mock".into(),
+            name: "Mock".into(),
+            protocol: "mock".into(),
+            models: vec![ModelInfo {
+                id: "text-only".into(),
+                name: "Text Only".into(),
+                input: vec!["text".into()],
+                ..Default::default()
+            }],
+        }];
+        let mut app = AppState::new(
+            ws.clone(),
+            "sess-ghost",
+            providers,
+            Some("mock".into()),
+            Some("text-only".into()),
+            None,
+        );
+        app.input.insert_str("请看 @shot.png ");
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let AppAction::SubmitPrompt(prompt) = action else {
+            panic!("expected SubmitPrompt, got {action:?}");
+        };
+        assert_eq!(app.items.len(), 1);
+
+        assert!(!app.active_model_supports_images());
+        assert!(mentions::mentions_resolve_any_image(&ws, false, &prompt).await);
+
+        rollback_trailing_user_bubble(&mut app, &prompt);
+        app.input.set_text_end(&prompt);
+        app.reject_unsupported_images_notice();
+
+        assert!(
+            !app.items
+                .iter()
+                .any(|it| matches!(it, ChatItem::User { .. })),
+            "rejected @image prompt must not leave a ghost user bubble: {:?}",
+            app.items
+        );
+        assert_eq!(app.input.text(), "请看 @shot.png");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

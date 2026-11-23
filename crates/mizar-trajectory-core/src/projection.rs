@@ -39,6 +39,27 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// 常驻 `IncrementalFolder` 保留各条记录 `*detail` 预览的默认字节上限（UTF-8 边界安全）。
+pub const DEFAULT_DETAIL_MAX_BYTES: usize = 512;
+
+/// 按 UTF-8 字符边界安全截断文本，确保返回值总字节数不超过 `max_bytes`。
+pub fn cap_detail_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    if max_bytes < ELLIPSIS.len() {
+        let cut = text.floor_char_boundary(max_bytes);
+        return text[..cut].to_string();
+    }
+    let body_budget = max_bytes - ELLIPSIS.len();
+    let cut = text.floor_char_boundary(body_budget);
+    let mut out = String::with_capacity(cut + ELLIPSIS.len());
+    out.push_str(&text[..cut]);
+    out.push_str(ELLIPSIS);
+    out
+}
+
 /// 增量轨迹折叠器：每次仅消费新增 `TraceEvent`，避免在长会话评估时重复重扫全量事件历史。
 #[derive(Clone)]
 pub struct IncrementalFolder {
@@ -51,10 +72,16 @@ pub struct IncrementalFolder {
     current_turn: Option<u64>,
     current_step: Option<usize>,
     last_counted_turn: Option<u64>,
+    detail_max_bytes: Option<usize>,
 }
 
 impl IncrementalFolder {
     pub fn new(session_id: impl Into<String>) -> Self {
+        Self::with_detail_cap(session_id, Some(DEFAULT_DETAIL_MAX_BYTES))
+    }
+
+    /// 构造指定 `*detail` 字节上限的增量折叠器（`None` 表示保留完整原文，供离线无损折叠使用）。
+    pub fn with_detail_cap(session_id: impl Into<String>, detail_max_bytes: Option<usize>) -> Self {
         Self {
             session_id: session_id.into(),
             stats: SessionStats::default(),
@@ -65,6 +92,14 @@ impl IncrementalFolder {
             current_turn: None,
             current_step: None,
             last_counted_turn: None,
+            detail_max_bytes,
+        }
+    }
+
+    fn cap_detail(&self, text: &str) -> String {
+        match self.detail_max_bytes {
+            Some(max_bytes) => cap_detail_bytes(text, max_bytes),
+            None => text.to_string(),
         }
     }
 
@@ -214,7 +249,7 @@ impl IncrementalFolder {
                         preview
                     },
                     source: Some("user".to_string()),
-                    input_detail: Some(text.clone()),
+                    input_detail: Some(self.cap_detail(text)),
                     output_detail: None,
                     reasoning_detail: None,
                     call_id: None,
@@ -238,7 +273,7 @@ impl IncrementalFolder {
                     kind: RecordKind::Context,
                     label: format!("[{source}] {preview}"),
                     source: Some(source.clone()),
-                    input_detail: Some(text.clone()),
+                    input_detail: Some(self.cap_detail(text)),
                     output_detail: None,
                     reasoning_detail: None,
                     call_id: None,
@@ -324,8 +359,8 @@ impl IncrementalFolder {
                     label,
                     source: Some("assistant".to_string()),
                     input_detail: None,
-                    output_detail: (!text.is_empty()).then(|| text.clone()),
-                    reasoning_detail: (!reasoning.is_empty()).then(|| reasoning.clone()),
+                    output_detail: (!text.is_empty()).then(|| self.cap_detail(text)),
+                    reasoning_detail: (!reasoning.is_empty()).then(|| self.cap_detail(reasoning)),
                     call_id: None,
                     tool_name: None,
                     started_at_ms,
@@ -360,7 +395,7 @@ impl IncrementalFolder {
                     kind: RecordKind::Tool,
                     label,
                     source: Some("tool".to_string()),
-                    input_detail: Some(arguments.clone()),
+                    input_detail: Some(self.cap_detail(arguments)),
                     output_detail: None,
                     reasoning_detail: None,
                     call_id: Some(call_id.clone()),
@@ -397,8 +432,9 @@ impl IncrementalFolder {
                 if let Some(pending) = self.pending_calls.remove(tool_call_id) {
                     let dur = ev.ts_ms.saturating_sub(pending.started_at_ms) as u64;
                     self.stats.tool_ms += dur;
+                    let capped_output = self.cap_detail(content);
                     if let Some(rec) = self.records.get_mut(pending.rec_idx) {
-                        rec.output_detail = Some(content.clone());
+                        rec.output_detail = Some(capped_output);
                         rec.duration_ms = Some(dur);
                         rec.is_error = *is_error;
                         rec.blocked = *blocked;
@@ -414,7 +450,7 @@ impl IncrementalFolder {
                         label: name.clone(),
                         source: Some("tool".to_string()),
                         input_detail: None,
-                        output_detail: Some(content.clone()),
+                        output_detail: Some(self.cap_detail(content)),
                         reasoning_detail: None,
                         call_id: Some(tool_call_id.clone()),
                         tool_name: Some(name.clone()),
@@ -445,7 +481,11 @@ impl IncrementalFolder {
                     label: format!("[{rule_id}] {summary}"),
                     source: Some(rule_id.clone()),
                     input_detail: None,
-                    output_detail: Some(serde_json::to_string_pretty(evidence).unwrap_or_default()),
+                    output_detail: Some(
+                        self.cap_detail(
+                            &serde_json::to_string_pretty(evidence).unwrap_or_default(),
+                        ),
+                    ),
                     reasoning_detail: None,
                     call_id: None,
                     tool_name: None,
@@ -481,7 +521,7 @@ impl IncrementalFolder {
 
 /// 将有序 `TraceEvent` 流纯折叠为结构化的 `TrajectorySnapshot`。
 pub fn fold_trajectory(session_id: &str, events: &[TraceEvent]) -> TrajectorySnapshot {
-    let mut folder = IncrementalFolder::new(session_id);
+    let mut folder = IncrementalFolder::with_detail_cap(session_id, None);
     for ev in events {
         folder.push_event(ev);
     }

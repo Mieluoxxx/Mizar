@@ -401,12 +401,12 @@ impl IncrementalDetector {
                 ..
             } => {
                 self.open_tools.remove(tool_call_id);
-                let meta = self.call_meta.get(tool_call_id);
-                let turn = meta.map(|m| m.0).or(self.current_turn);
-                let step = meta.map(|m| m.1);
+                let meta = self.call_meta.remove(tool_call_id);
+                let turn = meta.as_ref().map(|m| m.0).or(self.current_turn);
+                let step = meta.as_ref().map(|m| m.1);
 
                 if *blocked && let Some((_, _, orig_name, canon)) = meta {
-                    self.denied_keys.insert((orig_name.clone(), canon.clone()));
+                    self.denied_keys.insert((orig_name, canon));
                 }
 
                 if *is_error {
@@ -592,5 +592,65 @@ fn report_unclosed_for_turn(
                 evidence: json!({ "kind": "tool", "callId": call_id, "tool": name }),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_detector_removes_consumed_call_meta_and_preserves_r03() {
+        let mut detector = IncrementalDetector::new(DetectorConfig::default());
+        let call1 = TraceEvent {
+            session_id: "s-det".into(),
+            seq: 1,
+            ts_ms: 100,
+            kind: TraceEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            },
+        };
+        detector.push_event(&call1, &[]);
+        assert_eq!(detector.call_meta.len(), 1);
+
+        let res1 = TraceEvent {
+            session_id: "s-det".into(),
+            seq: 2,
+            ts_ms: 110,
+            kind: TraceEventKind::ToolResult {
+                tool_call_id: "c1".into(),
+                name: "bash".into(),
+                content: "denied".into(),
+                is_error: true,
+                blocked: true,
+            },
+        };
+        detector.push_event(&res1, &[]);
+        assert!(detector.call_meta.is_empty());
+
+        let call2 = TraceEvent {
+            session_id: "s-det".into(),
+            seq: 3,
+            ts_ms: 120,
+            kind: TraceEventKind::ToolCall {
+                turn: 1,
+                step: 2,
+                call_id: "c2".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            },
+        };
+        detector.push_event(&call2, &[]);
+        assert_eq!(detector.call_meta.len(), 1);
+        let findings = detector.findings(&[]);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "R03_RETRY_AFTER_DENIED")
+        );
     }
 }

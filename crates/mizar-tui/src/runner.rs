@@ -21,13 +21,16 @@ use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_tools::EVENT_TOOLS_CHANGE;
 use mizar_tui_ui::TuiFeatures;
 use mizar_tui_ui::app::{
-    AppAction, AppState, ApprovalMode, NoticeLevel, SessionSelection, UiEvent, UiTurnEndReason,
+    AppAction, AppState, ApprovalMode, ChatItem, NoticeLevel, SessionSelection, ToolState, UiEvent,
+    UiTurnEndReason,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{ApprovalDecision, SessionPickerItem, SettingEntry};
 use mizar_tui_ui::terminal::{ProgramStatusState, ScreenMode, TerminalGuard, emit_program_status};
 use mizar_tui_ui::theme::ThemePreset;
-use mizar_tui_ui::ui::render;
+use mizar_tui_ui::ui::{
+    build_item_lines_for_scrollback_at, build_welcome_lines_for_scrollback, render,
+};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -50,11 +53,82 @@ pub use mizar_client::settings::{
     persist_setting_change, persist_setting_change_to, toggle_spine_module,
 };
 
-use actions::{handle_action, populate_side_panel_data};
+use actions::{SidePanelRefreshController, handle_action, populate_side_panel_data};
 use terminal_io::{
-    create_terminal, flush_inline_scrollback, handle_term_event_dirty, poll_term_event,
-    process_loop_ui_msg_dirty,
+    create_terminal, flush_inline_scrollback, handle_term_event_dirty, insert_scrollback_lines,
+    poll_term_event, process_loop_ui_msg_dirty,
 };
+
+fn inline_finalized_commit_limit(app: &AppState) -> usize {
+    if !app.is_running_activity() {
+        return app.items.len();
+    }
+    let mut limit = app.inline_committed_items.min(app.items.len());
+    while limit < app.items.len() {
+        let finalized = match &app.items[limit] {
+            ChatItem::User { .. } | ChatItem::Notice { .. } => true,
+            ChatItem::Assistant { .. } => {
+                // 仅当后续出现非 Notice 项时，流式助手消息才已定型且关闭 reveal
+                app.items[limit + 1..]
+                    .iter()
+                    .any(|it| !matches!(it, ChatItem::Notice { .. }))
+            }
+            ChatItem::ToolCall { status, .. } => {
+                !matches!(status, ToolState::Running) && limit + 1 < app.items.len()
+            }
+        };
+        if !finalized {
+            break;
+        }
+        limit += 1;
+    }
+    limit
+}
+
+fn flush_inline_scrollback_incremental<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut AppState,
+) -> bool {
+    if !app.is_running_activity() {
+        let before = app.inline_committed_items;
+        flush_inline_scrollback(terminal, app);
+        return app.inline_committed_items > before;
+    }
+
+    let target = inline_finalized_commit_limit(app);
+    if app.inline_committed_items >= target {
+        return false;
+    }
+    let Ok(size) = terminal.size() else {
+        return false;
+    };
+    let width = size.width.max(20) as usize;
+    let chunk_max = size.height.saturating_sub(2).max(4) as usize;
+
+    if !app.inline_welcome_committed {
+        let welcome_lines = build_welcome_lines_for_scrollback(app, width);
+        insert_scrollback_lines(terminal, &welcome_lines, chunk_max);
+        app.inline_welcome_committed = true;
+    }
+
+    let before = app.inline_committed_items;
+    while app.inline_committed_items < target {
+        let idx = app.inline_committed_items;
+        let lines = build_item_lines_for_scrollback_at(
+            &app.items,
+            idx,
+            &app.tool_extras,
+            width,
+            &app.theme,
+            &app.emphasis,
+            app.show_thinking,
+            app.verbose_expanded,
+        );
+        insert_scrollback_lines(terminal, &lines, chunk_max);
+        app.inline_committed_items += 1;
+    }
+    app.inline_committed_items > before
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeTarget {
@@ -684,6 +758,7 @@ pub async fn run_tui_with_summary(
         let mut terminal = create_terminal(app.screen_mode)?;
 
         let mut term_stream = Some(EventStream::new());
+        let (mut panel_ctrl, mut panel_rx) = SidePanelRefreshController::new();
         let mut wake_rx = ctx.agent_loop().ok().map(|a| a.inbox().subscribe_wake());
         let mut inbox_wake_ready = false;
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(90));
@@ -709,8 +784,10 @@ pub async fn run_tui_with_summary(
 
         let run_loop_res: Result<(), Box<dyn std::error::Error>> = async {
             while !app.should_quit {
-                if app.screen_mode == ScreenMode::Inline && !app.is_running_activity() {
-                    flush_inline_scrollback(&mut terminal.terminal, &mut app);
+                if app.screen_mode == ScreenMode::Inline
+                    && flush_inline_scrollback_incremental(&mut terminal.terminal, &mut app)
+                {
+                    needs_redraw = true;
                 }
                 if needs_redraw {
                     terminal.draw_synced(|frame| render(frame, &mut app))?;
@@ -844,6 +921,19 @@ pub async fn run_tui_with_summary(
                             }
                         }
                     }
+                    Some((panel_gen, panel_sid, snapshot)) = panel_rx.recv() => {
+                        let dirty = if panel_gen == panel_ctrl.current_gen()
+                            && panel_sid == app.session_id
+                            && app.features.side_panel
+                            && app.side_panel.open
+                        {
+                            snapshot.apply_to_side_panel(&mut app.side_panel_data, &app.anomalies);
+                            true
+                        } else {
+                            false
+                        };
+                        (AppAction::None, dirty)
+                    }
                 };
 
                 needs_redraw |= step_dirty || action != AppAction::None;
@@ -859,6 +949,7 @@ pub async fn run_tui_with_summary(
                     &active_sid,
                     &loop_tx,
                     &mut task_state,
+                    &mut panel_ctrl,
                     action,
                 )
                 .await;
@@ -909,6 +1000,7 @@ pub async fn run_tui_with_summary(
         if let Some(task) = update_check_task {
             task.abort();
         }
+        panel_ctrl.abort();
         run_loop_res
     }
     .await;
@@ -2087,5 +2179,56 @@ mod tests {
         assert_eq!(followup_res.unwrap(), "woke followup ok");
 
         ctx.fiber().dispose().await;
+    }
+
+    #[test]
+    fn inline_finalized_commit_limit_flushes_settled_prefix_while_busy() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-inline-inc",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.push_user_message("hello");
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "thinking done, calling tool".into(),
+            ts_ms: 10,
+        });
+        // 正在流式输出的 Assistant 尚未定型，仅其前面的 User 已可推进 scrollback
+        assert_eq!(super::inline_finalized_commit_limit(&app), 1);
+
+        // ToolCall 到来会闭合上一条 Assistant，且工具仍在运行，因此 User + Assistant 均可增量提交
+        app.apply_ui_event(UiEvent::ToolCall(mizar_llm::ToolCall {
+            id: "tc-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        }));
+        assert_eq!(super::inline_finalized_commit_limit(&app), 2);
+
+        // 工具完成后仍在最后一项（后续相邻工具可能影响 group_end），等下一个条目到达即提交
+        app.apply_ui_event(UiEvent::ToolResult {
+            call_id: "tc-1".into(),
+            name: "read".into(),
+            content: "ok".into(),
+            is_error: false,
+            blocked: false,
+            details: None,
+        });
+        assert_eq!(super::inline_finalized_commit_limit(&app), 2);
+
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "final answer".into(),
+            ts_ms: 20,
+        });
+        assert_eq!(super::inline_finalized_commit_limit(&app), 3);
+
+        // TurnEnd 空闲后全量收尾提交
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: super::UiTurnEndReason::Completed,
+        });
+        assert_eq!(super::inline_finalized_commit_limit(&app), 4);
     }
 }

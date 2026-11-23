@@ -543,16 +543,16 @@ impl TrajectoryRuntime {
     pub fn inspect(&self, session_id: &str, mode: TimelineMode) -> Option<TrajectoryReport> {
         if let Some(session) = self.resolve_session(session_id) {
             self.sync_managed_session(&session);
-            let (snapshot, findings) = {
+            let findings = {
                 let buffers = self.buffers.lock().unwrap();
                 let buf = buffers.get(session_id)?;
                 let folder = buf.inc_folder.as_ref()?;
                 let detector = buf.inc_detector.as_ref()?;
-                (
-                    folder.snapshot(),
-                    detector.findings_with_guards(folder.records()),
-                )
+                detector.findings_with_guards(folder.records())
             };
+            // 按需导出与 Ctrl+T 详查走无损投影，常驻 inc_folder 仍保留 <=512B 预览上限
+            let events = trace_events_from_session(&session);
+            let snapshot = fold_trajectory(session_id, &events);
             let timeline = derive_timeline(&snapshot.records, mode);
             return Some(TrajectoryReport {
                 snapshot,
@@ -568,7 +568,7 @@ impl TrajectoryRuntime {
             let folder = buf.inc_folder.as_ref()?;
             let detector = buf.inc_detector.as_ref()?;
             (
-                folder.snapshot(),
+                fold_trajectory(session_id, &buf.standalone_events),
                 detector.findings_with_guards(folder.records()),
             )
         };
@@ -578,6 +578,34 @@ impl TrajectoryRuntime {
             timeline,
             findings,
         })
+    }
+
+    /// 零快照拷贝提取指定会话的异常发现（避免构造全量 `TrajectorySnapshot` 与时间轴）。
+    pub fn findings_only(&self, session_id: &str) -> Vec<TrajectoryFinding> {
+        if let Some(session) = self.resolve_session(session_id) {
+            self.sync_managed_session(&session);
+            let buffers = self.buffers.lock().unwrap();
+            let Some(buf) = buffers.get(session_id) else {
+                return Vec::new();
+            };
+            let (Some(folder), Some(detector)) =
+                (buf.inc_folder.as_ref(), buf.inc_detector.as_ref())
+            else {
+                return Vec::new();
+            };
+            return detector.findings_with_guards(folder.records());
+        }
+
+        let mut buffers = self.buffers.lock().unwrap();
+        let Some(buf) = buffers.get_mut(session_id) else {
+            return Vec::new();
+        };
+        buf.sync_standalone(session_id, &self.config.detector);
+        let (Some(folder), Some(detector)) = (buf.inc_folder.as_ref(), buf.inc_detector.as_ref())
+        else {
+            return Vec::new();
+        };
+        detector.findings_with_guards(folder.records())
     }
 
     /// 纯离线分析：对任意传入的 `TraceEvent` 切片运行折叠 + 时间轴 + 异常检测。

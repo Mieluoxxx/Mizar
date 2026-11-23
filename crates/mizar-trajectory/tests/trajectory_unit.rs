@@ -473,3 +473,55 @@ async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic
     assert!(write_trace_export_atomic(&dir, &export).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn findings_only_matches_inspect_findings_without_snapshot_clone() {
+    use mizar_session::{SessionContextExt, SessionEvent, SessionStore, SessionTraceEvent};
+    use mizar_trajectory::TrajectoryContextExt;
+
+    let ctx = Context::new();
+    ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+    ctx.plugin(TrajectoryRuntime::plugin(), TrajectoryConfig::default())
+        .await
+        .unwrap();
+
+    let sessions = ctx.sessions().unwrap();
+    let s = sessions.create(None);
+    let traj = ctx.trajectory().unwrap();
+
+    for step in 1..=4 {
+        s.append_trace(SessionTraceEvent::StepStart {
+            turn: 1,
+            step,
+            system_prompt_chars: 100,
+            tools_count: 1,
+        });
+        s.append_trace(SessionTraceEvent::ToolCall {
+            turn: 1,
+            step,
+            call_id: format!("c-{step}"),
+            name: "read".into(),
+            arguments: r#"{"path":"foo.rs"}"#.into(),
+        });
+        s.append(SessionEvent::ToolResult {
+            tool_call_id: format!("c-{step}"),
+            name: "read".into(),
+            content: "err".into(),
+            is_error: true,
+        });
+        s.append_trace(SessionTraceEvent::StepEnd {
+            turn: 1,
+            step,
+            outcome: "tool_calls".into(),
+            usage: None,
+        });
+    }
+
+    let expected = traj
+        .inspect(&s.id, TimelineMode::Sequence)
+        .unwrap()
+        .findings;
+    let fast = traj.findings_only(&s.id);
+    assert!(!fast.is_empty());
+    assert_eq!(fast, expected);
+}
