@@ -1239,3 +1239,73 @@ async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_
     assert_eq!(loaded.header.id, "child-async");
     reopened.shutdown().unwrap();
 }
+
+#[tokio::test]
+async fn transient_busy_in_prior_batch_surfaces_to_subsequent_flush_without_poisoning() {
+    use mizar_session::{RecallSearchQuery, SessionEntry, SessionHeader};
+    use tokio::time::{Duration, sleep};
+
+    let db_path = temp_db_path("prior_batch_busy");
+    let _guard = TempDbGuard(db_path.clone());
+
+    let persistence =
+        SqliteSessionPersistence::open_with_busy_timeout(&db_path, Duration::from_millis(30))
+            .unwrap();
+
+    let mut header = SessionHeader::new("prior-busy", 1000);
+    header.cwd = Some("/ws/prior-busy".into());
+    persistence.create_session(&header).unwrap();
+    persistence.flush_async(None).await.unwrap();
+
+    let blocker = rusqlite::Connection::open(&db_path).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    // 先写入但不立即 flush，等待超过 busy_timeout 确保前一批次无 flush 先失败并暂存瞬时错误
+    persistence
+        .append_events(
+            "prior-busy",
+            &[SessionEntry {
+                seq: 1,
+                event: SessionEvent::user("锁持有期间入队写入"),
+                ts: 1001,
+            }],
+        )
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+
+    let busy_err = persistence.flush_async(None).await;
+    assert!(
+        busy_err.is_err(),
+        "expected prior batch transient SQLITE_BUSY error to surface on subsequent flush"
+    );
+
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    drop(blocker);
+
+    persistence
+        .append_events(
+            "prior-busy",
+            &[SessionEntry {
+                seq: 1,
+                event: SessionEvent::user("锁释放后恢复写入 PRIOR_BUSY_RECOVERED"),
+                ts: 1002,
+            }],
+        )
+        .unwrap();
+    persistence.flush_async(None).await.unwrap();
+
+    let recovered = persistence
+        .search_recall_async(RecallSearchQuery {
+            query: "PRIOR_BUSY_RECOVERED".into(),
+            session_ids: vec!["prior-busy".into()],
+            cwd: None,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].seq, 1);
+
+    persistence.shutdown().unwrap();
+}

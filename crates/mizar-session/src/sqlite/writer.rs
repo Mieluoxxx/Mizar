@@ -128,6 +128,7 @@ pub fn run_writer_loop(
     last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) {
     let mut sticky_error: Option<String> = None;
+    let mut pending_transient_error: Option<String> = None;
 
     while let Ok(first) = rx.recv() {
         let mut writes = Vec::new();
@@ -158,15 +159,41 @@ pub fn run_writer_loop(
             }
         }
 
+        let has_observer = !flushes.is_empty() || tail_action.is_some();
         let write_res = if let Some(ref err_msg) = sticky_error {
             Err(PersistenceError::Backend(err_msg.clone()))
         } else if writes.is_empty() {
-            Ok(())
+            if has_observer {
+                match pending_transient_error.take() {
+                    Some(err_msg) => Err(PersistenceError::Backend(err_msg)),
+                    None => Ok(()),
+                }
+            } else {
+                Ok(())
+            }
         } else {
             match apply_write_batch(&mut conn, &writes) {
-                Ok(()) => Ok(()),
-                Err(BatchWriteError::Transient(err)) => Err(err),
+                Ok(()) => {
+                    if has_observer {
+                        match pending_transient_error.take() {
+                            Some(err_msg) => Err(PersistenceError::Backend(err_msg)),
+                            None => Ok(()),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(BatchWriteError::Transient(err)) => {
+                    // 无观察者批次的瞬时忙碌不能直接丢弃，暂存到下一次 flush / 同步屏障消费一次
+                    if has_observer {
+                        pending_transient_error = None;
+                    } else {
+                        pending_transient_error = Some(err.to_string());
+                    }
+                    Err(err)
+                }
                 Err(BatchWriteError::Fatal(err)) => {
+                    pending_transient_error = None;
                     let msg = err.to_string();
                     sticky_error = Some(msg.clone());
                     *last_error.lock().unwrap() = Some(msg);
