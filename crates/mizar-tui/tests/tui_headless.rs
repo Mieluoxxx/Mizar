@@ -1368,6 +1368,7 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     let ctx = Context::new();
     ctx.logger().set_silent();
     let mut cfg = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
+    cfg.session_title = Some(mizar_agent_spine::SessionTitleConfig::default());
     cfg.agent.provider = Some("fake".into());
     cfg.agent.model = Some("smart-1".into());
     if let AgentToolsMode::Coding {

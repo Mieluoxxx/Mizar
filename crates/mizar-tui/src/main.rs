@@ -593,6 +593,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let loaded_cfg = load_mizar_config(&workspace);
     let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());
+    // `session-title` 仅归属交互式 TUI 会话（先开启默认配置再应用 settings.json 覆盖）
+    spine_cfg.session_title = Some(mizar_agent_spine::SessionTitleConfig::default());
     if !cli.no_persist {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }

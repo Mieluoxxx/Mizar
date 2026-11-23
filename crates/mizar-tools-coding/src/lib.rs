@@ -120,40 +120,90 @@ impl Plugin for CodingToolsPlugin {
                         let sp = c.service::<SystemPrompt>("systemPrompt")?;
                         c.effect("tools-coding.system-prompt", move || {
                             let tools = tools;
-                            Ok::<_, cordis::CordisError>(Some(sp.section(PromptSection::new(
-                                "coding_tools",
-                                20,
-                                move || {
-                                    let declared = tools.list_declared_infos(None);
-                                    let mut lines = Vec::new();
-                                    let mut snippets = Vec::new();
-                                    let mut guidelines = Vec::new();
-                                    for info in &declared {
-                                        if let Some(s) = &info.prompt_snippet {
-                                            snippets.push(format!("- {}: {}", info.name, s));
+                            Ok::<_, cordis::CordisError>(Some(sp.section(
+                                PromptSection::new_for_session(
+                                    "tools_guide",
+                                    20,
+                                    move |session_id| {
+                                        let declared = tools.list_declared_infos(session_id);
+                                        if declared.is_empty() {
+                                            return None;
                                         }
-                                        for g in &info.prompt_guidelines {
-                                            if !guidelines.contains(g) {
-                                                guidelines.push(g.clone());
+                                        let has = |name: &str| {
+                                            declared.iter().any(|info| info.name == name)
+                                        };
+                                        let mut lines = Vec::new();
+                                        let mut snippets = Vec::new();
+                                        let mut extra_guidelines = Vec::new();
+                                        for info in &declared {
+                                            if let Some(s) = &info.prompt_snippet {
+                                                snippets.push(format!("- `{}`: {s}", info.name));
+                                            }
+                                            if !matches!(info.name.as_str(), "read" | "edit") {
+                                                for g in &info.prompt_guidelines {
+                                                    if !extra_guidelines.contains(g) {
+                                                        extra_guidelines.push(g.clone());
+                                                    }
+                                                }
                                             }
                                         }
-                                    }
-                                    if !snippets.is_empty() {
-                                        lines.push("核心工具能力：".into());
-                                        lines.extend(snippets);
-                                    }
-                                    if !guidelines.is_empty() {
-                                        lines.push("操作原则：".into());
-                                        lines
-                                            .extend(guidelines.into_iter().map(|g| format!("- {g}")));
-                                        lines.push(
-                                            "- 读取或检索多个互不依赖的文件时，尽量在同一轮并发调用多个只读工具（read/grep/find）以减少串行往返"
-                                                .into(),
-                                        );
-                                    }
-                                    (!lines.is_empty()).then(|| lines.join("\n"))
-                                },
-                            ))))
+                                        if !snippets.is_empty() {
+                                            lines.push("Available tools:".into());
+                                            lines.extend(snippets);
+                                        }
+
+                                        let mut usage = Vec::new();
+                                        if has("bash") {
+                                            let mut dedicated = Vec::new();
+                                            if has("read") {
+                                                dedicated.push("`read` to inspect files");
+                                            }
+                                            if has("grep") {
+                                                dedicated.push("`grep` to search content");
+                                            }
+                                            if has("find") {
+                                                dedicated.push("`find` to locate files");
+                                            }
+                                            if has("edit") {
+                                                dedicated.push(
+                                                    "`edit` for targeted edits (batch disjoint edits to one file in `edits[]`)",
+                                                );
+                                            }
+                                            if !dedicated.is_empty() {
+                                                usage.push(format!(
+                                                    "- Prefer dedicated tools over `bash`: use {}; never run `cat`, `head`, `tail`, `sed`, `grep`, or `find` via `bash`.",
+                                                    dedicated.join(", ")
+                                                ));
+                                            }
+                                        } else if has("edit") {
+                                            usage.push(
+                                                "- Use `edit` for targeted changes to existing files (batch disjoint edits to one file in `edits[]`) instead of rewriting whole files."
+                                                    .into(),
+                                            );
+                                        }
+                                        for g in extra_guidelines {
+                                            usage.push(format!("- {g}"));
+                                        }
+                                        if has("edit") || has("write") || has("bash") {
+                                            usage.push(
+                                                "- Batch independent tool calls in one turn: issue parallel `read`, `grep`, `find`, cross-file `edit`/`write`, and independent `bash` calls together when they have no data dependency. Run calls sequentially only when a later step depends on an earlier result."
+                                                    .into(),
+                                            );
+                                        } else {
+                                            usage.push(
+                                                "- Batch independent read-only tool calls (`read`, `grep`, `find`) in one turn when they have no data dependency. Run calls sequentially only when a later step depends on an earlier result."
+                                                    .into(),
+                                            );
+                                        }
+
+                                        if !usage.is_empty() {
+                                            lines.push("Tool usage:".into());
+                                            lines.extend(usage);
+                                        }
+                                        (!lines.is_empty()).then(|| lines.join("\n"))
+                                    },
+                                ),
+                            )))
                         })?;
                         Ok::<_, cordis::CordisError>(())
                     }
@@ -327,11 +377,38 @@ mod tests {
 
         let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap();
         let built = prompt.build();
-        assert!(built.contains("核心工具能力："), "prompt:\n{built}");
-        assert!(built.contains("操作原则："), "prompt:\n{built}");
+        assert!(built.contains("Available tools:"), "prompt:\n{built}");
+        assert!(built.contains("Tool usage:"), "prompt:\n{built}");
+        assert!(built.contains("edits[]"), "prompt:\n{built}");
+        assert!(
+            built.contains("never run `cat`, `head`, `tail`, `sed`, `grep`, or `find` via `bash`"),
+            "prompt:\n{built}"
+        );
+        assert!(
+            built.contains("Batch independent tool calls in one turn"),
+            "prompt:\n{built}"
+        );
+        assert!(
+            !built
+                .chars()
+                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "tools_guide must be pure English:\n{built}"
+        );
+
+        // 验证 session_id 策略隔离不会跨会话泄漏
+        let tools = app.tools().unwrap();
+        tools.set_active_tools("s-ro", &["read".into()]);
+        let built_ro = prompt.build_for_session(Some("s-ro"));
+        assert!(built_ro.contains("- `read`:"), "s-ro:\n{built_ro}");
+        assert!(!built_ro.contains("- `bash`:"), "s-ro:\n{built_ro}");
+        assert!(
+            prompt
+                .build_for_session(Some("s-other"))
+                .contains("- `bash`:")
+        );
 
         coding.dispose().await;
-        assert!(!prompt.build().contains("核心工具能力："));
+        assert!(!prompt.build().contains("Available tools:"));
 
         let _ = std::fs::remove_dir_all(&root);
         app.fiber().dispose().await;

@@ -61,7 +61,7 @@ struct CatalogState {
 
 #[derive(Debug, Clone)]
 struct PublishedCatalogRecord {
-    seq: u64,
+    rendered: String,
     state: CatalogState,
 }
 
@@ -268,6 +268,9 @@ fn create_skill_tool(registry: Arc<SkillRegistry>, workspace: PathBuf) -> ToolDe
         idempotent: true,
         open_world: false,
     })
+    .with_prompt_snippet(
+        "Load full instructions for a named skill from the session skill catalog",
+    )
 }
 
 #[derive(Default, Clone, Copy)]
@@ -400,7 +403,8 @@ impl Plugin for SkillsPlugin {
                             cancel: cancel.clone(),
                         };
 
-                        // 1. 若当前会话声明了 `skill` 工具，按需注入或更新 <available_skills> 目录
+                        // 1. 若当前会话声明了 `skill` 工具，按需生成 <available_skills> 目录（经 TurnInput 入账保证位于 <environment_context> / <project_instructions> 之后）
+                        let mut skill_notices: Vec<TurnInput> = Vec::new();
                         let skill_tool_visible = ctx_inner
                             .tools()
                             .map(|rt| {
@@ -426,12 +430,12 @@ impl Plugin for SkillsPlugin {
                                 .with_visible_entries(|entries| {
                                     let still_vis = prev_record.as_ref().is_some_and(|rec| {
                                         entries.iter().any(|entry| {
-                                            entry.seq == rec.seq
-                                                && matches!(
-                                                    &entry.event,
-                                                    SessionEvent::ContextNotice { source, .. }
-                                                        if source == SKILL_CATALOG_SOURCE
-                                                )
+                                            matches!(
+                                                &entry.event,
+                                                SessionEvent::ContextNotice { source, text, .. }
+                                                    if source == SKILL_CATALOG_SOURCE
+                                                        && *text == rec.rendered
+                                            )
                                         })
                                     });
                                     let latest =
@@ -439,7 +443,7 @@ impl Plugin for SkillsPlugin {
                                             SessionEvent::ContextNotice {
                                                 source, text, ..
                                             } if source == SKILL_CATALOG_SOURCE => {
-                                                Some((entry.seq, text.clone()))
+                                                Some(text.clone())
                                             }
                                             _ => None,
                                         });
@@ -453,7 +457,7 @@ impl Plugin for SkillsPlugin {
                             };
 
                             if prev_state.is_none()
-                                && let Some((latest_seq, ref latest_text)) = latest_catalog
+                                && let Some(ref latest_text) = latest_catalog
                             {
                                 let matches_initial =
                                     *latest_text == render_catalog_message(&next_state, false);
@@ -463,7 +467,7 @@ impl Plugin for SkillsPlugin {
                                     published_map.lock().unwrap().insert(
                                         session.id.clone(),
                                         PublishedCatalogRecord {
-                                            seq: latest_seq,
+                                            rendered: latest_text.clone(),
                                             state: next_state.clone(),
                                         },
                                     );
@@ -479,21 +483,15 @@ impl Plugin for SkillsPlugin {
                             if should_emit {
                                 let is_update = prev_record.is_some() || latest_catalog.is_some();
                                 let rendered = render_catalog_message(&next_state, is_update);
-                                session.append(SessionEvent::context_notice(
-                                    SKILL_CATALOG_SOURCE,
-                                    rendered,
-                                ));
-                                if let Some(last_seq) =
-                                    session.with_visible_entries(|e| e.last().map(|x| x.seq))
-                                {
-                                    published_map.lock().unwrap().insert(
-                                        session.id.clone(),
-                                        PublishedCatalogRecord {
-                                            seq: last_seq,
-                                            state: next_state,
-                                        },
-                                    );
-                                }
+                                published_map.lock().unwrap().insert(
+                                    session.id.clone(),
+                                    PublishedCatalogRecord {
+                                        rendered: rendered.clone(),
+                                        state: next_state,
+                                    },
+                                );
+                                skill_notices
+                                    .push(TurnInput::notice(SKILL_CATALOG_SOURCE, rendered));
                             }
                         }
 
@@ -577,29 +575,29 @@ impl Plugin for SkillsPlugin {
                         }
 
                         if all_resolved && !cancel.is_cancelled() {
-                            if from_turn_inputs {
-                                for def in resolved_defs {
-                                    inputs.push(TurnInput::notice(
-                                        SKILL_INVOCATION_SOURCE,
-                                        render_skill_content(&def),
-                                    ));
-                                }
-                            } else {
-                                for def in resolved_defs {
-                                    session.append(SessionEvent::context_notice(
-                                        SKILL_INVOCATION_SOURCE,
-                                        render_skill_content(&def),
-                                    ));
-                                }
-                                if let Some(max_seq) = max_user_seq {
-                                    processed_gestures
-                                        .lock()
-                                        .unwrap()
-                                        .entry(session.id.clone())
-                                        .and_modify(|s| *s = (*s).max(max_seq))
-                                        .or_insert(max_seq);
-                                }
+                            for def in resolved_defs {
+                                skill_notices.push(TurnInput::notice(
+                                    SKILL_INVOCATION_SOURCE,
+                                    render_skill_content(&def),
+                                ));
                             }
+                            if !from_turn_inputs && let Some(max_seq) = max_user_seq {
+                                processed_gestures
+                                    .lock()
+                                    .unwrap()
+                                    .entry(session.id.clone())
+                                    .and_modify(|s| *s = (*s).max(max_seq))
+                                    .or_insert(max_seq);
+                            }
+                        }
+
+                        if !skill_notices.is_empty() {
+                            // 保持 `<skill-catalog>` / `<skill_content>` 紧随 `<project_instructions>` 且位于本轮用户文本之前
+                            let insert_at = inputs
+                                .iter()
+                                .position(|item| matches!(item, TurnInput::User { .. }))
+                                .unwrap_or(inputs.len());
+                            inputs.splice(insert_at..insert_at, skill_notices);
                         }
 
                         AgentPreStepDecision::Enter { inputs }

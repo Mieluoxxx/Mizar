@@ -613,6 +613,8 @@ mod disabled_plugins_tests {
         #[cfg(feature = "session-title")]
         {
             let mut spine = AgentSpineConfig::new(&proj);
+            assert!(spine.session_title.is_none());
+            spine.session_title = Some(crate::SessionTitleConfig::default());
             loaded.apply_to_spine(&mut spine);
             let cfg = spine.session_title.unwrap();
             assert!(cfg.enabled);

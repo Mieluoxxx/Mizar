@@ -706,22 +706,29 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
         let ctx = ctx.clone();
         let session = Arc::clone(session);
         async move {
-            ctx.waterfall(
-                EVENT_AGENT_PRE_STEP,
-                AgentPreStepInput {
-                    session,
-                    turn,
-                    step,
-                    provider: None,
-                    model: None,
-                    cancel,
-                    inputs: Vec::new(),
-                },
-                |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-                },
-            )
-            .await
+            let decision = ctx
+                .waterfall(
+                    EVENT_AGENT_PRE_STEP,
+                    AgentPreStepInput {
+                        session: Arc::clone(&session),
+                        turn,
+                        step,
+                        provider: None,
+                        model: None,
+                        cancel,
+                        inputs: Vec::new(),
+                    },
+                    |inp| -> BoxFuture<'static, AgentPreStepDecision> {
+                        Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
+                    },
+                )
+                .await;
+            if let AgentPreStepDecision::Enter { ref inputs } = decision {
+                for item in inputs {
+                    session.append(item.clone().into_session_event());
+                }
+            }
+            decision
         }
     };
 

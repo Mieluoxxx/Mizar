@@ -127,7 +127,7 @@ pub struct AgentSpineConfig {
     /// 是否启用无损情景回溯工具（静态常驻 `recall`，默认开启）。
     #[cfg(feature = "compaction")]
     pub recall: Option<RecallConfig>,
-    /// 是否启用基于对话主题的会话标题自动生成服务（默认开启）。
+    /// 是否启用基于对话主题的会话标题自动生成服务（默认关闭，由交互式 TUI 按需开启）。
     #[cfg(feature = "session-title")]
     pub session_title: Option<SessionTitleConfig>,
     /// 是否启用 Prompt Cache 后台定时续命保活服务（默认开启）。
@@ -165,7 +165,7 @@ impl AgentSpineConfig {
             #[cfg(feature = "compaction")]
             recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
-            session_title: Some(SessionTitleConfig::default()),
+            session_title: None,
             #[cfg(feature = "cache-warming")]
             cache_warming: Some(CacheWarmingConfig::default()),
             #[cfg(feature = "subagent")]
@@ -180,9 +180,7 @@ impl AgentSpineConfig {
         let ws = workspace.into();
         Self {
             workspace: ws.clone(),
-            persona: Some(
-                "你是一个高效、务实的编程与终端 AI 助手，擅长检查代码、执行命令和精确修改文件。回答简洁准确。".to_string(),
-            ),
+            persona: Some(mizar_system_prompt::DEFAULT_PERSONA.to_string()),
             agent: AgentLoopConfig::default(),
             tools_mode: AgentToolsMode::Coding {
                 coding: CodingToolsConfig::new(&ws),
@@ -203,7 +201,7 @@ impl AgentSpineConfig {
             #[cfg(feature = "compaction")]
             recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
-            session_title: Some(SessionTitleConfig::default()),
+            session_title: None,
             #[cfg(feature = "cache-warming")]
             cache_warming: Some(CacheWarmingConfig::default()),
             #[cfg(feature = "subagent")]
@@ -292,6 +290,9 @@ impl Plugin for AgentSpinePlugin {
                 SystemPrompt::plugin(),
                 SystemPromptConfig {
                     persona: config.persona,
+                    runtime_protocol: Some(
+                        mizar_system_prompt::DEFAULT_RUNTIME_PROTOCOL.to_string(),
+                    ),
                 },
             )?;
             ctx.try_plugin(AgentLoop::plugin(), config.agent)?;

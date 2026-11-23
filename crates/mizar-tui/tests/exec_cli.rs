@@ -1752,9 +1752,11 @@ async fn exec_responses_multi_turn_preserves_cache_key_affinity_and_static_instr
             .unwrap()
             .iter()
             .filter(|item| {
-                item.get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains("<environment_context>"))
+                item.get("role").and_then(Value::as_str) == Some("user")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.contains("<environment_context>"))
             })
             .count()
     };
@@ -2148,4 +2150,267 @@ async fn exec_trace_out_isolated_error_timeout_signal_and_write_failure() {
     );
     let err_bad = String::from_utf8_lossy(&out_bad.stderr);
     assert!(err_bad.contains("[W trace]"), "{err_bad}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_turn0_prompt_wire_format_order_file_mentions_and_trace_out() {
+    let tmp = TempRoot::new("exec_w15_wire");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(home.join(".mizar")).unwrap();
+    std::fs::create_dir_all(ws.join(".mizar")).unwrap();
+    std::fs::create_dir_all(ws.join(".agents/skills/helper")).unwrap();
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "WORKSPACE_RULE_W15").unwrap();
+    std::fs::write(
+        ws.join(".agents/skills/helper/SKILL.md"),
+        "---\nname: helper\ndescription: Helper skill for W1-5\n---\nHELPER_SKILL_BODY",
+    )
+    .unwrap();
+    std::fs::write(ws.join("src/sample.txt"), "SAMPLE_AT_FILE_CONTENT\n").unwrap();
+
+    let state = GatewayState::new(
+        vec![
+            MockStep::ResponsesText("ISO_TURN0_OK".into()),
+            MockStep::ResponsesText("MENTION_TURN1_OK".into()),
+            MockStep::ResponsesText("MENTION_TURN2_OK".into()),
+            MockStep::ResponsesText("DISABLED_MENTION_OK".into()),
+        ],
+        MockStep::ResponsesText("FALLBACK".into()),
+    );
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+
+    // A. --isolated --protocol responses（禁用 workspace AGENTS/skills？测试先在无 skill/无 AGENTS 独立目录验证 0-MCP/0-Skill 7 工具与 ~1.8KB 静态前缀）
+    let iso_ws = tmp.path().join("iso_ws");
+    std::fs::create_dir_all(&iso_ws).unwrap();
+    let trace_iso = tmp.path().join("iso/trajectory.json");
+    let mut cmd_iso = clean_env_cmd(
+        &home,
+        &iso_ws,
+        &[
+            "exec",
+            "--isolated",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "--trace-out",
+            trace_iso.to_str().unwrap(),
+            "inspect iso workspace",
+        ],
+    );
+    cmd_iso.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_iso = run_with_stdin(cmd_iso, None).await;
+    assert!(
+        out_iso.status.success(),
+        "iso stderr: {}",
+        String::from_utf8_lossy(&out_iso.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out_iso.stdout), "ISO_TURN0_OK\n");
+
+    let export_iso: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_iso).unwrap()).unwrap();
+    assert_eq!(export_iso.exit_code, 0);
+    assert_eq!(export_iso.termination_reason, "completed");
+
+    let iso_req = state.requests.lock().unwrap()[0].clone();
+    assert!(iso_req.body.get("instructions").is_none());
+    assert_eq!(iso_req.body["input"][0]["role"], "developer");
+    let dev_prompt = iso_req.body["input"][0]["content"].as_str().unwrap();
+    assert!(
+        (900..=2600).contains(&dev_prompt.len()),
+        "headless developer prompt should be ~1.8KB, got {} bytes:\n{dev_prompt}",
+        dev_prompt.len()
+    );
+    assert!(
+        !dev_prompt
+            .chars()
+            .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+        "developer prompt must be pure English:\n{dev_prompt}"
+    );
+    for expected in [
+        "Respond in the same language as the user unless asked otherwise.",
+        "Engineering principles:",
+        "Available tools:",
+        "Tool usage:",
+        "edits[]",
+        "Runtime context blocks",
+        "<environment_context>",
+        "<mizar-compaction>",
+    ] {
+        assert!(
+            dev_prompt.contains(expected),
+            "missing `{expected}` in:\n{dev_prompt}"
+        );
+    }
+    for forbidden in [
+        "These rules shape replies",
+        "During multi-step work, briefly tell the user what you are doing.",
+        "Subagent delegation",
+        "session-title",
+        "WORKSPACE_RULE_W15",
+    ] {
+        assert!(
+            !dev_prompt.contains(forbidden),
+            "unexpected `{forbidden}` in headless developer prompt:\n{dev_prompt}"
+        );
+    }
+    let mut iso_tools: Vec<String> = iso_req.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    iso_tools.sort();
+    assert_eq!(
+        iso_tools,
+        vec!["bash", "edit", "find", "grep", "read", "recall", "write"]
+    );
+
+    // B. Turn-0 ContextNotice 顺序 + @file 展开 + 跨轮 developer/tools 字节一致 + --trace-out
+    let trace_b = tmp.path().join("mentions/trajectory.json");
+    let mut cmd_b1 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "--trace-out",
+            trace_b.to_str().unwrap(),
+            "Check @src/sample.txt with /helper",
+        ],
+    );
+    cmd_b1.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_b1 = run_with_stdin(cmd_b1, None).await;
+    assert!(
+        out_b1.status.success(),
+        "b1 stderr: {}",
+        String::from_utf8_lossy(&out_b1.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out_b1.stdout),
+        "MENTION_TURN1_OK\n"
+    );
+
+    let export_b: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_b).unwrap()).unwrap();
+    assert_eq!(export_b.exit_code, 0);
+    assert_eq!(export_b.termination_reason, "completed");
+
+    let mut cmd_b2 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "-c",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "follow up",
+        ],
+    );
+    cmd_b2.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_b2 = run_with_stdin(cmd_b2, None).await;
+    assert!(
+        out_b2.status.success(),
+        "b2 stderr: {}",
+        String::from_utf8_lossy(&out_b2.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out_b2.stdout),
+        "MENTION_TURN2_OK\n"
+    );
+
+    let reqs = state.requests.lock().unwrap().clone();
+    assert!(reqs.len() >= 3);
+    let r_b1 = &reqs[1];
+    let r_b2 = &reqs[2];
+    assert_eq!(
+        r_b1.body["input"][0]["content"], r_b2.body["input"][0]["content"],
+        "developer prefix must stay byte-identical across turns"
+    );
+    assert_eq!(
+        r_b1.body["tools"], r_b2.body["tools"],
+        "tools declaration must stay identical across turns"
+    );
+    let b1_dev = r_b1.body["input"][0]["content"].as_str().unwrap();
+    assert!(!b1_dev.contains("WORKSPACE_RULE_W15"));
+    assert!(!b1_dev.contains("HELPER_SKILL_BODY"));
+    assert!(!b1_dev.contains("SAMPLE_AT_FILE_CONTENT"));
+
+    let b1_input = r_b1.body["input"].as_array().unwrap();
+    assert_eq!(b1_input[0]["role"], "developer");
+    let b1_texts: Vec<String> = b1_input
+        .iter()
+        .skip(1)
+        .map(|item| item["content"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let find_pos = |needle: &str| {
+        b1_texts
+            .iter()
+            .position(|t| t.contains(needle))
+            .map(|idx| idx + 1)
+            .unwrap_or_else(|| panic!("missing `{needle}` in input: {b1_texts:?}"))
+    };
+    let pos_env = find_pos("<environment_context>");
+    let pos_instr = find_pos("WORKSPACE_RULE_W15");
+    let pos_catalog = find_pos("<available_skills>");
+    let pos_skill = find_pos("HELPER_SKILL_BODY");
+    let pos_user = find_pos("Check @src/sample.txt with /helper");
+    let pos_mention = find_pos("SAMPLE_AT_FILE_CONTENT");
+    assert_eq!(pos_env, 1, "input[1] must be <environment_context>");
+    assert!(
+        pos_env < pos_instr
+            && pos_instr < pos_catalog
+            && pos_catalog < pos_skill
+            && pos_skill < pos_user
+            && pos_user < pos_mention,
+        "unexpected Turn-0 input order: env={pos_env}, instr={pos_instr}, catalog={pos_catalog}, skill={pos_skill}, user={pos_user}, mention={pos_mention}, items={b1_texts:?}"
+    );
+
+    // C. disabledPlugins=["file-mentions"] 时应跳过 @path 展开
+    std::fs::write(
+        ws.join(".mizar/settings.json"),
+        r#"{"disabledPlugins":["file-mentions"]}"#,
+    )
+    .unwrap();
+    let mut cmd_c = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "Check @src/sample.txt disabled",
+        ],
+    );
+    cmd_c.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_c = run_with_stdin(cmd_c, None).await;
+    assert!(
+        out_c.status.success(),
+        "c stderr: {}",
+        String::from_utf8_lossy(&out_c.stderr)
+    );
+    let r_c = state.requests.lock().unwrap().last().unwrap().clone();
+    assert!(
+        !r_c.body.to_string().contains("SAMPLE_AT_FILE_CONTENT"),
+        "disabledPlugins file-mentions should suppress @file expansion: {}",
+        r_c.body
+    );
 }

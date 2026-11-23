@@ -188,7 +188,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     )
     .unwrap();
 
-    let cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins([
+    let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins([
         "compaction",
         "tools-coding",
         "tool-search",
@@ -203,6 +203,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         "trajectory",
         "repeat-guard",
     ]);
+    assert!(cfg.session_title.is_none());
+    cfg.session_title = Some(mizar_agent_spine::SessionTitleConfig::default());
 
     let app = Context::new();
     let events: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -282,7 +284,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         startup_tool_names,
         HashSet::from(["probe_echo".to_string()])
     );
-    assert!(!prompt.build().contains("核心工具能力："));
+    assert!(!prompt.build().contains("Available tools:"));
     assert!(!prompt.build().contains("当前工作目录："));
 
     // 2. 热挂载 + 热卸载基础编程工具 (`tools-coding`)，含系统提示词提供者清理验证
@@ -292,7 +294,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     for expected in ["read", "bash", "edit", "write", "grep", "find"] {
         assert!(coding_tools.contains(expected), "missing {expected}");
     }
-    assert!(prompt.build().contains("核心工具能力："));
+    assert!(prompt.build().contains("Available tools:"));
     assert!(!prompt.build().contains("当前工作目录："));
     assert!(ctrl.set_enabled("tools-coding", false).await.unwrap());
     let after_disable_coding: HashSet<String> =
@@ -301,7 +303,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         after_disable_coding,
         HashSet::from(["probe_echo".to_string()])
     );
-    assert!(!prompt.build().contains("核心工具能力："));
+    assert!(!prompt.build().contains("Available tools:"));
 
     // 3. 热挂载 tool-search / codemode / mcp / skills / instructions / recall
     for id in [
@@ -328,7 +330,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     // 触发一次 pre-step，验证 instructions 与 skills 监听器均正常向会话注入上下文
     let session = sessions.create(None);
     session.append(SessionEvent::user("hello"));
-    let _ = app
+    if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
             AgentPreStepInput {
@@ -344,7 +346,12 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
                 Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
-        .await;
+        .await
+    {
+        for item in inputs {
+            session.append(item.into_session_event());
+        }
+    }
     assert!(session.visible_log().iter().any(|e| matches!(
         &e.event,
         SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE")
@@ -378,7 +385,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     // 确认 instructions 与 skills 监听器已被卸载：新建会话不再收到对应 ContextNotice
     let session_after_unload = sessions.create(None);
     session_after_unload.append(SessionEvent::user("after unload"));
-    let _ = app
+    if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
             AgentPreStepInput {
@@ -394,7 +401,12 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
                 Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
-        .await;
+        .await
+    {
+        for item in inputs {
+            session_after_unload.append(item.into_session_event());
+        }
+    }
     assert!(!session_after_unload.visible_log().iter().any(|e| matches!(
         &e.event,
         SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE") || text.contains("demo-skill")
@@ -405,7 +417,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     assert!(ctrl.set_enabled("instructions", true).await.unwrap());
     assert!(app.get::<SkillRegistry>("skills").is_some());
     assert!(app.get::<AgentInstructions>("agentInstructions").is_some());
-    let _ = app
+    if let AgentPreStepDecision::Enter { inputs } = app
         .waterfall(
             EVENT_AGENT_PRE_STEP,
             AgentPreStepInput {
@@ -421,7 +433,12 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
                 Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
             },
         )
-        .await;
+        .await
+    {
+        for item in inputs {
+            session_after_unload.append(item.into_session_event());
+        }
+    }
     assert!(session_after_unload.visible_log().iter().any(|e| matches!(
         &e.event,
         SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE")
