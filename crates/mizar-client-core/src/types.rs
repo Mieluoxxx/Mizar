@@ -9,7 +9,7 @@ use mizar_llm_types::{ContentBlock, ImageAttachment, ReasoningEffort, TokenUsage
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cache_audit::{CacheMissAudit, CacheWarmingSessionStatus};
+use crate::cache_audit::CacheMissAudit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolState {
@@ -222,9 +222,6 @@ pub struct SessionViewData {
     pub total_usage: TokenUsage,
     /// 该会话最近一次实测（或压缩后）上下文 token 数，供跨 resume 恢复占用估算。
     pub last_prompt_tokens: Option<u64>,
-    /// 当前会话的 Prompt Cache 保活实时状态（仅运行期可读时填充）。
-    #[serde(default)]
-    pub cache_warming: Option<CacheWarmingSessionStatus>,
     /// 从会话账本统计出的意外缓存重计费（`Cache Re-billed`）汇总。
     #[serde(default)]
     pub cache_miss_audit: CacheMissAudit,
@@ -494,9 +491,6 @@ pub enum ClientEvent {
     Flash(String),
     Notice {
         level: NoticeLevel,
-        text: String,
-    },
-    CacheWarmingNotice {
         text: String,
     },
     SubagentState {

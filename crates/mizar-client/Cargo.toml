@@ -16,7 +16,6 @@ futures = { workspace = true }
 image = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-agent-spine = { workspace = true }
-mizar-cache-warming = { workspace = true }
 mizar-client-core = { workspace = true }
 mizar-instructions = { workspace = true }
 mizar-llm = { workspace = true }

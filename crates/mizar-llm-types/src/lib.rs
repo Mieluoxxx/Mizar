@@ -3,18 +3,23 @@
 //! 本 crate 不依赖 `cordis`、`tokio` 或任何 HTTP/TLS 传输库，供纯 UI 层与核心领域层共用。
 
 pub mod assembler;
+pub mod cache_audit;
 pub mod error;
 pub mod sse;
 pub mod types;
 
 pub use assembler::BlockAssembler;
+pub use cache_audit::{
+    CacheMissAudit, MIN_CACHE_DROP_TOKENS, UsageAuditSample, calculate_usage_cost,
+    compute_cache_miss_audit,
+};
 pub use error::{
     LlmError, LlmErrorCode, is_context_window_exceeded, is_empty_response_error, is_quota_exceeded,
 };
 pub use sse::{SseEvent, SseParser, prefix_digest};
 pub use types::{
-    CacheRetention, CacheWarmingMode, ContentBlock, ContentBlockKind, FinishReason,
-    ImageAttachment, MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
+    CacheRetention, ContentBlock, ContentBlockKind, FinishReason, ImageAttachment,
+    MAX_IMAGES_PER_MESSAGE, Message, ModelCostRates, ModelCostTier, ModelInfo,
     OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, PromptCacheLifetime, ProviderInfo, ReasoningEffort,
     ReplayEnvelope, RequestOrigin, SessionAffinityMode, StreamChunk, TokenUsage, ToolCall,
     ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,

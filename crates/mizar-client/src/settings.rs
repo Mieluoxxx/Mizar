@@ -7,7 +7,6 @@ use mizar_agent_spine::{
     CompactionContextExt, SpinePluginsContextExt, normalize_session_title_thinking_level,
     patch_settings_file, persist_disabled_plugins, resolve_global_settings_path,
 };
-use mizar_cache_warming::{CacheWarmingMode, CacheWarmingRuntime, SERVICE_CACHE_WARMING};
 use mizar_client_core::{ApprovalMode, NoticeLevel, SettingEntry, SettingItemKind};
 use mizar_llm::ReasoningEffort;
 use mizar_session_title::{SessionTitleContextExt, parse_model_ref};
@@ -247,35 +246,6 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         ]);
     }
 
-    if let Some(cw) = ctx.get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING) {
-        let cfg = cw.config();
-        let mode_opts = ["off", "streaming", "idle"];
-        items.extend([
-            SettingEntry {
-                key: "cacheWarming".into(),
-                category: "缓存".into(),
-                label: "Prompt Cache 续命模式".into(),
-                description:
-                    "off 关闭；streaming 仅在生成或工具运行中保活；idle 回合结束后最多保活 30m"
-                        .into(),
-                kind: SettingItemKind::Choice {
-                    options: mode_opts.iter().map(|s| s.to_string()).collect(),
-                    selected: choice_index(&mode_opts, cfg.mode.as_str()),
-                },
-            },
-            SettingEntry {
-                key: "showCacheMissNotices".into(),
-                category: "缓存".into(),
-                label: "显示缓存保活提示".into(),
-                description: "在对话流中显示后台 Prompt Cache 续命状态通知（连续通知自动折叠）"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.show_cache_miss_notices,
-                },
-            },
-        ]);
-    }
-
     if let Ok(plugins) = ctx.spine_plugins() {
         for module in plugins.optional_modules() {
             items.push(SettingEntry {
@@ -401,20 +371,6 @@ pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
             }
             _ => {}
         });
-    } else if (key == "cacheWarming" || key == "showCacheMissNotices")
-        && let Some(cw) = ctx.get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
-    {
-        match key {
-            "cacheWarming" => {
-                if let Some(mode) = CacheWarmingMode::parse(value) {
-                    cw.set_mode(mode);
-                }
-            }
-            "showCacheMissNotices" => {
-                cw.set_show_notices(value == "true");
-            }
-            _ => {}
-        }
     }
 }
 
@@ -542,18 +498,6 @@ pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<
             "thinkingLevel",
             serde_json::Value::String(value.trim().to_ascii_lowercase()),
         ),
-        "cacheWarming" => {
-            root.insert(
-                "cacheWarming".to_string(),
-                serde_json::Value::String(value.trim().to_ascii_lowercase()),
-            );
-        }
-        "showCacheMissNotices" => {
-            root.insert(
-                "showCacheMissNotices".to_string(),
-                serde_json::Value::Bool(value == "true"),
-            );
-        }
         _ => {}
     })
 }
@@ -683,27 +627,6 @@ mod tests {
         // 3. 尝试禁用受保护核心模块必须被拒绝且不破坏已有配置
         let protected_res = toggle_spine_module(&ctx, Some(&settings_path), "llm", false).await;
         assert!(!protected_res.ok);
-
-        // 4. cacheWarming 与 showCacheMissNotices 暴露、热更新并原子持久化到 settings.json
-        let cw_entries = build_settings_entries(&ctx, &snap);
-        assert!(cw_entries.iter().any(|e| e.key == "cacheWarming"));
-        assert!(cw_entries.iter().any(|e| e.key == "showCacheMissNotices"));
-
-        apply_runtime_setting_change(&ctx, "cacheWarming", "streaming");
-        apply_runtime_setting_change(&ctx, "showCacheMissNotices", "true");
-        persist_setting_change_to(&settings_path, "cacheWarming", "streaming").unwrap();
-        persist_setting_change_to(&settings_path, "showCacheMissNotices", "true").unwrap();
-
-        let cw_rt = ctx
-            .get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
-            .unwrap();
-        assert_eq!(cw_rt.config().mode, CacheWarmingMode::Streaming);
-        assert!(cw_rt.config().show_cache_miss_notices);
-
-        let persisted_3: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(persisted_3["cacheWarming"], "streaming");
-        assert_eq!(persisted_3["showCacheMissNotices"], true);
 
         ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);

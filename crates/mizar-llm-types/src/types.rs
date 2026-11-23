@@ -158,36 +158,7 @@ pub enum CacheRetention {
     Long,
 }
 
-/// Prompt Cache 后台续命保活模式（`off` / `streaming` / `idle`）。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum CacheWarmingMode {
-    Off,
-    Streaming,
-    #[default]
-    Idle,
-}
-
-impl CacheWarmingMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Streaming => "streaming",
-            Self::Idle => "idle",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "false" | "0" => Some(Self::Off),
-            "streaming" => Some(Self::Streaming),
-            "idle" => Some(Self::Idle),
-            _ => None,
-        }
-    }
-}
-
-/// 模型请求来源归属，用于策略分流（如仅对主会话轮次启用缓存预热、子代理跳过自动标题等）。
+/// 模型请求来源归属，用于策略分流（如子代理跳过自动标题等）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RequestOrigin {
@@ -199,7 +170,6 @@ pub enum RequestOrigin {
     },
     Compaction,
     SessionTitle,
-    CacheWarm,
     Subagent,
     Custom(String),
 }
@@ -766,7 +736,6 @@ mod tests {
             turn,
             RequestOrigin::Compaction,
             RequestOrigin::SessionTitle,
-            RequestOrigin::CacheWarm,
             RequestOrigin::Subagent,
             RequestOrigin::Custom("bridge".into()),
         ] {
@@ -830,27 +799,5 @@ mod tests {
             .default_retention(),
             None
         );
-    }
-
-    #[test]
-    fn cache_warming_mode_serde_and_parse_roundtrip() {
-        assert_eq!(CacheWarmingMode::default(), CacheWarmingMode::Idle);
-        for (mode, wire) in [
-            (CacheWarmingMode::Off, "\"off\""),
-            (CacheWarmingMode::Streaming, "\"streaming\""),
-            (CacheWarmingMode::Idle, "\"idle\""),
-        ] {
-            assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
-            assert_eq!(
-                serde_json::from_str::<CacheWarmingMode>(wire).unwrap(),
-                mode
-            );
-            assert_eq!(CacheWarmingMode::parse(mode.as_str()), Some(mode));
-        }
-        assert_eq!(
-            CacheWarmingMode::parse("  IDLE "),
-            Some(CacheWarmingMode::Idle)
-        );
-        assert_eq!(CacheWarmingMode::parse("unknown"), None);
     }
 }

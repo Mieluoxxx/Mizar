@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mizar_llm::{CacheWarmingMode, ReasoningEffort};
+use mizar_llm::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -137,8 +137,6 @@ pub struct SettingsConfig {
     pub recall: Option<RecallSettings>,
     pub session_title: Option<SessionTitleSettings>,
     pub subagent: Option<SubagentSettings>,
-    pub cache_warming: Option<CacheWarmingMode>,
-    pub show_cache_miss_notices: Option<bool>,
     pub ui: Option<UiSettings>,
 }
 
@@ -322,12 +320,6 @@ impl SettingsConfig {
                 dst.max_watchdog_alerts = sub.max_watchdog_alerts;
             }
         }
-        if other.cache_warming.is_some() {
-            self.cache_warming = other.cache_warming;
-        }
-        if other.show_cache_miss_notices.is_some() {
-            self.show_cache_miss_notices = other.show_cache_miss_notices;
-        }
         if let Some(ui) = other.ui {
             let dst = self.ui.get_or_insert_with(Default::default);
             if ui.theme.is_some() {
@@ -466,7 +458,7 @@ mod disabled_plugins_tests {
     use crate::AgentSpineConfig;
     use crate::config::load_mizar_config_with_global;
     #[cfg(feature = "session-title")]
-    use mizar_llm::{CacheWarmingMode, ReasoningEffort};
+    use mizar_llm::ReasoningEffort;
 
     #[test]
     fn disabled_plugins_serializes_merges_dedups_sorts_and_patches_atomically() {
@@ -624,53 +616,6 @@ mod disabled_plugins_tests {
                 Some("mayoru-responses/deepseek-flash")
             );
             assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::High));
-        }
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn loads_and_overlays_cache_warming_settings() {
-        let tmp =
-            std::env::temp_dir().join(format!("mizar_cache_warming_cfg_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let global = tmp.join("global");
-        let proj = tmp.join("repo");
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::create_dir_all(proj.join(".mizar")).unwrap();
-
-        std::fs::write(
-            global.join("settings.json"),
-            r#"{
-                "cacheWarming": "idle",
-                "showCacheMissNotices": false
-            }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            proj.join(".mizar/settings.json"),
-            r#"{
-                "cacheWarming": "streaming",
-                "showCacheMissNotices": true
-            }"#,
-        )
-        .unwrap();
-
-        let loaded = load_mizar_config_with_global(&proj, Some(&global));
-        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
-        assert_eq!(
-            loaded.settings.cache_warming,
-            Some(CacheWarmingMode::Streaming)
-        );
-        assert_eq!(loaded.settings.show_cache_miss_notices, Some(true));
-
-        #[cfg(feature = "cache-warming")]
-        {
-            let mut spine = AgentSpineConfig::new(&proj);
-            loaded.apply_to_spine(&mut spine);
-            let cw = spine.cache_warming.unwrap();
-            assert_eq!(cw.mode, CacheWarmingMode::Streaming);
-            assert!(cw.show_cache_miss_notices);
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
