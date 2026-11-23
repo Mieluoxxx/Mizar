@@ -3,7 +3,7 @@ name = "mizar-compaction"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Mizar 四级渐进上下文压缩引擎（零模型剪枝、软硬分离检查点摘要、溢出兜底与压后工具守卫）"
+description = "Mizar 单阶段上下文压缩引擎（检查点摘要、溢出兜底与统一 write 写前读守卫）"
 
 [lints]
 workspace = true

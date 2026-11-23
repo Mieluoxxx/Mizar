@@ -439,7 +439,6 @@ where
                         outcome: ev.outcome.as_str().to_string(),
                         tokens_before: Some(ev.tokens_before),
                         tokens_after: Some(ev.tokens_after),
-                        pruned_count: ev.pruned_count,
                         first_kept_seq: ev.first_kept_seq,
                         summary_preview: ev.summary_preview.clone(),
                         message: ev.skipped_reason.clone(),

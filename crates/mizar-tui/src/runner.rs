@@ -1395,7 +1395,6 @@ mod tests {
                     outcome: "failed".into(),
                     tokens_before: None,
                     tokens_after: None,
-                    pruned_count: 0,
                     first_kept_seq: None,
                     summary_preview: None,
                     message: Some("stale error".into()),

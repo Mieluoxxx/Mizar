@@ -1,5 +1,5 @@
-//! L2 LLM 检查点摘要生成器（综合 `dsh` 同前缀尾置指令、`DS-Bot` `checkpointTailNote`、
-//! `dim #170` 实证关闭思考、`obelisk` 已证实事实/未证实推断分级）。
+//! LLM 检查点摘要生成器（同前缀尾置指令、`ReasoningEffort::Off` + 错误放宽回退、
+//! `obelisk` 已证实事实/未证实推断分级）。
 
 use futures::StreamExt;
 use mizar_llm::{
@@ -13,6 +13,7 @@ use crate::digest::CutPlan;
 
 const TRANSCRIPT_TOOL_RESULT_MAX_CHARS: usize = 2_000;
 const TRANSCRIPT_TOTAL_MAX_CHARS: usize = 96_000;
+const BOUNDARY_PREVIEW_MAX_CHARS: usize = 120;
 
 const SUMMARY_SECTIONS_GUIDE: &str = "\
 Write a concise, high-signal checkpoint summary with these exact sections:
@@ -29,7 +30,7 @@ Write a concise, high-signal checkpoint summary with these exact sections:
 - Completed work, in-progress items, and the immediate next step.
 
 ## Recovery Handles
-- Important file paths, symbol names, or `[seq #N]` handles for `recall_read` if verbatim detail is later needed.";
+- Important file paths, symbol names, or `[seq #N]` handles for `recall` if verbatim detail is later needed.";
 
 pub struct SummarizeParams<'a> {
     pub llm: &'a LlmRuntime,
@@ -42,7 +43,6 @@ pub struct SummarizeParams<'a> {
     pub cut: &'a CutPlan,
     pub focus: Option<&'a str>,
     pub reuse_prefix_cache: bool,
-    pub disable_reasoning: bool,
     pub cancel: CancellationToken,
 }
 
@@ -113,6 +113,92 @@ where
     })
 }
 
+fn compact_preview(raw: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    let mut count = 0usize;
+    let mut truncated = false;
+    for ch in raw.trim().chars() {
+        let normalized = if ch.is_whitespace() { ' ' } else { ch };
+        if normalized == ' ' && prev_space {
+            continue;
+        }
+        prev_space = normalized == ' ';
+        if count >= max_chars {
+            truncated = true;
+            break;
+        }
+        out.push(normalized);
+        count += 1;
+    }
+    let trimmed = out.trim().to_string();
+    if truncated {
+        format!("{trimmed}...")
+    } else {
+        trimmed
+    }
+}
+
+/// 生成保留边界首条消息的角色与内容特征预览（不依赖模型上下文中并不存在的 `seq #N`）。
+fn describe_boundary_entry(entry: &SessionEntry) -> String {
+    match &entry.event {
+        SessionEvent::User { text, images } => {
+            let preview = compact_preview(text, BOUNDARY_PREVIEW_MAX_CHARS);
+            if !preview.is_empty() {
+                format!("User message (\"{preview}\")")
+            } else if !images.is_empty() {
+                format!("User message ([{} image attachment(s)])", images.len())
+            } else {
+                "User message".to_string()
+            }
+        }
+        SessionEvent::Assistant { blocks, .. } => {
+            let text_joined: String = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let preview = compact_preview(&text_joined, BOUNDARY_PREVIEW_MAX_CHARS);
+            if !preview.is_empty() {
+                format!("Assistant message (\"{preview}\")")
+            } else {
+                let tool_names: Vec<&str> = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolCall { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if tool_names.is_empty() {
+                    "Assistant message".to_string()
+                } else {
+                    format!("Assistant tool call(s) ({})", tool_names.join(", "))
+                }
+            }
+        }
+        SessionEvent::ToolResult { name, content, .. } => {
+            let preview = compact_preview(content, BOUNDARY_PREVIEW_MAX_CHARS);
+            if preview.is_empty() {
+                format!("ToolResult for `{name}`")
+            } else {
+                format!("ToolResult for `{name}` (\"{preview}\")")
+            }
+        }
+        SessionEvent::BashExecution { command, .. } => {
+            let preview = compact_preview(command, BOUNDARY_PREVIEW_MAX_CHARS);
+            format!("local bash execution (`{preview}`)")
+        }
+        SessionEvent::ContextNotice { text, .. } => {
+            let preview = compact_preview(text, BOUNDARY_PREVIEW_MAX_CHARS);
+            format!("ContextNotice (\"{preview}\")")
+        }
+        _ => "boundary message".to_string(),
+    }
+}
+
 async fn run_prefix_reuse_summary<F>(
     params: &SummarizeParams<'_>,
     on_progress: &mut F,
@@ -126,12 +212,11 @@ where
     });
     messages.extend(params.current_visible_messages.iter().cloned());
 
-    let tail_note = if !params.cut.kept_entries.is_empty() {
+    let tail_note = if let Some(first_kept) = params.cut.kept_entries.first() {
+        let boundary_desc = describe_boundary_entry(first_kept);
         format!(
-            "Important tail boundary: the most recent {} visible message(s) starting at seq #{} will be preserved verbatim after this checkpoint. Focus your summary on everything BEFORE seq #{}. Do NOT answer the user's latest pending request and do NOT call any tools.",
+            "Important tail boundary: the most recent {} visible message(s) starting from the {boundary_desc} will be preserved verbatim after this checkpoint. Focus your summary on everything BEFORE that boundary message. Do NOT answer the user's latest pending request and do NOT call any tools.",
             params.cut.kept_entries.len(),
-            params.cut.first_kept_seq,
-            params.cut.first_kept_seq
         )
     } else {
         "Do NOT answer any pending user request and do NOT call any tools.".to_string()
@@ -161,8 +246,8 @@ where
         provider: params.provider.clone(),
         system: None,
         max_tokens: Some(4_096),
-        temperature: Some(0.2),
-        reasoning_effort: params.disable_reasoning.then_some(ReasoningEffort::Off),
+        temperature: None,
+        reasoning_effort: Some(ReasoningEffort::Off),
         headers: Vec::new(),
         session_id: params.session_id.clone(),
         cache_retention: None,
@@ -209,8 +294,8 @@ where
         provider: params.provider.clone(),
         system: None,
         max_tokens: Some(4_096),
-        temperature: Some(0.2),
-        reasoning_effort: params.disable_reasoning.then_some(ReasoningEffort::Off),
+        temperature: None,
+        reasoning_effort: Some(ReasoningEffort::Off),
         headers: Vec::new(),
         session_id: None,
         cache_retention: None,
@@ -248,7 +333,10 @@ where
                     err.code,
                     LlmErrorCode::InvalidRequest | LlmErrorCode::Unknown
                 )
-                && err.message.to_lowercase().contains("reason") =>
+                && {
+                    let msg = err.message.to_lowercase();
+                    msg.contains("reason") || msg.contains("effort") || msg.contains("thinking")
+                } =>
         {
             if let Some(fb) = fallback_opts {
                 collect_summary_stream(llm, fb, reject_tool_calls, on_progress).await

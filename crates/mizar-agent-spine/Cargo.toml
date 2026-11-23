@@ -19,7 +19,7 @@ coding = [
     "dep:mizar-skills",
     "dep:mizar-instructions",
 ]
-compaction = ["dep:mizar-compaction", "dep:mizar-recall", "mizar-cache-warming?/compaction"]
+compaction = ["dep:mizar-compaction", "dep:mizar-recall"]
 sqlite = ["dep:mizar-session-sqlite"]
 session-title = ["dep:mizar-session-title"]
 cache-warming = ["dep:mizar-cache-warming"]

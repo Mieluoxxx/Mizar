@@ -3,21 +3,19 @@ name = "mizar-cache-warming"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Prompt Cache 后台定时续命保活插件（四道安全门禁、$0.05 期望收益测算、休眠截止线与冷缓存时间同步）"
+description = "Prompt Cache 后台定时续命保活插件（四道安全门禁、$0.05 期望收益测算与休眠截止线）"
 
 [lints]
 workspace = true
 
 [features]
 default = []
-compaction = ["dep:mizar-compaction"]
 
 [dependencies]
 cordis = { workspace = true }
 futures = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-client-core = { workspace = true }
-mizar-compaction = { workspace = true, optional = true }
 mizar-llm = { workspace = true }
 mizar-session = { workspace = true }
 serde = { workspace = true }
@@ -26,6 +24,4 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-mizar-system-prompt = { workspace = true }
-mizar-tools = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }

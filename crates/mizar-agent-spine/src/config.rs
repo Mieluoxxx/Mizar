@@ -221,32 +221,17 @@ impl LoadedMizarConfig {
                 if let Some(v) = comp.auto_compact {
                     dst.auto_compact = v;
                 }
-                if let Some(v) = comp.auto_prune {
-                    dst.auto_prune = v;
+                if let Some(v) = comp.default_context_window {
+                    dst.default_context_window = v;
                 }
-                if let Some(v) = comp.soft_window_cap {
-                    dst.soft_window_cap = v;
+                if let Some(v) = comp.max_context_tokens {
+                    dst.max_context_tokens = (v > 0).then_some(v);
                 }
                 if let Some(v) = comp.trigger_ratio {
                     dst.trigger_ratio = v;
                 }
-                if let Some(v) = comp.prune_threshold_chars {
-                    dst.prune_threshold_chars = v;
-                }
-                if let Some(v) = comp.cold_cache_idle_secs {
-                    dst.cold_cache_idle_secs = v;
-                }
-                if let Some(v) = comp.reuse_prefix_cache {
-                    dst.reuse_prefix_cache = v;
-                }
-                if let Some(v) = comp.disable_summary_reasoning {
-                    dst.disable_summary_reasoning = v;
-                }
-                if let Some(v) = comp.enable_read_dedup {
-                    dst.enable_read_dedup = v;
-                }
-                if let Some(v) = comp.enable_write_after_compact_guard {
-                    dst.enable_write_after_compact_guard = v;
+                if let Some(v) = comp.keep_recent_tokens {
+                    dst.keep_recent_tokens = v;
                 }
             }
             if let Some(rec) = &self.settings.recall

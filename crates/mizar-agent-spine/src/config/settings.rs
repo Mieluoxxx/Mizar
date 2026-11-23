@@ -48,15 +48,10 @@ pub struct InstructionsSettings {
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
     pub auto_compact: Option<bool>,
-    pub auto_prune: Option<bool>,
-    pub soft_window_cap: Option<u64>,
+    pub default_context_window: Option<u64>,
+    pub max_context_tokens: Option<u64>,
     pub trigger_ratio: Option<f64>,
-    pub prune_threshold_chars: Option<usize>,
-    pub cold_cache_idle_secs: Option<u64>,
-    pub reuse_prefix_cache: Option<bool>,
-    pub disable_summary_reasoning: Option<bool>,
-    pub enable_read_dedup: Option<bool>,
-    pub enable_write_after_compact_guard: Option<bool>,
+    pub keep_recent_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -270,32 +265,17 @@ impl SettingsConfig {
             if comp.auto_compact.is_some() {
                 dst.auto_compact = comp.auto_compact;
             }
-            if comp.auto_prune.is_some() {
-                dst.auto_prune = comp.auto_prune;
+            if comp.default_context_window.is_some() {
+                dst.default_context_window = comp.default_context_window;
             }
-            if comp.soft_window_cap.is_some() {
-                dst.soft_window_cap = comp.soft_window_cap;
+            if comp.max_context_tokens.is_some() {
+                dst.max_context_tokens = comp.max_context_tokens;
             }
             if comp.trigger_ratio.is_some() {
                 dst.trigger_ratio = comp.trigger_ratio;
             }
-            if comp.prune_threshold_chars.is_some() {
-                dst.prune_threshold_chars = comp.prune_threshold_chars;
-            }
-            if comp.cold_cache_idle_secs.is_some() {
-                dst.cold_cache_idle_secs = comp.cold_cache_idle_secs;
-            }
-            if comp.reuse_prefix_cache.is_some() {
-                dst.reuse_prefix_cache = comp.reuse_prefix_cache;
-            }
-            if comp.disable_summary_reasoning.is_some() {
-                dst.disable_summary_reasoning = comp.disable_summary_reasoning;
-            }
-            if comp.enable_read_dedup.is_some() {
-                dst.enable_read_dedup = comp.enable_read_dedup;
-            }
-            if comp.enable_write_after_compact_guard.is_some() {
-                dst.enable_write_after_compact_guard = comp.enable_write_after_compact_guard;
+            if comp.keep_recent_tokens.is_some() {
+                dst.keep_recent_tokens = comp.keep_recent_tokens;
             }
         }
         if let Some(rec) = other.recall {
