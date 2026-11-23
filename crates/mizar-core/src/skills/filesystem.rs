@@ -131,6 +131,7 @@ struct CachedFingerprintEntry {
 }
 
 pub struct FilesystemSkillProvider {
+    #[allow(dead_code)]
     ctx: Context,
     config: FilesystemSkillConfig,
     default_cwd: Option<PathBuf>,
@@ -380,7 +381,6 @@ fn cached_stamps_still_valid(entry: &CachedFingerprintEntry) -> bool {
 }
 
 async fn discover_root(
-    ctx: &Context,
     provider_name: &str,
     root: &SkillRoot,
 ) -> Result<Vec<SkillCandidate>, String> {
@@ -419,10 +419,11 @@ async fn discover_root(
             }
             Ok(None) => {}
             Err(reason) => {
-                ctx.logger_named("skills").warn(format!(
+                tracing::warn!(
+                    target: "mizar::skills",
                     "skill file {} ignored: {reason}",
                     locator.path.display()
-                ));
+                );
             }
         }
     }
@@ -521,7 +522,7 @@ impl SkillProvider for FilesystemSkillProvider {
                 }
                 match run_cancellable(
                     &options.cancel,
-                    discover_root(&self.ctx, &self.config.provider_name, root),
+                    discover_root(&self.config.provider_name, root),
                 )
                 .await
                 {
@@ -531,10 +532,11 @@ impl SkillProvider for FilesystemSkillProvider {
                             return Err(err);
                         }
                         complete = false;
-                        self.ctx.logger_named("skills").warn(format!(
+                        tracing::warn!(
+                            target: "mizar::skills",
                             "skill root `{}` skipped: {err}",
                             root.path.display()
-                        ));
+                        );
                     }
                 }
             }

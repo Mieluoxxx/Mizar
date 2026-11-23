@@ -9,11 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent_loop::{
-    AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent, AgentToolCallEvent,
-    AgentTurnEndEvent, AgentTurnStartEvent, EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN,
-    EVENT_AGENT_STEP_START, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START,
-};
+use crate::agent_loop::{AgentEvent, subscribe_agent_events_when_ready};
 use cordis::{BoxFuture, Context, CordisError, Service};
 use mizar_session::{
     EVENT_SESSION_CREATED, EVENT_SESSION_EVENT, Session, SessionCreatedPayload, SessionEntry,
@@ -843,120 +839,115 @@ impl Service for TrajectoryRuntime {
                 buffers.entry(ev.session.id.clone()).or_default();
             })?;
 
-            let rt_turn_start = Arc::clone(&rt);
-            ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
-                {
-                    let mut buffers = rt_turn_start.buffers.lock().unwrap();
-                    let buf = buffers.entry(ev.session.id.clone()).or_default();
-                    buf.current_turn = ev.turn;
-                    buf.current_step = 0;
-                }
-                if !rt_turn_start.session_in_memory(&ev.session.id) {
-                    rt_turn_start.record_standalone_event(
-                        &ev.session.id,
-                        ev.ts_ms,
-                        TraceEventKind::TurnStart { turn: ev.turn },
-                    );
-                }
-            })?;
-
-            let rt_turn_end = Arc::clone(&rt);
-            ctx.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
-                if !rt_turn_end.session_in_memory(&ev.session.id) {
-                    rt_turn_end.record_standalone_event(
-                        &ev.session.id,
-                        ev.ts_ms,
-                        TraceEventKind::TurnEnd {
-                            turn: ev.turn,
-                            reason: ev.reason.as_str().to_string(),
-                        },
-                    );
-                }
-                rt_turn_end.evaluate_and_emit_new_findings(&ev.session.id);
-            })?;
-
-            let rt_step_start = Arc::clone(&rt);
-            ctx.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
-                {
-                    let mut buffers = rt_step_start.buffers.lock().unwrap();
-                    let buf = buffers.entry(ev.session.id.clone()).or_default();
-                    buf.current_turn = ev.turn;
-                    buf.current_step = ev.step;
-                }
-                if !rt_step_start.session_in_memory(&ev.session.id) {
-                    rt_step_start.record_standalone_event(
-                        &ev.session.id,
-                        ev.ts_ms,
-                        TraceEventKind::StepStart {
-                            turn: ev.turn,
-                            step: ev.step,
-                            system_prompt_chars: ev.system_prompt_chars,
-                            tools_count: ev.tools_count,
-                        },
-                    );
-                }
-            })?;
-
-            let rt_ft = Arc::clone(&rt);
-            ctx.on(
-                EVENT_AGENT_STEP_FIRST_TOKEN,
-                move |ev: &AgentStepFirstTokenEvent| {
-                    if !rt_ft.session_in_memory(&ev.session.id) {
-                        rt_ft.record_standalone_event(
-                            &ev.session.id,
-                            ev.ts_ms,
-                            TraceEventKind::FirstToken {
-                                turn: ev.turn,
-                                step: ev.step,
-                            },
-                        );
+            let rt_agent = Arc::clone(&rt);
+            subscribe_agent_events_when_ready(
+                &ctx,
+                "trajectory.agent-events",
+                move |ev| match ev {
+                    AgentEvent::TurnStart(ev) => {
+                        {
+                            let mut buffers = rt_agent.buffers.lock().unwrap();
+                            let buf = buffers.entry(ev.session.id.clone()).or_default();
+                            buf.current_turn = ev.turn;
+                            buf.current_step = 0;
+                        }
+                        if !rt_agent.session_in_memory(&ev.session.id) {
+                            rt_agent.record_standalone_event(
+                                &ev.session.id,
+                                ev.ts_ms,
+                                TraceEventKind::TurnStart { turn: ev.turn },
+                            );
+                        }
                     }
+                    AgentEvent::TurnEnd(ev) => {
+                        if !rt_agent.session_in_memory(&ev.session.id) {
+                            rt_agent.record_standalone_event(
+                                &ev.session.id,
+                                ev.ts_ms,
+                                TraceEventKind::TurnEnd {
+                                    turn: ev.turn,
+                                    reason: ev.reason.as_str().to_string(),
+                                },
+                            );
+                        }
+                        rt_agent.evaluate_and_emit_new_findings(&ev.session.id);
+                    }
+                    AgentEvent::StepStart(ev) => {
+                        {
+                            let mut buffers = rt_agent.buffers.lock().unwrap();
+                            let buf = buffers.entry(ev.session.id.clone()).or_default();
+                            buf.current_turn = ev.turn;
+                            buf.current_step = ev.step;
+                        }
+                        if !rt_agent.session_in_memory(&ev.session.id) {
+                            rt_agent.record_standalone_event(
+                                &ev.session.id,
+                                ev.ts_ms,
+                                TraceEventKind::StepStart {
+                                    turn: ev.turn,
+                                    step: ev.step,
+                                    system_prompt_chars: ev.system_prompt_chars,
+                                    tools_count: ev.tools_count,
+                                },
+                            );
+                        }
+                    }
+                    AgentEvent::StepFirstToken(ev) => {
+                        if !rt_agent.session_in_memory(&ev.session.id) {
+                            rt_agent.record_standalone_event(
+                                &ev.session.id,
+                                ev.ts_ms,
+                                TraceEventKind::FirstToken {
+                                    turn: ev.turn,
+                                    step: ev.step,
+                                },
+                            );
+                        }
+                    }
+                    AgentEvent::StepEnd(ev) => {
+                        if !rt_agent.session_in_memory(&ev.session.id) {
+                            rt_agent.record_standalone_event(
+                                &ev.session.id,
+                                ev.ts_ms,
+                                TraceEventKind::StepEnd {
+                                    turn: ev.turn,
+                                    step: ev.step,
+                                    outcome: ev.outcome.as_str().to_string(),
+                                    usage: ev.usage,
+                                },
+                            );
+                        }
+                        rt_agent.evaluate_and_emit_new_findings(&ev.session.id);
+                    }
+                    AgentEvent::ToolCall(ev) => {
+                        let managed = rt_agent.session_in_memory(&ev.session.id);
+                        let (turn, step) = {
+                            let mut buffers = rt_agent.buffers.lock().unwrap();
+                            let buf = buffers.entry(ev.session.id.clone()).or_default();
+                            if !managed {
+                                buf.pending_tool_calls
+                                    .push_back((ev.call.id.clone(), ev.call.name.clone()));
+                            }
+                            (buf.current_turn, buf.current_step)
+                        };
+                        if !managed {
+                            rt_agent.record_standalone_event(
+                                &ev.session.id,
+                                now_millis(),
+                                TraceEventKind::ToolCall {
+                                    turn,
+                                    step,
+                                    call_id: ev.call.id.clone(),
+                                    name: ev.call.name.clone(),
+                                    arguments: ev.call.arguments.clone(),
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
                 },
-            )?;
-
-            let rt_step_end = Arc::clone(&rt);
-            ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
-                if !rt_step_end.session_in_memory(&ev.session.id) {
-                    rt_step_end.record_standalone_event(
-                        &ev.session.id,
-                        ev.ts_ms,
-                        TraceEventKind::StepEnd {
-                            turn: ev.turn,
-                            step: ev.step,
-                            outcome: ev.outcome.as_str().to_string(),
-                            usage: ev.usage,
-                        },
-                    );
-                }
-                rt_step_end.evaluate_and_emit_new_findings(&ev.session.id);
-            })?;
-
-            let rt_tool_call = Arc::clone(&rt);
-            ctx.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
-                let managed = rt_tool_call.session_in_memory(&ev.session.id);
-                let (turn, step) = {
-                    let mut buffers = rt_tool_call.buffers.lock().unwrap();
-                    let buf = buffers.entry(ev.session.id.clone()).or_default();
-                    if !managed {
-                        buf.pending_tool_calls
-                            .push_back((ev.call.id.clone(), ev.call.name.clone()));
-                    }
-                    (buf.current_turn, buf.current_step)
-                };
-                if !managed {
-                    rt_tool_call.record_standalone_event(
-                        &ev.session.id,
-                        now_millis(),
-                        TraceEventKind::ToolCall {
-                            turn,
-                            step,
-                            call_id: ev.call.id.clone(),
-                            name: ev.call.name.clone(),
-                            arguments: ev.call.arguments.clone(),
-                        },
-                    );
-                }
-            })?;
+            )
+            .await?;
 
             let rt_tool_result = Arc::clone(&rt);
             ctx.on(EVENT_TOOLS_RESULT, move |ev: &ToolResultEvent| {

@@ -5,8 +5,11 @@ use std::time::Duration;
 
 use cordis::{Context, Service};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentTurnInputEvent, EVENT_AGENT_TURN_INPUT};
+use mizar_core::agent_loop::{
+    AgentEvent, AgentLoop, AgentLoopConfig, AgentLoopContextExt, AgentTurnInputEvent,
+};
 use mizar_core::session_title::{SessionTitleConfig, SessionTitleContextExt, SessionTitleRuntime};
+use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
     LlmErrorCode, LlmRuntime, ModelInfo, ProviderInfo, ReasoningEffort, StreamChunk,
@@ -15,6 +18,7 @@ use mizar_session::{
     EVENT_SESSION_TITLE_UPDATED, SessionContextExt, SessionCreateOptions, SessionEvent,
     SessionStore, SessionTitleUpdatedPayload, TitleSource,
 };
+use mizar_tools::ToolRuntime;
 
 struct ScriptedReply {
     text: Result<String, LlmError>,
@@ -99,6 +103,13 @@ async fn setup_app(
     let app = Context::new();
     app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
     app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        .await
+        .unwrap();
+    app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
+        .await
+        .unwrap();
     let llm_cleanup = app
         .llm()
         .unwrap()
@@ -173,16 +184,15 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
         content: "TOOL_SECRET".into(),
         is_error: false,
     });
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
             provider: Some("test".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
 
     wait_until(|| {
         session
@@ -208,31 +218,29 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
 
     // Turn 2: 未命中刷新间隔，不应再调用模型
     session.append(SessionEvent::user("继续调试第 2 轮"));
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 2,
             provider: Some("test".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(adapter.call_count.load(Ordering::SeqCst), 1);
 
     // Turn 3: 命中 refresh_interval_turns=3，再次刷新标题
     session.append(SessionEvent::user("顺便补全周期刷新与测试"));
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 3,
             provider: Some("test".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
 
     wait_until(|| {
         session
@@ -290,16 +298,15 @@ async fn respects_manual_ownership_and_inflight_race_and_allows_explicit_regener
         ..Default::default()
     });
     session.append(SessionEvent::user("测试人工改名保护"));
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
             provider: Some("test".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
 
     // 后台模型仍在飞行中时，用户人工改名，后台完成后不得覆盖
     tokio::time::sleep(Duration::from_millis(15)).await;
@@ -310,16 +317,15 @@ async fn respects_manual_ownership_and_inflight_race_and_allows_explicit_regener
 
     // Turn 2 到达：已是 Manual 所有权，不再触发自动刷新
     session.append(SessionEvent::user("第 2 轮提问"));
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 2,
             provider: Some("test".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(adapter.call_count.load(Ordering::SeqCst), 1);
 
@@ -371,16 +377,15 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
         ..Default::default()
     });
     session.append(SessionEvent::user("保留的兜底标题"));
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
             provider: Some("test".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(failing_adapter.call_count.load(Ordering::SeqCst), 1);
     assert_eq!(session.header().title.as_deref(), Some("保留的兜底标题"));
@@ -399,16 +404,15 @@ async fn fails_silently_without_retry_and_skips_offline_mock() {
         ..Default::default()
     });
     s2.append(SessionEvent::user("离线模式测试"));
-    app2.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app2.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&s2),
             turn: 1,
             provider: Some("mock".into()),
             model: Some("mock-v1".into()),
             ts_ms: s2.header().created_at_ms,
-        },
-    );
+        }));
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(offline_adapter.call_count.load(Ordering::SeqCst), 0);
     app2.fiber().dispose().await;
@@ -515,44 +519,41 @@ async fn failed_or_skipped_attempt_does_not_latch_turn() {
     session.append(SessionEvent::user("测试 turn 1 不被锁死"));
 
     // 1. Offline mock 在 turn=1 跳过后，不应锁死 turn=1
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
             provider: Some("mock".into()),
             model: Some("mock-v1".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
 
     // 2. 切到真实模型但首轮调用出错，出错后也不应永久锁死 turn=1
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
             provider: Some("real".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
     wait_until(|| adapter_calls.load(Ordering::SeqCst) == 1).await;
 
     // 3. 再次触发 turn=1 仍可生成并应用标题
     tokio::time::sleep(Duration::from_millis(20)).await;
-    app.emit(
-        EVENT_AGENT_TURN_INPUT,
-        AgentTurnInputEvent {
+    app.agent_loop()
+        .unwrap()
+        .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
             session: Arc::clone(&session),
             turn: 1,
             provider: Some("real".into()),
             model: Some("fast-title".into()),
             ts_ms: session.header().created_at_ms,
-        },
-    );
+        }));
     wait_until(|| {
         session
             .header()

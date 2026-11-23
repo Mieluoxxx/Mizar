@@ -14,15 +14,14 @@ pub mod system_prompt;
 pub mod trajectory;
 
 pub use agent_loop::{
-    AgentError, AgentLoop, AgentLoopConfig, AgentLoopContextExt, AgentPreStepDecision,
-    AgentPreStepInput, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
-    AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnInputEvent,
-    DEFAULT_AUTO_WAKE_LIMIT, DeliveryMode, EVENT_AGENT_PRE_STEP, EVENT_AGENT_REASONING_DELTA,
-    EVENT_AGENT_REQUEST, EVENT_AGENT_REQUEST_ERROR, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_START,
-    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
-    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_INPUT, EVENT_AGENT_TURN_START,
-    EVENT_AGENT_TURN_STOPPING, RunOptions, SessionInbox, StepOutcome, TurnEndReason, TurnInput,
-    TurnRunReport,
+    AgentError, AgentEvent, AgentEventGuard, AgentLoop, AgentLoopConfig, AgentLoopContextExt,
+    AgentPreStepDecision, AgentPreStepInput, AgentReasoningDeltaEvent, AgentRequestEvent,
+    AgentStatus, AgentStatusEvent, AgentStepEndEvent, AgentStepFirstTokenEvent,
+    AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent, AgentToolResultEvent,
+    AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnInputEvent, AgentTurnStartEvent,
+    AgentUsageEvent, DEFAULT_AUTO_WAKE_LIMIT, DeliveryMode, EVENT_AGENT_PRE_STEP,
+    EVENT_AGENT_REQUEST_ERROR, EVENT_AGENT_TURN_STOPPING, RunOptions, SessionInbox, StepOutcome,
+    TurnEndReason, TurnInput, TurnRunReport,
 };
 pub use skills::{
     EVENT_SKILLS_CHANGE, SkillLookupOptions, SkillProvider, SkillRegistry, SkillRegistryConfig,

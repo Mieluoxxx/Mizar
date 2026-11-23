@@ -6,7 +6,9 @@
 pub mod inbox;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::system_prompt::SystemPromptContextExt;
@@ -30,23 +32,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub const EVENT_AGENT_STATUS: &str = "agent/status";
 pub const EVENT_AGENT_PRE_STEP: &str = "agent/pre-step";
 pub const EVENT_AGENT_REQUEST_ERROR: &str = "agent/request-error";
 pub const EVENT_AGENT_TURN_STOPPING: &str = "agent/turn-stopping";
-pub const EVENT_AGENT_REQUEST: &str = "agent/request";
-pub const EVENT_AGENT_TEXT_DELTA: &str = "agent/text-delta";
-pub const EVENT_AGENT_REASONING_DELTA: &str = "agent/reasoning-delta";
-pub const EVENT_AGENT_TOOL_CALL: &str = "agent/tool-call";
-pub const EVENT_AGENT_TOOL_UPDATE: &str = "agent/tool-update";
-pub const EVENT_AGENT_TOOL_RESULT: &str = "agent/tool-result";
-pub const EVENT_AGENT_USAGE: &str = "agent/usage";
-pub const EVENT_AGENT_TURN_START: &str = "agent/turn-start";
-pub const EVENT_AGENT_TURN_INPUT: &str = "agent/turn-input";
-pub const EVENT_AGENT_TURN_END: &str = "agent/turn-end";
-pub const EVENT_AGENT_STEP_START: &str = "agent/step-start";
-pub const EVENT_AGENT_STEP_FIRST_TOKEN: &str = "agent/step-first-token";
-pub const EVENT_AGENT_STEP_END: &str = "agent/step-end";
 pub const ENVIRONMENT_CONTEXT_SOURCE: &str = "environment-context";
 
 fn build_environment_context_notice_if_needed(
@@ -152,7 +140,7 @@ impl StepOutcome {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentStatusEvent {
     pub session: Arc<Session>,
     pub status: AgentStatus,
@@ -216,33 +204,33 @@ pub struct AgentTurnStoppingEvent {
     pub last_text: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentRequestEvent {
     pub session: Arc<Session>,
     pub step: usize,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentTextDeltaEvent {
     pub session: Arc<Session>,
     pub text: String,
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentReasoningDeltaEvent {
     pub session: Arc<Session>,
     pub text: String,
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentToolCallEvent {
     pub session: Arc<Session>,
     pub call: ToolCall,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentToolUpdateEvent {
     pub session: Arc<Session>,
     pub tool_call_id: String,
@@ -251,7 +239,7 @@ pub struct AgentToolUpdateEvent {
     pub details: Option<Value>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentToolResultEvent {
     pub session: Arc<Session>,
     pub tool_call_id: String,
@@ -262,20 +250,20 @@ pub struct AgentToolResultEvent {
     pub details: Option<Value>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentUsageEvent {
     pub session: Arc<Session>,
     pub usage: TokenUsage,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentTurnStartEvent {
     pub session: Arc<Session>,
     pub turn: u64,
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentTurnInputEvent {
     pub session: Arc<Session>,
     pub turn: u64,
@@ -284,7 +272,7 @@ pub struct AgentTurnInputEvent {
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentTurnEndEvent {
     pub session: Arc<Session>,
     pub turn: u64,
@@ -292,7 +280,7 @@ pub struct AgentTurnEndEvent {
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentStepStartEvent {
     pub session: Arc<Session>,
     pub turn: u64,
@@ -302,7 +290,7 @@ pub struct AgentStepStartEvent {
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentStepFirstTokenEvent {
     pub session: Arc<Session>,
     pub turn: u64,
@@ -310,7 +298,7 @@ pub struct AgentStepFirstTokenEvent {
     pub ts_ms: u128,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AgentStepEndEvent {
     pub session: Arc<Session>,
     pub turn: u64,
@@ -320,6 +308,128 @@ pub struct AgentStepEndEvent {
     pub outcome: StepOutcome,
     pub usage: Option<TokenUsage>,
     pub ts_ms: u128,
+}
+
+/// Agent 主循环对外广播的强类型事件。
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Status(AgentStatusEvent),
+    Request(AgentRequestEvent),
+    TurnStart(AgentTurnStartEvent),
+    TurnInput(AgentTurnInputEvent),
+    TurnEnd(AgentTurnEndEvent),
+    StepStart(AgentStepStartEvent),
+    StepFirstToken(AgentStepFirstTokenEvent),
+    StepEnd(AgentStepEndEvent),
+    TextDelta(AgentTextDeltaEvent),
+    ReasoningDelta(AgentReasoningDeltaEvent),
+    ToolCall(AgentToolCallEvent),
+    ToolUpdate(AgentToolUpdateEvent),
+    ToolResult(AgentToolResultEvent),
+    Usage(AgentUsageEvent),
+}
+
+const AGENT_EVENT_BROADCAST_CAPACITY: usize = 2048;
+
+type AgentEventListener = Arc<dyn Fn(&AgentEvent) + Send + Sync>;
+
+struct AgentEventBus {
+    next_id: AtomicU64,
+    listeners: RwLock<Vec<(u64, AgentEventListener)>>,
+    tx: tokio::sync::broadcast::Sender<AgentEvent>,
+}
+
+impl AgentEventBus {
+    fn new() -> Arc<Self> {
+        let (tx, _) = tokio::sync::broadcast::channel(AGENT_EVENT_BROADCAST_CAPACITY);
+        Arc::new(Self {
+            next_id: AtomicU64::new(1),
+            listeners: RwLock::new(Vec::new()),
+            tx,
+        })
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+        self.tx.subscribe()
+    }
+
+    fn on_event(
+        self: &Arc<Self>,
+        cb: impl Fn(&AgentEvent) + Send + Sync + 'static,
+    ) -> AgentEventGuard {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let listener: AgentEventListener = Arc::new(cb);
+        self.listeners.write().unwrap().push((id, listener));
+        AgentEventGuard {
+            bus: Arc::downgrade(self),
+            id,
+        }
+    }
+
+    fn emit(&self, ev: AgentEvent) {
+        // 先快照再释放读锁，避免回调内 Drop 句柄触发重入死锁。
+        let snapshot: Vec<AgentEventListener> = {
+            let guard = self.listeners.read().unwrap();
+            guard.iter().map(|(_, cb)| Arc::clone(cb)).collect()
+        };
+        for cb in snapshot {
+            cb(&ev);
+        }
+        let _ = self.tx.send(ev);
+    }
+}
+
+/// 强类型 `AgentEvent` 同步订阅句柄：Drop 时自动注销监听器。
+#[must_use = "dropping AgentEventGuard immediately unregisters the AgentEvent listener"]
+pub struct AgentEventGuard {
+    bus: Weak<AgentEventBus>,
+    id: u64,
+}
+
+impl fmt::Debug for AgentEventGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentEventGuard")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl Drop for AgentEventGuard {
+    fn drop(&mut self) {
+        if let Some(bus) = self.bus.upgrade() {
+            bus.listeners
+                .write()
+                .unwrap()
+                .retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+/// 在 `agentLoop` 就绪后挂载强类型事件监听，并将 RAII 句柄登记到 `effect` 中随上下文清理。
+pub(crate) async fn subscribe_agent_events_when_ready<F>(
+    ctx: &Context,
+    effect_label: &'static str,
+    cb: F,
+) -> Result<cordis::Fiber, CordisError>
+where
+    F: Fn(&AgentEvent) + Send + Sync + 'static,
+{
+    let cb = Arc::new(cb);
+    let fiber = ctx.try_inject(["agentLoop"], move |c| {
+        let cb = Arc::clone(&cb);
+        async move {
+            let agent_loop = c.agent_loop()?;
+            c.effect(effect_label, move || {
+                let guard = agent_loop.on_event(move |ev| cb(ev));
+                Ok::<_, CordisError>(Some(Cleanup::sync(move || drop(guard))))
+            })?;
+            Ok::<_, CordisError>(())
+        }
+    })?;
+    if ctx.get::<AgentLoop>("agentLoop").is_some() {
+        fiber.wait_settled().await?;
+    }
+    Ok(fiber)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -410,7 +520,7 @@ fn partition_tool_batches(tools: &ToolRuntime, calls: Vec<ToolCall>) -> Vec<Vec<
 }
 
 struct TurnGuard {
-    ctx: Context,
+    events: Arc<AgentEventBus>,
     session: Arc<Session>,
     turn: u64,
     reason: TurnEndReason,
@@ -428,27 +538,21 @@ impl Drop for TurnGuard {
             turn: self.turn,
             reason: self.reason.as_str().to_string(),
         });
-        self.ctx.emit(
-            EVENT_AGENT_TURN_END,
-            AgentTurnEndEvent {
-                session: Arc::clone(&self.session),
-                turn: self.turn,
-                reason: self.reason.clone(),
-                ts_ms: now_millis(),
-            },
-        );
-        self.ctx.emit(
-            EVENT_AGENT_STATUS,
-            AgentStatusEvent {
-                session: Arc::clone(&self.session),
-                status: AgentStatus::Idle,
-            },
-        );
+        self.events.emit(AgentEvent::TurnEnd(AgentTurnEndEvent {
+            session: Arc::clone(&self.session),
+            turn: self.turn,
+            reason: self.reason.clone(),
+            ts_ms: now_millis(),
+        }));
+        self.events.emit(AgentEvent::Status(AgentStatusEvent {
+            session: Arc::clone(&self.session),
+            status: AgentStatus::Idle,
+        }));
     }
 }
 
 struct StepGuard {
-    ctx: Context,
+    events: Arc<AgentEventBus>,
     session: Arc<Session>,
     turn: u64,
     step: usize,
@@ -473,19 +577,16 @@ impl Drop for StepGuard {
             outcome: self.outcome.as_str().to_string(),
             usage: self.usage,
         });
-        self.ctx.emit(
-            EVENT_AGENT_STEP_END,
-            AgentStepEndEvent {
-                session: Arc::clone(&self.session),
-                turn: self.turn,
-                step: self.step,
-                provider: self.provider.clone(),
-                model: self.model.clone(),
-                outcome: self.outcome.clone(),
-                usage: self.usage,
-                ts_ms: now_millis(),
-            },
-        );
+        self.events.emit(AgentEvent::StepEnd(AgentStepEndEvent {
+            session: Arc::clone(&self.session),
+            turn: self.turn,
+            step: self.step,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            outcome: self.outcome.clone(),
+            usage: self.usage,
+            ts_ms: now_millis(),
+        }));
     }
 }
 
@@ -529,12 +630,28 @@ pub struct AgentLoop {
     config: AgentLoopConfig,
     inbox: Arc<SessionInbox>,
     short_cutoffs_by_session: Arc<Mutex<HashMap<String, usize>>>,
+    events: Arc<AgentEventBus>,
 }
 
 impl AgentLoop {
     /// 获取纯内存会话信箱（供 TUI / 桌面端 / 插件投递 `Steer`、`FollowUp` 与 `Inject` 消息）。
     pub fn inbox(&self) -> &SessionInbox {
         &self.inbox
+    }
+
+    /// 订阅强类型 `AgentEvent` 异步广播通道（容量 2048，适合异步观察者/TUI）。
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
+        self.events.subscribe()
+    }
+
+    /// 注册强类型 `AgentEvent` 同步有序监听器（零丢失、按注册顺序执行，Drop 返回句柄即注销）。
+    pub fn on_event(&self, cb: impl Fn(&AgentEvent) + Send + Sync + 'static) -> AgentEventGuard {
+        self.events.on_event(cb)
+    }
+
+    /// 通过 `AgentEventBus` 派发强类型事件（同时通知同步监听器与广播通道）。
+    pub fn emit_event(&self, ev: AgentEvent) {
+        self.events.emit(ev);
     }
 
     pub fn is_session_busy(&self, session_id: &str) -> bool {
@@ -717,23 +834,17 @@ impl AgentLoop {
 
         let turn = session.next_turn();
         session.append_trace(SessionTraceEvent::TurnStart { turn });
-        self.ctx.emit(
-            EVENT_AGENT_TURN_START,
-            AgentTurnStartEvent {
-                session: Arc::clone(&session),
-                turn,
-                ts_ms: now_millis(),
-            },
-        );
-        self.ctx.emit(
-            EVENT_AGENT_STATUS,
-            AgentStatusEvent {
-                session: Arc::clone(&session),
-                status: AgentStatus::Busy,
-            },
-        );
+        self.emit_event(AgentEvent::TurnStart(AgentTurnStartEvent {
+            session: Arc::clone(&session),
+            turn,
+            ts_ms: now_millis(),
+        }));
+        self.emit_event(AgentEvent::Status(AgentStatusEvent {
+            session: Arc::clone(&session),
+            status: AgentStatus::Busy,
+        }));
         let mut turn_guard = TurnGuard {
-            ctx: self.ctx.clone(),
+            events: Arc::clone(&self.events),
             session: Arc::clone(&session),
             turn,
             reason: TurnEndReason::Cancelled,
@@ -808,16 +919,13 @@ impl AgentLoop {
                     }
                     if !turn_input_emitted {
                         turn_input_emitted = true;
-                        self.ctx.emit(
-                            EVENT_AGENT_TURN_INPUT,
-                            AgentTurnInputEvent {
-                                session: Arc::clone(&session),
-                                turn,
-                                provider: provider.clone(),
-                                model: model.clone(),
-                                ts_ms: now_millis(),
-                            },
-                        );
+                        self.emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
+                            session: Arc::clone(&session),
+                            turn,
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            ts_ms: now_millis(),
+                        }));
                     }
                 }
                 AgentPreStepDecision::Reject { reason } => {
@@ -829,13 +937,10 @@ impl AgentLoop {
             }
 
             steps_executed += 1;
-            self.ctx.emit(
-                EVENT_AGENT_REQUEST,
-                AgentRequestEvent {
-                    session: Arc::clone(&session),
-                    step,
-                },
-            );
+            self.emit_event(AgentEvent::Request(AgentRequestEvent {
+                session: Arc::clone(&session),
+                step,
+            }));
 
             let prompt_text = system_prompt.build_for_session(Some(&session.id));
             let tool_list = tools.list_declared(Some(&session.id));
@@ -847,19 +952,16 @@ impl AgentLoop {
                 system_prompt_chars,
                 tools_count,
             });
-            self.ctx.emit(
-                EVENT_AGENT_STEP_START,
-                AgentStepStartEvent {
-                    session: Arc::clone(&session),
-                    turn,
-                    step,
-                    system_prompt_chars,
-                    tools_count,
-                    ts_ms: now_millis(),
-                },
-            );
+            self.emit_event(AgentEvent::StepStart(AgentStepStartEvent {
+                session: Arc::clone(&session),
+                turn,
+                step,
+                system_prompt_chars,
+                tools_count,
+                ts_ms: now_millis(),
+            }));
             let mut step_guard = StepGuard {
-                ctx: self.ctx.clone(),
+                events: Arc::clone(&self.events),
                 session: Arc::clone(&session),
                 turn,
                 step,
@@ -966,47 +1068,35 @@ impl AgentLoop {
                         if !first_token_emitted {
                             first_token_emitted = true;
                             session.append_trace(SessionTraceEvent::FirstToken { turn, step });
-                            self.ctx.emit(
-                                EVENT_AGENT_STEP_FIRST_TOKEN,
-                                AgentStepFirstTokenEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    ts_ms: now_millis(),
-                                },
-                            );
-                        }
-                        self.ctx.emit(
-                            EVENT_AGENT_TEXT_DELTA,
-                            AgentTextDeltaEvent {
+                            self.emit_event(AgentEvent::StepFirstToken(AgentStepFirstTokenEvent {
                                 session: Arc::clone(&session),
-                                text: text.clone(),
+                                turn,
+                                step,
                                 ts_ms: now_millis(),
-                            },
-                        );
+                            }));
+                        }
+                        self.emit_event(AgentEvent::TextDelta(AgentTextDeltaEvent {
+                            session: Arc::clone(&session),
+                            text: text.clone(),
+                            ts_ms: now_millis(),
+                        }));
                     }
                     StreamChunk::ReasoningDelta { text, .. } if !text.is_empty() => {
                         if !first_token_emitted {
                             first_token_emitted = true;
                             session.append_trace(SessionTraceEvent::FirstToken { turn, step });
-                            self.ctx.emit(
-                                EVENT_AGENT_STEP_FIRST_TOKEN,
-                                AgentStepFirstTokenEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    ts_ms: now_millis(),
-                                },
-                            );
-                        }
-                        self.ctx.emit(
-                            EVENT_AGENT_REASONING_DELTA,
-                            AgentReasoningDeltaEvent {
+                            self.emit_event(AgentEvent::StepFirstToken(AgentStepFirstTokenEvent {
                                 session: Arc::clone(&session),
-                                text: text.clone(),
+                                turn,
+                                step,
                                 ts_ms: now_millis(),
-                            },
-                        );
+                            }));
+                        }
+                        self.emit_event(AgentEvent::ReasoningDelta(AgentReasoningDeltaEvent {
+                            session: Arc::clone(&session),
+                            text: text.clone(),
+                            ts_ms: now_millis(),
+                        }));
                     }
                     StreamChunk::ToolCallDelta {
                         id,
@@ -1020,15 +1110,12 @@ impl AgentLoop {
                         if !first_token_emitted {
                             first_token_emitted = true;
                             session.append_trace(SessionTraceEvent::FirstToken { turn, step });
-                            self.ctx.emit(
-                                EVENT_AGENT_STEP_FIRST_TOKEN,
-                                AgentStepFirstTokenEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    ts_ms: now_millis(),
-                                },
-                            );
+                            self.emit_event(AgentEvent::StepFirstToken(AgentStepFirstTokenEvent {
+                                session: Arc::clone(&session),
+                                turn,
+                                step,
+                                ts_ms: now_millis(),
+                            }));
                         }
                     }
                     StreamChunk::BlockEnd {
@@ -1038,25 +1125,19 @@ impl AgentLoop {
                         if !first_token_emitted {
                             first_token_emitted = true;
                             session.append_trace(SessionTraceEvent::FirstToken { turn, step });
-                            self.ctx.emit(
-                                EVENT_AGENT_STEP_FIRST_TOKEN,
-                                AgentStepFirstTokenEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    ts_ms: now_millis(),
-                                },
-                            );
+                            self.emit_event(AgentEvent::StepFirstToken(AgentStepFirstTokenEvent {
+                                session: Arc::clone(&session),
+                                turn,
+                                step,
+                                ts_ms: now_millis(),
+                            }));
                         }
                     }
                     StreamChunk::Usage { usage } => {
-                        self.ctx.emit(
-                            EVENT_AGENT_USAGE,
-                            AgentUsageEvent {
-                                session: Arc::clone(&session),
-                                usage: *usage,
-                            },
-                        );
+                        self.emit_event(AgentEvent::Usage(AgentUsageEvent {
+                            session: Arc::clone(&session),
+                            usage: *usage,
+                        }));
                     }
                     _ => {}
                 }
@@ -1369,18 +1450,15 @@ impl AgentLoop {
                 if cancel.is_cancelled() {
                     for pending in batches[batch_idx..].iter().flatten() {
                         let content = "已取消执行".to_string();
-                        self.ctx.emit(
-                            EVENT_AGENT_TOOL_RESULT,
-                            AgentToolResultEvent {
-                                session: Arc::clone(&session),
-                                tool_call_id: pending.id.clone(),
-                                name: pending.name.clone(),
-                                content: content.clone(),
-                                is_error: true,
-                                blocked: false,
-                                details: None,
-                            },
-                        );
+                        self.emit_event(AgentEvent::ToolResult(AgentToolResultEvent {
+                            session: Arc::clone(&session),
+                            tool_call_id: pending.id.clone(),
+                            name: pending.name.clone(),
+                            content: content.clone(),
+                            is_error: true,
+                            blocked: false,
+                            details: None,
+                        }));
                         session.append(SessionEvent::ToolResult {
                             tool_call_id: pending.id.clone(),
                             name: pending.name.clone(),
@@ -1403,13 +1481,10 @@ impl AgentLoop {
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
                     });
-                    self.ctx.emit(
-                        EVENT_AGENT_TOOL_CALL,
-                        AgentToolCallEvent {
-                            session: Arc::clone(&session),
-                            call: call.clone(),
-                        },
-                    );
+                    self.emit_event(AgentEvent::ToolCall(AgentToolCallEvent {
+                        session: Arc::clone(&session),
+                        call: call.clone(),
+                    }));
                     let args = match parse_tool_arguments(&call.name, &call.arguments) {
                         Ok(args) => args,
                         Err(msg) => {
@@ -1418,21 +1493,18 @@ impl AgentLoop {
                             continue;
                         }
                     };
-                    let update_ctx = self.ctx.clone();
+                    let update_events = Arc::clone(&self.events);
                     let update_session = Arc::clone(&session);
                     let call_id_for_upd = call.id.clone();
                     let call_name_for_upd = call.name.clone();
                     let on_update: ToolUpdateCallback = Arc::new(move |upd: ToolUpdate| {
-                        update_ctx.emit(
-                            EVENT_AGENT_TOOL_UPDATE,
-                            AgentToolUpdateEvent {
-                                session: Arc::clone(&update_session),
-                                tool_call_id: call_id_for_upd.clone(),
-                                name: call_name_for_upd.clone(),
-                                preview: upd.preview,
-                                details: upd.details,
-                            },
-                        );
+                        update_events.emit(AgentEvent::ToolUpdate(AgentToolUpdateEvent {
+                            session: Arc::clone(&update_session),
+                            tool_call_id: call_id_for_upd.clone(),
+                            name: call_name_for_upd.clone(),
+                            preview: upd.preview,
+                            details: upd.details,
+                        }));
                     });
                     fut_indices.push(idx);
                     futs.push(
@@ -1460,18 +1532,15 @@ impl AgentLoop {
 
                 for (call, result) in batch.iter().zip(results) {
                     let extra_contexts = result.additional_contexts.clone();
-                    self.ctx.emit(
-                        EVENT_AGENT_TOOL_RESULT,
-                        AgentToolResultEvent {
-                            session: Arc::clone(&session),
-                            tool_call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            content: result.content.clone(),
-                            is_error: result.is_error,
-                            blocked: result.blocked,
-                            details: result.details,
-                        },
-                    );
+                    self.emit_event(AgentEvent::ToolResult(AgentToolResultEvent {
+                        session: Arc::clone(&session),
+                        tool_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        content: result.content.clone(),
+                        is_error: result.is_error,
+                        blocked: result.blocked,
+                        details: result.details,
+                    }));
                     if result.blocked {
                         session.append_trace(SessionTraceEvent::ToolOutcome {
                             tool_call_id: call.id.clone(),
@@ -1531,6 +1600,7 @@ impl Service for AgentLoop {
             config,
             inbox: Arc::new(SessionInbox::new()),
             short_cutoffs_by_session: Arc::new(Mutex::new(HashMap::new())),
+            events: AgentEventBus::new(),
         }))
     }
 
@@ -1820,10 +1890,11 @@ mod tests {
         let updates = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let updates_sub = Arc::clone(&updates);
-        app.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
-            updates_sub.lock().unwrap().push(ev.preview.clone());
-        })
-        .unwrap();
+        let _updates_guard = app.agent_loop().unwrap().on_event(move |ev| {
+            if let AgentEvent::ToolUpdate(ev) = ev {
+                updates_sub.lock().unwrap().push(ev.preview.clone());
+            }
+        });
 
         let tools = app.tools().unwrap();
         let in_flight_reg = Arc::clone(&in_flight);
@@ -1931,10 +2002,11 @@ mod tests {
         // 显式指定 RunOptions.max_steps 时应按上限中止并记录 MaxSteps
         let end_reasons = Arc::new(Mutex::new(Vec::<TurnEndReason>::new()));
         let reasons_sub = Arc::clone(&end_reasons);
-        app.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
-            reasons_sub.lock().unwrap().push(ev.reason.clone());
-        })
-        .unwrap();
+        let _reasons_guard = app.agent_loop().unwrap().on_event(move |ev| {
+            if let AgentEvent::TurnEnd(ev) = ev {
+                reasons_sub.lock().unwrap().push(ev.reason.clone());
+            }
+        });
 
         let s2 = app.sessions().unwrap().create(None);
         let capped = app
@@ -2018,16 +2090,12 @@ mod tests {
         let end_reasons = Arc::new(Mutex::new(Vec::<TurnEndReason>::new()));
 
         let so_sub = Arc::clone(&step_outcomes);
-        app.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
-            so_sub.lock().unwrap().push(ev.outcome.clone());
-        })
-        .unwrap();
-
         let tr_sub = Arc::clone(&end_reasons);
-        app.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
-            tr_sub.lock().unwrap().push(ev.reason.clone());
-        })
-        .unwrap();
+        let _outcomes_guard = app.agent_loop().unwrap().on_event(move |ev| match ev {
+            AgentEvent::StepEnd(ev) => so_sub.lock().unwrap().push(ev.outcome.clone()),
+            AgentEvent::TurnEnd(ev) => tr_sub.lock().unwrap().push(ev.reason.clone()),
+            _ => {}
+        });
 
         // 1. 文本在 FinishReason::MaxTokens 下截断：步级为 MaxTokens，轮级必须为 Truncated 而非 Completed
         let s1 = app.sessions().unwrap().create(None);
@@ -2901,13 +2969,11 @@ mod tests {
 
         let first_tokens = Arc::new(Mutex::new(Vec::<usize>::new()));
         let ft_cap = Arc::clone(&first_tokens);
-        app.on(
-            EVENT_AGENT_STEP_FIRST_TOKEN,
-            move |ev: &AgentStepFirstTokenEvent| {
+        let _ft_guard = app.agent_loop().unwrap().on_event(move |ev| {
+            if let AgentEvent::StepFirstToken(ev) = ev {
                 ft_cap.lock().unwrap().push(ev.step);
-            },
-        )
-        .unwrap();
+            }
+        });
 
         let agent = app.agent_loop().unwrap();
         let sess = app.sessions().unwrap().create(None);
@@ -3130,5 +3196,102 @@ mod tests {
             .unwrap();
         assert_eq!(text2, "recovered answer");
         app_stream_err.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn agent_event_bus_on_event_preserves_order_and_unregisters_on_drop() {
+        struct NoopAdapter;
+        impl LlmAdapter for NoopAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let (_tx, rx) = mpsc::unbounded();
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(NoopAdapter).await;
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+
+        let log = Arc::new(Mutex::new(Vec::<(&'static str, usize)>::new()));
+        let log1 = Arc::clone(&log);
+        let g1 = agent.on_event(move |ev| {
+            if let AgentEvent::Request(req) = ev {
+                log1.lock().unwrap().push(("first", req.step));
+            }
+        });
+        let log2 = Arc::clone(&log);
+        let g2 = agent.on_event(move |ev| {
+            if let AgentEvent::Request(req) = ev {
+                log2.lock().unwrap().push(("second", req.step));
+            }
+        });
+
+        agent.emit_event(AgentEvent::Request(AgentRequestEvent {
+            session: Arc::clone(&sess),
+            step: 1,
+        }));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![("first", 1), ("second", 1)],
+            "sync listeners must fire in registration order"
+        );
+
+        drop(g1);
+        agent.emit_event(AgentEvent::Request(AgentRequestEvent {
+            session: Arc::clone(&sess),
+            step: 2,
+        }));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![("first", 1), ("second", 1), ("second", 2)],
+            "dropped guard must unregister listener"
+        );
+
+        drop(g2);
+        app.fiber().dispose().await;
+    }
+
+    #[tokio::test]
+    async fn agent_event_bus_broadcast_subscribe_receives_typed_events() {
+        struct NoopAdapter;
+        impl LlmAdapter for NoopAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let (_tx, rx) = mpsc::unbounded();
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(NoopAdapter).await;
+        let agent = app.agent_loop().unwrap();
+        let sess = app.sessions().unwrap().create(None);
+
+        let mut rx = agent.subscribe();
+        agent.emit_event(AgentEvent::Status(AgentStatusEvent {
+            session: Arc::clone(&sess),
+            status: AgentStatus::Busy,
+        }));
+        agent.emit_event(AgentEvent::TextDelta(AgentTextDeltaEvent {
+            session: Arc::clone(&sess),
+            text: "hello".into(),
+            ts_ms: 42,
+        }));
+
+        match rx.recv().await.unwrap() {
+            AgentEvent::Status(ev) => {
+                assert_eq!(ev.session.id, sess.id);
+                assert_eq!(ev.status, AgentStatus::Busy);
+            }
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            AgentEvent::TextDelta(ev) => {
+                assert_eq!(ev.session.id, sess.id);
+                assert_eq!(ev.text, "hello");
+                assert_eq!(ev.ts_ms, 42);
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+
+        app.fiber().dispose().await;
     }
 }

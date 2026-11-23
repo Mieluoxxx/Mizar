@@ -1152,7 +1152,6 @@ mod tests {
         use mizar_session::SessionContextExt;
 
         let ctx = Context::new();
-        ctx.logger().set_silent();
         let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         if let AgentToolsMode::Coding {
             ref mut mcp,

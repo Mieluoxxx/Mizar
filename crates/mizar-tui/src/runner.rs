@@ -4,11 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use cordis::{
-    BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, LogLevel, LogSink, Plugin,
-};
+use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Plugin};
 use crossterm::event::EventStream;
 use mizar_client::approval::{ApprovalSnapshot, register_approval_hook_with};
+use mizar_client::logging::{env_log_level_override, install_tracing_handler};
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client::workspace::collect_user_skill_names;
 use mizar_core::agent_loop::AgentLoopContextExt;
@@ -21,7 +20,7 @@ use mizar_tools::EVENT_TOOLS_CHANGE;
 use mizar_tui_ui::TuiFeatures;
 use mizar_tui_ui::app::{
     AppAction, AppState, ApprovalMode, ChatItem, NoticeLevel, SessionSelection, ToolState, UiEvent,
-    UiTurnEndReason,
+    UiLogLevel, UiTurnEndReason,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{ApprovalDecision, SessionPickerItem, SettingEntry};
@@ -40,8 +39,8 @@ mod terminal_io;
 pub use actions::{apply_clipboard_content, resume_session_into_app};
 pub use mizar_client::events::{
     ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, WaitServicesError, steer_session,
-    subscribe_session_events, subscribe_session_events_into, to_ui_log_record, to_ui_status,
-    to_ui_step_outcome, to_ui_turn_end_reason, wait_for_services,
+    subscribe_session_events, subscribe_session_events_into, to_ui_status, to_ui_step_outcome,
+    to_ui_turn_end_reason, wait_for_services,
 };
 pub use mizar_client::session_view::{
     SelectionSources, collect_session_picker_items, find_model_in_provider,
@@ -256,16 +255,6 @@ impl TuiConfig {
             disabled_plugins: Vec::new(),
             startup_notices: Vec::new(),
         }
-    }
-}
-
-struct LoggerRestoreGuard {
-    ctx: Context,
-}
-
-impl Drop for LoggerRestoreGuard {
-    fn drop(&mut self) {
-        self.ctx.logger().set_sink(LogSink::Stdio);
     }
 }
 
@@ -575,14 +564,16 @@ pub async fn run_tui_with_summary(
     let (loop_tx, mut loop_rx) = mpsc::unbounded_channel::<LoopClientMsg>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
 
-    // 重定向 Cordis 日志，确保任何插件输出都不会污染终端 stdout
+    // 桥接 tracing 日志到 UI 事件，确保任何插件输出都不会污染终端 stdout
+    let log_threshold = match env_log_level_override() {
+        Some(UiLogLevel::Silent) => UiLogLevel::Silent,
+        Some(UiLogLevel::Error) => UiLogLevel::Error,
+        _ => UiLogLevel::Warn,
+    };
     let log_tx = ui_tx.clone();
-    ctx.logger().set_handler(move |record| {
-        if record.level >= LogLevel::Warn {
-            let _ = log_tx.send(UiEvent::Log(to_ui_log_record(record)));
-        }
+    let _tracing_guard = install_tracing_handler(log_threshold, move |record| {
+        let _ = log_tx.send(UiEvent::Log(record.clone()));
     });
-    let _logger_restore = LoggerRestoreGuard { ctx: ctx.clone() };
 
     let mut active_session = Arc::clone(&initial_session);
     let active_sid = Arc::new(RwLock::new(active_session.id.clone()));

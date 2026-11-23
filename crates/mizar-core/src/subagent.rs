@@ -18,13 +18,7 @@ pub mod worker;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{
-    AgentLoopContextExt, AgentReasoningDeltaEvent, AgentStepStartEvent, AgentTextDeltaEvent,
-    AgentToolCallEvent, AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent,
-    AgentTurnInputEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STEP_START,
-    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
-    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_INPUT,
-};
+use crate::agent_loop::{AgentEvent, AgentLoopContextExt};
 use crate::system_prompt::{PromptSection, SystemPromptContextExt};
 use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, EventOptions, Inject, Next, Plugin,
@@ -320,6 +314,7 @@ impl Service for SubagentRuntime {
         Box::pin(async move {
             let tools = ctx.tools()?;
             let sessions = ctx.sessions()?;
+            let agent_loop = ctx.agent_loop()?;
             let system_prompt = ctx.system_prompt()?;
 
             // 1. 先在 `tools/pre-execute` 最外层挂载硬护栏，再注册工具（LIFO 卸载时先下线工具再撤护栏）
@@ -358,97 +353,79 @@ impl Service for SubagentRuntime {
                 })))
             })?;
 
-            // 2. 订阅运行事件维护子会话实时活性快照（无阻塞、不影响主会话）
-            let rt_step = Arc::clone(&self);
-            let ctx_step = ctx.clone();
-            ctx.effect("subagent.activity-step-start", move || {
-                let h = ctx_step.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
-                    if let Some(tracker) = rt_step.tracker_for_child(&ev.session.id) {
-                        tracker.set_turn_step(ev.step);
+            // 2. 订阅强类型 AgentEvent 维护子会话实时活性快照与父轮次路由（无阻塞、不影响主会话）
+            let rt_events = Arc::clone(&self);
+            let agent_for_events = Arc::clone(&agent_loop);
+            ctx.effect("subagent.agent-events", move || {
+                let guard = agent_for_events.on_event(move |ev| match ev {
+                    AgentEvent::StepStart(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            tracker.set_turn_step(ev.step);
+                        }
                     }
-                })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            let rt_tcall = Arc::clone(&self);
-            let ctx_tcall = ctx.clone();
-            ctx.effect("subagent.activity-tool-call", move || {
-                let h = ctx_tcall.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
-                    if let Some(tracker) = rt_tcall.tracker_for_child(&ev.session.id) {
-                        let label = format_tool_activity_label(&ev.call.name, &ev.call.arguments);
-                        tracker.set_tool(&label);
+                    AgentEvent::ToolCall(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            let label =
+                                format_tool_activity_label(&ev.call.name, &ev.call.arguments);
+                            tracker.set_tool(&label);
+                        }
                     }
-                })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            let rt_tupd = Arc::clone(&self);
-            let ctx_tupd = ctx.clone();
-            ctx.effect("subagent.activity-tool-update", move || {
-                let h =
-                    ctx_tupd.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
-                        if let Some(tracker) = rt_tupd.tracker_for_child(&ev.session.id) {
+                    AgentEvent::ToolUpdate(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
                             if tracker.last_tool().is_none() {
                                 tracker.set_tool(&ev.name);
                             } else {
                                 tracker.touch();
                             }
                         }
-                    })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            let rt_tres = Arc::clone(&self);
-            let ctx_tres = ctx.clone();
-            ctx.effect("subagent.activity-tool-result", move || {
-                let h =
-                    ctx_tres.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
-                        if let Some(tracker) = rt_tres.tracker_for_child(&ev.session.id) {
+                    }
+                    AgentEvent::ToolResult(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
                             if tracker.last_tool().is_none() {
                                 tracker.set_tool(&ev.name);
                             } else {
                                 tracker.touch();
                             }
                         }
-                    })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            let rt_text = Arc::clone(&self);
-            let ctx_text = ctx.clone();
-            ctx.effect("subagent.activity-text-delta", move || {
-                let h = ctx_text.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
-                    if let Some(tracker) = rt_text.tracker_for_child(&ev.session.id) {
-                        tracker.touch();
                     }
-                })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            let rt_reason = Arc::clone(&self);
-            let ctx_reason = ctx.clone();
-            ctx.effect("subagent.activity-reasoning-delta", move || {
-                let h = ctx_reason.on(
-                    EVENT_AGENT_REASONING_DELTA,
-                    move |ev: &AgentReasoningDeltaEvent| {
-                        if let Some(tracker) = rt_reason.tracker_for_child(&ev.session.id) {
+                    AgentEvent::TextDelta(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
                             tracker.touch();
                         }
-                    },
-                )?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
+                    }
+                    AgentEvent::ReasoningDelta(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            tracker.touch();
+                        }
+                    }
+                    AgentEvent::TurnInput(ev) => {
+                        if !rt_events
+                            .active_children
+                            .lock()
+                            .unwrap()
+                            .contains_key(&ev.session.id)
+                        {
+                            rt_events.parent_turn_routes.lock().unwrap().insert(
+                                ev.session.id.clone(),
+                                (ev.provider.clone(), ev.model.clone()),
+                            );
+                        }
+                    }
+                    AgentEvent::TurnEnd(ev) => {
+                        rt_events
+                            .parent_turn_routes
+                            .lock()
+                            .unwrap()
+                            .remove(&ev.session.id);
+                    }
+                    AgentEvent::Status(_)
+                    | AgentEvent::Request(_)
+                    | AgentEvent::TurnStart(_)
+                    | AgentEvent::StepFirstToken(_)
+                    | AgentEvent::StepEnd(_)
+                    | AgentEvent::Usage(_) => {}
+                });
+                Ok::<_, CordisError>(Some(Cleanup::sync(move || drop(guard))))
             })?;
 
             // 3. 注册 `subagent` 工具（随插件卸载自动注销）
@@ -488,36 +465,7 @@ impl Service for SubagentRuntime {
                 ))))
             })?;
 
-            // 5. 追踪活跃父轮次路由，确保子会话在未传 `model` 时准确继承父会话的 provider/model
-            let routes_in = Arc::clone(&self.parent_turn_routes);
-            let active_in = Arc::clone(&self.active_children);
-            let ctx_in = ctx.clone();
-            ctx.effect("subagent.track-turn-input", move || {
-                let h = ctx_in.on(EVENT_AGENT_TURN_INPUT, move |ev: &AgentTurnInputEvent| {
-                    if !active_in.lock().unwrap().contains_key(&ev.session.id) {
-                        routes_in.lock().unwrap().insert(
-                            ev.session.id.clone(),
-                            (ev.provider.clone(), ev.model.clone()),
-                        );
-                    }
-                })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            let routes_end = Arc::clone(&self.parent_turn_routes);
-            let ctx_end = ctx.clone();
-            ctx.effect("subagent.track-turn-end", move || {
-                let h = ctx_end.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
-                    routes_end.lock().unwrap().remove(&ev.session.id);
-                })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    h.dispose().await;
-                })))
-            })?;
-
-            // 6. 最后登记清理句柄：LIFO 卸载时先触发 dispose_token，再停止在飞任务并清零每个父会话状态栏计数
+            // 5. 清理句柄：LIFO 卸载时先触发 dispose_token，再停止在飞任务并清零每个父会话状态栏计数
             let tasks_cleanup = Arc::clone(&self.tasks);
             let emit_lock_cleanup = Arc::clone(&self.state_emit_lock);
             let ctx_cleanup = ctx.clone();

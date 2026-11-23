@@ -289,9 +289,10 @@ impl SkillRegistry {
             (true, true)
         });
         if !inserted {
-            self.ctx.logger_named("skills").warn(format!(
+            tracing::warn!(
+                target: "mizar::skills",
                 "runtime skill \"{skill_name}\" ignored because it is already registered"
-            ));
+            );
             return Ok(Cleanup::sync(|| {}));
         }
         if changed {
@@ -409,10 +410,11 @@ impl SkillRegistry {
                     }
                     Err(err) => {
                         complete = false;
-                        self.ctx.logger_named("skills").warn(format!(
+                        tracing::warn!(
+                            target: "mizar::skills",
                             "skill provider `{}` skipped: {err}",
                             reg.provider.name()
-                        ));
+                        );
                     }
                 }
             }
@@ -431,10 +433,11 @@ impl SkillRegistry {
             for entry in all_candidates {
                 let name = entry.candidate.summary.name.clone();
                 if !seen.insert(name.clone()) {
-                    self.ctx.logger_named("skills").warn(format!(
+                    tracing::warn!(
+                        target: "mizar::skills",
                         "skill \"{name}\" from {} ignored because a higher-priority skill already exists",
                         entry.candidate.summary.source.as_str()
-                    ));
+                    );
                     continue;
                 }
                 winners.insert(name, entry);

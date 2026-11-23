@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{
-    AgentPreStepDecision, AgentPreStepInput, AgentRequestErrorDecision, AgentRequestErrorInput,
-    AgentRequestErrorKind, AgentStepEndEvent, EVENT_AGENT_PRE_STEP, EVENT_AGENT_REQUEST_ERROR,
-    EVENT_AGENT_STEP_END, StepOutcome,
+    AgentEvent, AgentPreStepDecision, AgentPreStepInput, AgentRequestErrorDecision,
+    AgentRequestErrorInput, AgentRequestErrorKind, EVENT_AGENT_PRE_STEP, EVENT_AGENT_REQUEST_ERROR,
+    StepOutcome, subscribe_agent_events_when_ready,
 };
 use crate::system_prompt::SystemPromptContextExt;
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Next, Service};
@@ -633,22 +633,17 @@ impl Service for CompactionRuntime {
             // 2. 步后记录最近真正成功答复过的 `(provider, model)` 路由
             {
                 let meta = Arc::clone(&self.sessions_meta);
-                let c = ctx.clone();
-                ctx.effect("compaction.step-end", move || {
-                    let h = c.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
-                        if matches!(ev.outcome, StepOutcome::Completed | StepOutcome::ToolCalls)
-                            && (ev.provider.is_some() || ev.model.is_some())
-                        {
-                            let mut guard = meta.lock().unwrap();
-                            let entry = guard.entry(ev.session.id.clone()).or_default();
-                            entry.last_answered_route =
-                                Some((ev.provider.clone(), ev.model.clone()));
-                        }
-                    })?;
-                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?;
+                subscribe_agent_events_when_ready(&ctx, "compaction.step-end", move |ev| {
+                    if let AgentEvent::StepEnd(ev) = ev
+                        && matches!(ev.outcome, StepOutcome::Completed | StepOutcome::ToolCalls)
+                        && (ev.provider.is_some() || ev.model.is_some())
+                    {
+                        let mut guard = meta.lock().unwrap();
+                        let entry = guard.entry(ev.session.id.clone()).or_default();
+                        entry.last_answered_route = Some((ev.provider.clone(), ev.model.clone()));
+                    }
+                })
+                .await?;
             }
 
             // 3. 溢出错误自动压缩并重试恢复

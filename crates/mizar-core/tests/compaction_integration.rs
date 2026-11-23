@@ -135,6 +135,11 @@ async fn setup_stack(
     app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
         .await
         .unwrap();
+    for rt in app.registry().values() {
+        for f in rt.fibers() {
+            let _ = f.wait_settled().await;
+        }
+    }
 
     let adapter = Arc::new(adapter);
     app.plugin(

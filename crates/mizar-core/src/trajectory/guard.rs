@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentTurnStartEvent, EVENT_AGENT_TURN_START};
+use crate::agent_loop::{AgentEvent, subscribe_agent_events_when_ready};
 use cordis::{
     BoxError, BoxFuture, Cleanup, Context, Next, Plugin, ValidationError, ValidationIssue,
 };
@@ -227,9 +227,12 @@ impl Plugin for RepeatToolGuardPlugin {
 
             // 用户新一轮提问开始时重置重复链，跨轮次的合理复查不当作死循环
             let chains_reset = Arc::clone(&chains);
-            ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
-                chains_reset.lock().unwrap().remove(&ev.session.id);
-            })?;
+            subscribe_agent_events_when_ready(&ctx, "repeat-tool-guard.turn-start", move |ev| {
+                if let AgentEvent::TurnStart(ev) = ev {
+                    chains_reset.lock().unwrap().remove(&ev.session.id);
+                }
+            })
+            .await?;
 
             Ok(None)
         })

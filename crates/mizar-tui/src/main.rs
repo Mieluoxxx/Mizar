@@ -588,8 +588,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app = Context::new();
-    // 进入终端界面前先静默，防止启动日志先刷到 stdout 再闪屏
-    app.logger().set_silent();
+    // 进入终端界面前先静默，防止启动日志先刷到 stderr 再闪屏
+    let _startup_tracing_guard = mizar_client::install_silent_tracing();
 
     let loaded_cfg = load_mizar_config(&workspace);
     let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());

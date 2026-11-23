@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use cordis::{Context, CordisError, PluginDef};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentLoopContextExt, AgentToolResultEvent, EVENT_AGENT_TOOL_RESULT};
+use mizar_core::agent_loop::{AgentEvent, AgentLoopContextExt};
 use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
 use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm::{
@@ -244,15 +244,6 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
         (),
     );
 
-    let results_sub = Arc::clone(&results_log);
-    app.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
-        results_sub
-            .lock()
-            .unwrap()
-            .push((ev.name.clone(), ev.is_error, ev.content.clone()));
-    })
-    .unwrap();
-
     // 等待全部依赖和 McpManager 就绪
     for rt in app.registry().values() {
         for f in rt.fibers() {
@@ -268,6 +259,16 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
     if let Some(mgr) = app.get::<McpManager>("mcp") {
         mgr.wait_ready().await;
     }
+
+    let results_sub = Arc::clone(&results_log);
+    let _tool_result_guard = app.agent_loop().unwrap().on_event(move |ev| {
+        if let AgentEvent::ToolResult(ev) = ev {
+            results_sub
+                .lock()
+                .unwrap()
+                .push((ev.name.clone(), ev.is_error, ev.content.clone()));
+        }
+    });
 
     // MCP 不应向静态 SystemPrompt 注入动态 mcp_servers 段落（保持前缀字节冻结）
     let prompt = mizar_core::system_prompt::SystemPromptContextExt::system_prompt(&app)

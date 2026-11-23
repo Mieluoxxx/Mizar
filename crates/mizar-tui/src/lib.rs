@@ -7,8 +7,11 @@ pub mod update;
 
 pub use mizar_client::events::{
     ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, WaitServicesError, steer_session,
-    subscribe_session_events, subscribe_session_events_into, to_ui_log_record, to_ui_status,
-    to_ui_step_outcome, to_ui_turn_end_reason, wait_for_services,
+    subscribe_session_events, subscribe_session_events_into, to_ui_status, to_ui_step_outcome,
+    to_ui_turn_end_reason, wait_for_services,
+};
+pub use mizar_client::logging::{
+    TracingBridgeGuard, install_silent_tracing, install_tracing_handler,
 };
 pub use mizar_client::session_view::{
     SelectionSources, collect_session_picker_items, find_model_in_provider,

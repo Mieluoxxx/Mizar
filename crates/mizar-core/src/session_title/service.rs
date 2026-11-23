@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentTurnInputEvent, EVENT_AGENT_TURN_INPUT};
+use crate::agent_loop::{AgentEvent, AgentTurnInputEvent, subscribe_agent_events_when_ready};
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service, ServicePlugin};
 use futures::StreamExt;
 use mizar_llm::{
@@ -249,9 +249,10 @@ impl SessionTitleRuntime {
                         st.last_triggered_turn = prev_triggered_turn;
                     }
                 }
-                rt.ctx
-                    .logger_named("session-title")
-                    .debug(format!("后台生成会话标题未应用: {err}"));
+                tracing::debug!(
+                    target: "mizar::session-title",
+                    "后台生成会话标题未应用: {err}"
+                );
             }
         });
     }
@@ -420,17 +421,18 @@ impl Service for SessionTitleRuntime {
         let ctx = ctx.clone();
         Box::pin(async move {
             let rt = Arc::clone(&self);
-            let c = ctx.clone();
             let cancel_on_dispose = self.dispose_token.clone();
-            ctx.effect("session-title.turn-input", move || {
-                let h = c.on(EVENT_AGENT_TURN_INPUT, move |ev: &AgentTurnInputEvent| {
-                    rt.handle_turn_input(ev);
-                })?;
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+            ctx.effect("session-title.dispose-token", move || {
+                Ok::<_, CordisError>(Some(Cleanup::sync(move || {
                     cancel_on_dispose.cancel();
-                    h.dispose().await;
                 })))
             })?;
+            subscribe_agent_events_when_ready(&ctx, "session-title.turn-input", move |ev| {
+                if let AgentEvent::TurnInput(ev) = ev {
+                    rt.handle_turn_input(ev);
+                }
+            })
+            .await?;
             Ok(())
         })
     }
@@ -451,9 +453,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopContextExt};
+    use crate::system_prompt::{SystemPrompt, SystemPromptConfig};
     use futures::channel::mpsc;
     use mizar_llm::{BoxChunkStream, LlmAdapter, LlmRuntime, ModelInfo, ProviderInfo, StreamChunk};
     use mizar_session::{SessionCreateOptions, SessionEvent, SessionStore};
+    use mizar_tools::ToolRuntime;
 
     use super::*;
 
@@ -499,6 +504,13 @@ mod tests {
         let app = Context::new();
         app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
         app.plugin(SessionStore::plugin(), ()).await.unwrap();
+        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+            .await
+            .unwrap();
+        app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
+            .await
+            .unwrap();
         let _reg = app
             .llm()
             .unwrap()
@@ -507,6 +519,7 @@ mod tests {
         app.plugin(SessionTitleRuntime::plugin(), SessionTitleConfig::default())
             .await
             .unwrap();
+        let agent = app.agent_loop().unwrap();
 
         let sessions = app.sessions().unwrap();
         let parent = sessions.create_with(SessionCreateOptions {
@@ -523,16 +536,13 @@ mod tests {
             ..Default::default()
         });
         child.append(SessionEvent::user("执行子任务"));
-        app.emit(
-            EVENT_AGENT_TURN_INPUT,
-            AgentTurnInputEvent {
-                session: Arc::clone(&child),
-                turn: 1,
-                provider: Some("real".into()),
-                model: Some("fast-title".into()),
-                ts_ms: child.header().created_at_ms,
-            },
-        );
+        agent.emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
+            session: Arc::clone(&child),
+            turn: 1,
+            provider: Some("real".into()),
+            model: Some("fast-title".into()),
+            ts_ms: child.header().created_at_ms,
+        }));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -548,16 +558,13 @@ mod tests {
             .unwrap();
         assert_eq!(forked.header().parent_id.as_deref(), Some("parent-main"));
         assert_eq!(forked.header().fork_seq, Some(seq));
-        app.emit(
-            EVENT_AGENT_TURN_INPUT,
-            AgentTurnInputEvent {
-                session: Arc::clone(&forked),
-                turn: 1,
-                provider: Some("real".into()),
-                model: Some("fast-title".into()),
-                ts_ms: forked.header().created_at_ms,
-            },
-        );
+        agent.emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {
+            session: Arc::clone(&forked),
+            turn: 1,
+            provider: Some("real".into()),
+            model: Some("fast-title".into()),
+            ts_ms: forked.header().created_at_ms,
+        }));
 
         for _ in 0..80 {
             if forked.header().title.is_some() {

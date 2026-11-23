@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use cordis::{Cleanup, Context, LogLevel};
+use cordis::{Cleanup, Context};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mizar_core::agent_loop::{AgentLoopContextExt, RunOptions};
 use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
@@ -21,8 +21,9 @@ use mizar_tui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui::side_panel::FileTouchRow;
 use mizar_tui::{
     AppAction, AppState, ChatItem, EmphasisConfig, SessionReplayItem, TuiConfig, UiEvent,
-    collect_session_picker_items, project_fork_view, project_resume_view, project_session_tree,
-    render, resume_session_into_app, subscribe_session_events, to_ui_log_record, wait_for_services,
+    UiLogLevel, collect_session_picker_items, install_tracing_handler, project_fork_view,
+    project_resume_view, project_session_tree, render, resume_session_into_app,
+    subscribe_session_events, wait_for_services,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -49,7 +50,6 @@ fn buffer_text(backend: &TestBackend) -> String {
 #[tokio::test]
 async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     let app_ctx = Context::new();
-    app_ctx.logger().set_silent();
 
     let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     if let AgentToolsMode::Coding {
@@ -72,12 +72,10 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let handles = subscribe_session_events(&app_ctx, Arc::clone(&active_sid), tx.clone()).unwrap();
 
-    // 重定向 logger 到 UI 事件
+    // 重定向 tracing 日志到 UI 事件
     let log_tx = tx.clone();
-    app_ctx.logger().set_handler(move |rec| {
-        if rec.level >= LogLevel::Warn {
-            let _ = log_tx.send(UiEvent::Log(to_ui_log_record(rec)));
-        }
+    let _log_guard = install_tracing_handler(UiLogLevel::Warn, move |rec| {
+        let _ = log_tx.send(UiEvent::Log(rec.clone()));
     });
 
     let mut state = AppState::new(
@@ -98,8 +96,8 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     assert!(welcome.contains("Mizar"), "welcome:\n{welcome}");
     assert!(welcome.contains("mock/mock-v1"), "welcome:\n{welcome}");
 
-    // 2. 触发一条真实 logger.warn，确认通过 UI 显示而不走 stdout
-    app_ctx.logger_named("tui-test").warn("测试告警消息");
+    // 2. 触发一条真实 tracing::warn!，确认通过 UI 显示而不走 stdout
+    tracing::warn!(target: "mizar::tui-test", "测试告警消息");
 
     // 3. 跑一轮会调用编码工具 find 的对话
     state.items.push(mizar_tui::ChatItem::User {
@@ -149,7 +147,6 @@ fn crate_root() -> PathBuf {
 
 async fn boot_mock_ctx(ws: PathBuf) -> Context {
     let app_ctx = Context::new();
-    app_ctx.logger().set_silent();
     let mut spine_cfg = AgentSpineConfig::coding(ws);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -607,7 +604,6 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
 
     let boot_ctx = |root: PathBuf, db: PathBuf| async move {
         let ctx = Context::new();
-        ctx.logger().set_silent();
         let mut spine_cfg = AgentSpineConfig::coding(root)
             .with_session_db(db)
             .with_disabled_plugins(["session-title"]);
@@ -815,7 +811,6 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
     ctx.fiber().dispose().await;
 
     let ctx2 = Context::new();
-    ctx2.logger().set_silent();
     let mut spine_cfg2 = AgentSpineConfig::coding(tmp_root.clone()).with_session_db(db_path);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -964,7 +959,6 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
     std::fs::write(tmp.join("shot.png"), &png_bytes).unwrap();
 
     let ctx = Context::new();
-    ctx.logger().set_silent();
     let mut cfg = AgentSpineConfig::coding(tmp.clone()).with_disabled_plugins(["session-title"]);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -1117,7 +1111,6 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
     }
 
     let app_ctx = Context::new();
-    app_ctx.logger().set_silent();
 
     let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         .with_disabled_plugins(["session-title"]);
@@ -1366,7 +1359,6 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     });
 
     let ctx = Context::new();
-    ctx.logger().set_silent();
     let mut cfg = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
     cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
     cfg.agent.provider = Some("fake".into());
@@ -1504,7 +1496,6 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     ctx.fiber().dispose().await;
 
     let ctx_restarted = Context::new();
-    ctx_restarted.logger().set_silent();
     let mut cfg_r = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
     if let AgentToolsMode::Coding {
         ref mut mcp,

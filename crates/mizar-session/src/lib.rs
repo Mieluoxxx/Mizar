@@ -73,6 +73,14 @@ pub struct Session {
     ctx: Context,
 }
 
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -391,16 +399,20 @@ impl Session {
 
             if let Some(ref backend) = persistence {
                 if let Err(err) = backend.append_events(&self.id, std::slice::from_ref(&entry)) {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化追加事件失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化追加事件失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 if let Some(patch) = title_patch
                     && let Err(err) = backend.update_header(&self.id, patch)
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化更新标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
             }
 
@@ -485,9 +497,11 @@ impl Session {
                         },
                     )
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化更新标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 true
             }
@@ -552,9 +566,11 @@ impl Session {
                         },
                     )
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化更新标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 CasOutcome::Updated
             }
@@ -599,9 +615,11 @@ impl Session {
                         },
                     )
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化清空标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化清空标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 true
             }
@@ -913,10 +931,11 @@ impl SessionStore {
         if let Some(backend) = self.ctx.session_persistence()
             && let Err(err) = backend.create_session(&header)
         {
-            self.ctx.logger_named("session").warn(format!(
+            tracing::warn!(
+                target: "mizar::session",
                 "持久化创建会话失败 (session={}): {err}",
                 session.id
-            ));
+            );
         }
 
         self.ctx.emit(
@@ -1045,18 +1064,20 @@ impl SessionStore {
         match backend.load_session(id) {
             Ok(Some(mut loaded)) => {
                 if loaded.skipped_events > 0 {
-                    self.ctx.logger_named("session").warn(format!(
+                    tracing::warn!(
+                        target: "mizar::session",
                         "会话 {id} 有 {} 条事件无法解析已跳过（常见于旧版二进制读新版写入的会话），其余历史已正常载入",
                         loaded.skipped_events
-                    ));
+                    );
                 }
                 let repaired = repair_dangling_tool_calls(&mut loaded);
                 if !repaired.is_empty()
                     && let Err(err) = backend.append_events(id, &repaired)
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化写入崩溃恢复条目失败 (session={id}): {err}"));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化写入崩溃恢复条目失败 (session={id}): {err}"
+                    );
                 }
                 let session = Arc::new(Session::from_loaded(self.ctx.clone(), loaded));
                 let (stored, inserted) = {
@@ -1080,9 +1101,10 @@ impl SessionStore {
             }
             Ok(None) => None,
             Err(err) => {
-                self.ctx
-                    .logger_named("session")
-                    .warn(format!("从持久化后端加载会话失败 (session={id}): {err}"));
+                tracing::warn!(
+                    target: "mizar::session",
+                    "从持久化后端加载会话失败 (session={id}): {err}"
+                );
                 None
             }
         }

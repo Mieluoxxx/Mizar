@@ -54,7 +54,7 @@
 | 模块 | 原对应包 / 服务名 | 关键类型 / 插件 | `inject` | 作用 |
 | :--- | :--- | :--- | :--- | :--- |
 | `system_prompt` | `"systemPrompt"` | `SystemPrompt`、`PromptSection` | 无 | 按 `order` 动态聚合系统提示词段落（内置 `persona` 与 `runtime_protocol`） |
-| `agent_loop` | `"agentLoop"` | `AgentLoop`、`SessionInbox`、`TurnInput` | `["llm", "tools", "sessions", "systemPrompt"]` | 托管 `SessionInbox`（`Steer`/`FollowUp`/`Inject`），串联 `agent/pre-step` → 冻结 `GenerateOptions` 调模型 → 工具并发/串行管线 → `agent/turn-stopping`，广播全套 `agent/*` 事件 |
+| `agent_loop` | `"agentLoop"` | `AgentLoop`、`AgentEvent`、`SessionInbox`、`TurnInput` | `["llm", "tools", "sessions", "systemPrompt"]` | 托管 `SessionInbox`（`Steer`/`FollowUp`/`Inject`），串联 `agent/pre-step` → 冻结 `GenerateOptions` 调模型 → 工具并发/串行管线 → `agent/turn-stopping`，通过 `AgentEventBus`（`subscribe` / `on_event`）广播强类型 `AgentEvent` |
 | `compaction` | `"compaction"` | `CompactionRuntime` | `["llm", "sessions", "tools", "systemPrompt"]` | 单阶段检查点压缩（真实可用窗口 80% 触发、`<mizar-digest>` 硬事实、膨胀保护、溢出 `retain=0` 恢复）与压后写文件/读去重守卫 |
 | `instructions` | `"agentInstructions"` | `AgentInstructions` | 无（事件订阅） | 扫描 `~/.mizar/`、`~/.agents/`、项目根到工作区祖先链及触达子目录的 `AGENTS.md` / `CLAUDE.md`，去重裁切并在 `agent/pre-step` 注入 `ContextNotice` |
 | `skills` | `"skills"` / `"skills-plugin"` | `SkillRegistry`、`SkillsPlugin` | `["tools", "skills"]` | 分层发现 `SKILL.md`、注册 `skill` 工具、目录注入与写入命中热失效 |
