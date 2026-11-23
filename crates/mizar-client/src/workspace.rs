@@ -12,7 +12,7 @@ use mizar_instructions::AgentInstructions;
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_skills::{SkillLookupOptions, SkillRegistry};
 use mizar_tools::{ToolExposure, ToolRuntime};
-use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
+use mizar_trajectory::TrajectoryRuntime;
 use tokio_util::sync::CancellationToken;
 
 /// 工作区与后端服务观测数据的纯数据快照，供各端（TUI / Merak）渲染侧栏或仪表盘。
@@ -161,13 +161,26 @@ pub fn collect_instructions_summary(
 
 /// 带超时采集工作区的 `git status --porcelain`（最多 24 条）与 `git diff --shortstat`。
 pub async fn collect_git_summary(workspace: &Path) -> (Vec<FileTouchRow>, String) {
-    let status_fut = tokio::process::Command::new("git")
+    let mut status_cmd = tokio::process::Command::new("git");
+    status_cmd
         .arg("status")
         .arg("--porcelain")
         .current_dir(workspace)
-        .output();
+        .kill_on_drop(true);
+    let status_fut = tokio::time::timeout(Duration::from_millis(300), status_cmd.output());
+
+    let mut stat_cmd = tokio::process::Command::new("git");
+    stat_cmd
+        .arg("diff")
+        .arg("--shortstat")
+        .current_dir(workspace)
+        .kill_on_drop(true);
+    let stat_fut = tokio::time::timeout(Duration::from_millis(300), stat_cmd.output());
+
+    let (status_res, stat_res) = tokio::join!(status_fut, stat_fut);
+
     let mut changes = Vec::new();
-    if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_millis(300), status_fut).await
+    if let Ok(Ok(out)) = status_res
         && out.status.success()
     {
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -190,13 +203,8 @@ pub async fn collect_git_summary(workspace: &Path) -> (Vec<FileTouchRow>, String
         }
     }
 
-    let stat_fut = tokio::process::Command::new("git")
-        .arg("diff")
-        .arg("--shortstat")
-        .current_dir(workspace)
-        .output();
     let mut stat = String::new();
-    if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_millis(300), stat_fut).await
+    if let Ok(Ok(out)) = stat_res
         && out.status.success()
     {
         stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -225,11 +233,9 @@ pub fn collect_trajectory_findings(ctx: &Context, session_id: &str) -> Vec<Strin
     let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") else {
         return Vec::new();
     };
-    let Some(report) = traj.inspect(session_id, TimelineMode::Sequence) else {
-        return Vec::new();
-    };
+    let raw_findings = traj.findings_only(session_id);
     let mut findings = Vec::new();
-    for f in report.findings {
+    for f in raw_findings {
         let line = format!("[{:?}] {}: {}", f.severity, f.title, f.summary);
         if !findings.contains(&line) {
             findings.push(line);

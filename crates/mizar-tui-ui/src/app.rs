@@ -175,10 +175,10 @@ pub struct AppState {
     pub always_allowed_tools: HashSet<String>,
 
     // 滚动与虚拟化状态
-    pub scroll_from_top: u16,
+    pub scroll_from_top: usize,
     pub auto_scroll: bool,
     pub last_viewport_height: u16,
-    pub last_total_lines: u16,
+    pub last_total_lines: usize,
 
     // 用量与性能仪表
     pub total_usage: TokenUsage,
@@ -620,6 +620,7 @@ impl AppState {
         let idx = self.items.len() - 1;
         self.item_cache
             .invalidate_tool_neighborhood(&self.items, idx);
+        self.enforce_tool_extras_budget();
         self.scroll_to_bottom();
     }
 
@@ -769,15 +770,67 @@ impl AppState {
         next
     }
 
-    fn page_step(&self) -> u16 {
-        self.last_viewport_height.saturating_sub(2).max(3)
+    /// 限制 `tool_extras` 历史大字段（`full_content`/`diff_raw`/`full_args`）内存占用，保留最近 64 次调用完整明细。
+    pub fn enforce_tool_extras_budget(&mut self) {
+        const KEEP_RECENT_TOOL_EXTRAS: usize = 64;
+        const MAX_TOOL_EXTRAS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+        if self.tool_extras.len() <= KEEP_RECENT_TOOL_EXTRAS {
+            return;
+        }
+        let mut total_bytes: usize = self
+            .tool_extras
+            .values()
+            .map(|e| {
+                e.full_content.len()
+                    + e.diff_raw.as_ref().map_or(0, String::len)
+                    + e.full_args.len()
+            })
+            .sum();
+        if total_bytes <= MAX_TOOL_EXTRAS_TOTAL_BYTES {
+            return;
+        }
+
+        let tool_count = self
+            .items
+            .iter()
+            .filter(|it| matches!(it, ChatItem::ToolCall { .. }))
+            .count();
+        let trim_limit = tool_count.saturating_sub(KEEP_RECENT_TOOL_EXTRAS);
+        let mut seen_tools = 0usize;
+        for (idx, item) in self.items.iter().enumerate() {
+            if seen_tools >= trim_limit || total_bytes <= MAX_TOOL_EXTRAS_TOTAL_BYTES {
+                break;
+            }
+            if let ChatItem::ToolCall { id, .. } = item {
+                seen_tools += 1;
+                if let Some(ext) = self.tool_extras.get_mut(id) {
+                    let freed = ext.full_content.len()
+                        + ext.diff_raw.as_ref().map_or(0, String::len)
+                        + ext.full_args.len();
+                    if freed > 0 {
+                        ext.full_content = String::new();
+                        ext.diff_raw = None;
+                        ext.full_args = String::new();
+                        total_bytes = total_bytes.saturating_sub(freed);
+                        self.item_cache.invalidate_item(idx);
+                    }
+                }
+            }
+        }
     }
 
-    pub fn scroll_up(&mut self, lines: u16) {
+    fn page_step(&self) -> usize {
+        (self.last_viewport_height as usize)
+            .saturating_sub(2)
+            .max(3)
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
         self.selection.clear();
         let max_scroll = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height);
+            .saturating_sub(self.last_viewport_height as usize);
         if max_scroll == 0 {
             self.auto_scroll = true;
             self.scroll_from_top = 0;
@@ -792,11 +845,11 @@ impl AppState {
         self.scroll_from_top = cur.saturating_sub(lines);
     }
 
-    pub fn scroll_down(&mut self, lines: u16) {
+    pub fn scroll_down(&mut self, lines: usize) {
         self.selection.clear();
         let max_scroll = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height);
+            .saturating_sub(self.last_viewport_height as usize);
         let next = self.scroll_from_top.saturating_add(lines);
         if next >= max_scroll {
             self.auto_scroll = true;
@@ -811,13 +864,13 @@ impl AppState {
         self.auto_scroll = true;
         self.scroll_from_top = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height);
+            .saturating_sub(self.last_viewport_height as usize);
     }
 
-    pub fn effective_scroll(&mut self, viewport_height: u16, total_lines: u16) -> u16 {
+    pub fn effective_scroll(&mut self, viewport_height: u16, total_lines: usize) -> usize {
         self.last_viewport_height = viewport_height;
         self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(viewport_height);
+        let max_scroll = total_lines.saturating_sub(viewport_height as usize);
         if self.auto_scroll {
             self.scroll_from_top = max_scroll;
         } else if max_scroll == 0 {
@@ -1007,6 +1060,7 @@ impl AppState {
             }
         }
         self.push_notice(NoticeLevel::Info, view.finish_notice);
+        self.enforce_tool_extras_budget();
         self.refresh_context_breakdown();
         self.scroll_to_bottom();
     }
@@ -2660,6 +2714,19 @@ mod tests {
             !app.auto_scroll,
             "shrink while scrollable must preserve lock"
         );
+
+        // 超过 u16::MAX (65,535) 行的长会话滚动不得截断或卡死
+        app.scroll_to_bottom();
+        assert_eq!(app.effective_scroll(30, 100_000), 99_970);
+        app.scroll_up(500);
+        assert!(!app.auto_scroll);
+        assert_eq!(app.scroll_from_top, 99_470);
+        assert!(app.scroll_from_top > u16::MAX as usize);
+        app.scroll_down(200);
+        assert_eq!(app.scroll_from_top, 99_670);
+        app.scroll_to_bottom();
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_from_top, 99_970);
 
         app.restore_session_view(SessionViewData {
             session_id: "s-restored".into(),

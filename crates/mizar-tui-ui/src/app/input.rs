@@ -765,7 +765,7 @@ impl AppState {
                         && let Some(turn) = self.timeline_snap.turns.get(idx)
                     {
                         self.auto_scroll = false;
-                        self.scroll_from_top = turn.top_line.min(u16::MAX as usize) as u16;
+                        self.scroll_from_top = turn.top_line;
                     }
                     return AppAction::None;
                 }

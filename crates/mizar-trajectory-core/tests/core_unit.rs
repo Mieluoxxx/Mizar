@@ -536,3 +536,75 @@ fn incremental_folder_and_detector_match_batch_parity() {
         assert_eq!(inc_findings, batch_findings, "at idx={idx}");
     }
 }
+
+#[test]
+fn incremental_folder_caps_detail_previews_at_512_utf8_bytes() {
+    let long_cjk = "猫娘工程师浮浮酱测试多字节截断".repeat(40);
+    let long_ascii = "x".repeat(2048);
+    let mut folder = mizar_trajectory_core::IncrementalFolder::new("s-cap");
+    let events = vec![
+        ev(1, 100, TraceEventKind::TurnStart { turn: 1 }),
+        ev(
+            2,
+            101,
+            TraceEventKind::UserMessage {
+                text: long_cjk.clone(),
+            },
+        ),
+        ev(
+            3,
+            102,
+            TraceEventKind::AssistantMessage {
+                text: long_cjk.clone(),
+                reasoning: long_cjk.clone(),
+                tool_calls: Vec::new(),
+                usage: None,
+            },
+        ),
+        ev(
+            4,
+            103,
+            TraceEventKind::ToolCall {
+                turn: 1,
+                step: 1,
+                call_id: "c1".into(),
+                name: "read".into(),
+                arguments: long_ascii.clone(),
+            },
+        ),
+        ev(
+            5,
+            104,
+            TraceEventKind::ToolResult {
+                tool_call_id: "c1".into(),
+                name: "read".into(),
+                content: long_cjk.clone(),
+                is_error: false,
+                blocked: false,
+            },
+        ),
+    ];
+    for e in &events {
+        folder.push_event(e);
+    }
+
+    let snap = folder.into_snapshot();
+    assert_eq!(snap.records.len(), 3);
+    for rec in &snap.records {
+        for detail in [
+            rec.input_detail.as_deref(),
+            rec.output_detail.as_deref(),
+            rec.reasoning_detail.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                detail.len() <= mizar_trajectory_core::projection::DEFAULT_DETAIL_MAX_BYTES,
+                "detail len {} exceeded 512",
+                detail.len()
+            );
+            assert!(detail.ends_with('…'));
+        }
+    }
+}

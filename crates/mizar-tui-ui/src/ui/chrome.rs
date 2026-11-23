@@ -164,28 +164,37 @@ pub(super) fn render_input_box(
             " 输入 (上下文压缩中 · Esc 取消) ".to_string(),
             Style::default().fg(app.theme.text_muted),
         ),
-        None if app.input.has_collapsed_pastes() && app.input.has_images() => (
-            format!(
-                " 输入 (Enter 发送 · 已附 {} 张图片 · 含折叠粘贴块，Ctrl+E 展开) ",
-                app.input.image_count()
-            ),
-            Style::default().fg(app.theme.text_muted),
-        ),
-        None if app.input.has_collapsed_pastes() => (
-            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) ".to_string(),
-            Style::default().fg(app.theme.text_muted),
-        ),
-        None if app.input.has_images() => (
-            format!(
-                " 输入 (Enter / Ctrl+Enter 发送 · 已附 {} 张图片 · Ctrl+V 粘贴 · ? 帮助) ",
-                app.input.image_count()
-            ),
-            Style::default().fg(app.theme.text_muted),
-        ),
-        None => (
-            " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) ".to_string(),
-            Style::default().fg(app.theme.text_muted),
-        ),
+        None => {
+            let has_collapsed = app.input.has_collapsed_pastes();
+            let image_count = app.input.image_count();
+            if has_collapsed && image_count > 0 {
+                (
+                    format!(
+                        " 输入 (Enter 发送 · 已附 {image_count} 张图片 · 含折叠粘贴块，Ctrl+E 展开) ",
+                    ),
+                    Style::default().fg(app.theme.text_muted),
+                )
+            } else if has_collapsed {
+                (
+                    " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · 含折叠粘贴块，Ctrl+E 展开) "
+                        .to_string(),
+                    Style::default().fg(app.theme.text_muted),
+                )
+            } else if image_count > 0 {
+                (
+                    format!(
+                        " 输入 (Enter / Ctrl+Enter 发送 · 已附 {image_count} 张图片 · Ctrl+V 粘贴 · ? 帮助) ",
+                    ),
+                    Style::default().fg(app.theme.text_muted),
+                )
+            } else {
+                (
+                    " 输入 (Enter / Ctrl+Enter 发送 · Tab 思考 · Ctrl+L 模型 · ? 帮助) "
+                        .to_string(),
+                    Style::default().fg(app.theme.text_muted),
+                )
+            }
+        }
     };
 
     let block = Block::default()

@@ -782,11 +782,43 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 f.wait_settled().await.map_err(|e| e.to_string())?;
             }
             if has_session_db && app.session_persistence().is_none() {
-                for _ in 0..25 {
-                    if app.session_persistence().is_some() {
-                        break;
+                let fibers: Vec<cordis::Fiber> = app
+                    .registry()
+                    .values()
+                    .into_iter()
+                    .flat_map(|rt| rt.fibers())
+                    .collect();
+                for f in fibers {
+                    let _ = f.wait_settled().await;
+                }
+                if app.session_persistence().is_none() {
+                    let has_pending = app.registry().values().into_iter().any(|rt| {
+                        rt.fibers().into_iter().any(|f| {
+                            matches!(
+                                f.state(),
+                                cordis::FiberState::Pending | cordis::FiberState::Loading
+                            )
+                        })
+                    });
+                    if has_pending {
+                        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                        let tx = Arc::new(Mutex::new(Some(tx)));
+                        if let Ok(probe) = app.try_inject(
+                            [mizar_session::SERVICE_SESSION_PERSISTENCE],
+                            move |_| {
+                                let tx = Arc::clone(&tx);
+                                async move {
+                                    if let Some(sender) = tx.lock().unwrap().take() {
+                                        let _ = sender.send(());
+                                    }
+                                    Ok::<_, cordis::CordisError>(())
+                                }
+                            },
+                        ) {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), rx).await;
+                            probe.dispose().await;
+                        }
                     }
-                    tokio::task::yield_now().await;
                 }
             }
             if let Some(mcp) = app.get::<McpManager>("mcp") {
