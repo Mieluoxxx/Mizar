@@ -21,6 +21,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = "0.2"
 loom = "0.7"
 ratatui = "0.30"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
 rquickjs = { version = "0.14", features = ["futures", "parallel"] }
 rusqlite = "0.43"
@@ -30,42 +31,18 @@ similar = "3"
 thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 tokio-util = { version = "0.7", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 unicode-normalization = "0.1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
-cordis = { path = "crates/cordis" }
-mizar-llm-types = { path = "crates/mizar-llm-types" }
+mizar-types = { path = "crates/mizar-types" }
 mizar-llm = { path = "crates/mizar-llm" }
-mizar-llm-http = { path = "crates/mizar-llm-http" }
-mizar-llm-completions = { path = "crates/mizar-llm-completions" }
-mizar-llm-messages = { path = "crates/mizar-llm-messages" }
-mizar-llm-mock = { path = "crates/mizar-llm-mock" }
-mizar-llm-responses = { path = "crates/mizar-llm-responses" }
-mizar-llm-retry = { path = "crates/mizar-llm-retry" }
-mizar-llm-router = { path = "crates/mizar-llm-router" }
-mizar-session = { path = "crates/mizar-session" }
-mizar-session-sqlite = { path = "crates/mizar-session-sqlite" }
-mizar-session-title = { path = "crates/mizar-session-title" }
 mizar-tools = { path = "crates/mizar-tools" }
-mizar-tools-coding = { path = "crates/mizar-tools-coding" }
+mizar-session = { path = "crates/mizar-session" }
 mizar-codemode = { path = "crates/mizar-codemode" }
-mizar-tool-fs = { path = "crates/mizar-tool-fs" }
-mizar-tool-search = { path = "crates/mizar-tool-search" }
-mizar-tool-time = { path = "crates/mizar-tool-time" }
 mizar-mcp = { path = "crates/mizar-mcp" }
-mizar-skills = { path = "crates/mizar-skills" }
-mizar-instructions = { path = "crates/mizar-instructions" }
-mizar-compaction = { path = "crates/mizar-compaction" }
-mizar-recall = { path = "crates/mizar-recall" }
-mizar-system-prompt = { path = "crates/mizar-system-prompt" }
-mizar-agent-loop = { path = "crates/mizar-agent-loop" }
-mizar-agent-spine = { path = "crates/mizar-agent-spine" }
-mizar-cache-warming = { path = "crates/mizar-cache-warming" }
-mizar-subagent = { path = "crates/mizar-subagent" }
-mizar-trajectory-core = { path = "crates/mizar-trajectory-core" }
-mizar-trajectory = { path = "crates/mizar-trajectory" }
-mizar-client-core = { path = "crates/mizar-client-core" }
+mizar-core = { path = "crates/mizar-core" }
 mizar-client = { path = "crates/mizar-client" }
 mizar-tui-ui = { path = "crates/mizar-tui-ui" }
 mizar-tui = { path = "crates/mizar-tui" }

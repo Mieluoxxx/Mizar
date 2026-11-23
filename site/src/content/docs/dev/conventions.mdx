@@ -7,14 +7,14 @@ order: 20
 
 import Callout from '../../../components/mdx/Callout.astro';
 
-贡献代码或增删 crate（模块分层与插件契约见 [Workspace 分层与隔离边界](/dev/) 及 [Cordis 微内核与新增工具](/dev/cordis/)）前，请先对齐以下仓库硬约定。多数规则都会在 clippy `-D warnings` 或 CI feature 组合构建里直接拦截。
+贡献代码或增删 crate（模块分层与静态装配见 [Workspace 分层与隔离边界](/dev/) 及 [MizarRuntime、强类型钩子与新增工具](/dev/runtime/)）前，请先对齐以下仓库硬约定。多数规则都会在 clippy `-D warnings` 或 CI feature 组合构建里直接拦截。
 
 ## 模块组织与依赖约束
 
 - **禁止使用 `mod.rs`**：模块组织一律采用现代 Rust 风格 `src/foo.rs` + `src/foo/bar.rs`。生产模块用 `use crate::xxx`，单元测试块内统一 `use super::*;`。
-- **文档与参考仓边界**：每个 crate 顶部都应具备中文 `//!` 模块说明，并标明对应的原生参考路径（现有少数历史例外如 `mizar-llm-http`）。`references/` 目录已被 `.gitignore` 排除，仅供对照设计原型，**切勿 `git add`**。
+- **文档与参考仓边界**：每个 crate 顶部都应具备中文 `//!` 模块说明，并标明对应的原生参考路径（现有例外：`mizar-llm/src/http.rs`）。`references/` 目录已被 `.gitignore` 排除，仅供对照设计原型，**切勿 `git add`**。
 - **Workspace 依赖管理**：根 `Cargo.toml` 不含 `[package]`；所有版本声明集中在 `[workspace.dependencies]`，子 crate 清单一律写 `{ workspace = true }` 并启用 `[lints] workspace = true`。
-- **错误处理与锁惯例**：公共错误类型使用 `thiserror` 并统一接入 `cordis::BoxError`，不引入 `anyhow`。代码库中 `.lock().unwrap()` 为既定可接受模式，无需特地包一层或替换为 `parking_lot`。
+- **错误处理与锁惯例**：公共错误类型使用 `thiserror` 并统一接入 `mizar_types::BoxError`，不引入 `anyhow`。代码库中 `.lock().unwrap()` 为既定可接受模式，无需特地包一层或替换为 `parking_lot`。
 
 ## 双语文案契约（不要统一成单语！）
 
@@ -30,22 +30,22 @@ import Callout from '../../../components/mdx/Callout.astro';
 ## `pi-emphasis` 双向契约与跨 Crate 联改
 
 - **UI 双向约定**：`crates/mizar-tui-ui/src/emphasis.rs` 中的 `reply_guidance_prompt()` 负责生成给模型的标注格式提示文本，同文件内的渲染器消费这些标记做终端强调渲染。**改生成端必须同步改渲染器，并让配对单测同时断言两端**。
-- **跨 crate 公共类型联动**：`mizar-tui-ui` 中的 `OverlayKind`、`OverlayAction` 与 `UiEvent` 在 `mizar-tui` 内有大量构造与模式匹配点；改其中一个枚举或字段，必须跑完整 `cargo check --workspace`，不要只 check 单个包。
+- **跨 crate 公共类型联动**：`mizar-types` 的 `ClientEvent`（`UiEvent`）与 `mizar-tui-ui` 的 `OverlayKind`、`OverlayAction` 在 `mizar-client` 与 `mizar-tui` 内有大量构造与模式匹配点；改其中一个枚举或字段，必须跑完整 `cargo check --workspace`，不要只 check 单个包。
 
 ## Feature 门控与测试规范
 
-`mizar-agent-spine` 定义了六个可裁剪 feature：`legacy`、`coding`、`compaction`、`sqlite`、`trajectory` 与 `router`。任何来自可选依赖的 `use` 语句都必须配上精确的 `#[cfg(feature = "...")]`，否则裁剪特性时编译立刻中断。
+`mizar-core` 定义了两个默认开启的可选 Cargo feature：`codemode` 与 `mcp`（`mizar-session` 另提供默认开启的 `bundled` 特性以内置编译 SQLite）。任何来自可选依赖的 `use` 语句都必须配上精确的 `#[cfg(feature = "...")]`，否则裁剪特性时编译立刻中断。
 
 ```bash title="必须验证的最小 feature 门控与测试规范"
-# 验证全部可选 feature 关闭时，库和测试目标依然能过编
-cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+# 验证可选 feature 关闭时，mizar-core 库与测试目标依然能过编
+cargo check --locked -p mizar-core --no-default-features --all-targets
 ```
 
 编写测试时注意三条具体约定：
 
 1. **无 `tempfile` 依赖**：仓库不引入 `tempfile` crate，临时目录测试请使用 `std::env::temp_dir().join(format!("mizar_xxx_{}", std::process::id()))` 并记得收尾清理。
-2. **集成测试显式注册**：`mizar-agent-spine` 的集成测试通过 `tests/integration/main.rs` 按 `#[cfg(feature)]` 汇总挂载，新增加集成测试模块时必须同步添加到 `main.rs`。
-3. **对齐测试编号与零跳过**：`crates/cordis/tests/compat.rs` 采用连续 `compat_NN_<描述>` 对齐 TS 原版测试用例。所有新增行为必须配备退化即失败（fail on regression）的确定性断言，禁止用 `#[ignore]` 或重试掩盖并发时序问题。
+2. **集成测试显式注册**：`mizar-core` 的集成测试通过 `tests/integration/main.rs` 按 `#[cfg(feature)]` 汇总挂载，新增加集成测试模块时必须同步添加到 `main.rs`。
+3. **退化即失败与零跳过**：所有新增行为必须配备退化即失败（fail on regression）的确定性断言，禁止用 `#[ignore]` 或重试掩盖并发时序问题。
 
 ## 标准 CI 检查与 Commit 规范
 

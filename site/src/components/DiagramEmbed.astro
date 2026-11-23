@@ -6,7 +6,7 @@ import ToolExposureDiagram from './diagrams/ToolExposureDiagram.astro';
 import InstructionsDiscoveryDiagram from './diagrams/InstructionsDiscoveryDiagram.astro';
 import SessionTraceDiagram from './diagrams/SessionTraceDiagram.astro';
 import SecurityMatrixDiagram from './diagrams/SecurityMatrixDiagram.astro';
-import CordisArchitectureDiagram from './diagrams/CordisArchitectureDiagram.astro';
+import RuntimeArchitectureDiagram from './diagrams/RuntimeArchitectureDiagram.astro';
 import { getLocaleFromUrl, type Locale } from '../lib/url';
 
 interface Props {
@@ -18,7 +18,7 @@ interface Props {
     | 'instructions-discovery'
     | 'session-trace'
     | 'security-matrix'
-    | 'cordis-architecture';
+    | 'runtime-architecture';
   title?: string;
   caption?: string;
   locale?: Locale;
@@ -35,4 +35,4 @@ const locale = Astro.props.locale ?? getLocaleFromUrl(Astro.url);
 {id === 'instructions-discovery' && <InstructionsDiscoveryDiagram caption={caption} locale={locale} />}
 {id === 'session-trace' && <SessionTraceDiagram caption={caption} locale={locale} />}
 {id === 'security-matrix' && <SecurityMatrixDiagram caption={caption} locale={locale} />}
-{id === 'cordis-architecture' && <CordisArchitectureDiagram caption={caption} locale={locale} />}
+{id === 'runtime-architecture' && <RuntimeArchitectureDiagram caption={caption} locale={locale} />}

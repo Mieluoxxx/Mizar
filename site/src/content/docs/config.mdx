@@ -139,38 +139,42 @@ import DiagramEmbed from '../../components/DiagramEmbed.astro';
 - `followSubdirs`（默认 `true`）允许在读取或编辑深层子目录文件时动态补载该目录的规则文件。
 - `skills.enabled` 控制是否启用 `.agents/skills`；`customDirs` 可额外挂载团队公共技能目录。
 
-## 上下文压缩与情景记忆回溯
+## 上下文压缩、情景回溯与分身配置
 
-长时间重构与大量工具输出不再只能手动 `/clear` 重来，可通过 `compaction` 与 `recall` 精细调优（详见 [会话、分叉与性能轨迹](/tui/sessions/)）：
+长时间重构与大量工具输出不再只能手动 `/clear` 重来，可通过 `compaction`、`recall`、`sessionTitle` 与 `subagent` 精细调优（详见 [会话、分叉与性能轨迹](/tui/sessions/)）：
 
-```json title="压缩引擎与情景回溯配置"
+```json title="压缩、回溯、标题与 Subagent 配置"
 {
   "compaction": {
     "enabled": true,
-    "autoPrune": true,
     "autoCompact": true,
-    "softWindowCap": 380000,
+    "defaultContextWindow": 128000,
     "triggerRatio": 0.8,
-    "pruneThresholdChars": 6000,
-    "coldCacheIdleSecs": 300,
-    "reusePrefixCache": true,
-    "disableSummaryReasoning": true,
-    "enableReadDedup": true,
-    "enableWriteAfterCompactGuard": true
+    "keepRecentTokens": 20000
   },
   "recall": {
     "enabled": true,
-    "autoActivateOnCompaction": true,
     "defaultSearchLimit": 8,
     "readCharLimit": 6000
+  },
+  "sessionTitle": {
+    "enabled": true,
+    "thinkingLevel": "low"
+  },
+  "subagent": {
+    "maxSteps": 20,
+    "maxStepsCap": 40,
+    "timeoutSecs": 180,
+    "maxConcurrent": 4,
+    "stallTimeoutSecs": 45,
+    "maxWatchdogAlerts": 2
   }
 }
 ```
 
-- `softWindowCap`（默认 `380000`）：即使在 1M 超大窗口模型上也维持温和软顶，避免注意力衰退与缓存效益下降；设为 `0` 关闭软顶。
-- `reusePrefixCache`（默认 `true`）与 `disableSummaryReasoning`（默认 `true`）：摘要请求尾置指令以复用主对话 Prompt Cache，并关闭思考以防隐藏推理挤占摘要预算。
-- `enableWriteAfterCompactGuard` & `enableReadDedup`：压缩后拦截对已存在文件未经重读的整文件 `write`（始终放行 `edit`），并对同一压缩代次内未改动的重复 `read` 自动去重。
-- `recall`：`recall_search` / `recall_read` 默认按 `Deferred` 零成本待命，`autoActivateOnCompaction`（默认 `true`）在首轮剪枝/压缩或分叉会话中自动向模型激活。
+- `compaction`：单阶段检查点压缩。按模型真实可用窗口（`context_window - reserved_output`，可用可选 `maxContextTokens` 封顶）的 `triggerRatio`（默认 `0.8`）触发，生成确定性 `<mizar-digest>` 与摘要并自动从 `ContextOverflow` 恢复；内置压后重复 `read` 去重与写前重读守卫（对已存在且超过 50 行的文件整文件 `write` 需先重读，始终放行 `edit`）。
+- `recall`（默认 `enabled: true`、`defaultSearchLimit: 8`、`readCharLimit: 6000`）：静态常驻 `Direct` 单一 `recall` 工具（支持 `search` / `read`），基于 SQLite WAL FTS5 索引穿透压缩与谱系边界无损检索历史记录。
+- `sessionTitle` 与 `subagent`：`sessionTitle` 异步生成 `MMDD｜TYPE｜Topic` 会话标题（可设 `model` 覆写 `provider/model`，尊重 `/rename` 人工修改）；`subagent` 控制后台单层常驻分身的步数、并发、超时及零 Token 活性看门狗（`stallTimeoutSecs: 0` 关闭看门狗）。
 
 ## 界面偏好、`/settings` 面板与模块启停
 
@@ -191,4 +195,4 @@ import DiagramEmbed from '../../components/DiagramEmbed.astro';
 }
 ```
 
-- `disabledPlugins`：声明禁用内置可选 Cordis 模块 ID（如 `tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`compaction`、`recall`、`trajectory`、`repeat-guard`）。在 `/settings` 的 **[模块]** 分组中可在空闲时实时热挂载/热卸载（任务运行中自动保护拒绝切换）；`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins` 受核心自保护，任何配置均不可禁用。
+- `disabledPlugins`：声明禁用 12 个内置可选模块 ID（`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`compaction`、`recall`、`session-title`、`subagent`、`trajectory`、`repeat-guard`）或 10 个官方宿主/TUI 扩展 ID（`file-mentions`、`local-bash`、`approval-gate`、`tui`、`tui-emphasis`、`tui-side-panel`、`tui-timeline-rail`、`tui-trajectory-view`、`tui-selection`、`tui-clipboard`，其中 `"tui"` 会级联关闭全部 `tui-*` 扩展）。在 `/settings` 的 **[模块]** 分组中可通过轻量原子开关在空闲时无销毁启停（`mcp` 启动禁用时延后到首次启用再初始化；任务运行中自动保护拒绝切换）；`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins` 受核心自保护，任何配置均不可禁用。

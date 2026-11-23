@@ -25,24 +25,24 @@ Mizar:
 
 Every built-in tool is designed around one principle: preserve essential signal without blowing out the model's context window in a single turn.
 
-### `read` · Chunked File Reading
+### `read` · Numbered Chunked File Reading
 
-Reads files by start and length (`offset` and `limit`). When output exceeds **2,000 lines** or **50 KiB**, it truncates after the leading slice and tells you at the bottom of the output which line number to resume from. Reading a file inside a deep subdirectory also automatically discovers any `AGENTS.md` rules scoped to that directory.
+Streams files by `offset` and `limit` with 1-indexed `<line>\t<text>` prefixes for exact line anchoring. Output truncates cleanly at **2,000 lines**, **50 KiB**, or **2,000 characters** per line and tells you which line to resume from. Reading inside a deep subdirectory also auto-discovers any scoped `AGENTS.md` rules.
 
 ### `grep` & `find` · Directory Scanning & Regex Search
 
-Built on high-speed search primitives that automatically honor `.gitignore` and skip hidden noise directories. By default, `grep` caps results at **100 matches** and truncates individual lines longer than **500 characters** (such as minified files); `find` caps results at **1,000 paths** to avoid flooding context with `node_modules` or `target/`.
+Prefers managed `rg` / `fd` in `PATH` or `~/.mizar/bin/`, with seamless built-in Rust (`ignore` + `regex`/`globset`) fallbacks that respect `.gitignore` and skip build noise directories. `grep` supports `content`, `files_with_matches`, and `count` modes (defaulting to **100 matches**, **20 per file**, and **500 chars** per line); `find` sorts results by modification time descending and defaults to **200 paths**.
 
-### `edit` & `write` · Serialized Safe Mutations
+### `edit` & `write` · Serialized Safe Multi-Edits
 
-`write` creates or overwrites entire files; `edit` requires an exact context match before applying replacements (supporting multiple edits in a single call and tolerant of minor smart-quote differences). **Consecutive mutations to the same file path are automatically queued and executed serially** so concurrent tool calls never clobber one another.
+`write` creates or overwrites entire files; `edit` supports atomic multi-hunk replacements via `edits[]` plus `replaceAll`, preserving BOM and CRLF/LF line endings. **Consecutive mutations to the same file path are automatically queued and executed serially** so concurrent tool calls never clobber one another.
 
-### `bash` · Local Shell & Large-Output Spooling
+### `bash` · Concurrent Shell & Large-Output Spooling
 
-Runs builds, tests, and scripts inside a dedicated process group (pressing `Esc` terminates the shell together with all spawned child processes). When stdout / stderr exceeds **2,000 lines** or **50 KiB**:
+Runs builds, tests, and scripts inside a dedicated POSIX shell process group (supporting parallel batches, configurable `timeout` defaulting to `120s` / max `600s`, and instant process-group cleanup on `Esc`):
 
-- `bash` keeps only the **tail** of the latest output so verbose build logs don't crowd out the final error;
-- At the same time, it writes the **complete raw log** to `mizar/mizar-bash-*.log` under the system temp directory and returns that path so you or the model can inspect full details via `read`.
+- `bash` keeps both head and tail slices capped at **400 lines**, **20 KiB**, and **768 bytes** per line;
+- When raw output exceeds **64 KiB**, it spills the **complete raw log** to `mizar/mizar-bash-*.log` under the system temp directory and returns that path for inspection via `read`.
 
 <Callout type="note" title="No hard path isolation by default">
 
@@ -62,10 +62,10 @@ If you attach a hundred external MCP tools and dump all their JSON Schemas into 
 
 From the user's perspective, tools operate in five `ToolExposure` tiers:
 
-1. **Direct (`Direct`)**: Tools like `read`, `edit`, and `bash` are declared to the model from turn one and can be invoked directly.
-2. **Model-only / No nesting (`ModelOnly`)**: Meta-tools such as `tool_search` and `codemode` can be called directly by the model, but cannot be called recursively from inside sandbox scripts.
+1. **Direct (`Direct`)**: Built-in tools such as `read`, `edit`, `bash`, and static episodic `recall` (`search` / `read`) stay declared to the model from turn one while keeping tool definitions frozen for Prompt Cache stability.
+2. **Model-only / No nesting (`ModelOnly`)**: Orchestration tools such as `tool_search`, `codemode`, and persistent background `subagent` (`spawn` / `send` / `status` / `stop`) can be called directly by the model, without recursive sandbox or nested subagent calls.
 3. **Sandbox-only (`Codemode`)**: All MCP server tools default to this tier—consuming zero tokens in the initial turn while remaining batch-callable inside the [Codemode Sandbox](/en/codemode/).
-4. **On-demand discovery (`Deferred`)**: Tools such as episodic recall (`recall_search` / `recall_read`) and external tools marked `deferred` stay hidden until activated by session triggers (such as pruning/compaction) or surfaced via `tool_search`.
+4. **On-demand discovery (`Deferred`)**: External MCP tools marked `deferred` stay hidden until discovered via `tool_search` or sandbox `searchTools()`.
 5. **Hidden (`Hidden`)**: Tools matched by `excludeTools` or configured as `hidden` are invisible to both the model and the sandbox.
 
 ## Tool Filtering & Permissions

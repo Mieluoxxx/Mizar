@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
+use mizar_core::trajectory::TrajectoryExport;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -74,6 +75,17 @@ enum MockStep {
         id: String,
         name: String,
         args: Value,
+    },
+    CompletionsToolCallWithUsage {
+        content_prefix: Option<String>,
+        id: String,
+        name: String,
+        args: Value,
+        usage: Value,
+    },
+    CompletionsTextWithUsage {
+        text: String,
+        usage: Value,
     },
     ResponsesText(String),
     MessagesText(String),
@@ -190,6 +202,53 @@ async fn start_gateway(state: Arc<GatewayState>) -> String {
                 })
                 .to_string();
                 let sse = format!("data: {tc}\n\ndata: [DONE]\n\n");
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }
+            MockStep::CompletionsToolCallWithUsage {
+                content_prefix,
+                id,
+                name,
+                args,
+                usage,
+            } => {
+                let mut sse = String::new();
+                if let Some(prefix) = content_prefix {
+                    let delta = json!({"choices":[{"delta":{"content": prefix}}]}).to_string();
+                    sse.push_str(&format!("data: {delta}\n\n"));
+                }
+                let tc = json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args.to_string(),
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+                .to_string();
+                let u = json!({"choices": [], "usage": usage}).to_string();
+                sse.push_str(&format!("data: {tc}\n\ndata: {u}\n\ndata: [DONE]\n\n"));
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }
+            MockStep::CompletionsTextWithUsage { text, usage } => {
+                let delta1 = json!({"choices":[{"delta":{"content": text}}]}).to_string();
+                let finish = json!({"choices":[{"delta":{},"finish_reason":"stop"}]}).to_string();
+                let u = json!({"choices": [], "usage": usage}).to_string();
+                let sse =
+                    format!("data: {delta1}\n\ndata: {finish}\n\ndata: {u}\n\ndata: [DONE]\n\n");
                 Response::builder()
                     .header("content-type", "text/event-stream")
                     .body(Body::from(sse))
@@ -1530,10 +1589,13 @@ async fn exec_supports_multi_turn_continue_resume_json_and_max_tokens() {
     assert!(!o_missing.status.success());
     assert!(o_missing.stdout.is_empty());
 
-    // 5. Reasoning-only 且无可见正文 -> 绝不能静默成功，必须返回非零并带 empty_response 诊断
-    state.set_script(vec![MockStep::CompletionsReasoningOnly(
-        "internal chain of thought without answer".into(),
-    )]);
+    // 5. Reasoning-only 且无可见正文 -> 自动重试耗尽后绝不能静默成功，必须返回非零并带 empty_response 诊断
+    state.set_script(vec![
+        MockStep::CompletionsReasoningOnly(
+            "internal chain of thought without answer".into()
+        );
+        4
+    ]);
     let mut c_reason = clean_env_cmd(
         &home,
         &ws,
@@ -1655,9 +1717,21 @@ async fn exec_responses_multi_turn_preserves_cache_key_affinity_and_static_instr
         reqs[0].body["prompt_cache_key"],
         reqs[1].body["prompt_cache_key"]
     );
-    let instr0 = reqs[0].body["instructions"].as_str().unwrap();
-    let instr1 = reqs[1].body["instructions"].as_str().unwrap();
-    assert_eq!(instr0, instr1, "instructions changed across turns");
+    assert!(
+        reqs[0].body.get("instructions").is_none(),
+        "top-level instructions must not be sent by default: {}",
+        reqs[0].body
+    );
+    assert!(
+        reqs[1].body.get("instructions").is_none(),
+        "top-level instructions must not be sent on turn 2: {}",
+        reqs[1].body
+    );
+    assert_eq!(reqs[0].body["input"][0]["role"], "developer");
+    assert_eq!(reqs[1].body["input"][0]["role"], "developer");
+    let instr0 = reqs[0].body["input"][0]["content"].as_str().unwrap();
+    let instr1 = reqs[1].body["input"][0]["content"].as_str().unwrap();
+    assert_eq!(instr0, instr1, "developer prefix changed across turns");
     assert_eq!(
         reqs[0].body["tools"], reqs[1].body["tools"],
         "tools declaration changed across turns"
@@ -1678,18 +1752,665 @@ async fn exec_responses_multi_turn_preserves_cache_key_affinity_and_static_instr
             .unwrap()
             .iter()
             .filter(|item| {
-                item.get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains("<environment_context>"))
+                item.get("role").and_then(Value::as_str) == Some("user")
+                    && item
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.contains("<environment_context>"))
             })
             .count()
     };
     assert_eq!(count_env(&reqs[0].body), 1, "{}", reqs[0].body["input"]);
     assert_eq!(count_env(&reqs[1].body), 1, "{}", reqs[1].body["input"]);
-    let env_text = reqs[0].body["input"][0]["content"].as_str().unwrap();
+    assert_eq!(reqs[0].body["input"][1]["role"], "user");
+    let env_text = reqs[0].body["input"][1]["content"].as_str().unwrap();
     assert!(
         env_text.contains(&format!("<cwd>{ws_display}</cwd>")),
         "{env_text}"
     );
     assert!(env_text.contains("<current_date>"), "{env_text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_trace_out_isolated_normal_text_json_and_env_precedence() {
+    let tmp = TempRoot::new("exec_trace_normal");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+
+    // 构造超过默认摘要上限的大文件以验证截断摘要
+    let big_content = format!(
+        "HEADER\n{}\nFOOTER",
+        "line-payload-1234567890\n".repeat(120)
+    );
+    std::fs::write(ws.join("big.txt"), &big_content).unwrap();
+
+    let state = GatewayState::new(
+        vec![
+            MockStep::CompletionsToolCallWithUsage {
+                content_prefix: Some("Checking file...".into()),
+                id: "call_big_read".into(),
+                name: "read".into(),
+                args: json!({ "path": "big.txt" }),
+                usage: json!({
+                    "prompt_tokens": 120,
+                    "completion_tokens": 18,
+                    "prompt_tokens_details": { "cached_tokens": 40 }
+                }),
+            },
+            MockStep::CompletionsTextWithUsage {
+                text: "TRACE_NORMAL_OK".into(),
+                usage: json!({
+                    "prompt_tokens": 260,
+                    "completion_tokens": 12,
+                    "prompt_tokens_details": { "cached_tokens": 100 }
+                }),
+            },
+        ],
+        MockStep::CompletionsText("UNEXPECTED".into()),
+    );
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+
+    // A. --isolated + text 模式 + --trace-out 自动创建多层父目录
+    let trace_a = tmp.path().join("nested/a/trajectory.json");
+    let mut cmd_a = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-out",
+            trace_a.to_str().unwrap(),
+            "inspect big.txt",
+        ],
+    );
+    cmd_a.env("API_KEY", "sk-trace-test");
+    let out_a = run_with_stdin(cmd_a, None).await;
+    assert!(
+        out_a.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out_a.stdout), "TRACE_NORMAL_OK\n");
+    assert!(!home.join(".mizar/sessions.sqlite").exists());
+
+    let raw_a = std::fs::read_to_string(&trace_a).expect("trajectory.json must exist");
+    let export_a: TrajectoryExport = serde_json::from_str(&raw_a).unwrap();
+    assert_eq!(export_a.exit_code, 0);
+    assert_eq!(export_a.termination_reason, "completed");
+    assert!(export_a.error.is_none());
+    assert!(export_a.isolated);
+    assert_eq!(export_a.output_format.as_deref(), Some("text"));
+    assert!(export_a.ttft_ms.is_some());
+    assert_eq!(export_a.turns.len(), 1);
+    assert_eq!(export_a.turns[0].steps.len(), 2);
+    // step 1: 120 - 40 = 80; step 2: 260 - 100 = 160 -> total input = 240, cache_read = 140
+    assert_eq!(export_a.usage.input_tokens, 240);
+    assert_eq!(export_a.usage.output_tokens, 30);
+    assert_eq!(export_a.usage.cache_read_tokens, 140);
+    assert_eq!(export_a.turns[0].usage, export_a.usage);
+    assert_eq!(export_a.tool_calls.len(), 1);
+    assert_eq!(export_a.tool_calls[0].name, "read");
+    assert!(export_a.tool_calls[0].arguments.contains("big.txt"));
+    assert_eq!(export_a.tool_results.len(), 1);
+    assert!(export_a.tool_results[0].truncated);
+    assert!(export_a.tool_results[0].original_chars > 2000);
+    assert!(
+        export_a.tool_results[0].content_summary.chars().count()
+            < export_a.tool_results[0].original_chars
+    );
+    assert!(!export_a.tool_results[0].is_error);
+    assert_eq!(export_a.report.snapshot.stats.tool_calls, 1);
+
+    // B. --isolated + --output-format json + MIZAR_TRACE_OUT 环境变量
+    state.set_script(vec![MockStep::CompletionsTextWithUsage {
+        text: "TRACE_JSON_OK".into(),
+        usage: json!({ "prompt_tokens": 50, "completion_tokens": 8 }),
+    }]);
+    let trace_b = tmp.path().join("env_only/trajectory.json");
+    let mut cmd_b = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--output-format",
+            "json",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "json mode",
+        ],
+    );
+    cmd_b.env("API_KEY", "sk-trace-test");
+    cmd_b.env("MIZAR_TRACE_OUT", &trace_b);
+    let out_b = run_with_stdin(cmd_b, None).await;
+    assert!(
+        out_b.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_b.stderr)
+    );
+    let stdout_json: Value = serde_json::from_slice(&out_b.stdout).unwrap();
+    assert_eq!(stdout_json["reason"], "completed");
+    let export_b: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_b).unwrap()).unwrap();
+    assert_eq!(export_b.exit_code, 0);
+    assert_eq!(export_b.output_format.as_deref(), Some("json"));
+    assert_eq!(
+        export_b.session_id,
+        stdout_json["session_id"].as_str().unwrap()
+    );
+
+    // C. --trace-out 优先级高于 MIZAR_TRACE_OUT
+    state.set_script(vec![MockStep::CompletionsText("CLI_WINS".into())]);
+    let trace_cli = tmp.path().join("cli_wins/trajectory.json");
+    let trace_env = tmp.path().join("env_ignored/trajectory.json");
+    let mut cmd_c = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-out",
+            trace_cli.to_str().unwrap(),
+            "precedence",
+        ],
+    );
+    cmd_c.env("API_KEY", "sk-trace-test");
+    cmd_c.env("MIZAR_TRACE_OUT", &trace_env);
+    let out_c = run_with_stdin(cmd_c, None).await;
+    assert!(out_c.status.success());
+    assert!(trace_cli.exists());
+    assert!(!trace_env.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_trace_out_isolated_error_timeout_signal_and_write_failure() {
+    let tmp = TempRoot::new("exec_trace_failures");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("note.txt"), "hello trace").unwrap();
+
+    let state = GatewayState::new(vec![], MockStep::HangForever);
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+    let secret = "sk-trace-secret-leak-check-123";
+
+    // A. 运行期 HTTP 401 报错退出 -> 生成 trajectory.json 且错误信息脱敏
+    state.set_script(vec![MockStep::HttpError {
+        status: 401,
+        retry_after: None,
+        retry_after_ms: None,
+        body: json!({"error":{"message": format!("bad key {secret}"), "type":"authentication_error"}}),
+    }]);
+    let trace_err = tmp.path().join("err_401/trajectory.json");
+    let mut cmd_err = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-out",
+            trace_err.to_str().unwrap(),
+            "fail 401",
+        ],
+    );
+    cmd_err.env("API_KEY", secret);
+    let out_err = run_with_stdin(cmd_err, None).await;
+    assert!(!out_err.status.success());
+    assert!(out_err.stdout.is_empty());
+    let raw_err = std::fs::read_to_string(&trace_err).unwrap();
+    assert!(
+        !raw_err.contains(secret),
+        "secret leaked into trace: {raw_err}"
+    );
+    let export_err: TrajectoryExport = serde_json::from_str(&raw_err).unwrap();
+    assert_eq!(export_err.exit_code, 1);
+    assert_eq!(export_err.termination_reason, "error");
+    assert!(export_err.error.is_some());
+    assert_eq!(export_err.turns.len(), 1);
+
+    // B. --max-steps 1 超步退出 -> 生成 trajectory.json 且保留已执行 tool_call / tool_result
+    state.set_script(vec![
+        MockStep::CompletionsToolCall {
+            id: "call_step1".into(),
+            name: "read".into(),
+            args: json!({"path": "note.txt"}),
+        },
+        MockStep::CompletionsText("SHOULD_NOT_RUN".into()),
+    ]);
+    let trace_steps = tmp.path().join("max_steps/trajectory.json");
+    let mut cmd_steps = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--max-steps",
+            "1",
+            "--trace-out",
+            trace_steps.to_str().unwrap(),
+            "step cap",
+        ],
+    );
+    cmd_steps.env("API_KEY", secret);
+    let out_steps = run_with_stdin(cmd_steps, None).await;
+    assert!(!out_steps.status.success());
+    assert!(out_steps.stdout.is_empty());
+    let export_steps: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_steps).unwrap()).unwrap();
+    assert_eq!(export_steps.exit_code, 1);
+    assert_eq!(export_steps.termination_reason, "max_steps");
+    assert_eq!(export_steps.tool_calls.len(), 1);
+    assert_eq!(export_steps.tool_results.len(), 1);
+    assert_eq!(
+        export_steps.tool_results[0].content_summary,
+        "1\thello trace"
+    );
+
+    // C. --timeout 1 超时退出（第 1 步执行工具调用，第 2 步挂起触发超时）
+    state.set_script(vec![
+        MockStep::CompletionsToolCallWithUsage {
+            content_prefix: None,
+            id: "call_before_timeout".into(),
+            name: "read".into(),
+            args: json!({"path": "note.txt"}),
+            usage: json!({ "prompt_tokens": 42, "completion_tokens": 9 }),
+        },
+        MockStep::HangForever,
+    ]);
+    let trace_timeout = tmp.path().join("timeout/trajectory.json");
+    let mut cmd_timeout = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--timeout",
+            "1",
+            "--trace-out",
+            trace_timeout.to_str().unwrap(),
+            "timeout test",
+        ],
+    );
+    cmd_timeout.env("API_KEY", secret);
+    let out_timeout = run_with_stdin(cmd_timeout, None).await;
+    assert_eq!(out_timeout.status.code(), Some(124));
+    assert!(out_timeout.stdout.is_empty());
+    let export_timeout: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_timeout).unwrap()).unwrap();
+    assert_eq!(export_timeout.exit_code, 124);
+    assert_eq!(export_timeout.termination_reason, "timeout");
+    assert_eq!(export_timeout.tool_calls.len(), 1);
+    assert_eq!(export_timeout.tool_results.len(), 1);
+    assert_eq!(export_timeout.usage.input_tokens, 42);
+    assert_eq!(export_timeout.usage.output_tokens, 9);
+
+    // D. SIGTERM 中断退出（通过 MIZAR_TRACE_OUT 导出）
+    state.set_script(vec![MockStep::HangForever]);
+    let reqs_before = state.requests.lock().unwrap().len();
+    let trace_sig = tmp.path().join("sigterm/trajectory.json");
+    let mut cmd_sig = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "sigterm trace",
+        ],
+    );
+    cmd_sig.env("API_KEY", secret);
+    cmd_sig.env("MIZAR_TRACE_OUT", &trace_sig);
+    let mut t_sig = tokio::process::Command::from(cmd_sig);
+    t_sig
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = t_sig.spawn().unwrap();
+    let pid = child.id().expect("child pid");
+    let wait_start = Instant::now();
+    while state.requests.lock().unwrap().len() == reqs_before {
+        assert!(wait_start.elapsed() < Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out_sig = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!out_sig.status.success());
+    assert!(out_sig.stdout.is_empty());
+    let export_sig: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_sig).unwrap()).unwrap();
+    assert_eq!(export_sig.termination_reason, "cancelled");
+    assert_ne!(export_sig.exit_code, 0);
+
+    // E. 落盘目标为目录导致写入失败时，仅打告警并保持主退出码与 stdout 干净
+    state.set_script(vec![MockStep::CompletionsText(
+        "MAIN_OK_DESPITE_TRACE_ERR".into(),
+    )]);
+    let bad_trace_dir = tmp.path().join("existing_dir");
+    std::fs::create_dir_all(&bad_trace_dir).unwrap();
+    let mut cmd_bad_out = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-out",
+            bad_trace_dir.to_str().unwrap(),
+            "best effort",
+        ],
+    );
+    cmd_bad_out.env("API_KEY", secret);
+    let out_bad = run_with_stdin(cmd_bad_out, None).await;
+    assert!(out_bad.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out_bad.stdout),
+        "MAIN_OK_DESPITE_TRACE_ERR\n"
+    );
+    let err_bad = String::from_utf8_lossy(&out_bad.stderr);
+    assert!(err_bad.contains("[W trace]"), "{err_bad}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_turn0_prompt_wire_format_order_file_mentions_and_trace_out() {
+    let tmp = TempRoot::new("exec_w15_wire");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(home.join(".mizar")).unwrap();
+    std::fs::create_dir_all(ws.join(".mizar")).unwrap();
+    std::fs::create_dir_all(ws.join(".agents/skills/helper")).unwrap();
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "WORKSPACE_RULE_W15").unwrap();
+    std::fs::write(
+        ws.join(".agents/skills/helper/SKILL.md"),
+        "---\nname: helper\ndescription: Helper skill for W1-5\n---\nHELPER_SKILL_BODY",
+    )
+    .unwrap();
+    std::fs::write(ws.join("src/sample.txt"), "SAMPLE_AT_FILE_CONTENT\n").unwrap();
+
+    let state = GatewayState::new(
+        vec![
+            MockStep::ResponsesText("ISO_TURN0_OK".into()),
+            MockStep::ResponsesText("MENTION_TURN1_OK".into()),
+            MockStep::ResponsesText("MENTION_TURN2_OK".into()),
+            MockStep::ResponsesText("DISABLED_MENTION_OK".into()),
+        ],
+        MockStep::ResponsesText("FALLBACK".into()),
+    );
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+
+    // A. --isolated --protocol responses（禁用 workspace AGENTS/skills？测试先在无 skill/无 AGENTS 独立目录验证 0-MCP/0-Skill 7 工具与 ~1.8KB 静态前缀）
+    let iso_ws = tmp.path().join("iso_ws");
+    std::fs::create_dir_all(&iso_ws).unwrap();
+    let trace_iso = tmp.path().join("iso/trajectory.json");
+    let mut cmd_iso = clean_env_cmd(
+        &home,
+        &iso_ws,
+        &[
+            "exec",
+            "--isolated",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "--trace-out",
+            trace_iso.to_str().unwrap(),
+            "inspect iso workspace",
+        ],
+    );
+    cmd_iso.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_iso = run_with_stdin(cmd_iso, None).await;
+    assert!(
+        out_iso.status.success(),
+        "iso stderr: {}",
+        String::from_utf8_lossy(&out_iso.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out_iso.stdout), "ISO_TURN0_OK\n");
+
+    let export_iso: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_iso).unwrap()).unwrap();
+    assert_eq!(export_iso.exit_code, 0);
+    assert_eq!(export_iso.termination_reason, "completed");
+
+    let iso_req = state.requests.lock().unwrap()[0].clone();
+    assert!(iso_req.body.get("instructions").is_none());
+    assert_eq!(iso_req.body["input"][0]["role"], "developer");
+    let dev_prompt = iso_req.body["input"][0]["content"].as_str().unwrap();
+    assert!(
+        (900..=2600).contains(&dev_prompt.len()),
+        "headless developer prompt should be ~1.8KB, got {} bytes:\n{dev_prompt}",
+        dev_prompt.len()
+    );
+    assert!(
+        !dev_prompt
+            .chars()
+            .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+        "developer prompt must be pure English:\n{dev_prompt}"
+    );
+    for expected in [
+        "Respond in the same language as the user unless asked otherwise.",
+        "Engineering principles:",
+        "Available tools:",
+        "Tool usage:",
+        "edits[]",
+        "Runtime context blocks",
+        "<environment_context>",
+        "<mizar-compaction>",
+    ] {
+        assert!(
+            dev_prompt.contains(expected),
+            "missing `{expected}` in:\n{dev_prompt}"
+        );
+    }
+    for forbidden in [
+        "These rules shape replies",
+        "During multi-step work, briefly tell the user what you are doing.",
+        "Subagent delegation",
+        "session-title",
+        "WORKSPACE_RULE_W15",
+    ] {
+        assert!(
+            !dev_prompt.contains(forbidden),
+            "unexpected `{forbidden}` in headless developer prompt:\n{dev_prompt}"
+        );
+    }
+    let mut iso_tools: Vec<String> = iso_req.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    iso_tools.sort();
+    assert_eq!(
+        iso_tools,
+        vec!["bash", "edit", "find", "grep", "read", "recall", "write"]
+    );
+
+    // B. Turn-0 ContextNotice 顺序 + @file 展开 + 跨轮 developer/tools 字节一致 + --trace-out
+    let trace_b = tmp.path().join("mentions/trajectory.json");
+    let mut cmd_b1 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "--trace-out",
+            trace_b.to_str().unwrap(),
+            "Check @src/sample.txt with /helper",
+        ],
+    );
+    cmd_b1.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_b1 = run_with_stdin(cmd_b1, None).await;
+    assert!(
+        out_b1.status.success(),
+        "b1 stderr: {}",
+        String::from_utf8_lossy(&out_b1.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out_b1.stdout),
+        "MENTION_TURN1_OK\n"
+    );
+
+    let export_b: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_b).unwrap()).unwrap();
+    assert_eq!(export_b.exit_code, 0);
+    assert_eq!(export_b.termination_reason, "completed");
+
+    let mut cmd_b2 = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "-c",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "follow up",
+        ],
+    );
+    cmd_b2.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_b2 = run_with_stdin(cmd_b2, None).await;
+    assert!(
+        out_b2.status.success(),
+        "b2 stderr: {}",
+        String::from_utf8_lossy(&out_b2.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out_b2.stdout),
+        "MENTION_TURN2_OK\n"
+    );
+
+    let reqs = state.requests.lock().unwrap().clone();
+    assert!(reqs.len() >= 3);
+    let r_b1 = &reqs[1];
+    let r_b2 = &reqs[2];
+    assert_eq!(
+        r_b1.body["input"][0]["content"], r_b2.body["input"][0]["content"],
+        "developer prefix must stay byte-identical across turns"
+    );
+    assert_eq!(
+        r_b1.body["tools"], r_b2.body["tools"],
+        "tools declaration must stay identical across turns"
+    );
+    let b1_dev = r_b1.body["input"][0]["content"].as_str().unwrap();
+    assert!(!b1_dev.contains("WORKSPACE_RULE_W15"));
+    assert!(!b1_dev.contains("HELPER_SKILL_BODY"));
+    assert!(!b1_dev.contains("SAMPLE_AT_FILE_CONTENT"));
+
+    let b1_input = r_b1.body["input"].as_array().unwrap();
+    assert_eq!(b1_input[0]["role"], "developer");
+    let b1_texts: Vec<String> = b1_input
+        .iter()
+        .skip(1)
+        .map(|item| item["content"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let find_pos = |needle: &str| {
+        b1_texts
+            .iter()
+            .position(|t| t.contains(needle))
+            .map(|idx| idx + 1)
+            .unwrap_or_else(|| panic!("missing `{needle}` in input: {b1_texts:?}"))
+    };
+    let pos_env = find_pos("<environment_context>");
+    let pos_instr = find_pos("WORKSPACE_RULE_W15");
+    let pos_catalog = find_pos("<available_skills>");
+    let pos_skill = find_pos("HELPER_SKILL_BODY");
+    let pos_user = find_pos("Check @src/sample.txt with /helper");
+    let pos_mention = find_pos("SAMPLE_AT_FILE_CONTENT");
+    assert_eq!(pos_env, 1, "input[1] must be <environment_context>");
+    assert!(
+        pos_env < pos_instr
+            && pos_instr < pos_catalog
+            && pos_catalog < pos_skill
+            && pos_skill < pos_user
+            && pos_user < pos_mention,
+        "unexpected Turn-0 input order: env={pos_env}, instr={pos_instr}, catalog={pos_catalog}, skill={pos_skill}, user={pos_user}, mention={pos_mention}, items={b1_texts:?}"
+    );
+
+    // C. disabledPlugins=["file-mentions"] 时应跳过 @path 展开
+    std::fs::write(
+        ws.join(".mizar/settings.json"),
+        r#"{"disabledPlugins":["file-mentions"]}"#,
+    )
+    .unwrap();
+    let mut cmd_c = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--protocol",
+            "responses",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-5",
+            "Check @src/sample.txt disabled",
+        ],
+    );
+    cmd_c.env("OPENAI_API_KEY", "sk-w15-test");
+    let out_c = run_with_stdin(cmd_c, None).await;
+    assert!(
+        out_c.status.success(),
+        "c stderr: {}",
+        String::from_utf8_lossy(&out_c.stderr)
+    );
+    let r_c = state.requests.lock().unwrap().last().unwrap().clone();
+    assert!(
+        !r_c.body.to_string().contains("SAMPLE_AT_FILE_CONTENT"),
+        "disabledPlugins file-mentions should suppress @file expansion: {}",
+        r_c.body
+    );
 }

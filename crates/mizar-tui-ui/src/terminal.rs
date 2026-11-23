@@ -178,37 +178,33 @@ pub fn probe_terminal_colors(timeout: Duration) -> TerminalColors {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 256];
 
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    const POLLIN_EVENT: i16 = 0x0001;
-    unsafe extern "C" {
-        fn poll(
-            fds: *mut PollFd,
-            nfds: std::os::raw::c_uint,
-            timeout: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-        fn read(fd: std::os::raw::c_int, buf: *mut std::os::raw::c_void, count: usize) -> isize;
-    }
-
     while Instant::now() < deadline {
         let rem_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
-            .min(i32::MAX as u128) as i32;
-        let mut pfd = PollFd {
+            .min(i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
             fd,
-            events: POLLIN_EVENT,
+            events: libc::POLLIN,
             revents: 0,
         };
-        let ready = unsafe { poll(&mut pfd, 1, rem_ms) };
-        if ready <= 0 {
+        let ready = unsafe { libc::poll(&mut pfd, 1 as libc::nfds_t, rem_ms) };
+        if ready < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             break;
         }
-        let n = unsafe { read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if ready == 0 {
+            break;
+        }
+        let n = loop {
+            let res = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if res < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break res;
+        };
         if n <= 0 {
             break;
         }

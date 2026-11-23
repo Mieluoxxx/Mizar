@@ -3,17 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
 use futures::Stream;
+use mizar_types::hooks::{BoxFuture, HookGuard, SyncEventBus, WaterfallHook};
 
 use crate::types::{
     FinishReason, GenerateOptions, ModelInfo, ProviderInfo, StreamChunk, TokenUsage,
 };
-use mizar_llm_types::LlmError;
-
-pub const EVENT_ADAPTERS_UPDATED: &str = "llm/adapters-updated";
-pub const EVENT_LLM_STREAM: &str = "llm/stream";
-pub const EVENT_LLM_AFTER_RESPONSE: &str = "llm/after-response";
+use mizar_types::llm::LlmError;
 
 pub type BoxChunkStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send>>;
 
@@ -64,19 +60,47 @@ struct AdapterEntry {
 }
 
 pub struct LlmRuntime {
-    ctx: Context,
     next_id: AtomicU64,
     adapters: Mutex<Vec<AdapterEntry>>,
     default_provider: Mutex<Option<String>>,
+    stream_hook: WaterfallHook<GenerateOptions, BoxChunkStream>,
+    after_response: Arc<SyncEventBus<LlmAfterResponseEvent>>,
+    adapters_updated: SyncEventBus<()>,
 }
 
 impl LlmRuntime {
-    /// 适配器插件调用它注册自己。返回的 `Cleanup` 放入 `ctx.effect` 即可随插件卸载自动注销。
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_id: AtomicU64::new(1),
+            adapters: Mutex::new(Vec::new()),
+            default_provider: Mutex::new(None),
+            stream_hook: WaterfallHook::new(),
+            after_response: Arc::new(SyncEventBus::new()),
+            adapters_updated: SyncEventBus::new(),
+        })
+    }
+
+    pub fn stream_hook(&self) -> &WaterfallHook<GenerateOptions, BoxChunkStream> {
+        &self.stream_hook
+    }
+
+    pub fn on_after_response(
+        &self,
+        cb: impl Fn(&LlmAfterResponseEvent) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.after_response.on(cb)
+    }
+
+    pub fn on_adapters_updated(&self, cb: impl Fn(&()) + Send + Sync + 'static) -> HookGuard {
+        self.adapters_updated.on(cb)
+    }
+
+    /// 注册适配器；返回的 `HookGuard` 在析构时自动注销该适配器。
     pub fn register_adapter(
         self: &Arc<Self>,
         provider: impl Into<String>,
         adapter: Arc<dyn LlmAdapter>,
-    ) -> Result<Cleanup, LlmError> {
+    ) -> Result<HookGuard, LlmError> {
         let provider = provider.into();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
@@ -90,7 +114,7 @@ impl LlmRuntime {
                 adapter,
             });
         }
-        self.ctx.emit(EVENT_ADAPTERS_UPDATED, ());
+        self.adapters_updated.emit(&());
 
         Ok(self.make_unregister_cleanup(id, provider))
     }
@@ -100,7 +124,7 @@ impl LlmRuntime {
         self: &Arc<Self>,
         provider: impl Into<String>,
         adapter: Arc<dyn LlmAdapter>,
-    ) -> Cleanup {
+    ) -> HookGuard {
         let provider = provider.into();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
@@ -116,7 +140,7 @@ impl LlmRuntime {
                 });
             }
         }
-        self.ctx.emit(EVENT_ADAPTERS_UPDATED, ());
+        self.adapters_updated.emit(&());
 
         self.make_unregister_cleanup(id, provider)
     }
@@ -133,12 +157,12 @@ impl LlmRuntime {
             }
         };
         if removed {
-            self.ctx.emit(EVENT_ADAPTERS_UPDATED, ());
+            self.adapters_updated.emit(&());
         }
         removed
     }
 
-    /// 原子同步指定集合的适配器（先移除再原地更新/追加），只触发一次 `EVENT_ADAPTERS_UPDATED`。
+    /// 原子同步指定集合的适配器（先移除再原地更新/追加），只触发一次 `adapters_updated`。
     pub fn sync_adapters(
         self: &Arc<Self>,
         removed: &[String],
@@ -174,7 +198,7 @@ impl LlmRuntime {
             dirty
         };
         if changed {
-            self.ctx.emit(EVENT_ADAPTERS_UPDATED, ());
+            self.adapters_updated.emit(&());
         }
     }
 
@@ -187,9 +211,9 @@ impl LlmRuntime {
         self.default_provider.lock().unwrap().clone()
     }
 
-    fn make_unregister_cleanup(self: &Arc<Self>, id: u64, provider: String) -> Cleanup {
+    fn make_unregister_cleanup(self: &Arc<Self>, id: u64, provider: String) -> HookGuard {
         let runtime = Arc::downgrade(self);
-        Cleanup::sync(move || {
+        HookGuard::new(move || {
             if let Some(rt) = runtime.upgrade() {
                 let removed = {
                     let mut list = rt.adapters.lock().unwrap();
@@ -204,7 +228,7 @@ impl LlmRuntime {
                     }
                 };
                 if removed {
-                    rt.ctx.emit(EVENT_ADAPTERS_UPDATED, ());
+                    rt.adapters_updated.emit(&());
                 }
             }
         })
@@ -279,7 +303,7 @@ impl LlmRuntime {
         Ok(adapter.stream(normalized))
     }
 
-    /// 流式调用。先经适配器幂等规整并冻结快照，再走 `waterfall("llm/stream")` 并在流正常收尾时发出 `llm/after-response`。
+    /// 流式调用。先经适配器幂等规整并冻结快照，再走 `stream_hook` 并在流正常收尾时发出 `after_response`。
     pub fn stream(&self, options: GenerateOptions) -> Result<BoxChunkStream, LlmError> {
         let (resolved_provider, adapter) = self
             .resolve_adapter_entry(options.provider.as_deref())
@@ -289,14 +313,12 @@ impl LlmRuntime {
         let snapshot = Arc::new(normalized.clone());
         let inner_adapter = Arc::clone(&adapter);
         let stream = self
-            .ctx
-            .waterfall(EVENT_LLM_STREAM, normalized, move |opts| {
-                inner_adapter.stream(opts)
-            });
+            .stream_hook
+            .call(normalized, move |opts| inner_adapter.stream(opts));
 
         Ok(Box::pin(AfterResponseStream {
             inner: stream,
-            ctx: self.ctx.clone(),
+            after_response: Arc::clone(&self.after_response),
             snapshot,
             provider: resolved_provider,
             latest_usage: None,
@@ -308,7 +330,7 @@ impl LlmRuntime {
 
 struct AfterResponseStream {
     inner: BoxChunkStream,
-    ctx: Context,
+    after_response: Arc<SyncEventBus<LlmAfterResponseEvent>>,
     snapshot: Arc<GenerateOptions>,
     provider: String,
     latest_usage: Option<TokenUsage>,
@@ -346,16 +368,13 @@ impl Stream for AfterResponseStream {
                             .clone()
                             .or_else(|| replay.as_ref().map(|r| r.model.clone()))
                             .unwrap_or_default();
-                        self.ctx.emit(
-                            EVENT_LLM_AFTER_RESPONSE,
-                            LlmAfterResponseEvent {
-                                request: Arc::clone(&self.snapshot),
-                                provider,
-                                model,
-                                finish_reason: reason.clone(),
-                                usage: self.latest_usage,
-                            },
-                        );
+                        self.after_response.emit(&LlmAfterResponseEvent {
+                            request: Arc::clone(&self.snapshot),
+                            provider,
+                            model,
+                            finish_reason: reason.clone(),
+                            usage: self.latest_usage,
+                        });
                     }
                 }
                 Err(_) => {
@@ -368,44 +387,12 @@ impl Stream for AfterResponseStream {
     }
 }
 
-impl Service for LlmRuntime {
-    type Config = ();
-
-    fn service_name() -> &'static str {
-        "llm"
-    }
-
-    fn plugin_name() -> &'static str {
-        "LlmRuntime"
-    }
-
-    fn create(ctx: &Context, _config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            next_id: AtomicU64::new(1),
-            adapters: Mutex::new(Vec::new()),
-            default_provider: Mutex::new(None),
-        }))
-    }
-}
-
-/// 为 `cordis::Context` 补充 `ctx.llm()` 扩展方法（对应 TS `declare module`）。
-pub trait LlmContextExt {
-    fn llm(&self) -> Result<Arc<LlmRuntime>, CordisError>;
-}
-
-impl LlmContextExt for Context {
-    fn llm(&self) -> Result<Arc<LlmRuntime>, CordisError> {
-        self.service::<LlmRuntime>("llm")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Message, RequestOrigin};
-    use cordis::Next;
     use futures::{StreamExt, executor::block_on, stream};
+    use mizar_types::hooks::Next;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
@@ -486,7 +473,7 @@ mod tests {
                 ],
                 FakeOutcome::ErrorChunk => vec![Ok(StreamChunk::Finish {
                     reason: FinishReason::Error {
-                        code: mizar_llm_types::LlmErrorCode::Server,
+                        code: mizar_types::llm::LlmErrorCode::Server,
                         message: "bad".into(),
                         status: Some(500),
                         retry_after_ms: None,
@@ -515,8 +502,7 @@ mod tests {
     #[test]
     fn stream_normalizes_before_snapshot_and_emits_after_response_once() {
         block_on(async {
-            let app = Context::new();
-            let llm = LlmRuntime::create(&app, ()).unwrap();
+            let llm = LlmRuntime::new();
 
             let adapter = Arc::new(FakeAdapter::new(
                 Some("norm-model"),
@@ -536,24 +522,18 @@ mod tests {
 
             let waterfall_seen_model = Arc::new(Mutex::new(None::<Option<String>>));
             let wf_cap = Arc::clone(&waterfall_seen_model);
-            app.on_waterfall(
-                EVENT_LLM_STREAM,
+            let _wf_guard = llm.stream_hook().register(
                 move |opts: GenerateOptions, next: Next<GenerateOptions, BoxChunkStream>| {
                     *wf_cap.lock().unwrap() = Some(opts.model.clone());
                     next.call(opts)
                 },
-            )
-            .unwrap();
+            );
 
             let events = Arc::new(Mutex::new(Vec::<LlmAfterResponseEvent>::new()));
             let ev_cap = Arc::clone(&events);
-            app.on(
-                EVENT_LLM_AFTER_RESPONSE,
-                move |ev: &LlmAfterResponseEvent| {
-                    ev_cap.lock().unwrap().push(ev.clone());
-                },
-            )
-            .unwrap();
+            let _ev_guard = llm.on_after_response(move |ev: &LlmAfterResponseEvent| {
+                ev_cap.lock().unwrap().push(ev.clone());
+            });
 
             let mut s = llm
                 .stream(GenerateOptions {
@@ -593,8 +573,7 @@ mod tests {
     #[test]
     fn after_response_skips_errors_aborts_cancel_stream_direct_and_duplicates() {
         block_on(async {
-            let app = Context::new();
-            let llm = LlmRuntime::create(&app, ()).unwrap();
+            let llm = LlmRuntime::new();
 
             let adapter = Arc::new(FakeAdapter::new(
                 Some("m-edge"),
@@ -619,13 +598,9 @@ mod tests {
 
             let events = Arc::new(Mutex::new(Vec::<LlmAfterResponseEvent>::new()));
             let ev_cap = Arc::clone(&events);
-            app.on(
-                EVENT_LLM_AFTER_RESPONSE,
-                move |ev: &LlmAfterResponseEvent| {
-                    ev_cap.lock().unwrap().push(ev.clone());
-                },
-            )
-            .unwrap();
+            let _ev_guard = llm.on_after_response(move |ev: &LlmAfterResponseEvent| {
+                ev_cap.lock().unwrap().push(ev.clone());
+            });
 
             // 1. Err(_) 后即使出现 Finish 也不发出
             let mut s1 = llm.stream(GenerateOptions::default()).unwrap();
@@ -673,8 +648,7 @@ mod tests {
     #[test]
     fn retry_via_stream_direct_emits_after_response_once_on_final_success() {
         block_on(async {
-            let app = Context::new();
-            let llm = LlmRuntime::create(&app, ()).unwrap();
+            let llm = LlmRuntime::new();
 
             let adapter = Arc::new(FakeAdapter::new(
                 Some("m-retry"),
@@ -695,8 +669,7 @@ mod tests {
                 .unwrap();
 
             let llm_for_retry = Arc::clone(&llm);
-            app.on_waterfall(
-                EVENT_LLM_STREAM,
+            let _wf_guard = llm.stream_hook().register(
                 move |opts: GenerateOptions, next: Next<GenerateOptions, BoxChunkStream>| {
                     let first = next.call(opts.clone());
                     let llm_inner = Arc::clone(&llm_for_retry);
@@ -715,18 +688,13 @@ mod tests {
                     .flat_map(stream::iter)
                     .boxed()
                 },
-            )
-            .unwrap();
+            );
 
             let events = Arc::new(Mutex::new(Vec::<LlmAfterResponseEvent>::new()));
             let ev_cap = Arc::clone(&events);
-            app.on(
-                EVENT_LLM_AFTER_RESPONSE,
-                move |ev: &LlmAfterResponseEvent| {
-                    ev_cap.lock().unwrap().push(ev.clone());
-                },
-            )
-            .unwrap();
+            let _ev_guard = llm.on_after_response(move |ev: &LlmAfterResponseEvent| {
+                ev_cap.lock().unwrap().push(ev.clone());
+            });
 
             let mut s = llm.stream(GenerateOptions::default()).unwrap();
             while let Some(item) = s.next().await {

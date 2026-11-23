@@ -3,10 +3,8 @@
 
 use std::sync::Arc;
 
-use cordis::{Context, Service};
 use mizar_mcp::{McpExposure, McpManager, McpPluginConfig, McpServerConfig};
-use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
-use mizar_tools::{ToolExecution, ToolRuntime, ToolsContextExt};
+use mizar_tools::{ToolExecution, ToolRuntime};
 use serde_json::json;
 
 const MOCK_MCP_SERVER_PY: &str = r#"
@@ -123,17 +121,9 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     cfg.background_connect = false;
     cfg.servers.insert("fff".into(), fff_cfg);
 
-    let app = Context::new();
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    app.plugin(McpManager::plugin(), cfg).await.unwrap();
-
-    let mgr: Arc<McpManager> = app.get("mcp").unwrap();
+    let tools = ToolRuntime::new();
+    let mgr = McpManager::start(Arc::clone(&tools), cfg).await;
     mgr.wait_ready().await;
-
-    let tools = app.tools().unwrap();
     let declared = tools.list_declared(Some("s1"));
     let declared_names: Vec<&str> = declared.iter().map(|t| t.name.as_str()).collect();
 
@@ -212,19 +202,21 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     assert!(!read_res.is_error, "{}", read_res.content);
     assert!(read_res.content.contains("indexed=42 files"));
 
-    // 存在 codemode 暴露的工具时，SystemPrompt 应生成 mcp_servers 提示段落
-    let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap().build();
+    // render_servers_section 辅助方法本身仍可按需渲染 MCP server 摘要
+    let section = mgr
+        .render_servers_section()
+        .expect("render_servers_section should summarize codemode servers");
     assert!(
-        prompt.contains("Call the tools of `codemode` servers from codemode scripts."),
-        "prompt:\n{prompt}"
+        section.contains("Call the tools of `codemode` servers from codemode scripts."),
+        "section:\n{section}"
     );
     assert!(
-        prompt.contains("mcp__fff (codemode): Indexed repo search server"),
-        "prompt:\n{prompt}"
+        section.contains("mcp__fff (codemode): Indexed repo search server"),
+        "section:\n{section}"
     );
 
+    mgr.close_all().await;
     let _ = std::fs::remove_dir_all(&dir);
-    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -277,13 +269,9 @@ async fn skip_global_config_ignores_global_mcp_but_loads_project_mcp() {
     )
     .unwrap();
 
-    let app = Context::new();
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    app.plugin(
-        McpManager::plugin(),
+    let tools = ToolRuntime::new();
+    let mcp = McpManager::start(
+        Arc::clone(&tools),
         McpPluginConfig {
             workspace: workspace.clone(),
             global_config_dir: Some(global_dir.clone()),
@@ -293,15 +281,7 @@ async fn skip_global_config_ignores_global_mcp_but_loads_project_mcp() {
             background_connect: false,
         },
     )
-    .await
-    .unwrap();
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
-
-    let mcp = app.service::<McpManager>("mcp").unwrap();
+    .await;
     mcp.wait_ready().await;
 
     let statuses = mcp.statuses();
@@ -318,7 +298,6 @@ async fn skip_global_config_ignores_global_mcp_but_loads_project_mcp() {
         "global MCP server process must never be spawned"
     );
 
-    let tools = app.tools().unwrap();
     let names: Vec<String> = tools
         .list_callable(None)
         .into_iter()
@@ -327,6 +306,6 @@ async fn skip_global_config_ignores_global_mcp_but_loads_project_mcp() {
     assert!(names.contains(&"mcp__proj_srv__grep".to_string()));
     assert!(!names.iter().any(|n| n.contains("global_srv")));
 
-    app.fiber().dispose().await;
+    mcp.close_all().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,6 +1,8 @@
 //! 会话事件日志的数据模型、头信息与可见性定义。
 
-use mizar_llm::{ContentBlock, ImageAttachment, ReasoningEffort, ReplayEnvelope, TokenUsage};
+use mizar_types::llm::{
+    ContentBlock, ImageAttachment, ReasoningEffort, ReplayEnvelope, TokenUsage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -147,15 +149,6 @@ impl CompactionDigest {
     }
 }
 
-/// 投影层工具结果剪枝项：不修改原始 `ToolResult`，仅在构造模型消息时替换为紧凑预览与 recall 句柄。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PrunedToolResult {
-    pub target_seq: u64,
-    pub replacement: String,
-    pub original_chars: usize,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum SessionEvent {
@@ -195,9 +188,6 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "CompactionDigest::is_empty")]
         digest: CompactionDigest,
     },
-    /// 零模型投影层批量剪枝记录（`EntryVisibility::LogOnly`）：
-    /// 一次性锁存较早 `ToolResult` 的紧凑预览，原文仍完整保留在日志中供 `recall` 查阅。
-    ToolResultPrune { pruned: Vec<PrunedToolResult> },
     /// 本地执行的 Shell 命令（`!` 载入上下文 / `!!` 仅本地审计不载入上下文）。
     BashExecution {
         command: String,
@@ -296,10 +286,9 @@ impl SessionEvent {
 
     pub fn visibility(&self) -> EntryVisibility {
         match self {
-            Self::Trace { .. }
-            | Self::ToolResultPrune { .. }
-            | Self::Selection { .. }
-            | Self::Usage { .. } => EntryVisibility::LogOnly,
+            Self::Trace { .. } | Self::Selection { .. } | Self::Usage { .. } => {
+                EntryVisibility::LogOnly
+            }
             Self::BashExecution {
                 exclude_from_context,
                 ..
@@ -345,7 +334,6 @@ impl SessionEvent {
             Self::Assistant { .. } => "assistant",
             Self::ToolResult { .. } => "tool-result",
             Self::Compaction { .. } => "compaction",
-            Self::ToolResultPrune { .. } => "tool-result-prune",
             Self::BashExecution { .. } => "bash-execution",
             Self::Trace { detail } => detail.kind_name(),
             Self::Selection { .. } => "selection",

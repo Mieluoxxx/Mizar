@@ -71,9 +71,31 @@ mizar --no-persist --no-instructions
 | `--help` | `-h` | 打印命令行参数帮助并退出 |
 | `--version` | `-V` | 打印当前版本号并退出 |
 
+## 无头单次执行（`mizar exec`）与结构化轨迹
+
+在 CI、自动化脚本或批量评测场景中，可使用 `mizar exec`（或在根命令使用 `-p` / `--prompt-file`）非交互执行单次任务并导出结构化执行轨迹：
+
+```bash title="无头执行、隔离环境与轨迹导出"
+# 隔离模式运行单次任务（跳过个人 ~/.mizar / ~/.agents 配置、MCP、Skills 与全局历史库）
+mizar exec --isolated -C /path/to/repo --output-format json --trace-out /tmp/trace.json "修复单测并汇报结果"
+
+# 从标准输入读取任务文本
+echo "Summarize README.md" | mizar exec --read-only
+```
+
+| 参数 | 作用 |
+| :--- | :--- |
+| `mizar exec [<prompt>]` | 进入非交互无头单次执行模式（无显式 prompt 且非 TTY 时读取 stdin 至 EOF） |
+| `-p, --prompt <TEXT>` / `--prompt-file <PATH>` | 直接传入任务文本或从文件读取（可用于根命令或 `exec`） |
+| `--isolated` | 隔离模式，跳过 `~/.mizar`、`~/.agents`、MCP、Skills、全局指令与全局 SQLite |
+| `--provider <ID>` / `--model <ID>` / `--protocol <API>` / `--base-url <URL>` | 临时覆盖模型提供方、ID、协议（`completions` / `responses` / `messages`）与基址 |
+| `--reasoning-effort <LVL>` / `--max-steps <N>` / `--max-tokens <N>` / `--timeout <SECS>` | 调整思考档位、单轮最大工具步数、单次最大输出 Token 与总超时 |
+| `--output-format <FMT>` / `--json` | 输出格式（`text` 或结构化 `json`） |
+| `--trace-out <PATH>` | 退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先） |
+
 ## 检查与原地更新
 
-Mizar 启动后会在后台静默检查是否有新版本（可用 `MIZAR_SKIP_VERSION_CHECK=1` 或 `MIZAR_OFFLINE=1` 关闭），发现更新时会在界面提示；退出后执行一条命令即可完成 SHA256 校验与原地更新：
+正式安装包启动后会在后台静默检查是否有新版本（开发构建 `/target/`、Homebrew 安装目录或设置 `MIZAR_SKIP_VERSION_CHECK=1` / `MIZAR_OFFLINE=1` 时自动跳过），发现更新时会在界面提示；退出后执行一条命令即可完成 SHA256 校验与原地更新：
 
 ```bash
 # 检查并更新到最新正式 Release
@@ -83,7 +105,7 @@ mizar update
 mizar update --check
 
 # 指定版本安装（例如预发布版本）
-mizar update --version v0.1.1
+mizar update --version v0.2.0
 ```
 
 <Callout type="tip">

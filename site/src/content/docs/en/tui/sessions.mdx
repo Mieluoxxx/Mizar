@@ -35,11 +35,11 @@ Run `/tree` in the input box:
 
 ## Context Compaction (`/compact`) & FTS5 Episodic Recall
 
-When long sessions approach the context budget, `mizar-compaction`, `mizar-session-sqlite`, and `mizar-recall` work together to reclaim window headroom without discarding historical details:
+When long sessions approach the context budget, `mizar-core` (`compaction`) and `mizar-session` (`sqlite` + `recall`) work together to reclaim window headroom without discarding historical details:
 
-- **Progressive compaction & manual `/compact [focus]`**: Before each step, L1 prunes oversized prior tool outputs without calling an LLM (retaining head/tail excerpts and a recall handle). If pressure remains above threshold (or you run `/compact keep refactor decisions`), L2 builds a deterministic `<mizar-digest>` plus a checkpoint summary using prefix-cache-friendly tail instructions, with automatic overflow and consecutive truncation recovery.
-- **Post-compaction tool guards**: After compaction, stale whole-file `write` calls on existing unread files are blocked (while targeted `edit` patches remain allowed), and duplicate `read` ranges within the same epoch are deduplicated.
-- **Lossless FTS5 episodic recall**: The WAL SQLite store maintains a contentless FTS5 `1..=3` Unicode n-gram index (with automatic in-memory fallback when persistence is disabled). Once the first prune/compaction happens or when running in a `/tree` fork lineage, `recall_search` and `recall_read` activate automatically so the model can search and read verbatim history across compaction boundaries.
+- **Single-stage checkpoint compaction & manual `/compact [focus]`**: Triggered at `80%` of the real usable window (`context_window - reserved_output`, or manually via `/compact keep refactor decisions`), building a deterministic `<mizar-digest>` plus checkpoint summary with automatic `retain=0` overflow recovery.
+- **Post-compaction tool guards**: After compaction, stale whole-file `write` calls on unread existing files (>50 lines) are blocked (while new files, small files, and targeted `edit` patches remain allowed), and duplicate `read` ranges within the same epoch are deduplicated.
+- **Lossless FTS5 episodic recall**: The WAL SQLite store maintains a contentless FTS5 `1..=3` Unicode n-gram index (with automatic in-memory fallback when persistence is disabled). The static `Direct` single `recall` tool (`search` / `read`) keeps the declared tool catalog frozen for Prompt Cache stability while searching verbatim history across compaction and `/tree` fork boundaries.
 
 ## Pinpointing Slowdowns With `/trace` (<kbd>Ctrl</kbd>+<kbd>T</kbd>)
 

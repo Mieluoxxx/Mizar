@@ -9,9 +9,8 @@ description = "基于 QuickJS (rquickjs) 沙箱的多工具 JS 编排执行引�
 workspace = true
 
 [dependencies]
-cordis = { workspace = true }
-mizar-tool-search = { workspace = true }
 mizar-tools = { workspace = true }
+mizar-types = { workspace = true }
 rquickjs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

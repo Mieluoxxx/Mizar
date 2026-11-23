@@ -4,23 +4,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub use mizar_client_core::tool_format::{
+pub use mizar_types::client::tool_format::{
     abbreviate_home_path, abbreviate_home_with, bash_inline_meta, bash_scope_label,
     clean_bash_output_lines, count_diff_stats, extract_inline_meta, format_bash_display,
     format_diff_stat, format_expanded_tool_args, format_tokens, is_path_arg_tool,
     is_read_only_compact_tool, short_id, single_line_text, summarize_live_preview,
     summarize_tool_args, summarize_tool_result, truncate_display,
 };
-pub use mizar_client_core::{
+pub use mizar_types::client::{
     ActivityState, ApprovalMode, BashInputMode, LocalBashOutput, NoticeLevel, PromptQueue,
     QueuedPrompt, SessionReplayItem, SessionSelection, SessionViewData, ToolExtraMeta, ToolState,
     UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
 };
-use mizar_llm_types::{
+use mizar_types::llm::{
     ContentBlock, ImageAttachment, MAX_IMAGES_PER_MESSAGE, ModelInfo, ProviderInfo,
     ReasoningEffort, TokenUsage,
 };
-use mizar_trajectory_core::{TimelineMode, TrajectoryReport};
+use mizar_types::trajectory::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::Value;
@@ -49,7 +49,7 @@ pub(crate) use cache::StreamingMarkdownPrefixCache;
 pub use cache::{CachedItemLines, ItemRenderKey, MAX_CACHED_RENDER_ITEMS, TranscriptRenderCache};
 
 /// 由后端异步事件与终端外部状态投递给 UI 主循环的消息。
-pub type UiEvent = mizar_client_core::ClientEvent;
+pub type UiEvent = mizar_types::client::ClientEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatItem {
@@ -175,10 +175,10 @@ pub struct AppState {
     pub always_allowed_tools: HashSet<String>,
 
     // 滚动与虚拟化状态
-    pub scroll_from_top: u16,
+    pub scroll_from_top: usize,
     pub auto_scroll: bool,
     pub last_viewport_height: u16,
-    pub last_total_lines: u16,
+    pub last_total_lines: usize,
 
     // 用量与性能仪表
     pub total_usage: TokenUsage,
@@ -237,8 +237,6 @@ pub struct AppState {
     pub last_step_outcome: Option<(usize, UiStepOutcome)>,
     /// 最近一次上报的终端 ProgramStatus，用于测试直接断言非 Completed 终态不产生 Done。
     pub last_program_status: Option<(ProgramStatusState, Option<String>)>,
-    /// 最近一条连续 Prompt Cache 保活通知的 `(item_idx, fold_count)`，用于折叠防刷屏。
-    last_cache_warming_notice: Option<(usize, usize)>,
     /// 当前活跃会话正在后台运行的 Subagent 数量。
     pub running_subagents: usize,
 }
@@ -326,7 +324,6 @@ impl AppState {
             last_turn_end_reason: None,
             last_step_outcome: None,
             last_program_status: None,
-            last_cache_warming_notice: None,
             running_subagents: 0,
         }
     }
@@ -623,6 +620,7 @@ impl AppState {
         let idx = self.items.len() - 1;
         self.item_cache
             .invalidate_tool_neighborhood(&self.items, idx);
+        self.enforce_tool_extras_budget();
         self.scroll_to_bottom();
     }
 
@@ -713,32 +711,6 @@ impl AppState {
             level,
             text: text.into(),
         });
-        self.last_cache_warming_notice = None;
-        self.close_streaming_assistant();
-    }
-
-    /// 写入 Prompt Cache 保活通知；若末尾紧邻同源通知且尚未在 Inline 模式落屏，则原地折叠更新计数。
-    pub fn push_cache_warming_notice(&mut self, text: impl Into<String>) {
-        let text = text.into();
-        if let Some((idx, count)) = self.last_cache_warming_notice
-            && idx + 1 == self.items.len()
-            && idx >= self.inline_committed_items
-            && let Some(ChatItem::Notice {
-                text: slot_text, ..
-            }) = self.items.get_mut(idx)
-        {
-            let next_count = count + 1;
-            *slot_text = format!("{text}（已连续折叠 ×{next_count}）");
-            self.item_cache.invalidate_item(idx);
-            self.last_cache_warming_notice = Some((idx, next_count));
-            return;
-        }
-        let idx = self.items.len();
-        self.items.push(ChatItem::Notice {
-            level: NoticeLevel::Info,
-            text,
-        });
-        self.last_cache_warming_notice = Some((idx, 1));
         self.close_streaming_assistant();
     }
 
@@ -798,15 +770,67 @@ impl AppState {
         next
     }
 
-    fn page_step(&self) -> u16 {
-        self.last_viewport_height.saturating_sub(2).max(3)
+    /// 限制 `tool_extras` 历史大字段（`full_content`/`diff_raw`/`full_args`）内存占用，保留最近 64 次调用完整明细。
+    pub fn enforce_tool_extras_budget(&mut self) {
+        const KEEP_RECENT_TOOL_EXTRAS: usize = 64;
+        const MAX_TOOL_EXTRAS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+        if self.tool_extras.len() <= KEEP_RECENT_TOOL_EXTRAS {
+            return;
+        }
+        let mut total_bytes: usize = self
+            .tool_extras
+            .values()
+            .map(|e| {
+                e.full_content.len()
+                    + e.diff_raw.as_ref().map_or(0, String::len)
+                    + e.full_args.len()
+            })
+            .sum();
+        if total_bytes <= MAX_TOOL_EXTRAS_TOTAL_BYTES {
+            return;
+        }
+
+        let tool_count = self
+            .items
+            .iter()
+            .filter(|it| matches!(it, ChatItem::ToolCall { .. }))
+            .count();
+        let trim_limit = tool_count.saturating_sub(KEEP_RECENT_TOOL_EXTRAS);
+        let mut seen_tools = 0usize;
+        for (idx, item) in self.items.iter().enumerate() {
+            if seen_tools >= trim_limit || total_bytes <= MAX_TOOL_EXTRAS_TOTAL_BYTES {
+                break;
+            }
+            if let ChatItem::ToolCall { id, .. } = item {
+                seen_tools += 1;
+                if let Some(ext) = self.tool_extras.get_mut(id) {
+                    let freed = ext.full_content.len()
+                        + ext.diff_raw.as_ref().map_or(0, String::len)
+                        + ext.full_args.len();
+                    if freed > 0 {
+                        ext.full_content = String::new();
+                        ext.diff_raw = None;
+                        ext.full_args = String::new();
+                        total_bytes = total_bytes.saturating_sub(freed);
+                        self.item_cache.invalidate_item(idx);
+                    }
+                }
+            }
+        }
     }
 
-    pub fn scroll_up(&mut self, lines: u16) {
+    fn page_step(&self) -> usize {
+        (self.last_viewport_height as usize)
+            .saturating_sub(2)
+            .max(3)
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
         self.selection.clear();
         let max_scroll = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height);
+            .saturating_sub(self.last_viewport_height as usize);
         if max_scroll == 0 {
             self.auto_scroll = true;
             self.scroll_from_top = 0;
@@ -821,11 +845,11 @@ impl AppState {
         self.scroll_from_top = cur.saturating_sub(lines);
     }
 
-    pub fn scroll_down(&mut self, lines: u16) {
+    pub fn scroll_down(&mut self, lines: usize) {
         self.selection.clear();
         let max_scroll = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height);
+            .saturating_sub(self.last_viewport_height as usize);
         let next = self.scroll_from_top.saturating_add(lines);
         if next >= max_scroll {
             self.auto_scroll = true;
@@ -840,13 +864,13 @@ impl AppState {
         self.auto_scroll = true;
         self.scroll_from_top = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height);
+            .saturating_sub(self.last_viewport_height as usize);
     }
 
-    pub fn effective_scroll(&mut self, viewport_height: u16, total_lines: u16) -> u16 {
+    pub fn effective_scroll(&mut self, viewport_height: u16, total_lines: usize) -> usize {
         self.last_viewport_height = viewport_height;
         self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(viewport_height);
+        let max_scroll = total_lines.saturating_sub(viewport_height as usize);
         if self.auto_scroll {
             self.scroll_from_top = max_scroll;
         } else if max_scroll == 0 {
@@ -892,7 +916,6 @@ impl AppState {
         self.last_turn_end_reason = None;
         self.last_step_outcome = None;
         self.last_program_status = None;
-        self.last_cache_warming_notice = None;
         self.running_subagents = 0;
         self.refresh_context_breakdown();
         self.push_notice(
@@ -1037,6 +1060,7 @@ impl AppState {
             }
         }
         self.push_notice(NoticeLevel::Info, view.finish_notice);
+        self.enforce_tool_extras_budget();
         self.refresh_context_breakdown();
         self.scroll_to_bottom();
     }
@@ -1248,7 +1272,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use mizar_llm_types::{ModelInfo, ToolCall};
+    use mizar_types::llm::{ModelInfo, ToolCall};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1882,7 +1906,6 @@ mod tests {
             outcome: "compacted".into(),
             tokens_before: Some(12_000),
             tokens_after: Some(2_400),
-            pruned_count: 2,
             first_kept_seq: Some(10),
             summary_preview: Some("已完成核心重构".into()),
             message: None,
@@ -2427,7 +2450,6 @@ mod tests {
             outcome: "compacted".into(),
             tokens_before: Some(12_000),
             tokens_after: Some(2_400),
-            pruned_count: 0,
             first_kept_seq: Some(2),
             summary_preview: None,
             message: None,
@@ -2581,7 +2603,6 @@ mod tests {
             outcome: "compacted".into(),
             tokens_before: Some(10_000),
             tokens_after: Some(3_000),
-            pruned_count: 1,
             first_kept_seq: Some(4),
             summary_preview: None,
             message: None,
@@ -2693,6 +2714,19 @@ mod tests {
             !app.auto_scroll,
             "shrink while scrollable must preserve lock"
         );
+
+        // 超过 u16::MAX (65,535) 行的长会话滚动不得截断或卡死
+        app.scroll_to_bottom();
+        assert_eq!(app.effective_scroll(30, 100_000), 99_970);
+        app.scroll_up(500);
+        assert!(!app.auto_scroll);
+        assert_eq!(app.scroll_from_top, 99_470);
+        assert!(app.scroll_from_top > u16::MAX as usize);
+        app.scroll_down(200);
+        assert_eq!(app.scroll_from_top, 99_670);
+        app.scroll_to_bottom();
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_from_top, 99_970);
 
         app.restore_session_view(SessionViewData {
             session_id: "s-restored".into(),
@@ -2812,51 +2846,6 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(!app.selection.is_active());
-    }
-
-    #[test]
-    fn consecutive_cache_warming_notices_fold_cleanly_until_interrupted() {
-        let mut app = AppState::new(
-            PathBuf::from("/tmp"),
-            "sess-cw-fold",
-            Vec::new(),
-            None,
-            None,
-            None,
-        );
-
-        app.apply_ui_event(UiEvent::CacheWarmingNotice {
-            text: "已保活 Prompt Cache #1".into(),
-        });
-        app.apply_ui_event(UiEvent::CacheWarmingNotice {
-            text: "已保活 Prompt Cache #2".into(),
-        });
-        app.apply_ui_event(UiEvent::CacheWarmingNotice {
-            text: "已保活 Prompt Cache #3".into(),
-        });
-
-        assert_eq!(app.items.len(), 1);
-        match &app.items[0] {
-            ChatItem::Notice { level, text } => {
-                assert_eq!(*level, NoticeLevel::Info);
-                assert!(text.contains("已保活 Prompt Cache #3"), "{text}");
-                assert!(text.contains("×3"), "{text}");
-            }
-            other => panic!("expected Notice, got: {other:?}"),
-        }
-
-        // 中间插入普通用户消息后，下一条保活通知应新开条目而不是覆盖旧消息
-        app.items.push(ChatItem::User {
-            text: "继续".into(),
-        });
-        app.apply_ui_event(UiEvent::CacheWarmingNotice {
-            text: "已保活 Prompt Cache #4".into(),
-        });
-        assert_eq!(app.items.len(), 3);
-        assert!(matches!(
-            &app.items[2],
-            ChatItem::Notice { text, .. } if text == "已保活 Prompt Cache #4"
-        ));
     }
 
     #[test]

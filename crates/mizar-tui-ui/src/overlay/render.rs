@@ -299,13 +299,13 @@ pub fn render_overlay(
                 .iter()
                 .map(|e| {
                     let desc = match e {
-                        mizar_llm_types::ReasoningEffort::Off => "关闭显式思考",
-                        mizar_llm_types::ReasoningEffort::Minimal => "极少推理 token",
-                        mizar_llm_types::ReasoningEffort::Low => "轻量快速推理",
-                        mizar_llm_types::ReasoningEffort::Medium => "均衡模式",
-                        mizar_llm_types::ReasoningEffort::High => "深度推理",
-                        mizar_llm_types::ReasoningEffort::XHigh => "超长推理预算",
-                        mizar_llm_types::ReasoningEffort::Max => "最大推理深度",
+                        mizar_types::llm::ReasoningEffort::Off => "关闭显式思考",
+                        mizar_types::llm::ReasoningEffort::Minimal => "极少推理 token",
+                        mizar_types::llm::ReasoningEffort::Low => "轻量快速推理",
+                        mizar_types::llm::ReasoningEffort::Medium => "均衡模式",
+                        mizar_types::llm::ReasoningEffort::High => "深度推理",
+                        mizar_types::llm::ReasoningEffort::XHigh => "超长推理预算",
+                        mizar_types::llm::ReasoningEffort::Max => "最大推理深度",
                     };
                     (format!("{e:?}").to_lowercase(), desc.to_string())
                 })

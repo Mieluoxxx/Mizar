@@ -1,0 +1,81 @@
+---
+title: MizarRuntime, Typed Hooks & Adding Tools
+description: Wire capabilities via the static MizarRuntime::build composition root and mizar-types::hooks—RAII HookGuard cleanup, 5 ToolExposure levels, typed hooks, and registering new tools.
+group: dev-arch
+order: 19
+---
+
+import Callout from '../../../../components/mdx/Callout.astro';
+
+As of v0.3, Mizar has exited its dynamic microkernel and wires subsystems explicitly through the **static `MizarRuntime::build` composition root** in `crates/mizar-core/src/spine.rs`, using strongly typed hooks and `#[must_use]` `HookGuard` handles from `crates/mizar-types/src/hooks.rs`.
+
+## Static Composition Root & `HookGuard` LIFO Invariants
+
+`MizarRuntime::build(config)` constructs and passes shared `Arc<T>` services in a compile-time DAG order:
+
+```text
+LlmRuntime → SqliteSessionPersistence / SessionStore → ToolRuntime → SystemPrompt → AgentLoop → Coding Tools / Extensions / SpinePlugins
+```
+
+All runtime services live directly on `MizarRuntime`, so missing dependencies fail at compile time instead of vanishing silently at runtime. Built-in optional modules are toggled atomically via `SpinePlugins` (`AtomicBool` gates plus `ToolRuntime` group masking; only heavyweight external `mcp` processes defer initialization until first enable when disabled at startup).
+
+- **Side effects return `#[must_use] HookGuard`**: `ToolRuntime::register`, `SystemPrompt::section`, `SyncEventBus::on`, `WaterfallHook::register*`, `SerialHook::register*`, and all `install_*` entry points return a `HookGuard`.
+- **LIFO teardown**: Always bind the returned guard, store it in host state, or pass it to `runtime.push_guard(guard)`—`MizarRuntime::shutdown()` (and `Drop`) unregisters every managed guard in **reverse registration (LIFO) order**.
+
+<Callout type="warning" title="Dropping a #[must_use] HookGuard unregisters immediately">
+  <code>HookGuard</code> is functional RAII state rather than a lint marker—writing <code>let _ = tools.register(...)</code> drops the guard at the semicolon and immediately removes the tool or hook. Store the <code>HookGuard</code> or hand it to <code>runtime.push_guard(guard)</code>.
+</Callout>
+
+## Minimal Tool Registration Example
+
+Register a synchronous or async tool directly on `Arc<ToolRuntime>` and keep the returned `HookGuard`:
+
+```rust title="crates/mizar-tools/src/..."
+use std::sync::Arc;
+use mizar_tools::{ToolDefinition, ToolError, ToolExposure, ToolRuntime};
+use mizar_types::hooks::{BoxError, HookGuard};
+use serde_json::json;
+
+pub fn register_ping_tool(tools: &Arc<ToolRuntime>) -> Result<HookGuard, ToolError> {
+    tools.register(
+        ToolDefinition::sync_tool(
+            "ping",
+            "Return pong for health diagnostics.",
+            json!({ "type": "object", "properties": {} }),
+            |_args, _exec| Ok::<_, BoxError>("pong".to_string()),
+        )
+        .with_exposure(ToolExposure::Direct),
+    )
+}
+```
+
+Adding a custom LLM protocol adapter follows the same pattern: implement `LlmAdapter` under `crates/mizar-llm/src/` and attach it with `runtime.register_adapter(name, adapter)`, which registers its `HookGuard` on `MizarRuntime`.
+
+## Tool Visibility (`ToolExposure`) & Three-Stage Pipeline
+
+When registering a tool, pick its `ToolExposure` deliberately so it lands in the intended prompt and sandbox surface:
+
+| `ToolExposure` Variant | Semantics | Typical Use Case |
+| :--- | :--- | :--- |
+| `Direct` | Declared to the LLM once active and callable inside `codemode` | Core built-in tools (`read` / `bash` / `edit` / `write` / `grep` / `find` / `skill` / `recall`) |
+| `ModelOnly` | Visible to the LLM, barred from recursive sandbox calls | Orchestration meta-tools (`tool_search` / `codemode` / `subagent`) |
+| `Codemode` | Listed in the sandbox catalog with zero first-turn prompt cost | Default for external MCP tools |
+| `Deferred` | Hidden by default; discoverable only via `tool_search` / `searchTools()` | Large or specialized external MCP tools |
+| `Hidden` | Completely hidden from both model and sandbox | Project-disabled (`excludeTools`) tools |
+
+`crates/mizar-tools/src/lib.rs` runs every tool invocation through three `WaterfallHook` stages: `pre_execute_hook` (validation/blocking), `execute_hook` (execution/timeouts), and `post_execute_hook` (output rewriting or context notices). Any tool mutating a file path must serialize via `with_file_mutation_queue` so concurrent tool calls never clobber one another.
+
+## Typed Hooks (`mizar-types::hooks`) & `AgentEvent`
+
+Untyped string event buses and `&dyn Any` downcasts have been replaced by strongly typed primitives (`crates/mizar-types/src/hooks.rs` and `crates/mizar-core/src/agent_loop.rs`):
+
+- **`WaterfallHook<I, O>` + `Next<I, O>`**: Middleware onion chain supporting `HookOptions { priority, prepend }` ordering (e.g., `SubagentRuntime` guards `tools.pre_execute_hook` at `priority: -100, prepend: true`; `agent_loop.pre_step_hook` orders `FileMentions(-50)` → `CompactionRuntime(-20)` → `<environment_context>(-10)` → `Skills(5)`).
+- **`SerialHook<I, O>`**: Lazy sequential chain that short-circuits on the first `Some(result)`.
+- **`SyncEventBus<E>`**: Reentrancy-safe snapshot dispatch powering synchronous listeners such as `tools.on_change`, `tools.on_result`, and `sessions.on_event`.
+- **`AgentLoop::subscribe()` / `on_event()`**: Broadcasts the closed `enum AgentEvent` (`Status`, `TurnStart`, `StepStart`, `TextDelta`, `ToolCall`, `ToolResult`, `Usage`, `TurnEnd`, etc.), paired with standard `tracing` and `mizar-client::logging`.
+
+## Wiring a New Capability Into the Host
+
+1. Declare any new crate or dependency in root `Cargo.toml` under `[workspace.dependencies]`, and use `{ workspace = true }` plus `[lints] workspace = true` inside sub-crates (see [Engineering Conventions, Gating & Testing](/en/dev/conventions/)).
+2. Construct and register the module cleanly in `MizarRuntime::build` inside `crates/mizar-core/src/spine.rs` (gating optional features with `#[cfg(feature = "...")]`, and registering a stable ID in `SpinePlugins` if runtime-toggleable).
+3. Update the authoritative **`docs/plugins.md`** crate table and topology diagram in lockstep so docs stay aligned with the compile-time DAG.

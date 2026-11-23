@@ -1,17 +1,12 @@
 //! 会话持久化抽象接口（Seam）：把领域层 `mizar-session` 与具体存储引擎（如 SQLite / JSONL）解耦。
 
-use std::ops::Deref;
-use std::sync::Arc;
-
-use cordis::{BoxFuture, Context};
+use mizar_types::hooks::BoxFuture;
 use thiserror::Error;
 
 use crate::model::{
     LoadedSession, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionHeader,
-    SessionHeaderPatch, SessionListQuery,
+    SessionHeaderPatch, SessionListQuery, SessionSelection,
 };
-
-pub const SERVICE_SESSION_PERSISTENCE: &str = "sessionPersistence";
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
@@ -44,7 +39,56 @@ pub trait SessionPersistence: Send + Sync + 'static {
 
     fn load_session(&self, session_id: &str) -> PersistenceResult<Option<LoadedSession>>;
 
+    /// 轻量读取会话头信息，避免反序列化与深拷贝完整 `entries`。
+    fn load_header(&self, session_id: &str) -> PersistenceResult<Option<SessionHeader>> {
+        Ok(self.load_session(session_id)?.map(|s| s.header))
+    }
+
+    /// 轻量读取会话最后记录的 `Selection` 快照，避免加载完整事件日志。
+    fn latest_selection(&self, session_id: &str) -> PersistenceResult<Option<SessionSelection>> {
+        let Some(loaded) = self.load_session(session_id)? else {
+            return Ok(None);
+        };
+        Ok(loaded
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.event.as_selection()))
+    }
+
     fn list_sessions(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>>;
+
+    fn load_session_async(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, PersistenceResult<Option<LoadedSession>>> {
+        let res = self.load_session(&session_id);
+        Box::pin(async move { res })
+    }
+
+    fn load_header_async(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, PersistenceResult<Option<SessionHeader>>> {
+        let res = self.load_header(&session_id);
+        Box::pin(async move { res })
+    }
+
+    fn latest_selection_async(
+        &self,
+        session_id: String,
+    ) -> BoxFuture<'static, PersistenceResult<Option<SessionSelection>>> {
+        let res = self.latest_selection(&session_id);
+        Box::pin(async move { res })
+    }
+
+    fn list_sessions_async(
+        &self,
+        query: SessionListQuery,
+    ) -> BoxFuture<'static, PersistenceResult<Vec<SessionHeader>>> {
+        let res = self.list_sessions(&query);
+        Box::pin(async move { res })
+    }
 
     fn append_events(&self, session_id: &str, entries: &[SessionEntry]) -> PersistenceResult<()>;
 
@@ -66,38 +110,12 @@ pub trait SessionPersistence: Send + Sync + 'static {
     ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
         Ok(None)
     }
-}
 
-/// 包装 `Arc<dyn SessionPersistence>` 以便通过 Cordis `ctx.provide` 注册与查找。
-#[derive(Clone)]
-pub struct SessionPersistenceHandle {
-    backend: Arc<dyn SessionPersistence>,
-}
-
-impl SessionPersistenceHandle {
-    pub fn new(backend: Arc<dyn SessionPersistence>) -> Self {
-        Self { backend }
-    }
-
-    pub fn backend(&self) -> &Arc<dyn SessionPersistence> {
-        &self.backend
-    }
-}
-
-impl Deref for SessionPersistenceHandle {
-    type Target = dyn SessionPersistence;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.backend
-    }
-}
-
-pub trait SessionPersistenceContextExt {
-    fn session_persistence(&self) -> Option<Arc<SessionPersistenceHandle>>;
-}
-
-impl SessionPersistenceContextExt for Context {
-    fn session_persistence(&self) -> Option<Arc<SessionPersistenceHandle>> {
-        self.get::<SessionPersistenceHandle>(SERVICE_SESSION_PERSISTENCE)
+    fn search_recall_async(
+        &self,
+        query: RecallSearchQuery,
+    ) -> BoxFuture<'static, PersistenceResult<Option<Vec<RecallSearchHit>>>> {
+        let res = self.search_recall(&query);
+        Box::pin(async move { res })
     }
 }

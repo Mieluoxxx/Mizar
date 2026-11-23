@@ -364,9 +364,6 @@ impl AppState {
             UiEvent::Notice { level, text } => {
                 self.push_notice(level, text);
             }
-            UiEvent::CacheWarmingNotice { text } => {
-                self.push_cache_warming_notice(text);
-            }
             UiEvent::SubagentState {
                 running_count,
                 notice,
@@ -480,7 +477,6 @@ impl AppState {
                 let label = match trigger.as_str() {
                     "manual" => "手动压缩中…",
                     "overflow" => "溢出恢复压缩中…",
-                    "cold-cache" => "冷缓存整理中…",
                     _ => "上下文压缩中…",
                 }
                 .to_string();
@@ -493,7 +489,6 @@ impl AppState {
             }
             UiEvent::CompactionProgress { stage, delta_chars } => {
                 let status = match stage.as_str() {
-                    "pruned" => "压缩中 · 已剪枝大输出".to_string(),
                     "prefill" => "压缩中 · prefill…".to_string(),
                     "transcript" => "压缩中 · 整理记录…".to_string(),
                     "summary" => format!("压缩中 · 摘要 {delta_chars} 字"),
@@ -510,7 +505,6 @@ impl AppState {
                 outcome,
                 tokens_before,
                 tokens_after,
-                pruned_count,
                 first_kept_seq,
                 summary_preview,
                 message,
@@ -520,7 +514,6 @@ impl AppState {
                     outcome,
                     tokens_before,
                     tokens_after,
-                    pruned_count,
                     first_kept_seq,
                     summary_preview,
                     message,
@@ -536,7 +529,6 @@ impl AppState {
         outcome: String,
         tokens_before: Option<u64>,
         tokens_after: Option<u64>,
-        pruned_count: usize,
         first_kept_seq: Option<u64>,
         summary_preview: Option<String>,
         message: Option<String>,
@@ -550,7 +542,7 @@ impl AppState {
             _ => {}
         }
         // 遵循 dsh-TUI 原则：total_usage 计费读数永不随压缩回退，仅刷新上下文占用视图
-        if matches!(outcome.as_str(), "compacted" | "pruned-only")
+        if outcome == "compacted"
             && let Some(after) = tokens_after.filter(|&v| v > 0)
         {
             self.last_prompt_tokens = Some(after);
@@ -558,20 +550,6 @@ impl AppState {
         self.refresh_context_breakdown();
 
         match outcome.as_str() {
-            "pruned-only" => {
-                let delta = match (tokens_before, tokens_after) {
-                    (Some(b), Some(a)) if b > a => {
-                        format!("，{} → {} tok（↓{}）", b, a, b - a)
-                    }
-                    _ => String::new(),
-                };
-                self.push_notice(
-                    NoticeLevel::Info,
-                    format!(
-                        "✓ 零模型剪枝完成：裁减 {pruned_count} 条大输出{delta}（原文保留，可用 recall_read 随时查阅）"
-                    ),
-                );
-            }
             "compacted" => {
                 let kept_tag = first_kept_seq
                     .map(|s| format!("保留自 #{s}"))
@@ -583,11 +561,6 @@ impl AppState {
                     }
                     _ => String::new(),
                 };
-                let prune_tag = if pruned_count > 0 {
-                    format!(" · 剪枝 {pruned_count} 条")
-                } else {
-                    String::new()
-                };
                 let body = summary_preview
                     .as_deref()
                     .map(str::trim)
@@ -596,7 +569,7 @@ impl AppState {
                     .unwrap_or_default();
                 self.push_notice(
                     NoticeLevel::Info,
-                    format!("✓ 上下文压缩完成（{kept_tag}{tok_tag}{prune_tag}）{body}"),
+                    format!("✓ 上下文压缩完成（{kept_tag}{tok_tag}）{body}"),
                 );
             }
             "skipped" => {

@@ -15,33 +15,26 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }
-cordis = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
-mizar-agent-loop = { workspace = true }
-mizar-agent-spine = { workspace = true }
+futures = { workspace = true }
 mizar-client = { workspace = true }
-mizar-client-core = { workspace = true }
-mizar-instructions = { workspace = true }
+mizar-core = { workspace = true }
 mizar-llm = { workspace = true }
-mizar-llm-mock = { workspace = true }
-mizar-llm-retry = { workspace = true }
-mizar-llm-router = { workspace = true }
 mizar-mcp = { workspace = true }
 mizar-session = { workspace = true }
-mizar-session-title = { workspace = true }
-mizar-skills = { workspace = true }
-mizar-system-prompt = { workspace = true }
 mizar-tools = { workspace = true }
-mizar-tools-coding = { workspace = true }
-mizar-trajectory = { workspace = true }
 mizar-tui-ui = { workspace = true }
-futures = { workspace = true }
+mizar-types = { workspace = true }
 ratatui = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

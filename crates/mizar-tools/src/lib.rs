@@ -1,29 +1,25 @@
 //! 工具注册表、分层暴露策略与三段执行管线（对齐 `NamiDSH` + `pi` 工具装载机制）。
 //!
-//! 每次工具调用经过三道 `waterfall`：
-//! - `tools/pre-execute`  → 执行前：拦截 / 检查（返回 `allow: false` 就不执行）
-//! - `tools/execute`      → 执行：可包一层超时、监控
-//! - `tools/post-execute` → 执行后：可改写结果或追加上下文提醒
+//! 每次工具调用经过三道 `WaterfallHook`：
+//! - `pre_execute`  → 执行前：拦截 / 检查（返回 `allow: false` 就不执行）
+//! - `execute`      → 执行：可包一层超时、监控
+//! - `post_execute` → 执行后：可改写结果或追加上下文提醒
 
+pub mod coding;
 pub mod mutation_queue;
+pub mod search;
 pub mod truncate;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Service};
-use mizar_llm::ToolSchema;
+use mizar_types::hooks::{BoxError, BoxFuture, HookGuard, SyncEventBus, WaterfallHook};
+use mizar_types::llm::ToolSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
-pub const EVENT_TOOLS_PRE_EXECUTE: &str = "tools/pre-execute";
-pub const EVENT_TOOLS_EXECUTE: &str = "tools/execute";
-pub const EVENT_TOOLS_POST_EXECUTE: &str = "tools/post-execute";
-pub const EVENT_TOOLS_CHANGE: &str = "tools/change";
-pub const EVENT_TOOLS_RESULT: &str = "tools/result";
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -301,7 +297,7 @@ pub struct ToolCallContext {
     pub exec: ToolExecution,
     pub cancel: CancellationToken,
     pub on_update: Option<ToolUpdateCallback>,
-    pub ctx: Context,
+    pub tools: Arc<ToolRuntime>,
 }
 
 impl ToolCallContext {
@@ -584,26 +580,67 @@ enum SessionToolPolicy {
     Explicit(Vec<String>),
 }
 
+#[derive(Clone)]
+struct CachedDeclaredLoadout {
+    version: u64,
+    infos: Arc<[ToolRuntimeInfo]>,
+    active_names: Arc<HashSet<String>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DisabledToolGroup {
+    names: Vec<String>,
+    prefixes: Vec<String>,
+}
+
+impl DisabledToolGroup {
+    fn matches(&self, name: &str) -> bool {
+        self.names.iter().any(|n| n == name) || self.prefixes.iter().any(|p| name.starts_with(p))
+    }
+}
+
 #[derive(Default)]
 struct ToolState {
+    version: u64,
     tools: Vec<ToolDefinition>,
     /// 显式全局覆盖（例如手动覆盖默认激活或无会话上下文下动态启用）。
     global_active_overrides: HashMap<String, bool>,
     /// 插件按需自动启用状态（如 `codemode` / `tool_search`），不绕过显式 `include_patterns`。
     auto_default_active: HashMap<String, bool>,
+    /// 按模块名分组的运行期临时屏蔽集（不污染 `global_active_overrides` 与 `exclude_patterns`）。
+    disabled_tool_groups: HashMap<String, DisabledToolGroup>,
     /// 若设置了 `Some(patterns)`，默认只激活匹配这些模式且未关闭的工具。
     include_patterns: Option<Vec<String>>,
     /// 屏蔽规则（即使注册或尝试激活也不对外暴露）。
     exclude_patterns: Vec<String>,
     /// 按会话管理的工具激活策略。
     session_policies: HashMap<String, SessionToolPolicy>,
+    /// 无特定会话上下文时的声明清单缓存（随 `version` 递增失效）。
+    default_declared_cache: Option<CachedDeclaredLoadout>,
+    /// 按会话缓存的声明清单（随 `version` 递增整体失效）。
+    session_declared_cache: HashMap<String, CachedDeclaredLoadout>,
 }
 
 impl ToolState {
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
+        self.default_declared_cache = None;
+        self.session_declared_cache.clear();
+    }
     fn is_excluded(&self, name: &str) -> bool {
         self.exclude_patterns
             .iter()
             .any(|p| wildcard_matches(p, name))
+    }
+
+    fn is_suppressed(&self, name: &str) -> bool {
+        self.disabled_tool_groups
+            .values()
+            .any(|group| group.matches(name))
+    }
+
+    fn is_blocked(&self, name: &str) -> bool {
+        self.is_excluded(name) || self.is_suppressed(name)
     }
 
     fn is_activatable(tool: &ToolDefinition, excluded: bool) -> bool {
@@ -611,7 +648,7 @@ impl ToolState {
     }
 
     fn is_default_active(&self, tool: &ToolDefinition) -> bool {
-        if !Self::is_activatable(tool, self.is_excluded(&tool.name)) {
+        if !Self::is_activatable(tool, self.is_blocked(&tool.name)) {
             return false;
         }
         if let Some(&overridden) = self.global_active_overrides.get(&tool.name) {
@@ -630,7 +667,7 @@ impl ToolState {
     }
 
     fn is_tool_active_for_session(&self, session_id: Option<&str>, tool: &ToolDefinition) -> bool {
-        if !Self::is_activatable(tool, self.is_excluded(&tool.name)) {
+        if !Self::is_activatable(tool, self.is_blocked(&tool.name)) {
             return false;
         }
         if let Some(sid) = session_id
@@ -660,7 +697,7 @@ impl ToolState {
             for name in explicit {
                 if seen.insert(name.as_str())
                     && let Some(def) = by_name.get(name.as_str())
-                    && Self::is_activatable(def, self.is_excluded(name))
+                    && Self::is_activatable(def, self.is_blocked(name))
                 {
                     out.push((*def).clone());
                 }
@@ -681,7 +718,7 @@ impl ToolState {
             for name in added {
                 if seen.insert(name.as_str())
                     && let Some(def) = by_name.get(name.as_str())
-                    && Self::is_activatable(def, self.is_excluded(name))
+                    && Self::is_activatable(def, self.is_blocked(name))
                 {
                     out.push((*def).clone());
                 }
@@ -695,7 +732,7 @@ impl ToolState {
         self.tools
             .iter()
             .filter(|t| {
-                if self.is_excluded(&t.name) {
+                if self.is_blocked(&t.name) {
                     return false;
                 }
                 match t.exposure {
@@ -712,7 +749,7 @@ impl ToolState {
         let Some(tool) = self.tools.iter().find(|t| t.name == tool_name) else {
             return false;
         };
-        if self.is_excluded(tool_name) {
+        if self.is_blocked(tool_name) {
             return false;
         }
         match tool.exposure {
@@ -724,13 +761,52 @@ impl ToolState {
 }
 
 pub struct ToolRuntime {
-    ctx: Context,
     state: Mutex<ToolState>,
+    pre_execute: WaterfallHook<ToolExecution, BoxFuture<'static, PreExecuteDecision>>,
+    execute: WaterfallHook<ToolExecution, BoxFuture<'static, ToolResult>>,
+    post_execute: WaterfallHook<PostExecuteInput, BoxFuture<'static, ToolResult>>,
+    on_change: SyncEventBus<()>,
+    on_result: SyncEventBus<ToolResultEvent>,
 }
 
 impl ToolRuntime {
-    /// 工具插件调用它登记自己。返回的 `Cleanup` 放入 `ctx.effect` 即可随插件自动注销。
-    pub fn register(self: &Arc<Self>, tool: ToolDefinition) -> Result<Cleanup, ToolError> {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ToolState::default()),
+            pre_execute: WaterfallHook::new(),
+            execute: WaterfallHook::new(),
+            post_execute: WaterfallHook::new(),
+            on_change: SyncEventBus::new(),
+            on_result: SyncEventBus::new(),
+        })
+    }
+
+    pub fn pre_execute_hook(
+        &self,
+    ) -> &WaterfallHook<ToolExecution, BoxFuture<'static, PreExecuteDecision>> {
+        &self.pre_execute
+    }
+
+    pub fn execute_hook(&self) -> &WaterfallHook<ToolExecution, BoxFuture<'static, ToolResult>> {
+        &self.execute
+    }
+
+    pub fn post_execute_hook(
+        &self,
+    ) -> &WaterfallHook<PostExecuteInput, BoxFuture<'static, ToolResult>> {
+        &self.post_execute
+    }
+
+    pub fn on_change(&self, cb: impl Fn(&()) + Send + Sync + 'static) -> HookGuard {
+        self.on_change.on(cb)
+    }
+
+    pub fn on_result(&self, cb: impl Fn(&ToolResultEvent) + Send + Sync + 'static) -> HookGuard {
+        self.on_result.on(cb)
+    }
+
+    /// 登记工具；返回的 `HookGuard` 在析构时自动注销该工具。
+    pub fn register(self: &Arc<Self>, tool: ToolDefinition) -> Result<HookGuard, ToolError> {
         let tool_name = tool.name.clone();
         {
             let mut st = self.state.lock().unwrap();
@@ -738,18 +814,19 @@ impl ToolRuntime {
                 return Err(ToolError::DuplicateTool(tool_name));
             }
             st.tools.push(tool);
-            // 并发插件挂载顺序不固定，按暴露层级与工具名归一化以稳定 instructions 与 tools 声明前缀
+            // 并发注册顺序不固定，按暴露层级与工具名归一化以稳定 instructions 与 tools 声明前缀
             st.tools.sort_by(|a, b| {
                 a.exposure
                     .sort_rank()
                     .cmp(&b.exposure.sort_rank())
                     .then_with(|| a.name.cmp(&b.name))
             });
+            st.bump_version();
         }
-        self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        self.on_change.emit(&());
 
         let runtime = Arc::downgrade(self);
-        Ok(Cleanup::sync(move || {
+        Ok(HookGuard::new(move || {
             if let Some(rt) = runtime.upgrade() {
                 {
                     let mut st = rt.state.lock().unwrap();
@@ -766,8 +843,9 @@ impl ToolRuntime {
                             }
                         }
                     }
+                    st.bump_version();
                 }
-                rt.ctx.emit(EVENT_TOOLS_CHANGE, ());
+                rt.on_change.emit(&());
             }
         }))
     }
@@ -779,10 +857,47 @@ impl ToolRuntime {
             let same = st.include_patterns == include && st.exclude_patterns == exclude;
             st.include_patterns = include;
             st.exclude_patterns = exclude;
+            if !same {
+                st.bump_version();
+            }
             !same
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
+        }
+    }
+
+    /// 按模块名屏蔽或恢复一组工具（按精确名与前缀匹配），不覆盖 `global_active_overrides` 或 `auto_default_active`。
+    pub fn set_disabled_tool_group(
+        &self,
+        group_key: &str,
+        names: &[&str],
+        prefixes: &[&str],
+        disabled: bool,
+    ) {
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            if disabled {
+                let next = DisabledToolGroup {
+                    names: names.iter().map(|s| (*s).to_string()).collect(),
+                    prefixes: prefixes.iter().map(|s| (*s).to_string()).collect(),
+                };
+                let same = st.disabled_tool_groups.get(group_key) == Some(&next);
+                if !same {
+                    st.disabled_tool_groups.insert(group_key.to_string(), next);
+                    st.bump_version();
+                }
+                !same
+            } else {
+                let removed = st.disabled_tool_groups.remove(group_key).is_some();
+                if removed {
+                    st.bump_version();
+                }
+                removed
+            }
+        };
+        if changed {
+            self.on_change.emit(&());
         }
     }
 
@@ -790,10 +905,15 @@ impl ToolRuntime {
     pub fn set_global_active_override(&self, name: &str, active: bool) {
         let changed = {
             let mut st = self.state.lock().unwrap();
-            st.global_active_overrides.insert(name.to_string(), active) != Some(active)
+            let changed =
+                st.global_active_overrides.insert(name.to_string(), active) != Some(active);
+            if changed {
+                st.bump_version();
+            }
+            changed
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
@@ -805,10 +925,14 @@ impl ToolRuntime {
                 Some(v) => st.auto_default_active.insert(name.to_string(), v),
                 None => st.auto_default_active.remove(name),
             };
-            prev != active
+            let changed = prev != active;
+            if changed {
+                st.bump_version();
+            }
+            changed
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
@@ -847,16 +971,17 @@ impl ToolRuntime {
                     st.tools
                         .iter()
                         .find(|t| &t.name == n)
-                        .is_some_and(|t| ToolState::is_activatable(t, st.is_excluded(n)))
+                        .is_some_and(|t| ToolState::is_activatable(t, st.is_blocked(n)))
                 })
                 .collect();
             st.session_policies.insert(
                 session_id.to_string(),
                 SessionToolPolicy::Explicit(valid.clone()),
             );
+            st.bump_version();
             valid
         };
-        self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        self.on_change.emit(&());
         result
     }
 
@@ -878,7 +1003,7 @@ impl ToolRuntime {
                     .tools
                     .iter()
                     .find(|t| &t.name == name)
-                    .is_some_and(|t| ToolState::is_activatable(t, st.is_excluded(name)));
+                    .is_some_and(|t| ToolState::is_activatable(t, st.is_blocked(name)));
                 if ok && !newly_added.contains(name) {
                     newly_added.push(name.clone());
                 }
@@ -894,11 +1019,12 @@ impl ToolRuntime {
                         list.extend(newly_added.iter().cloned());
                     }
                 }
+                st.bump_version();
             }
             newly_added
         };
         if !added.is_empty() {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
         added
     }
@@ -908,10 +1034,14 @@ impl ToolRuntime {
     pub fn reset_session_activations(&self, session_id: &str) -> bool {
         let changed = {
             let mut st = self.state.lock().unwrap();
-            st.session_policies.remove(session_id).is_some()
+            let removed = st.session_policies.remove(session_id).is_some();
+            if removed {
+                st.bump_version();
+            }
+            removed
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
         changed
     }
@@ -929,14 +1059,28 @@ impl ToolRuntime {
             .collect()
     }
 
-    pub fn list_declared_infos(&self, session_id: Option<&str>) -> Vec<ToolRuntimeInfo> {
-        let (active_defs, callable, registered) = {
+    fn list_declared_cached(&self, session_id: Option<&str>) -> CachedDeclaredLoadout {
+        let (snapshot_version, active_defs, callable, registered) = {
             let st = self.state.lock().unwrap();
+            let cached = match session_id {
+                None => st.default_declared_cache.as_ref(),
+                Some(sid) => st.session_declared_cache.get(sid),
+            };
+            if let Some(entry) = cached
+                && entry.version == st.version
+            {
+                return entry.clone();
+            }
+
             let active_defs = st.resolve_active_defs(session_id);
             let callable = st.resolve_callable_infos(&active_defs);
-            let registered: Vec<ToolRuntimeInfo> =
-                st.tools.iter().map(ToolDefinition::info).collect();
-            (active_defs, callable, registered)
+            let registered: Vec<ToolRuntimeInfo> = st
+                .tools
+                .iter()
+                .filter(|t| !st.is_blocked(&t.name))
+                .map(ToolDefinition::info)
+                .collect();
+            (st.version, active_defs, callable, registered)
         };
 
         let declared_infos: Vec<ToolRuntimeInfo> =
@@ -946,39 +1090,86 @@ impl ToolRuntime {
             .filter_map(|t| t.prepare_loadout.clone())
             .collect();
 
-        if hooks.is_empty() {
-            return declared_infos;
-        }
+        let final_infos = if hooks.is_empty() {
+            declared_infos
+        } else {
+            let loadout = ToolLoadout {
+                declared: declared_infos.clone(),
+                callable,
+                registered,
+            };
+            let mut description_overrides: HashMap<String, String> = HashMap::new();
+            let mut hidden: HashSet<String> = HashSet::new();
 
-        let loadout = ToolLoadout {
-            declared: declared_infos.clone(),
-            callable,
-            registered,
-        };
-        let mut description_overrides: HashMap<String, String> = HashMap::new();
-        let mut hidden: HashSet<String> = HashSet::new();
-
-        for hook in hooks {
-            if let Some(changes) = hook(&loadout) {
-                for (name, desc) in changes.descriptions {
-                    description_overrides.insert(name, desc);
+            for hook in hooks {
+                if let Some(changes) = hook(&loadout) {
+                    for (name, desc) in changes.descriptions {
+                        description_overrides.insert(name, desc);
+                    }
+                    for name in changes.hidden_declarations {
+                        hidden.insert(name);
+                    }
                 }
-                for name in changes.hidden_declarations {
-                    hidden.insert(name);
+            }
+
+            declared_infos
+                .into_iter()
+                .filter(|info| !hidden.contains(&info.name))
+                .map(|mut info| {
+                    if let Some(desc) = description_overrides.remove(&info.name) {
+                        info.description = desc;
+                    }
+                    info
+                })
+                .collect()
+        };
+
+        let active_names: HashSet<String> = final_infos.iter().map(|i| i.name.clone()).collect();
+        let entry = CachedDeclaredLoadout {
+            version: snapshot_version,
+            infos: Arc::from(final_infos),
+            active_names: Arc::new(active_names),
+        };
+
+        let mut st = self.state.lock().unwrap();
+        if st.version == snapshot_version {
+            match session_id {
+                None => st.default_declared_cache = Some(entry.clone()),
+                Some(sid) => {
+                    if st.session_declared_cache.len() >= 64
+                        && !st.session_declared_cache.contains_key(sid)
+                    {
+                        st.session_declared_cache.clear();
+                    }
+                    st.session_declared_cache
+                        .insert(sid.to_string(), entry.clone());
                 }
             }
         }
+        entry
+    }
 
-        declared_infos
-            .into_iter()
-            .filter(|info| !hidden.contains(&info.name))
-            .map(|mut info| {
-                if let Some(desc) = description_overrides.remove(&info.name) {
-                    info.description = desc;
-                }
-                info
-            })
-            .collect()
+    pub fn list_declared_infos(&self, session_id: Option<&str>) -> Vec<ToolRuntimeInfo> {
+        self.list_declared_cached(session_id).infos.to_vec()
+    }
+
+    /// O(1) 判断某工具在当前声明装配集中是否处于激活状态。
+    pub fn is_tool_active(&self, session_id: Option<&str>, name: &str) -> bool {
+        self.list_declared_cached(session_id)
+            .active_names
+            .contains(name)
+    }
+
+    /// 按工具名精确查询单个未屏蔽工具的元数据（避免为单项校验克隆全量列表）。
+    pub fn get_tool_info(&self, name: &str) -> Option<ToolRuntimeInfo> {
+        let st = self.state.lock().unwrap();
+        if st.is_blocked(name) {
+            return None;
+        }
+        st.tools
+            .iter()
+            .find(|t| t.name == name)
+            .map(ToolDefinition::info)
     }
 
     /// 供 `codemode` 沙箱使用的可调用工具列表（包含当前活跃 `Direct` 工具以及所有 `Codemode`/`Deferred` 工具）。
@@ -993,7 +1184,7 @@ impl ToolRuntime {
         let st = self.state.lock().unwrap();
         st.tools
             .iter()
-            .filter(|t| !st.is_excluded(&t.name))
+            .filter(|t| !st.is_blocked(&t.name))
             .map(ToolDefinition::info)
             .collect()
     }
@@ -1009,7 +1200,7 @@ impl ToolRuntime {
 
     fn find_tool(&self, name: &str) -> Option<ToolDefinition> {
         let st = self.state.lock().unwrap();
-        if st.is_excluded(name) {
+        if st.is_blocked(name) {
             return None;
         }
         st.tools.iter().find(|t| t.name == name).cloned()
@@ -1049,9 +1240,8 @@ impl ToolRuntime {
         let is_nested = nested || exec.nested;
         exec.nested = is_nested;
         let decision: PreExecuteDecision = self
-            .ctx
-            .waterfall(
-                EVENT_TOOLS_PRE_EXECUTE,
+            .pre_execute
+            .run(
                 exec.clone(),
                 |_| -> BoxFuture<'static, PreExecuteDecision> {
                     Box::pin(async { PreExecuteDecision::allow() })
@@ -1071,9 +1261,8 @@ impl ToolRuntime {
             let runtime = Arc::clone(self);
             let cancel_for_exec = cancel.clone();
             let update_for_exec = on_update.clone();
-            self.ctx
-                .waterfall(
-                    EVENT_TOOLS_EXECUTE,
+            self.execute
+                .run(
                     exec.clone(),
                     move |exec| -> BoxFuture<'static, ToolResult> {
                         let runtime = Arc::clone(&runtime);
@@ -1091,7 +1280,7 @@ impl ToolRuntime {
                                 exec,
                                 cancel,
                                 on_update,
-                                ctx: runtime.ctx.clone(),
+                                tools: runtime,
                             };
                             match (tool.execute)(args, call_ctx).await {
                                 Ok(output) => ToolResult::from_output(output),
@@ -1104,9 +1293,8 @@ impl ToolRuntime {
         };
 
         let result = self
-            .ctx
-            .waterfall(
-                EVENT_TOOLS_POST_EXECUTE,
+            .post_execute
+            .run(
                 PostExecuteInput {
                     exec: exec.clone(),
                     result,
@@ -1115,48 +1303,16 @@ impl ToolRuntime {
             )
             .await;
 
-        self.ctx.emit(
-            EVENT_TOOLS_RESULT,
-            ToolResultEvent {
-                exec,
-                result: result.clone(),
-            },
-        );
+        self.on_result.emit(&ToolResultEvent {
+            exec,
+            result: result.clone(),
+        });
         result
     }
 
     fn can_call_nested(&self, session_id: Option<&str>, name: &str) -> bool {
         let st = self.state.lock().unwrap();
         st.is_callable_in_sandbox(session_id, name)
-    }
-}
-
-impl Service for ToolRuntime {
-    type Config = ();
-
-    fn service_name() -> &'static str {
-        "tools"
-    }
-
-    fn plugin_name() -> &'static str {
-        "ToolRuntime"
-    }
-
-    fn create(ctx: &Context, _config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            state: Mutex::new(ToolState::default()),
-        }))
-    }
-}
-
-pub trait ToolsContextExt {
-    fn tools(&self) -> Result<Arc<ToolRuntime>, CordisError>;
-}
-
-impl ToolsContextExt for Context {
-    fn tools(&self) -> Result<Arc<ToolRuntime>, CordisError> {
-        self.service::<ToolRuntime>("tools")
     }
 }
 
@@ -1175,9 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn manages_exposure_activation_loadout_and_nested_guards() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _c1 = tools
             .register(
@@ -1255,9 +1409,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_tool_policy_transitions_and_auto_default_precedence() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _r = tools
             .register(ToolDefinition::sync_tool(
@@ -1317,9 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn declares_tools_in_deterministic_order_regardless_of_registration_order() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _ts = tools
             .register(
@@ -1396,5 +1546,130 @@ mod tests {
             after_activate,
             vec!["read", "write", "codemode", "tool_search", "mcp_b"]
         );
+    }
+
+    #[tokio::test]
+    async fn caches_declared_loadout_across_calls_and_invalidates_on_mutations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tools = ToolRuntime::new();
+
+        let hook_runs = Arc::new(AtomicUsize::new(0));
+        let hook_runs_c = Arc::clone(&hook_runs);
+
+        let _cm = tools
+            .register(
+                ToolDefinition::sync_tool("codemode", "base", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly)
+                .with_prepare_loadout(move |loadout| {
+                    hook_runs_c.fetch_add(1, Ordering::SeqCst);
+                    let mut changes = ToolLoadoutChanges::default();
+                    if loadout.declared.iter().any(|t| t.name == "read") {
+                        changes.hidden_declarations.push("read".to_string());
+                    }
+                    Some(changes)
+                }),
+            )
+            .unwrap();
+        let _r = tools
+            .register(ToolDefinition::sync_tool(
+                "read",
+                "read",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _d = tools
+            .register(
+                ToolDefinition::sync_tool("extra", "extra", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+
+        // 同版本多次查询 list_declared_infos / is_tool_active 只触发 1 次 prepare_loadout
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 0);
+        let infos = tools.list_declared_infos(Some("s1"));
+        assert_eq!(infos.len(), 1);
+        assert!(tools.is_tool_active(Some("s1"), "codemode"));
+        assert!(!tools.is_tool_active(Some("s1"), "read"));
+        assert!(!tools.is_tool_active(Some("s1"), "extra"));
+        let _ = tools.list_declared_infos(Some("s1"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 1);
+
+        // activate_tools / reset / selection / global override / auto_default / register / unregister 均使缓存失效
+        tools.activate_tools("s1", &["extra".to_string()]);
+        assert!(tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 2);
+
+        assert!(tools.reset_session_activations("s1"));
+        assert!(!tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 3);
+
+        tools.set_global_active_override("extra", true);
+        assert!(tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 4);
+
+        tools.set_tool_selection(None, vec!["extra".to_string()]);
+        assert!(tools.get_tool_info("extra").is_none());
+        assert!(tools.get_tool_info("read").is_some());
+        assert!(!tools.is_tool_active(Some("s1"), "extra"));
+        assert_eq!(hook_runs.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn disabled_tool_group_hides_tools_without_clobbering_overrides() {
+        let tools = ToolRuntime::new();
+
+        let _r = tools
+            .register(ToolDefinition::sync_tool(
+                "read",
+                "read",
+                json!({}),
+                |_, _| Ok::<_, BoxError>("ok".into()),
+            ))
+            .unwrap();
+        let _ts = tools
+            .register(
+                ToolDefinition::sync_tool("tool_search", "ts", json!({}), |_, _| {
+                    Ok::<_, BoxError>("ok".into())
+                })
+                .with_exposure(ToolExposure::ModelOnly)
+                .with_default_active(false),
+            )
+            .unwrap();
+        let _mcp = tools
+            .register(
+                ToolDefinition::sync_tool("mcp__demo__ping", "ping", json!({}), |_, _| {
+                    Ok::<_, BoxError>("pong".into())
+                })
+                .with_exposure(ToolExposure::Deferred),
+            )
+            .unwrap();
+
+        tools.set_auto_default_active("tool_search", Some(false));
+        tools.set_global_active_override("read", true);
+        assert!(tools.list().iter().any(|t| t.name == "read"));
+        assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
+
+        tools.set_disabled_tool_group("tools-coding", &["read"], &[], true);
+        tools.set_disabled_tool_group("mcp", &[], &["mcp__"], true);
+        assert!(!tools.list_all().iter().any(|t| t.name == "read"));
+        assert!(!tools.list_all().iter().any(|t| t.name == "mcp__demo__ping"));
+        assert!(!tools.list().iter().any(|t| t.name == "read"));
+        let exec_err = tools
+            .execute(ToolExecution::new("read", json!({}), None))
+            .await;
+        assert!(exec_err.is_error);
+
+        // 恢复后保留原有的 global_active_overrides 与 auto_default_active 语义
+        tools.set_disabled_tool_group("tools-coding", &["read"], &[], false);
+        tools.set_disabled_tool_group("mcp", &[], &["mcp__"], false);
+        assert!(tools.list().iter().any(|t| t.name == "read"));
+        assert!(tools.list_all().iter().any(|t| t.name == "mcp__demo__ping"));
+        assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
     }
 }

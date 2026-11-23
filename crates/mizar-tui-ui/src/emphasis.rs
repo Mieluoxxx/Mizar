@@ -106,7 +106,6 @@ const MODE_CORE: &[&str] = &[
     "Qualify",
 ];
 const OWNER_CORE: &[&str] = &["Owned", "Shared", "Foreign"];
-const CONTEXT_WORDS: &[&str] = &["Inferred", "New", "Changed", "Optional"];
 
 const SYNONYMS: &[(&str, &str)] = &[
     ("complete", "Done"),
@@ -470,18 +469,20 @@ pub fn decorate_action_lead_in(bold_inner: &str, cfg: &EmphasisConfig) -> String
     bold_inner.to_string()
 }
 
-/// 根据同一份词库动态生成 `reply_style` 系统提示词段落，保证模型规范与渲染器永远同步。
+/// 根据同一份词库动态生成紧凑英文 `reply_style` 提示词段落（`<= 800B`），保证模型规范与渲染器永远同步。
 pub fn reply_guidance_prompt() -> String {
-    let join_pills = |list: &[&str]| -> String {
+    let pick = |list: &[&str], max: usize| -> String {
         list.iter()
+            .take(max)
             .map(|w| format!("[[{w}]]"))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join("/")
     };
-    let title_list = |pairs: &[(&str, &str)]| -> String {
-        pairs
+    let cap_join = |targets: &[&str], pairs: &[(&str, &str)]| -> String {
+        targets
             .iter()
-            .map(|(w, _)| {
+            .filter(|target| pairs.iter().any(|(k, _)| k == *target))
+            .map(|w| {
                 let mut ch = w.chars();
                 match ch.next() {
                     Some(first) => format!("{}{}", first.to_ascii_uppercase(), ch.as_str()),
@@ -489,34 +490,28 @@ pub fn reply_guidance_prompt() -> String {
                 }
             })
             .collect::<Vec<_>>()
-            .join(", ")
+            .join("/")
     };
 
+    let key_labels = cap_join(
+        &["finding", "cause", "fix", "risk", "result", "next"],
+        LABEL_ICONS,
+    );
+    let actions = cap_join(&["check", "do", "next", "unblock", "run"], ACTION_ICONS);
+
     format!(
-        "These rules shape replies written to the user in this terminal. It colors pills, adds icons, and cannot change text size.\n\
-         \n\
-         - **Open cleanly without duplicating labels.** Start a substantive reply either with one optional work-mode pill ({mode}) on its own header line before the body, or with a bold lead label—never repeat the same word as both a bold label and a pill (never `**Investigate** [[Investigate]]`), and never glue a mode pill onto the start of a multi-line paragraph. Write labels as plain words; the terminal adds icons. Never type icon glyphs. Labels with an icon: {labels}. Prefer these; any other label shows without an icon.\n\
-         - **Shape follows information.** Use `├──` and `└──` (with `│  ` for nested levels) for what belongs to what, `→` for a sequence, `✓` or `✗` beside a checked item. Keep tree lines plain (never wrap `├──`, `└──`, or `│` in `**...**`), omit blank lines inside an active tree, and indent child rows directly under `│  ` (or use a Markdown table / nested list without mixing `├──` headings and flush `-` bullets).\n\
-         - **Bold the anchor terms.** Treat the components, choices, and key verdicts under discussion as concise bold anchors (1-3 short bold spans per paragraph or bullet, never entire long sentences). Italicize sparingly for contrast.\n\
-         - **Use pills sparingly for true status slots.** A pill is `[[Word]]` on a status cell, checklist verdict, or concrete outcome—not required on every heading or paragraph. Never place pills inside mid-sentence prose or parenthetical clauses (`(...)` / `（...）`), and never attach misleading status pills like [[Skipped]] or [[Pending]] to findings you already inspected:\n\
-           - **Red (wrong):** {err}\n\
-           - **Yellow (attention):** {warn}\n\
-           - **Green (settled):** {ok}\n\
-           - **Solid red (consequences):** {danger}\n\
-           - **Cyan (kind of work):** {mode} (standalone header line only)\n\
-           - **Blue (ownership):** {owner}\n\
-           - **Soft blue (context):** {ctx}, and any other short status label.\n\
-         - **Every attention pill carries its action.** Follow a red/yellow/solid-red pill or [[Inferred]] with a bold action lead-in ending in a colon ({actions}).\n\
-         - **Copyable text stays clean.** Keep pills out of paths, commands, code blocks, and exact identifiers.",
-        labels = title_list(LABEL_ICONS),
-        err = join_pills(ERROR_CORE),
-        warn = join_pills(WARNING_CORE),
-        ok = join_pills(SUCCESS_CORE),
-        danger = join_pills(DANGER_CORE),
-        mode = join_pills(MODE_CORE),
-        owner = join_pills(OWNER_CORE),
-        ctx = join_pills(CONTEXT_WORDS),
-        actions = title_list(ACTION_ICONS),
+        "These rules shape replies in this terminal (auto-styled pills/icons; never type glyphs):\n\
+         - During multi-step work, briefly tell the user what you are doing.\n\
+         - Start with a mode pill ({mode}) or bold label ({labels}), never both (e.g. `**Investigate** [[Investigate]]`).\n\
+         - Use pills sparingly for status only (not in paths/code/prose): {err}; {warn}; {ok}; {danger}. Follow error/warn/danger with a bold action ({actions}:).\n\
+         - Bold 1-3 anchors per item; use plain `├──`/`└──`/`→`/`✓`/`✗`.",
+        mode = pick(MODE_CORE, MODE_CORE.len()),
+        labels = key_labels,
+        err = pick(ERROR_CORE, 3),
+        warn = pick(WARNING_CORE, 4),
+        ok = pick(SUCCESS_CORE, 3),
+        danger = pick(DANGER_CORE, 2),
+        actions = actions,
     )
 }
 
@@ -571,14 +566,48 @@ mod tests {
     #[test]
     fn prompt_guidance_reflects_core_vocabulary() {
         let prompt = reply_guidance_prompt();
+        assert!(
+            prompt.len() <= 800,
+            "reply_guidance_prompt must be <= 800 bytes, got {}:\n{prompt}",
+            prompt.len()
+        );
+        assert!(
+            !prompt
+                .chars()
+                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
+            "reply_guidance_prompt must be pure English: {prompt}"
+        );
         assert!(prompt.contains("[[Done]]"));
         assert!(prompt.contains("[[Needs you]]"));
         assert!(prompt.contains("[[Costs money]]"));
+        assert!(prompt.contains("[[Failed]]"));
+        assert!(prompt.contains("[[Investigate]]"));
         assert!(prompt.contains("Finding"));
         assert!(prompt.contains("Check"));
         assert!(!prompt.contains("Pills are required"));
         assert!(prompt.contains("Use pills sparingly"));
-        assert!(prompt.contains("never `**Investigate** [[Investigate]]`"));
+        assert!(prompt.contains("**Investigate** [[Investigate]]"));
+        assert!(
+            prompt.contains("During multi-step work, briefly tell the user what you are doing.")
+        );
+
+        // 双向契约校验：提示词中出现的每个 [[...]] 标记都必须被渲染器识别为非 Neutral 胶囊
+        let mut rest = prompt.as_str();
+        let mut pill_count = 0usize;
+        while let Some(start) = rest.find("[[") {
+            let after = &rest[start + 2..];
+            let end = after.find("]]").expect("unclosed [[");
+            let label = &after[..end];
+            let parsed = parse_pill(label);
+            assert_ne!(
+                parsed.tone,
+                PillTone::Neutral,
+                "pill [[{label}]] in reply_guidance_prompt must match renderer vocabulary"
+            );
+            pill_count += 1;
+            rest = &after[end + 2..];
+        }
+        assert!(pill_count >= 10, "expected core pills, got {pill_count}");
     }
 
     #[test]

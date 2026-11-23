@@ -6,32 +6,28 @@
 
 pub mod model;
 pub mod persistence;
+pub mod recall;
+pub mod sqlite;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
-use mizar_llm::{ContentBlock, Message, ReasoningEffort};
+use mizar_types::hooks::{HookGuard, SyncEventBus};
+use mizar_types::llm::{ContentBlock, Message, ReasoningEffort};
 use uuid::Uuid;
 
 pub use model::{
-    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
-    RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin,
-    SessionSelection, SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
+    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, RecallSearchHit,
+    RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry, SessionEvent,
+    SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin, SessionSelection,
+    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
     derive_session_title,
 };
-pub use persistence::{
-    PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionPersistence,
-    SessionPersistenceContextExt, SessionPersistenceHandle,
-};
-
-pub const EVENT_SESSION_EVENT: &str = "session/event";
-pub const EVENT_SESSION_CREATED: &str = "session/created";
-pub const EVENT_SESSION_LOADED: &str = "session/loaded";
-pub const EVENT_SESSION_TITLE_UPDATED: &str = "session/title-updated";
+pub use persistence::{PersistenceError, PersistenceResult, SessionPersistence};
+pub use recall::{RECALL_TOOL_NAME, RecallConfig, register_recall_tool};
+pub use sqlite::{SqlitePersistenceConfig, SqliteSessionPersistence};
 
 #[derive(Clone)]
 pub struct SessionEventPayload {
@@ -56,6 +52,32 @@ pub struct SessionTitleUpdatedPayload {
     pub title_source: Option<TitleSource>,
 }
 
+struct SessionShared {
+    persistence: Mutex<Option<Arc<dyn SessionPersistence>>>,
+    on_event: SyncEventBus<SessionEventPayload>,
+    on_created: SyncEventBus<SessionCreatedPayload>,
+    on_loaded: SyncEventBus<SessionLoadedPayload>,
+    on_title_updated: SyncEventBus<SessionTitleUpdatedPayload>,
+}
+
+impl Default for SessionShared {
+    fn default() -> Self {
+        Self {
+            persistence: Mutex::new(None),
+            on_event: SyncEventBus::new(),
+            on_created: SyncEventBus::new(),
+            on_loaded: SyncEventBus::new(),
+            on_title_updated: SyncEventBus::new(),
+        }
+    }
+}
+
+impl SessionShared {
+    fn persistence(&self) -> Option<Arc<dyn SessionPersistence>> {
+        self.persistence.lock().unwrap().clone()
+    }
+}
+
 struct SessionInner {
     header: SessionHeader,
     log: Vec<SessionEntry>,
@@ -66,7 +88,15 @@ pub struct Session {
     pub id: String,
     inner: Mutex<SessionInner>,
     turn_counter: AtomicU64,
-    ctx: Context,
+    shared: Arc<SessionShared>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 fn now_millis() -> u128 {
@@ -125,18 +155,6 @@ fn collect_visible_indices(log: &[SessionEntry]) -> Vec<usize> {
     indices
 }
 
-fn collect_pruned_map(log: &[SessionEntry]) -> HashMap<u64, String> {
-    let mut map = HashMap::new();
-    for entry in log {
-        if let SessionEvent::ToolResultPrune { pruned } = &entry.event {
-            for item in pruned {
-                map.insert(item.target_seq, item.replacement.clone());
-            }
-        }
-    }
-    map
-}
-
 /// 将压缩检查点统一格式化为发给模型的软硬分离上下文块。
 pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> String {
     let mut out = String::new();
@@ -164,7 +182,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
             for pin in &digest.pinned_inputs {
                 out.push_str(&format!("[input seq #{}]", pin.seq));
                 if pin.truncated {
-                    out.push_str(" (truncated; use recall_read for full text)");
+                    out.push_str(" (truncated; use recall for full text)");
                 }
                 out.push('\n');
                 out.push_str(&pin.text);
@@ -176,7 +194,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
     out.push_str("<mizar-summary>\n");
     out.push_str(summary.trim());
     out.push_str("\n</mizar-summary>\n");
-    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall_search` / `recall_read`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
+    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
     out.push_str("</mizar-compaction>");
     out
 }
@@ -202,7 +220,6 @@ fn find_dangling_tool_calls(entries: &[SessionEntry]) -> Vec<(String, String)> {
             }
             SessionEvent::ContextNotice { .. }
             | SessionEvent::BashExecution { .. }
-            | SessionEvent::ToolResultPrune { .. }
             | SessionEvent::Selection { .. }
             | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => {}
@@ -260,13 +277,17 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
 }
 
 impl Session {
-    pub fn new(ctx: Context, id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Self {
         let id = id.into();
         let header = SessionHeader::new(id.clone(), now_millis());
-        Self::from_parts(ctx, header, Vec::new())
+        Self::from_parts(Arc::new(SessionShared::default()), header, Vec::new())
     }
 
-    pub fn from_loaded(ctx: Context, loaded: LoadedSession) -> Self {
+    pub fn from_loaded(loaded: LoadedSession) -> Self {
+        Self::from_loaded_with_shared(Arc::new(SessionShared::default()), loaded)
+    }
+
+    fn from_loaded_with_shared(shared: Arc<SessionShared>, loaded: LoadedSession) -> Self {
         let entries_last = loaded.entries.last().map_or(0, |e| e.seq);
         let floor = if let Some(max_p) = loaded.max_persisted_seq {
             max_p.max(entries_last)
@@ -275,16 +296,20 @@ impl Session {
         } else {
             entries_last
         };
-        Self::from_parts_with_floor(ctx, loaded.header, loaded.entries, floor)
+        Self::from_parts_with_floor(shared, loaded.header, loaded.entries, floor)
     }
 
-    fn from_parts(ctx: Context, header: SessionHeader, log: Vec<SessionEntry>) -> Self {
+    fn from_parts(
+        shared: Arc<SessionShared>,
+        header: SessionHeader,
+        log: Vec<SessionEntry>,
+    ) -> Self {
         let floor = log.last().map_or(0, |e| e.seq);
-        Self::from_parts_with_floor(ctx, header, log, floor)
+        Self::from_parts_with_floor(shared, header, log, floor)
     }
 
     fn from_parts_with_floor(
-        ctx: Context,
+        shared: Arc<SessionShared>,
         mut header: SessionHeader,
         log: Vec<SessionEntry>,
         min_last_seq: u64,
@@ -315,7 +340,7 @@ impl Session {
                 min_last_seq,
             }),
             turn_counter: AtomicU64::new(turn_init),
-            ctx,
+            shared,
         }
     }
 
@@ -328,9 +353,9 @@ impl Session {
         self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// 追加一条事件（`Surface` 或 `LogOnly`），同步写入可选持久化队列，并广播 `session/event`。
+    /// 追加一条事件（`Surface` 或 `LogOnly`），同步写入可选持久化队列，并广播 `on_event`。
     pub fn append(self: &Arc<Self>, event: SessionEvent) {
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let (entry, emitted_title) = {
             let mut inner = self.inner.lock().unwrap();
             let seq = inner
@@ -400,38 +425,38 @@ impl Session {
 
             if let Some(ref backend) = persistence {
                 if let Err(err) = backend.append_events(&self.id, std::slice::from_ref(&entry)) {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化追加事件失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化追加事件失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 if let Some(patch) = title_patch
                     && let Err(err) = backend.update_header(&self.id, patch)
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化更新标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
             }
 
             (entry, emitted_title)
         };
 
-        self.ctx.emit(
-            EVENT_SESSION_EVENT,
-            SessionEventPayload {
-                session: Arc::clone(self),
-                entry,
-            },
-        );
+        self.shared.on_event.emit(&SessionEventPayload {
+            session: Arc::clone(self),
+            entry,
+        });
         if let Some((title, title_source)) = emitted_title {
-            self.ctx.emit(
-                EVENT_SESSION_TITLE_UPDATED,
-                SessionTitleUpdatedPayload {
+            self.shared
+                .on_title_updated
+                .emit(&SessionTitleUpdatedPayload {
                     session: Arc::clone(self),
                     title,
                     title_source,
-                },
-            );
+                });
         }
     }
 
@@ -471,7 +496,7 @@ impl Session {
         if cleaned.is_empty() {
             return false;
         }
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let ts = now_millis();
         let changed = {
             let mut inner = self.inner.lock().unwrap();
@@ -494,9 +519,11 @@ impl Session {
                         },
                     )
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化更新标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 true
             }
@@ -504,14 +531,13 @@ impl Session {
         if !changed {
             return false;
         }
-        self.ctx.emit(
-            EVENT_SESSION_TITLE_UPDATED,
-            SessionTitleUpdatedPayload {
+        self.shared
+            .on_title_updated
+            .emit(&SessionTitleUpdatedPayload {
                 session: Arc::clone(self),
                 title: Some(cleaned),
                 title_source: Some(source),
-            },
-        );
+            });
         true
     }
 
@@ -529,7 +555,7 @@ impl Session {
         if cleaned.is_empty() {
             return Err(self.header().title);
         }
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let ts = now_millis();
         enum CasOutcome {
             Skipped(Option<String>),
@@ -561,9 +587,11 @@ impl Session {
                         },
                     )
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化更新标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化更新标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 CasOutcome::Updated
             }
@@ -572,14 +600,13 @@ impl Session {
             CasOutcome::Skipped(cur) => Err(cur),
             CasOutcome::Unchanged => Ok(cleaned),
             CasOutcome::Updated => {
-                self.ctx.emit(
-                    EVENT_SESSION_TITLE_UPDATED,
-                    SessionTitleUpdatedPayload {
+                self.shared
+                    .on_title_updated
+                    .emit(&SessionTitleUpdatedPayload {
                         session: Arc::clone(self),
                         title: Some(cleaned.clone()),
                         title_source: Some(TitleSource::Auto),
-                    },
-                );
+                    });
                 Ok(cleaned)
             }
         }
@@ -587,7 +614,7 @@ impl Session {
 
     /// 清空会话标题与来源标记。
     pub fn clear_title(self: &Arc<Self>) -> bool {
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let ts = now_millis();
         let changed = {
             let mut inner = self.inner.lock().unwrap();
@@ -608,9 +635,11 @@ impl Session {
                         },
                     )
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化清空标题失败 (session={}): {err}", self.id));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化清空标题失败 (session={}): {err}",
+                        self.id
+                    );
                 }
                 true
             }
@@ -618,14 +647,13 @@ impl Session {
         if !changed {
             return false;
         }
-        self.ctx.emit(
-            EVENT_SESSION_TITLE_UPDATED,
-            SessionTitleUpdatedPayload {
+        self.shared
+            .on_title_updated
+            .emit(&SessionTitleUpdatedPayload {
                 session: Arc::clone(self),
                 title: None,
                 title_source: None,
-            },
-        );
+            });
         true
     }
 
@@ -727,22 +755,6 @@ impl Session {
         inner.log.last().map_or(first_kept_seq, |e| e.seq)
     }
 
-    /// 追加一批锁存的投影层工具输出剪枝记录（不修改原始 `ToolResult` 事件）。
-    pub fn append_prune(self: &Arc<Self>, pruned: Vec<PrunedToolResult>) -> Option<u64> {
-        if pruned.is_empty() {
-            return None;
-        }
-        self.append(SessionEvent::ToolResultPrune { pruned });
-        let inner = self.inner.lock().unwrap();
-        inner.log.last().map(|e| e.seq)
-    }
-
-    /// 返回当前已锁存的所有工具结果剪枝映射（`target_seq -> replacement`）。
-    pub fn pruned_map(&self) -> HashMap<u64, String> {
-        let inner = self.inner.lock().unwrap();
-        collect_pruned_map(&inner.log)
-    }
-
     /// 返回最新一条事件序号（空会话返回 `0`）。
     pub fn last_seq(&self) -> u64 {
         self.inner.lock().unwrap().log.last().map_or(0, |e| e.seq)
@@ -758,7 +770,7 @@ impl Session {
     }
 
     pub fn flush(&self) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush(Some(&self.id))
         } else {
             Ok(())
@@ -766,7 +778,7 @@ impl Session {
     }
 
     pub async fn flush_async(&self) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush_async(Some(self.id.clone())).await
         } else {
             Ok(())
@@ -815,11 +827,10 @@ impl Session {
         f(&inner.log)
     }
 
-    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口与 `ToolResultPrune` 剪枝投影并跳过 `LogOnly` 事件）。
+    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口并跳过 `LogOnly` 事件）。
     pub fn derive_messages(&self) -> Vec<Message> {
         let inner = self.inner.lock().unwrap();
         let indices = collect_visible_indices(&inner.log);
-        let pruned_map = collect_pruned_map(&inner.log);
         let mut messages = Vec::with_capacity(indices.len());
         for idx in indices {
             let entry = &inner.log[idx];
@@ -844,12 +855,8 @@ impl Session {
                     is_error,
                     ..
                 } => {
-                    let effective_content = pruned_map
-                        .get(&entry.seq)
-                        .cloned()
-                        .unwrap_or_else(|| content.clone());
                     messages.push(Message::Tool {
-                        content: effective_content,
+                        content: content.clone(),
                         tool_call_id: tool_call_id.clone(),
                         is_error: *is_error,
                     });
@@ -888,8 +895,7 @@ impl Session {
                         messages.push(Message::user(content));
                     }
                 }
-                SessionEvent::ToolResultPrune { .. }
-                | SessionEvent::Selection { .. }
+                SessionEvent::Selection { .. }
                 | SessionEvent::Usage { .. }
                 | SessionEvent::Trace { .. } => {}
             }
@@ -899,12 +905,59 @@ impl Session {
 }
 
 pub struct SessionStore {
-    ctx: Context,
+    shared: Arc<SessionShared>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     default_cwd: Mutex<Option<String>>,
 }
 
 impl SessionStore {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shared: Arc::new(SessionShared::default()),
+            sessions: Mutex::new(HashMap::new()),
+            default_cwd: Mutex::new(None),
+        })
+    }
+
+    pub fn with_persistence(persistence: Arc<dyn SessionPersistence>) -> Arc<Self> {
+        let store = Self::new();
+        store.set_persistence(Some(persistence));
+        store
+    }
+
+    pub fn set_persistence(&self, persistence: Option<Arc<dyn SessionPersistence>>) {
+        *self.shared.persistence.lock().unwrap() = persistence;
+    }
+
+    pub fn persistence(&self) -> Option<Arc<dyn SessionPersistence>> {
+        self.shared.persistence()
+    }
+
+    pub fn on_event(&self, cb: impl Fn(&SessionEventPayload) + Send + Sync + 'static) -> HookGuard {
+        self.shared.on_event.on(cb)
+    }
+
+    pub fn on_created(
+        &self,
+        cb: impl Fn(&SessionCreatedPayload) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.shared.on_created.on(cb)
+    }
+
+    pub fn on_loaded(
+        &self,
+        cb: impl Fn(&SessionLoadedPayload) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.shared.on_loaded.on(cb)
+    }
+
+    pub fn on_title_updated(
+        &self,
+        cb: impl Fn(&SessionTitleUpdatedPayload) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.shared.on_title_updated.on(cb)
+    }
+
     pub fn set_default_cwd(&self, cwd: Option<String>) {
         *self.default_cwd.lock().unwrap() = cwd;
     }
@@ -932,7 +985,7 @@ impl SessionStore {
         header.origin = opts.origin;
 
         let session = Arc::new(Session::from_parts(
-            self.ctx.clone(),
+            Arc::clone(&self.shared),
             header.clone(),
             Vec::new(),
         ));
@@ -941,21 +994,19 @@ impl SessionStore {
             .unwrap()
             .insert(id, Arc::clone(&session));
 
-        if let Some(backend) = self.ctx.session_persistence()
+        if let Some(backend) = self.shared.persistence()
             && let Err(err) = backend.create_session(&header)
         {
-            self.ctx.logger_named("session").warn(format!(
+            tracing::warn!(
+                target: "mizar::session",
                 "持久化创建会话失败 (session={}): {err}",
                 session.id
-            ));
+            );
         }
 
-        self.ctx.emit(
-            EVENT_SESSION_CREATED,
-            SessionCreatedPayload {
-                session: Arc::clone(&session),
-            },
-        );
+        self.shared.on_created.emit(&SessionCreatedPayload {
+            session: Arc::clone(&session),
+        });
         session
     }
 
@@ -979,17 +1030,91 @@ impl SessionStore {
                 skipped_events: 0,
             });
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend.load_session(id).ok().flatten()
+    }
+
+    /// 异步只读加载或快照指定会话（优先走内存缓存，否则非阻塞委托持久化后端）。
+    pub async fn inspect_readonly_async(&self, id: &str) -> Option<LoadedSession> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            let max_seq = inner
+                .log
+                .last()
+                .map_or(0, |e| e.seq)
+                .max(inner.min_last_seq);
+            return Some(LoadedSession {
+                header: inner.header.clone(),
+                entries: inner.log.clone(),
+                max_persisted_seq: (max_seq > 0).then_some(max_seq),
+                skipped_events: 0,
+            });
+        }
+        let backend = self.shared.persistence()?;
+        backend
+            .load_session_async(id.to_string())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// 轻量只读获取会话头信息（避免深拷贝或全量反序列化 `entries`）。
+    pub fn inspect_header(&self, id: &str) -> Option<SessionHeader> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            return Some(existing.header());
+        }
+        let backend = self.shared.persistence()?;
+        backend.load_header(id).ok().flatten()
+    }
+
+    /// 异步轻量只读获取会话头信息。
+    pub async fn inspect_header_async(&self, id: &str) -> Option<SessionHeader> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
+            return Some(existing.header());
+        }
+        let backend = self.shared.persistence()?;
+        backend
+            .load_header_async(id.to_string())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// 轻量只读窥视某个会话最后记录的选择：不水合、不克隆整段事件日志、不触发悬挂工具调用修复。
+    pub fn peek_selection_light(&self, session_id: &str) -> Option<SessionSelection> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(session_id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            return inner
+                .log
+                .iter()
+                .rev()
+                .find_map(|entry| entry.event.as_selection());
+        }
+        let backend = self.shared.persistence()?;
+        backend.latest_selection(session_id).ok().flatten()
     }
 
     /// 只读窥视某个会话最后记录的选择：不水合进内存、不触发悬挂工具调用修复（后者会写库）。
     pub fn peek_selection(&self, session_id: &str) -> Option<SessionSelection> {
-        self.inspect_readonly(session_id)?
-            .entries
-            .iter()
-            .rev()
-            .find_map(|entry| entry.event.as_selection())
+        self.peek_selection_light(session_id)
+    }
+
+    /// 异步轻量只读窥视某个会话最后记录的选择。
+    pub async fn peek_selection_async(&self, session_id: &str) -> Option<SessionSelection> {
+        if let Some(existing) = self.sessions.lock().unwrap().get(session_id).cloned() {
+            let inner = existing.inner.lock().unwrap();
+            return inner
+                .log
+                .iter()
+                .rev()
+                .find_map(|entry| entry.event.as_selection());
+        }
+        let backend = self.shared.persistence()?;
+        backend
+            .latest_selection_async(session_id.to_string())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// 优先从内存返回；若内存中不存在且挂载了持久化后端，则自动从后端水合重建（包含悬挂工具调用自愈）。
@@ -998,24 +1123,29 @@ impl SessionStore {
             return Some(existing);
         }
 
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         match backend.load_session(id) {
             Ok(Some(mut loaded)) => {
                 if loaded.skipped_events > 0 {
-                    self.ctx.logger_named("session").warn(format!(
+                    tracing::warn!(
+                        target: "mizar::session",
                         "会话 {id} 有 {} 条事件无法解析已跳过（常见于旧版二进制读新版写入的会话），其余历史已正常载入",
                         loaded.skipped_events
-                    ));
+                    );
                 }
                 let repaired = repair_dangling_tool_calls(&mut loaded);
                 if !repaired.is_empty()
                     && let Err(err) = backend.append_events(id, &repaired)
                 {
-                    self.ctx
-                        .logger_named("session")
-                        .warn(format!("持久化写入崩溃恢复条目失败 (session={id}): {err}"));
+                    tracing::warn!(
+                        target: "mizar::session",
+                        "持久化写入崩溃恢复条目失败 (session={id}): {err}"
+                    );
                 }
-                let session = Arc::new(Session::from_loaded(self.ctx.clone(), loaded));
+                let session = Arc::new(Session::from_loaded_with_shared(
+                    Arc::clone(&self.shared),
+                    loaded,
+                ));
                 let (stored, inserted) = {
                     let mut guard = self.sessions.lock().unwrap();
                     if let Some(existing) = guard.get(id) {
@@ -1026,20 +1156,18 @@ impl SessionStore {
                     }
                 };
                 if inserted {
-                    self.ctx.emit(
-                        EVENT_SESSION_LOADED,
-                        SessionLoadedPayload {
-                            session: Arc::clone(&stored),
-                        },
-                    );
+                    self.shared.on_loaded.emit(&SessionLoadedPayload {
+                        session: Arc::clone(&stored),
+                    });
                 }
                 Some(stored)
             }
             Ok(None) => None,
             Err(err) => {
-                self.ctx
-                    .logger_named("session")
-                    .warn(format!("从持久化后端加载会话失败 (session={id}): {err}"));
+                tracing::warn!(
+                    target: "mizar::session",
+                    "从持久化后端加载会话失败 (session={id}): {err}"
+                );
                 None
             }
         }
@@ -1080,7 +1208,7 @@ impl SessionStore {
         new_header.fork_seq = Some(up_to_seq);
         new_header.origin = opts.origin.or(Some(SessionOrigin::User));
 
-        let mut loaded = if let Some(backend) = self.ctx.session_persistence() {
+        let mut loaded = if let Some(backend) = self.shared.persistence() {
             backend.fork_session(from_session_id, up_to_seq, &new_header)?
         } else {
             let entries: Vec<SessionEntry> = parent
@@ -1099,22 +1227,22 @@ impl SessionStore {
 
         let repaired = repair_dangling_tool_calls(&mut loaded);
         if !repaired.is_empty()
-            && let Some(backend) = self.ctx.session_persistence()
+            && let Some(backend) = self.shared.persistence()
         {
             backend.append_events(&new_id, &repaired)?;
         }
 
-        let child = Arc::new(Session::from_loaded(self.ctx.clone(), loaded));
+        let child = Arc::new(Session::from_loaded_with_shared(
+            Arc::clone(&self.shared),
+            loaded,
+        ));
         self.sessions
             .lock()
             .unwrap()
             .insert(new_id, Arc::clone(&child));
-        self.ctx.emit(
-            EVENT_SESSION_CREATED,
-            SessionCreatedPayload {
-                session: Arc::clone(&child),
-            },
-        );
+        self.shared.on_created.emit(&SessionCreatedPayload {
+            session: Arc::clone(&child),
+        });
         Ok(child)
     }
 
@@ -1133,7 +1261,26 @@ impl SessionStore {
             }
             chain.push(id.clone());
             depth += 1;
-            cur = self.inspect_readonly(&id).and_then(|s| s.header.parent_id);
+            cur = self.inspect_header(&id).and_then(|h| h.parent_id);
+        }
+        chain
+    }
+
+    /// 异步沿 `parent_id` 向上回溯会话谱系链（轻量仅查头信息，最多 64 代，防环）。
+    pub async fn lineage_session_ids_async(&self, session_id: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut cur = Some(session_id.to_string());
+        let mut depth = 0usize;
+        while let Some(id) = cur {
+            if depth >= 64 || chain.contains(&id) {
+                break;
+            }
+            chain.push(id.clone());
+            depth += 1;
+            cur = self
+                .inspect_header_async(&id)
+                .await
+                .and_then(|h| h.parent_id);
         }
         chain
     }
@@ -1143,19 +1290,26 @@ impl SessionStore {
         &self,
         query: &RecallSearchQuery,
     ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.search_recall(query)
         } else {
             Ok(None)
         }
     }
 
-    /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。
-    pub fn list_headers(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
-        if let Some(backend) = self.ctx.session_persistence() {
-            return backend.list_sessions(query);
+    /// 异步委托给持久化后端执行全文情景回溯。
+    pub async fn search_recall_async(
+        &self,
+        query: RecallSearchQuery,
+    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
+        if let Some(backend) = self.shared.persistence() {
+            backend.search_recall_async(query).await
+        } else {
+            Ok(None)
         }
+    }
 
+    fn list_in_memory_headers(&self, query: &SessionListQuery) -> Vec<SessionHeader> {
         let mut headers: Vec<SessionHeader> = self
             .sessions
             .lock()
@@ -1178,11 +1332,30 @@ impl SessionStore {
         if let Some(limit) = query.limit {
             headers.truncate(limit);
         }
-        Ok(headers)
+        headers
+    }
+
+    /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。
+    pub fn list_headers(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
+        if let Some(backend) = self.shared.persistence() {
+            return backend.list_sessions(query);
+        }
+        Ok(self.list_in_memory_headers(query))
+    }
+
+    /// 异步列出全部会话头信息。
+    pub async fn list_headers_async(
+        &self,
+        query: SessionListQuery,
+    ) -> PersistenceResult<Vec<SessionHeader>> {
+        if let Some(backend) = self.shared.persistence() {
+            return backend.list_sessions_async(query).await;
+        }
+        Ok(self.list_in_memory_headers(&query))
     }
 
     pub fn flush(&self, session_id: Option<&str>) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush(session_id)
         } else {
             Ok(())
@@ -1190,7 +1363,7 @@ impl SessionStore {
     }
 
     pub async fn flush_async(&self, session_id: Option<String>) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush_async(session_id).await
         } else {
             Ok(())
@@ -1199,52 +1372,5 @@ impl SessionStore {
 
     pub fn clear(&self) {
         self.sessions.lock().unwrap().clear();
-    }
-}
-
-impl Service for SessionStore {
-    type Config = ();
-
-    fn service_name() -> &'static str {
-        "sessions"
-    }
-
-    fn plugin_name() -> &'static str {
-        "SessionStore"
-    }
-
-    fn create(ctx: &Context, _config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            sessions: Mutex::new(HashMap::new()),
-            default_cwd: Mutex::new(None),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let store = Arc::downgrade(&self);
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            // 服务卸载前刷新持久化屏障，再清掉内存会话缓存
-            ctx.effect("sessions.clear", || {
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || {
-                    if let Some(s) = store.upgrade() {
-                        let _ = s.flush(None);
-                        s.clear();
-                    }
-                })))
-            })?;
-            Ok(())
-        })
-    }
-}
-
-pub trait SessionContextExt {
-    fn sessions(&self) -> Result<Arc<SessionStore>, CordisError>;
-}
-
-impl SessionContextExt for Context {
-    fn sessions(&self) -> Result<Arc<SessionStore>, CordisError> {
-        self.service::<SessionStore>("sessions")
     }
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use mizar_llm_types::{ImageAttachment, MAX_IMAGES_PER_MESSAGE, ReasoningEffort};
+use mizar_types::llm::{ImageAttachment, MAX_IMAGES_PER_MESSAGE, ReasoningEffort};
 
 use super::{
     AppAction, AppState, ApprovalMode, BashInputMode, LaunchpadQuickAction, NoticeLevel,
@@ -765,7 +765,7 @@ impl AppState {
                         && let Some(turn) = self.timeline_snap.turns.get(idx)
                     {
                         self.auto_scroll = false;
-                        self.scroll_from_top = turn.top_line.min(u16::MAX as usize) as u16;
+                        self.scroll_from_top = turn.top_line;
                     }
                     return AppAction::None;
                 }

@@ -15,6 +15,8 @@
 //! - `--reasoning-effort <level>`：推理强度（`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`）
 //! - `--max-steps <n>`：限制单轮最大工具循环步数
 //! - `--timeout <secs>`：限制无头单次任务总超时秒数
+//! - `--output-format <fmt>` / `--json`：无头输出格式（`text` / `json`）
+//! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
 //! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
 //! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
@@ -41,21 +43,22 @@
 //! - `BASE_URL`、`MODEL`、`WORKSPACE`、`MIZAR_HOME`
 //! - `MIZAR_SKIP_VERSION_CHECK` / `MIZAR_OFFLINE`：跳过启动时版本检查（`MIZAR_OFFLINE` 同时禁用更新下载）
 //! - `MIZAR_RELEASE_BASE_URL`：覆盖 GitHub Release 基址（默认为 `https://github.com/Mieluoxxx/Mizar`）
+//! - `MIZAR_TRACE_OUT`：无头模式结构化轨迹 JSON 导出路径（低于 `--trace-out` 优先级）
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use cordis::{Context, Service};
-use mizar_agent_spine::{
-    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, load_mizar_config,
+use mizar_core::spine::{
+    AgentSpineConfig, AgentToolsMode, MizarRuntime, load_mizar_config,
     resolve_default_session_db_path,
 };
 use mizar_llm::ReasoningEffort;
-use mizar_llm_mock::MockPlugin;
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
-use mizar_llm_router::LlmRouter;
-use mizar_tools_coding::CodingToolsPreset;
-use mizar_tui::exec::{ExecConfig, ExecOutputFormat, resolve_exec_prompt, run_exec_cli};
+use mizar_llm::retry::RetryConfig;
+use mizar_tools::coding::CodingToolsPreset;
+use mizar_tui::exec::{
+    ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
+};
 use mizar_tui::update::{current_version, run_update_cli, should_check_for_updates_at_startup};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -94,6 +97,7 @@ struct CliArgs {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     output_format: Option<ExecOutputFormat>,
+    trace_out: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -112,6 +116,7 @@ impl CliArgs {
             || self.max_tokens.is_some()
             || self.timeout_secs.is_some()
             || self.output_format.is_some()
+            || self.trace_out.is_some()
     }
 }
 
@@ -145,6 +150,7 @@ Options:
       --timeout <secs>          Total execution timeout in seconds (>= 1)
       --output-format <fmt>     Headless output format (text, json)
       --json                    Shorthand for --output-format json
+      --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
       --isolated                Skip personal global config, MCP, skills, instructions, and DB
       --minimal                 Enable minimal coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
@@ -428,6 +434,13 @@ where
                 }
                 out.output_format = Some(ExecOutputFormat::Json);
             }
+            "--trace-out" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--trace-out 路径不能为空".to_string());
+                }
+                out.trace_out = Some(PathBuf::from(val));
+            }
             "--timeout" => {
                 let val = take_value(flag, inline, &mut args)?;
                 let parsed = val
@@ -556,6 +569,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             exclude_tools: cli.exclude_tools,
             resume_session: cli.resume_session,
             output_format: cli.output_format.unwrap_or_default(),
+            trace_out: resolve_trace_out_path(cli.trace_out, env_non_empty("MIZAR_TRACE_OUT")),
         })
         .await;
         if code != 0 {
@@ -566,17 +580,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.has_exec_only_flags() {
         eprintln!(
-            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --max-tokens, --timeout, --output-format, --json) require `exec`, `-p/--prompt`, or `--prompt-file`"
+            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --max-tokens, --timeout, --output-format, --json, --trace-out) require `exec`, `-p/--prompt`, or `--prompt-file`"
         );
         std::process::exit(1);
     }
 
-    let app = Context::new();
-    // 进入终端界面前先静默，防止启动日志先刷到 stdout 再闪屏
-    app.logger().set_silent();
+    // 进入终端界面前先静默，防止启动日志先刷到 stderr 再闪屏
+    let _startup_tracing_guard = mizar_client::install_silent_tracing();
 
     let loaded_cfg = load_mizar_config(&workspace);
     let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());
+    // `session-title` 仅归属交互式 TUI 会话（先开启默认配置再应用 settings.json 覆盖）
+    spine_cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
     if !cli.no_persist {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
@@ -661,15 +676,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             .push((NoticeLevel::Warn, format!("配置解析失败：{err}")));
     }
 
-    app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
+    let runtime = MizarRuntime::build(spine_cfg).await?;
+    runtime.install_retry(RetryConfig::default());
 
     if let Some(resolved) = resolved_llm {
-        app.plugin(LlmRouter::plugin(), resolved.router);
+        runtime.install_router(resolved.router);
         tui_cfg.provider = Some(resolved.active_provider);
         tui_cfg.model = resolved.active_model;
     } else {
-        app.plugin(MockPlugin, ());
+        runtime.register_mock_adapter()?;
         tui_cfg.provider = Some("mock".to_string());
         tui_cfg.model = Some("mock-v1".to_string());
         tui_cfg.startup_notices.push((
@@ -679,8 +694,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let run_res = run_tui_with_summary(app.clone(), tui_cfg).await;
-    app.fiber().dispose().await;
+    let run_res = run_tui_with_summary(Arc::clone(&runtime), tui_cfg).await;
+    runtime.shutdown().await;
     match run_res {
         Ok(summary) => {
             if std::io::stdout().is_terminal()
@@ -812,5 +827,42 @@ mod tests {
                 .unwrap()
                 .has_exec_only_flags()
         );
+    }
+
+    #[test]
+    fn parse_exec_trace_out_flag_and_validation() {
+        let parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--trace-out".to_string(),
+            "artifacts/trace.json".to_string(),
+            "run".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.trace_out.as_deref(),
+            Some(std::path::Path::new("artifacts/trace.json"))
+        );
+        assert!(parsed.has_exec_only_flags());
+
+        let inline_parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--trace-out=/tmp/t.json".to_string(),
+            "run".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            inline_parsed.trace_out.as_deref(),
+            Some(std::path::Path::new("/tmp/t.json"))
+        );
+
+        assert!(parse_cli_args_from(["exec".into(), "--trace-out".into(), "   ".into()]).is_err());
+        assert!(parse_cli_args_from(["exec".into(), "--trace-out".into()]).is_err());
+        assert!(
+            parse_cli_args_from(["--trace-out".into(), "a.json".into()])
+                .unwrap()
+                .has_exec_only_flags()
+        );
+        assert!(format_help_text().contains("--trace-out <path>"));
+        assert!(format_help_text().contains("MIZAR_TRACE_OUT"));
     }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mizar_instructions::sha256_hex;
+use mizar_core::instructions::sha256_hex;
 use reqwest::redirect::Policy;
 
 pub const DEFAULT_RELEASE_REPO_URL: &str = "https://github.com/Mieluoxxx/Mizar";
@@ -234,19 +234,22 @@ fn extract_tag_from_location_or_url(raw: &str) -> Option<String> {
 }
 
 fn build_release_client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .user_agent(format!("mizar/{}", current_version()))
-        // 一旦重定向指向 `/releases/tag/...` 即停止，避免下载整页 Release HTML，同时免受 GitHub API 限流
-        .redirect(Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || attempt.url().path().contains("/releases/tag/") {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))
+    mizar_llm::http::configure_custom_ca_roots(
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .user_agent(format!("mizar/{}", current_version()))
+            // 一旦重定向指向 `/releases/tag/...` 即停止，避免下载整页 Release HTML，同时免受 GitHub API 限流
+            .redirect(Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 || attempt.url().path().contains("/releases/tag/")
+                {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            })),
+    )
+    .build()
+    .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))
 }
 
 /// 通过 `<base_url>/releases/latest` 的重定向头解析最新 Release 标签。

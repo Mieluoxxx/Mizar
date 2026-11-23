@@ -2,18 +2,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use cordis::{Cleanup, Context, LogLevel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use mizar_agent_loop::{AgentLoopContextExt, RunOptions};
-use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+use mizar_core::agent_loop::RunOptions;
+use mizar_core::spine::{AgentSpineConfig, AgentToolsMode, MizarRuntime};
+use mizar_core::trajectory::TimelineMode;
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, ModelInfo,
-    ProviderInfo, ReasoningEffort, StreamChunk,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, ModelInfo, ProviderInfo,
+    ReasoningEffort, StreamChunk,
 };
-use mizar_llm_mock::MockPlugin;
-use mizar_session::{SessionContextExt, SessionCreateOptions, SessionEvent, TitleSource};
-use mizar_system_prompt::SystemPromptContextExt;
-use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
+use mizar_session::{SessionCreateOptions, SessionEvent, TitleSource};
 use mizar_tui::app::ToolExtraMeta;
 use mizar_tui::editor::display_width;
 use mizar_tui::emphasis::mount_reply_guidance_section;
@@ -21,8 +18,9 @@ use mizar_tui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui::side_panel::FileTouchRow;
 use mizar_tui::{
     AppAction, AppState, ChatItem, EmphasisConfig, SessionReplayItem, TuiConfig, UiEvent,
-    collect_session_picker_items, project_fork_view, project_resume_view, project_session_tree,
-    render, resume_session_into_app, subscribe_session_events, to_ui_log_record, wait_for_services,
+    UiLogLevel, collect_session_picker_items, install_tracing_handler, project_fork_view,
+    project_resume_view, project_session_tree, render, resume_session_into_app,
+    subscribe_session_events,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -48,9 +46,6 @@ fn buffer_text(backend: &TestBackend) -> String {
 
 #[tokio::test]
 async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
-    let app_ctx = Context::new();
-    app_ctx.logger().set_silent();
-
     let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -63,21 +58,18 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    app_ctx.plugin(AgentSpinePlugin, spine_cfg);
-    app_ctx.plugin(MockPlugin, ());
-    wait_for_services(&app_ctx).await.unwrap();
+    let runtime = MizarRuntime::build(spine_cfg).await.unwrap();
+    runtime.register_mock_adapter().unwrap();
 
-    let session = app_ctx.sessions().unwrap().create(None);
+    let session = runtime.sessions.create(None);
     let active_sid = Arc::new(RwLock::new(session.id.clone()));
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
-    let handles = subscribe_session_events(&app_ctx, Arc::clone(&active_sid), tx.clone()).unwrap();
+    let handles = subscribe_session_events(&runtime, Arc::clone(&active_sid), tx.clone());
 
-    // 重定向 logger 到 UI 事件
+    // 重定向 tracing 日志到 UI 事件
     let log_tx = tx.clone();
-    app_ctx.logger().set_handler(move |rec| {
-        if rec.level >= LogLevel::Warn {
-            let _ = log_tx.send(UiEvent::Log(to_ui_log_record(rec)));
-        }
+    let _log_guard = install_tracing_handler(UiLogLevel::Warn, move |rec| {
+        let _ = log_tx.send(UiEvent::Log(rec.clone()));
     });
 
     let mut state = AppState::new(
@@ -98,16 +90,15 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     assert!(welcome.contains("Mizar"), "welcome:\n{welcome}");
     assert!(welcome.contains("mock/mock-v1"), "welcome:\n{welcome}");
 
-    // 2. 触发一条真实 logger.warn，确认通过 UI 显示而不走 stdout
-    app_ctx.logger_named("tui-test").warn("测试告警消息");
+    // 2. 触发一条真实 tracing::warn!，确认通过 UI 显示而不走 stdout
+    tracing::warn!(target: "mizar::tui-test", "测试告警消息");
 
     // 3. 跑一轮会调用编码工具 find 的对话
     state.items.push(mizar_tui::ChatItem::User {
         text: "项目里有哪些文件？".into(),
     });
-    let reply = app_ctx
-        .agent_loop()
-        .unwrap()
+    let reply = runtime
+        .agent_loop
         .run_with_options(
             Arc::clone(&session),
             "项目里有哪些文件？",
@@ -137,19 +128,15 @@ async fn renders_welcome_and_streams_mock_tool_roundtrip_into_test_backend() {
     let mut narrow_term = Terminal::new(narrow_backend).unwrap();
     narrow_term.draw(|f| render(f, &mut state)).unwrap();
 
-    for h in handles {
-        drop(h.dispose());
-    }
-    app_ctx.fiber().dispose().await;
+    drop(handles);
+    runtime.shutdown().await;
 }
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-async fn boot_mock_ctx(ws: PathBuf) -> Context {
-    let app_ctx = Context::new();
-    app_ctx.logger().set_silent();
+async fn boot_mock_ctx(ws: PathBuf) -> Arc<MizarRuntime> {
     let mut spine_cfg = AgentSpineConfig::coding(ws);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -162,10 +149,9 @@ async fn boot_mock_ctx(ws: PathBuf) -> Context {
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    app_ctx.plugin(AgentSpinePlugin, spine_cfg);
-    app_ctx.plugin(MockPlugin, ());
-    wait_for_services(&app_ctx).await.unwrap();
-    app_ctx
+    let runtime = MizarRuntime::build(spine_cfg).await.unwrap();
+    runtime.register_mock_adapter().unwrap();
+    runtime
 }
 
 #[tokio::test]
@@ -174,20 +160,20 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
     let app_ctx = boot_mock_ctx(ws.clone()).await;
 
     // 1. 验证 pi-emphasis 回复引导片段只在挂载期注入系统提示词，卸载后干净消失
-    let cleanup = mount_reply_guidance_section(&app_ctx, &EmphasisConfig::default())
-        .unwrap()
-        .expect("emphasis section cleanup");
-    let sp = app_ctx.system_prompt().unwrap();
+    let cleanup = mount_reply_guidance_section(
+        &app_ctx.system_prompt,
+        Some(Arc::clone(&app_ctx.sessions)),
+        &EmphasisConfig::default(),
+    )
+    .expect("emphasis section cleanup");
+    let sp = &app_ctx.system_prompt;
     let built_with = sp.build();
     assert!(
         built_with.contains("These rules shape replies"),
         "prompt:\n{built_with}"
     );
 
-    match cleanup {
-        Cleanup::Sync(f) => f(),
-        Cleanup::Async(f) => f().await,
-    }
+    drop(cleanup);
     let built_without = sp.build();
     assert!(
         !built_without.contains("These rules shape replies"),
@@ -195,7 +181,7 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
     );
 
     // 2. 验证 [[Done]] 胶囊、CJK 相邻粗体 **证据与影响：**源码中、词级 Diff、思考与正文空行隔离及去重
-    let session = app_ctx.sessions().unwrap().create(None);
+    let session = app_ctx.sessions.create(None);
     let mut state = AppState::new(ws, &session.id, Vec::new(), None, None, None);
     state.items.push(ChatItem::Assistant {
         reasoning: "Let me write Chinese content.".into(),
@@ -325,14 +311,14 @@ async fn renders_emphasis_cjk_bold_edit_diff_and_mounts_prompt_section() {
     assert!(!folded_screen.contains("line7"));
     assert!(session.log().is_empty());
 
-    app_ctx.fiber().dispose().await;
+    app_ctx.shutdown().await;
 }
 
 #[tokio::test]
 async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines() {
     let ws = crate_root();
     let app_ctx = boot_mock_ctx(ws.clone()).await;
-    let session = app_ctx.sessions().unwrap().create(None);
+    let session = app_ctx.sessions.create(None);
     session.append(SessionEvent::user(
         "first step investigate_very_long_identifier_for_horizontal_panning",
     ));
@@ -362,7 +348,7 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     assert_eq!(fork_act, AppAction::ForkSessionAtSeq(1));
 
     // 重放截断日志验证 restore_session_view
-    let forked = app_ctx.sessions().unwrap().create(None);
+    let forked = app_ctx.sessions.create(None);
     for e in session.log() {
         if e.seq <= 1 {
             forked.append(e.event);
@@ -444,7 +430,7 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
         "sp files:\n{files_screen}"
     );
 
-    app_ctx.fiber().dispose().await;
+    app_ctx.shutdown().await;
 }
 
 #[tokio::test]
@@ -460,18 +446,21 @@ async fn expands_at_mentions_via_pre_step_and_folds_on_resume() {
     std::fs::write(ws.join("sub/inside.txt"), "SECRET_NESTED\n").unwrap();
 
     let app_ctx = boot_mock_ctx(ws.clone()).await;
-    let store = app_ctx.sessions().unwrap();
+    let store = &app_ctx.sessions;
     let session = store.create(None);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let hook_handle =
-        mizar_tui::mentions::register_mention_hook(&app_ctx, ws.clone(), false, tx.clone())
-            .unwrap();
+    let hook_handle = mizar_tui::mentions::register_mention_hook(
+        &app_ctx.agent_loop,
+        Some(Arc::clone(&app_ctx.llm)),
+        ws.clone(),
+        false,
+        tx.clone(),
+    );
 
     let prompt = "请查看 @src/demo.rs#L2-3、@sub 与 @does_not_exist.rs";
     let _reply = app_ctx
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run_with_options(
             Arc::clone(&session),
             prompt,
@@ -544,21 +533,21 @@ async fn expands_at_mentions_via_pre_step_and_folds_on_resume() {
     );
     assert!(!screen.contains("line 2"), "screen:\n{screen}");
 
-    drop(hook_handle.dispose());
-    app_ctx.fiber().dispose().await;
+    drop(hook_handle);
+    app_ctx.shutdown().await;
     let _ = std::fs::remove_dir_all(&ws);
 }
 
 #[tokio::test]
 async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() {
-    use cordis::{BoxFuture, Next};
     use mizar_llm::{
-        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, Message,
-        ModelInfo, ProviderInfo, StreamChunk,
+        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, Message, ModelInfo,
+        ProviderInfo, StreamChunk,
     };
-    use mizar_tools::{EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution};
-    use mizar_tools_coding::bash::execute_bash_process;
+    use mizar_tools::coding::bash::execute_bash_process;
+    use mizar_tools::{PreExecuteDecision, ToolExecution};
     use mizar_tui::app::LocalBashOutput;
+    use mizar_types::{BoxFuture, Next};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -606,8 +595,6 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
     let pre_exec_hits = Arc::new(AtomicUsize::new(0));
 
     let boot_ctx = |root: PathBuf, db: PathBuf| async move {
-        let ctx = Context::new();
-        ctx.logger().set_silent();
         let mut spine_cfg = AgentSpineConfig::coding(root)
             .with_session_db(db)
             .with_disabled_plugins(["session-title"]);
@@ -622,41 +609,34 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
             skills.include_default_roots = false;
             instructions.include_default_global = false;
         }
-        ctx.plugin(AgentSpinePlugin, spine_cfg);
-        ctx.plugin(MockPlugin, ());
-        wait_for_services(&ctx).await.unwrap();
-        ctx
+        let runtime = MizarRuntime::build(spine_cfg).await.unwrap();
+        runtime.register_mock_adapter().unwrap();
+        runtime
     };
 
     let ctx = boot_ctx(tmp_root.clone(), db_path.clone()).await;
-    let _spy_handle = ctx
-        .llm()
-        .unwrap()
-        .register_adapter(
-            "spy",
-            Arc::new(SpyLlm {
-                seen_messages: Arc::clone(&seen_messages),
-            }),
-        )
-        .unwrap();
+    ctx.register_adapter(
+        "spy",
+        Arc::new(SpyLlm {
+            seen_messages: Arc::clone(&seen_messages),
+        }),
+    )
+    .unwrap();
 
-    // 注册拦截器以验证 `!` / `!!` 本地命令不触发 `tools/pre-execute` 弹窗审批
+    // 注册拦截器以验证 `!` / `!!` 本地命令不触发 `tools.pre_execute_hook()` 弹窗审批
     let hits_clone = Arc::clone(&pre_exec_hits);
-    let _pre_hook = ctx
-        .on_waterfall(
-            EVENT_TOOLS_PRE_EXECUTE,
-            move |_exec: ToolExecution,
-                  _next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
-                let hits_inner = Arc::clone(&hits_clone);
-                Box::pin(async move {
-                    hits_inner.fetch_add(1, Ordering::Relaxed);
-                    PreExecuteDecision::deny("should not run")
-                })
-            },
-        )
-        .unwrap();
+    let _pre_hook = ctx.tools.pre_execute_hook().register(
+        move |_exec: ToolExecution,
+              _next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+            let hits_inner = Arc::clone(&hits_clone);
+            Box::pin(async move {
+                hits_inner.fetch_add(1, Ordering::Relaxed);
+                PreExecuteDecision::deny("should not run")
+            })
+        },
+    );
 
-    let session = ctx.sessions().unwrap().create(Some("e2e-bash-sess".into()));
+    let session = ctx.sessions.create(Some("e2e-bash-sess".into()));
     let mut state = AppState::new(
         tmp_root.clone(),
         &session.id,
@@ -782,8 +762,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
 
     // 4. 随后向模型提问：SpyLlm 必须能看见 ! 命令与输出，绝不可见 !! 命令与输出
     let reply = ctx
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run_with_options(
             Arc::clone(&session),
             "分析上面命令的输出",
@@ -812,10 +791,8 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
 
     // 5. 关闭当前宿主并从 SQLite 重建宿主验证 --resume 与 /tree 回放
     session.flush_async().await.unwrap();
-    ctx.fiber().dispose().await;
+    ctx.shutdown().await;
 
-    let ctx2 = Context::new();
-    ctx2.logger().set_silent();
     let mut spine_cfg2 = AgentSpineConfig::coding(tmp_root.clone()).with_session_db(db_path);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -828,12 +805,10 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    ctx2.plugin(AgentSpinePlugin, spine_cfg2);
-    wait_for_services(&ctx2).await.unwrap();
+    let ctx2 = MizarRuntime::build(spine_cfg2).await.unwrap();
 
     let reloaded = ctx2
-        .sessions()
-        .unwrap()
+        .sessions
         .get("e2e-bash-sess")
         .expect("reloaded session from sqlite");
 
@@ -891,7 +866,7 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
     });
     assert_eq!(only_local_state.side_panel_data.context.tool_tokens, 0);
 
-    ctx2.fiber().dispose().await;
+    ctx2.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp_root);
 }
 
@@ -899,8 +874,8 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
 async fn mention_image_respects_model_input_capability_and_delivers_multimodal_payload() {
     use futures::channel::mpsc as futures_mpsc;
     use mizar_llm::{
-        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, Message,
-        ModelInfo, ProviderInfo, StreamChunk,
+        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, Message, ModelInfo,
+        ProviderInfo, StreamChunk,
     };
     use std::io::Cursor;
     use std::sync::Mutex;
@@ -963,8 +938,6 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
         .unwrap();
     std::fs::write(tmp.join("shot.png"), &png_bytes).unwrap();
 
-    let ctx = Context::new();
-    ctx.logger().set_silent();
     let mut cfg = AgentSpineConfig::coding(tmp.clone()).with_disabled_plugins(["session-title"]);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -977,24 +950,24 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    ctx.plugin(AgentSpinePlugin, cfg);
-    wait_for_services(&ctx).await.unwrap();
+    let ctx = MizarRuntime::build(cfg).await.unwrap();
 
     let spy = Arc::new(VisionSpyAdapter {
         seen: Mutex::new(Vec::new()),
     });
-    let _spy_handle = ctx
-        .llm()
-        .unwrap()
-        .register_adapter("spy", spy.clone())
-        .unwrap();
+    ctx.register_adapter("spy", spy.clone()).unwrap();
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
-    let _mention_guard =
-        mizar_tui::mentions::register_mention_hook(&ctx, tmp.clone(), true, ui_tx).unwrap();
+    let _mention_guard = mizar_tui::mentions::register_mention_hook(
+        &ctx.agent_loop,
+        Some(Arc::clone(&ctx.llm)),
+        tmp.clone(),
+        true,
+        ui_tx,
+    );
 
-    let session = ctx.sessions().unwrap().create(None);
-    let agent = ctx.agent_loop().unwrap();
+    let session = ctx.sessions.create(None);
+    let agent = &ctx.agent_loop;
 
     // 1. 使用仅声明 input=["text"] 的模型时，@shot.png 应在发出模型请求前被明确取消并提示错误
     let blocked = agent
@@ -1063,7 +1036,7 @@ async fn mention_image_respects_model_input_capability_and_delivers_multimodal_p
         assert!(!img_msg.text_content().contains("<attached-file"));
     }
 
-    ctx.fiber().dispose().await;
+    ctx.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -1075,8 +1048,7 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
 
     use futures::stream;
     use mizar_llm::{
-        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, StreamChunk,
-        ToolCall,
+        BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, StreamChunk, ToolCall,
     };
     use mizar_tui::terminal::ProgramStatusState;
     use mizar_tui::{NoticeLevel, UiStepOutcome, UiTurnEndReason};
@@ -1116,9 +1088,6 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
         }
     }
 
-    let app_ctx = Context::new();
-    app_ctx.logger().set_silent();
-
     let mut spine_cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         .with_disabled_plugins(["session-title"]);
     if let AgentToolsMode::Coding {
@@ -1132,13 +1101,10 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    app_ctx.plugin(AgentSpinePlugin, spine_cfg);
-    wait_for_services(&app_ctx).await.unwrap();
+    let app_ctx = MizarRuntime::build(spine_cfg).await.unwrap();
 
     let mode = Arc::new(AtomicUsize::new(0));
-    let _adapter_cleanup = app_ctx
-        .llm()
-        .unwrap()
+    app_ctx
         .register_adapter(
             "scripted-end-states",
             Arc::new(ScriptedEndStatesAdapter {
@@ -1148,10 +1114,10 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
         .unwrap();
 
     // 1. Phase A: MaxSteps (max_steps=1)
-    let session = app_ctx.sessions().unwrap().create(None);
+    let session = app_ctx.sessions.create(None);
     let active_sid = Arc::new(RwLock::new(session.id.clone()));
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
-    let _handles = subscribe_session_events(&app_ctx, Arc::clone(&active_sid), tx.clone()).unwrap();
+    let _handles = subscribe_session_events(&app_ctx, Arc::clone(&active_sid), tx.clone());
 
     let mut state = AppState::new(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")),
@@ -1164,8 +1130,7 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
 
     let max_steps_ret = app_ctx
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run_with_options(
             Arc::clone(&session),
             "执行工具直至步数上限",
@@ -1219,14 +1184,13 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
     );
 
     // 2. Phase B: FinishReason::MaxTokens -> Truncated
-    let s2 = app_ctx.sessions().unwrap().create(None);
+    let s2 = app_ctx.sessions.create(None);
     *active_sid.write().unwrap() = s2.id.clone();
     state.reset_for_new_session(&s2.id, None);
     mode.store(1, Ordering::SeqCst);
 
     let trunc_ret = app_ctx
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run_with_options(
             Arc::clone(&s2),
             "触发 MaxTokens 截断",
@@ -1269,7 +1233,7 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
         "Truncated must not render 就绪:\n{screen_b}"
     );
 
-    let traj = app_ctx.get::<TrajectoryRuntime>("trajectory").unwrap();
+    let traj = app_ctx.trajectory.as_ref().unwrap();
     let report = traj.inspect(&s2.id, TimelineMode::Sequence).unwrap();
     assert_eq!(
         report.snapshot.stats.interrupted_steps, 1,
@@ -1300,8 +1264,7 @@ async fn end_to_end_max_steps_and_max_tokens_truncation_status_trajectory_and_re
     )));
 
     drop(_handles);
-    drop(_adapter_cleanup);
-    app_ctx.fiber().dispose().await;
+    app_ctx.shutdown().await;
 }
 
 #[tokio::test]
@@ -1365,9 +1328,8 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
         calls: Arc::clone(&recorded_calls),
     });
 
-    let ctx = Context::new();
-    ctx.logger().set_silent();
     let mut cfg = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
+    cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
     cfg.agent.provider = Some("fake".into());
     cfg.agent.model = Some("smart-1".into());
     if let AgentToolsMode::Coding {
@@ -1381,35 +1343,30 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    ctx.plugin(AgentSpinePlugin, cfg);
-    wait_for_services(&ctx).await.unwrap();
-    let _llm_handle = ctx
-        .llm()
-        .unwrap()
-        .register_adapter("fake", adapter)
-        .unwrap();
+    let ctx = MizarRuntime::build(cfg).await.unwrap();
+    ctx.register_adapter("fake", adapter).unwrap();
 
     // 1. 创建一个空会话（event_count == 0）与一个真实对话会话
-    let empty_sess = ctx.sessions().unwrap().create_with(SessionCreateOptions {
+    let empty_sess = ctx.sessions.create_with(SessionCreateOptions {
         id: Some("sess-empty".into()),
         cwd: Some(ws.display().to_string()),
         ..Default::default()
     });
     assert_eq!(empty_sess.header().event_count, 0);
 
-    let mut active_session = ctx.sessions().unwrap().create_with(SessionCreateOptions {
+    let mut active_session = ctx.sessions.create_with(SessionCreateOptions {
         id: Some("sess-target".into()),
         cwd: Some(ws.display().to_string()),
         ..Default::default()
     });
     let active_sid = Arc::new(RwLock::new(active_session.id.clone()));
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-    let _subs = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone()).unwrap();
+    let _subs = subscribe_session_events(&ctx, Arc::clone(&active_sid), ui_tx.clone());
 
     let mut app = AppState::new(
         ws.clone(),
         active_session.id.clone(),
-        ctx.llm().unwrap().provider_infos(),
+        ctx.llm.provider_infos(),
         Some("fake".into()),
         Some("smart-1".into()),
         Some(ReasoningEffort::Medium),
@@ -1417,8 +1374,7 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
 
     // 2. 跑一轮真实 AgentLoop：首轮异步触发标题生成，回写并经由事件流更新 app.session_title
     let reply = ctx
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run(
             Arc::clone(&active_session),
             "mizar --resume 12345678-1234-1234-1234-123456789abc 实现会话标题生成",
@@ -1455,14 +1411,14 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     );
 
     // 3. collect_session_picker_items 过滤空会话（仅留 sess-target），开启新会话后通过选择器切换回来
-    let picker_items = collect_session_picker_items(&ctx.sessions().unwrap());
+    let picker_items = collect_session_picker_items(&ctx.sessions);
     assert_eq!(picker_items.len(), 1);
     assert_eq!(picker_items[0].session_id, "sess-target");
     assert_eq!(picker_items[0].title, generated_title);
     assert_eq!(picker_items[0].cwd_tail, "my-repo");
 
     // 切到一个新会话，再从 SessionPicker 选回 sess-target
-    let fresh = ctx.sessions().unwrap().create_with(SessionCreateOptions {
+    let fresh = ctx.sessions.create_with(SessionCreateOptions {
         id: Some("sess-fresh".into()),
         cwd: Some(ws.display().to_string()),
         ..Default::default()
@@ -1500,10 +1456,8 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
         Some("0402｜FIX｜手工修订标题")
     );
     active_session.flush_async().await.unwrap();
-    ctx.fiber().dispose().await;
+    ctx.shutdown().await;
 
-    let ctx_restarted = Context::new();
-    ctx_restarted.logger().set_silent();
     let mut cfg_r = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
     if let AgentToolsMode::Coding {
         ref mut mcp,
@@ -1516,20 +1470,15 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
         skills.include_default_roots = false;
         instructions.include_default_global = false;
     }
-    ctx_restarted.plugin(AgentSpinePlugin, cfg_r);
-    wait_for_services(&ctx_restarted).await.unwrap();
+    let ctx_restarted = MizarRuntime::build(cfg_r).await.unwrap();
 
-    let reloaded = ctx_restarted
-        .sessions()
-        .unwrap()
-        .get("sess-target")
-        .unwrap();
+    let reloaded = ctx_restarted.sessions.get("sess-target").unwrap();
     assert_eq!(
         reloaded.header().title.as_deref(),
         Some("0402｜FIX｜手工修订标题")
     );
     assert_eq!(reloaded.header().title_source, Some(TitleSource::Manual));
 
-    ctx_restarted.fiber().dispose().await;
+    ctx_restarted.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }

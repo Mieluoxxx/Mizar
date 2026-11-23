@@ -51,7 +51,7 @@ const isEn = locale === 'en';
 
       {/* 持久化架构横条 */}
       <rect x="33" y="56" width="366" height="46" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
-      <text x="45" y="75" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-session-sqlite (WAL · busy_timeout=5s)</text>
+      <text x="45" y="75" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-session::sqlite (WAL · busy_timeout=5s)</text>
       <text x="45" y="92" font-size={isEn ? 9 : 9.5} fill="var(--grey-9)">{isEn ? 'Single-Writer thread (128/tx off Tokio) · query_only read' : 'Single-Writer 线程 (128条/事务隔离Tokio) · query_only 读'}</text>
 
       {/* 主干时间线 */}

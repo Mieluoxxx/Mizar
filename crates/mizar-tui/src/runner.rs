@@ -1,33 +1,32 @@
-//! 异步运行循环：将 Cordis / AgentLoop / Trajectory 事件接入终端界面，并按 `disabledPlugins` 条件挂载客户端与 TUI 扩展。
+//! 异步运行循环：将 `MizarRuntime`（AgentLoop / Trajectory / Spine）事件接入终端界面，并按 `disabledPlugins` 条件挂载客户端与 TUI 扩展。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use cordis::{
-    BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, LogLevel, LogSink, Plugin,
-};
 use crossterm::event::EventStream;
-use mizar_agent_loop::AgentLoopContextExt;
-use mizar_agent_spine::{SpinePluginsContextExt, SubagentContextExt};
-use mizar_client::approval::{ApprovalSnapshot, register_approval_hook_with};
-use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
+use mizar_client::approval::{ApprovalSnapshot, install_approval_gate};
+use mizar_client::logging::{env_log_level_override, install_tracing_handler};
+use mizar_client::mentions::{FileMentionsConfig, install_file_mentions};
 use mizar_client::workspace::collect_user_skill_names;
-use mizar_client_core::{HostExtensionFlags, PLUGIN_TUI_EMPHASIS};
-use mizar_llm::{LlmContextExt, ReasoningEffort};
-use mizar_session::{Session, SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
-use mizar_skills::EVENT_SKILLS_CHANGE;
-use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
-use mizar_tools::EVENT_TOOLS_CHANGE;
+use mizar_core::spine::MizarRuntime;
+use mizar_core::system_prompt::{PromptSection, SystemPrompt};
+use mizar_llm::ReasoningEffort;
+use mizar_session::{Session, SessionListQuery, SessionStore};
 use mizar_tui_ui::TuiFeatures;
 use mizar_tui_ui::app::{
-    AppAction, AppState, ApprovalMode, NoticeLevel, SessionSelection, UiEvent, UiTurnEndReason,
+    AppAction, AppState, ApprovalMode, ChatItem, NoticeLevel, SessionSelection, ToolState, UiEvent,
+    UiLogLevel, UiTurnEndReason,
 };
 use mizar_tui_ui::emphasis::{EmphasisConfig, reply_guidance_prompt};
 use mizar_tui_ui::overlay::{ApprovalDecision, SessionPickerItem, SettingEntry};
 use mizar_tui_ui::terminal::{ProgramStatusState, ScreenMode, TerminalGuard, emit_program_status};
 use mizar_tui_ui::theme::ThemePreset;
-use mizar_tui_ui::ui::render;
+use mizar_tui_ui::ui::{
+    build_item_lines_for_scrollback_at, build_welcome_lines_for_scrollback, render,
+};
+use mizar_types::HookGuard;
+use mizar_types::client::HostExtensionFlags;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -36,9 +35,9 @@ mod terminal_io;
 
 pub use actions::{apply_clipboard_content, resume_session_into_app};
 pub use mizar_client::events::{
-    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, WaitServicesError, steer_session,
-    subscribe_session_events, subscribe_session_events_into, to_ui_log_record, to_ui_status,
-    to_ui_step_outcome, to_ui_turn_end_reason, wait_for_services,
+    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, steer_session,
+    subscribe_session_events, subscribe_session_events_into, to_ui_status, to_ui_step_outcome,
+    to_ui_turn_end_reason,
 };
 pub use mizar_client::session_view::{
     SelectionSources, collect_session_picker_items, find_model_in_provider,
@@ -50,11 +49,82 @@ pub use mizar_client::settings::{
     persist_setting_change, persist_setting_change_to, toggle_spine_module,
 };
 
-use actions::{handle_action, populate_side_panel_data};
+use actions::{SidePanelRefreshController, handle_action, populate_side_panel_data};
 use terminal_io::{
-    create_terminal, flush_inline_scrollback, handle_term_event_dirty, poll_term_event,
-    process_loop_ui_msg_dirty,
+    create_terminal, flush_inline_scrollback, handle_term_event_dirty, insert_scrollback_lines,
+    poll_term_event, process_loop_ui_msg_dirty,
 };
+
+fn inline_finalized_commit_limit(app: &AppState) -> usize {
+    if !app.is_running_activity() {
+        return app.items.len();
+    }
+    let mut limit = app.inline_committed_items.min(app.items.len());
+    while limit < app.items.len() {
+        let finalized = match &app.items[limit] {
+            ChatItem::User { .. } | ChatItem::Notice { .. } => true,
+            ChatItem::Assistant { .. } => {
+                // 仅当后续出现非 Notice 项时，流式助手消息才已定型且关闭 reveal
+                app.items[limit + 1..]
+                    .iter()
+                    .any(|it| !matches!(it, ChatItem::Notice { .. }))
+            }
+            ChatItem::ToolCall { status, .. } => {
+                !matches!(status, ToolState::Running) && limit + 1 < app.items.len()
+            }
+        };
+        if !finalized {
+            break;
+        }
+        limit += 1;
+    }
+    limit
+}
+
+fn flush_inline_scrollback_incremental<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut AppState,
+) -> bool {
+    if !app.is_running_activity() {
+        let before = app.inline_committed_items;
+        flush_inline_scrollback(terminal, app);
+        return app.inline_committed_items > before;
+    }
+
+    let target = inline_finalized_commit_limit(app);
+    if app.inline_committed_items >= target {
+        return false;
+    }
+    let Ok(size) = terminal.size() else {
+        return false;
+    };
+    let width = size.width.max(20) as usize;
+    let chunk_max = size.height.saturating_sub(2).max(4) as usize;
+
+    if !app.inline_welcome_committed {
+        let welcome_lines = build_welcome_lines_for_scrollback(app, width);
+        insert_scrollback_lines(terminal, &welcome_lines, chunk_max);
+        app.inline_welcome_committed = true;
+    }
+
+    let before = app.inline_committed_items;
+    while app.inline_committed_items < target {
+        let idx = app.inline_committed_items;
+        let lines = build_item_lines_for_scrollback_at(
+            &app.items,
+            idx,
+            &app.tool_extras,
+            width,
+            &app.theme,
+            &app.emphasis,
+            app.show_thinking,
+            app.verbose_expanded,
+        );
+        insert_scrollback_lines(terminal, &lines, chunk_max);
+        app.inline_committed_items += 1;
+    }
+    app.inline_committed_items > before
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeTarget {
@@ -185,75 +255,53 @@ impl TuiConfig {
     }
 }
 
-struct LoggerRestoreGuard {
-    ctx: Context,
-}
-
-impl Drop for LoggerRestoreGuard {
-    fn drop(&mut self) {
-        self.ctx.logger().set_sink(LogSink::Stdio);
-    }
-}
-
-/// 将交互式 TUI 回复视觉语法提示段挂载到系统提示词注册表。
+/// 将交互式 TUI 回复视觉语法提示段挂载到系统提示词注册表（`order = 60`，子代理会话自动跳过）。
 pub fn mount_reply_guidance_section(
-    ctx: &Context,
+    sp: &Arc<SystemPrompt>,
+    sessions: Option<Arc<SessionStore>>,
     emphasis: &EmphasisConfig,
-) -> Result<Option<Cleanup>, CordisError> {
-    let Ok(sp) = ctx.system_prompt() else {
-        return Ok(None);
-    };
+) -> Option<HookGuard> {
     if !(emphasis.enabled && emphasis.guidance) {
-        return Ok(None);
+        return None;
     }
     let prompt = reply_guidance_prompt();
-    Ok(Some(sp.section(PromptSection::new(
+    Some(sp.section(PromptSection::new_for_session(
         "tui_reply_guidance",
-        95,
-        move || Some(prompt.clone()),
-    ))))
+        60,
+        move |session_id| {
+            if let (Some(sid), Some(store)) = (session_id, sessions.as_ref())
+                && store
+                    .get(sid)
+                    .is_some_and(|s| s.header().is_subagent_child())
+            {
+                return None;
+            }
+            Some(prompt.clone())
+        },
+    )))
 }
 
-/// 官方 TUI 回复视觉语法提示段 Cordis 插件（依赖 `systemPrompt`，卸载时自动清理段落）。
-#[derive(Default, Clone, Copy)]
-pub struct TuiEmphasisPlugin;
-
-impl Plugin for TuiEmphasisPlugin {
-    type Config = EmphasisConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some(PLUGIN_TUI_EMPHASIS)
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["systemPrompt"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let _ = ctx.system_prompt()?;
-            let c = ctx.clone();
-            ctx.effect("mizar-tui-emphasis", move || {
-                mount_reply_guidance_section(&c, &config)
-            })?;
-            Ok(None)
-        })
-    }
+/// 将 TUI 回复视觉语法提示段挂载到 `MizarRuntime` 上，返回可选 RAII `HookGuard`。
+pub fn install_tui_emphasis(
+    runtime: &MizarRuntime,
+    emphasis: &EmphasisConfig,
+) -> Option<HookGuard> {
+    mount_reply_guidance_section(
+        &runtime.system_prompt,
+        Some(Arc::clone(&runtime.sessions)),
+        emphasis,
+    )
 }
 
 /// 构造 `/session` 命令的只读会话身份与账目报告（`TuiConfig` + `AppState` 薄包装）。
 pub fn build_session_info_report(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     config: &TuiConfig,
     session: &Session,
     app: &AppState,
 ) -> String {
     mizar_client::session_view::build_session_info_report(
-        ctx,
+        runtime,
         session,
         config.session_db_path.as_deref(),
         app.active_context_window(),
@@ -294,9 +342,9 @@ fn settings_snapshot_from_app(app: &AppState) -> SettingsViewSnapshot {
     }
 }
 
-/// 基于 `AppState` 与 Cordis 运行时服务状态构建 `/settings` 条目列表（薄包装）。
-pub fn build_settings_entries(ctx: &Context, app: &AppState) -> Vec<SettingEntry> {
-    mizar_client::settings::build_settings_entries(ctx, &settings_snapshot_from_app(app))
+/// 基于 `AppState` 与 `MizarRuntime` 运行时服务状态构建 `/settings` 条目列表（薄包装）。
+pub fn build_settings_entries(runtime: &MizarRuntime, app: &AppState) -> Vec<SettingEntry> {
+    mizar_client::settings::build_settings_entries(runtime, &settings_snapshot_from_app(app))
 }
 
 pub(super) fn process_loop_ui_msg(
@@ -426,14 +474,17 @@ async fn poll_inbox_wake(
     }
 }
 
-/// 在已装配 `AgentSpinePlugin` 与模型适配器的 `Context` 上启动全屏 TUI。
-pub async fn run_tui(ctx: Context, config: TuiConfig) -> Result<(), Box<dyn std::error::Error>> {
-    run_tui_with_summary(ctx, config).await.map(|_| ())
+/// 在已装配的 `MizarRuntime` 上启动全屏 TUI。
+pub async fn run_tui(
+    runtime: Arc<MizarRuntime>,
+    config: TuiConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_tui_with_summary(runtime, config).await.map(|_| ())
 }
 
-/// 在已装配 `AgentSpinePlugin` 与模型适配器的 `Context` 上启动 TUI，并在恢复终端后返回当前会话摘要。
+/// 在已装配的 `MizarRuntime` 上启动 TUI，并在恢复终端后返回当前会话摘要。
 pub async fn run_tui_with_summary(
-    ctx: Context,
+    runtime: Arc<MizarRuntime>,
     config: TuiConfig,
 ) -> Result<TuiExitSummary, Box<dyn std::error::Error>> {
     let ext_flags = HostExtensionFlags::from_disabled_plugins(&config.disabled_plugins);
@@ -441,13 +492,12 @@ pub async fn run_tui_with_summary(
         return Err("TUI 已被配置 disabledPlugins 中的 \"tui\" 禁用".into());
     }
 
-    wait_for_services(&ctx).await?;
-    let sessions = ctx.sessions()?;
+    let sessions = &runtime.sessions;
     let mut resume_notice: Option<(NoticeLevel, String)> = None;
     let mut startup_picker_items: Option<Vec<SessionPickerItem>> = None;
     let (initial_session, resumed) = match &config.resume_session {
         Some(ResumeTarget::Picker) => {
-            startup_picker_items = Some(collect_session_picker_items(&sessions));
+            startup_picker_items = Some(collect_session_picker_items(sessions));
             (sessions.create(None), false)
         }
         Some(ResumeTarget::Id(target_id)) => {
@@ -486,28 +536,35 @@ pub async fn run_tui_with_summary(
         }
         None => (sessions.create(None), false),
     };
-    let providers = ctx.llm().map(|l| l.provider_infos()).unwrap_or_default();
+    let providers = runtime.llm.provider_infos();
 
     let (loop_tx, mut loop_rx) = mpsc::unbounded_channel::<LoopClientMsg>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
 
-    // 重定向 Cordis 日志，确保任何插件输出都不会污染终端 stdout
+    // 桥接 tracing 日志到 UI 事件，确保任何输出都不会污染终端 stdout
+    let log_threshold = match env_log_level_override() {
+        Some(UiLogLevel::Silent) => UiLogLevel::Silent,
+        Some(UiLogLevel::Error) => UiLogLevel::Error,
+        _ => UiLogLevel::Warn,
+    };
     let log_tx = ui_tx.clone();
-    ctx.logger().set_handler(move |record| {
-        if record.level >= LogLevel::Warn {
-            let _ = log_tx.send(UiEvent::Log(to_ui_log_record(record)));
-        }
+    let _tracing_guard = install_tracing_handler(log_threshold, move |record| {
+        let _ = log_tx.send(UiEvent::Log(record.clone()));
     });
-    let _logger_restore = LoggerRestoreGuard { ctx: ctx.clone() };
 
     let mut active_session = Arc::clone(&initial_session);
     let active_sid = Arc::new(RwLock::new(active_session.id.clone()));
-    let mut handles = {
+    let mut guards = Vec::new();
+    {
         let bus_tx = loop_tx.clone();
-        subscribe_session_events_into(&ctx, Arc::clone(&active_sid), move |ev| {
-            let _ = bus_tx.send(LoopClientMsg::Bus(ev));
-        })?
-    };
+        guards.push(subscribe_session_events_into(
+            &runtime,
+            Arc::clone(&active_sid),
+            move |ev| {
+                let _ = bus_tx.send(LoopClientMsg::Bus(ev));
+            },
+        ));
+    }
 
     let mut app = AppState::new(
         config.workspace.clone(),
@@ -536,7 +593,7 @@ pub async fn run_tui_with_summary(
         latest_workspace: if resumed {
             None
         } else {
-            latest_workspace_selection(&sessions, &config.workspace).map(to_ui_selection)
+            latest_workspace_selection(sessions, &config.workspace).map(to_ui_selection)
         },
     };
     if let Some(resolved) = resolve_selection(&sources, resumed) {
@@ -570,32 +627,29 @@ pub async fn run_tui_with_summary(
             app.overlay.open_session_picker(items);
         }
     }
-    app.user_skill_names = collect_user_skill_names(&ctx, &config.workspace).await;
-    {
-        // 不在启动阶段缓存旧 `Arc<SkillRegistry>`，确保即使启动屏蔽或运行期重挂 `skills` 也能动态感知最新列表
-        let ctx_skills = ctx.clone();
+    app.user_skill_names = collect_user_skill_names(&runtime, &config.workspace).await;
+    if let Some(skills) = runtime.skills.as_ref() {
+        let rt_skills = Arc::clone(&runtime);
         let ws_skills = config.workspace.clone();
         let tx_skills = ui_tx.clone();
-        handles.push(ctx.on_signal(EVENT_SKILLS_CHANGE, move || {
-            let ctx_inner = ctx_skills.clone();
+        guards.push(skills.on_change(move |_| {
+            let rt_inner = Arc::clone(&rt_skills);
             let ws = ws_skills.clone();
             let tx = tx_skills.clone();
             tokio::spawn(async move {
-                let names = collect_user_skill_names(&ctx_inner, &ws).await;
+                let names = collect_user_skill_names(&rt_inner, &ws).await;
                 let _ = tx.send(UiEvent::UserSkillsUpdated(names));
             });
-        })?);
+        }));
     }
     {
         let tx_tools = ui_tx.clone();
-        handles.push(ctx.on_signal(EVENT_TOOLS_CHANGE, move || {
+        guards.push(runtime.tools.on_change(move |_| {
             let _ = tx_tools.send(UiEvent::ToolsUpdated);
-        })?);
+        }));
     }
-    if let Ok(plugins) = ctx.spine_plugins() {
-        for err_msg in plugins.startup_errors() {
-            app.push_notice(NoticeLevel::Warn, err_msg);
-        }
+    for err_msg in runtime.modules.startup_errors() {
+        app.push_notice(NoticeLevel::Warn, err_msg);
     }
     for (level, msg) in &config.startup_notices {
         app.push_notice(*level, msg.clone());
@@ -622,46 +676,46 @@ pub async fn run_tui_with_summary(
         app.set_theme_preset(preset);
     }
 
-    let mut plugin_fibers = Vec::new();
-    if ext_flags.tui_emphasis && ctx.system_prompt().is_ok() {
-        plugin_fibers.push(ctx.plugin(TuiEmphasisPlugin, app.emphasis).await?);
+    if ext_flags.tui_emphasis
+        && let Some(guard) = install_tui_emphasis(&runtime, &app.emphasis)
+    {
+        guards.push(guard);
     }
 
-    // 共享审批快照（供 tools/pre-execute 异步瀑布流无锁读取当前审批策略）
+    // 共享审批快照（供 tools.pre_execute_hook 异步瀑布流无锁读取当前审批策略）
     let approval_snap = Arc::new(RwLock::new(ApprovalSnapshot {
         mode: app.approval_mode,
         always_allowed: app.always_allowed_tools.clone(),
     }));
     if ext_flags.approval_gate {
         let approval_tx = loop_tx.clone();
-        handles.push(register_approval_hook_with(
-            &ctx,
-            Arc::clone(&active_sid),
-            Arc::clone(&approval_snap),
-            move |ev| {
-                let _ = approval_tx.send(LoopClientMsg::Bus(ev));
-            },
-        )?);
+        guards.push(install_approval_gate(
+            &runtime,
+            mizar_client::approval::ApprovalGateConfig::with_callback(
+                Arc::clone(&active_sid),
+                Arc::clone(&approval_snap),
+                move |ev| {
+                    let _ = approval_tx.send(LoopClientMsg::Bus(ev));
+                },
+            ),
+        ));
     }
     if ext_flags.file_mentions {
         let mention_tx = loop_tx.clone();
-        plugin_fibers.push(
-            ctx.plugin(
-                FileMentionsPlugin,
-                FileMentionsConfig::with_callback(
-                    config.workspace.clone(),
-                    config.restrict_to_workspace,
-                    move |ev| {
-                        let _ = mention_tx.send(LoopClientMsg::Bus(ev));
-                    },
-                ),
-            )
-            .await?,
-        );
+        guards.push(install_file_mentions(
+            &runtime,
+            FileMentionsConfig::with_callback(
+                config.workspace.clone(),
+                config.restrict_to_workspace,
+                move |ev| {
+                    let _ = mention_tx.send(LoopClientMsg::Bus(ev));
+                },
+            ),
+        ));
     }
 
     if app.features.side_panel && app.side_panel.open {
-        populate_side_panel_data(&ctx, &mut app).await;
+        populate_side_panel_data(&runtime, &mut app).await;
     }
 
     let mut task_state = RunController::default();
@@ -674,7 +728,8 @@ pub async fn run_tui_with_summary(
         let mut terminal = create_terminal(app.screen_mode)?;
 
         let mut term_stream = Some(EventStream::new());
-        let mut wake_rx = ctx.agent_loop().ok().map(|a| a.inbox().subscribe_wake());
+        let (mut panel_ctrl, mut panel_rx) = SidePanelRefreshController::new();
+        let mut wake_rx = Some(runtime.agent_loop.inbox().subscribe_wake());
         let mut inbox_wake_ready = false;
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(90));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -699,8 +754,10 @@ pub async fn run_tui_with_summary(
 
         let run_loop_res: Result<(), Box<dyn std::error::Error>> = async {
             while !app.should_quit {
-                if app.screen_mode == ScreenMode::Inline && !app.is_running_activity() {
-                    flush_inline_scrollback(&mut terminal.terminal, &mut app);
+                if app.screen_mode == ScreenMode::Inline
+                    && flush_inline_scrollback_incremental(&mut terminal.terminal, &mut app)
+                {
+                    needs_redraw = true;
                 }
                 if needs_redraw {
                     terminal.draw_synced(|frame| render(frame, &mut app))?;
@@ -834,13 +891,26 @@ pub async fn run_tui_with_summary(
                             }
                         }
                     }
+                    Some((panel_gen, panel_sid, snapshot)) = panel_rx.recv() => {
+                        let dirty = if panel_gen == panel_ctrl.current_gen()
+                            && panel_sid == app.session_id
+                            && app.features.side_panel
+                            && app.side_panel.open
+                        {
+                            snapshot.apply_to_side_panel(&mut app.side_panel_data, &app.anomalies);
+                            true
+                        } else {
+                            false
+                        };
+                        (AppAction::None, dirty)
+                    }
                 };
 
                 needs_redraw |= step_dirty || action != AppAction::None;
 
                 let was_cancel_run = matches!(action, AppAction::CancelRun);
                 handle_action(
-                    &ctx,
+                    &runtime,
                     &config,
                     &mut app,
                     &mut active_session,
@@ -849,6 +919,7 @@ pub async fn run_tui_with_summary(
                     &active_sid,
                     &loop_tx,
                     &mut task_state,
+                    &mut panel_ctrl,
                     action,
                 )
                 .await;
@@ -872,7 +943,7 @@ pub async fn run_tui_with_summary(
                 inbox_wake_ready = false;
                 if can_drain_inbox_followup
                     && actions::drain_next_inbox_followup(
-                        &ctx,
+                        &runtime,
                         &config,
                         &mut app,
                         &active_session,
@@ -899,6 +970,7 @@ pub async fn run_tui_with_summary(
         if let Some(task) = update_check_task {
             task.abort();
         }
+        panel_ctrl.abort();
         run_loop_res
     }
     .await;
@@ -906,20 +978,17 @@ pub async fn run_tui_with_summary(
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     emit_program_status(ProgramStatusState::Idle, None, None);
     task_state.abort_for_session_switch();
-    if let Ok(sub) = ctx.subagent() {
+    if let Some(sub) = runtime.subagent.as_ref() {
         sub.cancel_parent_subagents(&app.session_id);
     }
-    for fiber in plugin_fibers.into_iter().rev() {
-        fiber.dispose().await;
-    }
-    for handle in handles.into_iter().rev() {
-        handle.dispose().await;
+    for guard in guards.into_iter().rev() {
+        drop(guard);
     }
     loop_res?;
 
     Ok(TuiExitSummary {
         session_id: app.session_id.clone(),
-        persisted: ctx.session_persistence().is_some(),
+        persisted: runtime.persistence.is_some(),
     })
 }
 
@@ -930,7 +999,7 @@ mod tests {
     use mizar_tui_ui::app::{AppAction, AppState, ChatItem, UiEvent};
 
     use super::{
-        ActiveTaskKind, LoopClientMsg, RunController, TuiEmphasisPlugin, process_loop_ui_msg,
+        ActiveTaskKind, LoopClientMsg, RunController, install_tui_emphasis, process_loop_ui_msg,
     };
 
     fn process_ui_event(
@@ -991,12 +1060,10 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_local_bash_run_executes_persists_and_supports_cancel() {
-        use cordis::Service;
-        use mizar_session::{SessionContextExt, SessionStore};
+        use mizar_session::SessionStore;
 
-        let ctx = cordis::Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let session = ctx.sessions().unwrap().create(Some("runner-bash".into()));
+        let store = SessionStore::new();
+        let session = store.create(Some("runner-bash".into()));
 
         let mut app = AppState::new(
             std::env::temp_dir(),
@@ -1084,15 +1151,12 @@ mod tests {
                 ..
             }
         ));
-
-        ctx.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn settings_module_entries_toggle_persists_disabled_plugins_and_refreshes_runtime_state()
     {
-        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, CompactionContextExt};
-        use mizar_session::SessionContextExt;
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
         use mizar_tui_ui::overlay::{OverlayKind, SettingItemKind};
 
         let tmp = std::env::temp_dir().join(format!("mizar_tui_modules_{}", std::process::id()));
@@ -1110,24 +1174,22 @@ mod tests {
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         std::fs::write(&settings_path, r#"{"defaultModel":"gpt-4o"}"#).unwrap();
 
-        let ctx = cordis::Context::new();
         let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
-        if let mizar_agent_spine::AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
+        if let mizar_core::spine::AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
             mcp.global_config_dir = Some(tmp.join(".mizar"));
         }
-        ctx.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        super::wait_for_services(&ctx).await.unwrap();
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let session = ctx.sessions().unwrap().create(None);
+        let session = runtime.sessions.create(None);
         let mut app = AppState::new(ws.clone(), session.id.clone(), Vec::new(), None, None, None);
-        app.user_skill_names = super::collect_user_skill_names(&ctx, &ws).await;
+        app.user_skill_names = super::collect_user_skill_names(&runtime, &ws).await;
         assert!(app.user_skill_names.contains(&"tui-demo".to_string()));
-        super::actions::populate_side_panel_data(&ctx, &mut app).await;
+        super::actions::populate_side_panel_data(&runtime, &mut app).await;
         assert!(!app.side_panel_data.instructions.is_empty());
         assert!(!app.side_panel_data.tools.is_empty());
 
         // 启动时 compaction 被屏蔽：/settings 中不含 [压缩] 配置项，且 plugin.compaction 为 false
-        let initial_entries = super::build_settings_entries(&ctx, &app);
+        let initial_entries = super::build_settings_entries(&runtime, &app);
         assert!(
             !initial_entries.iter().any(|e| e.category == "压缩"),
             "compaction entries must be omitted while module is disabled"
@@ -1145,14 +1207,14 @@ mod tests {
 
         // 1. 运行期启用 compaction -> 服务上线 + 弹窗自动包含 [压缩] + 写入 disabledPlugins: []
         super::actions::apply_module_toggle_setting(
-            &ctx,
+            &runtime,
             &mut app,
             Some(&settings_path),
             "compaction",
             true,
         )
         .await;
-        assert!(ctx.compaction().is_ok());
+        assert!(runtime.compaction.as_ref().unwrap().is_module_enabled());
         match &app.overlay.active {
             Some(OverlayKind::SettingsModal { items, .. }) => {
                 assert!(items.iter().any(|e| e.key == "compaction.enabled"));
@@ -1169,7 +1231,7 @@ mod tests {
         // 2. 禁用 skills / instructions / compaction -> skills 补全清空、侧栏指令清空、[压缩] 移除、排序去重落盘
         for id in ["skills", "instructions", "compaction"] {
             super::actions::apply_module_toggle_setting(
-                &ctx,
+                &runtime,
                 &mut app,
                 Some(&settings_path),
                 id,
@@ -1179,8 +1241,8 @@ mod tests {
         }
         assert!(app.user_skill_names.is_empty());
         assert!(app.side_panel_data.instructions.is_empty());
-        assert!(ctx.compaction().is_err());
-        let after_disable_entries = super::build_settings_entries(&ctx, &app);
+        assert!(!runtime.compaction.as_ref().unwrap().is_module_enabled());
+        let after_disable_entries = super::build_settings_entries(&runtime, &app);
         assert!(!after_disable_entries.iter().any(|e| e.category == "压缩"));
         let persisted_2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -1192,14 +1254,14 @@ mod tests {
         // 3. 运行期繁忙保护：is_compacting 时拒绝启用 skills，状态与 settings.json 保持不变
         app.set_compacting_state("手动压缩中…");
         super::actions::apply_module_toggle_setting(
-            &ctx,
+            &runtime,
             &mut app,
             Some(&settings_path),
             "skills",
             true,
         )
         .await;
-        assert!(ctx.get::<mizar_skills::SkillRegistry>("skills").is_none());
+        assert!(!runtime.skills.as_ref().unwrap().is_enabled());
         let persisted_3: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
@@ -1212,7 +1274,7 @@ mod tests {
         let act = process_ui_event(&mut app, &mut task_state, UiEvent::ToolsUpdated);
         assert_eq!(act, AppAction::RefreshSidePanelTools);
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1395,7 +1457,6 @@ mod tests {
                     outcome: "failed".into(),
                     tokens_before: None,
                     tokens_after: None,
-                    pruned_count: 0,
                     first_kept_seq: None,
                     summary_preview: None,
                     message: Some("stale error".into()),
@@ -1408,15 +1469,15 @@ mod tests {
 
     #[tokio::test]
     async fn build_session_info_report_thin_wrappers_match_app_and_config() {
-        use cordis::Service;
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
         use mizar_session::{
-            CompactionDigest, SessionContextExt, SessionCreateOptions, SessionEvent, SessionStore,
-            SessionTraceEvent,
+            CompactionDigest, SessionCreateOptions, SessionEvent, SessionTraceEvent,
         };
 
-        let ctx = cordis::Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let store = &runtime.sessions;
 
         let parent = store.create(None);
         parent.append(SessionEvent::user("parent"));
@@ -1485,14 +1546,14 @@ mod tests {
             "{report_at}"
         );
 
-        let report_live = super::build_session_info_report(&ctx, &tui_cfg, &child, &app);
+        let report_live = super::build_session_info_report(&runtime, &tui_cfg, &child, &app);
         assert!(
             report_live.contains(&format!("ID       {child_id}")),
             "{report_live}"
         );
         assert!(report_live.contains("仅内存（未持久化）"), "{report_live}");
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[test]
@@ -1617,15 +1678,14 @@ mod tests {
 
     #[tokio::test]
     async fn tui_emphasis_plugin_respects_enable_and_dispose() {
-        use cordis::Service;
-        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
         use mizar_tui_ui::emphasis::EmphasisConfig;
+        use std::sync::Arc;
 
-        let ctx = cordis::Context::new();
-        ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::temp_dir()))
             .await
             .unwrap();
-        let sp = ctx.system_prompt().unwrap();
+        let sp = &runtime.system_prompt;
 
         assert!(!sp.build().contains("These rules shape replies"));
 
@@ -1636,41 +1696,60 @@ mod tests {
             icons: true,
             guidance: true,
         };
-        let disabled_fiber = ctx.plugin(TuiEmphasisPlugin, disabled_cfg).await.unwrap();
+        assert!(install_tui_emphasis(&runtime, &disabled_cfg).is_none());
         assert!(!sp.build().contains("These rules shape replies"));
-        disabled_fiber.dispose().await;
 
-        // 2. enabled=true && guidance=true 时挂载注入，卸载后干净移除
+        // 2. enabled=true && guidance=true 时挂载注入，释放守卫后干净移除
         let enabled_cfg = EmphasisConfig {
             enabled: true,
             round_caps: true,
             icons: true,
             guidance: true,
         };
-        let plugin_fiber = ctx.plugin(TuiEmphasisPlugin, enabled_cfg).await.unwrap();
+        let guard1 = install_tui_emphasis(&runtime, &enabled_cfg).unwrap();
         assert!(sp.build().contains("These rules shape replies"));
 
-        plugin_fiber.dispose().await;
+        drop(guard1);
         assert!(!sp.build().contains("These rules shape replies"));
 
-        ctx.fiber().dispose().await;
+        // 3. 子代理会话调用 build_for_session 时，不得收到 TUI 回复样式引导
+        let sessions = &runtime.sessions;
+        let root_sess = sessions.create(Some("tui-root".into()));
+        let child_sess = sessions.create_with(mizar_session::SessionCreateOptions {
+            id: Some("tui-child".into()),
+            parent_id: Some(root_sess.id.clone()),
+            origin: Some(mizar_session::SessionOrigin::Subagent),
+            ..Default::default()
+        });
+        let guard2 = install_tui_emphasis(&runtime, &enabled_cfg).unwrap();
+        assert!(
+            sp.build_for_session(Some(&root_sess.id))
+                .contains("These rules shape replies")
+        );
+        assert!(
+            !sp.build_for_session(Some(&child_sess.id))
+                .contains("These rules shape replies")
+        );
+        drop(guard2);
+        let _ = Arc::strong_count(&runtime);
+
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn run_tui_with_summary_refuses_to_start_when_tui_plugin_disabled() {
-        use cordis::Service;
-        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+        use std::sync::Arc;
 
         let raw_before = crossterm::terminal::is_raw_mode_enabled().ok();
-        let ctx = cordis::Context::new();
-        ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::temp_dir()))
             .await
             .unwrap();
 
         let mut cfg = super::TuiConfig::new(std::env::temp_dir());
-        cfg.disabled_plugins = vec![mizar_client_core::PLUGIN_TUI.to_string()];
+        cfg.disabled_plugins = vec![mizar_types::client::PLUGIN_TUI.to_string()];
 
-        let err = super::run_tui_with_summary(ctx.clone(), cfg)
+        let err = super::run_tui_with_summary(Arc::clone(&runtime), cfg)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("tui"), "unexpected error: {err}");
@@ -1682,29 +1761,27 @@ mod tests {
             );
         }
         assert!(
-            !ctx.system_prompt()
-                .unwrap()
+            !runtime
+                .system_prompt
                 .build()
                 .contains("These rules shape replies")
         );
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn runtime_feature_gates_block_disabled_clipboard_local_bash_and_side_panel() {
-        use cordis::Service;
-        use mizar_client_core::{
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+        use mizar_tui_ui::TuiFeatures;
+        use mizar_types::client::{
             HostExtensionFlags, PLUGIN_LOCAL_BASH, PLUGIN_TUI_CLIPBOARD, PLUGIN_TUI_SIDE_PANEL,
         };
-        use mizar_session::{SessionContextExt, SessionStore};
-        use mizar_tools::ToolRuntime;
-        use mizar_tui_ui::TuiFeatures;
 
-        let ctx = cordis::Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let session = ctx.sessions().unwrap().create(None);
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let session = runtime.sessions.create(None);
 
         let flags = HostExtensionFlags::from_disabled_plugins(&[
             PLUGIN_TUI_CLIPBOARD.to_string(),
@@ -1754,11 +1831,11 @@ mod tests {
 
         // 3. side-panel 禁用时 populate_side_panel_data 跳过侧栏与工具/Git 采集
         app.side_panel.open = true;
-        super::actions::populate_side_panel_data(&ctx, &mut app).await;
+        super::actions::populate_side_panel_data(&runtime, &mut app).await;
         assert!(app.side_panel_data.tools.is_empty());
         assert!(app.side_panel_data.git_changes.is_empty());
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -1766,18 +1843,14 @@ mod tests {
      {
         use std::sync::Arc;
 
-        use cordis::{Context, PluginDef, Service};
         use futures::channel::mpsc as futures_mpsc;
-        use mizar_agent_loop::{
-            AgentLoop, AgentLoopConfig, AgentLoopContextExt, DeliveryMode, TurnInput,
-        };
+        use mizar_core::agent_loop::{DeliveryMode, TurnInput};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
         use mizar_llm::{
-            BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
-            LlmRuntime, Message, ModelInfo, ProviderInfo, ReasoningEffort, StreamChunk, ToolCall,
+            BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, Message, ModelInfo,
+            ProviderInfo, ReasoningEffort, StreamChunk, ToolCall,
         };
-        use mizar_session::{SessionContextExt, SessionStore};
-        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
-        use mizar_tools::{ToolDefinition, ToolOutput, ToolRuntime, ToolsContextExt};
+        use mizar_tools::{ToolDefinition, ToolOutput};
         use tokio::sync::{Notify, mpsc};
 
         struct SteerTuiAdapter {
@@ -1861,14 +1934,7 @@ mod tests {
             }
         }
 
-        let ctx = Context::new();
-        ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-            .await
-            .unwrap();
-        ctx.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::temp_dir()))
             .await
             .unwrap();
 
@@ -1876,28 +1942,14 @@ mod tests {
         let adapter = Arc::new(SteerTuiAdapter {
             recorded: Arc::clone(&recorded),
         });
-        ctx.plugin(
-            PluginDef::sync("mock-tui-prov", move |c, ()| {
-                let llm = c.llm()?;
-                let a = Arc::clone(&adapter);
-                c.effect("mock-tui-prov.reg", move || {
-                    Ok::<_, LlmError>(Some(llm.register_adapter("mock-tui", a)?))
-                })?;
-                Ok::<_, cordis::CordisError>(())
-            })
-            .inject(["llm"]),
-            (),
-        )
-        .await
-        .unwrap();
+        runtime.register_adapter("mock-tui", adapter).unwrap();
 
         let started_round = Arc::new(Notify::new());
         let release_round = Arc::new(Notify::new());
         let started_sig = Arc::clone(&started_round);
         let release_sig = Arc::clone(&release_round);
-        let _tool_reg = ctx
-            .tools()
-            .unwrap()
+        let _tool_reg = runtime
+            .tools
             .register(ToolDefinition::async_rich_tool(
                 "tui_gate",
                 "blocks until released or cancelled",
@@ -1908,7 +1960,7 @@ mod tests {
                     async move {
                         s.notify_one();
                         tokio::select! {
-                            _ = r.notified() => Ok::<_, cordis::BoxError>(ToolOutput::text("gate_done")),
+                            _ = r.notified() => Ok::<_, mizar_types::BoxError>(ToolOutput::text("gate_done")),
                             _ = call_ctx.cancel.cancelled() => Err("cancelled".into()),
                         }
                     }
@@ -1916,7 +1968,7 @@ mod tests {
             ))
             .unwrap();
 
-        let sess = ctx.sessions().unwrap().create(None);
+        let sess = runtime.sessions.create(None);
         let cfg = super::TuiConfig::new(std::env::temp_dir());
         let mut app = AppState::new(
             std::env::temp_dir(),
@@ -1931,7 +1983,7 @@ mod tests {
 
         // 1. 启动第一轮（进入阻塞工具），然后发温和 SteerPrompt：不得取消活跃 CancellationToken
         super::actions::spawn_agent_run(
-            &ctx,
+            &runtime,
             &cfg,
             &mut app,
             &sess,
@@ -1943,7 +1995,7 @@ mod tests {
         started_round.notified().await;
 
         super::actions::handle_steer_prompt(
-            &ctx,
+            &runtime,
             &cfg,
             &mut app,
             &sess,
@@ -1974,9 +2026,9 @@ mod tests {
         app.set_busy_state(false);
 
         // 2. 启动第二轮并预塞 FollowUp，然后执行硬取消 cancel_active_run：立即取消且清空收件箱
-        let agent_loop = ctx.agent_loop().unwrap();
+        let agent_loop = &runtime.agent_loop;
         super::actions::spawn_agent_run(
-            &ctx,
+            &runtime,
             &cfg,
             &mut app,
             &sess,
@@ -1999,7 +2051,7 @@ mod tests {
             "subagent:batch",
         );
 
-        super::actions::cancel_active_run(&ctx, &mut app, &sess, &mut task_state);
+        super::actions::cancel_active_run(&runtime, &mut app, &sess, &mut task_state);
         assert!(task_state.active_task().unwrap().cancel.is_cancelled());
         assert!(task_state.active_task().unwrap().user_cancelled);
         assert!(agent_loop.inbox().pop_followup(&sess.id).is_none());
@@ -2035,7 +2087,7 @@ mod tests {
         assert_eq!(woken_sid, sess.id);
 
         assert!(super::actions::drain_next_inbox_followup(
-            &ctx,
+            &runtime,
             &cfg,
             &mut app,
             &sess,
@@ -2053,6 +2105,57 @@ mod tests {
         };
         assert_eq!(followup_res.unwrap(), "woke followup ok");
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
+    }
+
+    #[test]
+    fn inline_finalized_commit_limit_flushes_settled_prefix_while_busy() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-inline-inc",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        app.apply_ui_event(UiEvent::TurnStart { turn: 1 });
+        app.push_user_message("hello");
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "thinking done, calling tool".into(),
+            ts_ms: 10,
+        });
+        // 正在流式输出的 Assistant 尚未定型，仅其前面的 User 已可推进 scrollback
+        assert_eq!(super::inline_finalized_commit_limit(&app), 1);
+
+        // ToolCall 到来会闭合上一条 Assistant，且工具仍在运行，因此 User + Assistant 均可增量提交
+        app.apply_ui_event(UiEvent::ToolCall(mizar_llm::ToolCall {
+            id: "tc-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"a.rs"}"#.into(),
+        }));
+        assert_eq!(super::inline_finalized_commit_limit(&app), 2);
+
+        // 工具完成后仍在最后一项（后续相邻工具可能影响 group_end），等下一个条目到达即提交
+        app.apply_ui_event(UiEvent::ToolResult {
+            call_id: "tc-1".into(),
+            name: "read".into(),
+            content: "ok".into(),
+            is_error: false,
+            blocked: false,
+            details: None,
+        });
+        assert_eq!(super::inline_finalized_commit_limit(&app), 2);
+
+        app.apply_ui_event(UiEvent::TextDelta {
+            text: "final answer".into(),
+            ts_ms: 20,
+        });
+        assert_eq!(super::inline_finalized_commit_limit(&app), 3);
+
+        // TurnEnd 空闲后全量收尾提交
+        app.apply_ui_event(UiEvent::TurnEnd {
+            reason: super::UiTurnEndReason::Completed,
+        });
+        assert_eq!(super::inline_finalized_commit_limit(&app), 4);
     }
 }

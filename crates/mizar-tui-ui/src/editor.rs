@@ -2,8 +2,9 @@
 //!（融合 `pi` `editor.ts` + `dsh-TUI` `PromptEditor.tsx`）。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use mizar_llm_types::ImageAttachment;
+use mizar_types::llm::ImageAttachment;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::BashInputMode;
@@ -20,7 +21,7 @@ pub struct InputLayout {
 struct UndoEntry {
     text: String,
     cursor: usize,
-    pastes: HashMap<String, PasteEntry>,
+    pastes: HashMap<String, Arc<PasteEntry>>,
     paste_seq: usize,
     image_seq: usize,
 }
@@ -52,7 +53,7 @@ enum HistoryNavState {
         index: usize,
         draft_text: String,
         draft_cursor: usize,
-        draft_pastes: HashMap<String, PasteEntry>,
+        draft_pastes: HashMap<String, Arc<PasteEntry>>,
         draft_paste_seq: usize,
         draft_image_seq: usize,
     },
@@ -70,7 +71,7 @@ pub struct TextInput {
     kill_ring: String,
     paste_seq: usize,
     image_seq: usize,
-    pastes: HashMap<String, PasteEntry>,
+    pastes: HashMap<String, Arc<PasteEntry>>,
     layout_cache: Option<CachedInputLayout>,
 }
 
@@ -121,11 +122,23 @@ impl TextInput {
     }
 
     pub fn image_count(&self) -> usize {
-        self.active_images().len()
+        if self.pastes.is_empty() {
+            return 0;
+        }
+        self.pastes
+            .values()
+            .filter(|entry| entry.image.is_some())
+            .map(|entry| self.text.match_indices(&entry.token).count())
+            .sum()
     }
 
     pub fn has_images(&self) -> bool {
-        self.image_count() > 0
+        if self.pastes.is_empty() {
+            return false;
+        }
+        self.pastes
+            .values()
+            .any(|entry| entry.image.is_some() && self.text.contains(&entry.token))
     }
 
     fn push_undo(&mut self) {
@@ -254,11 +267,11 @@ impl TextInput {
         for (token, image) in images {
             self.pastes.insert(
                 token.clone(),
-                PasteEntry {
+                Arc::new(PasteEntry {
                     token: token.clone(),
                     raw: String::new(),
                     image: Some(image.clone()),
-                },
+                }),
             );
         }
     }
@@ -301,11 +314,11 @@ impl TextInput {
         };
         self.pastes.insert(
             token.clone(),
-            PasteEntry {
+            Arc::new(PasteEntry {
                 token: token.clone(),
                 raw: String::new(),
                 image: Some(image),
-            },
+            }),
         );
         self.text.insert_str(self.cursor, &token);
         self.cursor += token.len();
@@ -331,11 +344,11 @@ impl TextInput {
             };
             self.pastes.insert(
                 token.clone(),
-                PasteEntry {
+                Arc::new(PasteEntry {
                     token: token.clone(),
                     raw: normalized,
                     image: None,
-                },
+                }),
             );
             self.text.insert_str(self.cursor, &token);
             self.cursor += token.len();
@@ -1010,5 +1023,41 @@ mod tests {
         assert!(input.has_collapsed_pastes());
         assert_eq!(input.image_count(), 1);
         assert_eq!(input.cursor_byte(), saved_cursor);
+    }
+
+    #[test]
+    fn push_undo_shares_paste_entries_and_counters_avoid_cloning() {
+        let mut input = TextInput::new();
+        let big = (1..=12)
+            .map(|i| format!("paste-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.insert_paste(&big);
+        let img = ImageAttachment::new("image/png", "A".repeat(1024)).with_dimensions(320, 240);
+        let tok = input.insert_image(None, img);
+
+        assert!(input.has_images());
+        assert_eq!(input.image_count(), input.active_images().len());
+
+        // 敲空格触发 push_undo()：undo 快照与当前 pastes 应共享同一份 Arc<PasteEntry>
+        input.insert_str(" hello ");
+        let active_arc = input.pastes.get(&tok).expect("image entry");
+        let undo_arc = input
+            .undo_stack
+            .last()
+            .and_then(|u| u.pastes.get(&tok))
+            .expect("undo image entry");
+        assert!(Arc::ptr_eq(active_arc, undo_arc));
+
+        // 删掉图片占位符后计数器清零，撤销后恢复
+        for _ in 0.." hello ".len() {
+            input.backspace();
+        }
+        input.backspace();
+        assert!(!input.has_images());
+        assert_eq!(input.image_count(), 0);
+        assert!(input.undo());
+        assert!(input.has_images());
+        assert_eq!(input.image_count(), 1);
     }
 }

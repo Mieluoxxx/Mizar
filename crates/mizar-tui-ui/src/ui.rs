@@ -1,6 +1,6 @@
 //! TUI 布局与渲染引擎主入口：双栏工作台、全屏轨迹切换、浮层与选区叠绘调度。
 
-use mizar_llm_types::ReasoningEffort;
+use mizar_types::llm::ReasoningEffort;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -238,7 +238,7 @@ mod tests {
             None,
             None,
         );
-        app.apply_ui_event(UiEvent::ToolCall(mizar_llm_types::ToolCall {
+        app.apply_ui_event(UiEvent::ToolCall(mizar_types::llm::ToolCall {
             id: "c1".into(),
             name: "read".into(),
             arguments: r#"{"path":"a.rs"}"#.into(),
@@ -247,7 +247,7 @@ mod tests {
         assert!(frame1.contains("read(a.rs)"), "{frame1}");
 
         // 第二个工具到来后，c1 不再是组尾，必须失效缓存并消除两者之间的空行
-        app.apply_ui_event(UiEvent::ToolCall(mizar_llm_types::ToolCall {
+        app.apply_ui_event(UiEvent::ToolCall(mizar_types::llm::ToolCall {
             id: "c2".into(),
             name: "read".into(),
             arguments: r#"{"path":"b.rs"}"#.into(),
@@ -434,5 +434,60 @@ mod tests {
             app.item_cache.len()
         );
         assert!(top_screen.contains("user prompt line #0"));
+    }
+
+    #[test]
+    fn resize_defers_offscreen_reflow_and_materializes_when_scrolled_into_view() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-lazy-resize",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        for i in 0..160 {
+            app.items.push(crate::app::ChatItem::User {
+                text: format!("prompt #{i} with enough words to wrap at 80 cols"),
+            });
+            app.items.push(crate::app::ChatItem::Assistant {
+                reasoning: String::new(),
+                text: format!(
+                    "assistant paragraph #{i}: long explanation text that differs across widths"
+                ),
+            });
+        }
+
+        // 1. 首次在 120 列全量渲染
+        let _ = render_buffer_text(&mut app, 120, 30);
+
+        // 2. 缩窄至 80 列（auto_scroll = true）：离屏第 0 条应保留旧高度占位，不在新宽度下重排
+        let _ = render_buffer_text(&mut app, 80, 30);
+        let content_w80 = 80usize - crate::timeline_rail::RAIL_WIDTH as usize;
+        let key_item0_w80 = crate::app::ItemRenderKey {
+            width: content_w80,
+            theme_id: app.theme.id,
+            emphasis_enabled: app.emphasis.enabled,
+            round_caps: app.emphasis.round_caps,
+            expanded: app.verbose_expanded,
+            status_code: 0,
+            reasoning_len: 0,
+            text_len: match &app.items[0] {
+                crate::app::ChatItem::User { text } => text.len(),
+                _ => unreachable!(),
+            },
+            preview_len: 0,
+        };
+        assert!(
+            app.item_cache.get_height(0, &key_item0_w80).is_none(),
+            "offscreen item 0 should not be eagerly reflowed at width 80 while bottom-pinned"
+        );
+
+        // 3. 滚回顶部后，第 0 条进入视口并惰性重排准确渲染
+        app.auto_scroll = false;
+        app.scroll_from_top = 0;
+        let top_screen = render_buffer_text(&mut app, 80, 30);
+        assert!(top_screen.contains("prompt #0"));
+        assert!(app.item_cache.get_height(0, &key_item0_w80).is_some());
     }
 }

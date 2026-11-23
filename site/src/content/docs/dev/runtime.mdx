@@ -1,0 +1,81 @@
+---
+title: MizarRuntime、强类型钩子与新增工具
+description: 基于静态 MizarRuntime::build 组合根与 mizar-types::hooks 强类型钩子装配能力：HookGuard RAII 清理、5 级 ToolExposure、强类型事件总线与注册新工具。
+group: dev-arch
+order: 19
+---
+
+import Callout from '../../../components/mdx/Callout.astro';
+
+Mizar v0.3 已彻底退出动态微内核，在 `crates/mizar-core/src/spine.rs` 通过 **`MizarRuntime::build` 静态组合根** 按编译期 DAG 顺序直接构建并传入 `Arc<T>` 服务，以 `crates/mizar-types/src/hooks.rs` 的强类型钩子与 `#[must_use]` `HookGuard` 协同扩展与逆序清理。
+
+## 静态组合根与 `HookGuard` 清理不变量
+
+`MizarRuntime::build(config)` 按固定依赖图依次实例化并传递服务：
+
+```text
+LlmRuntime → SqliteSessionPersistence / SessionStore → ToolRuntime → SystemPrompt → AgentLoop → 编码工具 / 扩展模块 / SpinePlugins
+```
+
+所有核心服务都在 `MizarRuntime` 字段上直接持有，缺失依赖会在编译期直接报错；内置模块开关由 `SpinePlugins`（`AtomicBool` 门控 + `ToolRuntime` 分组屏蔽，仅重量级外部进程 `mcp` 在启动禁用时延迟到首次启用初始化）管理。
+
+- **副作用统一返回 `#[must_use] HookGuard`**：`ToolRuntime::register`、`SystemPrompt::section`、`SyncEventBus::on`、`WaterfallHook::register*`、`SerialHook::register*` 以及各类 `install_*` 都会返回 `HookGuard`。
+- **LIFO 逆序销毁**：必须将 `HookGuard` 绑定具名变量、保存在宿主结构体中，或交给 `runtime.push_guard(guard)` 托管——`MizarRuntime::shutdown()`（及 `Drop`）会按加入顺序的 **LIFO 逆序** 自动注销工具与钩子。
+
+<Callout type="warning" title="丢弃 #[must_use] HookGuard 会立即注销">
+  <code>HookGuard</code> 不是只用于消除编译警告的装饰类型——如果用 <code>let _ = tools.register(...)</code> 临时丢弃返回值，该工具或钩子会在语句结束瞬间被立刻卸载。请务必保存返回的 <code>HookGuard</code>，或调用 <code>runtime.push_guard(guard)</code> 纳入运行时生命周期。
+</Callout>
+
+## 注册新工具最小示例
+
+直接通过 `ToolRuntime::register` 注册工具并接收返回的 `HookGuard`：
+
+```rust title="crates/mizar-tools/src/..."
+use std::sync::Arc;
+use mizar_tools::{ToolDefinition, ToolError, ToolExposure, ToolRuntime};
+use mizar_types::hooks::{BoxError, HookGuard};
+use serde_json::json;
+
+pub fn register_ping_tool(tools: &Arc<ToolRuntime>) -> Result<HookGuard, ToolError> {
+    tools.register(
+        ToolDefinition::sync_tool(
+            "ping",
+            "Return pong for health diagnostics.",
+            json!({ "type": "object", "properties": {} }),
+            |_args, _exec| Ok::<_, BoxError>("pong".to_string()),
+        )
+        .with_exposure(ToolExposure::Direct),
+    )
+}
+```
+
+接入自定义 LLM 协议适配器同样无需运行时反射：在 `crates/mizar-llm/src/` 实现 `LlmAdapter` 并调用 `runtime.register_adapter(name, adapter)`，底层同样会把 `HookGuard` 交由 `MizarRuntime` 托管。
+
+## 工具可见性（`ToolExposure`）与三段管线
+
+注册工具时需明确选定 `ToolExposure`，选错会导致工具不可见或无法在沙箱中调用：
+
+| `ToolExposure` 枚举 | 行为语义 | 适用场景 |
+| :--- | :--- | :--- |
+| `Direct` | 激活后对大模型直接暴露且沙箱可用 | 核心内置工具（`read` / `bash` / `edit` / `write` / `grep` / `find` / `skill` / `recall`） |
+| `ModelOnly` | 对大模型可见，禁止沙箱脚本递归调用 | 编排元工具（`tool_search` / `codemode` / `subagent`） |
+| `Codemode` | 只进沙箱目录与编排环境、不占首轮 prompt | 外部 MCP 工具默认值 |
+| `Deferred` | 平时隐藏，仅能靠 `tool_search` / `searchTools()` 检出 | 大型或冷门外部 MCP 工具 |
+| `Hidden` | 对模型与沙箱完全屏蔽 | 项目显式禁用（`excludeTools`）工具 |
+
+`crates/mizar-tools/src/lib.rs` 对每次工具执行串联三道 `WaterfallHook`：`pre_execute_hook`（校验与拦截）、`execute_hook`（超时/监控包装）与 `post_execute_hook`（输出改写或上下文提醒）。涉及同一文件路径写入的工具，务必使用 `with_file_mutation_queue` 串行执行，防止并发 tool call 互相踩写。
+
+## `mizar-types::hooks` 强类型钩子与 `AgentEvent`
+
+仓库摒弃了无类型字符串事件总线与 `&dyn Any` 向下转型，统一使用强类型原语（`crates/mizar-types/src/hooks.rs` 与 `crates/mizar-core/src/agent_loop.rs`）：
+
+- **`WaterfallHook<I, O>` + `Next<I, O>`**：支持通过 `HookOptions { priority, prepend }` 控制拦截顺序（例如 `SubagentRuntime` 以 `priority: -100, prepend: true` 守在 `tools.pre_execute_hook` 最外层；`agent_loop.pre_step_hook` 依次按 `FileMentions(-50)` → `CompactionRuntime(-20)` → `<environment_context>(-10)` → `Skills(5)` 装配）。
+- **`SerialHook<I, O>`**：按优先级惰性串行调用，首个返回 `Some(result)` 即短路返回。
+- **`SyncEventBus<E>`**：拷贝快照后同步广播，允许回调内重入注销；驱动 `tools.on_change`、`tools.on_result` 与 `sessions.on_event` 等事件。
+- **`AgentLoop::subscribe()` / `on_event()`**：向外广播封闭强类型 `enum AgentEvent`（`Status`、`TurnStart`、`StepStart`、`TextDelta`、`ToolCall`、`ToolResult`、`Usage`、`TurnEnd` 等），结合 `tracing` 与 `mizar-client::logging` 完成可观测采集。
+
+## 把新能力接进宿主
+
+1. 若引入新外部依赖或新 crate，按 root `Cargo.toml` 规范在 `[workspace.dependencies]` 统一登记版本，子 crate 清单使用 `{ workspace = true }` 与 `[lints] workspace = true`（完整规范见 [工程规范、门控与测试](/dev/conventions/)）。
+2. 在 `crates/mizar-core/src/spine.rs` 的 `MizarRuntime::build` 按依赖顺序显式构造与注册（可选特征须配好 `#[cfg(feature = "...")]`；需要运行期开关则在 `SpinePlugins` 登记稳定 ID）。
+3. 同步更新权威架构文档 **`docs/plugins.md`** 的 crate 表格与拓扑关系，保持文档与编译依赖图零漂移。

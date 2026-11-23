@@ -1,4 +1,4 @@
-//! 前端无关的 Mizar 客户端宿主运行时与官方扩展插件集。
+//! 前端无关的 Mizar 客户端宿主运行时与官方扩展挂接器。
 //!
 //! 供 `mizar-tui` 与桌面端（Merak）共同复用，严禁引入 `ratatui`、`crossterm` 或 `mizar-tui-ui`。
 
@@ -6,19 +6,20 @@ pub mod approval;
 pub mod events;
 pub mod images;
 pub mod local_bash;
+pub mod logging;
 pub mod mentions;
 pub mod session_view;
 pub mod settings;
 pub mod workspace;
 
 pub use approval::{
-    ApprovalGateConfig, ApprovalGatePlugin, ApprovalSnapshot, register_approval_hook,
+    ApprovalGateConfig, ApprovalSnapshot, install_approval_gate, register_approval_hook,
     register_approval_hook_with, tool_needs_approval,
 };
 pub use events::{
-    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, WaitServicesError, steer_session,
-    subscribe_session_events, subscribe_session_events_into, to_ui_log_record, to_ui_status,
-    to_ui_step_outcome, to_ui_turn_end_reason, wait_for_services,
+    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, steer_session,
+    subscribe_session_events, subscribe_session_events_into, to_ui_status, to_ui_step_outcome,
+    to_ui_turn_end_reason,
 };
 pub use images::{
     ImageProcessError, JPEG_QUALITY, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_EDGE, MAX_IMAGE_PIXELS,
@@ -26,9 +27,13 @@ pub use images::{
     sniff_image_format,
 };
 pub use local_bash::{execute_local_bash_for_session, next_local_bash_call_id};
+pub use logging::{
+    TracingBridgeGuard, ensure_tracing_installed, env_log_level, env_log_level_override,
+    install_silent_tracing, install_tracing_handler, parse_log_level, ui_log_level_tag,
+};
 pub use mentions::{
-    FileMentionsConfig, FileMentionsPlugin, MENTION_MAX_DIR_ENTRIES, MENTION_MAX_FILE_CHARS,
-    MENTION_MAX_TOTAL_CHARS, MentionExpansionResult, expand_text_mentions,
+    FileMentionsConfig, MENTION_MAX_DIR_ENTRIES, MENTION_MAX_FILE_CHARS, MENTION_MAX_TOTAL_CHARS,
+    MentionExpansionResult, expand_text_mentions, install_file_mentions,
     mentions_resolve_any_image, register_mention_hook, register_mention_hook_with,
 };
 pub use session_view::{

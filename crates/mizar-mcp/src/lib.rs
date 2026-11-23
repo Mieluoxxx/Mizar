@@ -1,5 +1,5 @@
 //! MCP 插件：连接配置文件与程序注册的 MCP Server，将远程工具以 `mcp__<server>__<tool>` 注册进 `ToolRuntime`，
-//! 并支持 `Direct` / `Codemode` / `Deferred` / `Hidden` 分级暴露、`list_mcp_resources` 资源工具及 `<mcp_servers>` 提示词。
+//! 并支持 `Direct` / `Codemode` / `Deferred` / `Hidden` 分级暴露及 `list_mcp_resources` 资源工具。
 
 pub mod client;
 pub mod config;
@@ -7,17 +7,16 @@ pub mod transport;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Logger, Service};
-use mizar_system_prompt::{PromptSection, SystemPrompt};
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head, write_temp_output,
 };
 use mizar_tools::{
     ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolNamespace, ToolOutput,
-    ToolsContextExt,
+    ToolRuntime,
 };
+use mizar_types::hooks::{BoxError, HookGuard};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -102,7 +101,7 @@ pub struct McpServerStatus {
 struct ConnectedServer {
     entry: LoadedMcpEntry,
     client: Arc<McpClient>,
-    cleanups: Vec<Cleanup>,
+    guards: Vec<HookGuard>,
 }
 
 fn mcp_server_summary(description: Option<&str>, instructions: Option<&str>) -> String {
@@ -126,11 +125,11 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 pub struct McpManager {
-    ctx: Context,
+    tools: Arc<ToolRuntime>,
     config: McpPluginConfig,
     servers: AsyncMutex<HashMap<String, ConnectedServer>>,
     statuses: Mutex<HashMap<String, McpServerStatus>>,
-    resource_cleanups: AsyncMutex<Vec<Cleanup>>,
+    resource_guards: AsyncMutex<Vec<HookGuard>>,
     connect_lock: AsyncMutex<()>,
     connect_cancel: CancellationToken,
     phase: Mutex<McpManagerPhase>,
@@ -138,8 +137,31 @@ pub struct McpManager {
 }
 
 impl McpManager {
-    fn logger(&self) -> Logger {
-        self.ctx.logger_named("mcp")
+    pub fn new(tools: Arc<ToolRuntime>, config: McpPluginConfig) -> Arc<Self> {
+        Arc::new(Self {
+            tools,
+            config,
+            servers: AsyncMutex::new(HashMap::new()),
+            statuses: Mutex::new(HashMap::new()),
+            resource_guards: AsyncMutex::new(Vec::new()),
+            connect_lock: AsyncMutex::new(()),
+            connect_cancel: CancellationToken::new(),
+            phase: Mutex::new(McpManagerPhase::Initializing),
+            ready_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    pub async fn start(tools: Arc<ToolRuntime>, config: McpPluginConfig) -> Arc<Self> {
+        let mgr = Self::new(tools, config);
+        if mgr.config.background_connect {
+            let mgr_connect = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr_connect.connect_configured().await;
+            });
+        } else {
+            mgr.connect_configured().await;
+        }
+        mgr
     }
 
     fn is_closing_or_closed(&self) -> bool {
@@ -263,7 +285,7 @@ impl McpManager {
         Some(parts.join("\n"))
     }
 
-    pub async fn connect_configured(&self) {
+    pub async fn connect_configured(self: &Arc<Self>) {
         let _guard = self.connect_lock.lock().await;
         if self.is_closing_or_closed() {
             self.ready_notify.notify_waiters();
@@ -282,7 +304,7 @@ impl McpManager {
             };
             let loaded = load_mcp_config_with_global(&self.config.workspace, global_dir.as_deref());
             for err in loaded.errors {
-                self.logger().warn(err);
+                tracing::warn!(target: "mizar::mcp", "{err}");
             }
             for entry in loaded.entries {
                 entries_map.insert(entry.name.clone(), entry);
@@ -326,6 +348,8 @@ impl McpManager {
             }
         }
 
+        // 并发连接各启用的 MCP Server，消除单点慢服务导致的 30s+ 队头阻塞
+        let mut join_set = tokio::task::JoinSet::new();
         for entry in entries {
             if self.is_closing_or_closed() {
                 break;
@@ -333,15 +357,25 @@ impl McpManager {
             if !entry.config.enabled {
                 continue;
             }
-            if let Err(err) = self.connect_one(entry.clone()).await {
-                if self.is_closing_or_closed() {
-                    break;
+            let mgr = Arc::clone(self);
+            join_set.spawn(async move {
+                if mgr.is_closing_or_closed() {
+                    return;
                 }
-                self.logger()
-                    .warn(format!("MCP server `{}` failed: {err}", entry.name));
-                if let Some(st) = self.statuses.lock().unwrap().get_mut(&entry.name) {
-                    st.state = McpConnectionState::Failed(err);
+                if let Err(err) = mgr.connect_one(entry.clone()).await {
+                    if mgr.is_closing_or_closed() {
+                        return;
+                    }
+                    tracing::warn!(target: "mizar::mcp", "MCP server `{}` failed: {err}", entry.name);
+                    if let Some(st) = mgr.statuses.lock().unwrap().get_mut(&entry.name) {
+                        st.state = McpConnectionState::Failed(err);
+                    }
                 }
+            });
+        }
+        while let Some(res) = join_set.join_next().await {
+            if let Err(err) = res {
+                tracing::warn!(target: "mizar::mcp", "MCP connect task failed: {err}");
             }
         }
 
@@ -360,15 +394,9 @@ impl McpManager {
     async fn connect_one(&self, entry: LoadedMcpEntry) -> Result<(), String> {
         let cancel = self.connect_cancel.clone();
         let client = Arc::new(
-            McpClient::connect(
-                &entry.name,
-                &entry.config,
-                &self.config.workspace,
-                self.logger(),
-                &cancel,
-            )
-            .await
-            .map_err(|e| e.to_string())?,
+            McpClient::connect(&entry.name, &entry.config, &self.config.workspace, &cancel)
+                .await
+                .map_err(|e| e.to_string())?,
         );
 
         let remote_tools = match client.list_all_tools(&cancel).await {
@@ -384,7 +412,7 @@ impl McpManager {
             return Err("MCP manager closed".to_string());
         }
 
-        let tools_rt = self.ctx.tools().map_err(|e| e.to_string())?;
+        let tools_rt = Arc::clone(&self.tools);
         let ns_name = mcp_namespace(&entry.name);
         let ns_desc = entry
             .config
@@ -406,7 +434,7 @@ impl McpManager {
             instructions: ns_instructions.clone(),
         };
 
-        let mut cleanups = Vec::new();
+        let mut guards = Vec::new();
         let mut registered_tools = Vec::new();
 
         for remote in &remote_tools {
@@ -425,15 +453,22 @@ impl McpManager {
             def.default_active = Some(exposure == ToolExposure::Direct);
 
             match tools_rt.register(def) {
-                Ok(c) => {
-                    cleanups.push(c);
+                Ok(g) => {
+                    guards.push(g);
                     registered_tools.push((full_name, exposure));
                 }
                 Err(err) => {
-                    self.logger()
-                        .warn(format!("skipping MCP tool `{full_name}`: {err}"));
+                    tracing::warn!(target: "mizar::mcp", "skipping MCP tool `{full_name}`: {err}");
                 }
             }
+        }
+
+        if self.is_closing_or_closed() {
+            for g in guards.into_iter().rev() {
+                drop(g);
+            }
+            client.close().await;
+            return Err("MCP manager closed".to_string());
         }
 
         let state = McpConnectionState::Connected {
@@ -454,15 +489,15 @@ impl McpManager {
             ConnectedServer {
                 entry,
                 client,
-                cleanups,
+                guards,
             },
         );
         Ok(())
     }
 
-    async fn sync_resource_tools(&self) {
-        let mut res_cleanups = self.resource_cleanups.lock().await;
-        if !res_cleanups.is_empty() {
+    async fn sync_resource_tools(self: &Arc<Self>) {
+        let mut res_guards = self.resource_guards.lock().await;
+        if !res_guards.is_empty() {
             return;
         }
         let any_resources = {
@@ -472,18 +507,16 @@ impl McpManager {
         if !any_resources {
             return;
         }
-        let Ok(tools_rt) = self.ctx.tools() else {
-            return;
-        };
 
+        let weak = Arc::downgrade(self);
         let defs = [
-            make_list_resources_def(false),
-            make_list_resources_def(true),
-            make_read_resource_def(),
+            make_list_resources_def(Weak::clone(&weak), false),
+            make_list_resources_def(Weak::clone(&weak), true),
+            make_read_resource_def(weak),
         ];
         for def in defs {
-            if let Ok(c) = tools_rt.register(def) {
-                res_cleanups.push(c);
+            if let Ok(g) = self.tools.register(def) {
+                res_guards.push(g);
             }
         }
     }
@@ -500,9 +533,9 @@ impl McpManager {
         self.ready_notify.notify_waiters();
         let _connect_guard = self.connect_lock.lock().await;
 
-        let mut res = self.resource_cleanups.lock().await;
-        for c in res.drain(..) {
-            run_cleanup(c).await;
+        let mut res = self.resource_guards.lock().await;
+        for g in res.drain(..).rev() {
+            drop(g);
         }
         drop(res);
 
@@ -511,8 +544,8 @@ impl McpManager {
         drop(srvs);
 
         for srv in drained {
-            for c in srv.cleanups {
-                run_cleanup(c).await;
+            for g in srv.guards.into_iter().rev() {
+                drop(g);
             }
             srv.client.close().await;
         }
@@ -543,10 +576,9 @@ impl McpManager {
     }
 }
 
-async fn run_cleanup(c: Cleanup) {
-    match c {
-        Cleanup::Sync(f) => f(),
-        Cleanup::Async(f) => f().await,
+impl Drop for McpManager {
+    fn drop(&mut self) {
+        self.connect_cancel.cancel();
     }
 }
 
@@ -602,6 +634,26 @@ fn make_mcp_tool_def(
     def
 }
 
+async fn format_truncated_output(spill_prefix: &str, raw_text: &str) -> String {
+    let trunc = truncate_head(raw_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if trunc.truncated {
+        let spilled = write_temp_output(spill_prefix, raw_text)
+            .await
+            .ok()
+            .map(|p| format!(" Full output saved to: {}", p.display()))
+            .unwrap_or_default();
+        format!(
+            "{}\n\n[Truncated to {} lines / {}.{}]",
+            trunc.content,
+            trunc.output_lines,
+            format_size(DEFAULT_MAX_BYTES),
+            spilled
+        )
+    } else {
+        trunc.content
+    }
+}
+
 async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
     let is_error = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
     let structured = res.get("structuredContent").cloned();
@@ -641,23 +693,7 @@ async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
         parts.join("\n")
     };
 
-    let trunc = truncate_head(&raw_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    let content = if trunc.truncated {
-        let spilled = write_temp_output("mizar-mcp-", &raw_text)
-            .await
-            .ok()
-            .map(|p| format!(" Full output saved to: {}", p.display()))
-            .unwrap_or_default();
-        format!(
-            "{}\n\n[Truncated to {} lines / {}.{}]",
-            trunc.content,
-            trunc.output_lines,
-            format_size(DEFAULT_MAX_BYTES),
-            spilled
-        )
-    } else {
-        trunc.content
-    };
+    let content = format_truncated_output("mizar-mcp-", &raw_text).await;
 
     Ok(ToolOutput {
         content,
@@ -667,7 +703,7 @@ async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
     })
 }
 
-fn make_list_resources_def(templates: bool) -> ToolDefinition {
+fn make_list_resources_def(mgr: Weak<McpManager>, templates: bool) -> ToolDefinition {
     let (name, desc) = if templates {
         (
             LIST_MCP_RESOURCE_TEMPLATES_TOOL,
@@ -689,11 +725,10 @@ fn make_list_resources_def(templates: bool) -> ToolDefinition {
                 "cursor": { "type": "string", "description": "Optional pagination cursor when filtering one server" }
             }
         }),
-        move |args, call_ctx| async move {
-            let mgr = call_ctx
-                .ctx
-                .get::<McpManager>("mcp")
-                .ok_or("MCP 服务未就绪")?;
+        move |args, call_ctx| {
+            let mgr = Weak::clone(&mgr);
+            async move {
+                let mgr = mgr.upgrade().ok_or("MCP 服务未就绪")?;
             let server_filter = args.get("server").and_then(Value::as_str);
             let cursor = args.get("cursor").and_then(Value::as_str);
             let clients = mgr.resource_clients(server_filter).await;
@@ -731,16 +766,17 @@ fn make_list_resources_def(templates: bool) -> ToolDefinition {
                 }
             }
 
-            let mut payload = json!({ key: items });
-            if let Some(srv) = server_filter {
-                payload["server"] = Value::String(srv.to_string());
-            }
-            if let Some(nc) = next_cursor {
-                payload["nextCursor"] = Value::String(nc);
-            }
+                let mut payload = json!({ key: items });
+                if let Some(srv) = server_filter {
+                    payload["server"] = Value::String(srv.to_string());
+                }
+                if let Some(nc) = next_cursor {
+                    payload["nextCursor"] = Value::String(nc);
+                }
 
-            let text = serde_json::to_string_pretty(&payload)?;
-            Ok(ToolOutput::text(text).with_structured(payload))
+                let text = serde_json::to_string_pretty(&payload)?;
+                Ok(ToolOutput::text(text).with_structured(payload))
+            }
         },
     )
     .with_exposure(ToolExposure::Direct)
@@ -751,7 +787,7 @@ fn make_list_resources_def(templates: bool) -> ToolDefinition {
     })
 }
 
-fn make_read_resource_def() -> ToolDefinition {
+fn make_read_resource_def(mgr: Weak<McpManager>) -> ToolDefinition {
     ToolDefinition::async_rich_tool(
         READ_MCP_RESOURCE_TOOL,
         "Read an MCP resource by server name and URI.",
@@ -763,41 +799,42 @@ fn make_read_resource_def() -> ToolDefinition {
             },
             "required": ["server", "uri"]
         }),
-        move |args, call_ctx| async move {
-            let server = args
-                .get("server")
-                .and_then(Value::as_str)
-                .ok_or("缺少 server 参数")?;
-            let uri = args
-                .get("uri")
-                .and_then(Value::as_str)
-                .ok_or("缺少 uri 参数")?;
-            let mgr = call_ctx
-                .ctx
-                .get::<McpManager>("mcp")
-                .ok_or("MCP 服务未就绪")?;
-            let clients = mgr.resource_clients(Some(server)).await;
-            let Some((_, client)) = clients.into_iter().next() else {
-                return Err(format!("Unknown or resource-less MCP server: {server}").into());
-            };
-            let res = client.read_resource(uri, &call_ctx.cancel).await?;
-            let mut texts = Vec::new();
-            if let Some(contents) = res.get("contents").and_then(Value::as_array) {
-                for item in contents {
-                    if let Some(t) = item.get("text").and_then(Value::as_str) {
-                        texts.push(t.to_string());
-                    } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
-                        let path = write_temp_output("mizar-mcp-blob-", blob).await?;
-                        texts.push(format!("[Binary resource saved to: {}]", path.display()));
+        move |args, call_ctx| {
+            let mgr = Weak::clone(&mgr);
+            async move {
+                let server = args
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .ok_or("缺少 server 参数")?;
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or("缺少 uri 参数")?;
+                let mgr = mgr.upgrade().ok_or("MCP 服务未就绪")?;
+                let clients = mgr.resource_clients(Some(server)).await;
+                let Some((_, client)) = clients.into_iter().next() else {
+                    return Err(format!("Unknown or resource-less MCP server: {server}").into());
+                };
+                let res = client.read_resource(uri, &call_ctx.cancel).await?;
+                let mut texts = Vec::new();
+                if let Some(contents) = res.get("contents").and_then(Value::as_array) {
+                    for item in contents {
+                        if let Some(t) = item.get("text").and_then(Value::as_str) {
+                            texts.push(t.to_string());
+                        } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
+                            let path = write_temp_output("mizar-mcp-blob-", blob).await?;
+                            texts.push(format!("[Binary resource saved to: {}]", path.display()));
+                        }
                     }
                 }
+                let raw_text = if texts.is_empty() {
+                    res.to_string()
+                } else {
+                    texts.join("\n")
+                };
+                let text = format_truncated_output("mizar-mcp-resource-", &raw_text).await;
+                Ok(ToolOutput::text(text).with_structured(res))
             }
-            let text = if texts.is_empty() {
-                res.to_string()
-            } else {
-                texts.join("\n")
-            };
-            Ok(ToolOutput::text(text).with_structured(res))
         },
     )
     .with_exposure(ToolExposure::Direct)
@@ -808,91 +845,6 @@ fn make_read_resource_def() -> ToolDefinition {
     })
 }
 
-impl Service for McpManager {
-    type Config = McpPluginConfig;
-
-    fn service_name() -> &'static str {
-        "mcp"
-    }
-
-    fn plugin_name() -> &'static str {
-        "McpManager"
-    }
-
-    fn inject() -> Inject {
-        Inject::from(["tools"])
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            config,
-            servers: AsyncMutex::new(HashMap::new()),
-            statuses: Mutex::new(HashMap::new()),
-            resource_cleanups: AsyncMutex::new(Vec::new()),
-            connect_lock: AsyncMutex::new(()),
-            connect_cancel: CancellationToken::new(),
-            phase: Mutex::new(McpManagerPhase::Initializing),
-            ready_notify: Arc::new(tokio::sync::Notify::new()),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let mgr_connect = Arc::clone(&self);
-        let mgr_close = Arc::clone(&self);
-        let mgr_prompt = Arc::clone(&self);
-        let ctx = ctx.clone();
-
-        Box::pin(async move {
-            let prompt_fiber = ctx.try_inject(["systemPrompt"], move |c| {
-                let mgr = Arc::clone(&mgr_prompt);
-                async move {
-                    let sp = c.service::<SystemPrompt>("systemPrompt")?;
-                    c.effect("mcp.system-prompt", move || {
-                        Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                            "mcp_servers",
-                            30,
-                            move || mgr.render_servers_section(),
-                        ))))
-                    })?;
-                    Ok::<_, CordisError>(())
-                }
-            })?;
-            if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
-                prompt_fiber.wait_settled().await?;
-            }
-
-            ctx.effect("mcp.close-all", move || {
-                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                    mgr_close.close_all().await;
-                })))
-            })?;
-
-            if mgr_connect.config.background_connect {
-                tokio::spawn(async move {
-                    mgr_connect.connect_configured().await;
-                });
-            } else {
-                mgr_connect.connect_configured().await;
-            }
-
-            Ok(())
-        })
-    }
-}
-
-pub type McpPlugin = cordis::ServicePlugin<McpManager>;
-
-pub trait McpContextExt {
-    fn mcp(&self) -> Result<Arc<McpManager>, CordisError>;
-}
-
-impl McpContextExt for Context {
-    fn mcp(&self) -> Result<Arc<McpManager>, CordisError> {
-        self.service::<McpManager>("mcp")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,14 +852,11 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_before_connect_wakes_wait_ready_and_remains_idempotent() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
+        let tools = ToolRuntime::new();
         let mut cfg = McpPluginConfig::new(".");
         cfg.load_config_files = false;
         cfg.background_connect = false;
-        app.plugin(McpManager::plugin(), cfg).await.unwrap();
-
-        let mgr = app.mcp().unwrap();
+        let mgr = McpManager::start(tools, cfg).await;
         mgr.wait_ready().await;
         assert_eq!(*mgr.phase.lock().unwrap(), McpManagerPhase::Ready);
 
@@ -930,7 +879,57 @@ mod tests {
         mgr.close_all().await;
         mgr.connect_configured().await;
         assert_eq!(*mgr.phase.lock().unwrap(), McpManagerPhase::Closed);
+    }
 
-        app.fiber().dispose().await;
+    #[tokio::test]
+    async fn format_truncated_output_truncates_large_resource_and_spills_to_temp_file() {
+        let huge = "x".repeat(DEFAULT_MAX_BYTES + 4096);
+        let formatted = format_truncated_output("mizar-mcp-resource-", &huge).await;
+        assert!(formatted.contains("[Truncated to "));
+        assert!(formatted.contains("Full output saved to: "));
+        assert!(formatted.len() < huge.len());
+        if let Some((_, rest)) = formatted.split_once("Full output saved to: ")
+            && let Some(path_str) = rest.strip_suffix(']')
+        {
+            let path = std::path::Path::new(path_str);
+            assert!(path.exists());
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_configured_connects_servers_concurrently() {
+        let tools = ToolRuntime::new();
+        let mut cfg = McpPluginConfig::new(".");
+        cfg.load_config_files = false;
+        cfg.background_connect = false;
+        for name in ["slow_a", "slow_b", "slow_c"] {
+            let mut srv = McpServerConfig::stdio(
+                "sh",
+                vec!["-c".to_string(), "sleep 0.25; exit 1".to_string()],
+            );
+            srv.timeout_ms = Some(2_000);
+            cfg.servers.insert(name.to_string(), srv);
+        }
+
+        let t0 = std::time::Instant::now();
+        let mgr = McpManager::start(tools, cfg).await;
+        let elapsed = t0.elapsed();
+
+        let statuses = mgr.statuses();
+        assert_eq!(statuses.len(), 3);
+        assert!(
+            statuses
+                .iter()
+                .all(|s| matches!(s.state, McpConnectionState::Failed(_)))
+        );
+        // 3 个各耗时 250ms 的服务若串行至少 750ms；并发应显著低于 600ms
+        assert!(
+            elapsed < std::time::Duration::from_millis(600),
+            "expected concurrent MCP connect, elapsed {elapsed:?}"
+        );
+
+        mgr.close_all().await;
     }
 }

@@ -2,15 +2,13 @@
 
 use std::path::Path;
 
-use cordis::Context;
-use mizar_agent_spine::{
-    CompactionContextExt, SpinePluginsContextExt, normalize_session_title_thinking_level,
-    patch_settings_file, persist_disabled_plugins, resolve_global_settings_path,
+use mizar_core::session_title::parse_model_ref;
+use mizar_core::spine::{
+    MizarRuntime, normalize_session_title_thinking_level, patch_settings_file,
+    persist_disabled_plugins, resolve_global_settings_path,
 };
-use mizar_cache_warming::{CacheWarmingMode, CacheWarmingRuntime, SERVICE_CACHE_WARMING};
-use mizar_client_core::{ApprovalMode, NoticeLevel, SettingEntry, SettingItemKind};
 use mizar_llm::ReasoningEffort;
-use mizar_session_title::{SessionTitleContextExt, parse_model_ref};
+use mizar_types::client::{ApprovalMode, NoticeLevel, SettingEntry, SettingItemKind};
 
 /// 前端传递给设置列表构建器的纯视图状态快照（零终端/UI 结构依赖）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +38,7 @@ impl Default for SettingsViewSnapshot {
     }
 }
 
-/// 内置 Cordis 模块热切换的结构化执行结果，供各端（TUI / Merak）同步各自界面与提示。
+/// 内置可选模块热切换的结构化执行结果，供各端（TUI / Merak）同步各自界面与提示。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleToggleOutcome {
     pub ok: bool,
@@ -59,29 +57,27 @@ fn choice_index(options: &[&str], current: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn format_soft_window_cap_label(cap: u64) -> &'static str {
+fn format_max_context_tokens_label(cap: Option<u64>) -> &'static str {
     match cap {
-        0 => "off",
-        1..=160_000 => "128k",
-        160_001..=260_000 => "200k",
-        260_001..=440_000 => "380k",
-        _ => "512k",
+        None | Some(0) => "off",
+        Some(1..=300_000) => "200k",
+        Some(_) => "400k",
     }
 }
 
-fn parse_soft_window_cap_label(label: &str) -> u64 {
-    match label {
-        "off" | "0" => 0,
-        "128k" => 128_000,
-        "200k" => 200_000,
-        "380k" => 380_000,
-        "512k" => 512_000,
-        _ => 380_000,
+fn parse_max_context_tokens_label(label: &str) -> Option<u64> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "200k" | "200000" => Some(200_000),
+        "400k" | "400000" => Some(400_000),
+        _ => None,
     }
 }
 
-/// 根据前端视图快照与 Cordis 运行时服务状态构建统一 `/settings` 条目列表。
-pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec<SettingEntry> {
+/// 根据前端视图快照与运行时服务状态构建统一 `/settings` 条目列表。
+pub fn build_settings_entries(
+    runtime: &MizarRuntime,
+    snap: &SettingsViewSnapshot,
+) -> Vec<SettingEntry> {
     let theme_opts = [
         "auto",
         "mist-dark",
@@ -180,94 +176,47 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         },
     ];
 
-    if let Ok(comp) = ctx.compaction() {
+    if let Some(comp) = runtime.compaction.as_ref()
+        && comp.is_module_enabled()
+    {
         let cfg = comp.config();
-        let cap_opts = ["off", "128k", "200k", "380k", "512k"];
+        let cap_opts = ["off", "200k", "400k"];
         items.extend([
             SettingEntry {
                 key: "compaction.enabled".into(),
                 category: "压缩".into(),
                 label: "启用上下文压缩".into(),
-                description: "总开关：关闭后不会执行自动剪枝、自动压缩或 /compact".into(),
+                description: "总开关：关闭后不会执行自动压缩或 /compact".into(),
                 kind: SettingItemKind::Toggle { value: cfg.enabled },
-            },
-            SettingEntry {
-                key: "compaction.autoPrune".into(),
-                category: "压缩".into(),
-                label: "L1 零模型大输出剪枝".into(),
-                description:
-                    "达到水位时优先对较早轮次大工具输出留头尾+recall句柄，省去 LLM 摘要费用".into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.auto_prune,
-                },
             },
             SettingEntry {
                 key: "compaction.autoCompact".into(),
                 category: "压缩".into(),
-                label: "L2 自动检查点摘要".into(),
-                description: "L1 剪枝仍超阈值时自动生成软硬分离检查点摘要".into(),
+                label: "自动检查点摘要".into(),
+                description: "上下文达到有效窗口 80% 时自动生成结构化检查点摘要".into(),
                 kind: SettingItemKind::Toggle {
                     value: cfg.auto_compact,
                 },
             },
             SettingEntry {
-                key: "compaction.reusePrefixCache".into(),
+                key: "compaction.maxContextTokens".into(),
                 category: "压缩".into(),
-                label: "尾置指令复用前缀缓存".into(),
-                description: "摘要请求复用主对话前缀以吃满 Prompt Cache，失败自动回退纯净转写"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.reuse_prefix_cache,
-                },
-            },
-            SettingEntry {
-                key: "compaction.disableSummaryReasoning".into(),
-                category: "压缩".into(),
-                label: "摘要请求关闭思考".into(),
-                description: "生成压缩摘要时设 reasoning_effort=off，防止隐藏思考耗尽输出预算"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.disable_summary_reasoning,
-                },
-            },
-            SettingEntry {
-                key: "compaction.enableReadDedup".into(),
-                category: "压缩".into(),
-                label: "跨压缩感知重复读去重".into(),
-                description: "同一压缩代次内重复 read 未改动文件区间时返回简短提示，压后自动失效"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.enable_read_dedup,
-                },
-            },
-            SettingEntry {
-                key: "compaction.enableWriteAfterCompactGuard".into(),
-                category: "压缩".into(),
-                label: "压后陈旧整文件写保护".into(),
-                description:
-                    "拦截对压缩前 read 过的已存在文件直接整文件 write，始终放行 edit 与新建".into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.enable_write_after_compact_guard,
-                },
-            },
-            SettingEntry {
-                key: "compaction.softWindowCap".into(),
-                category: "压缩".into(),
-                label: "超大窗口软顶".into(),
-                description:
-                    "为 1M 等超大窗口模型设置触发软上限（默认 380k），保持注意力与缓存效率".into(),
+                label: "上下文软上限".into(),
+                description: "为超大窗口模型设置可选上限（默认 off，使用真实可用窗口）".into(),
                 kind: SettingItemKind::Choice {
                     options: cap_opts.iter().map(|s| s.to_string()).collect(),
                     selected: choice_index(
                         &cap_opts,
-                        format_soft_window_cap_label(cfg.soft_window_cap),
+                        format_max_context_tokens_label(cfg.max_context_tokens),
                     ),
                 },
             },
         ]);
     }
 
-    if let Ok(st) = ctx.session_title() {
+    if let Some(st) = runtime.session_title.as_ref()
+        && st.is_module_enabled()
+    {
         let cfg = st.config();
         let thinking_opts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
         let current_thinking = cfg.reasoning_effort.unwrap_or(ReasoningEffort::Low);
@@ -303,47 +252,16 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
         ]);
     }
 
-    if let Some(cw) = ctx.get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING) {
-        let cfg = cw.config();
-        let mode_opts = ["off", "streaming", "idle"];
-        items.extend([
-            SettingEntry {
-                key: "cacheWarming".into(),
-                category: "缓存".into(),
-                label: "Prompt Cache 续命模式".into(),
-                description:
-                    "off 关闭；streaming 仅在生成或工具运行中保活；idle 回合结束后最多保活 30m"
-                        .into(),
-                kind: SettingItemKind::Choice {
-                    options: mode_opts.iter().map(|s| s.to_string()).collect(),
-                    selected: choice_index(&mode_opts, cfg.mode.as_str()),
-                },
+    for module in runtime.modules.optional_modules() {
+        items.push(SettingEntry {
+            key: format!("plugin.{}", module.id),
+            category: "模块".into(),
+            label: format!("{} ({})", module.label, module.id),
+            description: module.description,
+            kind: SettingItemKind::Toggle {
+                value: module.enabled,
             },
-            SettingEntry {
-                key: "showCacheMissNotices".into(),
-                category: "缓存".into(),
-                label: "显示缓存保活提示".into(),
-                description: "在对话流中显示后台 Prompt Cache 续命状态通知（连续通知自动折叠）"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.show_cache_miss_notices,
-                },
-            },
-        ]);
-    }
-
-    if let Ok(plugins) = ctx.spine_plugins() {
-        for module in plugins.optional_modules() {
-            items.push(SettingEntry {
-                key: format!("plugin.{}", module.id),
-                category: "模块".into(),
-                label: format!("{} ({})", module.label, module.id),
-                description: module.description,
-                kind: SettingItemKind::Toggle {
-                    value: module.enabled,
-                },
-            });
-        }
+        });
     }
 
     items
@@ -351,25 +269,12 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
 
 /// 运行期热更新内置 `SpinePlugins` 模块的启用状态，并可选原子写回 `disabledPlugins`。
 pub async fn toggle_spine_module(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     settings_path: Option<&Path>,
     plugin_id: &str,
     enabled: bool,
 ) -> ModuleToggleOutcome {
-    let Ok(plugins) = ctx.spine_plugins() else {
-        return ModuleToggleOutcome {
-            ok: false,
-            plugin_id: plugin_id.to_string(),
-            enabled,
-            label: plugin_id.to_string(),
-            disabled_ids: Vec::new(),
-            flash: None,
-            notices: vec![(
-                NoticeLevel::Error,
-                "spinePlugins 控制器服务不可用".to_string(),
-            )],
-        };
-    };
+    let plugins = &runtime.modules;
 
     let label = plugins
         .get(plugin_id)
@@ -425,26 +330,21 @@ pub async fn toggle_spine_module(
 }
 
 /// 运行期热更新与终端实例无关的模块配置（`compaction.*`、`sessionTitle.*`）。
-pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
+pub fn apply_runtime_setting_change(runtime: &MizarRuntime, key: &str, value: &str) {
     if key.starts_with("compaction.")
-        && let Ok(comp) = ctx.compaction()
+        && let Some(comp) = runtime.compaction.as_ref()
     {
         let flag = value == "true";
         comp.update_config(|cfg| match key {
             "compaction.enabled" => cfg.enabled = flag,
-            "compaction.autoPrune" => cfg.auto_prune = flag,
             "compaction.autoCompact" => cfg.auto_compact = flag,
-            "compaction.reusePrefixCache" => cfg.reuse_prefix_cache = flag,
-            "compaction.disableSummaryReasoning" => cfg.disable_summary_reasoning = flag,
-            "compaction.enableReadDedup" => cfg.enable_read_dedup = flag,
-            "compaction.enableWriteAfterCompactGuard" => {
-                cfg.enable_write_after_compact_guard = flag
+            "compaction.maxContextTokens" => {
+                cfg.max_context_tokens = parse_max_context_tokens_label(value)
             }
-            "compaction.softWindowCap" => cfg.soft_window_cap = parse_soft_window_cap_label(value),
             _ => {}
         });
     } else if key.starts_with("sessionTitle.")
-        && let Ok(st) = ctx.session_title()
+        && let Some(st) = runtime.session_title.as_ref()
     {
         st.update_config(|cfg| match key {
             "sessionTitle.enabled" => cfg.enabled = value == "true",
@@ -462,20 +362,6 @@ pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
             }
             _ => {}
         });
-    } else if (key == "cacheWarming" || key == "showCacheMissNotices")
-        && let Some(cw) = ctx.get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
-    {
-        match key {
-            "cacheWarming" => {
-                if let Some(mode) = CacheWarmingMode::parse(value) {
-                    cw.set_mode(mode);
-                }
-            }
-            "showCacheMissNotices" => {
-                cw.set_show_notices(value == "true");
-            }
-            _ => {}
-        }
     }
 }
 
@@ -558,12 +444,18 @@ pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<
             "mouseCapture",
             serde_json::Value::Bool(value == "true"),
         ),
-        "compaction.softWindowCap" => upsert_nested_json(
-            root,
-            "compaction",
-            "softWindowCap",
-            serde_json::Value::Number(serde_json::Number::from(parse_soft_window_cap_label(value))),
-        ),
+        "compaction.maxContextTokens" => {
+            if let Some(cap) = parse_max_context_tokens_label(value) {
+                upsert_nested_json(
+                    root,
+                    "compaction",
+                    "maxContextTokens",
+                    serde_json::Value::Number(serde_json::Number::from(cap)),
+                );
+            } else if let Some(obj) = root.get_mut("compaction").and_then(|v| v.as_object_mut()) {
+                obj.remove("maxContextTokens");
+            }
+        }
         k if let Some(field) = k.strip_prefix("compaction.") => upsert_nested_json(
             root,
             "compaction",
@@ -597,26 +489,13 @@ pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<
             "thinkingLevel",
             serde_json::Value::String(value.trim().to_ascii_lowercase()),
         ),
-        "cacheWarming" => {
-            root.insert(
-                "cacheWarming".to_string(),
-                serde_json::Value::String(value.trim().to_ascii_lowercase()),
-            );
-        }
-        "showCacheMissNotices" => {
-            root.insert(
-                "showCacheMissNotices".to_string(),
-                serde_json::Value::Bool(value == "true"),
-            );
-        }
         _ => {}
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
-    use mizar_session::SessionContextExt;
+    use mizar_core::spine::{AgentSpineConfig, AgentToolsMode};
 
     use super::*;
 
@@ -639,27 +518,25 @@ mod tests {
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         std::fs::write(&settings_path, r#"{"defaultModel":"gpt-4o"}"#).unwrap();
 
-        let ctx = Context::new();
         let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
         if let AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
             mcp.global_config_dir = Some(tmp.join(".mizar"));
         }
-        ctx.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        crate::events::wait_for_services(&ctx).await.unwrap();
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let session = ctx.sessions().unwrap().create(None);
+        let session = runtime.sessions.create(None);
         let snap = SettingsViewSnapshot::default();
         assert!(
-            crate::workspace::collect_user_skill_names(&ctx, &ws)
+            crate::workspace::collect_user_skill_names(&runtime, &ws)
                 .await
                 .contains(&"client-demo".to_string())
         );
         assert!(
-            !crate::workspace::collect_instructions_summary(&ctx, Some(&session.id)).is_empty()
+            !crate::workspace::collect_instructions_summary(&runtime, Some(&session.id)).is_empty()
         );
 
         // 启动时 compaction 被屏蔽：设置列表中不含 [压缩] 配置项，且 plugin.compaction 为 false
-        let initial_entries = build_settings_entries(&ctx, &snap);
+        let initial_entries = build_settings_entries(&runtime, &snap);
         assert!(
             !initial_entries.iter().any(|e| e.category == "压缩"),
             "compaction entries must be omitted while module is disabled"
@@ -671,13 +548,58 @@ mod tests {
         assert_eq!(comp_entry.kind, SettingItemKind::Toggle { value: false });
 
         // 1. 运行期启用 compaction -> 服务上线 + 列表包含 [压缩] + 写入 disabledPlugins: []
-        let out_enable = toggle_spine_module(&ctx, Some(&settings_path), "compaction", true).await;
+        let out_enable =
+            toggle_spine_module(&runtime, Some(&settings_path), "compaction", true).await;
         assert!(out_enable.ok);
         assert!(out_enable.disabled_ids.is_empty());
-        assert!(ctx.compaction().is_ok());
+        assert!(runtime.compaction.as_ref().unwrap().is_module_enabled());
 
-        let after_enable = build_settings_entries(&ctx, &snap);
-        assert!(after_enable.iter().any(|e| e.key == "compaction.enabled"));
+        let after_enable = build_settings_entries(&runtime, &snap);
+        let comp_keys: Vec<&str> = after_enable
+            .iter()
+            .filter(|e| e.category == "压缩")
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(
+            comp_keys,
+            vec![
+                "compaction.enabled",
+                "compaction.autoCompact",
+                "compaction.maxContextTokens",
+            ]
+        );
+        apply_runtime_setting_change(&runtime, "compaction.maxContextTokens", "200k");
+        assert_eq!(
+            runtime
+                .compaction
+                .as_ref()
+                .unwrap()
+                .config()
+                .max_context_tokens,
+            Some(200_000)
+        );
+        persist_setting_change_to(&settings_path, "compaction.maxContextTokens", "200k").unwrap();
+        let persisted_cap: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(persisted_cap["compaction"]["maxContextTokens"], 200_000);
+        apply_runtime_setting_change(&runtime, "compaction.maxContextTokens", "off");
+        assert_eq!(
+            runtime
+                .compaction
+                .as_ref()
+                .unwrap()
+                .config()
+                .max_context_tokens,
+            None
+        );
+        persist_setting_change_to(&settings_path, "compaction.maxContextTokens", "off").unwrap();
+        let persisted_off: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            persisted_off["compaction"]
+                .get("maxContextTokens")
+                .is_none()
+        );
         let persisted_1: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(persisted_1["defaultModel"], "gpt-4o");
@@ -685,17 +607,19 @@ mod tests {
 
         // 2. 禁用 skills / instructions / compaction -> skills 与指令采集清空、[压缩] 移除、排序去重落盘
         for id in ["skills", "instructions", "compaction"] {
-            let res = toggle_spine_module(&ctx, Some(&settings_path), id, false).await;
+            let res = toggle_spine_module(&runtime, Some(&settings_path), id, false).await;
             assert!(res.ok);
         }
         assert!(
-            crate::workspace::collect_user_skill_names(&ctx, &ws)
+            crate::workspace::collect_user_skill_names(&runtime, &ws)
                 .await
                 .is_empty()
         );
-        assert!(crate::workspace::collect_instructions_summary(&ctx, Some(&session.id)).is_empty());
-        assert!(ctx.compaction().is_err());
-        let after_disable = build_settings_entries(&ctx, &snap);
+        assert!(
+            crate::workspace::collect_instructions_summary(&runtime, Some(&session.id)).is_empty()
+        );
+        assert!(!runtime.compaction.as_ref().unwrap().is_module_enabled());
+        let after_disable = build_settings_entries(&runtime, &snap);
         assert!(!after_disable.iter().any(|e| e.category == "压缩"));
         let persisted_2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -705,31 +629,10 @@ mod tests {
         );
 
         // 3. 尝试禁用受保护核心模块必须被拒绝且不破坏已有配置
-        let protected_res = toggle_spine_module(&ctx, Some(&settings_path), "llm", false).await;
+        let protected_res = toggle_spine_module(&runtime, Some(&settings_path), "llm", false).await;
         assert!(!protected_res.ok);
 
-        // 4. cacheWarming 与 showCacheMissNotices 暴露、热更新并原子持久化到 settings.json
-        let cw_entries = build_settings_entries(&ctx, &snap);
-        assert!(cw_entries.iter().any(|e| e.key == "cacheWarming"));
-        assert!(cw_entries.iter().any(|e| e.key == "showCacheMissNotices"));
-
-        apply_runtime_setting_change(&ctx, "cacheWarming", "streaming");
-        apply_runtime_setting_change(&ctx, "showCacheMissNotices", "true");
-        persist_setting_change_to(&settings_path, "cacheWarming", "streaming").unwrap();
-        persist_setting_change_to(&settings_path, "showCacheMissNotices", "true").unwrap();
-
-        let cw_rt = ctx
-            .get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
-            .unwrap();
-        assert_eq!(cw_rt.config().mode, CacheWarmingMode::Streaming);
-        assert!(cw_rt.config().show_cache_miss_notices);
-
-        let persisted_3: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(persisted_3["cacheWarming"], "streaming");
-        assert_eq!(persisted_3["showCacheMissNotices"], true);
-
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

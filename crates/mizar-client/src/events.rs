@@ -1,45 +1,16 @@
-//! 客户端事件订阅、后端枚举投影、核心服务就绪等待与活跃任务代次控制器。
+//! 客户端事件订阅、后端枚举投影与活跃任务代次控制器。
 
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
 
-use cordis::{Context, CordisError, DisposableHandle, LogLevel, LogRecord};
-use mizar_agent_loop::{
-    AgentLoop, AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
-    AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
-    AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
-    AgentUsageEvent, DeliveryMode, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS,
-    EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
-    EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT,
-    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
-    InboxPushResult, StepOutcome, TurnEndReason, TurnInput,
+use mizar_core::agent_loop::{
+    AgentEvent, AgentLoop, AgentStatus, DeliveryMode, InboxPushResult, StepOutcome, TurnEndReason,
+    TurnInput,
 };
-use mizar_agent_spine::{
-    CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent, CompactionTrigger,
-    EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS, EVENT_COMPACTION_START,
-};
-use mizar_cache_warming::{CacheWarmingNoticeEvent, EVENT_CACHE_WARMING_NOTICE};
-use mizar_client_core::{
-    ClientEvent, UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
-};
-use mizar_llm::LlmRuntime;
-use mizar_session::{EVENT_SESSION_TITLE_UPDATED, SessionStore, SessionTitleUpdatedPayload};
-use mizar_subagent::{EVENT_SUBAGENT_STATE, SubagentStateEvent};
-use mizar_trajectory::{EVENT_TRAJECTORY_ANOMALY, TrajectoryAnomalyEvent};
-use thiserror::Error;
+use mizar_core::spine::{CompactionTrigger, MizarRuntime};
+use mizar_types::HookGuard;
+use mizar_types::client::{ClientEvent, UiAgentStatus, UiStepOutcome, UiTurnEndReason};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-/// 等待核心后端服务就绪时的失败原因。
-#[derive(Debug, Error)]
-pub enum WaitServicesError {
-    #[error("等待核心服务（agentLoop / sessions / llm）超时")]
-    Timeout,
-    #[error("等待核心服务探针通道提前关闭")]
-    ProbeDropped,
-    #[error(transparent)]
-    Cordis(#[from] CordisError),
-}
 
 pub fn to_ui_status(status: AgentStatus) -> UiAgentStatus {
     match status {
@@ -67,21 +38,6 @@ pub fn to_ui_step_outcome(outcome: &StepOutcome) -> UiStepOutcome {
         StepOutcome::Error { message } => UiStepOutcome::Error {
             message: message.clone(),
         },
-    }
-}
-
-pub fn to_ui_log_record(record: &LogRecord) -> UiLogRecord {
-    let level = match record.level {
-        LogLevel::Silent => UiLogLevel::Silent,
-        LogLevel::Error => UiLogLevel::Error,
-        LogLevel::Warn => UiLogLevel::Warn,
-        LogLevel::Info => UiLogLevel::Info,
-        LogLevel::Debug => UiLogLevel::Debug,
-    };
-    UiLogRecord {
-        level,
-        name: record.name.clone(),
-        message: record.message.clone(),
     }
 }
 
@@ -218,86 +174,49 @@ pub fn steer_session(
 
 /// 订阅当前会话相关的 Agent 与轨迹事件并投递到 `tx`。
 pub fn subscribe_session_events(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     session_id_rx: Arc<RwLock<String>>,
     tx: mpsc::UnboundedSender<ClientEvent>,
-) -> Result<Vec<DisposableHandle>, CordisError> {
-    subscribe_session_events_into(ctx, session_id_rx, move |ev| {
+) -> HookGuard {
+    subscribe_session_events_into(runtime, session_id_rx, move |ev| {
         let _ = tx.send(ev);
     })
 }
 
 /// 订阅当前会话相关的 Agent、压缩、轨迹与标题事件，并通过自定义闭包投递。
 pub fn subscribe_session_events_into<F>(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     session_id_rx: Arc<RwLock<String>>,
     send: F,
-) -> Result<Vec<DisposableHandle>, CordisError>
+) -> HookGuard
 where
     F: Fn(ClientEvent) + Clone + Send + Sync + 'static,
 {
-    let mut handles = Vec::new();
+    let mut guards = Vec::new();
     let is_current = move |sid: &str| *session_id_rx.read().unwrap() == sid;
 
     {
         let send = send.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_STATUS, move |ev: &AgentStatusEvent| {
-            if check(&ev.session.id) {
+        guards.push(runtime.agent_loop.on_event(move |ev| match ev {
+            AgentEvent::Status(ev) if check(&ev.session.id) => {
                 send(ClientEvent::Status(to_ui_status(ev.status)));
             }
-        })?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TURN_START, move |ev: &AgentTurnStartEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::TurnStart { turn: ev.turn });
-                }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_TURN_END, move |ev: &AgentTurnEndEvent| {
-            if check(&ev.session.id) {
+            AgentEvent::TurnStart(ev) if check(&ev.session.id) => {
+                send(ClientEvent::TurnStart { turn: ev.turn });
+            }
+            AgentEvent::TurnEnd(ev) if check(&ev.session.id) => {
                 send(ClientEvent::TurnEnd {
                     reason: to_ui_turn_end_reason(ev.reason.clone()),
                 });
             }
-        })?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_STEP_START, move |ev: &AgentStepStartEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::StepStart { ts_ms: ev.ts_ms });
-                }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_AGENT_STEP_FIRST_TOKEN,
-            move |ev: &AgentStepFirstTokenEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::FirstToken { ts_ms: ev.ts_ms });
-                }
-            },
-        )?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {
-            if check(&ev.session.id) {
+            AgentEvent::StepStart(ev) if check(&ev.session.id) => {
+                send(ClientEvent::StepStart { ts_ms: ev.ts_ms });
+            }
+            AgentEvent::StepFirstToken(ev) if check(&ev.session.id) => {
+                send(ClientEvent::FirstToken { ts_ms: ev.ts_ms });
+            }
+            AgentEvent::StepEnd(ev) if check(&ev.session.id) => {
                 send(ClientEvent::StepEnd {
                     step: ev.step,
                     ts_ms: ev.ts_ms,
@@ -305,246 +224,131 @@ where
                     usage: ev.usage,
                 });
             }
-        })?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TEXT_DELTA, move |ev: &AgentTextDeltaEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::TextDelta {
-                        text: ev.text.clone(),
-                        ts_ms: ev.ts_ms,
-                    });
-                }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_AGENT_REASONING_DELTA,
-            move |ev: &AgentReasoningDeltaEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::ReasoningDelta {
-                        text: ev.text.clone(),
-                        ts_ms: ev.ts_ms,
-                    });
-                }
-            },
-        )?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TOOL_CALL, move |ev: &AgentToolCallEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::ToolCall(ev.call.clone()));
-                }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TOOL_UPDATE, move |ev: &AgentToolUpdateEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::ToolUpdate {
-                        call_id: ev.tool_call_id.clone(),
-                        name: ev.name.clone(),
-                        preview: ev.preview.clone(),
-                    });
-                }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_AGENT_TOOL_RESULT, move |ev: &AgentToolResultEvent| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::ToolResult {
-                        call_id: ev.tool_call_id.clone(),
-                        name: ev.name.clone(),
-                        content: ev.content.clone(),
-                        is_error: ev.is_error,
-                        blocked: ev.blocked,
-                        details: ev.details.clone(),
-                    });
-                }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(EVENT_AGENT_USAGE, move |ev: &AgentUsageEvent| {
-            if check(&ev.session.id) {
+            AgentEvent::TextDelta(ev) if check(&ev.session.id) => {
+                send(ClientEvent::TextDelta {
+                    text: ev.text.clone(),
+                    ts_ms: ev.ts_ms,
+                });
+            }
+            AgentEvent::ReasoningDelta(ev) if check(&ev.session.id) => {
+                send(ClientEvent::ReasoningDelta {
+                    text: ev.text.clone(),
+                    ts_ms: ev.ts_ms,
+                });
+            }
+            AgentEvent::ToolCall(ev) if check(&ev.session.id) => {
+                send(ClientEvent::ToolCall(ev.call.clone()));
+            }
+            AgentEvent::ToolUpdate(ev) if check(&ev.session.id) => {
+                send(ClientEvent::ToolUpdate {
+                    call_id: ev.tool_call_id.clone(),
+                    name: ev.name.clone(),
+                    preview: ev.preview.clone(),
+                });
+            }
+            AgentEvent::ToolResult(ev) if check(&ev.session.id) => {
+                send(ClientEvent::ToolResult {
+                    call_id: ev.tool_call_id.clone(),
+                    name: ev.name.clone(),
+                    content: ev.content.clone(),
+                    is_error: ev.is_error,
+                    blocked: ev.blocked,
+                    details: ev.details.clone(),
+                });
+            }
+            AgentEvent::Usage(ev) if check(&ev.session.id) => {
                 send(ClientEvent::Usage(ev.usage));
             }
-        })?);
+            AgentEvent::Status(_)
+            | AgentEvent::Request(_)
+            | AgentEvent::TurnStart(_)
+            | AgentEvent::TurnInput(_)
+            | AgentEvent::TurnEnd(_)
+            | AgentEvent::StepStart(_)
+            | AgentEvent::StepFirstToken(_)
+            | AgentEvent::StepEnd(_)
+            | AgentEvent::TextDelta(_)
+            | AgentEvent::ReasoningDelta(_)
+            | AgentEvent::ToolCall(_)
+            | AgentEvent::ToolUpdate(_)
+            | AgentEvent::ToolResult(_)
+            | AgentEvent::Usage(_) => {}
+        }));
     }
-    {
+    if let Some(traj) = &runtime.trajectory {
         let send = send.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_TRAJECTORY_ANOMALY,
-            move |ev: &TrajectoryAnomalyEvent| {
-                if check(&ev.session_id) {
-                    send(ClientEvent::Anomaly(ev.finding.summary.clone()));
-                }
-            },
-        )?);
+        guards.push(traj.on_anomaly(move |ev| {
+            if check(&ev.session_id) {
+                send(ClientEvent::Anomaly(ev.finding.summary.clone()));
+            }
+        }));
     }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_COMPACTION_START, move |ev: &CompactionStartEvent| {
+    if let Some(comp) = &runtime.compaction {
+        {
+            let send = send.clone();
+            let check = is_current.clone();
+            guards.push(comp.on_start(move |ev| {
                 if check(&ev.session_id) {
                     send(ClientEvent::CompactionStarted {
                         trigger: ev.trigger.as_str().to_string(),
                     });
                 }
-            })?,
-        );
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_COMPACTION_PROGRESS,
-            move |ev: &CompactionProgressEvent| {
+            }));
+        }
+        {
+            let send = send.clone();
+            let check = is_current.clone();
+            guards.push(comp.on_progress(move |ev| {
                 if check(&ev.session_id) {
                     send(ClientEvent::CompactionProgress {
                         stage: ev.stage.clone(),
                         delta_chars: ev.delta_chars,
                     });
                 }
-            },
-        )?);
-    }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(
-            ctx.on(EVENT_COMPACTION_END, move |ev: &CompactionEndEvent| {
+            }));
+        }
+        {
+            let send = send.clone();
+            let check = is_current.clone();
+            guards.push(comp.on_end(move |ev| {
                 if check(&ev.session_id) {
                     send(ClientEvent::CompactionFinished {
                         outcome: ev.outcome.as_str().to_string(),
                         tokens_before: Some(ev.tokens_before),
                         tokens_after: Some(ev.tokens_after),
-                        pruned_count: ev.pruned_count,
                         first_kept_seq: ev.first_kept_seq,
                         summary_preview: ev.summary_preview.clone(),
                         message: ev.skipped_reason.clone(),
                         is_manual: ev.trigger == CompactionTrigger::Manual,
                     });
                 }
-            })?,
-        );
+            }));
+        }
     }
     {
         let send = send.clone();
         let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_SESSION_TITLE_UPDATED,
-            move |ev: &SessionTitleUpdatedPayload| {
-                if check(&ev.session.id) {
-                    send(ClientEvent::SessionTitleUpdated(ev.title.clone()));
-                }
-            },
-        )?);
+        guards.push(runtime.sessions.on_title_updated(move |ev| {
+            if check(&ev.session.id) {
+                send(ClientEvent::SessionTitleUpdated(ev.title.clone()));
+            }
+        }));
     }
-    {
-        let send = send.clone();
-        let check = is_current.clone();
-        handles.push(ctx.on(
-            EVENT_CACHE_WARMING_NOTICE,
-            move |ev: &CacheWarmingNoticeEvent| {
-                if check(&ev.session_id) {
-                    send(ClientEvent::CacheWarmingNotice {
-                        text: ev.text.clone(),
-                    });
-                }
-            },
-        )?);
-    }
-    {
+    if let Some(sub) = &runtime.subagent {
         let send = send;
         let check = is_current;
-        handles.push(
-            ctx.on(EVENT_SUBAGENT_STATE, move |ev: &SubagentStateEvent| {
-                if check(&ev.parent_session_id) {
-                    send(ClientEvent::SubagentState {
-                        running_count: ev.running_count,
-                        notice: ev.notice.clone(),
-                    });
-                }
-            })?,
-        );
-    }
-
-    Ok(handles)
-}
-
-/// 等待 `agentLoop`、`sessions`、`llm` 核心服务以及所有已挂载插件就绪（消除异步挂载竞态）。
-pub async fn wait_for_services(ctx: &Context) -> Result<(), WaitServicesError> {
-    if ctx
-        .get::<mizar_agent_loop::AgentLoop>("agentLoop")
-        .is_none()
-        || ctx.get::<SessionStore>("sessions").is_none()
-        || ctx.get::<LlmRuntime>("llm").is_none()
-    {
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
-        let probe = ctx.try_inject(["agentLoop", "sessions", "llm"], move |_| {
-            let tx = Arc::clone(&tx);
-            async move {
-                if let Some(sender) = tx.lock().unwrap().take() {
-                    let _ = sender.send(());
-                }
-                Ok::<_, CordisError>(())
+        guards.push(sub.on_state(move |ev| {
+            if check(&ev.parent_session_id) {
+                send(ClientEvent::SubagentState {
+                    running_count: ev.running_count,
+                    notice: ev.notice.clone(),
+                });
             }
-        })?;
-        let wait_res = tokio::time::timeout(Duration::from_secs(5), rx).await;
-        probe.dispose().await;
-        match wait_res {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(WaitServicesError::ProbeDropped),
-            Err(_) => return Err(WaitServicesError::Timeout),
-        }
+        }));
     }
 
-    // 插件在 apply() 内通过 ctx.try_inject 派生的子 fiber 可能在首轮快照之后出现，
-    // 需迭代直到不再产生新 fiber 且全部落稳（PENDING 态子 fiber 的 inertia 为 false，不会阻塞）。
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        let fibers: Vec<cordis::Fiber> = ctx
-            .registry()
-            .values()
-            .into_iter()
-            .flat_map(|rt| rt.fibers())
-            .collect();
-        let mut grew = false;
-        for f in fibers {
-            if let Some(uid) = f.uid()
-                && seen.insert(uid)
-            {
-                grew = true;
-            }
-            let _ = f.wait_settled().await;
-        }
-        if !grew {
-            break;
-        }
-    }
-    Ok(())
+    HookGuard::group(guards)
 }
 
 #[cfg(test)]
@@ -602,65 +406,5 @@ mod tests {
 
         ctrl.abort_for_session_switch();
         assert!(ctrl.active_task().is_none());
-    }
-
-    #[tokio::test]
-    async fn wait_for_services_settles_late_try_inject_child_without_blocking_on_pending_optional()
-    {
-        use std::path::PathBuf;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        use cordis::PluginDef;
-        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
-
-        let ctx = Context::new();
-        ctx.logger().set_silent();
-        let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-        if let AgentToolsMode::Coding {
-            ref mut mcp,
-            ref mut skills,
-            ref mut instructions,
-            ..
-        } = cfg.tools_mode
-        {
-            mcp.load_config_files = false;
-            skills.include_default_roots = false;
-            instructions.include_default_global = false;
-        }
-        ctx.plugin(AgentSpinePlugin, cfg);
-
-        // 永不就绪的可选依赖（保持 PENDING）不应阻塞 wait_for_services
-        let _pending_optional = ctx
-            .try_inject(["nonExistentOptionalService"], |_| async {
-                Ok::<_, CordisError>(())
-            })
-            .unwrap();
-
-        // 在异步插件体内延迟派生 try_inject 子 fiber，模拟 CodingToolsPlugin / McpManager 挂接 systemPrompt
-        let child_settled = Arc::new(AtomicBool::new(false));
-        let child_settled_cb = Arc::clone(&child_settled);
-        ctx.plugin(
-            PluginDef::sync("late-try-inject-spawner", move |c, ()| {
-                let flag = Arc::clone(&child_settled_cb);
-                c.try_inject(["systemPrompt"], move |_| {
-                    let inner = Arc::clone(&flag);
-                    async move {
-                        tokio::time::sleep(Duration::from_millis(40)).await;
-                        inner.store(true, Ordering::SeqCst);
-                        Ok::<_, CordisError>(())
-                    }
-                })?;
-                Ok::<_, CordisError>(())
-            }),
-            (),
-        );
-
-        wait_for_services(&ctx).await.unwrap();
-        assert!(
-            child_settled.load(Ordering::SeqCst),
-            "wait_for_services returned before dynamically spawned try_inject child settled"
-        );
-
-        ctx.fiber().dispose().await;
     }
 }

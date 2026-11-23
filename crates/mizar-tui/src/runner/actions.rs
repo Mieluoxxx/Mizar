@@ -1,16 +1,11 @@
 //! 工作台动作执行器：派发代理回合、本地 Bash、会话切换/恢复、剪贴板粘贴、侧栏数据采集与设置热更新。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use cordis::Context;
 use crossterm::event::EventStream;
-use mizar_agent_loop::{AgentLoopContextExt, DeliveryMode, RunOptions, TurnInput};
-use mizar_agent_spine::{
-    CompactionContextExt, CompactionError, ManualCompactOptions, SubagentContextExt,
-    resolve_global_settings_path,
-};
 use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController, steer_session};
 use mizar_client::images;
 use mizar_client::local_bash::{execute_local_bash_for_session, next_local_bash_call_id};
@@ -23,24 +18,26 @@ use mizar_client::settings::{
     apply_runtime_setting_change, persist_setting_change, toggle_spine_module,
 };
 use mizar_client::workspace::{
-    collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
+    WorkspacePanelSnapshot, collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
     collect_workspace_panel_snapshot,
 };
-use mizar_client_core::{HostExtensionFlags, short_id};
-use mizar_instructions::AgentInstructions;
-use mizar_llm::{ImageAttachment, LlmContextExt};
-use mizar_mcp::{McpConnectionState, McpManager};
-use mizar_session::{Session, SessionContextExt, SessionCreateOptions};
-use mizar_session_title::SessionTitleContextExt;
-use mizar_skills::{SkillLookupOptions, SkillRegistry};
-use mizar_tools::{ToolExposure, ToolRuntime};
-use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
-use mizar_tui_ui::app::{AppAction, AppState, NoticeLevel, SessionSelection, UiEvent};
+use mizar_core::agent_loop::{DeliveryMode, RunOptions, TurnInput};
+use mizar_core::skills::SkillLookupOptions;
+use mizar_core::spine::{
+    CompactionError, ManualCompactOptions, MizarRuntime, resolve_global_settings_path,
+};
+use mizar_core::trajectory::TimelineMode;
+use mizar_llm::ImageAttachment;
+use mizar_mcp::McpConnectionState;
+use mizar_session::{Session, SessionCreateOptions};
+use mizar_tools::ToolExposure;
+use mizar_tui_ui::app::{AppAction, AppState, ChatItem, NoticeLevel, SessionSelection, UiEvent};
 use mizar_tui_ui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui_ui::terminal::{
     ScreenMode, apply_terminal_modes, resume_after_external_editor, set_mouse_capture_enabled,
     suspend_for_external_editor,
 };
+use mizar_types::client::{HostExtensionFlags, short_id};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -91,17 +88,24 @@ pub async fn apply_clipboard_content(
         Ok(clipboard::ClipboardContent::Image {
             bytes,
             source_label,
-        }) => match images::process_image_bytes(&bytes) {
-            Ok(processed) => {
-                let suffix = processed.marker_suffix();
-                let _ = app.insert_pasted_image(suffix.as_deref(), processed.attachment);
+        }) => {
+            match tokio::task::spawn_blocking(move || images::process_image_bytes(&bytes)).await {
+                Ok(Ok(processed)) => {
+                    let suffix = processed.marker_suffix();
+                    let _ = app.insert_pasted_image(suffix.as_deref(), processed.attachment);
+                }
+                Ok(Err(err)) => {
+                    let msg = format!("剪贴板图片处理失败（{source_label}）：{err}");
+                    app.set_flash(msg.clone());
+                    app.push_notice(NoticeLevel::Error, msg);
+                }
+                Err(err) => {
+                    let msg = format!("剪贴板图片处理任务异常（{source_label}）：{err}");
+                    app.set_flash(msg.clone());
+                    app.push_notice(NoticeLevel::Error, msg);
+                }
             }
-            Err(err) => {
-                let msg = format!("剪贴板图片处理失败（{source_label}）：{err}");
-                app.set_flash(msg.clone());
-                app.push_notice(NoticeLevel::Error, msg);
-            }
-        },
+        }
         Ok(clipboard::ClipboardContent::Files(paths)) => {
             let mut text_refs = Vec::new();
             for path in paths {
@@ -114,8 +118,10 @@ pub async fn apply_clipboard_content(
                     && let Ok(bytes) = tokio::fs::read(&path).await
                     && images::sniff_image_format(&bytes).is_some()
                 {
-                    match images::process_image_bytes(&bytes) {
-                        Ok(processed) => {
+                    match tokio::task::spawn_blocking(move || images::process_image_bytes(&bytes))
+                        .await
+                    {
+                        Ok(Ok(processed)) => {
                             let suffix = processed.marker_suffix();
                             if app
                                 .insert_pasted_image(suffix.as_deref(), processed.attachment)
@@ -124,8 +130,13 @@ pub async fn apply_clipboard_content(
                                 break;
                             }
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             let msg = format!("图片 `{}` 处理失败：{err}", path.display());
+                            app.set_flash(msg.clone());
+                            app.push_notice(NoticeLevel::Error, msg);
+                        }
+                        Err(err) => {
+                            let msg = format!("图片 `{}` 处理任务异常：{err}", path.display());
                             app.set_flash(msg.clone());
                             app.push_notice(NoticeLevel::Error, msg);
                         }
@@ -151,7 +162,7 @@ pub async fn apply_clipboard_content(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_agent_run(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
@@ -161,7 +172,7 @@ pub(super) fn spawn_agent_run(
     images: Vec<ImageAttachment>,
 ) {
     spawn_agent_run_input(
-        ctx,
+        runtime,
         config,
         app,
         active_session,
@@ -173,7 +184,7 @@ pub(super) fn spawn_agent_run(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_agent_run_input(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
@@ -181,10 +192,7 @@ pub(super) fn spawn_agent_run_input(
     task_state: &mut RunController,
     input: TurnInput,
 ) {
-    let Ok(agent_loop) = ctx.agent_loop() else {
-        app.push_notice(NoticeLevel::Error, "agentLoop 服务未就绪");
-        return;
-    };
+    let agent_loop = Arc::clone(&runtime.agent_loop);
     let (run_id, cancel) = task_state.start(active_session.id.clone(), ActiveTaskKind::AgentRun);
     app.set_busy_state(true);
 
@@ -225,20 +233,17 @@ pub(super) fn spawn_agent_run_input(
 
 /// 从 `SessionInbox` 出队当前活跃会话的下一条待唤醒 `FollowUp` 并启动一轮对话。
 pub(super) fn drain_next_inbox_followup(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
     loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
     task_state: &mut RunController,
 ) -> bool {
-    let Ok(agent_loop) = ctx.agent_loop() else {
-        return false;
-    };
-    if agent_loop.is_session_busy(&active_session.id) {
+    if runtime.agent_loop.is_session_busy(&active_session.id) {
         return false;
     }
-    let Some(next_input) = agent_loop.inbox().pop_followup(&active_session.id) else {
+    let Some(next_input) = runtime.agent_loop.inbox().pop_followup(&active_session.id) else {
         return false;
     };
     match &next_input {
@@ -256,7 +261,7 @@ pub(super) fn drain_next_inbox_followup(
         }
     }
     spawn_agent_run_input(
-        ctx,
+        runtime,
         config,
         app,
         active_session,
@@ -269,23 +274,22 @@ pub(super) fn drain_next_inbox_followup(
 
 /// 执行硬取消：关闭审批浮层、触发 `CancellationToken` 并清理用户输入项（已落箱后台回执转 `Inject` 保留）。
 pub(super) fn cancel_active_run(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     app: &mut AppState,
     active_session: &Session,
     task_state: &mut RunController,
 ) {
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     task_state.cancel_active();
-    if let Ok(agent_loop) = ctx.agent_loop() {
-        agent_loop
-            .inbox()
-            .clear_user_items_and_defer_notices(&active_session.id);
-    }
+    runtime
+        .agent_loop
+        .inbox()
+        .clear_user_items_and_defer_notices(&active_session.id);
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_steer_prompt(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &Arc<Session>,
@@ -320,10 +324,10 @@ pub(super) async fn handle_steer_prompt(
         task.kind == ActiveTaskKind::AgentRun && task.session_id == active_session.id
     });
 
-    if is_active_agent_run && let Ok(agent_loop) = ctx.agent_loop() {
+    if is_active_agent_run {
         app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
         let push_res = steer_session(
-            &agent_loop,
+            &runtime.agent_loop,
             &active_session.id,
             TurnInput::user_with_images(prompt.clone(), images.clone()),
         );
@@ -340,7 +344,7 @@ pub(super) async fn handle_steer_prompt(
 
     app.push_user_message(&prompt);
     spawn_agent_run(
-        ctx,
+        runtime,
         config,
         app,
         active_session,
@@ -389,6 +393,12 @@ pub(super) fn spawn_local_bash_run(
     let update_tx = tx.clone();
 
     tokio::spawn(async move {
+        const LOCAL_BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+        let timeout_cancel = cancel.clone();
+        let timeout_guard = tokio::spawn(async move {
+            tokio::time::sleep(LOCAL_BASH_DEFAULT_TIMEOUT).await;
+            timeout_cancel.cancel();
+        });
         let ev = execute_local_bash_for_session(
             &session,
             call_id,
@@ -409,6 +419,7 @@ pub(super) fn spawn_local_bash_run(
             },
         )
         .await;
+        timeout_guard.abort();
 
         let _ = tx.send(LoopClientMsg::Task {
             run_id,
@@ -418,31 +429,110 @@ pub(super) fn spawn_local_bash_run(
     });
 }
 
-pub(super) fn populate_tools_and_mcps(ctx: &Context, app: &mut AppState) {
+pub(super) struct SidePanelRefreshController {
+    tx: mpsc::UnboundedSender<(u64, String, WorkspacePanelSnapshot)>,
+    generation: u64,
+    in_flight: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SidePanelRefreshController {
+    pub(super) fn new() -> (
+        Self,
+        mpsc::UnboundedReceiver<(u64, String, WorkspacePanelSnapshot)>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                generation: 0,
+                in_flight: None,
+            },
+            rx,
+        )
+    }
+
+    pub(super) fn current_gen(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn abort(&mut self) {
+        if let Some(handle) = self.in_flight.take() {
+            handle.abort();
+        }
+    }
+}
+
+pub(super) fn schedule_side_panel_refresh(
+    runtime: &Arc<MizarRuntime>,
+    app: &mut AppState,
+    panel_ctrl: &mut SidePanelRefreshController,
+) {
+    if !app.features.side_panel || !app.side_panel.open {
+        return;
+    }
+    app.refresh_context_breakdown();
+    app.side_panel_data.files = app.touched_files.clone();
+    panel_ctrl.abort();
+    panel_ctrl.generation = panel_ctrl.generation.wrapping_add(1);
+    let generation = panel_ctrl.generation;
+    let runtime_bg = Arc::clone(runtime);
+    let ws_bg = app.workspace.clone();
+    let sid_bg = app.session_id.clone();
+    let tx = panel_ctrl.tx.clone();
+    panel_ctrl.in_flight = Some(tokio::spawn(async move {
+        let snapshot = collect_workspace_panel_snapshot(&runtime_bg, &ws_bg, Some(&sid_bg)).await;
+        let _ = tx.send((generation, sid_bg, snapshot));
+    }));
+}
+
+fn rollback_trailing_user_bubble(app: &mut AppState, expected_text: &str) {
+    if app.items.len() > app.inline_committed_items
+        && matches!(app.items.last(), Some(ChatItem::User { text }) if text == expected_text)
+    {
+        let idx = app.items.len() - 1;
+        app.items.pop();
+        app.item_cache.invalidate_item(idx);
+    }
+}
+
+pub(super) fn populate_tools_and_mcps(runtime: &MizarRuntime, app: &mut AppState) {
     if !app.features.side_panel {
         return;
     }
-    app.side_panel_data.tools = collect_tools_summary(ctx, Some(&app.session_id));
-    app.side_panel_data.mcps = collect_mcps_summary(ctx);
+    app.side_panel_data.tools = collect_tools_summary(runtime, Some(&app.session_id));
+    app.side_panel_data.mcps = collect_mcps_summary(runtime);
 }
 
-pub(super) async fn populate_side_panel_data(ctx: &Context, app: &mut AppState) {
+pub(super) async fn populate_side_panel_data(runtime: &MizarRuntime, app: &mut AppState) {
     if !app.features.side_panel {
         return;
     }
     app.refresh_context_breakdown();
     app.side_panel_data.files = app.touched_files.clone();
     let snapshot =
-        collect_workspace_panel_snapshot(ctx, &app.workspace, Some(&app.session_id)).await;
+        collect_workspace_panel_snapshot(runtime, &app.workspace, Some(&app.session_id)).await;
     snapshot.apply_to_side_panel(&mut app.side_panel_data, &app.anomalies);
 }
 
+#[cfg(test)]
 pub(super) async fn apply_module_toggle_setting(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     app: &mut AppState,
     settings_path: Option<&Path>,
     plugin_id: &str,
     enabled: bool,
+) {
+    apply_module_toggle_setting_with_panel(runtime, app, settings_path, plugin_id, enabled, None)
+        .await;
+}
+
+pub(super) async fn apply_module_toggle_setting_with_panel(
+    runtime: &Arc<MizarRuntime>,
+    app: &mut AppState,
+    settings_path: Option<&Path>,
+    plugin_id: &str,
+    enabled: bool,
+    panel_ctrl: Option<&mut SidePanelRefreshController>,
 ) {
     if app.is_running_activity() {
         app.overlay
@@ -451,19 +541,21 @@ pub(super) async fn apply_module_toggle_setting(
         app.push_notice(NoticeLevel::Warn, msg);
         app.set_flash(msg);
         app.overlay
-            .refresh_settings(super::build_settings_entries(ctx, app));
+            .refresh_settings(super::build_settings_entries(runtime, app));
         return;
     }
 
-    let outcome = toggle_spine_module(ctx, settings_path, plugin_id, enabled).await;
+    let outcome = toggle_spine_module(runtime, settings_path, plugin_id, enabled).await;
     if outcome.ok {
-        app.user_skill_names = collect_user_skill_names(ctx, &app.workspace).await;
-        if app.features.side_panel {
-            populate_side_panel_data(ctx, app).await;
+        app.user_skill_names = collect_user_skill_names(runtime, &app.workspace).await;
+        if let Some(ctrl) = panel_ctrl {
+            schedule_side_panel_refresh(runtime, app, ctrl);
+        } else {
+            populate_side_panel_data(runtime, app).await;
         }
     }
     app.overlay
-        .refresh_settings(super::build_settings_entries(ctx, app));
+        .refresh_settings(super::build_settings_entries(runtime, app));
     if let Some(flash) = outcome.flash {
         app.set_flash(flash);
     }
@@ -473,9 +565,10 @@ pub(super) async fn apply_module_toggle_setting(
 }
 
 pub(super) async fn apply_host_setting_change(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     app: &mut AppState,
     terminal: &mut BufferedTerminal,
+    panel_ctrl: &mut SidePanelRefreshController,
     key: &str,
     value: &str,
 ) {
@@ -508,16 +601,10 @@ pub(super) async fn apply_host_setting_change(
             let _ = set_mouse_capture_enabled(enabled);
         }
         "ui.sidePanelOpen" => {
-            if app.features.side_panel && app.side_panel.open {
-                populate_side_panel_data(ctx, app).await;
-            }
+            schedule_side_panel_refresh(runtime, app, panel_ctrl);
         }
-        k if k.starts_with("compaction.")
-            || k.starts_with("sessionTitle.")
-            || k == "cacheWarming"
-            || k == "showCacheMissNotices" =>
-        {
-            apply_runtime_setting_change(ctx, key, value);
+        k if k.starts_with("compaction.") || k.starts_with("sessionTitle.") => {
+            apply_runtime_setting_change(runtime, key, value);
         }
         _ => {}
     }
@@ -525,25 +612,19 @@ pub(super) async fn apply_host_setting_change(
 
 /// 在已运行的 TUI 状态上切换到指定历史会话（`/resume` 选择器与 `--resume` 共用投影与路由恢复）。
 pub async fn resume_session_into_app(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &mut Arc<Session>,
     active_sid: &Arc<RwLock<String>>,
     target_id: &str,
 ) -> bool {
-    let Ok(sessions) = ctx.sessions() else {
-        app.push_notice(NoticeLevel::Warn, "sessions 服务未就绪");
-        return false;
-    };
-    let Some(next) = sessions.get(target_id) else {
+    let Some(next) = runtime.sessions.get(target_id) else {
         app.push_notice(NoticeLevel::Warn, format!("未找到历史会话 `{target_id}`"));
         return false;
     };
     app.pending_settings_model_pick = None;
-    if let Ok(agent_loop) = ctx.agent_loop() {
-        agent_loop.inbox().clear(&next.id);
-    }
+    runtime.agent_loop.inbox().clear(&next.id);
     *active_sid.write().unwrap() = next.id.clone();
 
     let sources = SelectionSources {
@@ -567,7 +648,7 @@ pub async fn resume_session_into_app(
     app.restore_session_view(project_resume_view(&next));
     *active_session = next;
     if app.features.side_panel && app.side_panel.open {
-        populate_side_panel_data(ctx, app).await;
+        populate_side_panel_data(runtime, app).await;
     }
     app.set_flash(format!("✓ 已恢复会话 ({})", short_id(target_id)));
     true
@@ -575,7 +656,7 @@ pub async fn resume_session_into_app(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_action(
-    ctx: &Context,
+    runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &mut Arc<Session>,
@@ -584,6 +665,7 @@ pub(super) async fn handle_action(
     active_sid: &Arc<RwLock<String>>,
     loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
     task_state: &mut RunController,
+    panel_ctrl: &mut SidePanelRefreshController,
     action: AppAction,
 ) {
     match action {
@@ -608,7 +690,7 @@ pub(super) async fn handle_action(
             apply_clipboard_content(app, &config.workspace, res).await;
         }
         AppAction::CancelRun => {
-            cancel_active_run(ctx, app, active_session, task_state);
+            cancel_active_run(runtime, app, active_session, task_state);
         }
         AppAction::CompactSession(focus) => {
             if app.is_running_activity() {
@@ -618,10 +700,14 @@ pub(super) async fn handle_action(
                 );
                 return;
             }
-            let Ok(compaction) = ctx.compaction() else {
+            let Some(compaction) = runtime.compaction.as_ref().map(Arc::clone) else {
                 app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
                 return;
             };
+            if !compaction.is_module_enabled() {
+                app.push_notice(NoticeLevel::Warn, "compaction 服务未启用");
+                return;
+            }
             if !compaction.config().enabled {
                 app.push_notice(NoticeLevel::Info, "上下文压缩已在配置中禁用");
                 return;
@@ -641,11 +727,9 @@ pub(super) async fn handle_action(
             tokio::spawn(async move {
                 match compaction.compact_now(session, opts, cancel).await {
                     Ok(_) | Err(CompactionError::Llm(_)) => {
-                        // Pipeline 内部已广播 `EVENT_COMPACTION_END`，避免重复投递
+                        // Pipeline 内部已广播 `on_end` 事件，避免重复投递
                     }
-                    Err(
-                        err @ (CompactionError::AlreadyRunning(_) | CompactionError::Cordis(_)),
-                    ) => {
+                    Err(err @ CompactionError::AlreadyRunning(_)) => {
                         let _ = tx.send(LoopClientMsg::Task {
                             run_id,
                             session_id: task_session_id,
@@ -653,7 +737,6 @@ pub(super) async fn handle_action(
                                 outcome: "failed".to_string(),
                                 tokens_before: None,
                                 tokens_after: None,
-                                pruned_count: 0,
                                 first_kept_seq: None,
                                 summary_preview: None,
                                 message: Some(err.to_string()),
@@ -667,53 +750,43 @@ pub(super) async fn handle_action(
         AppAction::NewSession => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
-            if let Ok(sub) = ctx.subagent() {
+            if let Some(sub) = runtime.subagent.as_ref() {
                 sub.cancel_parent_subagents(&active_session.id);
             }
-            if let Ok(agent_loop) = ctx.agent_loop() {
-                agent_loop.inbox().clear(&active_session.id);
-            }
+            runtime.agent_loop.inbox().clear(&active_session.id);
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            if let Ok(sessions) = ctx.sessions() {
-                let next = sessions.create(None);
-                let title = next.header().title;
-                *active_sid.write().unwrap() = next.id.clone();
-                app.reset_for_new_session(next.id.clone(), title);
-                *active_session = next;
-                if app.features.side_panel && app.side_panel.open {
-                    populate_side_panel_data(ctx, app).await;
-                }
-            }
+            let next = runtime.sessions.create(None);
+            let title = next.header().title;
+            *active_sid.write().unwrap() = next.id.clone();
+            app.reset_for_new_session(next.id.clone(), title);
+            *active_session = next;
+            schedule_side_panel_refresh(runtime, app, panel_ctrl);
         }
         AppAction::OpenSessionPicker => {
-            if let Ok(sessions) = ctx.sessions() {
-                let items = collect_session_picker_items(&sessions);
-                if items.is_empty() {
-                    app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
-                } else {
-                    app.overlay.open_session_picker(items);
-                }
+            let items = collect_session_picker_items(&runtime.sessions);
+            if items.is_empty() {
+                app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
             } else {
-                app.push_notice(NoticeLevel::Warn, "sessions 服务未就绪");
+                app.overlay.open_session_picker(items);
             }
         }
         AppAction::ResumeSession(target_id) => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
-            if let Ok(sub) = ctx.subagent() {
+            if let Some(sub) = runtime.subagent.as_ref() {
                 sub.cancel_parent_subagents(&active_session.id);
             }
-            if let Ok(agent_loop) = ctx.agent_loop() {
-                agent_loop.inbox().clear(&active_session.id);
-            }
+            runtime.agent_loop.inbox().clear(&active_session.id);
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            let _ =
-                resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
-                    .await;
+            if resume_session_into_app(runtime, config, app, active_session, active_sid, &target_id)
+                .await
+            {
+                schedule_side_panel_refresh(runtime, app, panel_ctrl);
+            }
         }
         AppAction::RenameSession(title_arg) => {
             if let Some(new_title) = title_arg {
@@ -725,13 +798,20 @@ pub(super) async fn handle_action(
                     app.push_notice(NoticeLevel::Warn, "标题未变化或为空，未做修改");
                 }
             } else {
-                let Ok(st) = ctx.session_title() else {
+                let Some(st) = runtime.session_title.as_ref().map(Arc::clone) else {
                     app.push_notice(
                         NoticeLevel::Warn,
                         "session-title 服务未启用（可在 /settings 中开启）",
                     );
                     return;
                 };
+                if !st.is_module_enabled() {
+                    app.push_notice(
+                        NoticeLevel::Warn,
+                        "session-title 服务未启用（可在 /settings 中开启）",
+                    );
+                    return;
+                }
                 let session = Arc::clone(active_session);
                 let provider = app.provider.clone();
                 let model = app.model.clone();
@@ -771,12 +851,13 @@ pub(super) async fn handle_action(
                 )
                 .await
             {
+                rollback_trailing_user_bubble(app, &prompt);
                 app.input.set_text_end(&prompt);
                 app.reject_unsupported_images_notice();
                 return;
             }
             spawn_agent_run(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -788,11 +869,12 @@ pub(super) async fn handle_action(
         }
         AppAction::SubmitPromptWithImages { text, images } => {
             if !app.active_model_supports_images() {
+                rollback_trailing_user_bubble(app, &text);
                 app.reject_unsupported_images_notice();
                 return;
             }
             spawn_agent_run(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -804,7 +886,7 @@ pub(super) async fn handle_action(
         }
         AppAction::SteerPrompt(prompt) => {
             handle_steer_prompt(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -817,7 +899,7 @@ pub(super) async fn handle_action(
         }
         AppAction::SteerPromptWithImages { text, images } => {
             handle_steer_prompt(
-                ctx,
+                runtime,
                 config,
                 app,
                 active_session,
@@ -846,7 +928,7 @@ pub(super) async fn handle_action(
             );
         }
         AppAction::ShowStats => {
-            if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
+            if let Some(traj) = runtime.trajectory.as_ref() {
                 if let Some(report) = traj.inspect(&app.session_id, TimelineMode::Sequence) {
                     let s = &report.snapshot.stats;
                     let interrupted = if s.interrupted_steps > 0 {
@@ -877,44 +959,43 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowSessionInfo => {
-            let report = super::build_session_info_report(ctx, config, active_session, app);
+            let report = super::build_session_info_report(runtime, config, active_session, app);
             app.push_notice(NoticeLevel::Info, report);
         }
         AppAction::ShowTools => {
-            if let Some(rt) = ctx.get::<ToolRuntime>("tools") {
-                let declared: HashSet<String> = rt
-                    .list_declared(Some(&app.session_id))
-                    .into_iter()
-                    .map(|t| t.name)
-                    .collect();
-                let all = rt.list_all();
-                let mut lines = vec![format!(
-                    "工具列表（当前会话已声明 {} / 共 {} 个可用）：",
-                    declared.len(),
-                    all.len()
-                )];
-                for info in all {
-                    let active_mark = if declared.contains(&info.name) {
-                        "●"
-                    } else {
-                        "○"
-                    };
-                    let exp = match info.exposure {
-                        ToolExposure::Direct => "direct",
-                        ToolExposure::ModelOnly => "model-only",
-                        ToolExposure::Codemode => "codemode",
-                        ToolExposure::Deferred => "deferred",
-                        ToolExposure::Hidden => "hidden",
-                    };
-                    lines.push(format!("  {active_mark} {} [{exp}]", info.name));
-                }
-                app.push_notice(NoticeLevel::Info, lines.join("\n"));
-            } else {
-                app.push_notice(NoticeLevel::Warn, "tools 服务未就绪");
+            let rt = &runtime.tools;
+            let declared: HashSet<String> = rt
+                .list_declared(Some(&app.session_id))
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            let all = rt.list_all();
+            let mut lines = vec![format!(
+                "工具列表（当前会话已声明 {} / 共 {} 个可用）：",
+                declared.len(),
+                all.len()
+            )];
+            for info in all {
+                let active_mark = if declared.contains(&info.name) {
+                    "●"
+                } else {
+                    "○"
+                };
+                let exp = match info.exposure {
+                    ToolExposure::Direct => "direct",
+                    ToolExposure::ModelOnly => "model-only",
+                    ToolExposure::Codemode => "codemode",
+                    ToolExposure::Deferred => "deferred",
+                    ToolExposure::Hidden => "hidden",
+                };
+                lines.push(format!("  {active_mark} {} [{exp}]", info.name));
             }
+            app.push_notice(NoticeLevel::Info, lines.join("\n"));
         }
         AppAction::ShowMcp => {
-            if let Some(mgr) = ctx.get::<McpManager>("mcp") {
+            if !runtime.modules.is_enabled("mcp") {
+                app.push_notice(NoticeLevel::Warn, "MCP 服务未启用");
+            } else if let Some(mgr) = runtime.mcp().await {
                 let statuses = mgr.statuses();
                 if statuses.is_empty() {
                     app.push_notice(
@@ -945,7 +1026,9 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowSkills => {
-            if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
+            if let Some(reg) = runtime.skills.as_ref()
+                && reg.is_enabled()
+            {
                 let list = reg
                     .list(SkillLookupOptions {
                         cwd: Some(app.workspace.clone()),
@@ -993,7 +1076,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowInstructions => {
-            if let Some(inst) = ctx.get::<AgentInstructions>("agentInstructions") {
+            if let Some(inst) = runtime.instructions.as_ref() {
                 let report = inst.probe_report(Some(&app.session_id));
                 if !report.enabled {
                     app.push_notice(
@@ -1034,7 +1117,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ExportTrajectory(custom_path) => {
-            if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
+            if let Some(traj) = runtime.trajectory.as_ref() {
                 if let Some(jsonl) = traj.export_jsonl(&app.session_id) {
                     let target = custom_path.unwrap_or_else(|| {
                         app.workspace
@@ -1055,9 +1138,7 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ShowOrSwitchModel(target) => {
-            if let Ok(llm) = ctx.llm() {
-                app.providers = llm.provider_infos();
-            }
+            app.providers = runtime.llm.provider_infos();
             match target {
                 None if app.providers.iter().any(|p| !p.models.is_empty()) => {
                     let _ = app.open_model_selector();
@@ -1097,21 +1178,20 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::RefreshSidePanelData => {
-            if app.features.side_panel && app.side_panel.open {
-                populate_side_panel_data(ctx, app).await;
-            }
+            schedule_side_panel_refresh(runtime, app, panel_ctrl);
         }
         AppAction::RefreshSidePanelTools => {
             if app.features.side_panel && app.side_panel.open {
-                populate_tools_and_mcps(ctx, app);
+                populate_tools_and_mcps(runtime, app);
             }
         }
         AppAction::OpenTrajectoryScene(mode) => {
             if !app.features.trajectory_view {
                 return;
             }
-            let report = ctx
-                .get::<TrajectoryRuntime>("trajectory")
+            let report = runtime
+                .trajectory
+                .as_ref()
                 .and_then(|traj| traj.inspect(&app.session_id, mode));
             app.open_trajectory_with_report(report);
         }
@@ -1120,7 +1200,7 @@ pub(super) async fn handle_action(
         }
         AppAction::OpenSettings(initial_query) => {
             app.pending_settings_model_pick = None;
-            let items = super::build_settings_entries(ctx, app);
+            let items = super::build_settings_entries(runtime, app);
             let save_hint = resolve_global_settings_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~/.mizar/settings.json".to_string());
@@ -1129,17 +1209,18 @@ pub(super) async fn handle_action(
         AppAction::ApplySetting { key, value } => {
             if let Some(plugin_id) = key.strip_prefix("plugin.") {
                 let settings_path = resolve_global_settings_path();
-                apply_module_toggle_setting(
-                    ctx,
+                apply_module_toggle_setting_with_panel(
+                    runtime,
                     app,
                     settings_path.as_deref(),
                     plugin_id,
                     value == "true",
+                    Some(panel_ctrl),
                 )
                 .await;
                 return;
             }
-            apply_host_setting_change(ctx, app, terminal, &key, &value).await;
+            apply_host_setting_change(runtime, app, terminal, panel_ctrl, &key, &value).await;
             if let Err(err) = persist_setting_change(&key, &value) {
                 app.push_notice(
                     NoticeLevel::Warn,
@@ -1148,7 +1229,9 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::OpenSkillPicker => {
-            if let Some(reg) = ctx.get::<SkillRegistry>("skills") {
+            if let Some(reg) = runtime.skills.as_ref()
+                && reg.is_enabled()
+            {
                 let list = reg
                     .list(SkillLookupOptions {
                         cwd: Some(app.workspace.clone()),
@@ -1180,36 +1263,34 @@ pub(super) async fn handle_action(
         AppAction::ForkSessionAtSeq(target_seq) => {
             app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
             task_state.abort_for_session_switch();
-            if let Ok(sub) = ctx.subagent() {
+            if let Some(sub) = runtime.subagent.as_ref() {
                 sub.cancel_parent_subagents(&active_session.id);
             }
-            if let Ok(agent_loop) = ctx.agent_loop() {
-                agent_loop.inbox().clear(&active_session.id);
-            }
+            runtime.agent_loop.inbox().clear(&active_session.id);
             if app.is_running_activity() {
                 app.set_idle_state();
             }
-            if let Ok(sessions) = ctx.sessions() {
-                match sessions.fork(&app.session_id, target_seq, SessionCreateOptions::default()) {
-                    Ok(next) => {
-                        *active_sid.write().unwrap() = next.id.clone();
-                        app.restore_session_view(project_fork_view(&next, target_seq));
-                        *active_session = next;
-                        if app.features.side_panel && app.side_panel.open {
-                            populate_side_panel_data(ctx, app).await;
-                        }
-                    }
-                    Err(err) => {
-                        app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
-                    }
+            match runtime.sessions.fork(
+                &app.session_id,
+                target_seq,
+                SessionCreateOptions::default(),
+            ) {
+                Ok(next) => {
+                    *active_sid.write().unwrap() = next.id.clone();
+                    app.restore_session_view(project_fork_view(&next, target_seq));
+                    *active_session = next;
+                    schedule_side_panel_refresh(runtime, app, panel_ctrl);
+                }
+                Err(err) => {
+                    app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
                 }
             }
         }
         AppAction::OpenExternalEditor => {
             let draft = app.input.expand_text();
-            let tmp_path =
+            let tmp_path: PathBuf =
                 std::env::temp_dir().join(format!("mizar-draft-{}.md", std::process::id()));
-            if let Err(err) = std::fs::write(&tmp_path, &draft) {
+            if let Err(err) = tokio::fs::write(&tmp_path, &draft).await {
                 app.push_notice(NoticeLevel::Error, format!("写入临时草稿文件失败：{err}"));
                 return;
             }
@@ -1220,18 +1301,26 @@ pub(super) async fn handle_action(
             let bin = parts.next().unwrap_or("vi").to_string();
             let extra_args: Vec<String> = parts.map(ToString::to_string).collect();
 
+            // 挂起前必须释放 EventStream，防止后台 tty 读取线程与外部编辑器争抢按键导致丢键
+            *term_stream = None;
             let _ = suspend_for_external_editor();
-            let status = std::process::Command::new(&bin)
-                .args(&extra_args)
-                .arg(&tmp_path)
-                .status();
+            let bin_owned = bin.clone();
+            let tmp_owned = tmp_path.clone();
+            let status = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(&bin_owned)
+                    .args(&extra_args)
+                    .arg(&tmp_owned)
+                    .status()
+            })
+            .await;
             let _ = resume_after_external_editor(app.screen_mode, app.mouse_capture_enabled);
             if let Ok(rebuilt) = create_terminal(app.screen_mode) {
                 *terminal = rebuilt;
             }
+            *term_stream = Some(EventStream::new());
 
             match status {
-                Ok(s) if s.success() => match std::fs::read_to_string(&tmp_path) {
+                Ok(Ok(s)) if s.success() => match tokio::fs::read_to_string(&tmp_path).await {
                     Ok(edited) => {
                         let clean = edited.strip_suffix('\n').unwrap_or(&edited);
                         app.input.set_text_end(clean);
@@ -1241,20 +1330,26 @@ pub(super) async fn handle_action(
                         app.push_notice(NoticeLevel::Error, format!("读取编辑结果失败：{err}"));
                     }
                 },
-                Ok(s) => {
+                Ok(Ok(s)) => {
                     app.push_notice(
                         NoticeLevel::Warn,
                         format!("外部编辑器 `{bin}` 退出码：{:?}", s.code()),
                     );
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     app.push_notice(
                         NoticeLevel::Error,
                         format!("启动外部编辑器 `{bin}` 失败：{err}"),
                     );
                 }
+                Err(err) => {
+                    app.push_notice(
+                        NoticeLevel::Error,
+                        format!("等待外部编辑器 `{bin}` 任务失败：{err}"),
+                    );
+                }
             }
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
         }
         AppAction::SwitchScreenMode(next_mode) => {
             if next_mode == app.screen_mode {
@@ -1288,5 +1383,76 @@ pub(super) async fn handle_action(
                 app.set_flash("🖱 已暂停鼠标追踪，终端原生划词复制可用 (F2 恢复)");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use mizar_llm::{ModelInfo, ProviderInfo};
+    use mizar_tui_ui::app::{AppAction, AppState, ChatItem};
+
+    use super::{mentions, rollback_trailing_user_bubble};
+
+    #[tokio::test]
+    async fn at_image_rejection_on_non_vision_model_rolls_back_ghost_user_bubble() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ws = std::env::temp_dir().join(format!(
+            "mizar_tui_ghost_bubble_{}_{uniq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("shot.png"),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+
+        let providers = vec![ProviderInfo {
+            id: "mock".into(),
+            name: "Mock".into(),
+            protocol: "mock".into(),
+            models: vec![ModelInfo {
+                id: "text-only".into(),
+                name: "Text Only".into(),
+                input: vec!["text".into()],
+                ..Default::default()
+            }],
+        }];
+        let mut app = AppState::new(
+            ws.clone(),
+            "sess-ghost",
+            providers,
+            Some("mock".into()),
+            Some("text-only".into()),
+            None,
+        );
+        app.input.insert_str("请看 @shot.png ");
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let AppAction::SubmitPrompt(prompt) = action else {
+            panic!("expected SubmitPrompt, got {action:?}");
+        };
+        assert_eq!(app.items.len(), 1);
+
+        assert!(!app.active_model_supports_images());
+        assert!(mentions::mentions_resolve_any_image(&ws, false, &prompt).await);
+
+        rollback_trailing_user_bubble(&mut app, &prompt);
+        app.input.set_text_end(&prompt);
+        app.reject_unsupported_images_notice();
+
+        assert!(
+            !app.items
+                .iter()
+                .any(|it| matches!(it, ChatItem::User { .. })),
+            "rejected @image prompt must not leave a ghost user bubble: {:?}",
+            app.items
+        );
+        assert_eq!(app.input.text(), "请看 @shot.png");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

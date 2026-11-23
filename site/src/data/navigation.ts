@@ -81,7 +81,7 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Config & Precedence',
         },
         description: {
-          zh: '全局与项目级 settings.json 合并规则、/settings 实时配置、上下文压缩与模块热开关。',
+          zh: '全局与项目级 settings.json 合并规则、/settings 实时配置、上下文压缩与模块原子开关。',
           en: 'Global and project settings.json merge rules, live /settings modal, compaction, and module toggles.',
         },
       },
@@ -202,8 +202,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'CLI Flags',
         },
         description: {
-          zh: '按场景组合命令行启动参数，覆盖模型、工作区、视口、工具集与审批行为。',
-          en: 'Combine CLI startup flags by scenario for models, workspace, viewport, toolsets, and approvals.',
+          zh: '按场景组合命令行启动参数，覆盖模型、工作区、视口、工具集、无头 exec 与 --trace-out。',
+          en: 'Combine CLI startup flags across workspace, models, headless exec, --trace-out, and approvals.',
         },
       },
       {
@@ -243,8 +243,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Built-in Tools',
         },
         description: {
-          zh: '6 个内置编程工具的能力边界、输出截断保护与 ToolExposure 可见层级。',
-          en: 'Capabilities, output truncation limits, and ToolExposure tiers across the 6 built-in coding tools.',
+          zh: '6 个内置编程工具、recall 情景回溯、常驻 subagent、输出截断与 ToolExposure 层级。',
+          en: 'The 6 coding tools, static recall, persistent subagent, truncation limits, and ToolExposure tiers.',
         },
       },
       {
@@ -373,24 +373,24 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Workspace Layers & Cores',
         },
         description: {
-          zh: '30 个 crate 的职责分层，以及严禁引入运行时依赖的三大纯核心边界。',
-          en: 'Responsibilities across the 30 workspace crates and the three pure core crates shielded from runtime deps.',
+          zh: '10 个 crate 的静态 DAG 职责分层，以及纯核心（mizar-types/mizar-tui-ui）与 Merak 零终端隔离边界。',
+          en: 'Responsibilities across 10 workspace crates, pure-core rules (mizar-types/mizar-tui-ui), and zero-TUI client bounds.',
         },
       },
       {
-        slug: 'dev/cordis',
-        fileSlug: 'dev/cordis',
+        slug: 'dev/runtime',
+        fileSlug: 'dev/runtime',
         label: {
-          zh: 'Cordis 插件',
-          en: 'Cordis',
+          zh: '运行时与钩子',
+          en: 'Runtime & Hooks',
         },
         title: {
-          zh: 'Cordis 微内核与新增工具',
-          en: 'Cordis Kernel & New Tools',
+          zh: 'MizarRuntime、强类型钩子与新增工具',
+          en: 'MizarRuntime, Typed Hooks & Tools',
         },
         description: {
-          zh: 'Plugin trait、inject / provide 注入契约、effect 倒序清理，以及从零编写新工具插件。',
-          en: 'Plugin trait, inject / provide contracts, LIFO effect cleanup, and building a new tool plugin from scratch.',
+          zh: 'MizarRuntime::build 静态装配、RAII HookGuard 清理、强类型钩子与事件总线，以及从零注册新工具。',
+          en: 'MizarRuntime::build static assembly, RAII HookGuard cleanup, typed hooks/event buses, and registering new tools.',
         },
       },
       {

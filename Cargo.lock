@@ -304,16 +304,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cordis"
-version = "0.2.0"
-dependencies = [
- "futures",
- "loom",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1508,129 +1498,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "mizar-agent-loop"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "cordis",
- "futures",
- "mizar-llm",
- "mizar-session",
- "mizar-system-prompt",
- "mizar-tools",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "mizar-agent-spine"
-version = "0.2.0"
-dependencies = [
- "axum",
- "cordis",
- "dirs",
- "futures",
- "mizar-agent-loop",
- "mizar-cache-warming",
- "mizar-codemode",
- "mizar-compaction",
- "mizar-instructions",
- "mizar-llm",
- "mizar-llm-mock",
- "mizar-llm-retry",
- "mizar-llm-router",
- "mizar-mcp",
- "mizar-recall",
- "mizar-session",
- "mizar-session-sqlite",
- "mizar-session-title",
- "mizar-skills",
- "mizar-subagent",
- "mizar-system-prompt",
- "mizar-tool-fs",
- "mizar-tool-search",
- "mizar-tool-time",
- "mizar-tools",
- "mizar-tools-coding",
- "mizar-trajectory",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "mizar-cache-warming"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "futures",
- "mizar-agent-loop",
- "mizar-client-core",
- "mizar-compaction",
- "mizar-llm",
- "mizar-session",
- "mizar-system-prompt",
- "mizar-tools",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "mizar-client"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
- "cordis",
  "futures",
  "image",
- "mizar-agent-loop",
- "mizar-agent-spine",
- "mizar-cache-warming",
- "mizar-client-core",
- "mizar-instructions",
+ "mizar-core",
  "mizar-llm",
  "mizar-mcp",
  "mizar-session",
- "mizar-session-title",
- "mizar-skills",
- "mizar-subagent",
  "mizar-tools",
- "mizar-tools-coding",
- "mizar-trajectory",
+ "mizar-types",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-client-core"
-version = "0.2.0"
-dependencies = [
- "dirs",
- "futures",
- "ignore",
- "mizar-llm-types",
- "serde",
- "serde_json",
- "unicode-width",
+ "tracing",
 ]
 
 [[package]]
 name = "mizar-codemode"
 version = "0.2.0"
 dependencies = [
- "cordis",
- "mizar-tool-search",
  "mizar-tools",
+ "mizar-types",
  "rquickjs",
  "serde",
  "serde_json",
@@ -1639,378 +1532,94 @@ dependencies = [
 ]
 
 [[package]]
-name = "mizar-compaction"
+name = "mizar-core"
 version = "0.2.0"
 dependencies = [
- "cordis",
+ "axum",
+ "chrono",
+ "dirs",
  "futures",
- "mizar-agent-loop",
+ "loom",
+ "mizar-codemode",
  "mizar-llm",
+ "mizar-mcp",
  "mizar-session",
- "mizar-system-prompt",
  "mizar-tools",
- "mizar-tools-coding",
+ "mizar-types",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-instructions"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "dirs",
- "futures",
- "mizar-agent-loop",
- "mizar-llm",
- "mizar-session",
- "mizar-system-prompt",
- "mizar-tools",
- "mizar-tools-coding",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
+ "tracing",
 ]
 
 [[package]]
 name = "mizar-llm"
 version = "0.2.0"
 dependencies = [
- "cordis",
- "futures",
- "mizar-llm-types",
- "tokio-util",
-]
-
-[[package]]
-name = "mizar-llm-completions"
-version = "0.2.0"
-dependencies = [
  "axum",
- "cordis",
  "futures",
- "mizar-llm",
- "mizar-llm-http",
+ "mizar-types",
  "reqwest",
  "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-llm-http"
-version = "0.2.0"
-dependencies = [
- "futures",
- "mizar-llm",
- "reqwest",
  "serde_json",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-llm-messages"
-version = "0.2.0"
-dependencies = [
- "axum",
- "cordis",
- "futures",
- "mizar-llm",
- "mizar-llm-http",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-llm-mock"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "futures",
- "mizar-llm",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-llm-responses"
-version = "0.2.0"
-dependencies = [
- "axum",
- "cordis",
- "futures",
- "mizar-llm",
- "mizar-llm-http",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-llm-retry"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "futures",
- "mizar-llm",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "mizar-llm-router"
-version = "0.2.0"
-dependencies = [
- "axum",
- "cordis",
- "futures",
- "mizar-llm",
- "mizar-llm-completions",
- "mizar-llm-http",
- "mizar-llm-messages",
- "mizar-llm-mock",
- "mizar-llm-responses",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-llm-types"
-version = "0.2.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "mizar-mcp"
 version = "0.2.0"
 dependencies = [
- "cordis",
  "dirs",
  "mizar-llm",
- "mizar-llm-http",
- "mizar-system-prompt",
  "mizar-tools",
+ "mizar-types",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-recall"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "mizar-agent-loop",
- "mizar-llm",
- "mizar-session",
- "mizar-session-sqlite",
- "mizar-tools",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
+ "tracing",
 ]
 
 [[package]]
 name = "mizar-session"
 version = "0.2.0"
 dependencies = [
- "cordis",
- "mizar-llm",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "mizar-session-sqlite"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "mizar-llm",
- "mizar-llm-types",
- "mizar-session",
+ "mizar-tools",
+ "mizar-types",
  "rusqlite",
  "serde",
  "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-session-title"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "cordis",
- "futures",
- "mizar-agent-loop",
- "mizar-llm",
- "mizar-session",
- "serde",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-skills"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "dirs",
- "futures",
- "loom",
- "mizar-agent-loop",
- "mizar-llm",
- "mizar-session",
- "mizar-system-prompt",
- "mizar-tools",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "mizar-subagent"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "futures",
- "mizar-agent-loop",
- "mizar-codemode",
- "mizar-llm",
- "mizar-recall",
- "mizar-session",
- "mizar-session-sqlite",
- "mizar-session-title",
- "mizar-system-prompt",
- "mizar-tool-fs",
- "mizar-tool-time",
- "mizar-tools",
- "mizar-tools-coding",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "mizar-system-prompt"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "tokio",
-]
-
-[[package]]
-name = "mizar-tool-fs"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "mizar-tools",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-tool-search"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "mizar-tools",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mizar-tool-time"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "cordis",
- "mizar-tools",
- "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "mizar-tools"
 version = "0.2.0"
 dependencies = [
- "cordis",
- "loom",
- "mizar-llm",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "uuid",
-]
-
-[[package]]
-name = "mizar-tools-coding"
-version = "0.2.0"
-dependencies = [
- "cordis",
  "dirs",
  "globset",
  "ignore",
  "libc",
- "mizar-system-prompt",
- "mizar-tools",
+ "loom",
+ "mizar-types",
+ "regex",
  "serde",
  "serde_json",
  "similar",
- "tokio",
- "tokio-util",
- "unicode-normalization",
-]
-
-[[package]]
-name = "mizar-trajectory"
-version = "0.2.0"
-dependencies = [
- "cordis",
- "mizar-agent-loop",
- "mizar-llm",
- "mizar-session",
- "mizar-tools",
- "mizar-trajectory-core",
- "serde",
- "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-trajectory-core"
-version = "0.2.0"
-dependencies = [
- "mizar-llm-types",
- "serde",
- "serde_json",
+ "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]
@@ -2020,34 +1629,25 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "cordis",
  "crossterm",
  "futures",
  "image",
- "mizar-agent-loop",
- "mizar-agent-spine",
+ "libc",
  "mizar-client",
- "mizar-client-core",
- "mizar-instructions",
+ "mizar-core",
  "mizar-llm",
- "mizar-llm-mock",
- "mizar-llm-retry",
- "mizar-llm-router",
  "mizar-mcp",
  "mizar-session",
- "mizar-session-title",
- "mizar-skills",
- "mizar-system-prompt",
  "mizar-tools",
- "mizar-tools-coding",
- "mizar-trajectory",
  "mizar-tui-ui",
+ "mizar-types",
  "ratatui",
  "reqwest",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2056,12 +1656,24 @@ version = "0.2.0"
 dependencies = [
  "crossterm",
  "futures",
- "mizar-client-core",
- "mizar-llm-types",
- "mizar-trajectory-core",
+ "libc",
+ "mizar-types",
  "ratatui",
  "serde_json",
  "similar",
+ "unicode-width",
+]
+
+[[package]]
+name = "mizar-types"
+version = "0.2.0"
+dependencies = [
+ "dirs",
+ "futures",
+ "ignore",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "unicode-width",
 ]
 

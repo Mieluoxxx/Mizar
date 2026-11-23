@@ -1,23 +1,19 @@
 //! 只读会话投影、模型选择优先级解析与会话报告生成（零终端依赖）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
-use cordis::Context;
-use mizar_agent_spine::strip_summary_wrapper;
-use mizar_cache_warming::{CacheWarmingRuntime, SERVICE_CACHE_WARMING};
-use mizar_client_core::{
-    CacheMissAudit, CacheWarmingSessionStatus, ContextBreakdownSnapshot, NoticeLevel,
-    SessionPickerItem, SessionReplayItem, SessionSelection, SessionTreeEntry, SessionViewData,
-    UsageAuditSample, abbreviate_home_path, compute_cache_miss_audit, format_tokens, short_id,
-    truncate_display,
-};
-use mizar_llm::{ContentBlock, LlmContextExt, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
+use mizar_core::spine::{MizarRuntime, strip_summary_wrapper};
+use mizar_llm::{ContentBlock, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
 use mizar_session::{
-    Session, SessionEvent, SessionListQuery, SessionPersistenceContextExt, SessionStore,
-    SessionTraceEvent, TraceSeverity,
+    Session, SessionEvent, SessionListQuery, SessionStore, SessionTraceEvent, TraceSeverity,
+};
+use mizar_types::client::{
+    CacheMissAudit, ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem,
+    SessionSelection, SessionTreeEntry, SessionViewData, UsageAuditSample, abbreviate_home_path,
+    compute_cache_miss_audit, format_tokens, short_id, truncate_display,
 };
 
 /// 选择解析的输入：各来源的值与「是否显式指定」标记。
@@ -342,45 +338,24 @@ fn collect_usage_audit_samples(
     (samples, last_rates)
 }
 
-fn format_eta_secs(secs: u64) -> String {
-    if secs >= 60 {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m{s}s")
-        }
-    } else {
-        format!("{secs}s")
-    }
-}
-
 /// 构造 `/session` 命令的只读会话身份与账目报告。
 pub fn build_session_info_report(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     session: &Session,
     session_db_path: Option<&Path>,
     context_window: u64,
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
 ) -> String {
-    let warming = ctx
-        .get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
-        .and_then(|rt| rt.status(&session.id));
-    let providers = ctx
-        .llm()
-        .map(|llm| llm.provider_infos())
-        .unwrap_or_default();
+    let providers = runtime.llm.provider_infos();
     build_session_info_report_at_with_cache(
         session,
-        ctx.session_persistence().is_some(),
+        runtime.persistence.is_some(),
         session_db_path,
         context_window,
         last_prompt_tokens,
         context_breakdown,
         now_millis(),
-        warming.as_ref(),
         &providers,
     )
 }
@@ -403,12 +378,11 @@ pub fn build_session_info_report_at(
         last_prompt_tokens,
         context_breakdown,
         now_ms,
-        None,
         &[],
     )
 }
 
-/// 附带运行期保活状态与路由计价表的完整 `/session` 报告构造函数。
+/// 附带路由计价表的完整 `/session` 报告构造函数。
 #[allow(clippy::too_many_arguments)]
 pub fn build_session_info_report_at_with_cache(
     session: &Session,
@@ -418,7 +392,6 @@ pub fn build_session_info_report_at_with_cache(
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
     now_ms: u128,
-    warming: Option<&CacheWarmingSessionStatus>,
     providers: &[ProviderInfo],
 ) -> String {
     let header = session.header();
@@ -431,13 +404,11 @@ pub fn build_session_info_report_at_with_cache(
     let mut tool_error_count = 0u64;
     let mut bash_count = 0u64;
     let mut bash_local_count = 0u64;
-    let mut pruned_seqs = HashSet::<u64>::new();
     let mut injection_counts = HashMap::<String, u64>::new();
     let mut compaction_count = 0u64;
     let mut latest_compaction: Option<(u64, Option<u64>, Option<u64>)> = None;
     let mut total_usage = TokenUsage::default();
     let mut latest_context_tokens: Option<u64> = None;
-    let mut saw_prune_after_last_context = false;
     let mut audit = CacheMissAudit::default();
 
     session.with_all_entries(|entries| {
@@ -460,7 +431,6 @@ pub fn build_session_info_report_at_with_cache(
                         let prompt = u.prompt_tokens();
                         if prompt > 0 {
                             latest_context_tokens = Some(prompt);
-                            saw_prune_after_last_context = false;
                         }
                     }
                 }
@@ -480,14 +450,7 @@ pub fn build_session_info_report_at_with_cache(
                     latest_compaction = Some((*first_kept_seq, *tokens_before, *tokens_after));
                     if let Some(after) = tokens_after.filter(|&v| v > 0) {
                         latest_context_tokens = Some(after);
-                        saw_prune_after_last_context = false;
                     }
-                }
-                SessionEvent::ToolResultPrune { pruned } => {
-                    for item in pruned {
-                        pruned_seqs.insert(item.target_seq);
-                    }
-                    saw_prune_after_last_context = true;
                 }
                 SessionEvent::BashExecution {
                     exclude_from_context,
@@ -576,9 +539,6 @@ pub fn build_session_info_report_at_with_cache(
             tool_parts.push(format!("bash {bash_count}"));
         }
     }
-    if !pruned_seqs.is_empty() {
-        tool_parts.push(format!("prune {}", pruned_seqs.len()));
-    }
     lines.push(format!("工具     {}", join_mid_dot(&tool_parts)));
 
     const KNOWN_INJECTION_SOURCES: [(&str, &str); 5] = [
@@ -653,11 +613,7 @@ pub fn build_session_info_report_at_with_cache(
     ));
 
     let window = context_window.max(1);
-    let effective_measured = if saw_prune_after_last_context {
-        last_prompt_tokens.or(latest_context_tokens)
-    } else {
-        latest_context_tokens.or(last_prompt_tokens)
-    };
+    let effective_measured = latest_context_tokens.or(last_prompt_tokens);
     let ctx_summary = if let Some(measured) = effective_measured {
         let pct = (measured as f64 / window as f64) * 100.0;
         format!(
@@ -683,34 +639,7 @@ pub fn build_session_info_report_at_with_cache(
     };
     lines.push(format!("上下文   {ctx_summary}"));
 
-    if let Some(st) = warming {
-        let mut parts = vec![st.mode.as_str().to_string()];
-        if st.active {
-            let eta = st
-                .next_warm_in_secs
-                .map(|s| format!("待命（下次 {} 后）", format_eta_secs(s)))
-                .unwrap_or_else(|| "待命中".to_string());
-            parts.push(eta);
-        } else if let Some(ref reason) = st.last_stop_reason {
-            parts.push(format!("已停止（{reason}）"));
-        } else {
-            parts.push("空闲".to_string());
-        }
-        if st.warm_count > 0 {
-            parts.push(format!(
-                "已保活 {} 次（${:.4}）",
-                st.warm_count, st.total_warm_cost_usd
-            ));
-        }
-        lines.push(format!("缓存续命 {}", parts.join(" · ")));
-    }
-
-    if warming.is_some()
-        || audit.miss_events > 0
-        || audit.warm_events > 0
-        || cache_read > 0
-        || cache_write > 0
-    {
+    if audit.miss_events > 0 || audit.warm_events > 0 || cache_read > 0 || cache_write > 0 {
         let mut audit_parts = vec![format!(
             "Cache Re-billed: {} tokens",
             format_tokens(audit.cache_rebilled_tokens)
@@ -848,9 +777,7 @@ pub fn project_session_view(
                 }
                 _ => {}
             },
-            SessionEvent::ToolResultPrune { .. }
-            | SessionEvent::Selection { .. }
-            | SessionEvent::Usage { .. } => {}
+            SessionEvent::Selection { .. } | SessionEvent::Usage { .. } => {}
         }
     }
     if saw_usage {
@@ -864,7 +791,6 @@ pub fn project_session_view(
         selection: session.latest_selection().map(to_ui_selection),
         total_usage,
         last_prompt_tokens,
-        cache_warming: None,
         cache_miss_audit,
     }
 }
@@ -1013,8 +939,7 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
                     can_fork: true,
                 })
             }
-            SessionEvent::ToolResultPrune { .. }
-            | SessionEvent::Selection { .. }
+            SessionEvent::Selection { .. }
             | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => None,
         })
@@ -1218,11 +1143,8 @@ mod tests {
     #[tokio::test]
     async fn project_resume_view_maps_turn_notice_and_truncated_turn_end_to_notice_never_assistant()
     {
-        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
-        use mizar_session::SessionContextExt;
+        use mizar_core::spine::{AgentSpineConfig, AgentToolsMode};
 
-        let ctx = Context::new();
-        ctx.logger().set_silent();
         let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         if let AgentToolsMode::Coding {
             ref mut mcp,
@@ -1235,10 +1157,9 @@ mod tests {
             skills.include_default_roots = false;
             instructions.include_default_global = false;
         }
-        ctx.plugin(AgentSpinePlugin, cfg);
-        crate::events::wait_for_services(&ctx).await.unwrap();
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let session = ctx.sessions().unwrap().create(None);
+        let session = runtime.sessions.create(None);
         session.append(SessionEvent::user("hi"));
         session.append_trace(SessionTraceEvent::TurnNotice {
             turn: 1,
@@ -1292,20 +1213,16 @@ mod tests {
             } if text.contains("max_tokens")
         )));
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn build_session_info_report_covers_full_identity_ledger_and_empty_omissions() {
-        use cordis::Service;
         use mizar_session::{
-            CompactionDigest, SessionContextExt, SessionCreateOptions, SessionEvent, SessionStore,
-            SessionTraceEvent,
+            CompactionDigest, SessionCreateOptions, SessionEvent, SessionStore, SessionTraceEvent,
         };
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let store = SessionStore::new();
 
         let parent = store.create(None);
         parent.append(SessionEvent::user("parent"));
@@ -1384,20 +1301,14 @@ mod tests {
         );
         assert!(!fresh_report.contains("谱系") && !fresh_report.contains("压缩"));
         assert!(fresh_report.contains("存储     仅内存（未持久化）"));
-
-        ctx.fiber().dispose().await;
     }
 
     #[tokio::test]
-    async fn build_session_info_report_renders_cache_warming_status_and_rebilled_audit() {
-        use cordis::Service;
-        use mizar_cache_warming::CacheWarmingMode;
+    async fn build_session_info_report_renders_rebilled_audit() {
         use mizar_llm::ModelCostRates;
-        use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
+        use mizar_session::{SessionEvent, SessionStore};
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let store = SessionStore::new();
         let session = store.create(None);
         session.record_selection(Some("anthropic".into()), Some("claude-sonnet".into()), None);
         session.append(SessionEvent::Assistant {
@@ -1450,17 +1361,6 @@ mod tests {
                 ..Default::default()
             }],
         }];
-        let warming = CacheWarmingSessionStatus {
-            mode: CacheWarmingMode::Idle,
-            active: true,
-            next_warm_in_secs: Some(270),
-            next_warm_at_ms: None,
-            warm_count: 1,
-            total_warm_cost_usd: 0.024,
-            last_stop_reason: None,
-            last_warm_cost_usd: Some(0.024),
-            last_miss_cost_usd: Some(0.276),
-        };
         let breakdown = ContextBreakdownSnapshot::default();
         let report = build_session_info_report_at_with_cache(
             &session,
@@ -1470,14 +1370,10 @@ mod tests {
             Some(80_200),
             &breakdown,
             session.header().updated_at_ms + 1_000,
-            Some(&warming),
             &providers,
         );
 
-        assert!(
-            report.contains("缓存续命 idle · 待命（下次 4m30s 后） · 已保活 1 次（$0.0240）"),
-            "{report}"
-        );
+        assert!(!report.contains("缓存续命"), "{report}");
         assert!(
             report.contains("缓存审计 Cache Re-billed: 80.0k tokens · 1 次意外失效 · 额外 $0.2760 · 续命 1 次（$0.0240）"),
             "{report}"
@@ -1487,18 +1383,13 @@ mod tests {
         assert_eq!(view.cache_miss_audit.cache_rebilled_tokens, 80_000);
         assert_eq!(view.cache_miss_audit.miss_events, 1);
         assert_eq!(view.cache_miss_audit.warm_events, 1);
-
-        ctx.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn latest_workspace_selection_skips_newer_subagent_child_session() {
-        use cordis::Service;
-        use mizar_session::{SessionContextExt, SessionCreateOptions};
+        use mizar_session::{SessionCreateOptions, SessionStore};
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let store = SessionStore::new();
         let ws = PathBuf::from("/tmp/mizar-ws-sel");
 
         let parent = store.create_with(SessionCreateOptions {
@@ -1524,7 +1415,5 @@ mod tests {
         let sel = latest_workspace_selection(&store, &ws).expect("should find parent selection");
         assert_eq!(sel.provider.as_deref(), Some("anthropic"));
         assert_eq!(sel.model.as_deref(), Some("claude-sonnet"));
-
-        ctx.fiber().dispose().await;
     }
 }

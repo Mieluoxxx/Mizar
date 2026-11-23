@@ -11,24 +11,16 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }
-cordis = { workspace = true }
 futures = { workspace = true }
 image = { workspace = true }
-mizar-agent-loop = { workspace = true }
-mizar-agent-spine = { workspace = true }
-mizar-cache-warming = { workspace = true }
-mizar-client-core = { workspace = true }
-mizar-instructions = { workspace = true }
+mizar-core = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-mcp = { workspace = true }
 mizar-session = { workspace = true }
-mizar-session-title = { workspace = true }
-mizar-skills = { workspace = true }
-mizar-subagent = { workspace = true }
 mizar-tools = { workspace = true }
-mizar-tools-coding = { workspace = true }
-mizar-trajectory = { workspace = true }
+mizar-types = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
