@@ -3,7 +3,9 @@ set -eu
 
 REPO="Mieluoxxx/Mizar"
 INSTALL_DIR="${MIZAR_INSTALL_DIR:-${HOME}/.local/bin}"
+MIZAR_BIN_DIR="${HOME}/.mizar/bin"
 VERSION="${MIZAR_VERSION:-}"
+SKIP_TOOLS="${MIZAR_SKIP_TOOLS:-0}"
 
 usage() {
   cat <<'EOF'
@@ -14,11 +16,13 @@ Usage: install.sh [OPTIONS]
 Options:
   -v, --version <ver>   Install a specific release tag (e.g. v0.1.0 or 0.1.0)
   -d, --dir <path>      Installation directory (default: ~/.local/bin)
+      --skip-tools      Skip installing managed rg/fd helper binaries to ~/.mizar/bin
   -h, --help            Print this help message
 
 Environment:
   MIZAR_VERSION         Same as --version
   MIZAR_INSTALL_DIR     Same as --dir
+  MIZAR_SKIP_TOOLS      Set to 1 to skip managed rg/fd installation
 EOF
 }
 
@@ -39,6 +43,10 @@ while [ "$#" -gt 0 ]; do
       fi
       INSTALL_DIR="$2"
       shift 2
+      ;;
+    --skip-tools)
+      SKIP_TOOLS=1
+      shift
       ;;
     -h|--help)
       usage
@@ -151,6 +159,103 @@ verify_sha256() {
   fi
 }
 
+# 通过 /releases/latest 302 重定向解析最新 tag，避免触发 api.github.com 匿名限流。
+resolve_latest_tag_redirect() {
+  gh_repo="$1"
+  effective_url=$(curl -fsSLI --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' "https://github.com/${gh_repo}/releases/latest" 2>/dev/null || true)
+  case "$effective_url" in
+    */releases/tag/*)
+      echo "${effective_url##*/releases/tag/}"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+tool_target_candidates() {
+  case "$TARGET" in
+    aarch64-apple-darwin) echo "aarch64-apple-darwin" ;;
+    x86_64-apple-darwin) echo "x86_64-apple-darwin" ;;
+    x86_64-unknown-linux-gnu) echo "x86_64-unknown-linux-musl x86_64-unknown-linux-gnu" ;;
+    aarch64-unknown-linux-gnu) echo "aarch64-unknown-linux-musl aarch64-unknown-linux-gnu" ;;
+    *) echo "" ;;
+  esac
+}
+
+install_github_tool() {
+  bin_name="$1"
+  gh_repo="$2"
+  asset_prefix="$3"
+  tag_has_v="$4"
+
+  tag=$(resolve_latest_tag_redirect "$gh_repo") || return 1
+  ver="${tag#v}"
+  if [ "$tag_has_v" = "1" ]; then
+    ver_part="v${ver}"
+  else
+    ver_part="${ver}"
+  fi
+
+  candidates=$(tool_target_candidates)
+  [ -n "$candidates" ] || return 1
+
+  tool_tmp="${TMP_DIR}/tool-${bin_name}"
+  mkdir -p "$tool_tmp"
+
+  for triple in $candidates; do
+    archive="${asset_prefix}-${ver_part}-${triple}.tar.gz"
+    url="https://github.com/${gh_repo}/releases/download/${tag}/${archive}"
+    archive_path="${tool_tmp}/${archive}"
+    if curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$archive_path" 2>/dev/null; then
+      if tar -xzf "$archive_path" -C "$tool_tmp" 2>/dev/null; then
+        found_bin=$(find "$tool_tmp" -type f -name "$bin_name" | head -n 1 || true)
+        if [ -n "$found_bin" ]; then
+          mkdir -p "$MIZAR_BIN_DIR"
+          if command -v install >/dev/null 2>&1; then
+            install -m 755 "$found_bin" "${MIZAR_BIN_DIR}/${bin_name}"
+          else
+            cp "$found_bin" "${MIZAR_BIN_DIR}/${bin_name}"
+            chmod 755 "${MIZAR_BIN_DIR}/${bin_name}"
+          fi
+          echo "Installed managed ${bin_name} (${tag}) to ${MIZAR_BIN_DIR}/${bin_name}"
+          return 0
+        fi
+      fi
+    fi
+  done
+
+  return 1
+}
+
+install_helper_tools() {
+  case "$SKIP_TOOLS" in
+    1|true|TRUE|yes|YES)
+      echo "Skipping managed rg/fd installation (MIZAR_SKIP_TOOLS/--skip-tools)."
+      return 0
+      ;;
+  esac
+
+  if command -v rg >/dev/null 2>&1 || [ -x "${MIZAR_BIN_DIR}/rg" ]; then
+    :
+  else
+    echo "Installing managed rg to ${MIZAR_BIN_DIR}..."
+    if ! install_github_tool "rg" "BurntSushi/ripgrep" "ripgrep" "0"; then
+      echo "warning: failed to download ripgrep (rg); mizar will use its built-in Rust grep fallback" >&2
+    fi
+  fi
+
+  if command -v fd >/dev/null 2>&1 || command -v fdfind >/dev/null 2>&1 || [ -x "${MIZAR_BIN_DIR}/fd" ]; then
+    :
+  else
+    echo "Installing managed fd to ${MIZAR_BIN_DIR}..."
+    if ! install_github_tool "fd" "sharkdp/fd" "fd" "1"; then
+      echo "warning: failed to download fd; mizar will use its built-in Rust file walker fallback" >&2
+    fi
+  fi
+}
+
 TARGET=$(detect_target)
 TAG=$(resolve_tag)
 ARCHIVE="mizar-${TAG}-${TARGET}.tar.gz"
@@ -180,6 +285,8 @@ else
 fi
 
 echo "Installed $("${INSTALL_DIR}/mizar" --version) to ${INSTALL_DIR}/mizar"
+install_helper_tools
+
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *)

@@ -1979,6 +1979,7 @@ dependencies = [
  "libc",
  "mizar-system-prompt",
  "mizar-tools",
+ "regex",
  "serde",
  "serde_json",
  "similar",
