@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use cordis::{Context, Service};
 use mizar_mcp::{McpContextExt, McpExposure, McpManager, McpPluginConfig, McpServerConfig};
-use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_tools::{ToolExecution, ToolRuntime, ToolsContextExt};
 use serde_json::json;
 
@@ -125,9 +124,6 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
 
     let app = Context::new();
     app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
     app.plugin(McpManager::plugin(), cfg).await.unwrap();
 
     let mgr: Arc<McpManager> = app.get("mcp").unwrap();
@@ -212,11 +208,6 @@ async fn connects_stdio_mcp_applies_hidden_and_codemode_exposures_and_reads_reso
     assert!(!read_res.is_error, "{}", read_res.content);
     assert!(read_res.content.contains("indexed=42 files"));
 
-    // MCP 不应向静态 SystemPrompt 注入动态 mcp_servers 段落（保持前缀字节冻结）
-    let prompt = app.service::<SystemPrompt>("systemPrompt").unwrap().build();
-    assert!(!prompt.contains("mcp_servers"), "prompt:\n{prompt}");
-    assert!(!prompt.contains("mcp__fff"), "prompt:\n{prompt}");
-
     // render_servers_section 辅助方法本身仍可按需渲染 MCP server 摘要
     let section = app
         .mcp()
@@ -288,9 +279,6 @@ async fn skip_global_config_ignores_global_mcp_but_loads_project_mcp() {
 
     let app = Context::new();
     app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
     app.plugin(
         McpManager::plugin(),
         McpPluginConfig {

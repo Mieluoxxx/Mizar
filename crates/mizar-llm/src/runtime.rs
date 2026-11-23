@@ -9,7 +9,7 @@ use futures::Stream;
 use crate::types::{
     FinishReason, GenerateOptions, ModelInfo, ProviderInfo, StreamChunk, TokenUsage,
 };
-use mizar_llm_types::LlmError;
+use mizar_types::llm::LlmError;
 
 pub const EVENT_ADAPTERS_UPDATED: &str = "llm/adapters-updated";
 pub const EVENT_LLM_STREAM: &str = "llm/stream";
@@ -486,7 +486,7 @@ mod tests {
                 ],
                 FakeOutcome::ErrorChunk => vec![Ok(StreamChunk::Finish {
                     reason: FinishReason::Error {
-                        code: mizar_llm_types::LlmErrorCode::Server,
+                        code: mizar_types::llm::LlmErrorCode::Server,
                         message: "bad".into(),
                         status: Some(500),
                         retry_after_ms: None,

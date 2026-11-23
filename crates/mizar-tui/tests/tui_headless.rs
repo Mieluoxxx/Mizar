@@ -4,16 +4,16 @@ use std::time::Duration;
 
 use cordis::{Cleanup, Context, LogLevel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use mizar_agent_loop::{AgentLoopContextExt, RunOptions};
-use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+use mizar_core::agent_loop::{AgentLoopContextExt, RunOptions};
+use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+use mizar_core::system_prompt::SystemPromptContextExt;
+use mizar_core::trajectory::{TimelineMode, TrajectoryRuntime};
+use mizar_llm::mock::MockPlugin;
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, ModelInfo,
     ProviderInfo, ReasoningEffort, StreamChunk,
 };
-use mizar_llm_mock::MockPlugin;
 use mizar_session::{SessionContextExt, SessionCreateOptions, SessionEvent, TitleSource};
-use mizar_system_prompt::SystemPromptContextExt;
-use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
 use mizar_tui::app::ToolExtraMeta;
 use mizar_tui::editor::display_width;
 use mizar_tui::emphasis::mount_reply_guidance_section;
@@ -556,8 +556,8 @@ async fn bash_mode_e2e_executes_isolates_cancels_truncates_and_replays_sqlite() 
         BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, Message,
         ModelInfo, ProviderInfo, StreamChunk,
     };
+    use mizar_tools::coding::bash::execute_bash_process;
     use mizar_tools::{EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolExecution};
-    use mizar_tools_coding::bash::execute_bash_process;
     use mizar_tui::app::LocalBashOutput;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1368,7 +1368,7 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     let ctx = Context::new();
     ctx.logger().set_silent();
     let mut cfg = AgentSpineConfig::coding(&ws).with_session_db(&db_path);
-    cfg.session_title = Some(mizar_agent_spine::SessionTitleConfig::default());
+    cfg.session_title = Some(mizar_core::spine::SessionTitleConfig::default());
     cfg.agent.provider = Some("fake".into());
     cfg.agent.model = Some("smart-1".into());
     if let AgentToolsMode::Coding {

@@ -7,11 +7,6 @@ use std::time::Duration;
 
 use cordis::Context;
 use crossterm::event::EventStream;
-use mizar_agent_loop::{AgentLoopContextExt, DeliveryMode, RunOptions, TurnInput};
-use mizar_agent_spine::{
-    CompactionContextExt, CompactionError, ManualCompactOptions, SubagentContextExt,
-    resolve_global_settings_path,
-};
 use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController, steer_session};
 use mizar_client::images;
 use mizar_client::local_bash::{execute_local_bash_for_session, next_local_bash_call_id};
@@ -27,21 +22,26 @@ use mizar_client::workspace::{
     WorkspacePanelSnapshot, collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
     collect_workspace_panel_snapshot,
 };
-use mizar_client_core::{HostExtensionFlags, short_id};
-use mizar_instructions::AgentInstructions;
+use mizar_core::agent_loop::{AgentLoopContextExt, DeliveryMode, RunOptions, TurnInput};
+use mizar_core::instructions::AgentInstructions;
+use mizar_core::session_title::SessionTitleContextExt;
+use mizar_core::skills::{SkillLookupOptions, SkillRegistry};
+use mizar_core::spine::{
+    CompactionContextExt, CompactionError, ManualCompactOptions, SubagentContextExt,
+    resolve_global_settings_path,
+};
+use mizar_core::trajectory::{TimelineMode, TrajectoryRuntime};
 use mizar_llm::{ImageAttachment, LlmContextExt};
 use mizar_mcp::{McpConnectionState, McpManager};
 use mizar_session::{Session, SessionContextExt, SessionCreateOptions};
-use mizar_session_title::SessionTitleContextExt;
-use mizar_skills::{SkillLookupOptions, SkillRegistry};
 use mizar_tools::{ToolExposure, ToolRuntime};
-use mizar_trajectory::{TimelineMode, TrajectoryRuntime};
 use mizar_tui_ui::app::{AppAction, AppState, ChatItem, NoticeLevel, SessionSelection, UiEvent};
 use mizar_tui_ui::overlay::{ApprovalDecision, SkillPickerItem};
 use mizar_tui_ui::terminal::{
     ScreenMode, apply_terminal_modes, resume_after_external_editor, set_mouse_capture_enabled,
     suspend_for_external_editor,
 };
+use mizar_types::client::{HostExtensionFlags, short_id};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

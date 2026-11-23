@@ -11,12 +11,14 @@ use std::sync::Arc;
 use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Next, Plugin,
 };
-use mizar_agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput};
-use mizar_client_core::{
-    ClientEvent, FILE_MENTIONS_SOURCE, NoticeLevel, PLUGIN_FILE_MENTIONS, extract_mentions,
+use mizar_core::agent_loop::{
+    AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput,
 };
 use mizar_llm::{ImageAttachment, LlmContextExt, MAX_IMAGES_PER_MESSAGE};
-use mizar_tools_coding::path_utils::resolve_read_path;
+use mizar_tools::coding::path_utils::resolve_read_path;
+use mizar_types::client::{
+    ClientEvent, FILE_MENTIONS_SOURCE, NoticeLevel, PLUGIN_FILE_MENTIONS, extract_mentions,
+};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

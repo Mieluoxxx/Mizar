@@ -16,9 +16,9 @@ pub mod timeline_rail;
 pub mod trajectory_scene;
 pub mod ui;
 
-pub use mizar_client_core::{HostExtensionFlags, PromptQueue, mentions, reveal, tps};
+pub use mizar_types::client::{HostExtensionFlags, PromptQueue, mentions, reveal, tps};
 
-pub type UiEvent = mizar_client_core::ClientEvent;
+pub type UiEvent = mizar_types::client::ClientEvent;
 
 pub use app::{
     AppAction, AppState, ApprovalMode, BashInputMode, ChatItem, LaunchpadQuickAction,

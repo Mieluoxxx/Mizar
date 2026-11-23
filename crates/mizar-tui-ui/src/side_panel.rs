@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-pub use mizar_client_core::{
+pub use mizar_types::client::{
     ContextBreakdownSnapshot, FileTouchRow, InstructionSummaryRow, McpSummaryRow, SidePanelData,
     ToolSummaryRow,
 };

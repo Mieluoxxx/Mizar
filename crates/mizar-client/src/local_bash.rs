@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mizar_client_core::{ClientEvent, LocalBashOutput};
 use mizar_session::{Session, SessionEvent};
-use mizar_tools_coding::bash::execute_bash_process;
+use mizar_tools::coding::bash::execute_bash_process;
+use mizar_types::client::{ClientEvent, LocalBashOutput};
 use tokio_util::sync::CancellationToken;
 
 static LOCAL_BASH_SEQ: AtomicU64 = AtomicU64::new(1);

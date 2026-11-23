@@ -1,6 +1,6 @@
 //! TUI 插件化特性开关：由宿主的 `HostExtensionFlags` 派生，控制各前端交互与渲染通道的挂载。
 
-use mizar_client_core::HostExtensionFlags;
+use mizar_types::client::HostExtensionFlags;
 
 /// 控制 `mizar-tui-ui` 可选前端扩展的运行时开关集合。
 ///
@@ -53,7 +53,7 @@ impl From<HostExtensionFlags> for TuiFeatures {
 
 #[cfg(test)]
 mod tests {
-    use mizar_client_core::{
+    use mizar_types::client::{
         PLUGIN_LOCAL_BASH, PLUGIN_TUI, PLUGIN_TUI_CLIPBOARD, PLUGIN_TUI_SIDE_PANEL,
     };
 

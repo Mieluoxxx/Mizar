@@ -6,6 +6,8 @@
 
 pub mod model;
 pub mod persistence;
+pub mod recall;
+pub mod sqlite;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,20 +15,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
-use mizar_llm::{ContentBlock, Message, ReasoningEffort};
+use mizar_types::llm::{ContentBlock, Message, ReasoningEffort};
 use uuid::Uuid;
 
 pub use model::{
-    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
-    RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin,
-    SessionSelection, SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
+    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, RecallSearchHit,
+    RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry, SessionEvent,
+    SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin, SessionSelection,
+    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
     derive_session_title,
 };
 pub use persistence::{
     PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionPersistence,
     SessionPersistenceContextExt, SessionPersistenceHandle,
 };
+pub use recall::{RECALL_TOOL_NAME, RecallConfig, RecallPlugin};
+pub use sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
 
 pub const EVENT_SESSION_EVENT: &str = "session/event";
 pub const EVENT_SESSION_CREATED: &str = "session/created";
@@ -125,18 +129,6 @@ fn collect_visible_indices(log: &[SessionEntry]) -> Vec<usize> {
     indices
 }
 
-fn collect_pruned_map(log: &[SessionEntry]) -> HashMap<u64, String> {
-    let mut map = HashMap::new();
-    for entry in log {
-        if let SessionEvent::ToolResultPrune { pruned } = &entry.event {
-            for item in pruned {
-                map.insert(item.target_seq, item.replacement.clone());
-            }
-        }
-    }
-    map
-}
-
 /// 将压缩检查点统一格式化为发给模型的软硬分离上下文块。
 pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> String {
     let mut out = String::new();
@@ -202,7 +194,6 @@ fn find_dangling_tool_calls(entries: &[SessionEntry]) -> Vec<(String, String)> {
             }
             SessionEvent::ContextNotice { .. }
             | SessionEvent::BashExecution { .. }
-            | SessionEvent::ToolResultPrune { .. }
             | SessionEvent::Selection { .. }
             | SessionEvent::Usage { .. }
             | SessionEvent::Trace { .. } => {}
@@ -727,22 +718,6 @@ impl Session {
         inner.log.last().map_or(first_kept_seq, |e| e.seq)
     }
 
-    /// 追加一批锁存的投影层工具输出剪枝记录（不修改原始 `ToolResult` 事件）。
-    pub fn append_prune(self: &Arc<Self>, pruned: Vec<PrunedToolResult>) -> Option<u64> {
-        if pruned.is_empty() {
-            return None;
-        }
-        self.append(SessionEvent::ToolResultPrune { pruned });
-        let inner = self.inner.lock().unwrap();
-        inner.log.last().map(|e| e.seq)
-    }
-
-    /// 返回当前已锁存的所有工具结果剪枝映射（`target_seq -> replacement`）。
-    pub fn pruned_map(&self) -> HashMap<u64, String> {
-        let inner = self.inner.lock().unwrap();
-        collect_pruned_map(&inner.log)
-    }
-
     /// 返回最新一条事件序号（空会话返回 `0`）。
     pub fn last_seq(&self) -> u64 {
         self.inner.lock().unwrap().log.last().map_or(0, |e| e.seq)
@@ -815,11 +790,10 @@ impl Session {
         f(&inner.log)
     }
 
-    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口与 `ToolResultPrune` 剪枝投影并跳过 `LogOnly` 事件）。
+    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口并跳过 `LogOnly` 事件）。
     pub fn derive_messages(&self) -> Vec<Message> {
         let inner = self.inner.lock().unwrap();
         let indices = collect_visible_indices(&inner.log);
-        let pruned_map = collect_pruned_map(&inner.log);
         let mut messages = Vec::with_capacity(indices.len());
         for idx in indices {
             let entry = &inner.log[idx];
@@ -844,12 +818,8 @@ impl Session {
                     is_error,
                     ..
                 } => {
-                    let effective_content = pruned_map
-                        .get(&entry.seq)
-                        .cloned()
-                        .unwrap_or_else(|| content.clone());
                     messages.push(Message::Tool {
-                        content: effective_content,
+                        content: content.clone(),
                         tool_call_id: tool_call_id.clone(),
                         is_error: *is_error,
                     });
@@ -888,8 +858,7 @@ impl Session {
                         messages.push(Message::user(content));
                     }
                 }
-                SessionEvent::ToolResultPrune { .. }
-                | SessionEvent::Selection { .. }
+                SessionEvent::Selection { .. }
                 | SessionEvent::Usage { .. }
                 | SessionEvent::Trace { .. } => {}
             }

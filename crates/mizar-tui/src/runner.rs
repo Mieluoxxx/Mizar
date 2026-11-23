@@ -8,16 +8,15 @@ use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, LogLevel, LogSink, Plugin,
 };
 use crossterm::event::EventStream;
-use mizar_agent_loop::AgentLoopContextExt;
-use mizar_agent_spine::{SpinePluginsContextExt, SubagentContextExt};
 use mizar_client::approval::{ApprovalSnapshot, register_approval_hook_with};
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client::workspace::collect_user_skill_names;
-use mizar_client_core::{HostExtensionFlags, PLUGIN_TUI_EMPHASIS};
+use mizar_core::agent_loop::AgentLoopContextExt;
+use mizar_core::skills::EVENT_SKILLS_CHANGE;
+use mizar_core::spine::{SpinePluginsContextExt, SubagentContextExt};
+use mizar_core::system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_llm::{LlmContextExt, ReasoningEffort};
 use mizar_session::{Session, SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
-use mizar_skills::EVENT_SKILLS_CHANGE;
-use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_tools::EVENT_TOOLS_CHANGE;
 use mizar_tui_ui::TuiFeatures;
 use mizar_tui_ui::app::{
@@ -31,6 +30,7 @@ use mizar_tui_ui::theme::ThemePreset;
 use mizar_tui_ui::ui::{
     build_item_lines_for_scrollback_at, build_welcome_lines_for_scrollback, render,
 };
+use mizar_types::client::{HostExtensionFlags, PLUGIN_TUI_EMPHASIS};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -1193,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn settings_module_entries_toggle_persists_disabled_plugins_and_refreshes_runtime_state()
     {
-        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, CompactionContextExt};
+        use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, CompactionContextExt};
         use mizar_session::SessionContextExt;
         use mizar_tui_ui::overlay::{OverlayKind, SettingItemKind};
 
@@ -1214,7 +1214,7 @@ mod tests {
 
         let ctx = cordis::Context::new();
         let mut cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["compaction"]);
-        if let mizar_agent_spine::AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
+        if let mizar_core::spine::AgentToolsMode::Coding { ref mut mcp, .. } = cfg.tools_mode {
             mcp.global_config_dir = Some(tmp.join(".mizar"));
         }
         ctx.plugin(AgentSpinePlugin, cfg).await.unwrap();
@@ -1301,7 +1301,10 @@ mod tests {
             true,
         )
         .await;
-        assert!(ctx.get::<mizar_skills::SkillRegistry>("skills").is_none());
+        assert!(
+            ctx.get::<mizar_core::skills::SkillRegistry>("skills")
+                .is_none()
+        );
         let persisted_3: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(
@@ -1719,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn tui_emphasis_plugin_respects_enable_and_dispose() {
         use cordis::Service;
-        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
+        use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
         use mizar_tui_ui::emphasis::EmphasisConfig;
 
         let ctx = cordis::Context::new();
@@ -1784,7 +1787,7 @@ mod tests {
     #[tokio::test]
     async fn run_tui_with_summary_refuses_to_start_when_tui_plugin_disabled() {
         use cordis::Service;
-        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
+        use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig, SystemPromptContextExt};
 
         let raw_before = crossterm::terminal::is_raw_mode_enabled().ok();
         let ctx = cordis::Context::new();
@@ -1793,7 +1796,7 @@ mod tests {
             .unwrap();
 
         let mut cfg = super::TuiConfig::new(std::env::temp_dir());
-        cfg.disabled_plugins = vec![mizar_client_core::PLUGIN_TUI.to_string()];
+        cfg.disabled_plugins = vec![mizar_types::client::PLUGIN_TUI.to_string()];
 
         let err = super::run_tui_with_summary(ctx.clone(), cfg)
             .await
@@ -1819,12 +1822,12 @@ mod tests {
     #[tokio::test]
     async fn runtime_feature_gates_block_disabled_clipboard_local_bash_and_side_panel() {
         use cordis::Service;
-        use mizar_client_core::{
-            HostExtensionFlags, PLUGIN_LOCAL_BASH, PLUGIN_TUI_CLIPBOARD, PLUGIN_TUI_SIDE_PANEL,
-        };
         use mizar_session::{SessionContextExt, SessionStore};
         use mizar_tools::ToolRuntime;
         use mizar_tui_ui::TuiFeatures;
+        use mizar_types::client::{
+            HostExtensionFlags, PLUGIN_LOCAL_BASH, PLUGIN_TUI_CLIPBOARD, PLUGIN_TUI_SIDE_PANEL,
+        };
 
         let ctx = cordis::Context::new();
         ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
@@ -1893,15 +1896,15 @@ mod tests {
 
         use cordis::{Context, PluginDef, Service};
         use futures::channel::mpsc as futures_mpsc;
-        use mizar_agent_loop::{
+        use mizar_core::agent_loop::{
             AgentLoop, AgentLoopConfig, AgentLoopContextExt, DeliveryMode, TurnInput,
         };
+        use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
         use mizar_llm::{
             BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
             LlmRuntime, Message, ModelInfo, ProviderInfo, ReasoningEffort, StreamChunk, ToolCall,
         };
         use mizar_session::{SessionContextExt, SessionStore};
-        use mizar_system_prompt::{SystemPrompt, SystemPromptConfig};
         use mizar_tools::{ToolDefinition, ToolOutput, ToolRuntime, ToolsContextExt};
         use tokio::sync::{Notify, mpsc};
 

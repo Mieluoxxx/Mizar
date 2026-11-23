@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cordis::Logger;
-use mizar_llm::sse::SseParser;
+use mizar_types::llm::sse::SseParser;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -355,7 +355,7 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     fn new(url: &str, config: &McpServerConfig) -> Result<Self, McpError> {
-        let client = mizar_llm_http::default_http_client();
+        let client = mizar_llm::http::default_http_client();
         let mut headers = HashMap::new();
         for (k, v) in &config.headers {
             headers.insert(k.clone(), expand_env_vars(v));
@@ -475,7 +475,7 @@ impl HttpTransport {
             if content_type.contains("text/event-stream") {
                 let mut dec = SseParser::new();
                 let mut matched: Option<Result<Value, McpError>> = None;
-                let mut consume_events = |events: Vec<mizar_llm::sse::SseEvent>| -> bool {
+                let mut consume_events = |events: Vec<mizar_types::llm::sse::SseEvent>| -> bool {
                     for ev in events {
                         let data = ev.data.trim();
                         if data.is_empty() || data == "[DONE]" {

@@ -1,0 +1,18 @@
+[package]
+name = "mizar-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mizar 纯核心契约、轨迹建模与跨端纯客户端算法层（零 tokio / cordis / reqwest / rquickjs / rusqlite / ratatui / crossterm）"
+
+[lints]
+workspace = true
+
+[dependencies]
+dirs = { workspace = true }
+futures = { workspace = true }
+ignore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+unicode-width = { workspace = true }
