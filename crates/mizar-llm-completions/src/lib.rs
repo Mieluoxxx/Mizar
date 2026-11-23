@@ -123,6 +123,17 @@ impl CompletionsConfig {
     }
 }
 
+fn sanitize_tool_arguments(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "{}";
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(_)) => raw,
+        _ => "{}",
+    }
+}
+
 /// 统一消息格式 → OpenAI Chat Completions 格式（带跨协议回放降级）。
 pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
     match message {
@@ -170,7 +181,7 @@ pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": arguments,
+                            "arguments": sanitize_tool_arguments(arguments),
                         }
                     })),
                     _ => None,
@@ -1106,5 +1117,51 @@ mod tests {
 
         assert_eq!(log[2].0, None);
         assert_eq!(log[2].3.as_deref(), Some("sess-or-3"));
+    }
+
+    #[test]
+    fn to_wire_sanitizes_malformed_tool_call_arguments() {
+        let msg = Message::assistant_parts(
+            "",
+            vec![
+                ToolCall {
+                    id: "call_valid".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                },
+                ToolCall {
+                    id: "call_empty".into(),
+                    name: "read".into(),
+                    arguments: "   ".into(),
+                },
+                ToolCall {
+                    id: "call_truncated".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/lib"#.into(),
+                },
+                ToolCall {
+                    id: "call_array".into(),
+                    name: "read".into(),
+                    arguments: "[1,2]".into(),
+                },
+                ToolCall {
+                    id: "call_null".into(),
+                    name: "read".into(),
+                    arguments: "null".into(),
+                },
+            ],
+        );
+
+        let wire = to_wire(&msg, "openai", "gpt-4o");
+        let calls = wire["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            r#"{"path":"src/lib.rs"}"#
+        );
+        assert_eq!(calls[1]["function"]["arguments"], "{}");
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(calls[3]["function"]["arguments"], "{}");
+        assert_eq!(calls[4]["function"]["arguments"], "{}");
     }
 }

@@ -12,13 +12,15 @@ use mizar_llm_types::ContentBlock;
 use mizar_session::{
     PersistenceResult, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionEvent,
 };
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 const MAX_INDEX_CHARS: usize = 16_384;
 const MAX_DOC_TOKENS: usize = 4_096;
 const MAX_QUERY_TOKENS: usize = 24;
 const MAX_PREVIEW_CHARS: usize = 4_000;
 const SNIPPET_MAX_CHARS: usize = 240;
+pub const MAX_RECALL_SEARCH_HITS: usize = 20;
+pub const MAX_RECALL_SEARCH_TOTAL_BYTES: usize = 16 * 1024;
 
 /// 从 `SessionEntry` 提取参与情景回溯索引的纯文本（跳过 `thinking`、`Trace` 与合成通知噪音）。
 pub fn extract_indexable_text(event: &SessionEvent) -> Option<String> {
@@ -363,7 +365,7 @@ pub fn search_recall_from_conn(
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let limit = query.limit.clamp(1, 50);
+    let limit = query.limit.clamp(1, MAX_RECALL_SEARCH_HITS);
     let groups = encode_query_groups(trimmed);
     if groups.is_empty() {
         return Ok(Vec::new());
@@ -383,7 +385,161 @@ pub fn search_recall_from_conn(
         hits = run_fts_query(conn, &or_expr, query, trimmed, limit)?;
     }
 
-    Ok(hits)
+    Ok(enforce_recall_byte_cap(hits, MAX_RECALL_SEARCH_TOTAL_BYTES))
+}
+
+#[derive(Clone)]
+struct RecallScopeTarget {
+    source_session_id: String,
+    max_seq: Option<u64>,
+    attributed_session_id: String,
+    attributed_title: Option<String>,
+}
+
+fn resolve_session_scopes(
+    conn: &Connection,
+    session_ids: &[String],
+) -> PersistenceResult<Vec<RecallScopeTarget>> {
+    let requested: HashSet<&str> = session_ids.iter().map(String::as_str).collect();
+    let mut scopes = Vec::with_capacity(session_ids.len());
+    let mut stmt = conn
+        .prepare_cached("SELECT title, parent_id, fork_seq FROM sessions WHERE id = ?1")
+        .map_err(crate::schema::map_sqlite_err)?;
+
+    for sid in session_ids {
+        scopes.push(RecallScopeTarget {
+            source_session_id: sid.clone(),
+            max_seq: None,
+            attributed_session_id: sid.clone(),
+            attributed_title: None,
+        });
+
+        let mut cur = sid.clone();
+        let mut bound: Option<u64> = None;
+        let mut root_title: Option<String> = None;
+        let mut visited = HashSet::from([sid.clone()]);
+
+        for depth in 0..64 {
+            let row: Option<(Option<String>, Option<String>, Option<i64>)> = stmt
+                .query_row([&cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()
+                .map_err(crate::schema::map_sqlite_err)?;
+            let Some((title, parent_id, fork_seq)) = row else {
+                break;
+            };
+            if depth == 0 {
+                root_title = title;
+            }
+            let (Some(pid), Some(fseq_raw)) = (parent_id, fork_seq) else {
+                break;
+            };
+            let Ok(fseq) = u64::try_from(fseq_raw) else {
+                break;
+            };
+            if visited.contains(&pid) || requested.contains(pid.as_str()) {
+                break;
+            }
+            let next_bound = bound.map_or(fseq, |b| b.min(fseq));
+            scopes.push(RecallScopeTarget {
+                source_session_id: pid.clone(),
+                max_seq: Some(next_bound),
+                attributed_session_id: sid.clone(),
+                attributed_title: root_title.clone(),
+            });
+            visited.insert(pid.clone());
+            cur = pid;
+            bound = Some(next_bound);
+        }
+    }
+
+    Ok(scopes)
+}
+
+fn resolve_cwd_inherited_scopes(
+    conn: &Connection,
+    cwd: &str,
+) -> PersistenceResult<Vec<RecallScopeTarget>> {
+    let mut child_stmt = conn
+        .prepare_cached(
+            "SELECT id, title, parent_id, fork_seq
+             FROM sessions
+             WHERE cwd = ?1 AND parent_id IS NOT NULL AND fork_seq IS NOT NULL",
+        )
+        .map_err(crate::schema::map_sqlite_err)?;
+    let children: Vec<(String, Option<String>, String, i64)> = child_stmt
+        .query_map([cwd], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .map_err(crate::schema::map_sqlite_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(crate::schema::map_sqlite_err)?;
+
+    let mut parent_stmt = conn
+        .prepare_cached("SELECT cwd, parent_id, fork_seq FROM sessions WHERE id = ?1")
+        .map_err(crate::schema::map_sqlite_err)?;
+    let mut scopes = Vec::new();
+
+    for (child_id, child_title, first_pid, first_fseq_raw) in children {
+        let Ok(mut bound) = u64::try_from(first_fseq_raw) else {
+            continue;
+        };
+        let mut cur = first_pid;
+        let mut visited = HashSet::from([child_id.clone()]);
+
+        for _ in 0..64 {
+            if !visited.insert(cur.clone()) {
+                break;
+            }
+            let row: Option<(Option<String>, Option<String>, Option<i64>)> = parent_stmt
+                .query_row([&cur], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()
+                .map_err(crate::schema::map_sqlite_err)?;
+            let Some((anc_cwd, next_pid, next_fseq)) = row else {
+                break;
+            };
+            if anc_cwd.as_deref() != Some(cwd) {
+                scopes.push(RecallScopeTarget {
+                    source_session_id: cur.clone(),
+                    max_seq: Some(bound),
+                    attributed_session_id: child_id.clone(),
+                    attributed_title: child_title.clone(),
+                });
+            }
+            let (Some(pid), Some(fseq_raw)) = (next_pid, next_fseq) else {
+                break;
+            };
+            let Ok(fseq) = u64::try_from(fseq_raw) else {
+                break;
+            };
+            bound = bound.min(fseq);
+            cur = pid;
+        }
+    }
+
+    Ok(scopes)
+}
+
+fn append_scope_filters(
+    scopes: &[RecallScopeTarget],
+    bind_values: &mut Vec<rusqlite::types::Value>,
+) -> Vec<String> {
+    let mut parts = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let sid_idx = bind_values.len() + 1;
+        bind_values.push(rusqlite::types::Value::Text(
+            scope.source_session_id.clone(),
+        ));
+        if let Some(max_seq) = scope.max_seq {
+            let seq_idx = bind_values.len() + 1;
+            bind_values.push(rusqlite::types::Value::Integer(
+                i64::try_from(max_seq).unwrap_or(i64::MAX),
+            ));
+            parts.push(format!(
+                "(d.session_id = ?{sid_idx} AND d.seq <= ?{seq_idx})"
+            ));
+        } else {
+            parts.push(format!("d.session_id = ?{sid_idx}"));
+        }
+    }
+    parts
 }
 
 fn run_fts_query(
@@ -394,7 +550,7 @@ fn run_fts_query(
     limit: usize,
 ) -> PersistenceResult<Vec<RecallSearchHit>> {
     let mut sql = String::from(
-        "SELECT d.session_id, s.title, d.seq, d.ts_ms, d.kind, d.preview
+        "SELECT d.session_id, s.title, d.seq, d.ts_ms, d.kind, d.preview, s.cwd
          FROM session_recall_fts f
          JOIN session_recall_docs d ON d.doc_id = f.rowid
          JOIN sessions s ON s.id = d.session_id
@@ -403,24 +559,35 @@ fn run_fts_query(
     let mut bind_values: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::Text(match_expr.to_string())];
 
-    if !query.session_ids.is_empty() {
-        let placeholders: Vec<String> = query
-            .session_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", bind_values.len() + i + 1))
-            .collect();
-        sql.push_str(&format!(
-            " AND d.session_id IN ({})",
-            placeholders.join(", ")
-        ));
-        for sid in &query.session_ids {
-            bind_values.push(rusqlite::types::Value::Text(sid.clone()));
-        }
+    let session_scopes = if !query.session_ids.is_empty() {
+        resolve_session_scopes(conn, &query.session_ids)?
+    } else {
+        Vec::new()
+    };
+    let cwd_inherited_scopes = if query.session_ids.is_empty()
+        && let Some(ref cwd) = query.cwd
+    {
+        resolve_cwd_inherited_scopes(conn, cwd)?
+    } else {
+        Vec::new()
+    };
+
+    if !session_scopes.is_empty() {
+        let filters = append_scope_filters(&session_scopes, &mut bind_values);
+        sql.push_str(&format!(" AND ({})", filters.join(" OR ")));
     } else if let Some(ref cwd) = query.cwd {
-        let idx = bind_values.len() + 1;
-        sql.push_str(&format!(" AND s.cwd = ?{idx}"));
+        let cwd_idx = bind_values.len() + 1;
         bind_values.push(rusqlite::types::Value::Text(cwd.clone()));
+        if cwd_inherited_scopes.is_empty() {
+            sql.push_str(&format!(" AND s.cwd = ?{cwd_idx}"));
+        } else {
+            let mut filters = vec![format!("s.cwd = ?{cwd_idx}")];
+            filters.extend(append_scope_filters(
+                &cwd_inherited_scopes,
+                &mut bind_values,
+            ));
+            sql.push_str(&format!(" AND ({})", filters.join(" OR ")));
+        }
     }
 
     let limit_idx = bind_values.len() + 1;
@@ -440,7 +607,16 @@ fn run_fts_query(
             let ts_ms: i64 = row.get(3)?;
             let kind: String = row.get(4)?;
             let preview: String = row.get(5)?;
-            Ok((session_id, session_title, seq, ts_ms, kind, preview))
+            let row_cwd: Option<String> = row.get(6)?;
+            Ok((
+                session_id,
+                session_title,
+                seq,
+                ts_ms,
+                kind,
+                preview,
+                row_cwd,
+            ))
         })
         .map_err(crate::schema::map_sqlite_err)?;
 
@@ -460,8 +636,10 @@ fn run_fts_query(
 
     let mut exact_hits = Vec::new();
     let mut fallback_hits = Vec::new();
+    let mut seen_hits: HashSet<(String, u64)> = HashSet::new();
+
     for row in rows {
-        let (session_id, session_title, seq, ts_ms, kind, preview) =
+        let (session_id, session_title, seq, ts_ms, kind, preview, row_cwd) =
             row.map_err(crate::schema::map_sqlite_err)?;
         let preview_lower = preview.to_lowercase();
         let mut all_match = terms_lower
@@ -490,25 +668,115 @@ fn run_fts_query(
             }
         }
 
+        if !all_match && !any_match {
+            continue;
+        }
+
+        let seq_u64 = u64::try_from(seq.max(0)).unwrap_or(0);
         let snippet_text = snippet_source.as_deref().unwrap_or(preview.as_str());
-        let hit = RecallSearchHit {
-            session_id,
-            session_title,
-            seq: u64::try_from(seq.max(0)).unwrap_or(0),
-            ts: crate::schema::i64_to_millis(ts_ms),
-            kind,
-            snippet: build_snippet(snippet_text, &terms_lower, SNIPPET_MAX_CHARS),
+        let snippet = build_snippet(snippet_text, &terms_lower, SNIPPET_MAX_CHARS);
+        let ts = crate::schema::i64_to_millis(ts_ms);
+
+        let mut push_hit = |out_sid: String, out_title: Option<String>| {
+            if !seen_hits.insert((out_sid.clone(), seq_u64)) {
+                return;
+            }
+            let hit = RecallSearchHit {
+                session_id: out_sid,
+                session_title: out_title,
+                seq: seq_u64,
+                ts,
+                kind: kind.clone(),
+                snippet: snippet.clone(),
+            };
+            if all_match {
+                exact_hits.push(hit);
+            } else {
+                fallback_hits.push(hit);
+            }
         };
-        if all_match {
-            exact_hits.push(hit);
-        } else if any_match {
-            fallback_hits.push(hit);
+
+        if !session_scopes.is_empty() {
+            for scope in &session_scopes {
+                if scope.source_session_id == session_id
+                    && scope.max_seq.is_none_or(|m| seq_u64 <= m)
+                {
+                    let out_title = if scope.max_seq.is_some() {
+                        scope.attributed_title.clone()
+                    } else {
+                        session_title.clone()
+                    };
+                    push_hit(scope.attributed_session_id.clone(), out_title);
+                }
+            }
+        } else {
+            let direct_cwd_match = query
+                .cwd
+                .as_deref()
+                .is_none_or(|expected| row_cwd.as_deref() == Some(expected));
+            if direct_cwd_match {
+                push_hit(session_id.clone(), session_title.clone());
+            }
+            for scope in &cwd_inherited_scopes {
+                if scope.source_session_id == session_id
+                    && scope.max_seq.is_none_or(|m| seq_u64 <= m)
+                {
+                    push_hit(
+                        scope.attributed_session_id.clone(),
+                        scope.attributed_title.clone(),
+                    );
+                }
+            }
         }
     }
 
     exact_hits.extend(fallback_hits);
     exact_hits.truncate(limit);
     Ok(exact_hits)
+}
+
+fn hit_byte_len(hit: &RecallSearchHit) -> usize {
+    hit.session_id.len()
+        + hit.session_title.as_deref().map_or(0, str::len)
+        + hit.kind.len()
+        + hit.snippet.len()
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn enforce_recall_byte_cap(
+    hits: Vec<RecallSearchHit>,
+    max_total_bytes: usize,
+) -> Vec<RecallSearchHit> {
+    let mut bounded = Vec::with_capacity(hits.len());
+    let mut total_bytes = 0usize;
+    for mut hit in hits {
+        let len = hit_byte_len(&hit);
+        if total_bytes + len <= max_total_bytes {
+            total_bytes += len;
+            bounded.push(hit);
+            continue;
+        }
+        if bounded.is_empty() {
+            let fixed = hit.session_id.len()
+                + hit.session_title.as_deref().map_or(0, str::len)
+                + hit.kind.len();
+            let avail = max_total_bytes.saturating_sub(fixed);
+            hit.snippet = truncate_utf8_bytes(&hit.snippet, avail).to_string();
+            bounded.push(hit);
+        }
+        break;
+    }
+    bounded
 }
 
 fn build_snippet(text: &str, terms_lower: &[String], max_chars: usize) -> String {

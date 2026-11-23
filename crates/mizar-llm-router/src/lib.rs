@@ -396,6 +396,11 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 supports_developer_role: compat_cfg.supports_developer_role.unwrap_or(true),
                 use_top_level_instructions: compat_cfg.use_top_level_instructions.unwrap_or(false),
                 supports_strict_mode: compat_cfg.supports_strict_mode.unwrap_or(false),
+                supports_mid_convo_effort: compat_cfg.supports_mid_convo_effort.unwrap_or(false),
+                supports_additional_tools: compat_cfg.supports_additional_tools.unwrap_or(false),
+                supports_tool_search_output: compat_cfg
+                    .supports_tool_search_output
+                    .unwrap_or(false),
                 send_session_affinity_headers: compat_cfg.send_session_affinity_headers,
                 session_affinity_mode: compat_cfg.parsed_session_affinity_mode(),
                 supports_long_cache_retention: compat_cfg

@@ -69,6 +69,9 @@ pub struct CompatConfig {
     pub supports_reasoning_effort: Option<bool>,
     pub supports_strict_mode: Option<bool>,
     pub use_top_level_instructions: Option<bool>,
+    pub supports_mid_convo_effort: Option<bool>,
+    pub supports_additional_tools: Option<bool>,
+    pub supports_tool_search_output: Option<bool>,
 }
 
 impl From<CompletionsCompat> for CompatConfig {
@@ -143,6 +146,15 @@ impl CompatConfig {
             use_top_level_instructions: overlay
                 .use_top_level_instructions
                 .or(self.use_top_level_instructions),
+            supports_mid_convo_effort: overlay
+                .supports_mid_convo_effort
+                .or(self.supports_mid_convo_effort),
+            supports_additional_tools: overlay
+                .supports_additional_tools
+                .or(self.supports_additional_tools),
+            supports_tool_search_output: overlay
+                .supports_tool_search_output
+                .or(self.supports_tool_search_output),
         }
     }
 
@@ -924,5 +936,30 @@ mod tests {
             back.compat.and_then(|c| c.force_adaptive_thinking),
             Some(true)
         );
+    }
+
+    #[test]
+    fn compat_config_roundtrips_and_merges_responses_cache_flags() {
+        let base: CompatConfig = serde_json::from_str(
+            r#"{
+                "supportsMidConvoEffort": true,
+                "supportsAdditionalTools": true,
+                "supportsToolSearchOutput": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(base.supports_mid_convo_effort, Some(true));
+        assert_eq!(base.supports_additional_tools, Some(true));
+        assert_eq!(base.supports_tool_search_output, Some(false));
+
+        let overlay = CompatConfig {
+            supports_additional_tools: Some(false),
+            supports_tool_search_output: Some(true),
+            ..Default::default()
+        };
+        let merged = base.merge_overlay(&overlay);
+        assert_eq!(merged.supports_mid_convo_effort, Some(true));
+        assert_eq!(merged.supports_additional_tools, Some(false));
+        assert_eq!(merged.supports_tool_search_output, Some(true));
     }
 }

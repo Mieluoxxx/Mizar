@@ -5,25 +5,28 @@ use std::sync::mpsc;
 use mizar_session::{
     LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
     SESSION_FORMAT_VERSION, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
-    SessionListQuery, SessionOrigin, TitlePatch, TitleSource, TitleSourcePatch,
+    SessionListQuery, SessionOrigin, SessionSelection, TitlePatch, TitleSource, TitleSourcePatch,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::oneshot;
 
-use crate::recall::{index_entry_in_tx, index_session_events_in_tx, search_recall_from_conn};
+use crate::recall::{index_entry_in_tx, search_recall_from_conn};
 use crate::schema::{
-    list_sessions_from_conn, load_session_from_conn, map_sqlite_err, millis_to_i64, visibility_str,
+    is_sqlite_busy, latest_selection_from_conn, list_sessions_from_conn, load_header_from_conn,
+    load_session_from_conn, map_sqlite_err, millis_to_i64, visibility_str,
 };
 
 const MAX_BATCH_COMMANDS: usize = 128;
 
-pub enum BarrierReply {
-    Sync(mpsc::SyncSender<PersistenceResult<()>>),
-    Async(oneshot::Sender<PersistenceResult<()>>),
+pub enum ReadReply<T> {
+    Sync(mpsc::SyncSender<PersistenceResult<T>>),
+    Async(oneshot::Sender<PersistenceResult<T>>),
 }
 
-impl BarrierReply {
-    fn send(self, res: PersistenceResult<()>) {
+pub type BarrierReply = ReadReply<()>;
+
+impl<T> ReadReply<T> {
+    fn send(self, res: PersistenceResult<T>) {
         match self {
             Self::Sync(tx) => {
                 let _ = tx.send(res);
@@ -53,15 +56,23 @@ pub enum WriteCmd {
     },
     LoadSession {
         session_id: String,
-        reply: mpsc::SyncSender<PersistenceResult<Option<LoadedSession>>>,
+        reply: ReadReply<Option<LoadedSession>>,
+    },
+    LoadHeader {
+        session_id: String,
+        reply: ReadReply<Option<SessionHeader>>,
+    },
+    LatestSelection {
+        session_id: String,
+        reply: ReadReply<Option<SessionSelection>>,
     },
     ListSessions {
         query: SessionListQuery,
-        reply: mpsc::SyncSender<PersistenceResult<Vec<SessionHeader>>>,
+        reply: ReadReply<Vec<SessionHeader>>,
     },
     SearchRecall {
         query: RecallSearchQuery,
-        reply: mpsc::SyncSender<PersistenceResult<Vec<RecallSearchHit>>>,
+        reply: ReadReply<Vec<RecallSearchHit>>,
     },
     Flush(BarrierReply),
     Shutdown(mpsc::SyncSender<PersistenceResult<()>>),
@@ -72,10 +83,36 @@ fn stops_batch_collection(cmd: &WriteCmd) -> bool {
         cmd,
         WriteCmd::ForkSession { .. }
             | WriteCmd::LoadSession { .. }
+            | WriteCmd::LoadHeader { .. }
+            | WriteCmd::LatestSelection { .. }
             | WriteCmd::ListSessions { .. }
             | WriteCmd::SearchRecall { .. }
             | WriteCmd::Shutdown(_)
     )
+}
+
+enum BatchWriteError {
+    /// 跨进程锁竞争等瞬时 SQLite 冲突：当前批次失败，但不得污染写线程的 `sticky_error`。
+    Transient(PersistenceError),
+    Fatal(PersistenceError),
+}
+
+impl From<serde_json::Error> for BatchWriteError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Fatal(PersistenceError::Serialization(err))
+    }
+}
+
+fn map_batch_sqlite_err(err: rusqlite::Error) -> BatchWriteError {
+    if is_sqlite_busy(&err) {
+        BatchWriteError::Transient(map_sqlite_err(err))
+    } else {
+        BatchWriteError::Fatal(map_sqlite_err(err))
+    }
+}
+
+fn map_batch_persistence_err(err: PersistenceError) -> BatchWriteError {
+    BatchWriteError::Fatal(err)
 }
 
 fn clone_err_res(res: &PersistenceResult<()>) -> PersistenceResult<()> {
@@ -126,13 +163,16 @@ pub fn run_writer_loop(
         } else if writes.is_empty() {
             Ok(())
         } else {
-            let res = apply_write_batch(&mut conn, &writes);
-            if let Err(ref err) = res {
-                let msg = err.to_string();
-                sticky_error = Some(msg.clone());
-                *last_error.lock().unwrap() = Some(msg);
+            match apply_write_batch(&mut conn, &writes) {
+                Ok(()) => Ok(()),
+                Err(BatchWriteError::Transient(err)) => Err(err),
+                Err(BatchWriteError::Fatal(err)) => {
+                    let msg = err.to_string();
+                    sticky_error = Some(msg.clone());
+                    *last_error.lock().unwrap() = Some(msg);
+                    Err(err)
+                }
             }
-            res
         };
 
         for reply in flushes {
@@ -158,21 +198,35 @@ pub fn run_writer_loop(
                         Ok(()) => load_session_from_conn(&conn, &session_id),
                         Err(err) => Err(err),
                     };
-                    let _ = reply.send(res);
+                    reply.send(res);
+                }
+                WriteCmd::LoadHeader { session_id, reply } => {
+                    let res = match write_res {
+                        Ok(()) => load_header_from_conn(&conn, &session_id),
+                        Err(err) => Err(err),
+                    };
+                    reply.send(res);
+                }
+                WriteCmd::LatestSelection { session_id, reply } => {
+                    let res = match write_res {
+                        Ok(()) => latest_selection_from_conn(&conn, &session_id),
+                        Err(err) => Err(err),
+                    };
+                    reply.send(res);
                 }
                 WriteCmd::ListSessions { query, reply } => {
                     let res = match write_res {
                         Ok(()) => list_sessions_from_conn(&conn, &query),
                         Err(err) => Err(err),
                     };
-                    let _ = reply.send(res);
+                    reply.send(res);
                 }
                 WriteCmd::SearchRecall { query, reply } => {
                     let res = match write_res {
                         Ok(()) => search_recall_from_conn(&conn, &query),
                         Err(err) => Err(err),
                     };
-                    let _ = reply.send(res);
+                    reply.send(res);
                 }
                 WriteCmd::Shutdown(reply) => {
                     let _ = reply.send(write_res);
@@ -187,14 +241,14 @@ pub fn run_writer_loop(
     }
 }
 
-fn apply_write_batch(conn: &mut Connection, writes: &[WriteCmd]) -> PersistenceResult<()> {
+fn apply_write_batch(conn: &mut Connection, writes: &[WriteCmd]) -> Result<(), BatchWriteError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(map_sqlite_err)?;
+        .map_err(map_batch_sqlite_err)?;
 
     for cmd in writes {
         match cmd {
-            WriteCmd::CreateSession(header) => insert_session_header(&tx, header)?,
+            WriteCmd::CreateSession(header) => insert_session_header_in_batch(&tx, header)?,
             WriteCmd::AppendEvents {
                 session_id,
                 entries,
@@ -206,8 +260,26 @@ fn apply_write_batch(conn: &mut Connection, writes: &[WriteCmd]) -> PersistenceR
         }
     }
 
-    tx.commit().map_err(map_sqlite_err)?;
+    tx.commit().map_err(map_batch_sqlite_err)?;
     Ok(())
+}
+
+fn insert_session_header_in_batch(
+    tx: &Transaction<'_>,
+    h: &SessionHeader,
+) -> Result<(), BatchWriteError> {
+    insert_session_header(tx, h).map_err(|err| match err {
+        PersistenceError::Backend(msg) if is_busy_msg(&msg) => {
+            BatchWriteError::Transient(PersistenceError::Backend(msg))
+        }
+        other => BatchWriteError::Fatal(other),
+    })
+}
+
+fn is_busy_msg(msg: &str) -> bool {
+    msg.contains("database is locked")
+        || msg.contains("database table is locked")
+        || msg.contains("database schema is locked")
 }
 
 fn insert_session_header(tx: &Transaction<'_>, h: &SessionHeader) -> PersistenceResult<()> {
@@ -258,7 +330,7 @@ fn append_entries_in_tx(
     tx: &Transaction<'_>,
     session_id: &str,
     entries: &[SessionEntry],
-) -> PersistenceResult<()> {
+) -> Result<(), BatchWriteError> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -271,14 +343,14 @@ fn append_entries_in_tx(
                      id, format_version, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?3)",
             )
-            .map_err(map_sqlite_err)?;
+            .map_err(map_batch_sqlite_err)?;
         ensure
             .execute(params![
                 session_id,
                 i64::from(SESSION_FORMAT_VERSION),
                 first_ts
             ])
-            .map_err(map_sqlite_err)?;
+            .map_err(map_batch_sqlite_err)?;
     }
 
     let mut added_total = 0i64;
@@ -293,7 +365,7 @@ fn append_entries_in_tx(
                      session_id, seq, ts_ms, visibility, kind, payload_json
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
-            .map_err(map_sqlite_err)?;
+            .map_err(map_batch_sqlite_err)?;
 
         for entry in entries {
             let ts_i64 = millis_to_i64(entry.ts);
@@ -307,7 +379,7 @@ fn append_entries_in_tx(
                     entry.event.kind_name(),
                     payload_json,
                 ])
-                .map_err(map_sqlite_err)?;
+                .map_err(map_batch_sqlite_err)?;
             if changed > 0 {
                 added_total += 1;
                 if entry.is_surface() {
@@ -319,7 +391,7 @@ fn append_entries_in_tx(
                         max_compacted.map_or(*first_kept_seq, |prev| prev.max(*first_kept_seq)),
                     );
                 }
-                index_entry_in_tx(tx, session_id, entry)?;
+                index_entry_in_tx(tx, session_id, entry).map_err(map_batch_persistence_err)?;
             }
         }
     }
@@ -337,7 +409,7 @@ fn append_entries_in_tx(
                      END
                  WHERE id = ?1",
             )
-            .map_err(map_sqlite_err)?;
+            .map_err(map_batch_sqlite_err)?;
         upd.execute(params![
             session_id,
             max_ts,
@@ -345,7 +417,7 @@ fn append_entries_in_tx(
             added_surface,
             max_compacted.map(|v| v as i64),
         ])
-        .map_err(map_sqlite_err)?;
+        .map_err(map_batch_sqlite_err)?;
     }
 
     Ok(())
@@ -355,7 +427,7 @@ fn update_header_in_tx(
     tx: &Transaction<'_>,
     session_id: &str,
     patch: &SessionHeaderPatch,
-) -> PersistenceResult<()> {
+) -> Result<(), BatchWriteError> {
     let (apply_title, title_val): (i64, Option<&str>) = match &patch.title {
         TitlePatch::Keep => (0, None),
         TitlePatch::Set(v) => (1, Some(v.as_str())),
@@ -387,7 +459,7 @@ fn update_header_in_tx(
                  END
              WHERE id = ?1",
         )
-        .map_err(map_sqlite_err)?;
+        .map_err(map_batch_sqlite_err)?;
     stmt.execute(params![
         session_id,
         apply_title,
@@ -397,7 +469,7 @@ fn update_header_in_tx(
         patch.updated_at_ms.map(millis_to_i64),
         patch.compacted_up_to_seq.map(|v| v as i64),
     ])
-    .map_err(map_sqlite_err)?;
+    .map_err(map_batch_sqlite_err)?;
     Ok(())
 }
 
@@ -422,6 +494,12 @@ fn exec_fork(
     }
 
     let mut fresh_header = new_header.clone();
+    if fresh_header.parent_id.is_none() {
+        fresh_header.parent_id = Some(from_id.to_string());
+    }
+    if fresh_header.fork_seq.is_none() {
+        fresh_header.fork_seq = Some(up_to_seq);
+    }
     fresh_header.event_count = 0;
     fresh_header.surface_count = 0;
     fresh_header.compacted_up_to_seq = None;
@@ -473,8 +551,7 @@ fn exec_fork(
     )
     .map_err(map_sqlite_err)?;
 
-    index_session_events_in_tx(&tx, &new_header.id)?;
-
+    // 不在写锁内重算父会话全量 FTS5：父会话 seq <= up_to_seq 已有现成索引，检索时按 (parent_id, fork_seq) 继承回溯。
     let loaded = load_session_from_conn(&tx, &new_header.id)?
         .ok_or_else(|| PersistenceError::NotFound(new_header.id.clone()))?;
     tx.commit().map_err(map_sqlite_err)?;
