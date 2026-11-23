@@ -281,3 +281,195 @@ async fn incremental_anomaly_eval_emits_new_findings_without_duplicating_old_one
     assert_eq!(report.snapshot.stats, offline.snapshot.stats);
     assert_eq!(report.findings, offline.findings);
 }
+
+#[tokio::test]
+async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic_write() {
+    use mizar_llm::{ContentBlock, TokenUsage};
+    use mizar_session::{Session, SessionEvent, SessionTraceEvent};
+    use mizar_trajectory::{
+        DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TRAJECTORY_EXPORT_SCHEMA_VERSION, TraceExportMeta,
+        TrajectoryExport, build_trajectory_export, write_trace_export_atomic,
+    };
+    use std::sync::Arc;
+
+    let app = Context::new();
+    app.plugin(TrajectoryRuntime::plugin(), TrajectoryConfig::default())
+        .await
+        .unwrap();
+
+    let sess = Arc::new(Session::new(app.clone(), "sess-export-unit"));
+    sess.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
+    sess.append(SessionEvent::user("inspect project"));
+    sess.append_trace(SessionTraceEvent::StepStart {
+        turn: 1,
+        step: 1,
+        system_prompt_chars: 1200,
+        tools_count: 4,
+    });
+    sess.append_trace(SessionTraceEvent::FirstToken { turn: 1, step: 1 });
+
+    let long_args = json!({
+        "path": "src/main.rs",
+        "note": "x".repeat(800),
+    })
+    .to_string();
+    let step1_usage = TokenUsage {
+        input_tokens: 100,
+        output_tokens: 25,
+        total_tokens: Some(165),
+        cache_read_tokens: Some(40),
+        cache_write_tokens: Some(10),
+        reasoning_tokens: Some(5),
+    };
+    sess.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::ToolCall {
+            id: "call_1".to_string(),
+            name: "read".to_string(),
+            arguments: long_args.clone(),
+        }],
+        usage: Some(step1_usage),
+        replay: None,
+    });
+    sess.append_trace(SessionTraceEvent::ToolCall {
+        turn: 1,
+        step: 1,
+        call_id: "call_1".to_string(),
+        name: "read".to_string(),
+        arguments: long_args.clone(),
+    });
+    let big_result = format!("头部内容-{}", "测试字符".repeat(220));
+    let expected_chars = big_result.chars().count();
+    assert!(expected_chars > DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS);
+    sess.append(SessionEvent::ToolResult {
+        tool_call_id: "call_1".to_string(),
+        name: "read".to_string(),
+        content: big_result,
+        is_error: false,
+    });
+    sess.append_trace(SessionTraceEvent::StepEnd {
+        turn: 1,
+        step: 1,
+        outcome: "tool_calls".to_string(),
+        usage: Some(step1_usage),
+    });
+
+    sess.append_trace(SessionTraceEvent::CompactionStart {
+        trigger: "auto".to_string(),
+    });
+    sess.append(SessionEvent::Compaction {
+        summary: "已压缩早期文件读取输出".to_string(),
+        first_kept_seq: 4,
+        tokens_before: Some(9000),
+        tokens_after: Some(2500),
+        digest: Default::default(),
+    });
+    sess.append_trace(SessionTraceEvent::CompactionEnd {
+        status: "compacted".to_string(),
+        first_kept_seq: Some(4),
+        tokens_before: Some(9000),
+        tokens_after: Some(2500),
+    });
+
+    sess.append_trace(SessionTraceEvent::StepStart {
+        turn: 1,
+        step: 2,
+        system_prompt_chars: 900,
+        tools_count: 4,
+    });
+    sess.append_trace(SessionTraceEvent::FirstToken { turn: 1, step: 2 });
+    let step2_usage = TokenUsage {
+        input_tokens: 50,
+        output_tokens: 15,
+        total_tokens: Some(145),
+        cache_read_tokens: Some(80),
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+    };
+    sess.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "done".to_string(),
+        }],
+        usage: Some(step2_usage),
+        replay: None,
+    });
+    sess.append_trace(SessionTraceEvent::StepEnd {
+        turn: 1,
+        step: 2,
+        outcome: "completed".to_string(),
+        usage: Some(step2_usage),
+    });
+    sess.append_trace(SessionTraceEvent::TurnEnd {
+        turn: 1,
+        reason: "completed".to_string(),
+    });
+
+    let rt = app.service::<TrajectoryRuntime>("trajectory").unwrap();
+    let events = mizar_trajectory::trace_events_from_session(&sess);
+    let report = rt.inspect_events(&sess.id, &events, TimelineMode::Sequence);
+    let export = sess.with_all_entries(|entries| {
+        build_trajectory_export(
+            report,
+            Some(entries),
+            TraceExportMeta {
+                exit_code: 0,
+                termination_reason: "completed".to_string(),
+                error: None,
+                duration_ms: 42,
+                provider: Some("openai".to_string()),
+                model: Some("gpt-test".to_string()),
+                isolated: true,
+                output_format: Some("text".to_string()),
+            },
+            DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS,
+        )
+    });
+
+    assert_eq!(export.schema_version, TRAJECTORY_EXPORT_SCHEMA_VERSION);
+    assert_eq!(export.session_id, "sess-export-unit");
+    assert_eq!(export.exit_code, 0);
+    assert_eq!(export.termination_reason, "completed");
+    assert!(export.ttft_ms.is_some());
+    assert_eq!(export.turns.len(), 1);
+    assert_eq!(export.turns[0].steps.len(), 2);
+    assert_eq!(export.turns[0].usage.input_tokens, 150);
+    assert_eq!(export.turns[0].usage.output_tokens, 40);
+    assert_eq!(export.turns[0].usage.cache_read_tokens, 120);
+    assert_eq!(export.turns[0].usage.cache_write_tokens, 10);
+    assert_eq!(export.turns[0].usage.reasoning_tokens, 5);
+    assert_eq!(export.usage, export.turns[0].usage);
+    assert_eq!(export.tool_calls.len(), 1);
+    assert_eq!(export.tool_calls[0].arguments, long_args);
+    assert_eq!(export.tool_results.len(), 1);
+    assert!(export.tool_results[0].truncated);
+    assert_eq!(export.tool_results[0].original_chars, expected_chars);
+    assert!(
+        export.tool_results[0]
+            .content_summary
+            .contains("[truncated")
+    );
+    assert_eq!(export.compactions.len(), 3);
+    assert_eq!(export.compactions[0].kind, "start");
+    assert_eq!(export.compactions[1].kind, "checkpoint");
+    assert_eq!(export.compactions[1].first_kept_seq, Some(4));
+    assert_eq!(export.compactions[2].kind, "end");
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("mizar_traj_export_{}_{uniq}", std::process::id()));
+    let target = dir.join("nested/sub/trajectory.json");
+    write_trace_export_atomic(&target, &export).unwrap();
+    let raw = std::fs::read_to_string(&target).unwrap();
+    let decoded: TrajectoryExport = serde_json::from_str(&raw).unwrap();
+    assert_eq!(decoded, export);
+
+    // 不得残留临时文件，且目标路径为目录时应明确返回错误
+    let entries: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert!(write_trace_export_atomic(&dir, &export).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

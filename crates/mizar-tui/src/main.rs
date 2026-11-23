@@ -15,6 +15,8 @@
 //! - `--reasoning-effort <level>`：推理强度（`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`）
 //! - `--max-steps <n>`：限制单轮最大工具循环步数
 //! - `--timeout <secs>`：限制无头单次任务总超时秒数
+//! - `--output-format <fmt>` / `--json`：无头输出格式（`text` / `json`）
+//! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
 //! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
 //! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
@@ -41,6 +43,7 @@
 //! - `BASE_URL`、`MODEL`、`WORKSPACE`、`MIZAR_HOME`
 //! - `MIZAR_SKIP_VERSION_CHECK` / `MIZAR_OFFLINE`：跳过启动时版本检查（`MIZAR_OFFLINE` 同时禁用更新下载）
 //! - `MIZAR_RELEASE_BASE_URL`：覆盖 GitHub Release 基址（默认为 `https://github.com/Mieluoxxx/Mizar`）
+//! - `MIZAR_TRACE_OUT`：无头模式结构化轨迹 JSON 导出路径（低于 `--trace-out` 优先级）
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -55,7 +58,9 @@ use mizar_llm_mock::MockPlugin;
 use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_tools_coding::CodingToolsPreset;
-use mizar_tui::exec::{ExecConfig, ExecOutputFormat, resolve_exec_prompt, run_exec_cli};
+use mizar_tui::exec::{
+    ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
+};
 use mizar_tui::update::{current_version, run_update_cli, should_check_for_updates_at_startup};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -94,6 +99,7 @@ struct CliArgs {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     output_format: Option<ExecOutputFormat>,
+    trace_out: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -112,6 +118,7 @@ impl CliArgs {
             || self.max_tokens.is_some()
             || self.timeout_secs.is_some()
             || self.output_format.is_some()
+            || self.trace_out.is_some()
     }
 }
 
@@ -145,6 +152,7 @@ Options:
       --timeout <secs>          Total execution timeout in seconds (>= 1)
       --output-format <fmt>     Headless output format (text, json)
       --json                    Shorthand for --output-format json
+      --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
       --isolated                Skip personal global config, MCP, skills, instructions, and DB
       --minimal                 Enable minimal coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
@@ -428,6 +436,13 @@ where
                 }
                 out.output_format = Some(ExecOutputFormat::Json);
             }
+            "--trace-out" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--trace-out 路径不能为空".to_string());
+                }
+                out.trace_out = Some(PathBuf::from(val));
+            }
             "--timeout" => {
                 let val = take_value(flag, inline, &mut args)?;
                 let parsed = val
@@ -556,6 +571,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             exclude_tools: cli.exclude_tools,
             resume_session: cli.resume_session,
             output_format: cli.output_format.unwrap_or_default(),
+            trace_out: resolve_trace_out_path(cli.trace_out, env_non_empty("MIZAR_TRACE_OUT")),
         })
         .await;
         if code != 0 {
@@ -566,7 +582,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.has_exec_only_flags() {
         eprintln!(
-            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --max-tokens, --timeout, --output-format, --json) require `exec`, `-p/--prompt`, or `--prompt-file`"
+            "error: headless options (--isolated, --provider, --model, --protocol, --base-url, --reasoning-effort, --max-steps, --max-tokens, --timeout, --output-format, --json, --trace-out) require `exec`, `-p/--prompt`, or `--prompt-file`"
         );
         std::process::exit(1);
     }
@@ -812,5 +828,42 @@ mod tests {
                 .unwrap()
                 .has_exec_only_flags()
         );
+    }
+
+    #[test]
+    fn parse_exec_trace_out_flag_and_validation() {
+        let parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--trace-out".to_string(),
+            "artifacts/trace.json".to_string(),
+            "run".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.trace_out.as_deref(),
+            Some(std::path::Path::new("artifacts/trace.json"))
+        );
+        assert!(parsed.has_exec_only_flags());
+
+        let inline_parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--trace-out=/tmp/t.json".to_string(),
+            "run".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            inline_parsed.trace_out.as_deref(),
+            Some(std::path::Path::new("/tmp/t.json"))
+        );
+
+        assert!(parse_cli_args_from(["exec".into(), "--trace-out".into(), "   ".into()]).is_err());
+        assert!(parse_cli_args_from(["exec".into(), "--trace-out".into()]).is_err());
+        assert!(
+            parse_cli_args_from(["--trace-out".into(), "a.json".into()])
+                .unwrap()
+                .has_exec_only_flags()
+        );
+        assert!(format_help_text().contains("--trace-out <path>"));
+        assert!(format_help_text().contains("MIZAR_TRACE_OUT"));
     }
 }
