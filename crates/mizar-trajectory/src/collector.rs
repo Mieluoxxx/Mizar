@@ -29,6 +29,7 @@ use mizar_trajectory_core::{
     detect_anomalies, fold_trajectory, preview_chars,
 };
 
+use crate::export::{TraceExportMeta, TrajectoryExport, build_trajectory_export};
 use crate::guard::{EVENT_GUARD_REPEAT, GuardRepeatEvent};
 
 pub const EVENT_TRAJECTORY_EVENT: &str = "trajectory/event";
@@ -747,6 +748,28 @@ impl TrajectoryRuntime {
             }
         }
         Some(out)
+    }
+
+    /// 构造某会话的完整结构化导出对象 `TrajectoryExport`（优先从权威 `Session` 提取原始记录）。
+    pub fn build_trace_export(
+        &self,
+        session_id: &str,
+        mode: TimelineMode,
+        meta: TraceExportMeta,
+        max_result_chars: usize,
+    ) -> TrajectoryExport {
+        if let Some(session) = self.resolve_session(session_id) {
+            let Some(report) = self.inspect(session_id, mode) else {
+                return TrajectoryExport::empty(session_id, meta);
+            };
+            return session.with_all_entries(|entries| {
+                build_trajectory_export(report, Some(entries), meta, max_result_chars)
+            });
+        }
+        if let Some(report) = self.inspect(session_id, mode) {
+            return build_trajectory_export(report, None, meta, max_result_chars);
+        }
+        TrajectoryExport::empty(session_id, meta)
     }
 
     /// 解析 JSONL 文本为 `Vec<TraceEvent>`，供离线检验使用。
