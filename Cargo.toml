@@ -21,6 +21,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 libc = "0.2"
 loom = "0.7"
 ratatui = "0.30"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
 rquickjs = { version = "0.14", features = ["futures", "parallel"] }
 rusqlite = "0.43"

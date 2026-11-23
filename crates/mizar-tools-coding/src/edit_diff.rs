@@ -1,12 +1,22 @@
-//! `edit` 工具的精确/模糊匹配、BOM 与换行保留、多 hunk 冲突检查与 unified diff 生成。
+//! `edit` 工具的精确/模糊多 hunk 匹配、BOM 与换行保留、原子重叠检查、紧凑 diff 与近邻预览。
 
+use std::collections::HashSet;
+
+use mizar_tools::truncate::{truncate_head, truncate_line};
 use similar::{ChangeTag, TextDiff};
 use unicode_normalization::UnicodeNormalization;
+
+pub const EDIT_DIFF_MAX_LINES: usize = 80;
+pub const EDIT_DIFF_MAX_BYTES: usize = 4 * 1024;
+const PREVIEW_MAX_LINES: usize = 15;
+const PREVIEW_MAX_LINE_CHARS: usize = 200;
+const DIFF_MAX_LINE_CHARS: usize = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditOp {
     pub old_text: String,
     pub new_text: String,
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +31,7 @@ pub struct AppliedEditsResult {
     pub base_content: String,
     pub new_content: String,
     pub used_fuzzy_match: bool,
+    pub replacements_applied: usize,
 }
 
 pub fn strip_bom(content: &str) -> (&'static str, &str) {
@@ -197,36 +208,132 @@ fn widen_replacements_to_lines(
         .collect())
 }
 
-struct MatchAttempt {
-    index: usize,
-    match_length: usize,
-    used_fuzzy_match: bool,
+fn extract_tokens(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            for lc in ch.to_lowercase() {
+                current.push(lc);
+            }
+        } else if !current.is_empty() {
+            tokens.insert(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.insert(current);
+    }
+    tokens
 }
 
-fn find_text_in(content: &str, old_text: &str) -> Option<MatchAttempt> {
-    if let Some(idx) = content.find(old_text) {
-        return Some(MatchAttempt {
-            index: idx,
-            match_length: old_text.len(),
-            used_fuzzy_match: false,
-        });
-    }
-    let fuzzy_content = normalize_for_fuzzy_match(content);
-    let fuzzy_old = normalize_for_fuzzy_match(old_text);
-    fuzzy_content.find(&fuzzy_old).map(|idx| MatchAttempt {
-        index: idx,
-        match_length: fuzzy_old.len(),
-        used_fuzzy_match: true,
-    })
+fn line_number_at(content: &str, byte_idx: usize) -> usize {
+    let clamped = byte_idx.min(content.len());
+    content[..clamped].bytes().filter(|&b| b == b'\n').count() + 1
 }
 
-fn count_fuzzy_occurrences(content: &str, old_text: &str) -> usize {
-    let fuzzy_content = normalize_for_fuzzy_match(content);
-    let fuzzy_old = normalize_for_fuzzy_match(old_text);
-    if fuzzy_old.is_empty() {
-        return 0;
+/// 匹配失败时定位最相近的行区段预览（`<line>\t<text>` 格式），辅助模型快速修正 `oldText`。
+pub fn find_closest_snippet(normalized_content: &str, old_text: &str) -> Option<String> {
+    let content_lines: Vec<&str> = normalized_content.split('\n').collect();
+    if content_lines.is_empty() || (content_lines.len() == 1 && content_lines[0].is_empty()) {
+        return None;
     }
-    fuzzy_content.matches(&fuzzy_old).count()
+
+    let format_range = |start: usize, end: usize| -> String {
+        let clamped_end = end.min(content_lines.len());
+        let clamped_start = start.min(clamped_end);
+        let body = (clamped_start..clamped_end)
+            .map(|idx| {
+                let (short, _) = truncate_line(content_lines[idx], PREVIEW_MAX_LINE_CHARS);
+                format!("{}\t{}", idx + 1, short)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Closest matching region (lines {}-{}):\n{body}",
+            clamped_start + 1,
+            clamped_end
+        )
+    };
+
+    if content_lines.len() <= PREVIEW_MAX_LINES {
+        return Some(format_range(0, content_lines.len()));
+    }
+
+    let old_tokens = extract_tokens(old_text);
+    let old_trimmed_lines: Vec<String> = old_text
+        .split('\n')
+        .map(|l| normalize_for_fuzzy_match(l.trim()))
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if old_tokens.is_empty() && old_trimmed_lines.is_empty() {
+        return None;
+    }
+
+    let window = old_text.split('\n').count().clamp(1, 8);
+    let max_start = content_lines.len().saturating_sub(window);
+    let mut best_score = 0.0f64;
+    let mut best_start = 0usize;
+
+    let norm_content_lines: Vec<String> = content_lines
+        .iter()
+        .map(|l| normalize_for_fuzzy_match(l.trim()))
+        .collect();
+
+    for start in 0..=max_start {
+        let end = (start + window).min(content_lines.len());
+        let slice_text = content_lines[start..end].join("\n");
+        let win_tokens = extract_tokens(&slice_text);
+
+        let token_score = if old_tokens.is_empty() {
+            0.0
+        } else {
+            let hits = old_tokens
+                .iter()
+                .filter(|t| win_tokens.contains(*t))
+                .count();
+            hits as f64 / old_tokens.len() as f64
+        };
+
+        let line_score = if old_trimmed_lines.is_empty() {
+            0.0
+        } else {
+            let line_hits = old_trimmed_lines
+                .iter()
+                .filter(|ol| {
+                    norm_content_lines[start..end].iter().any(|cl| {
+                        !cl.is_empty()
+                            && (cl == *ol || cl.contains(ol.as_str()) || ol.contains(cl.as_str()))
+                    })
+                })
+                .count();
+            line_hits as f64 / old_trimmed_lines.len() as f64
+        };
+
+        let score = 0.65 * token_score + 0.35 * line_score;
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+
+    if best_score < 0.15 {
+        return None;
+    }
+
+    let ctx_start = best_start.saturating_sub(2);
+    let ctx_end = (best_start + window + 2)
+        .min(content_lines.len())
+        .min(ctx_start + PREVIEW_MAX_LINES);
+    Some(format_range(ctx_start, ctx_end))
+}
+
+fn edit_label(edit_index: usize, total: usize) -> String {
+    if total == 1 {
+        "the text".to_string()
+    } else {
+        format!("edits[{edit_index}]")
+    }
 }
 
 pub fn apply_edits_to_normalized_content(
@@ -243,6 +350,7 @@ pub fn apply_edits_to_normalized_content(
         .map(|e| EditOp {
             old_text: normalize_to_lf(&e.old_text),
             new_text: normalize_to_lf(&e.new_text),
+            replace_all: e.replace_all,
         })
         .collect();
 
@@ -257,13 +365,16 @@ pub fn apply_edits_to_normalized_content(
         }
     }
 
+    // 若任意段无法精确命中但可经模糊归一化命中，则整体切换至模糊归一化视图，保持多段定位坐标一致。
     let mut need_fuzzy = false;
     for edit in &normalized_edits {
-        if let Some(attempt) = find_text_in(normalized_content, &edit.old_text)
-            && attempt.used_fuzzy_match
-        {
-            need_fuzzy = true;
-            break;
+        if !normalized_content.contains(&edit.old_text) {
+            let fuzzy_content = normalize_for_fuzzy_match(normalized_content);
+            let fuzzy_old = normalize_for_fuzzy_match(&edit.old_text);
+            if !fuzzy_old.is_empty() && fuzzy_content.contains(&fuzzy_old) {
+                need_fuzzy = true;
+                break;
+            }
         }
     }
 
@@ -285,40 +396,62 @@ pub fn apply_edits_to_normalized_content(
 
     let mut matched: Vec<Matched> = Vec::with_capacity(total);
     for (i, edit) in normalized_edits.iter().enumerate() {
-        let Some(attempt) = find_text_in(search_space, &edit.old_text) else {
-            return Err(if total == 1 {
-                format!(
-                    "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
-                )
-            } else {
-                format!(
-                    "Could not find edits[{i}] in {path}. The oldText must match exactly including all whitespace and newlines."
-                )
-            });
+        let needle = if need_fuzzy {
+            normalize_for_fuzzy_match(&edit.old_text)
+        } else {
+            edit.old_text.clone()
         };
-
-        let occurrences = count_fuzzy_occurrences(search_space, &edit.old_text);
-        if occurrences > 1 {
+        if needle.is_empty() {
             return Err(if total == 1 {
-                format!(
-                    "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
-                )
+                format!("oldText must not be empty in {path}.")
             } else {
-                format!(
-                    "Found {occurrences} occurrences of edits[{i}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
-                )
+                format!("edits[{i}].oldText must not be empty in {path}.")
             });
         }
 
-        matched.push(Matched {
-            edit_index: i,
-            match_index: attempt.index,
-            match_length: attempt.match_length,
-            new_text: edit.new_text.clone(),
-        });
+        let hits: Vec<usize> = search_space
+            .match_indices(&needle)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if hits.is_empty() {
+            let label = edit_label(i, total);
+            let mut msg = format!(
+                "Could not find {label} in {path}. The oldText must match exactly including whitespace and newlines."
+            );
+            if let Some(preview) = find_closest_snippet(normalized_content, &edit.old_text) {
+                msg.push_str("\n\n");
+                msg.push_str(&preview);
+            }
+            return Err(msg);
+        }
+
+        if hits.len() > 1 && !edit.replace_all {
+            let line_nums: Vec<String> = hits
+                .iter()
+                .take(10)
+                .map(|&idx| line_number_at(search_space, idx).to_string())
+                .collect();
+            let suffix = if hits.len() > 10 { ", ..." } else { "" };
+            let label = edit_label(i, total);
+            return Err(format!(
+                "Found {} occurrences of {label} in {path} (at lines {}{suffix}). Provide more surrounding context to make it unique, or set replaceAll=true.",
+                hits.len(),
+                line_nums.join(", ")
+            ));
+        }
+
+        for idx in hits {
+            matched.push(Matched {
+                edit_index: i,
+                match_index: idx,
+                match_length: needle.len(),
+                new_text: edit.new_text.clone(),
+            });
+        }
     }
 
-    matched.sort_by_key(|m| m.match_index);
+    matched.sort_by_key(|m| (m.match_index, m.match_length));
     for pair in matched.windows(2) {
         let prev = &pair[0];
         let curr = &pair[1];
@@ -330,6 +463,7 @@ pub fn apply_edits_to_normalized_content(
         }
     }
 
+    let replacements_applied = matched.len();
     let raw_replacements: Vec<TextReplacement> = matched
         .into_iter()
         .map(|m| TextReplacement {
@@ -358,6 +492,7 @@ pub fn apply_edits_to_normalized_content(
         base_content: normalized_content.to_string(),
         new_content,
         used_fuzzy_match: need_fuzzy,
+        replacements_applied,
     })
 }
 
@@ -392,6 +527,41 @@ pub fn generate_diff(
     (unified, first_changed_line)
 }
 
+/// 生成给模型看的紧凑限长 diff 片段（单行封顶 + 总行数/字节封顶），避免大改动回显撑爆上下文。
+pub fn format_compact_diff(
+    unified_diff: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> (String, bool) {
+    if unified_diff.trim().is_empty() {
+        return (String::new(), false);
+    }
+    let mut any_line_capped = false;
+    let capped_lines: Vec<String> = unified_diff
+        .lines()
+        .map(|line| {
+            let (short, hit) = truncate_line(line, DIFF_MAX_LINE_CHARS);
+            if hit {
+                any_line_capped = true;
+            }
+            short
+        })
+        .collect();
+    let total_lines = capped_lines.len();
+    let joined = capped_lines.join("\n");
+    let trunc = truncate_head(&joined, max_lines, max_bytes);
+    if trunc.truncated {
+        let mut out = trunc.content;
+        out.push_str(&format!(
+            "\n... [diff truncated, showing {} of {total_lines} lines]",
+            trunc.output_lines
+        ));
+        (out, true)
+    } else {
+        (trunc.content, any_line_capped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,10 +581,12 @@ mod tests {
                 EditOp {
                     old_text: "    let s = \"hello\";".into(),
                     new_text: "    let s = \"hi\";".into(),
+                    replace_all: false,
                 },
                 EditOp {
                     old_text: "    println!(\"world\");".into(),
                     new_text: "    println!(\"rust\");".into(),
+                    replace_all: false,
                 },
             ],
             "demo.rs",
@@ -422,6 +594,7 @@ mod tests {
         .unwrap();
 
         assert!(applied.used_fuzzy_match);
+        assert_eq!(applied.replacements_applied, 2);
         let final_out = format!(
             "{bom}{}",
             restore_line_endings(&applied.new_content, ending)
@@ -432,7 +605,7 @@ mod tests {
 
         let (diff, first_line) =
             generate_diff("demo.rs", &applied.base_content, &applied.new_content, 2);
-        assert!(diff.contains("-\t") || diff.contains("-    let s"));
+        assert!(diff.contains("-    let s"));
         assert_eq!(first_line, Some(2));
     }
 
@@ -444,11 +617,14 @@ mod tests {
             &[EditOp {
                 old_text: "dup".into(),
                 new_text: "x".into(),
+                replace_all: false,
             }],
             "f.txt",
         )
         .unwrap_err();
         assert!(dup_err.contains("2 occurrences"));
+        assert!(dup_err.contains("lines 1, 2"));
+        assert!(dup_err.contains("replaceAll=true"));
 
         let overlap = apply_edits_to_normalized_content(
             "abcdef",
@@ -456,15 +632,90 @@ mod tests {
                 EditOp {
                     old_text: "abcd".into(),
                     new_text: "1".into(),
+                    replace_all: false,
                 },
                 EditOp {
                     old_text: "cdef".into(),
                     new_text: "2".into(),
+                    replace_all: false,
                 },
             ],
             "f.txt",
         )
         .unwrap_err();
         assert!(overlap.contains("overlap"));
+    }
+
+    #[test]
+    fn supports_replace_all_and_atomic_original_matching() {
+        let content = "let foo = bar;\nlet baz = foo + foo;\n";
+        let applied = apply_edits_to_normalized_content(
+            content,
+            &[
+                EditOp {
+                    old_text: "foo".into(),
+                    new_text: "qux".into(),
+                    replace_all: true,
+                },
+                EditOp {
+                    old_text: "bar".into(),
+                    new_text: "42".into(),
+                    replace_all: false,
+                },
+            ],
+            "vars.rs",
+        )
+        .unwrap();
+        assert_eq!(applied.replacements_applied, 4);
+        assert_eq!(applied.new_content, "let qux = 42;\nlet baz = qux + qux;\n");
+    }
+
+    #[test]
+    fn not_found_error_includes_closest_matching_region_preview() {
+        let mut lines = Vec::new();
+        for i in 1..=30 {
+            if i == 18 {
+                lines.push("fn compute_total_price(tax: f64, base: f64) -> f64 {".to_string());
+            } else if i == 19 {
+                lines.push("    base * (1.0 + tax)".to_string());
+            } else if i == 20 {
+                lines.push("}".to_string());
+            } else {
+                lines.push(format!("// unrelated filler line {i}"));
+            }
+        }
+        let content = lines.join("\n");
+
+        let err = apply_edits_to_normalized_content(
+            &content,
+            &[EditOp {
+                old_text: "fn compute_total_price(tax: f64, amount: f64) -> f64 {\n    amount * (1.0 + tax)\n}"
+                    .into(),
+                new_text: "fn compute_total_price() -> f64 { 0.0 }".into(),
+                replace_all: false,
+            }],
+            "price.rs",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Closest matching region"), "err:\n{err}");
+        assert!(err.contains("18\tfn compute_total_price"), "err:\n{err}");
+    }
+
+    #[test]
+    fn format_compact_diff_caps_large_diffs() {
+        let old = (1..=150)
+            .map(|i| format!("old_line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (1..=150)
+            .map(|i| format!("new_line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (full_diff, _) = generate_diff("big.txt", &old, &new, 2);
+        let (compact, was_trunc) = format_compact_diff(&full_diff, 30, 1024);
+        assert!(was_trunc);
+        assert!(compact.contains("diff truncated, showing"));
+        assert!(compact.len() < full_diff.len());
     }
 }
