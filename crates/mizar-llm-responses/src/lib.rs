@@ -1,6 +1,6 @@
 //! OpenAI Responses 协议适配器（对应 `NamiDSH/packages/llm-responses`）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,8 +8,8 @@ use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, Message, ModelInfo, ProviderInfo, ReasoningEffort,
-    ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
+    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
     clamp_openai_prompt_cache_key, detect_session_affinity_mode, push_session_affinity_headers,
     resolve_cache_retention,
 };
@@ -20,6 +20,7 @@ use mizar_llm_http::{
 use serde_json::{Value, json};
 
 pub const PROTOCOL_RESPONSES: &str = "openai-responses";
+const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: u32 = 16;
 
 #[derive(Debug, Clone)]
 pub struct ResponsesConfig {
@@ -31,6 +32,9 @@ pub struct ResponsesConfig {
     pub model: Option<String>,
     pub headers: HashMap<String, String>,
     pub supports_max_output_tokens: bool,
+    pub supports_developer_role: bool,
+    pub use_top_level_instructions: bool,
+    pub supports_strict_mode: bool,
     pub send_session_affinity_headers: Option<bool>,
     pub session_affinity_mode: Option<SessionAffinityMode>,
     pub supports_long_cache_retention: bool,
@@ -50,6 +54,9 @@ impl Default for ResponsesConfig {
             model: None,
             headers: HashMap::new(),
             supports_max_output_tokens: true,
+            supports_developer_role: true,
+            use_top_level_instructions: false,
+            supports_strict_mode: false,
             send_session_affinity_headers: None,
             session_affinity_mode: None,
             supports_long_cache_retention: true,
@@ -65,7 +72,7 @@ pub fn to_wire(message: &Message) -> Vec<Value> {
     to_wire_inner(message, None)
 }
 
-/// 把 `Message` 翻译为 Responses API 的 `input` 条目；若同协议/路由/模型命中且含加密推理签名则一并回放。
+/// 把 `Message` 翻译为 Responses API 的 `input` 条目；若同协议/路由/模型命中且含原生保序输出序列则一并回放。
 pub fn to_wire_with_replay(message: &Message, provider: &str, model: &str) -> Vec<Value> {
     to_wire_inner(message, Some((provider, model)))
 }
@@ -82,67 +89,95 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
             "output": content,
         })],
         Message::Assistant { blocks, replay } => {
+            let block_call_ids: HashSet<&str> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolCall { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+
             let matched_replay = replay_target.and_then(|(provider, model)| {
                 replay
                     .as_ref()
                     .filter(|r| r.matches(PROTOCOL_RESPONSES, provider, model))
             });
-            let replay_reasoning_items: Vec<Value> = matched_replay
-                .and_then(|r| r.response.get("reasoningItems"))
+
+            if let Some(output_items) = matched_replay
+                .and_then(|r| r.response.get("outputItems"))
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|item| has_encrypted_reasoning(item))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let replayed_reasoning = !replay_reasoning_items.is_empty();
-            let call_item_ids = matched_replay
-                .and_then(|r| r.response.get("callItemIds"))
-                .and_then(Value::as_object);
+                && !output_items.is_empty()
+            {
+                let mut items = Vec::with_capacity(output_items.len());
+                for item in output_items {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") if has_encrypted_reasoning(item) => {
+                            items.push(item.clone());
+                        }
+                        Some("message") => {
+                            items.push(item.clone());
+                        }
+                        Some("function_call")
+                            if item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|cid| block_call_ids.contains(cid)) =>
+                        {
+                            items.push(item.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                if !items.is_empty() {
+                    return items;
+                }
+            }
 
-            let mut items = Vec::with_capacity(replay_reasoning_items.len() + blocks.len());
-            items.extend(replay_reasoning_items);
-            let mut text_buf = String::new();
-            let mut calls = Vec::new();
-
+            // 跨模型/跨路由或无原生保序回放数据时，仍严格按 blocks 原序输出，且剥离 reasoning 与 fc_* id 避免配对校验错误。
+            let mut items = Vec::with_capacity(blocks.len().max(1));
             for block in blocks {
                 match block {
-                    ContentBlock::Text { text } => text_buf.push_str(text),
+                    ContentBlock::Reasoning { .. } => {}
+                    ContentBlock::Text { text } => {
+                        if !text.is_empty() {
+                            items.push(json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": text,
+                                    "annotations": [],
+                                }],
+                            }));
+                        }
+                    }
                     ContentBlock::ToolCall {
                         id,
                         name,
                         arguments,
-                    } => calls.push((id, name, arguments)),
-                    ContentBlock::Reasoning { .. } => {}
+                    } => {
+                        items.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": arguments,
+                        }));
+                    }
                 }
             }
 
-            if !text_buf.is_empty() || (calls.is_empty() && !replayed_reasoning) {
+            if items.is_empty() {
                 items.push(json!({
                     "type": "message",
                     "role": "assistant",
-                    "content": text_buf,
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "",
+                        "annotations": [],
+                    }],
                 }));
-            }
-            for (id, name, arguments) in calls {
-                let mut call_obj = json!({
-                    "type": "function_call",
-                    "call_id": id,
-                    "name": name,
-                    "arguments": arguments,
-                });
-                if replayed_reasoning
-                    && let Some(fc_id) = call_item_ids
-                        .and_then(|map| map.get(id.as_str()))
-                        .and_then(Value::as_str)
-                        .filter(|s| s.starts_with("fc_"))
-                    && let Some(map) = call_obj.as_object_mut()
-                {
-                    map.insert("id".to_string(), Value::String(fc_id.to_string()));
-                }
-                items.push(call_obj);
             }
             items
         }
@@ -176,7 +211,7 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
         }
         Message::System { content } => vec![json!({
             "type": "message",
-            "role": "system",
+            "role": "developer",
             "content": content,
         })],
     }
@@ -188,6 +223,19 @@ fn has_encrypted_reasoning(item: &Value) -> bool {
             .get("encrypted_content")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty())
+}
+
+fn clamp_message_id(id: &str) -> String {
+    if id.len() <= 64 {
+        return id.to_string();
+    }
+    // OpenAI Responses 要求 message.id 不超过 64 字符，超长时转为确定性短哈希。
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("msg_{hash:016x}")
 }
 
 fn normalize_reasoning_item(item: &Value) -> Option<Value> {
@@ -222,29 +270,261 @@ fn normalize_reasoning_item(item: &Value) -> Option<Value> {
     Some(Value::Object(obj))
 }
 
-fn upsert_reasoning_item(list: &mut Vec<Value>, raw: &Value) {
-    let Some(normalized) = normalize_reasoning_item(raw) else {
-        return;
-    };
-    if let Some(item_id) = normalized.get("id").and_then(Value::as_str)
-        && let Some(existing) = list
-            .iter_mut()
-            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id))
-    {
-        *existing = normalized;
-        return;
+fn normalize_message_item(item: &Value, fallback_text: &str) -> Option<Value> {
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("assistant");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("completed");
+
+    let mut parts = Vec::new();
+    if let Some(content_arr) = item.get("content").and_then(Value::as_array) {
+        for part in content_arr {
+            match part.get("type").and_then(Value::as_str) {
+                Some("output_text") => {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                    let annotations = part
+                        .get("annotations")
+                        .filter(|v| v.is_array())
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    parts.push(json!({
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": annotations,
+                    }));
+                }
+                Some("refusal") => {
+                    let refusal = part.get("refusal").and_then(Value::as_str).unwrap_or("");
+                    parts.push(json!({
+                        "type": "refusal",
+                        "refusal": refusal,
+                    }));
+                }
+                _ => {}
+            }
+        }
     }
-    list.push(normalized);
+    if parts.is_empty() && !fallback_text.is_empty() {
+        parts.push(json!({
+            "type": "output_text",
+            "text": fallback_text,
+            "annotations": [],
+        }));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), json!("message"));
+    obj.insert("role".to_string(), json!(role));
+    obj.insert("status".to_string(), json!(status));
+    if let Some(id) = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        obj.insert("id".to_string(), json!(clamp_message_id(id)));
+    }
+    if let Some(phase) = item
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        obj.insert("phase".to_string(), json!(phase));
+    }
+    obj.insert("content".to_string(), Value::Array(parts));
+    Some(Value::Object(obj))
+}
+
+fn normalize_function_call_item(
+    item_id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), json!("function_call"));
+    if item_id.starts_with("fc_") {
+        obj.insert("id".to_string(), json!(item_id));
+    }
+    obj.insert("call_id".to_string(), json!(call_id));
+    obj.insert("name".to_string(), json!(name));
+    obj.insert("arguments".to_string(), json!(arguments));
+    Value::Object(obj)
+}
+
+const UNSUPPORTED_STRICT_SCHEMA_KEYS: &[&str] = &[
+    "$ref",
+    "$defs",
+    "definitions",
+    "allOf",
+    "oneOf",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+    "unevaluatedProperties",
+    "propertyNames",
+    "contains",
+    "prefixItems",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+
+fn is_structured_schema(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    let has_structured_type = match obj.get("type") {
+        Some(Value::String(t)) => t == "object" || t == "array",
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .any(|v| v.as_str().is_some_and(|t| t == "object" || t == "array")),
+        _ => false,
+    };
+    has_structured_type || obj.contains_key("properties") || obj.contains_key("items")
+}
+
+fn schema_allows_null(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    match obj.get("type") {
+        Some(Value::String(t)) if t == "null" => return true,
+        Some(Value::Array(arr)) if arr.iter().any(|v| v.as_str() == Some("null")) => return true,
+        _ => {}
+    }
+    if obj.get("const").is_some_and(Value::is_null) {
+        return true;
+    }
+    if obj
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(Value::is_null))
+    {
+        return true;
+    }
+    obj.get("anyOf")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(schema_allows_null))
+}
+
+fn make_json_schema_node_strict(schema: &mut Value) -> bool {
+    let Some(obj) = schema.as_object_mut() else {
+        return false;
+    };
+    for key in UNSUPPORTED_STRICT_SCHEMA_KEYS {
+        if obj.contains_key(*key) {
+            return false;
+        }
+    }
+    if !obj.contains_key("type") && !obj.contains_key("anyOf") && !obj.contains_key("enum") {
+        return false;
+    }
+    if let Some(any_of) = obj.get_mut("anyOf") {
+        let Some(variants) = any_of.as_array_mut() else {
+            return false;
+        };
+        if variants.is_empty() {
+            return false;
+        }
+        for variant in variants.iter_mut() {
+            if is_structured_schema(variant) || !make_json_schema_node_strict(variant) {
+                return false;
+            }
+        }
+    }
+    if let Some(items) = obj.get_mut("items")
+        && (items.is_array() || !make_json_schema_node_strict(items))
+    {
+        return false;
+    }
+
+    let is_object_schema = obj.get("type").and_then(Value::as_str) == Some("object");
+    if obj.contains_key("properties") && !is_object_schema {
+        return false;
+    }
+    if !is_object_schema {
+        return true;
+    }
+    if let Some(add_props) = obj.get("additionalProperties")
+        && *add_props != Value::Bool(false)
+    {
+        return false;
+    }
+
+    let required_set: HashSet<String> = match obj.get("required") {
+        None => HashSet::new(),
+        Some(Value::Array(arr)) => {
+            let mut set = HashSet::with_capacity(arr.len());
+            for v in arr {
+                let Some(name) = v.as_str() else {
+                    return false;
+                };
+                set.insert(name.to_string());
+            }
+            set
+        }
+        Some(_) => return false,
+    };
+
+    if !obj.contains_key("properties") {
+        obj.insert("properties".to_string(), json!({}));
+    }
+    let Some(props_obj) = obj.get_mut("properties").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    for req_key in &required_set {
+        if !props_obj.contains_key(req_key) {
+            return false;
+        }
+    }
+
+    let mut all_prop_names = Vec::with_capacity(props_obj.len());
+    for (key, prop) in props_obj.iter_mut() {
+        all_prop_names.push(Value::String(key.clone()));
+        if !make_json_schema_node_strict(prop) {
+            return false;
+        }
+        if !required_set.contains(key) && !schema_allows_null(prop) {
+            let inner = prop.clone();
+            *prop = json!({ "anyOf": [inner, { "type": "null" }] });
+        }
+    }
+
+    obj.insert("required".to_string(), Value::Array(all_prop_names));
+    obj.insert("additionalProperties".to_string(), Value::Bool(false));
+    true
+}
+
+/// 将工具 JSON Schema 转换为 OpenAI Responses strict 子集；若含不支持关键字则返回 `None` 以便回退非 strict。
+fn make_strict_json_schema(schema: &Value) -> Option<Value> {
+    let mut cloned = schema.clone();
+    if !make_json_schema_node_strict(&mut cloned) {
+        return None;
+    }
+    if cloned.get("type").and_then(Value::as_str) != Some("object") {
+        return None;
+    }
+    Some(cloned)
 }
 
 fn effort_str(effort: ReasoningEffort) -> Option<&'static str> {
     match effort {
-        ReasoningEffort::Off => None,
+        ReasoningEffort::Off => Some("none"),
         ReasoningEffort::Minimal => Some("minimal"),
         ReasoningEffort::Low => Some("low"),
         ReasoningEffort::Medium => Some("medium"),
         ReasoningEffort::High => Some("high"),
-        ReasoningEffort::XHigh | ReasoningEffort::Max => Some("high"),
+        ReasoningEffort::XHigh | ReasoningEffort::Max => Some("xhigh"),
     }
 }
 
@@ -268,12 +548,27 @@ pub fn build_request_body(
     }
     let instructions = sys_parts.join("\n\n");
 
-    let input: Vec<Value> = options
-        .messages
-        .iter()
-        .filter(|m| !matches!(m, Message::System { .. }))
-        .flat_map(|m| to_wire_with_replay(m, &config.provider, model))
-        .collect();
+    let mut input: Vec<Value> = Vec::new();
+    if !instructions.is_empty() && !config.use_top_level_instructions {
+        // GPT-6.2 对顶层 instructions 不进前缀缓存，内联放在 input 首位才能稳定命中 Prompt Cache。
+        let role = if config.supports_developer_role {
+            "developer"
+        } else {
+            "user"
+        };
+        input.push(json!({
+            "type": "message",
+            "role": role,
+            "content": instructions,
+        }));
+    }
+    input.extend(
+        options
+            .messages
+            .iter()
+            .filter(|m| !matches!(m, Message::System { .. }))
+            .flat_map(|m| to_wire_with_replay(m, &config.provider, model)),
+    );
 
     let mut body = json!({
         "model": model,
@@ -281,7 +576,7 @@ pub fn build_request_body(
         "store": false,
         "input": input,
     });
-    if !instructions.is_empty() {
+    if !instructions.is_empty() && config.use_top_level_instructions {
         body["instructions"] = Value::String(instructions);
     }
     let retention =
@@ -300,26 +595,40 @@ pub fn build_request_body(
     if config.supports_max_output_tokens
         && let Some(max_tokens) = options.max_tokens
     {
-        body["max_output_tokens"] = json!(max_tokens);
+        body["max_output_tokens"] = json!(max_tokens.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS));
     }
     if let Some(temp) = options.temperature {
         body["temperature"] = json!(temp);
     }
-    if let Some(effort) = options.reasoning_effort.and_then(effort_str) {
-        body["reasoning"] = json!({ "effort": effort });
-        body["include"] = json!(["reasoning.encrypted_content"]);
+    if let Some(requested_effort) = options.reasoning_effort
+        && let Some(effort) = effort_str(requested_effort)
+    {
+        if requested_effort == ReasoningEffort::Off {
+            body["reasoning"] = json!({ "effort": effort });
+        } else {
+            body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
     }
     if !options.tools.is_empty() {
         let tools: Vec<Value> = options
             .tools
             .iter()
             .map(|t| {
+                let (parameters, strict) = if config.supports_strict_mode {
+                    match make_strict_json_schema(&t.parameters) {
+                        Some(strict_schema) => (strict_schema, true),
+                        None => (t.parameters.clone(), false),
+                    }
+                } else {
+                    (t.parameters.clone(), false)
+                };
                 json!({
                     "type": "function",
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
-                    "strict": false,
+                    "parameters": parameters,
+                    "strict": strict,
                 })
             })
             .collect();
@@ -340,11 +649,114 @@ enum ResponsesFinishPhase {
     Emitted,
 }
 
-struct PendingCall {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SlotKey {
+    OutputIndex(usize),
+    ItemId(String),
+    FallbackReasoning,
+    FallbackText,
+}
+
+enum ActiveSlot {
+    Reasoning {
+        stream_idx: usize,
+        output_index: Option<usize>,
+        item_id: Option<String>,
+        started: bool,
+        text: String,
+    },
+    Message {
+        stream_idx: usize,
+        output_index: Option<usize>,
+        item_id: Option<String>,
+        phase: Option<String>,
+        started: bool,
+        text: String,
+    },
+    FunctionCall {
+        stream_idx: usize,
+        output_index: Option<usize>,
+        item_id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+impl ActiveSlot {
+    fn item_id(&self) -> Option<&str> {
+        match self {
+            Self::Reasoning { item_id, .. } | Self::Message { item_id, .. } => item_id.as_deref(),
+            Self::FunctionCall { item_id, .. } => (!item_id.is_empty()).then_some(item_id.as_str()),
+        }
+    }
+}
+
+struct RecordedOutputItem {
+    item_id: Option<String>,
+    output_index: Option<usize>,
     stream_idx: usize,
-    call_id: String,
-    name: String,
-    arguments: String,
+    item: Value,
+}
+
+fn upsert_recorded_output_item(
+    list: &mut Vec<RecordedOutputItem>,
+    item_id: Option<&str>,
+    output_index: Option<usize>,
+    stream_idx: usize,
+    item: Value,
+) {
+    let clean_id = item_id.filter(|s| !s.is_empty());
+    if let Some(id) = clean_id
+        && let Some(existing) = list
+            .iter_mut()
+            .find(|entry| entry.item_id.as_deref() == Some(id))
+    {
+        existing.item = item;
+        if existing.output_index.is_none() {
+            existing.output_index = output_index;
+        }
+        return;
+    }
+    list.push(RecordedOutputItem {
+        item_id: clean_id.map(ToString::to_string),
+        output_index,
+        stream_idx,
+        item,
+    });
+}
+
+fn classify_incomplete_finish(reason: Option<&str>) -> FinishReason {
+    let normalized = reason.map(str::trim).filter(|s| !s.is_empty());
+    match normalized {
+        Some("max_output_tokens") => FinishReason::MaxTokens,
+        Some("content_filter") => FinishReason::Error {
+            code: LlmErrorCode::ContentRefused,
+            message: "response incomplete: content_filter".to_string(),
+            status: None,
+            retry_after_ms: None,
+        },
+        Some(other) => {
+            let err = LlmError::classify_provider_error(
+                None,
+                Some("incomplete"),
+                Some(other),
+                &format!("response incomplete: {other}"),
+            );
+            FinishReason::Error {
+                code: err.code,
+                message: err.message,
+                status: err.status,
+                retry_after_ms: err.retry_after_ms,
+            }
+        }
+        None => FinishReason::Error {
+            code: LlmErrorCode::MalformedResponse,
+            message: "response incomplete without a provider reason".to_string(),
+            status: None,
+            retry_after_ms: None,
+        },
+    }
 }
 
 /// OpenAI Responses SSE 解码器。
@@ -353,13 +765,12 @@ pub struct ResponsesSseDecoder {
     model: String,
     response_id: Option<String>,
     next_index: usize,
-    text_idx: Option<usize>,
-    reasoning_idx: Option<usize>,
-    pending_calls: HashMap<String, PendingCall>,
-    completed_items: std::collections::HashSet<String>,
-    reasoning_items: Vec<Value>,
-    call_item_ids: HashMap<String, String>,
+    active_slots: HashMap<SlotKey, ActiveSlot>,
+    item_id_to_slot: HashMap<String, SlotKey>,
+    completed_items: HashSet<String>,
+    completed_output_items: Vec<RecordedOutputItem>,
     has_tool_calls: bool,
+    saw_terminal_response: bool,
     usage: Option<TokenUsage>,
     finish_reason: Option<FinishReason>,
     event_phase: ResponsesEventPhase,
@@ -373,13 +784,12 @@ impl ResponsesSseDecoder {
             model: model.into(),
             response_id: None,
             next_index: 0,
-            text_idx: None,
-            reasoning_idx: None,
-            pending_calls: HashMap::new(),
-            completed_items: std::collections::HashSet::new(),
-            reasoning_items: Vec::new(),
-            call_item_ids: HashMap::new(),
+            active_slots: HashMap::new(),
+            item_id_to_slot: HashMap::new(),
+            completed_items: HashSet::new(),
+            completed_output_items: Vec::new(),
             has_tool_calls: false,
+            saw_terminal_response: false,
             usage: None,
             finish_reason: None,
             event_phase: ResponsesEventPhase::Streaming,
@@ -393,11 +803,63 @@ impl ResponsesSseDecoder {
         idx
     }
 
+    fn resolve_slot_key(
+        &self,
+        output_index: Option<usize>,
+        item_id: Option<&str>,
+        fallback: Option<&SlotKey>,
+    ) -> Option<SlotKey> {
+        if let Some(oi) = output_index {
+            let key = SlotKey::OutputIndex(oi);
+            if self.active_slots.contains_key(&key) {
+                return Some(key);
+            }
+        }
+        if let Some(id) = item_id.filter(|s| !s.is_empty()) {
+            if let Some(mapped) = self.item_id_to_slot.get(id)
+                && self.active_slots.contains_key(mapped)
+            {
+                return Some(mapped.clone());
+            }
+            let id_key = SlotKey::ItemId(id.to_string());
+            if self.active_slots.contains_key(&id_key) {
+                return Some(id_key);
+            }
+        }
+        if let Some(fk) = fallback
+            && self.active_slots.contains_key(fk)
+        {
+            return Some(fk.clone());
+        }
+        None
+    }
+
+    fn remove_slot(
+        &mut self,
+        output_index: Option<usize>,
+        item_id: Option<&str>,
+        fallback: Option<&SlotKey>,
+    ) -> Option<ActiveSlot> {
+        let key = self.resolve_slot_key(output_index, item_id, fallback)?;
+        let slot = self.active_slots.remove(&key)?;
+        if let Some(id) = item_id.filter(|s| !s.is_empty()) {
+            self.item_id_to_slot.remove(id);
+        }
+        if let Some(slot_id) = slot.item_id() {
+            self.item_id_to_slot.remove(slot_id);
+        }
+        Some(slot)
+    }
+
     fn parse_usage(resp_obj: &Value) -> Option<TokenUsage> {
         let u = resp_obj.get("usage")?;
         let raw_input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
         let cached = u
             .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_write = u
+            .pointer("/input_tokens_details/cache_write_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -406,11 +868,11 @@ impl ResponsesSseDecoder {
             .and_then(Value::as_u64);
         let total = u.get("total_tokens").and_then(Value::as_u64);
         Some(TokenUsage {
-            input_tokens: raw_input.saturating_sub(cached),
+            input_tokens: raw_input.saturating_sub(cached).saturating_sub(cache_write),
             output_tokens: output,
             total_tokens: total,
             cache_read_tokens: (cached > 0).then_some(cached),
-            cache_write_tokens: None,
+            cache_write_tokens: (cache_write > 0).then_some(cache_write),
             reasoning_tokens: reasoning,
         })
     }
@@ -441,6 +903,10 @@ impl SseStreamDecoder for ResponsesSseDecoder {
             .and_then(Value::as_str)
             .or(event.event.as_deref())
             .unwrap_or("");
+        let output_index = payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize);
 
         match event_type {
             "response.created" | "response.in_progress" => {
@@ -448,29 +914,122 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                     self.response_id = Some(id.to_string());
                 }
             }
-            "response.output_text.delta" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str)
-                    && !delta.is_empty()
-                {
-                    let idx = match self.text_idx {
-                        Some(i) => i,
-                        None => {
-                            let i = self.alloc_index();
-                            self.text_idx = Some(i);
+            "response.output_item.added" => {
+                if let Some(item) = payload.get("item") {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty());
+                    let slot_key = output_index
+                        .map(SlotKey::OutputIndex)
+                        .or_else(|| item_id.map(|id| SlotKey::ItemId(id.to_string())));
+
+                    match item_type {
+                        "reasoning" => {
+                            let key = slot_key.unwrap_or(SlotKey::FallbackReasoning);
+                            if !self.active_slots.contains_key(&key) {
+                                let stream_idx = self.alloc_index();
+                                if let Some(id) = item_id {
+                                    self.item_id_to_slot.insert(id.to_string(), key.clone());
+                                }
+                                self.active_slots.insert(
+                                    key,
+                                    ActiveSlot::Reasoning {
+                                        stream_idx,
+                                        output_index,
+                                        item_id: item_id.map(ToString::to_string),
+                                        started: false,
+                                        text: String::new(),
+                                    },
+                                );
+                            }
+                        }
+                        "message" => {
+                            let key = slot_key.unwrap_or(SlotKey::FallbackText);
+                            if !self.active_slots.contains_key(&key) {
+                                let stream_idx = self.alloc_index();
+                                let phase = item
+                                    .get("phase")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToString::to_string);
+                                if let Some(id) = item_id {
+                                    self.item_id_to_slot.insert(id.to_string(), key.clone());
+                                }
+                                self.active_slots.insert(
+                                    key,
+                                    ActiveSlot::Message {
+                                        stream_idx,
+                                        output_index,
+                                        item_id: item_id.map(ToString::to_string),
+                                        phase,
+                                        started: false,
+                                        text: String::new(),
+                                    },
+                                );
+                            }
+                        }
+                        "function_call" => {
+                            if item_id.is_some_and(|id| self.completed_items.contains(id)) {
+                                return Ok(false);
+                            }
+                            let Some(key) = slot_key else {
+                                return Ok(false);
+                            };
+                            if self.active_slots.contains_key(&key) {
+                                return Ok(false);
+                            }
+                            let stream_idx = self.alloc_index();
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let args = item
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+
                             if !emit(StreamChunk::BlockStart {
-                                index: i,
-                                kind: ContentBlockKind::Text,
+                                index: stream_idx,
+                                kind: ContentBlockKind::ToolCall,
                             }) {
                                 return Ok(true);
                             }
-                            i
+                            if (!call_id.is_empty() || !name.is_empty() || !args.is_empty())
+                                && !emit(StreamChunk::ToolCallDelta {
+                                    index: stream_idx,
+                                    id: (!call_id.is_empty()).then_some(call_id.clone()),
+                                    name: (!name.is_empty()).then_some(name.clone()),
+                                    arguments_delta: args.clone(),
+                                })
+                            {
+                                return Ok(true);
+                            }
+
+                            if let Some(id) = item_id {
+                                self.item_id_to_slot.insert(id.to_string(), key.clone());
+                            }
+                            self.active_slots.insert(
+                                key,
+                                ActiveSlot::FunctionCall {
+                                    stream_idx,
+                                    output_index,
+                                    item_id: item_id.unwrap_or("").to_string(),
+                                    call_id,
+                                    name,
+                                    arguments: args,
+                                },
+                            );
                         }
-                    };
-                    if !emit(StreamChunk::TextDelta {
-                        index: idx,
-                        text: delta.to_string(),
-                    }) {
-                        return Ok(true);
+                        _ => {}
                     }
                 }
             }
@@ -478,88 +1037,166 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                 if let Some(delta) = payload.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
-                    let idx = match self.reasoning_idx {
-                        Some(i) => i,
-                        None => {
-                            let i = self.alloc_index();
-                            self.reasoning_idx = Some(i);
+                    let item_id = payload.get("item_id").and_then(Value::as_str);
+                    let key = self
+                        .resolve_slot_key(output_index, item_id, Some(&SlotKey::FallbackReasoning))
+                        .unwrap_or_else(|| {
+                            output_index
+                                .map(SlotKey::OutputIndex)
+                                .or_else(|| {
+                                    item_id
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| SlotKey::ItemId(s.to_string()))
+                                })
+                                .unwrap_or(SlotKey::FallbackReasoning)
+                        });
+                    if !self.active_slots.contains_key(&key) {
+                        let stream_idx = self.alloc_index();
+                        if let Some(id) = item_id.filter(|s| !s.is_empty()) {
+                            self.item_id_to_slot.insert(id.to_string(), key.clone());
+                        }
+                        self.active_slots.insert(
+                            key.clone(),
+                            ActiveSlot::Reasoning {
+                                stream_idx,
+                                output_index,
+                                item_id: item_id.filter(|s| !s.is_empty()).map(ToString::to_string),
+                                started: false,
+                                text: String::new(),
+                            },
+                        );
+                    }
+                    if let Some(ActiveSlot::Reasoning {
+                        stream_idx,
+                        started,
+                        text,
+                        ..
+                    }) = self.active_slots.get_mut(&key)
+                    {
+                        let idx = *stream_idx;
+                        if !*started {
+                            *started = true;
                             if !emit(StreamChunk::BlockStart {
-                                index: i,
+                                index: idx,
                                 kind: ContentBlockKind::Reasoning,
                             }) {
                                 return Ok(true);
                             }
-                            i
                         }
-                    };
+                        text.push_str(delta);
+                        if !emit(StreamChunk::ReasoningDelta {
+                            index: idx,
+                            text: delta.to_string(),
+                        }) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            "response.reasoning_summary_part.done" => {
+                let item_id = payload.get("item_id").and_then(Value::as_str);
+                if let Some(key) =
+                    self.resolve_slot_key(output_index, item_id, Some(&SlotKey::FallbackReasoning))
+                    && let Some(ActiveSlot::Reasoning {
+                        stream_idx,
+                        started,
+                        text,
+                        ..
+                    }) = self.active_slots.get_mut(&key)
+                    && *started
+                    && !text.is_empty()
+                {
+                    let idx = *stream_idx;
+                    text.push_str("\n\n");
                     if !emit(StreamChunk::ReasoningDelta {
                         index: idx,
-                        text: delta.to_string(),
+                        text: "\n\n".to_string(),
                     }) {
                         return Ok(true);
                     }
                 }
             }
-            "response.output_item.added" => {
-                if let Some(item) = payload.get("item")
-                    && item.get("type").and_then(Value::as_str) == Some("function_call")
-                    && let Some(item_id) = item.get("id").and_then(Value::as_str)
-                    && !self.completed_items.contains(item_id)
-                    && !self.pending_calls.contains_key(item_id)
+            "response.output_text.delta" | "response.refusal.delta" => {
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
                 {
-                    let stream_idx = self.alloc_index();
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let args = item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-
-                    if !emit(StreamChunk::BlockStart {
-                        index: stream_idx,
-                        kind: ContentBlockKind::ToolCall,
-                    }) {
-                        return Ok(true);
+                    let item_id = payload.get("item_id").and_then(Value::as_str);
+                    let key = self
+                        .resolve_slot_key(output_index, item_id, Some(&SlotKey::FallbackText))
+                        .unwrap_or_else(|| {
+                            output_index
+                                .map(SlotKey::OutputIndex)
+                                .or_else(|| {
+                                    item_id
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| SlotKey::ItemId(s.to_string()))
+                                })
+                                .unwrap_or(SlotKey::FallbackText)
+                        });
+                    if !self.active_slots.contains_key(&key) {
+                        let stream_idx = self.alloc_index();
+                        if let Some(id) = item_id.filter(|s| !s.is_empty()) {
+                            self.item_id_to_slot.insert(id.to_string(), key.clone());
+                        }
+                        self.active_slots.insert(
+                            key.clone(),
+                            ActiveSlot::Message {
+                                stream_idx,
+                                output_index,
+                                item_id: item_id.filter(|s| !s.is_empty()).map(ToString::to_string),
+                                phase: None,
+                                started: false,
+                                text: String::new(),
+                            },
+                        );
                     }
-                    if !args.is_empty()
-                        && !emit(StreamChunk::ToolCallDelta {
-                            index: stream_idx,
-                            id: (!call_id.is_empty()).then_some(call_id.clone()),
-                            name: (!name.is_empty()).then_some(name.clone()),
-                            arguments_delta: args.clone(),
-                        })
+                    if let Some(ActiveSlot::Message {
+                        stream_idx,
+                        started,
+                        text,
+                        ..
+                    }) = self.active_slots.get_mut(&key)
                     {
-                        return Ok(true);
+                        let idx = *stream_idx;
+                        if !*started {
+                            *started = true;
+                            if !emit(StreamChunk::BlockStart {
+                                index: idx,
+                                kind: ContentBlockKind::Text,
+                            }) {
+                                return Ok(true);
+                            }
+                        }
+                        text.push_str(delta);
+                        if !emit(StreamChunk::TextDelta {
+                            index: idx,
+                            text: delta.to_string(),
+                        }) {
+                            return Ok(true);
+                        }
                     }
-
-                    self.pending_calls.insert(
-                        item_id.to_string(),
-                        PendingCall {
-                            stream_idx,
-                            call_id,
-                            name,
-                            arguments: args,
-                        },
-                    );
                 }
             }
             "response.function_call_arguments.delta" => {
-                if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
-                    && !self.completed_items.contains(item_id)
-                    && let Some(delta) = payload.get("delta").and_then(Value::as_str)
-                {
-                    let entry = if let Some(existing) = self.pending_calls.get_mut(item_id) {
-                        existing
-                    } else {
+                let item_id = payload.get("item_id").and_then(Value::as_str).unwrap_or("");
+                if !item_id.is_empty() && self.completed_items.contains(item_id) {
+                    return Ok(false);
+                }
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                    let fallback =
+                        (!item_id.is_empty()).then(|| SlotKey::ItemId(item_id.to_string()));
+                    let key = self
+                        .resolve_slot_key(
+                            output_index,
+                            (!item_id.is_empty()).then_some(item_id),
+                            fallback.as_ref(),
+                        )
+                        .or_else(|| output_index.map(SlotKey::OutputIndex))
+                        .or(fallback);
+                    let Some(key) = key else {
+                        return Ok(false);
+                    };
+                    if !self.active_slots.contains_key(&key) {
                         let stream_idx = self.alloc_index();
                         if !emit(StreamChunk::BlockStart {
                             index: stream_idx,
@@ -567,109 +1204,366 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                         }) {
                             return Ok(true);
                         }
-                        self.pending_calls.insert(
-                            item_id.to_string(),
-                            PendingCall {
+                        if !item_id.is_empty() {
+                            self.item_id_to_slot
+                                .insert(item_id.to_string(), key.clone());
+                        }
+                        self.active_slots.insert(
+                            key.clone(),
+                            ActiveSlot::FunctionCall {
                                 stream_idx,
+                                output_index,
+                                item_id: item_id.to_string(),
                                 call_id: String::new(),
                                 name: String::new(),
                                 arguments: String::new(),
                             },
                         );
-                        self.pending_calls.get_mut(item_id).expect("inserted")
-                    };
-
-                    entry.arguments.push_str(delta);
-                    if !emit(StreamChunk::ToolCallDelta {
-                        index: entry.stream_idx,
-                        id: None,
-                        name: None,
-                        arguments_delta: delta.to_string(),
-                    }) {
-                        return Ok(true);
                     }
+                    if let Some(ActiveSlot::FunctionCall {
+                        stream_idx,
+                        arguments,
+                        ..
+                    }) = self.active_slots.get_mut(&key)
+                    {
+                        let idx = *stream_idx;
+                        arguments.push_str(delta);
+                        if !emit(StreamChunk::ToolCallDelta {
+                            index: idx,
+                            id: None,
+                            name: None,
+                            arguments_delta: delta.to_string(),
+                        }) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let item_id = payload.get("item_id").and_then(Value::as_str);
+                if item_id.is_some_and(|id| self.completed_items.contains(id)) {
+                    return Ok(false);
+                }
+                if let Some(final_args) = payload.get("arguments").and_then(Value::as_str)
+                    && let Some(key) = self.resolve_slot_key(output_index, item_id, None)
+                    && let Some(ActiveSlot::FunctionCall { arguments, .. }) =
+                        self.active_slots.get_mut(&key)
+                {
+                    *arguments = final_args.to_string();
                 }
             }
             "response.output_item.done" => {
                 if let Some(item) = payload.get("item") {
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("reasoning") => {
-                            upsert_reasoning_item(&mut self.reasoning_items, item);
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                    let item_id = item.get("id").and_then(Value::as_str);
+
+                    match item_type {
+                        "reasoning" => {
+                            let slot = self.remove_slot(
+                                output_index,
+                                item_id,
+                                Some(&SlotKey::FallbackReasoning),
+                            );
+                            let (stream_idx, slot_output_index, started, slot_text) = match slot {
+                                Some(ActiveSlot::Reasoning {
+                                    stream_idx,
+                                    output_index: slot_oi,
+                                    started,
+                                    text,
+                                    ..
+                                }) => (stream_idx, output_index.or(slot_oi), started, text),
+                                _ => (self.alloc_index(), output_index, false, String::new()),
+                            };
+                            let summary_text = item
+                                .get("summary")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|s| s.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n")
+                                })
+                                .unwrap_or_default();
+                            let content_text = item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|c| c.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n")
+                                })
+                                .unwrap_or_default();
+                            let final_text = if !summary_text.is_empty() {
+                                summary_text
+                            } else if !content_text.is_empty() {
+                                content_text
+                            } else {
+                                slot_text
+                            };
+                            if started || !final_text.is_empty() {
+                                if !started
+                                    && !emit(StreamChunk::BlockStart {
+                                        index: stream_idx,
+                                        kind: ContentBlockKind::Reasoning,
+                                    })
+                                {
+                                    return Ok(true);
+                                }
+                                if !emit(StreamChunk::BlockEnd {
+                                    index: stream_idx,
+                                    block: ContentBlock::Reasoning { text: final_text },
+                                }) {
+                                    return Ok(true);
+                                }
+                            }
+                            if let Some(norm) = normalize_reasoning_item(item) {
+                                upsert_recorded_output_item(
+                                    &mut self.completed_output_items,
+                                    item_id,
+                                    slot_output_index,
+                                    stream_idx,
+                                    norm,
+                                );
+                            }
                         }
-                        Some("function_call") => {
-                            let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
-                            if !item_id.is_empty()
-                                && !self.completed_items.insert(item_id.to_string())
+                        "message" => {
+                            let slot = self.remove_slot(
+                                output_index,
+                                item_id,
+                                Some(&SlotKey::FallbackText),
+                            );
+                            let (stream_idx, slot_output_index, started, slot_text, slot_phase) =
+                                match slot {
+                                    Some(ActiveSlot::Message {
+                                        stream_idx,
+                                        output_index: slot_oi,
+                                        started,
+                                        text,
+                                        phase,
+                                        ..
+                                    }) => {
+                                        (stream_idx, output_index.or(slot_oi), started, text, phase)
+                                    }
+                                    _ => (
+                                        self.alloc_index(),
+                                        output_index,
+                                        false,
+                                        String::new(),
+                                        None,
+                                    ),
+                                };
+                            let item_text = item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    let mut buf = String::new();
+                                    for c in arr {
+                                        match c.get("type").and_then(Value::as_str) {
+                                            Some("output_text") => {
+                                                if let Some(t) =
+                                                    c.get("text").and_then(Value::as_str)
+                                                {
+                                                    buf.push_str(t);
+                                                }
+                                            }
+                                            Some("refusal") => {
+                                                if let Some(r) =
+                                                    c.get("refusal").and_then(Value::as_str)
+                                                {
+                                                    buf.push_str(r);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    buf
+                                })
+                                .unwrap_or_default();
+                            let final_text = if !item_text.is_empty() {
+                                item_text
+                            } else {
+                                slot_text
+                            };
+                            if started || !final_text.is_empty() {
+                                if !started
+                                    && !emit(StreamChunk::BlockStart {
+                                        index: stream_idx,
+                                        kind: ContentBlockKind::Text,
+                                    })
+                                {
+                                    return Ok(true);
+                                }
+                                if !emit(StreamChunk::BlockEnd {
+                                    index: stream_idx,
+                                    block: ContentBlock::Text {
+                                        text: final_text.clone(),
+                                    },
+                                }) {
+                                    return Ok(true);
+                                }
+                            }
+                            if let Some(mut norm) = normalize_message_item(item, &final_text) {
+                                if norm.get("phase").is_none()
+                                    && let Some(p) = slot_phase
+                                    && let Some(obj) = norm.as_object_mut()
+                                {
+                                    obj.insert("phase".to_string(), json!(p));
+                                }
+                                upsert_recorded_output_item(
+                                    &mut self.completed_output_items,
+                                    item_id,
+                                    slot_output_index,
+                                    stream_idx,
+                                    norm,
+                                );
+                            }
+                        }
+                        "function_call" => {
+                            let id_str = item_id.unwrap_or("");
+                            if !id_str.is_empty()
+                                && !self.completed_items.insert(id_str.to_string())
                             {
                                 return Ok(false);
                             }
-                            let mut pending =
-                                self.pending_calls
-                                    .remove(item_id)
-                                    .unwrap_or_else(|| PendingCall {
-                                        stream_idx: self.alloc_index(),
-                                        call_id: String::new(),
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    });
-                            if let Some(call_id) = item.get("call_id").and_then(Value::as_str)
-                                && !call_id.is_empty()
+                            let slot = self.remove_slot(
+                                output_index,
+                                (!id_str.is_empty()).then_some(id_str),
+                                None,
+                            );
+                            let (
+                                stream_idx,
+                                slot_output_index,
+                                had_slot,
+                                mut call_id,
+                                mut name,
+                                mut arguments,
+                            ) = match slot {
+                                Some(ActiveSlot::FunctionCall {
+                                    stream_idx,
+                                    output_index: slot_oi,
+                                    call_id,
+                                    name,
+                                    arguments,
+                                    ..
+                                }) => (
+                                    stream_idx,
+                                    output_index.or(slot_oi),
+                                    true,
+                                    call_id,
+                                    name,
+                                    arguments,
+                                ),
+                                _ => (
+                                    self.alloc_index(),
+                                    output_index,
+                                    false,
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                ),
+                            };
+                            if let Some(cid) = item.get("call_id").and_then(Value::as_str)
+                                && !cid.is_empty()
                             {
-                                pending.call_id = call_id.to_string();
+                                call_id = cid.to_string();
                             }
-                            if let Some(name) = item.get("name").and_then(Value::as_str)
-                                && !name.is_empty()
+                            if let Some(n) = item.get("name").and_then(Value::as_str)
+                                && !n.is_empty()
                             {
-                                pending.name = name.to_string();
+                                name = n.to_string();
                             }
                             if let Some(args) = item.get("arguments").and_then(Value::as_str)
                                 && !args.is_empty()
                             {
-                                pending.arguments = args.to_string();
+                                arguments = args.to_string();
                             }
-                            if item_id.starts_with("fc_") && !pending.call_id.is_empty() {
-                                self.call_item_ids
-                                    .insert(pending.call_id.clone(), item_id.to_string());
+                            if !had_slot
+                                && !emit(StreamChunk::BlockStart {
+                                    index: stream_idx,
+                                    kind: ContentBlockKind::ToolCall,
+                                })
+                            {
+                                return Ok(true);
                             }
                             self.has_tool_calls = true;
                             if !emit(StreamChunk::BlockEnd {
-                                index: pending.stream_idx,
+                                index: stream_idx,
                                 block: ContentBlock::ToolCall {
-                                    id: pending.call_id,
-                                    name: pending.name,
-                                    arguments: pending.arguments,
+                                    id: call_id.clone(),
+                                    name: name.clone(),
+                                    arguments: arguments.clone(),
                                 },
                             }) {
                                 return Ok(true);
                             }
+                            let norm =
+                                normalize_function_call_item(id_str, &call_id, &name, &arguments);
+                            upsert_recorded_output_item(
+                                &mut self.completed_output_items,
+                                (!id_str.is_empty()).then_some(id_str),
+                                slot_output_index,
+                                stream_idx,
+                                norm,
+                            );
                         }
                         _ => {}
                     }
                 }
             }
             "response.completed" | "response.incomplete" => {
+                self.saw_terminal_response = true;
                 if let Some(resp_obj) = payload.get("response") {
                     if let Some(id) = resp_obj.get("id").and_then(Value::as_str) {
                         self.response_id = Some(id.to_string());
                     }
                     if let Some(output) = resp_obj.get("output").and_then(Value::as_array) {
-                        for item in output {
-                            if has_encrypted_reasoning(item) {
-                                upsert_reasoning_item(&mut self.reasoning_items, item);
+                        for (idx, item) in output.iter().enumerate() {
+                            if has_encrypted_reasoning(item)
+                                && let Some(norm) = normalize_reasoning_item(item)
+                            {
+                                let stream_idx = self.alloc_index();
+                                upsert_recorded_output_item(
+                                    &mut self.completed_output_items,
+                                    item.get("id").and_then(Value::as_str),
+                                    Some(idx),
+                                    stream_idx,
+                                    norm,
+                                );
                             }
                         }
                     }
                     if let Some(u) = Self::parse_usage(resp_obj) {
                         self.usage = Some(u);
                     }
-                    if event_type == "response.incomplete"
-                        || resp_obj
-                            .pointer("/incomplete_details/reason")
+                    let status = resp_obj.get("status").and_then(Value::as_str);
+                    let incomplete_reason = resp_obj
+                        .pointer("/incomplete_details/reason")
+                        .and_then(Value::as_str);
+                    if event_type == "response.incomplete" || status == Some("incomplete") {
+                        self.finish_reason = Some(classify_incomplete_finish(incomplete_reason));
+                    } else if status == Some("cancelled") {
+                        self.finish_reason = Some(FinishReason::Aborted);
+                    } else if status == Some("failed") {
+                        let err_obj = resp_obj.get("error").unwrap_or(resp_obj);
+                        let msg = err_obj
+                            .get("message")
                             .and_then(Value::as_str)
-                            == Some("max_output_tokens")
-                    {
+                            .unwrap_or("responses stream failed");
+                        let ecode = err_obj.get("code").and_then(Value::as_str);
+                        let etype = err_obj.get("type").and_then(Value::as_str);
+                        let err = LlmError::classify_provider_error(None, etype, ecode, msg);
+                        self.finish_reason = Some(FinishReason::Error {
+                            code: err.code,
+                            message: err.message,
+                            status: err.status,
+                            retry_after_ms: err.retry_after_ms,
+                        });
+                    } else if incomplete_reason == Some("max_output_tokens") {
                         self.finish_reason = Some(FinishReason::MaxTokens);
                     }
+                } else if event_type == "response.incomplete" {
+                    self.finish_reason = Some(classify_incomplete_finish(None));
                 }
                 self.event_phase = ResponsesEventPhase::Done;
                 return Ok(true);
@@ -699,20 +1593,60 @@ impl SseStreamDecoder for ResponsesSseDecoder {
         }
         self.finish_phase = ResponsesFinishPhase::Emitted;
 
-        let mut remaining: Vec<PendingCall> = self.pending_calls.drain().map(|(_, p)| p).collect();
-        remaining.sort_by_key(|p| p.stream_idx);
-        for pending in remaining {
-            self.has_tool_calls = true;
-            if !emit(StreamChunk::BlockEnd {
-                index: pending.stream_idx,
-                block: ContentBlock::ToolCall {
-                    id: pending.call_id,
-                    name: pending.name,
-                    arguments: pending.arguments,
-                },
-            }) {
-                return Ok(());
+        let mut has_unfinished_calls = false;
+        let active: Vec<ActiveSlot> = self.active_slots.drain().map(|(_, s)| s).collect();
+        self.item_id_to_slot.clear();
+        for slot in active {
+            match slot {
+                ActiveSlot::FunctionCall { .. } => {
+                    // 未收到 output_item.done 的工具调用绝不发射 BlockEnd，防止参数截断或串号。
+                    has_unfinished_calls = true;
+                }
+                ActiveSlot::Message {
+                    stream_idx,
+                    output_index,
+                    item_id,
+                    phase,
+                    text,
+                    ..
+                } => {
+                    if self.saw_terminal_response && !text.is_empty() {
+                        let raw_msg = json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "id": item_id,
+                            "phase": phase,
+                            "content": [{
+                                "type": "output_text",
+                                "text": text,
+                                "annotations": [],
+                            }],
+                        });
+                        if let Some(norm) = normalize_message_item(&raw_msg, &text) {
+                            upsert_recorded_output_item(
+                                &mut self.completed_output_items,
+                                item_id.as_deref(),
+                                output_index,
+                                stream_idx,
+                                norm,
+                            );
+                        }
+                    }
+                }
+                ActiveSlot::Reasoning { .. } => {}
             }
+        }
+
+        if has_unfinished_calls
+            && !matches!(
+                self.finish_reason,
+                Some(FinishReason::MaxTokens | FinishReason::Error { .. } | FinishReason::Aborted)
+            )
+        {
+            return Err(LlmError::malformed(
+                "responses stream ended with unfinished function_call",
+            ));
         }
 
         if let Some(usage) = self.usage
@@ -729,20 +1663,33 @@ impl SseStreamDecoder for ResponsesSseDecoder {
             } else {
                 FinishReason::Stop
             });
+
+        self.completed_output_items.sort_by_key(|entry| {
+            (
+                entry.output_index.unwrap_or(entry.stream_idx),
+                entry.stream_idx,
+            )
+        });
+        let drop_tool_calls = matches!(reason, FinishReason::MaxTokens);
+        let output_items: Vec<Value> = self
+            .completed_output_items
+            .iter()
+            .filter(
+                |entry| match entry.item.get("type").and_then(Value::as_str) {
+                    Some("reasoning") => has_encrypted_reasoning(&entry.item),
+                    Some("function_call") => !drop_tool_calls,
+                    Some("message") => true,
+                    _ => false,
+                },
+            )
+            .map(|entry| entry.item.clone())
+            .collect();
+
         let mut replay_response = json!({ "id": self.response_id });
-        if let Some(obj) = replay_response.as_object_mut() {
-            let encrypted_items: Vec<Value> = self
-                .reasoning_items
-                .iter()
-                .filter(|item| has_encrypted_reasoning(item))
-                .cloned()
-                .collect();
-            if !encrypted_items.is_empty() {
-                obj.insert("reasoningItems".to_string(), Value::Array(encrypted_items));
-            }
-            if !self.call_item_ids.is_empty() {
-                obj.insert("callItemIds".to_string(), json!(self.call_item_ids));
-            }
+        if let Some(obj) = replay_response.as_object_mut()
+            && !output_items.is_empty()
+        {
+            obj.insert("outputItems".to_string(), Value::Array(output_items));
         }
         let replay = ReplayEnvelope {
             protocol: PROTOCOL_RESPONSES.to_string(),
@@ -1221,11 +2168,13 @@ mod tests {
             .unwrap();
 
         let replay = asm.replay().unwrap();
+        assert_eq!(replay.response["outputItems"][0]["type"], "reasoning");
         assert_eq!(
-            replay.response["reasoningItems"][0]["encrypted_content"],
+            replay.response["outputItems"][0]["encrypted_content"],
             "enc_v1_final"
         );
-        assert_eq!(replay.response["callItemIds"]["call_1"], "fc_1");
+        assert_eq!(replay.response["outputItems"][1]["type"], "function_call");
+        assert_eq!(replay.response["outputItems"][1]["id"], "fc_1");
 
         let assistant = Message::assistant(asm.blocks(), Some(replay));
         let same = to_wire_with_replay(&assistant, "responses", "gpt-5");
@@ -1252,5 +2201,293 @@ mod tests {
             req_with_effort["include"],
             json!(["reasoning.encrypted_content"])
         );
+    }
+
+    fn run_sse_decoder(raw: &str) -> (BlockAssembler, Vec<StreamChunk>, Result<(), LlmError>) {
+        let mut parser = SseParser::new();
+        let events = parser.push(raw.as_bytes(), || {});
+        let mut decoder = ResponsesSseDecoder::new("responses", "gpt-5");
+        let mut asm = BlockAssembler::new();
+        let mut chunks = Vec::new();
+        for ev in events {
+            match decoder.on_event(ev, &mut |chunk| {
+                chunks.push(chunk.clone());
+                asm.push(chunk);
+                true
+            }) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(err) => return (asm, chunks, Err(err)),
+            }
+        }
+        let finish_res = decoder.on_finish(&mut |chunk| {
+            chunks.push(chunk.clone());
+            asm.push(chunk);
+            true
+        });
+        (asm, chunks, finish_res)
+    }
+
+    #[test]
+    fn wire_request_body_handles_developer_role_reasoning_clamping_and_strict_mode() {
+        use mizar_llm::ToolSchema;
+
+        let tools = vec![
+            ToolSchema {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "limit": { "type": "integer" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolSchema {
+                name: "complex_mcp".into(),
+                description: "MCP tool with unsupported strict keyword".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "oneOf": [{ "type": "string" }, { "type": "integer" }] }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        ];
+
+        // 1. 默认：developer 内联进 input[0]、无顶层 instructions、summary: "auto"、max_output_tokens >= 16、strict: false
+        let default_body = build_request_body(
+            &ResponsesConfig::default(),
+            &GenerateOptions {
+                system: Some("sys prompt".into()),
+                messages: vec![Message::system("extra dev"), Message::user("hello")],
+                max_tokens: Some(4),
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                tools: tools.clone(),
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert!(default_body.get("instructions").is_none());
+        assert_eq!(default_body["input"][0]["role"], "developer");
+        assert_eq!(
+            default_body["input"][0]["content"],
+            "sys prompt\n\nextra dev"
+        );
+        assert_eq!(default_body["input"][1]["role"], "user");
+        assert_eq!(default_body["max_output_tokens"], 16);
+        assert_eq!(
+            default_body["reasoning"],
+            json!({ "effort": "medium", "summary": "auto" })
+        );
+        assert_eq!(
+            default_body["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(default_body["tools"][0]["strict"], false);
+        assert_eq!(default_body["tools"][1]["strict"], false);
+
+        // 2. supports_developer_role=false 降级为 user；Off 不发 summary 与 include；supports_strict_mode=true 自动转换兼容工具
+        let strict_no_dev_body = build_request_body(
+            &ResponsesConfig {
+                supports_developer_role: false,
+                supports_strict_mode: true,
+                ..Default::default()
+            },
+            &GenerateOptions {
+                messages: vec![Message::system("sys"), Message::user("hi")],
+                max_tokens: Some(256),
+                reasoning_effort: Some(ReasoningEffort::Off),
+                tools: tools.clone(),
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert!(strict_no_dev_body.get("instructions").is_none());
+        assert_eq!(strict_no_dev_body["input"][0]["role"], "user");
+        assert_eq!(strict_no_dev_body["input"][0]["content"], "sys");
+        assert_eq!(strict_no_dev_body["max_output_tokens"], 256);
+        assert_eq!(strict_no_dev_body["reasoning"], json!({ "effort": "none" }));
+        assert!(strict_no_dev_body.get("include").is_none());
+        assert_eq!(strict_no_dev_body["tools"][0]["strict"], true);
+        assert_eq!(
+            strict_no_dev_body["tools"][0]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            strict_no_dev_body["tools"][0]["parameters"]["properties"]["limit"],
+            json!({ "anyOf": [{ "type": "integer" }, { "type": "null" }] })
+        );
+        assert_eq!(
+            strict_no_dev_body["tools"][0]["parameters"]["required"],
+            json!(["limit", "path"])
+        );
+        // 含 oneOf 的工具安全回退为 strict: false
+        assert_eq!(strict_no_dev_body["tools"][1]["strict"], false);
+
+        // 3. use_top_level_instructions=true + XHigh => xhigh
+        let top_instr_body = build_request_body(
+            &ResponsesConfig {
+                use_top_level_instructions: true,
+                ..Default::default()
+            },
+            &GenerateOptions {
+                messages: vec![Message::system("top sys"), Message::user("go")],
+                reasoning_effort: Some(ReasoningEffort::XHigh),
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert_eq!(top_instr_body["instructions"], "top sys");
+        assert_eq!(top_instr_body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(top_instr_body["input"][0]["role"], "user");
+        assert_eq!(
+            top_instr_body["reasoning"],
+            json!({ "effort": "xhigh", "summary": "auto" })
+        );
+    }
+
+    #[test]
+    fn preserves_interleaved_output_order_and_message_metadata_in_replay() {
+        let long_msg_id = format!("msg_{}", "a".repeat(80));
+        let raw = format!(
+            concat!(
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}}}\n\n",
+                "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"item_id\":\"rs_1\",\"delta\":\"think 1\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"think 1\"}}]}}}}\n\n",
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{{\"id\":\"{long_id}\",\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"content\":[]}}}}\n\n",
+                "data: {{\"type\":\"response.output_text.delta\",\"output_index\":1,\"item_id\":\"{long_id}\",\"delta\":\"Checking file...\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{{\"id\":\"{long_id}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"phase\":\"commentary\",\"content\":[{{\"type\":\"output_text\",\"text\":\"Checking file...\",\"annotations\":[]}}]}}}}\n\n",
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"item_id\":\"fc_1\",\"delta\":\"{{\\\"p\\\":1}}\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{{\\\"p\\\":1}}\"}}}}\n\n",
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":3,\"item\":{{\"id\":\"rs_2\",\"type\":\"reasoning\",\"summary\":[]}}}}\n\n",
+                "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":3,\"item_id\":\"rs_2\",\"delta\":\"think 2\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":3,\"item\":{{\"id\":\"rs_2\",\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"think 2\"}}],\"encrypted_content\":\"enc_2\"}}}}\n\n",
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":4,\"item\":{{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[]}}}}\n\n",
+                "data: {{\"type\":\"response.output_text.delta\",\"output_index\":4,\"item_id\":\"msg_2\",\"delta\":\"Done.\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":4,\"item\":{{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"phase\":\"final_answer\",\"content\":[{{\"type\":\"output_text\",\"text\":\"Done.\",\"annotations\":[]}}]}}}}\n\n",
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":5,\"item\":{{\"id\":\"fc_2\",\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"bash\",\"arguments\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":5,\"item_id\":\"fc_2\",\"delta\":\"{{\\\"cmd\\\":\\\"ls\\\"}}\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"output_index\":5,\"item\":{{\"id\":\"fc_2\",\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"bash\",\"arguments\":\"{{\\\"cmd\\\":\\\"ls\\\"}}\"}}}}\n\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_seq\",\"status\":\"completed\",\"output\":[{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"think 1\"}}],\"encrypted_content\":\"enc_1\"}}],\"usage\":{{\"input_tokens\":100,\"output_tokens\":40,\"total_tokens\":140,\"input_tokens_details\":{{\"cached_tokens\":60,\"cache_write_tokens\":15}}}}}}}}\n\n"
+            ),
+            long_id = long_msg_id
+        );
+
+        let (asm, _chunks, res) = run_sse_decoder(&raw);
+        res.unwrap();
+
+        let blocks = asm.blocks();
+        assert_eq!(blocks.len(), 6);
+        assert!(matches!(&blocks[0], ContentBlock::Reasoning { text } if text == "think 1"));
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == "Checking file..."));
+        assert!(matches!(&blocks[2], ContentBlock::ToolCall { id, .. } if id == "call_1"));
+        assert!(matches!(&blocks[3], ContentBlock::Reasoning { text } if text == "think 2"));
+        assert!(matches!(&blocks[4], ContentBlock::Text { text } if text == "Done."));
+        assert!(matches!(&blocks[5], ContentBlock::ToolCall { id, .. } if id == "call_2"));
+
+        let usage = asm.usage().unwrap();
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.cache_read_tokens, Some(60));
+        assert_eq!(usage.cache_write_tokens, Some(15));
+        assert_eq!(usage.prompt_tokens(), 100);
+
+        let replay = asm.replay().unwrap();
+        let out_items = replay.response["outputItems"].as_array().unwrap().clone();
+        assert_eq!(out_items.len(), 6);
+        assert_eq!(out_items[0]["id"], "rs_1");
+        assert_eq!(out_items[0]["encrypted_content"], "enc_1");
+        assert_eq!(out_items[1]["type"], "message");
+        assert_eq!(out_items[1]["phase"], "commentary");
+        assert_eq!(out_items[1]["status"], "completed");
+        assert!(out_items[1]["id"].as_str().unwrap().len() <= 64);
+        assert_eq!(out_items[1]["content"][0]["type"], "output_text");
+        assert_eq!(out_items[2]["id"], "fc_1");
+        assert_eq!(out_items[3]["id"], "rs_2");
+        assert_eq!(out_items[4]["id"], "msg_2");
+        assert_eq!(out_items[4]["phase"], "final_answer");
+        assert_eq!(out_items[5]["id"], "fc_2");
+
+        let assistant = Message::assistant(blocks, Some(replay));
+        let same_wire = to_wire_with_replay(&assistant, "responses", "gpt-5");
+        assert_eq!(same_wire, *out_items);
+
+        // 跨模型仍保序输出 message/function_call，但剥离 reasoning 与 fc_* id
+        let diff_wire = to_wire_with_replay(&assistant, "responses", "gpt-4.1");
+        assert_eq!(diff_wire.len(), 4);
+        assert_eq!(diff_wire[0]["type"], "message");
+        assert_eq!(diff_wire[0]["content"][0]["text"], "Checking file...");
+        assert_eq!(diff_wire[1]["type"], "function_call");
+        assert_eq!(diff_wire[1]["call_id"], "call_1");
+        assert!(diff_wire[1].get("id").is_none());
+        assert_eq!(diff_wire[2]["type"], "message");
+        assert_eq!(diff_wire[2]["content"][0]["text"], "Done.");
+        assert_eq!(diff_wire[3]["type"], "function_call");
+        assert_eq!(diff_wire[3]["call_id"], "call_2");
+        assert!(diff_wire[3].get("id").is_none());
+    }
+
+    #[test]
+    fn classifies_incomplete_reasons_and_rejects_unfinished_tool_calls() {
+        let max_tok_raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_cut\",\"type\":\"function_call\",\"call_id\":\"call_cut\",\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\"}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_inc1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        let (asm_max, chunks_max, res_max) = run_sse_decoder(max_tok_raw);
+        res_max.unwrap();
+        assert_eq!(asm_max.finish(), FinishReason::MaxTokens);
+        assert!(asm_max.tool_calls().is_empty());
+        assert!(!chunks_max.iter().any(|c| matches!(
+            c,
+            StreamChunk::BlockEnd {
+                block: ContentBlock::ToolCall { .. },
+                ..
+            }
+        )));
+
+        let filter_raw = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_inc2\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n";
+        let (asm_filter, _chunks_filter, res_filter) = run_sse_decoder(filter_raw);
+        res_filter.unwrap();
+        assert!(matches!(
+            asm_filter.finish(),
+            FinishReason::Error {
+                code: LlmErrorCode::ContentRefused,
+                ..
+            }
+        ));
+
+        let missing_reason_raw = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_inc3\",\"status\":\"incomplete\"}}\n\n";
+        let (asm_missing, _chunks_missing, res_missing) = run_sse_decoder(missing_reason_raw);
+        res_missing.unwrap();
+        assert!(matches!(
+            asm_missing.finish(),
+            FinishReason::Error {
+                code: LlmErrorCode::MalformedResponse,
+                ..
+            }
+        ));
+
+        // 异常结束未收到 output_item.done 的 function_call 绝不发射 BlockEnd/Finish，直接报 MalformedResponse
+        let unclosed_call_raw = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_unclosed\",\"type\":\"function_call\",\"call_id\":\"call_u\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_unclosed\",\"delta\":\"{\\\"cmd\\\":\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (_asm_unclosed, chunks_unclosed, res_unclosed) = run_sse_decoder(unclosed_call_raw);
+        assert!(matches!(
+            res_unclosed,
+            Err(err) if err.code == LlmErrorCode::MalformedResponse
+        ));
+        assert!(!chunks_unclosed.iter().any(|c| matches!(
+            c,
+            StreamChunk::BlockEnd {
+                block: ContentBlock::ToolCall { .. },
+                ..
+            } | StreamChunk::Finish { .. }
+        )));
     }
 }

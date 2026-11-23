@@ -67,6 +67,8 @@ pub struct CompatConfig {
     pub supports_store: Option<bool>,
     pub supports_developer_role: Option<bool>,
     pub supports_reasoning_effort: Option<bool>,
+    pub supports_strict_mode: Option<bool>,
+    pub use_top_level_instructions: Option<bool>,
 }
 
 impl From<CompletionsCompat> for CompatConfig {
@@ -137,6 +139,10 @@ impl CompatConfig {
             supports_reasoning_effort: overlay
                 .supports_reasoning_effort
                 .or(self.supports_reasoning_effort),
+            supports_strict_mode: overlay.supports_strict_mode.or(self.supports_strict_mode),
+            use_top_level_instructions: overlay
+                .use_top_level_instructions
+                .or(self.use_top_level_instructions),
         }
     }
 
