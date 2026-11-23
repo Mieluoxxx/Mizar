@@ -530,7 +530,6 @@ pub enum ClientEvent {
         outcome: String,
         tokens_before: Option<u64>,
         tokens_after: Option<u64>,
-        pruned_count: usize,
         first_kept_seq: Option<u64>,
         summary_preview: Option<String>,
         message: Option<String>,

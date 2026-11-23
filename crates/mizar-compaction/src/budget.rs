@@ -1,7 +1,8 @@
 //! 上下文预算公式、CJK/代码混合 token 估算与真实 `TokenUsage` 锚点校准。
 //!
-//! 综合 `dim`（窗口扣除输出预留 + `<= 0.5*B` 压后上限 + `0.25*B` regrowth 防抖）、
-//! `DS-Bot`（`380_000` 软顶防止超大窗口失掉缓存与注意力）与 `pi`（最近有效 usage 校准 + 冷缓存窗口）。
+//! 统一基于模型真实可用窗口（`context_window - reserved_output`）与可选 `max_context_tokens`
+//! 推导触发阈值，并以固定的 `keep_recent_tokens`（小窗自动钳位）切分保留尾部；
+//! 实测校准锚点使用 `u.prompt_tokens()`（已含 `cache_read` 与 `cache_write`）。
 
 use mizar_llm::{ContentBlock, ImageAttachment, Message};
 use mizar_session::{Session, SessionEntry, SessionEvent};
@@ -16,11 +17,7 @@ pub struct ContextBudget {
     pub usable_tokens: u64,
     pub effective_window: u64,
     pub trigger_tokens: u64,
-    pub prune_target_tokens: u64,
-    pub post_compact_max_tokens: u64,
     pub keep_recent_tokens: u64,
-    pub regrowth_tokens: u64,
-    pub urgent_tokens: u64,
 }
 
 pub fn compute_budget(
@@ -32,37 +29,22 @@ pub fn compute_budget(
     let declared_out = u64::from(max_output.unwrap_or(16_384));
     let reserved_output = declared_out.min(131_072).min(window / 2);
     let usable_tokens = window.saturating_sub(reserved_output).max(2_048);
-    let effective_window = if config.soft_window_cap > 0 {
-        usable_tokens.min(config.soft_window_cap).max(2_048)
-    } else {
-        usable_tokens
-    };
+    let effective_window = config
+        .max_context_tokens
+        .filter(|&cap| cap > 0)
+        .map_or(usable_tokens, |cap| usable_tokens.min(cap).max(2_048));
 
     let trigger_ratio = config.trigger_ratio.clamp(0.20, 0.95);
-    let prune_target_ratio = config.prune_target_ratio.clamp(0.15, trigger_ratio);
-    let post_compact_ratio = config.post_compact_max_ratio.clamp(0.20, 0.85);
-    let keep_recent_ratio = config.keep_recent_ratio.clamp(0.05, 0.45);
-    let regrowth_ratio = config.regrowth_ratio.clamp(0.05, 0.50);
-
-    let trigger_tokens = ((effective_window as f64) * trigger_ratio).floor() as u64;
-    let prune_target_tokens = ((effective_window as f64) * prune_target_ratio).floor() as u64;
-    let post_compact_max_tokens = ((usable_tokens as f64) * post_compact_ratio).floor() as u64;
-    let keep_recent_tokens = (((effective_window as f64) * keep_recent_ratio).floor() as u64)
-        .min((post_compact_max_tokens / 2).max(512));
-    let regrowth_tokens = (((effective_window as f64) * regrowth_ratio).floor() as u64).max(512);
-    let urgent_tokens = ((usable_tokens as f64) * 0.92).floor() as u64;
+    let trigger_tokens = (((effective_window as f64) * trigger_ratio).floor() as u64).max(1_024);
+    let keep_recent_tokens = config.keep_recent_tokens.min(effective_window / 4);
 
     ContextBudget {
         context_window: window,
         reserved_output,
         usable_tokens,
         effective_window,
-        trigger_tokens: trigger_tokens.max(1_024),
-        prune_target_tokens: prune_target_tokens.max(512),
-        post_compact_max_tokens: post_compact_max_tokens.max(1_024),
-        keep_recent_tokens: keep_recent_tokens.max(512),
-        regrowth_tokens,
-        urgent_tokens: urgent_tokens.max(trigger_tokens),
+        trigger_tokens,
+        keep_recent_tokens,
     }
 }
 
@@ -176,8 +158,9 @@ pub fn estimate_entry_tokens(entry: &SessionEntry, pruned_replacement: Option<&s
 }
 
 /// 估算当前会话发往模型的总上下文 token 数：
-/// 若最新一次 `Compaction` / `ToolResultPrune` 之后存在有效的实测 `Assistant.usage.input_tokens`，
-/// 则以该实测值作为锚点，加上锚点之后新增条目的增量估算；否则全量按估算值求和。
+/// 若最新一次边界变更之后存在有效的实测 `Assistant.usage.prompt_tokens()`，
+/// 则以该实测值（含 `cache_read` + `cache_write`）作为锚点，加上锚点之后新增条目的增量估算；
+/// 否则全量按估算值求和。
 pub fn estimate_session_context_tokens(
     session: &Session,
     system_prompt_text: &str,
@@ -187,7 +170,7 @@ pub fn estimate_session_context_tokens(
     let visible = session.visible_log();
     let all = session.all_entries();
 
-    // 找到最近一次改变前缀形态的边界序号（Compaction 或 ToolResultPrune）
+    // 找到最近一次改变前缀形态的边界序号（Compaction 或旧库遗留的 ToolResultPrune）
     let last_mutation_seq = all
         .iter()
         .rev()
@@ -197,17 +180,18 @@ pub fn estimate_session_context_tokens(
         })
         .unwrap_or(0);
 
-    // 寻找晚于最新前缀变更的最近有效 Assistant 实测 input_tokens
+    // 寻找晚于最新前缀变更的最近有效 Assistant 实测 prompt_tokens()
     let mut calibrated_anchor: Option<(u64, u64)> = None;
     for entry in visible.iter().rev() {
         if entry.seq <= last_mutation_seq {
             continue;
         }
-        if let SessionEvent::Assistant { usage: Some(u), .. } = &entry.event
-            && u.input_tokens > 0
-        {
-            calibrated_anchor = Some((entry.seq, u.input_tokens));
-            break;
+        if let SessionEvent::Assistant { usage: Some(u), .. } = &entry.event {
+            let prompt_tokens = u.prompt_tokens();
+            if prompt_tokens > 0 {
+                calibrated_anchor = Some((entry.seq, prompt_tokens));
+                break;
+            }
         }
     }
 
@@ -233,21 +217,71 @@ pub fn estimate_session_context_tokens(
 
 #[cfg(test)]
 mod tests {
+    use mizar_llm::TokenUsage;
+
     use super::*;
 
     #[test]
-    fn budget_respects_soft_cap_and_half_window_ceiling() {
+    fn budget_releases_full_usable_window_by_default_and_honors_optional_cap() {
         let cfg = CompactionConfig::default();
-        // 1M 窗口下受 380k 软顶保护，避免等到 800k 才压缩
-        let b = compute_budget(1_048_576, Some(65_536), &cfg);
-        assert_eq!(b.effective_window, 380_000);
-        assert_eq!(b.trigger_tokens, 304_000);
-        assert!(b.post_compact_max_tokens <= b.usable_tokens / 2);
+
+        // 1M 窗口（131k max_output）默认无硬顶：usable=917_504, 80%=734_003, keep=20_000
+        let b_1m = compute_budget(1_048_576, Some(131_072), &cfg);
+        assert_eq!(b_1m.usable_tokens, 917_504);
+        assert_eq!(b_1m.effective_window, 917_504);
+        assert_eq!(b_1m.trigger_tokens, 734_003);
+        assert_eq!(b_1m.keep_recent_tokens, 20_000);
 
         // 128k 常规窗口下按 usable * 0.8 触发
         let b128 = compute_budget(128_000, Some(16_384), &cfg);
         assert_eq!(b128.usable_tokens, 111_616);
+        assert_eq!(b128.effective_window, 111_616);
         assert_eq!(b128.trigger_tokens, 89_292);
+        assert_eq!(b128.keep_recent_tokens, 20_000);
+
+        // 显式配置 max_context_tokens 时封顶生效
+        let capped_cfg = CompactionConfig {
+            max_context_tokens: Some(200_000),
+            ..cfg.clone()
+        };
+        let b_cap = compute_budget(1_048_576, Some(65_536), &capped_cfg);
+        assert_eq!(b_cap.effective_window, 200_000);
+        assert_eq!(b_cap.trigger_tokens, 160_000);
+        assert_eq!(b_cap.keep_recent_tokens, 20_000);
+
+        // 小窗自动将 keep_recent_tokens 钳位至 effective_window / 4
+        let b_small = compute_budget(16_384, Some(4_096), &cfg);
+        assert_eq!(b_small.effective_window, 12_288);
+        assert_eq!(b_small.keep_recent_tokens, 3_072);
+    }
+
+    #[test]
+    fn session_context_estimate_calibrates_with_full_prompt_tokens_including_cache() {
+        let session = std::sync::Arc::new(mizar_session::Session::new(
+            cordis::Context::new(),
+            "cache-hit-anchor",
+        ));
+        session.append(SessionEvent::user("inspect repo"));
+        session.append(SessionEvent::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            replay: None,
+            usage: Some(TokenUsage {
+                input_tokens: 4_000,
+                cache_read_tokens: Some(80_000),
+                cache_write_tokens: Some(6_000),
+                output_tokens: 200,
+                ..TokenUsage::default()
+            }),
+        });
+
+        let estimated = estimate_session_context_tokens(&session, "", 0);
+        // 锚点 prompt_tokens = 90_000 加上当前 Assistant 自身轻量估计，不应被低估为 4_000
+        assert!(
+            (90_000..90_100).contains(&estimated),
+            "estimated={estimated}"
+        );
     }
 
     #[test]

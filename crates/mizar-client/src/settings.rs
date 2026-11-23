@@ -59,24 +59,19 @@ fn choice_index(options: &[&str], current: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn format_soft_window_cap_label(cap: u64) -> &'static str {
+fn format_max_context_tokens_label(cap: Option<u64>) -> &'static str {
     match cap {
-        0 => "off",
-        1..=160_000 => "128k",
-        160_001..=260_000 => "200k",
-        260_001..=440_000 => "380k",
-        _ => "512k",
+        None | Some(0) => "off",
+        Some(1..=300_000) => "200k",
+        Some(_) => "400k",
     }
 }
 
-fn parse_soft_window_cap_label(label: &str) -> u64 {
-    match label {
-        "off" | "0" => 0,
-        "128k" => 128_000,
-        "200k" => 200_000,
-        "380k" => 380_000,
-        "512k" => 512_000,
-        _ => 380_000,
+fn parse_max_context_tokens_label(label: &str) -> Option<u64> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "200k" | "200000" => Some(200_000),
+        "400k" | "400000" => Some(400_000),
+        _ => None,
     }
 }
 
@@ -182,85 +177,34 @@ pub fn build_settings_entries(ctx: &Context, snap: &SettingsViewSnapshot) -> Vec
 
     if let Ok(comp) = ctx.compaction() {
         let cfg = comp.config();
-        let cap_opts = ["off", "128k", "200k", "380k", "512k"];
+        let cap_opts = ["off", "200k", "400k"];
         items.extend([
             SettingEntry {
                 key: "compaction.enabled".into(),
                 category: "压缩".into(),
                 label: "启用上下文压缩".into(),
-                description: "总开关：关闭后不会执行自动剪枝、自动压缩或 /compact".into(),
+                description: "总开关：关闭后不会执行自动压缩或 /compact".into(),
                 kind: SettingItemKind::Toggle { value: cfg.enabled },
-            },
-            SettingEntry {
-                key: "compaction.autoPrune".into(),
-                category: "压缩".into(),
-                label: "L1 零模型大输出剪枝".into(),
-                description:
-                    "达到水位时优先对较早轮次大工具输出留头尾+recall句柄，省去 LLM 摘要费用".into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.auto_prune,
-                },
             },
             SettingEntry {
                 key: "compaction.autoCompact".into(),
                 category: "压缩".into(),
-                label: "L2 自动检查点摘要".into(),
-                description: "L1 剪枝仍超阈值时自动生成软硬分离检查点摘要".into(),
+                label: "自动检查点摘要".into(),
+                description: "上下文达到有效窗口 80% 时自动生成结构化检查点摘要".into(),
                 kind: SettingItemKind::Toggle {
                     value: cfg.auto_compact,
                 },
             },
             SettingEntry {
-                key: "compaction.reusePrefixCache".into(),
+                key: "compaction.maxContextTokens".into(),
                 category: "压缩".into(),
-                label: "尾置指令复用前缀缓存".into(),
-                description: "摘要请求复用主对话前缀以吃满 Prompt Cache，失败自动回退纯净转写"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.reuse_prefix_cache,
-                },
-            },
-            SettingEntry {
-                key: "compaction.disableSummaryReasoning".into(),
-                category: "压缩".into(),
-                label: "摘要请求关闭思考".into(),
-                description: "生成压缩摘要时设 reasoning_effort=off，防止隐藏思考耗尽输出预算"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.disable_summary_reasoning,
-                },
-            },
-            SettingEntry {
-                key: "compaction.enableReadDedup".into(),
-                category: "压缩".into(),
-                label: "跨压缩感知重复读去重".into(),
-                description: "同一压缩代次内重复 read 未改动文件区间时返回简短提示，压后自动失效"
-                    .into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.enable_read_dedup,
-                },
-            },
-            SettingEntry {
-                key: "compaction.enableWriteAfterCompactGuard".into(),
-                category: "压缩".into(),
-                label: "压后陈旧整文件写保护".into(),
-                description:
-                    "拦截对压缩前 read 过的已存在文件直接整文件 write，始终放行 edit 与新建".into(),
-                kind: SettingItemKind::Toggle {
-                    value: cfg.enable_write_after_compact_guard,
-                },
-            },
-            SettingEntry {
-                key: "compaction.softWindowCap".into(),
-                category: "压缩".into(),
-                label: "超大窗口软顶".into(),
-                description:
-                    "为 1M 等超大窗口模型设置触发软上限（默认 380k），保持注意力与缓存效率".into(),
+                label: "上下文软上限".into(),
+                description: "为超大窗口模型设置可选上限（默认 off，使用真实可用窗口）".into(),
                 kind: SettingItemKind::Choice {
                     options: cap_opts.iter().map(|s| s.to_string()).collect(),
                     selected: choice_index(
                         &cap_opts,
-                        format_soft_window_cap_label(cfg.soft_window_cap),
+                        format_max_context_tokens_label(cfg.max_context_tokens),
                     ),
                 },
             },
@@ -432,15 +376,10 @@ pub fn apply_runtime_setting_change(ctx: &Context, key: &str, value: &str) {
         let flag = value == "true";
         comp.update_config(|cfg| match key {
             "compaction.enabled" => cfg.enabled = flag,
-            "compaction.autoPrune" => cfg.auto_prune = flag,
             "compaction.autoCompact" => cfg.auto_compact = flag,
-            "compaction.reusePrefixCache" => cfg.reuse_prefix_cache = flag,
-            "compaction.disableSummaryReasoning" => cfg.disable_summary_reasoning = flag,
-            "compaction.enableReadDedup" => cfg.enable_read_dedup = flag,
-            "compaction.enableWriteAfterCompactGuard" => {
-                cfg.enable_write_after_compact_guard = flag
+            "compaction.maxContextTokens" => {
+                cfg.max_context_tokens = parse_max_context_tokens_label(value)
             }
-            "compaction.softWindowCap" => cfg.soft_window_cap = parse_soft_window_cap_label(value),
             _ => {}
         });
     } else if key.starts_with("sessionTitle.")
@@ -558,12 +497,18 @@ pub fn persist_setting_change_to(path: &Path, key: &str, value: &str) -> Result<
             "mouseCapture",
             serde_json::Value::Bool(value == "true"),
         ),
-        "compaction.softWindowCap" => upsert_nested_json(
-            root,
-            "compaction",
-            "softWindowCap",
-            serde_json::Value::Number(serde_json::Number::from(parse_soft_window_cap_label(value))),
-        ),
+        "compaction.maxContextTokens" => {
+            if let Some(cap) = parse_max_context_tokens_label(value) {
+                upsert_nested_json(
+                    root,
+                    "compaction",
+                    "maxContextTokens",
+                    serde_json::Value::Number(serde_json::Number::from(cap)),
+                );
+            } else if let Some(obj) = root.get_mut("compaction").and_then(|v| v.as_object_mut()) {
+                obj.remove("maxContextTokens");
+            }
+        }
         k if let Some(field) = k.strip_prefix("compaction.") => upsert_nested_json(
             root,
             "compaction",
@@ -677,7 +622,38 @@ mod tests {
         assert!(ctx.compaction().is_ok());
 
         let after_enable = build_settings_entries(&ctx, &snap);
-        assert!(after_enable.iter().any(|e| e.key == "compaction.enabled"));
+        let comp_keys: Vec<&str> = after_enable
+            .iter()
+            .filter(|e| e.category == "压缩")
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(
+            comp_keys,
+            vec![
+                "compaction.enabled",
+                "compaction.autoCompact",
+                "compaction.maxContextTokens",
+            ]
+        );
+        apply_runtime_setting_change(&ctx, "compaction.maxContextTokens", "200k");
+        assert_eq!(
+            ctx.compaction().unwrap().config().max_context_tokens,
+            Some(200_000)
+        );
+        persist_setting_change_to(&settings_path, "compaction.maxContextTokens", "200k").unwrap();
+        let persisted_cap: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(persisted_cap["compaction"]["maxContextTokens"], 200_000);
+        apply_runtime_setting_change(&ctx, "compaction.maxContextTokens", "off");
+        assert_eq!(ctx.compaction().unwrap().config().max_context_tokens, None);
+        persist_setting_change_to(&settings_path, "compaction.maxContextTokens", "off").unwrap();
+        let persisted_off: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            persisted_off["compaction"]
+                .get("maxContextTokens")
+                .is_none()
+        );
         let persisted_1: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(persisted_1["defaultModel"], "gpt-4o");

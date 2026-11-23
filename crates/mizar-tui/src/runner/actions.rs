@@ -653,7 +653,6 @@ pub(super) async fn handle_action(
                                 outcome: "failed".to_string(),
                                 tokens_before: None,
                                 tokens_after: None,
-                                pruned_count: 0,
                                 first_kept_seq: None,
                                 summary_preview: None,
                                 message: Some(err.to_string()),

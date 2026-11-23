@@ -11,8 +11,6 @@ use mizar_agent_loop::{
     AgentTurnEndEvent, AgentTurnStartEvent, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START,
 };
 use mizar_client_core::CacheWarmingSessionStatus;
-#[cfg(feature = "compaction")]
-use mizar_compaction::CompactionRuntime;
 use mizar_llm::{
     CACHE_WARMING_MAX_AGE_MS, CACHE_WARMING_MAX_IDLE_AGE_MS, CacheWarmingDecision,
     CacheWarmingMode, CacheWarmingPhase, EVENT_LLM_AFTER_RESPONSE, FinishReason, GenerateOptions,
@@ -158,15 +156,6 @@ fn lookup_session_in_memory(sessions: &SessionStore, session_id: &str) -> Option
         return None;
     }
     sessions.get(session_id)
-}
-
-fn touch_compaction_activity(ctx: &Context, session_id: &str) {
-    #[cfg(feature = "compaction")]
-    if let Some(comp) = ctx.reflect().get::<CompactionRuntime>("compaction") {
-        comp.touch_session_activity(session_id);
-    }
-    #[cfg(not(feature = "compaction"))]
-    let _ = (ctx, session_id);
 }
 
 /// Prompt Cache 续命后台运行时服务（`ctx.cache_warming()`）。
@@ -790,7 +779,7 @@ impl CacheWarmingRuntime {
 
         let (warm_count, next_spec) = next_arm;
 
-        // 仅在保活成功收尾后落盘 Usage("cache_warm") 并同步刷新 compaction 活跃时间
+        // 仅在保活成功收尾后落盘 Usage("cache_warm")
         let note = format!(
             "Prompt Cache 续命第 {warm_count} 次（TTL {}s，本次费用 ${warm_cost:.4}）",
             req.ttl_ms / 1000
@@ -802,7 +791,6 @@ impl CacheWarmingRuntime {
             effective_usage,
             Some(note),
         ));
-        touch_compaction_activity(&self.ctx, &session_id);
 
         if self.config.lock().unwrap().show_cache_miss_notices {
             let text = format!(
@@ -1405,155 +1393,6 @@ mod tests {
 
         session.record_selection(Some("test-prov".into()), Some("other-model".into()), None);
         assert!(!cw.status(&session.id).unwrap().active);
-
-        ctx.fiber().dispose().await;
-    }
-
-    #[cfg(feature = "compaction")]
-    #[tokio::test]
-    async fn warming_refreshes_compaction_last_activity_at_when_present() {
-        use cordis::BoxFuture;
-        use mizar_agent_loop::{
-            AgentPreStepDecision, AgentPreStepInput, AgentStepEndEvent, EVENT_AGENT_PRE_STEP,
-            EVENT_AGENT_STEP_END, StepOutcome,
-        };
-        use mizar_compaction::{CompactionConfig, CompactionRuntime};
-
-        // short=11s -> delay_ms = 1_000ms，配合 cold_cache_idle_secs=1 验证真实保活刷新活跃时间
-        let adapter = Arc::new(WarmingTestAdapter::new(
-            "anthropic-messages",
-            rich_anthropic_model(11, true),
-            300_000,
-        ));
-        let (ctx, llm, sessions) =
-            setup_test_ctx(Arc::clone(&adapter), CacheWarmingConfig::default()).await;
-        ctx.plugin(mizar_tools::ToolRuntime::plugin(), ())
-            .await
-            .unwrap();
-        ctx.plugin(
-            mizar_system_prompt::SystemPrompt::plugin(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        ctx.plugin(
-            CompactionRuntime::plugin(),
-            CompactionConfig {
-                enabled: true,
-                auto_compact: true,
-                auto_prune: false,
-                default_context_window: 2_000,
-                soft_window_cap: 2_000,
-                cold_cache_idle_secs: 1,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            ctx.reflect()
-                .get::<CompactionRuntime>("compaction")
-                .is_some()
-        );
-
-        let session = sessions.create(None);
-        for idx in 0..6 {
-            session.append(SessionEvent::user(format!(
-                "turn {idx} {}",
-                "x".repeat(450)
-            )));
-            session.append(SessionEvent::assistant_text(format!(
-                "reply {idx} {}",
-                "y".repeat(450)
-            )));
-        }
-
-        let mut stream = llm
-            .stream(GenerateOptions {
-                provider: Some("test-prov".into()),
-                model: Some("claude-sonnet".into()),
-                session_id: Some(session.id.clone()),
-                origin: RequestOrigin::SessionTurn {
-                    session_id: session.id.clone(),
-                    turn: 1,
-                    step: 1,
-                },
-                ..Default::default()
-            })
-            .unwrap();
-        while stream.next().await.is_some() {}
-
-        ctx.emit(
-            EVENT_AGENT_STEP_END,
-            AgentStepEndEvent {
-                session: Arc::clone(&session),
-                turn: 1,
-                step: 1,
-                provider: Some("test-prov".into()),
-                model: Some("claude-sonnet".into()),
-                outcome: StepOutcome::Completed,
-                usage: None,
-                ts_ms: 1,
-            },
-        );
-
-        // 等待 1.2s：初始步骤已超过 1s cold_cache_idle_secs，但 1.0s 时保活已刷新 last_activity_at
-        tokio::time::sleep(Duration::from_millis(1_200)).await;
-        assert_eq!(
-            ctx.cache_warming()
-                .unwrap()
-                .status(&session.id)
-                .unwrap()
-                .warm_count,
-            1
-        );
-
-        let _ = ctx
-            .waterfall(
-                EVENT_AGENT_PRE_STEP,
-                AgentPreStepInput {
-                    session: Arc::clone(&session),
-                    turn: 2,
-                    step: 1,
-                    provider: Some("test-prov".into()),
-                    model: Some("claude-sonnet".into()),
-                    cancel: CancellationToken::new(),
-                    inputs: Vec::new(),
-                },
-                |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-                },
-            )
-            .await;
-        assert!(
-            session.latest_compaction_boundary().is_none(),
-            "cache_warm must reset compaction last_activity_at and prevent premature ColdCache compaction"
-        );
-
-        // 关闭保活后真正闲置 > 1s，ColdCache 应正常触发作为反证对照
-        ctx.cache_warming().unwrap().set_mode(CacheWarmingMode::Off);
-        tokio::time::sleep(Duration::from_millis(1_150)).await;
-        let _ = ctx
-            .waterfall(
-                EVENT_AGENT_PRE_STEP,
-                AgentPreStepInput {
-                    session: Arc::clone(&session),
-                    turn: 3,
-                    step: 1,
-                    provider: Some("test-prov".into()),
-                    model: Some("claude-sonnet".into()),
-                    cancel: CancellationToken::new(),
-                    inputs: Vec::new(),
-                },
-                |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                    Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-                },
-            )
-            .await;
-        assert!(
-            session.latest_compaction_boundary().is_some(),
-            "once warming is disabled and idle exceeds 1s, ColdCache compaction should trigger"
-        );
 
         ctx.fiber().dispose().await;
     }
