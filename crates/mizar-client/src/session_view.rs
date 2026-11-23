@@ -7,12 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Local};
 use cordis::Context;
 use mizar_agent_spine::strip_summary_wrapper;
-use mizar_cache_warming::{CacheWarmingRuntime, SERVICE_CACHE_WARMING};
 use mizar_client_core::{
-    CacheMissAudit, CacheWarmingSessionStatus, ContextBreakdownSnapshot, NoticeLevel,
-    SessionPickerItem, SessionReplayItem, SessionSelection, SessionTreeEntry, SessionViewData,
-    UsageAuditSample, abbreviate_home_path, compute_cache_miss_audit, format_tokens, short_id,
-    truncate_display,
+    CacheMissAudit, ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem,
+    SessionSelection, SessionTreeEntry, SessionViewData, UsageAuditSample, abbreviate_home_path,
+    compute_cache_miss_audit, format_tokens, short_id, truncate_display,
 };
 use mizar_llm::{ContentBlock, LlmContextExt, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
 use mizar_session::{
@@ -342,20 +340,6 @@ fn collect_usage_audit_samples(
     (samples, last_rates)
 }
 
-fn format_eta_secs(secs: u64) -> String {
-    if secs >= 60 {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m{s}s")
-        }
-    } else {
-        format!("{secs}s")
-    }
-}
-
 /// 构造 `/session` 命令的只读会话身份与账目报告。
 pub fn build_session_info_report(
     ctx: &Context,
@@ -365,9 +349,6 @@ pub fn build_session_info_report(
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
 ) -> String {
-    let warming = ctx
-        .get::<CacheWarmingRuntime>(SERVICE_CACHE_WARMING)
-        .and_then(|rt| rt.status(&session.id));
     let providers = ctx
         .llm()
         .map(|llm| llm.provider_infos())
@@ -380,7 +361,6 @@ pub fn build_session_info_report(
         last_prompt_tokens,
         context_breakdown,
         now_millis(),
-        warming.as_ref(),
         &providers,
     )
 }
@@ -403,12 +383,11 @@ pub fn build_session_info_report_at(
         last_prompt_tokens,
         context_breakdown,
         now_ms,
-        None,
         &[],
     )
 }
 
-/// 附带运行期保活状态与路由计价表的完整 `/session` 报告构造函数。
+/// 附带路由计价表的完整 `/session` 报告构造函数。
 #[allow(clippy::too_many_arguments)]
 pub fn build_session_info_report_at_with_cache(
     session: &Session,
@@ -418,7 +397,6 @@ pub fn build_session_info_report_at_with_cache(
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
     now_ms: u128,
-    warming: Option<&CacheWarmingSessionStatus>,
     providers: &[ProviderInfo],
 ) -> String {
     let header = session.header();
@@ -683,34 +661,7 @@ pub fn build_session_info_report_at_with_cache(
     };
     lines.push(format!("上下文   {ctx_summary}"));
 
-    if let Some(st) = warming {
-        let mut parts = vec![st.mode.as_str().to_string()];
-        if st.active {
-            let eta = st
-                .next_warm_in_secs
-                .map(|s| format!("待命（下次 {} 后）", format_eta_secs(s)))
-                .unwrap_or_else(|| "待命中".to_string());
-            parts.push(eta);
-        } else if let Some(ref reason) = st.last_stop_reason {
-            parts.push(format!("已停止（{reason}）"));
-        } else {
-            parts.push("空闲".to_string());
-        }
-        if st.warm_count > 0 {
-            parts.push(format!(
-                "已保活 {} 次（${:.4}）",
-                st.warm_count, st.total_warm_cost_usd
-            ));
-        }
-        lines.push(format!("缓存续命 {}", parts.join(" · ")));
-    }
-
-    if warming.is_some()
-        || audit.miss_events > 0
-        || audit.warm_events > 0
-        || cache_read > 0
-        || cache_write > 0
-    {
+    if audit.miss_events > 0 || audit.warm_events > 0 || cache_read > 0 || cache_write > 0 {
         let mut audit_parts = vec![format!(
             "Cache Re-billed: {} tokens",
             format_tokens(audit.cache_rebilled_tokens)
@@ -864,7 +815,6 @@ pub fn project_session_view(
         selection: session.latest_selection().map(to_ui_selection),
         total_usage,
         last_prompt_tokens,
-        cache_warming: None,
         cache_miss_audit,
     }
 }
@@ -1389,9 +1339,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_session_info_report_renders_cache_warming_status_and_rebilled_audit() {
+    async fn build_session_info_report_renders_rebilled_audit() {
         use cordis::Service;
-        use mizar_cache_warming::CacheWarmingMode;
         use mizar_llm::ModelCostRates;
         use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
 
@@ -1450,17 +1399,6 @@ mod tests {
                 ..Default::default()
             }],
         }];
-        let warming = CacheWarmingSessionStatus {
-            mode: CacheWarmingMode::Idle,
-            active: true,
-            next_warm_in_secs: Some(270),
-            next_warm_at_ms: None,
-            warm_count: 1,
-            total_warm_cost_usd: 0.024,
-            last_stop_reason: None,
-            last_warm_cost_usd: Some(0.024),
-            last_miss_cost_usd: Some(0.276),
-        };
         let breakdown = ContextBreakdownSnapshot::default();
         let report = build_session_info_report_at_with_cache(
             &session,
@@ -1470,14 +1408,10 @@ mod tests {
             Some(80_200),
             &breakdown,
             session.header().updated_at_ms + 1_000,
-            Some(&warming),
             &providers,
         );
 
-        assert!(
-            report.contains("缓存续命 idle · 待命（下次 4m30s 后） · 已保活 1 次（$0.0240）"),
-            "{report}"
-        );
+        assert!(!report.contains("缓存续命"), "{report}");
         assert!(
             report.contains("缓存审计 Cache Re-billed: 80.0k tokens · 1 次意外失效 · 额外 $0.2760 · 续命 1 次（$0.0240）"),
             "{report}"

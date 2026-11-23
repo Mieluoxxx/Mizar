@@ -270,16 +270,6 @@ impl LoadedMizarConfig {
             ));
         }
 
-        #[cfg(feature = "cache-warming")]
-        if let Some(dst) = spine.cache_warming.as_mut() {
-            if let Some(mode) = self.settings.cache_warming {
-                dst.mode = mode;
-            }
-            if let Some(show) = self.settings.show_cache_miss_notices {
-                dst.show_cache_miss_notices = show;
-            }
-        }
-
         #[cfg(feature = "subagent")]
         if let Some(sub) = &self.settings.subagent
             && let Some(dst) = spine.subagent.as_mut()

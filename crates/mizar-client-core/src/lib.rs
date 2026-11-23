@@ -14,10 +14,9 @@ pub mod types;
 pub mod workspace_cache;
 
 pub use cache_audit::{
-    CacheMissAudit, CacheWarmingSessionStatus, MIN_CACHE_DROP_TOKENS, UsageAuditSample,
-    calculate_usage_cost, compute_cache_miss_audit,
+    CacheMissAudit, MIN_CACHE_DROP_TOKENS, UsageAuditSample, calculate_usage_cost,
+    compute_cache_miss_audit,
 };
-pub use mizar_llm_types::CacheWarmingMode;
 
 pub use mentions::{
     FILE_MENTIONS_SOURCE, MentionCandidate, MentionCandidateKind, MentionCaret, MentionToken,

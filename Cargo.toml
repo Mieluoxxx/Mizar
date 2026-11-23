@@ -62,7 +62,6 @@ mizar-recall = { path = "crates/mizar-recall" }
 mizar-system-prompt = { path = "crates/mizar-system-prompt" }
 mizar-agent-loop = { path = "crates/mizar-agent-loop" }
 mizar-agent-spine = { path = "crates/mizar-agent-spine" }
-mizar-cache-warming = { path = "crates/mizar-cache-warming" }
 mizar-subagent = { path = "crates/mizar-subagent" }
 mizar-trajectory-core = { path = "crates/mizar-trajectory-core" }
 mizar-trajectory = { path = "crates/mizar-trajectory" }

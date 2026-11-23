@@ -512,11 +512,7 @@ pub(super) async fn apply_host_setting_change(
                 populate_side_panel_data(ctx, app).await;
             }
         }
-        k if k.starts_with("compaction.")
-            || k.starts_with("sessionTitle.")
-            || k == "cacheWarming"
-            || k == "showCacheMissNotices" =>
-        {
+        k if k.starts_with("compaction.") || k.starts_with("sessionTitle.") => {
             apply_runtime_setting_change(ctx, key, value);
         }
         _ => {}
