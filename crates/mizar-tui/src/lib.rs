@@ -1,4 +1,4 @@
-//! 终端交互式 TUI 客户端宿主：桥接纯前端工作台 `mizar-tui-ui`、`mizar-client` 与 Cordis / AgentLoop / Trajectory 后端。
+//! 终端交互式 TUI 客户端宿主：桥接纯前端工作台 `mizar-tui-ui`、`mizar-client` 与 `MizarRuntime` 后端。
 
 pub mod clipboard;
 pub mod exec;
@@ -6,9 +6,9 @@ pub mod runner;
 pub mod update;
 
 pub use mizar_client::events::{
-    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, WaitServicesError, steer_session,
+    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, steer_session,
     subscribe_session_events, subscribe_session_events_into, to_ui_status, to_ui_step_outcome,
-    to_ui_turn_end_reason, wait_for_services,
+    to_ui_turn_end_reason,
 };
 pub use mizar_client::logging::{
     TracingBridgeGuard, install_silent_tracing, install_tracing_handler,
@@ -25,7 +25,7 @@ pub use mizar_client::settings::{
 pub use mizar_client::{images, mentions};
 
 pub mod emphasis {
-    pub use crate::runner::{TuiEmphasisPlugin, mount_reply_guidance_section};
+    pub use crate::runner::{install_tui_emphasis, mount_reply_guidance_section};
     pub use mizar_tui_ui::emphasis::*;
 }
 
@@ -43,7 +43,8 @@ pub use mizar_tui_ui::{
     trajectory_scene, ui,
 };
 pub use runner::{
-    ResumeTarget, TuiConfig, TuiEmphasisPlugin, TuiExitSummary, build_session_info_report,
+    ResumeTarget, TuiConfig, TuiExitSummary, build_session_info_report,
     build_session_info_report_at, build_settings_entries, format_resume_command,
-    mount_reply_guidance_section, resume_session_into_app, run_tui, run_tui_with_summary,
+    install_tui_emphasis, mount_reply_guidance_section, resume_session_into_app, run_tui,
+    run_tui_with_summary,
 };

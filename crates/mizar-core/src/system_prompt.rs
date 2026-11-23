@@ -1,11 +1,11 @@
 //! 系统提示词（对应 `NamiDSH/packages/system-prompt`）。
 //!
-//! 系统提示词不是写死的字符串，而是由多个插件各自贡献「段落」按 `order` 拼起来的。
+//! 系统提示词不是写死的字符串，而是由各模块各自贡献「段落」按 `order` 拼起来的。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
+use mizar_types::HookGuard;
 
 /// 默认编码 Agent 人设（`order = 0`，纯英文静态前缀）。
 pub const DEFAULT_PERSONA: &str = "\
@@ -69,18 +69,42 @@ impl PromptSection {
 }
 
 pub struct SystemPrompt {
-    persona: String,
-    runtime_protocol: Option<String>,
     sections: Mutex<HashMap<String, PromptSection>>,
 }
 
 impl SystemPrompt {
-    /// 其他插件调用它贡献一段提示词，返回 `Cleanup` 放入 `ctx.effect` 即可随插件卸载移除。
-    pub fn section(self: &Arc<Self>, section: PromptSection) -> Cleanup {
+    /// 构造系统提示词服务，并预装人设（`order = 0`）与可选运行时上下文协议说明（`order = 40`）。
+    pub fn new(config: SystemPromptConfig) -> Arc<Self> {
+        let persona = config
+            .persona
+            .unwrap_or_else(|| DEFAULT_PERSONA.to_string());
+        let runtime_protocol = config
+            .runtime_protocol
+            .filter(|text| !text.trim().is_empty());
+
+        let mut sections = HashMap::new();
+        sections.insert(
+            "persona".to_string(),
+            PromptSection::new("persona", 0, move || Some(persona.clone())),
+        );
+        if let Some(protocol) = runtime_protocol {
+            sections.insert(
+                "runtime_protocol".to_string(),
+                PromptSection::new("runtime_protocol", 40, move || Some(protocol.clone())),
+            );
+        }
+
+        Arc::new(Self {
+            sections: Mutex::new(sections),
+        })
+    }
+
+    /// 其他模块调用它贡献一段提示词，返回 `HookGuard` 在释放时自动移除对应段落。
+    pub fn section(self: &Arc<Self>, section: PromptSection) -> HookGuard {
         let id = section.id.clone();
         self.sections.lock().unwrap().insert(id.clone(), section);
         let weak = Arc::downgrade(self);
-        Cleanup::sync(move || {
+        HookGuard::new(move || {
             if let Some(sp) = weak.upgrade() {
                 sp.sections.lock().unwrap().remove(&id);
             }
@@ -105,141 +129,45 @@ impl SystemPrompt {
     }
 }
 
-impl Service for SystemPrompt {
-    type Config = SystemPromptConfig;
-
-    fn service_name() -> &'static str {
-        "systemPrompt"
-    }
-
-    fn plugin_name() -> &'static str {
-        "SystemPrompt"
-    }
-
-    fn create(_ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        let persona = config
-            .persona
-            .unwrap_or_else(|| DEFAULT_PERSONA.to_string());
-        let runtime_protocol = config
-            .runtime_protocol
-            .filter(|text| !text.trim().is_empty());
-        Ok(Arc::new(Self {
-            persona,
-            runtime_protocol,
-            sections: Mutex::new(HashMap::new()),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let persona = self.persona.clone();
-        let runtime_protocol = self.runtime_protocol.clone();
-        let sp = Arc::clone(&self);
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            let sp_persona = Arc::clone(&sp);
-            ctx.effect("systemPrompt.persona", move || {
-                Ok::<_, CordisError>(Some(sp_persona.section(PromptSection::new(
-                    "persona",
-                    0,
-                    move || Some(persona.clone()),
-                ))))
-            })?;
-            if let Some(protocol) = runtime_protocol {
-                let sp_proto = Arc::clone(&sp);
-                ctx.effect("systemPrompt.runtime-protocol", move || {
-                    Ok::<_, CordisError>(Some(sp_proto.section(PromptSection::new(
-                        "runtime_protocol",
-                        40,
-                        move || Some(protocol.clone()),
-                    ))))
-                })?;
-            }
-            Ok(())
-        })
-    }
-}
-
-pub trait SystemPromptContextExt {
-    fn system_prompt(&self) -> Result<Arc<SystemPrompt>, CordisError>;
-}
-
-impl SystemPromptContextExt for Context {
-    fn system_prompt(&self) -> Result<Arc<SystemPrompt>, CordisError> {
-        self.service::<SystemPrompt>("systemPrompt")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn builds_sections_ordered_deterministically_without_dynamic_date() {
-        let app = Context::new();
-        app.plugin(
-            SystemPrompt::plugin(),
-            SystemPromptConfig {
-                persona: Some("测试人设".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn builds_sections_ordered_deterministically_without_dynamic_date() {
+        let sp = SystemPrompt::new(SystemPromptConfig {
+            persona: Some("测试人设".into()),
+            ..Default::default()
+        });
 
-        let sp = app.system_prompt().unwrap();
-        let h_mid_b = app
-            .effect("extra.b", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                    "b_same_order",
-                    50,
-                    || Some("段落 B".into()),
-                ))))
-            })
-            .unwrap();
-        let h_mid_a = app
-            .effect("extra.a", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                    "a_same_order",
-                    50,
-                    || Some("段落 A".into()),
-                ))))
-            })
-            .unwrap();
+        let h_mid_b = sp.section(PromptSection::new("b_same_order", 50, || {
+            Some("段落 B".into())
+        }));
+        let h_mid_a = sp.section(PromptSection::new("a_same_order", 50, || {
+            Some("段落 A".into())
+        }));
 
         let prompt = sp.build();
         assert!(!prompt.contains("今天是 "));
         let lines: Vec<&str> = prompt.split("\n\n").collect();
         assert_eq!(lines, vec!["测试人设", "段落 A", "段落 B"]);
 
-        h_mid_a.dispose().await;
-        h_mid_b.dispose().await;
+        drop(h_mid_a);
+        drop(h_mid_b);
         let prompt_after = sp.build();
         assert_eq!(prompt_after, "测试人设");
     }
 
-    #[tokio::test]
-    async fn default_persona_and_runtime_protocol_are_english_and_session_aware() {
-        let app = Context::new();
-        app.plugin(
-            SystemPrompt::plugin(),
-            SystemPromptConfig {
-                persona: None,
-                runtime_protocol: Some(DEFAULT_RUNTIME_PROTOCOL.to_string()),
-            },
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn default_persona_and_runtime_protocol_are_english_and_session_aware() {
+        let sp = SystemPrompt::new(SystemPromptConfig {
+            persona: None,
+            runtime_protocol: Some(DEFAULT_RUNTIME_PROTOCOL.to_string()),
+        });
 
-        let sp = app.system_prompt().unwrap();
-        let _h = app
-            .effect("extra.session", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
-                    "session_probe",
-                    20,
-                    |sid| sid.map(|id| format!("Session section: {id}")),
-                ))))
-            })
-            .unwrap();
+        let _h = sp.section(PromptSection::new_for_session("session_probe", 20, |sid| {
+            sid.map(|id| format!("Session section: {id}"))
+        }));
 
         let default_built = sp.build();
         assert!(default_built.contains("Respond in the same language as the user"));

@@ -1,20 +1,16 @@
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxFuture, Context, PluginDef};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{
-    AgentLoopContextExt, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP,
-};
+use mizar_core::agent_loop::{AgentPreStepDecision, AgentPreStepInput};
 use mizar_core::spine::{
-    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CompactionContextExt, CompactionOutcome,
-    ManualCompactOptions, RECALL_TOOL_NAME,
+    AgentSpineConfig, AgentToolsMode, CompactionOutcome, ManualCompactOptions, MizarRuntime,
+    RECALL_TOOL_NAME,
 };
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo,
-    ProviderInfo, StreamChunk,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, ModelInfo, ProviderInfo, StreamChunk,
 };
-use mizar_session::{SessionContextExt, SessionEvent};
-use mizar_tools::{ToolDefinition, ToolExecution, ToolExposure, ToolNamespace, ToolsContextExt};
+use mizar_session::SessionEvent;
+use mizar_tools::{ToolDefinition, ToolExecution, ToolExposure, ToolNamespace};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -91,39 +87,18 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
         instructions.include_default_global = false;
     }
 
-    let app = Context::new();
-    app.plugin(AgentSpinePlugin, cfg).await.unwrap();
+    let runtime = MizarRuntime::build(cfg).await.unwrap();
 
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let adapter = Arc::new(SummaryMockAdapter {
         seen_requests: Arc::clone(&seen_requests),
     });
-    app.plugin(
-        PluginDef::sync("spine-mock-adapter", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter);
-            ctx.effect("spine-mock-adapter.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("spine-mock", a)?))
-            })?;
-            Ok::<_, cordis::CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    )
-    .await
-    .unwrap();
+    runtime.register_adapter("spine-mock", adapter).unwrap();
 
-    // 等核心插件全部 settled
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
-
-    let sessions = app.sessions().unwrap();
-    let tools = app.tools().unwrap();
-    let compaction = app.compaction().unwrap();
-    let _agent_loop = app.agent_loop().unwrap();
+    let sessions = &runtime.sessions;
+    let tools = &runtime.tools;
+    let compaction = runtime.compaction.as_ref().unwrap();
+    let agent_loop = &runtime.agent_loop;
 
     let session = sessions.create(Some("spine-e2e-1".into()));
 
@@ -141,22 +116,16 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
 
     // 2. 首步 pre-step 应注入 AGENTS.md
     session.append(SessionEvent::user("早期关键约束：暗号为 星尘压缩密钥_2026"));
-    if let AgentPreStepDecision::Enter { inputs } = app
-        .waterfall(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepInput {
-                session: Arc::clone(&session),
-                turn: 1,
-                step: 1,
-                provider: Some("spine-mock".into()),
-                model: Some("m-spine".into()),
-                cancel: CancellationToken::new(),
-                inputs: Vec::new(),
-            },
-            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-            },
-        )
+    if let AgentPreStepDecision::Enter { inputs } = agent_loop
+        .run_pre_step(AgentPreStepInput {
+            session: Arc::clone(&session),
+            turn: 1,
+            step: 1,
+            provider: Some("spine-mock".into()),
+            model: Some("m-spine".into()),
+            cancel: CancellationToken::new(),
+            inputs: Vec::new(),
+        })
         .await
     {
         for item in inputs {
@@ -202,22 +171,16 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
     );
 
     // 4. 压后下一步 pre-step：mizar-instructions 应立即重注 AGENTS.md
-    if let AgentPreStepDecision::Enter { inputs } = app
-        .waterfall(
-            EVENT_AGENT_PRE_STEP,
-            AgentPreStepInput {
-                session: Arc::clone(&session),
-                turn: 2,
-                step: 1,
-                provider: Some("spine-mock".into()),
-                model: Some("m-spine".into()),
-                cancel: CancellationToken::new(),
-                inputs: Vec::new(),
-            },
-            |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-            },
-        )
+    if let AgentPreStepDecision::Enter { inputs } = agent_loop
+        .run_pre_step(AgentPreStepInput {
+            session: Arc::clone(&session),
+            turn: 2,
+            step: 1,
+            provider: Some("spine-mock".into()),
+            model: Some("m-spine".into()),
+            cancel: CancellationToken::new(),
+            inputs: Vec::new(),
+        })
         .await
     {
         for item in inputs {
@@ -257,7 +220,7 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
     assert!(!read_res.is_error, "{}", read_res.content);
     assert!(read_res.content.contains("星尘压缩密钥_2026"));
 
-    app.fiber().dispose().await;
+    runtime.shutdown().await;
     let _ = std::fs::remove_dir_all(&ws);
 }
 
@@ -287,16 +250,10 @@ async fn headless_zero_mcp_zero_skill_freezes_seven_tools_and_codemode_activates
         instructions.include_default_global = false;
     }
 
-    let app = Context::new();
-    app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
+    let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-    let sessions = app.sessions().unwrap();
-    let tools = app.tools().unwrap();
+    let sessions = &runtime.sessions;
+    let tools = &runtime.tools;
     let session = sessions.create(Some("seven-tools-1".into()));
 
     let mut initial_names: Vec<String> = tools
@@ -336,6 +293,6 @@ async fn headless_zero_mcp_zero_skill_freezes_seven_tools_and_codemode_activates
     assert!(active_names.contains(&"codemode".to_string()));
     assert!(active_names.contains(&"tool_search".to_string()));
 
-    app.fiber().dispose().await;
+    runtime.shutdown().await;
     let _ = std::fs::remove_dir_all(&ws);
 }

@@ -24,16 +24,3 @@ pub use files::{
     resolve_mizar_home,
 };
 pub use state::AgentInstructions;
-
-use cordis::{Context, CordisError};
-use std::sync::Arc;
-
-pub trait InstructionsContextExt {
-    fn agent_instructions(&self) -> Result<Arc<AgentInstructions>, CordisError>;
-}
-
-impl InstructionsContextExt for Context {
-    fn agent_instructions(&self) -> Result<Arc<AgentInstructions>, CordisError> {
-        self.service::<AgentInstructions>("agentInstructions")
-    }
-}

@@ -5,12 +5,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
-use cordis::Context;
-use mizar_core::spine::strip_summary_wrapper;
-use mizar_llm::{ContentBlock, LlmContextExt, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
+use mizar_core::spine::{MizarRuntime, strip_summary_wrapper};
+use mizar_llm::{ContentBlock, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
 use mizar_session::{
-    Session, SessionEvent, SessionListQuery, SessionPersistenceContextExt, SessionStore,
-    SessionTraceEvent, TraceSeverity,
+    Session, SessionEvent, SessionListQuery, SessionStore, SessionTraceEvent, TraceSeverity,
 };
 use mizar_types::client::{
     CacheMissAudit, ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem,
@@ -342,20 +340,17 @@ fn collect_usage_audit_samples(
 
 /// 构造 `/session` 命令的只读会话身份与账目报告。
 pub fn build_session_info_report(
-    ctx: &Context,
+    runtime: &MizarRuntime,
     session: &Session,
     session_db_path: Option<&Path>,
     context_window: u64,
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
 ) -> String {
-    let providers = ctx
-        .llm()
-        .map(|llm| llm.provider_infos())
-        .unwrap_or_default();
+    let providers = runtime.llm.provider_infos();
     build_session_info_report_at_with_cache(
         session,
-        ctx.session_persistence().is_some(),
+        runtime.persistence.is_some(),
         session_db_path,
         context_window,
         last_prompt_tokens,
@@ -1148,10 +1143,8 @@ mod tests {
     #[tokio::test]
     async fn project_resume_view_maps_turn_notice_and_truncated_turn_end_to_notice_never_assistant()
     {
-        use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
-        use mizar_session::SessionContextExt;
+        use mizar_core::spine::{AgentSpineConfig, AgentToolsMode};
 
-        let ctx = Context::new();
         let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         if let AgentToolsMode::Coding {
             ref mut mcp,
@@ -1164,10 +1157,9 @@ mod tests {
             skills.include_default_roots = false;
             instructions.include_default_global = false;
         }
-        ctx.plugin(AgentSpinePlugin, cfg);
-        crate::events::wait_for_services(&ctx).await.unwrap();
+        let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let session = ctx.sessions().unwrap().create(None);
+        let session = runtime.sessions.create(None);
         session.append(SessionEvent::user("hi"));
         session.append_trace(SessionTraceEvent::TurnNotice {
             turn: 1,
@@ -1221,20 +1213,16 @@ mod tests {
             } if text.contains("max_tokens")
         )));
 
-        ctx.fiber().dispose().await;
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
     async fn build_session_info_report_covers_full_identity_ledger_and_empty_omissions() {
-        use cordis::Service;
         use mizar_session::{
-            CompactionDigest, SessionContextExt, SessionCreateOptions, SessionEvent, SessionStore,
-            SessionTraceEvent,
+            CompactionDigest, SessionCreateOptions, SessionEvent, SessionStore, SessionTraceEvent,
         };
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let store = SessionStore::new();
 
         let parent = store.create(None);
         parent.append(SessionEvent::user("parent"));
@@ -1313,19 +1301,14 @@ mod tests {
         );
         assert!(!fresh_report.contains("谱系") && !fresh_report.contains("压缩"));
         assert!(fresh_report.contains("存储     仅内存（未持久化）"));
-
-        ctx.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn build_session_info_report_renders_rebilled_audit() {
-        use cordis::Service;
         use mizar_llm::ModelCostRates;
-        use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
+        use mizar_session::{SessionEvent, SessionStore};
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let store = SessionStore::new();
         let session = store.create(None);
         session.record_selection(Some("anthropic".into()), Some("claude-sonnet".into()), None);
         session.append(SessionEvent::Assistant {
@@ -1400,18 +1383,13 @@ mod tests {
         assert_eq!(view.cache_miss_audit.cache_rebilled_tokens, 80_000);
         assert_eq!(view.cache_miss_audit.miss_events, 1);
         assert_eq!(view.cache_miss_audit.warm_events, 1);
-
-        ctx.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn latest_workspace_selection_skips_newer_subagent_child_session() {
-        use cordis::Service;
-        use mizar_session::{SessionContextExt, SessionCreateOptions};
+        use mizar_session::{SessionCreateOptions, SessionStore};
 
-        let ctx = Context::new();
-        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-        let store = ctx.sessions().unwrap();
+        let store = SessionStore::new();
         let ws = PathBuf::from("/tmp/mizar-ws-sel");
 
         let parent = store.create_with(SessionCreateOptions {
@@ -1437,7 +1415,5 @@ mod tests {
         let sel = latest_workspace_selection(&store, &ws).expect("should find parent selection");
         assert_eq!(sel.provider.as_deref(), Some("anthropic"));
         assert_eq!(sel.model.as_deref(), Some("claude-sonnet"));
-
-        ctx.fiber().dispose().await;
     }
 }

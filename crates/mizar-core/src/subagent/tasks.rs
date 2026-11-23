@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::subagent::{SubagentError, SubagentMode};
 
-pub const EVENT_SUBAGENT_STATE: &str = "subagent/state";
 const MAX_SETTLED_PER_PARENT: usize = 32;
 
 /// 后台或同步 Subagent 单次运行的生命周期状态。
@@ -63,7 +62,7 @@ pub struct SubagentTaskSnapshot {
     pub summary: Option<String>,
 }
 
-/// 通过 Cordis 事件总线广播的 Subagent 生命周期变更通知。
+/// 通过强类型状态事件总线广播的 Subagent 生命周期变更通知。
 #[derive(Debug, Clone)]
 pub struct SubagentStateEvent {
     pub parent_session_id: String,

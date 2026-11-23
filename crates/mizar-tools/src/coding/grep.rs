@@ -801,14 +801,14 @@ pub fn create_grep_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
                         .or_else(|| args.get("outputMode"))
                         .and_then(Value::as_str),
                 )
-                .map_err(|e| -> cordis::BoxError { e.into() })?;
+                .map_err(|e| -> mizar_types::BoxError { e.into() })?;
 
                 if call_ctx.cancel.is_cancelled() {
                     return Err("Operation aborted".into());
                 }
 
                 let search_path = resolve_to_cwd(&cwd, raw_path, restrict_to_workspace)
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
                 let meta = tokio::fs::metadata(&search_path)
                     .await
                     .map_err(|_| format!("Path not found: {}", search_path.display()))?;
@@ -955,7 +955,7 @@ mod tests {
             exec: ToolExecution::new("grep", args.clone(), None),
             cancel: CancellationToken::new(),
             on_update: None,
-            ctx: cordis::Context::new(),
+            tools: crate::ToolRuntime::new(),
         }
     }
 

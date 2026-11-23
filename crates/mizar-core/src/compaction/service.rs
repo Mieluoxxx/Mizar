@@ -1,4 +1,4 @@
-//! `CompactionRuntime` Cordis 服务（`"compaction"`）：
+//! `CompactionRuntime` 上下文压缩服务：
 //! 统一编排单阶段检查点摘要、溢出兜底恢复、手动 `/compact`、上下文压力探测与 `write` 写前读守卫。
 
 use std::collections::{HashMap, HashSet};
@@ -6,18 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{
-    AgentEvent, AgentPreStepDecision, AgentPreStepInput, AgentRequestErrorDecision,
-    AgentRequestErrorInput, AgentRequestErrorKind, EVENT_AGENT_PRE_STEP, EVENT_AGENT_REQUEST_ERROR,
-    StepOutcome, subscribe_agent_events_when_ready,
+    AgentEvent, AgentLoop, AgentPreStepDecision, AgentPreStepInput, AgentRequestErrorDecision,
+    AgentRequestErrorInput, AgentRequestErrorKind, StepOutcome,
 };
-use crate::system_prompt::SystemPromptContextExt;
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Next, Service};
-use mizar_llm::LlmContextExt;
-use mizar_session::{Session, SessionContextExt, SessionTraceEvent};
-use mizar_tools::{
-    EVENT_TOOLS_POST_EXECUTE, EVENT_TOOLS_PRE_EXECUTE, PostExecuteInput, PreExecuteDecision,
-    ToolExecution, ToolResult, ToolsContextExt,
-};
+use crate::system_prompt::SystemPrompt;
+use mizar_llm::LlmRuntime;
+use mizar_session::{Session, SessionStore, SessionTraceEvent};
+use mizar_tools::{PostExecuteInput, PreExecuteDecision, ToolExecution, ToolResult, ToolRuntime};
+use mizar_types::{BoxFuture, HookGuard, HookOptions, Next, SyncEventBus};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::budget::{
@@ -29,8 +25,7 @@ use crate::compaction::summarizer::{SummarizeParams, generate_checkpoint_summary
 use crate::compaction::{
     CompactionConfig, CompactionEndEvent, CompactionError, CompactionOutcome,
     CompactionProgressEvent, CompactionReport, CompactionStartEvent, CompactionTrigger,
-    ContextPressureReport, EVENT_COMPACTION_END, EVENT_COMPACTION_PROGRESS, EVENT_COMPACTION_START,
-    ManualCompactOptions,
+    ContextPressureReport, ManualCompactOptions,
 };
 
 #[derive(Debug, Default)]
@@ -50,15 +45,225 @@ impl Drop for InFlightGuard {
 }
 
 pub struct CompactionRuntime {
-    ctx: Context,
+    llm: Arc<LlmRuntime>,
+    tools: Arc<ToolRuntime>,
+    system_prompt: Arc<SystemPrompt>,
     config: Arc<Mutex<CompactionConfig>>,
     module_enabled: AtomicBool,
     in_flight: Arc<Mutex<HashSet<String>>>,
     sessions_meta: Arc<Mutex<HashMap<String, SessionCompactionMeta>>>,
     file_guards: Arc<FileGuardTracker>,
+    on_start: SyncEventBus<CompactionStartEvent>,
+    on_progress: SyncEventBus<CompactionProgressEvent>,
+    on_end: Arc<SyncEventBus<CompactionEndEvent>>,
 }
 
 impl CompactionRuntime {
+    pub fn new(
+        llm: Arc<LlmRuntime>,
+        tools: Arc<ToolRuntime>,
+        system_prompt: Arc<SystemPrompt>,
+        config: CompactionConfig,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            llm,
+            tools,
+            system_prompt,
+            config: Arc::new(Mutex::new(config)),
+            module_enabled: AtomicBool::new(true),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            sessions_meta: Arc::new(Mutex::new(HashMap::new())),
+            file_guards: Arc::new(FileGuardTracker::new()),
+            on_start: SyncEventBus::new(),
+            on_progress: SyncEventBus::new(),
+            on_end: Arc::new(SyncEventBus::new()),
+        })
+    }
+
+    pub fn install(
+        llm: Arc<LlmRuntime>,
+        sessions: &Arc<SessionStore>,
+        tools: &Arc<ToolRuntime>,
+        system_prompt: Arc<SystemPrompt>,
+        agent_loop: &Arc<AgentLoop>,
+        config: CompactionConfig,
+    ) -> (Arc<Self>, HookGuard) {
+        let rt = Self::new(llm, Arc::clone(tools), system_prompt, config);
+        let mut guards = Vec::new();
+
+        // 1. 步前自动检查水位并触发单阶段检查点压缩（priority = -20，早于 instructions/skills）
+        {
+            let weak = Arc::downgrade(&rt);
+            guards.push(
+                agent_loop.pre_step_hook().register_with(
+                    HookOptions {
+                        priority: -20,
+                        ..Default::default()
+                    },
+                    move |input: AgentPreStepInput,
+                          next: Next<
+                        AgentPreStepInput,
+                        BoxFuture<'static, AgentPreStepDecision>,
+                    >| {
+                        let weak = weak.clone();
+                        Box::pin(async move {
+                            if input.cancel.is_cancelled() {
+                                return AgentPreStepDecision::Reject {
+                                    reason: "cancelled".to_string(),
+                                };
+                            }
+                            if let Some(rt) = weak.upgrade() {
+                                rt.handle_pre_step(&input).await;
+                            }
+                            next.call(input).await
+                        }) as BoxFuture<'static, AgentPreStepDecision>
+                    },
+                ),
+            );
+        }
+
+        // 2. 步后记录最近真正成功答复过的 `(provider, model)` 路由
+        {
+            let weak = Arc::downgrade(&rt);
+            let meta = Arc::clone(&rt.sessions_meta);
+            let ev_guard = agent_loop.on_event(move |ev| {
+                let Some(rt_step) = weak.upgrade() else {
+                    return;
+                };
+                if !rt_step.is_module_enabled() {
+                    return;
+                }
+                if let AgentEvent::StepEnd(ev) = ev
+                    && matches!(ev.outcome, StepOutcome::Completed | StepOutcome::ToolCalls)
+                    && (ev.provider.is_some() || ev.model.is_some())
+                {
+                    let mut guard = meta.lock().unwrap();
+                    let entry = guard.entry(ev.session.id.clone()).or_default();
+                    entry.last_answered_route = Some((ev.provider.clone(), ev.model.clone()));
+                }
+            });
+            guards.push(HookGuard::new(move || drop(ev_guard)));
+        }
+
+        // 3. 溢出错误自动压缩并重试恢复
+        {
+            let weak = Arc::downgrade(&rt);
+            guards.push(agent_loop.request_error_hook().register(
+                move |input: AgentRequestErrorInput,
+                      next: Next<
+                    AgentRequestErrorInput,
+                    BoxFuture<'static, AgentRequestErrorDecision>,
+                >| {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        if input.kind == AgentRequestErrorKind::ContextOverflow
+                            && let Some(rt) = weak.upgrade()
+                            && rt.handle_overflow(&input).await
+                        {
+                            return AgentRequestErrorDecision::Retry;
+                        }
+                        next.call(input).await
+                    }) as BoxFuture<'static, AgentRequestErrorDecision>
+                },
+            ));
+        }
+
+        // 4. 统一 `write` 写前读守卫（>50 行首读要求 + 压后陈旧整文件覆写拦截）
+        {
+            let weak = Arc::downgrade(&rt);
+            let file_guards = Arc::clone(&rt.file_guards);
+            let sessions_pre = Arc::clone(sessions);
+            guards.push(tools.pre_execute_hook().register(
+                move |exec: ToolExecution,
+                      next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+                    let weak = weak.clone();
+                    let file_guards = Arc::clone(&file_guards);
+                    let sessions_ref = Arc::clone(&sessions_pre);
+                    Box::pin(async move {
+                        if weak
+                            .upgrade()
+                            .is_some_and(|rt| rt.is_module_enabled())
+                        {
+                            let decision = file_guards.check_pre_execute(&exec, &sessions_ref);
+                            if !decision.allow {
+                                return decision;
+                            }
+                        }
+                        next.call(exec).await
+                    }) as BoxFuture<'static, PreExecuteDecision>
+                },
+            ));
+        }
+
+        // 5. 追踪成功 `read`/`write` 后的文件可见状态
+        {
+            let weak = Arc::downgrade(&rt);
+            let file_guards = Arc::clone(&rt.file_guards);
+            let sessions_post = Arc::clone(sessions);
+            guards.push(tools.post_execute_hook().register(
+                move |input: PostExecuteInput,
+                      next: Next<PostExecuteInput, BoxFuture<'static, ToolResult>>| {
+                    let weak = weak.clone();
+                    let file_guards = Arc::clone(&file_guards);
+                    let sessions_ref = Arc::clone(&sessions_post);
+                    Box::pin(async move {
+                        if !weak
+                            .upgrade()
+                            .is_some_and(|rt| rt.is_module_enabled())
+                        {
+                            return next.call(input).await;
+                        }
+                        let exec = input.exec.clone();
+                        let res = next.call(input).await;
+                        file_guards.handle_post_execute(&exec, res, &sessions_ref)
+                    }) as BoxFuture<'static, ToolResult>
+                },
+            ));
+        }
+
+        // 6. 追踪会话真实落盘序号，对齐 FileGuardTracker 的 `last_read_seq`
+        {
+            let weak = Arc::downgrade(&rt);
+            let file_guards = Arc::clone(&rt.file_guards);
+            guards.push(sessions.on_event(move |ev| {
+                if !weak.upgrade().is_some_and(|rt| rt.is_module_enabled()) {
+                    return;
+                }
+                if let mizar_session::SessionEvent::ToolResult {
+                    tool_call_id,
+                    is_error: false,
+                    ..
+                } = &ev.entry.event
+                {
+                    file_guards.reconcile_tool_result_seq(
+                        &ev.session.id,
+                        tool_call_id,
+                        ev.entry.seq,
+                    );
+                }
+            }));
+        }
+
+        (rt, HookGuard::group(guards))
+    }
+
+    pub fn on_start(
+        &self,
+        cb: impl Fn(&CompactionStartEvent) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.on_start.on(cb)
+    }
+
+    pub fn on_progress(
+        &self,
+        cb: impl Fn(&CompactionProgressEvent) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.on_progress.on(cb)
+    }
+
+    pub fn on_end(&self, cb: impl Fn(&CompactionEndEvent) + Send + Sync + 'static) -> HookGuard {
+        self.on_end.on(cb)
+    }
     pub fn is_module_enabled(&self) -> bool {
         self.module_enabled.load(Ordering::Acquire)
     }
@@ -96,26 +301,24 @@ impl CompactionRuntime {
         model: Option<&str>,
         default_window: u64,
     ) -> (u64, Option<u32>) {
-        if let Ok(llm) = self.ctx.llm() {
-            let providers = llm.provider_infos();
-            let chosen_model = match provider {
-                Some(pid) => providers
+        let providers = self.llm.provider_infos();
+        let chosen_model = match provider {
+            Some(pid) => providers
+                .iter()
+                .find(|p| p.id == pid)
+                .and_then(|p| match model {
+                    Some(mid) => p.models.iter().find(|m| m.id == mid),
+                    None => p.models.first(),
+                }),
+            None => match model {
+                Some(mid) => providers
                     .iter()
-                    .find(|p| p.id == pid)
-                    .and_then(|p| match model {
-                        Some(mid) => p.models.iter().find(|m| m.id == mid),
-                        None => p.models.first(),
-                    }),
-                None => match model {
-                    Some(mid) => providers
-                        .iter()
-                        .find_map(|p| p.models.iter().find(|m| m.id == mid)),
-                    None => providers.first().and_then(|p| p.models.first()),
-                },
-            };
-            if let Some(m) = chosen_model {
-                return (m.context_window.unwrap_or(default_window), m.max_tokens);
-            }
+                    .find_map(|p| p.models.iter().find(|m| m.id == mid)),
+                None => providers.first().and_then(|p| p.models.first()),
+            },
+        };
+        if let Some(m) = chosen_model {
+            return (m.context_window.unwrap_or(default_window), m.max_tokens);
         }
         (default_window, None)
     }
@@ -135,16 +338,8 @@ impl CompactionRuntime {
         &self,
         session_id: &str,
     ) -> (String, Vec<mizar_llm::ToolSchema>, usize) {
-        let system_prompt = self
-            .ctx
-            .system_prompt()
-            .map(|sp| sp.build_for_session(Some(session_id)))
-            .unwrap_or_default();
-        let tools = self
-            .ctx
-            .tools()
-            .map(|rt| rt.list_declared(Some(session_id)))
-            .unwrap_or_default();
+        let system_prompt = self.system_prompt.build_for_session(Some(session_id));
+        let tools = self.tools.list_declared(Some(session_id));
         let tools_chars: usize = tools
             .iter()
             .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
@@ -299,7 +494,7 @@ impl CompactionRuntime {
         let tokens_before = estimate_session_context_tokens(&session, &sys_prompt, tools_chars);
 
         struct CompactionTraceGuard {
-            ctx: Context,
+            on_end: Arc<SyncEventBus<CompactionEndEvent>>,
             session: Arc<Session>,
             trigger: CompactionTrigger,
             tokens_before: u64,
@@ -314,21 +509,16 @@ impl CompactionRuntime {
                         tokens_before: Some(self.tokens_before),
                         tokens_after: Some(self.tokens_before),
                     });
-                    self.ctx.emit(
-                        EVENT_COMPACTION_END,
-                        CompactionEndEvent {
-                            session_id: self.session.id.clone(),
-                            trigger: self.trigger,
-                            outcome: CompactionOutcome::Failed,
-                            tokens_before: self.tokens_before,
-                            tokens_after: self.tokens_before,
-                            first_kept_seq: None,
-                            summary_preview: None,
-                            skipped_reason: Some(
-                                "compaction aborted before completion".to_string(),
-                            ),
-                        },
-                    );
+                    self.on_end.emit(&CompactionEndEvent {
+                        session_id: self.session.id.clone(),
+                        trigger: self.trigger,
+                        outcome: CompactionOutcome::Failed,
+                        tokens_before: self.tokens_before,
+                        tokens_after: self.tokens_before,
+                        first_kept_seq: None,
+                        summary_preview: None,
+                        skipped_reason: Some("compaction aborted before completion".to_string()),
+                    });
                 }
             }
         }
@@ -337,17 +527,14 @@ impl CompactionRuntime {
         session.append_trace(SessionTraceEvent::CompactionStart {
             trigger: trigger.as_str().to_string(),
         });
-        self.ctx.emit(
-            EVENT_COMPACTION_START,
-            CompactionStartEvent {
-                session_id: session.id.clone(),
-                trigger,
-                tokens_before,
-                context_window: budget.context_window,
-            },
-        );
+        self.on_start.emit(&CompactionStartEvent {
+            session_id: session.id.clone(),
+            trigger,
+            tokens_before,
+            context_window: budget.context_window,
+        });
         let mut trace_guard = CompactionTraceGuard {
-            ctx: self.ctx.clone(),
+            on_end: Arc::clone(&self.on_end),
             session: Arc::clone(&session),
             trigger,
             tokens_before,
@@ -394,31 +581,7 @@ impl CompactionRuntime {
             return Ok(report);
         };
 
-        let llm = match self.ctx.llm() {
-            Ok(llm) => llm,
-            Err(err) => {
-                session.append_trace(SessionTraceEvent::CompactionEnd {
-                    status: "failed".to_string(),
-                    first_kept_seq: None,
-                    tokens_before: Some(tokens_before),
-                    tokens_after: Some(tokens_before),
-                });
-                let err_report = CompactionReport {
-                    outcome: CompactionOutcome::Failed,
-                    trigger,
-                    tokens_before,
-                    tokens_after: tokens_before,
-                    first_kept_seq: None,
-                    summary_preview: None,
-                    skipped_reason: Some(err.to_string()),
-                };
-                self.emit_end_event(&session.id, &err_report);
-                trace_guard.finished = true;
-                return Err(err.into());
-            }
-        };
         let current_visible_messages = session.derive_messages();
-        let ctx_for_progress = self.ctx.clone();
         let sid_for_progress = session.id.clone();
 
         // 溢出场景当前前缀已爆窗，禁止复用前缀，直接走纯净转写请求
@@ -426,7 +589,7 @@ impl CompactionRuntime {
 
         let summary_res = generate_checkpoint_summary(
             SummarizeParams {
-                llm: &llm,
+                llm: &self.llm,
                 session_id: Some(session.id.clone()),
                 provider: effective_provider.clone(),
                 model: effective_model.clone(),
@@ -439,14 +602,11 @@ impl CompactionRuntime {
                 cancel: cancel.clone(),
             },
             |stage, delta_chars| {
-                ctx_for_progress.emit(
-                    EVENT_COMPACTION_PROGRESS,
-                    CompactionProgressEvent {
-                        session_id: sid_for_progress.clone(),
-                        stage: stage.to_string(),
-                        delta_chars,
-                    },
-                );
+                self.on_progress.emit(&CompactionProgressEvent {
+                    session_id: sid_for_progress.clone(),
+                    stage: stage.to_string(),
+                    delta_chars,
+                });
             },
         )
         .await;
@@ -516,9 +676,7 @@ impl CompactionRuntime {
         let tokens_after_est = resident_overhead + checkpoint_tokens + cut.kept_tokens;
 
         // 压后联动：清空本会话临时激活的延迟工具（recall 会由其事件监听重新激活）
-        if let Ok(tools_rt) = self.ctx.tools() {
-            tools_rt.reset_session_activations(&session.id);
-        }
+        self.tools.reset_session_activations(&session.id);
 
         session.compact_at(
             summary_out.summary.clone(),
@@ -554,19 +712,16 @@ impl CompactionRuntime {
     }
 
     fn emit_end_event(&self, session_id: &str, report: &CompactionReport) {
-        self.ctx.emit(
-            EVENT_COMPACTION_END,
-            CompactionEndEvent {
-                session_id: session_id.to_string(),
-                trigger: report.trigger,
-                outcome: report.outcome,
-                tokens_before: report.tokens_before,
-                tokens_after: report.tokens_after,
-                first_kept_seq: report.first_kept_seq,
-                summary_preview: report.summary_preview.clone(),
-                skipped_reason: report.skipped_reason.clone(),
-            },
-        );
+        self.on_end.emit(&CompactionEndEvent {
+            session_id: session_id.to_string(),
+            trigger: report.trigger,
+            outcome: report.outcome,
+            tokens_before: report.tokens_before,
+            tokens_after: report.tokens_after,
+            first_kept_seq: report.first_kept_seq,
+            summary_preview: report.summary_preview.clone(),
+            skipped_reason: report.skipped_reason.clone(),
+        });
     }
 }
 
@@ -578,238 +733,4 @@ fn build_summary_preview(summary: &str, max_chars: usize) -> String {
     }
     let head: String = cleaned.chars().take(max_chars).collect();
     format!("{head}…")
-}
-
-impl Service for CompactionRuntime {
-    type Config = CompactionConfig;
-
-    fn service_name() -> &'static str {
-        "compaction"
-    }
-
-    fn plugin_name() -> &'static str {
-        "CompactionRuntime"
-    }
-
-    fn inject() -> Inject {
-        Inject::from(["llm", "sessions", "tools", "systemPrompt"])
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            config: Arc::new(Mutex::new(config)),
-            module_enabled: AtomicBool::new(true),
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
-            sessions_meta: Arc::new(Mutex::new(HashMap::new())),
-            file_guards: Arc::new(FileGuardTracker::new()),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            // 1. 步前自动检查水位并触发单阶段检查点压缩
-            {
-                let rt = Arc::clone(&self);
-                let c = ctx.clone();
-                ctx.effect("compaction.pre-step", move || {
-                    let h = c.on_waterfall_with(
-                        EVENT_AGENT_PRE_STEP,
-                        move |input: AgentPreStepInput,
-                              next: Next<
-                            AgentPreStepInput,
-                            BoxFuture<'static, AgentPreStepDecision>,
-                        >| {
-                            let rt = Arc::clone(&rt);
-                            Box::pin(async move {
-                                if input.cancel.is_cancelled() {
-                                    return AgentPreStepDecision::Reject {
-                                        reason: "cancelled".to_string(),
-                                    };
-                                }
-                                rt.handle_pre_step(&input).await;
-                                next.call(input).await
-                            })
-                                as BoxFuture<'static, AgentPreStepDecision>
-                        },
-                        cordis::EventOptions {
-                            priority: -20,
-                            ..Default::default()
-                        },
-                    )?;
-                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?;
-            }
-
-            // 2. 步后记录最近真正成功答复过的 `(provider, model)` 路由
-            {
-                let rt_step = Arc::clone(&self);
-                let meta = Arc::clone(&self.sessions_meta);
-                subscribe_agent_events_when_ready(&ctx, "compaction.step-end", move |ev| {
-                    if !rt_step.is_module_enabled() {
-                        return;
-                    }
-                    if let AgentEvent::StepEnd(ev) = ev
-                        && matches!(ev.outcome, StepOutcome::Completed | StepOutcome::ToolCalls)
-                        && (ev.provider.is_some() || ev.model.is_some())
-                    {
-                        let mut guard = meta.lock().unwrap();
-                        let entry = guard.entry(ev.session.id.clone()).or_default();
-                        entry.last_answered_route = Some((ev.provider.clone(), ev.model.clone()));
-                    }
-                })
-                .await?;
-            }
-
-            // 3. 溢出错误自动压缩并重试恢复
-            {
-                let rt = Arc::clone(&self);
-                let c = ctx.clone();
-                ctx.effect("compaction.request-error", move || {
-                    let h = c.on_waterfall(
-                        EVENT_AGENT_REQUEST_ERROR,
-                        move |input: AgentRequestErrorInput,
-                              next: Next<
-                            AgentRequestErrorInput,
-                            BoxFuture<'static, AgentRequestErrorDecision>,
-                        >| {
-                            let rt = Arc::clone(&rt);
-                            Box::pin(async move {
-                                if input.kind == AgentRequestErrorKind::ContextOverflow
-                                    && rt.handle_overflow(&input).await
-                                {
-                                    return AgentRequestErrorDecision::Retry;
-                                }
-                                next.call(input).await
-                            })
-                                as BoxFuture<'static, AgentRequestErrorDecision>
-                        },
-                    )?;
-                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?;
-            }
-
-            // 4. 统一 `write` 写前读守卫（>50 行首读要求 + 压后陈旧整文件覆写拦截）
-            {
-                let rt_pre = Arc::clone(&self);
-                let guards = Arc::clone(&self.file_guards);
-                let c = ctx.clone();
-                let c_inner = ctx.clone();
-                ctx.effect("compaction.pre-execute-guard", move || {
-                    let h =
-                        c.on_waterfall(
-                            EVENT_TOOLS_PRE_EXECUTE,
-                            move |exec: ToolExecution,
-                                  next: Next<
-                                ToolExecution,
-                                BoxFuture<'static, PreExecuteDecision>,
-                            >| {
-                                let rt_pre = Arc::clone(&rt_pre);
-                                let guards = Arc::clone(&guards);
-                                let ctx_ref = c_inner.clone();
-                                Box::pin(async move {
-                                    if !rt_pre.is_module_enabled() {
-                                        return next.call(exec).await;
-                                    }
-                                    if let Ok(sessions) = ctx_ref.sessions() {
-                                        let decision = guards.check_pre_execute(&exec, &sessions);
-                                        if !decision.allow {
-                                            return decision;
-                                        }
-                                    }
-                                    next.call(exec).await
-                                })
-                                    as BoxFuture<'static, PreExecuteDecision>
-                            },
-                        )?;
-                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?;
-            }
-
-            // 5. 追踪成功 `read`/`write` 后的文件可见状态
-            {
-                let rt_post = Arc::clone(&self);
-                let guards = Arc::clone(&self.file_guards);
-                let c = ctx.clone();
-                let c_inner = ctx.clone();
-                ctx.effect("compaction.post-execute-guard", move || {
-                    let h = c.on_waterfall(
-                        EVENT_TOOLS_POST_EXECUTE,
-                        move |input: PostExecuteInput,
-                              next: Next<PostExecuteInput, BoxFuture<'static, ToolResult>>| {
-                            let rt_post = Arc::clone(&rt_post);
-                            let guards = Arc::clone(&guards);
-                            let ctx_ref = c_inner.clone();
-                            Box::pin(async move {
-                                if !rt_post.is_module_enabled() {
-                                    return next.call(input).await;
-                                }
-                                let exec = input.exec.clone();
-                                let res = next.call(input).await;
-                                if let Ok(sessions) = ctx_ref.sessions() {
-                                    guards.handle_post_execute(&exec, res, &sessions)
-                                } else {
-                                    res
-                                }
-                            }) as BoxFuture<'static, ToolResult>
-                        },
-                    )?;
-                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?;
-            }
-
-            // 6. 追踪会话真实落盘序号，对齐 FileGuardTracker 的 `last_read_seq`
-            {
-                let rt_seq = Arc::clone(&self);
-                let guards = Arc::clone(&self.file_guards);
-                let c = ctx.clone();
-                ctx.effect("compaction.session-event-seq", move || {
-                    let h = c.on(
-                        mizar_session::EVENT_SESSION_EVENT,
-                        move |ev: &mizar_session::SessionEventPayload| {
-                            if !rt_seq.is_module_enabled() {
-                                return;
-                            }
-                            if let mizar_session::SessionEvent::ToolResult {
-                                tool_call_id,
-                                is_error: false,
-                                ..
-                            } = &ev.entry.event
-                            {
-                                guards.reconcile_tool_result_seq(
-                                    &ev.session.id,
-                                    tool_call_id,
-                                    ev.entry.seq,
-                                );
-                            }
-                        },
-                    )?;
-                    Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
-                        h.dispose().await;
-                    })))
-                })?;
-            }
-
-            Ok(())
-        })
-    }
-}
-
-pub trait CompactionContextExt {
-    fn compaction(&self) -> Result<Arc<CompactionRuntime>, CordisError>;
-}
-
-impl CompactionContextExt for Context {
-    fn compaction(&self) -> Result<Arc<CompactionRuntime>, CordisError> {
-        self.service::<CompactionRuntime>("compaction")
-    }
 }

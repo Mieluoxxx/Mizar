@@ -19,11 +19,11 @@ use crate::http::{
 };
 use crate::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    LlmAdapter, LlmError, LlmErrorCode, LlmRuntime, Message, ModelInfo, ProviderInfo,
     ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, resolve_cache_retention,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
+use mizar_types::hooks::{BoxFuture, HookGuard};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_MESSAGES: &str = "anthropic-messages";
@@ -1026,36 +1026,12 @@ impl LlmAdapter for MessagesAdapter {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct MessagesPlugin;
-
-impl Plugin for MessagesPlugin {
-    type Config = MessagesConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("llm-messages")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["llm"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let llm = ctx.llm()?;
-            let provider = config.provider.clone();
-            ctx.effect("llm-messages.registerAdapter", || {
-                Ok::<_, LlmError>(Some(
-                    llm.register_adapter(provider, Arc::new(MessagesAdapter::new(config)))?,
-                ))
-            })?;
-            Ok(None)
-        })
-    }
+pub fn register_messages_adapter(
+    llm: &Arc<LlmRuntime>,
+    config: MessagesConfig,
+) -> Result<HookGuard, LlmError> {
+    let provider = config.provider.clone();
+    llm.register_adapter(provider, Arc::new(MessagesAdapter::new(config)))
 }
 
 #[cfg(test)]

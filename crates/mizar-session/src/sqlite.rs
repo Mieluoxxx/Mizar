@@ -1,4 +1,4 @@
-//! 基于嵌入式 SQLite（WAL + Single-Writer 后台线程）的 `SessionPersistence` 实现与 Cordis 插件。
+//! 基于嵌入式 SQLite（WAL + Single-Writer 后台线程）的 `SessionPersistence` 实现。
 
 pub mod recall;
 pub mod schema;
@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use crate::{
     LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
-    SERVICE_SESSION_PERSISTENCE, SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery,
-    SessionPersistence, SessionPersistenceHandle, SessionSelection,
+    SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionPersistence,
+    SessionSelection,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin};
+use mizar_types::hooks::BoxFuture;
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::oneshot;
 
@@ -454,39 +454,5 @@ impl SessionPersistence for SqliteSessionPersistence {
                     .map(Some)
             })
         }
-    }
-}
-
-/// 将 `SqliteSessionPersistence` 作为 Cordis 插件挂载到 `SERVICE_SESSION_PERSISTENCE`。
-#[derive(Default, Clone, Copy)]
-pub struct SqlitePersistencePlugin;
-
-impl Plugin for SqlitePersistencePlugin {
-    type Config = SqlitePersistenceConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("session-persistence-sqlite")
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let backend = SqliteSessionPersistence::open_async(&config.db_path).await?;
-            let handle = Arc::new(SessionPersistenceHandle::new(backend.clone()));
-            ctx.provide(SERVICE_SESSION_PERSISTENCE, handle)?;
-
-            ctx.effect("sessionPersistence.sqlite.shutdown", move || {
-                let backend_for_cleanup = Arc::clone(&backend);
-                Ok::<_, cordis::CordisError>(Some(Cleanup::async_fn(move || async move {
-                    let _ =
-                        tokio::task::spawn_blocking(move || backend_for_cleanup.shutdown()).await;
-                })))
-            })?;
-
-            Ok(None)
-        })
     }
 }

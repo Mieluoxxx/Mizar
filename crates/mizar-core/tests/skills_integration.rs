@@ -1,21 +1,20 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cordis::{Context, Service};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopContextExt};
+use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, AgentPreStepDecision, AgentPreStepInput};
 use mizar_core::skills::{
-    SKILL_CATALOG_SOURCE, SKILL_INVOCATION_SOURCE, SkillInvocationPolicy, SkillRegistration,
-    SkillRegistry, SkillRegistryConfig, SkillResourceBase, SkillSource, SkillsConfig,
-    SkillsContextExt, SkillsPlugin, extract_skill_gestures, is_skill_name, parse_skill_markdown,
+    SKILL_CATALOG_SOURCE, SKILL_INVOCATION_SOURCE, SkillInvocationPolicy, SkillLookupOptions,
+    SkillRegistration, SkillRegistry, SkillRegistryConfig, SkillResourceBase, SkillSource,
+    SkillsConfig, extract_skill_gestures, install_skills, is_skill_name, parse_skill_markdown,
 };
 use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmRuntime, Message,
-    StreamChunk, ToolCall,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmRuntime, Message, StreamChunk,
+    ToolCall,
 };
-use mizar_session::{SessionContextExt, SessionEvent};
-use mizar_tools::{ToolRuntime, ToolsContextExt};
+use mizar_session::{SessionEvent, SessionStore};
+use mizar_tools::ToolRuntime;
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -88,17 +87,25 @@ async fn zero_skills_does_not_register_skill_tool() {
     std::fs::create_dir_all(base.join("repo")).unwrap();
     std::fs::create_dir_all(base.join("empty-agents")).unwrap();
 
-    let ctx = Context::new();
-    ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    ctx.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
-        .await
-        .unwrap();
+    let llm = LlmRuntime::new();
+    let sessions = SessionStore::new();
+    let tools = ToolRuntime::new();
+    let sp = SystemPrompt::new(SystemPromptConfig::default());
+    let agent = AgentLoop::new(
+        llm,
+        Arc::clone(&tools),
+        sessions,
+        sp,
+        AgentLoopConfig::default(),
+    );
+    let reg = SkillRegistry::new(SkillRegistryConfig::default());
     let mut cfg = SkillsConfig::new(base.join("repo"));
     cfg.include_user_roots = false;
     cfg.agents_home = Some(base.join("empty-agents"));
-    ctx.plugin(SkillsPlugin, cfg).await.unwrap();
+    let _skills_guard = install_skills(reg, Arc::clone(&tools), &agent, cfg)
+        .await
+        .unwrap();
 
-    let tools = ctx.tools().unwrap();
     assert!(
         !tools.list_all().iter().any(|t| t.name == "skill"),
         "0 skills 时不得注册 skill 工具"
@@ -111,7 +118,6 @@ async fn zero_skills_does_not_register_skill_tool() {
         "0 skills 时不得向模型声明 skill 工具"
     );
 
-    ctx.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -239,37 +245,28 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
     let seen_messages = Arc::new(Mutex::new(Vec::new()));
     let seen_tools = Arc::new(Mutex::new(Vec::new()));
 
-    let ctx = Context::new();
-    ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-    ctx.plugin(mizar_session::SessionStore::plugin(), ())
-        .await
-        .unwrap();
-    ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    ctx.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
-        .await
-        .unwrap();
+    let llm = LlmRuntime::new();
+    let sessions = SessionStore::new();
+    let tools = ToolRuntime::new();
+    let sp = SystemPrompt::new(SystemPromptConfig::default());
+    let reg = SkillRegistry::new(SkillRegistryConfig::default());
+    let agent = AgentLoop::new(
+        Arc::clone(&llm),
+        Arc::clone(&tools),
+        Arc::clone(&sessions),
+        sp,
+        AgentLoopConfig::default(),
+    );
 
     let mut skills_cfg = SkillsConfig::new(&sub_cwd);
     skills_cfg.agents_home = Some(user_agents.clone());
     skills_cfg.custom_skill_dirs = vec![custom_dir.clone()];
-    ctx.plugin(SkillsPlugin, skills_cfg).await.unwrap();
-    ctx.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
+    let _skills_guard = install_skills(Arc::clone(&reg), Arc::clone(&tools), &agent, skills_cfg)
         .await
         .unwrap();
 
-    for rt in ctx.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
-
     // 注册运行时 skill (rank 250)，优先级低于 project-agents (200) 但高于 custom (300)
-    let _rt_guard = ctx
-        .skills()
-        .unwrap()
+    let _rt_guard = reg
         .register(SkillRegistration {
             name: "runtime-skill".to_string(),
             description: "Runtime helper".to_string(),
@@ -290,14 +287,9 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
         seen_messages: Arc::clone(&seen_messages),
         seen_tools: Arc::clone(&seen_tools),
     });
-    let _llm_cleanup = ctx
-        .llm()
-        .unwrap()
-        .register_adapter("scripted", adapter)
-        .unwrap();
+    let _llm_cleanup = llm.register_adapter("scripted", adapter).unwrap();
 
-    let session = ctx.sessions().unwrap().create(None);
-    let agent = ctx.agent_loop().unwrap();
+    let session = sessions.create(None);
 
     // 第一轮：触发目录注入（不含 manual-only 与 ignored-skill），同时用户显式输入 /manual-only，
     // 而 /model-only (user-invocable: false) 应被手势层忽略
@@ -380,12 +372,10 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
         "---\nname: alpha-skill\ndescription: Project alpha guide v2\n---\nPROJECT_BODY_V2",
     )
     .unwrap();
-    let loaded_v2 = ctx
-        .skills()
-        .unwrap()
+    let loaded_v2 = reg
         .get(
             "alpha-skill",
-            mizar_core::skills::SkillLookupOptions {
+            SkillLookupOptions {
                 cwd: Some(sub_cwd.clone()),
                 cancel: CancellationToken::new(),
             },
@@ -415,10 +405,8 @@ async fn discovers_skills_by_layer_rank_and_runs_progressive_loop() {
     assert!(catalog_msgs[1].contains("Project alpha guide v2"));
 
     // 当 skill 工具被屏蔽时，新会话不应收到任何 catalog 注入
-    ctx.tools()
-        .unwrap()
-        .set_tool_selection(None, vec!["skill".to_string()]);
-    let isolated_session = ctx.sessions().unwrap().create(None);
+    tools.set_tool_selection(None, vec!["skill".to_string()]);
+    let isolated_session = sessions.create(None);
     let _ = agent
         .run(
             Arc::clone(&isolated_session),
@@ -461,28 +449,27 @@ async fn include_user_roots_false_skips_user_skills_but_keeps_project_skills() {
     )
     .unwrap();
 
-    let ctx = Context::new();
-    ctx.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    ctx.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    ctx.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
-        .await
-        .unwrap();
+    let llm = LlmRuntime::new();
+    let sessions = SessionStore::new();
+    let tools = ToolRuntime::new();
+    let sp = SystemPrompt::new(SystemPromptConfig::default());
+    let agent = AgentLoop::new(
+        llm,
+        Arc::clone(&tools),
+        sessions,
+        sp,
+        AgentLoopConfig::default(),
+    );
+    let reg = SkillRegistry::new(SkillRegistryConfig::default());
     let mut cfg = SkillsConfig::new(&repo);
     cfg.agents_home = Some(user_agents.clone());
     cfg.include_user_roots = false;
-    ctx.plugin(SkillsPlugin, cfg).await.unwrap();
-    for rt in ctx.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
+    let _skills_guard = install_skills(Arc::clone(&reg), tools, &agent, cfg)
+        .await
+        .unwrap();
 
-    let names: Vec<String> = ctx
-        .skills()
-        .unwrap()
-        .list(mizar_core::skills::SkillLookupOptions {
+    let names: Vec<String> = reg
+        .list(SkillLookupOptions {
             cwd: Some(repo.clone()),
             cancel: CancellationToken::new(),
         })
@@ -494,10 +481,8 @@ async fn include_user_roots_false_skips_user_skills_but_keeps_project_skills() {
     assert!(!names.contains(&"user-only".to_string()), "{names:?}");
 
     // 即使 cwd 恰好等于 home_dir（其下有 .agents/skills），也必须屏蔽 user-only
-    let home_names: Vec<String> = ctx
-        .skills()
-        .unwrap()
-        .list(mizar_core::skills::SkillLookupOptions {
+    let home_names: Vec<String> = reg
+        .list(SkillLookupOptions {
             cwd: Some(home_dir.clone()),
             cancel: CancellationToken::new(),
         })
@@ -510,14 +495,11 @@ async fn include_user_roots_false_skips_user_skills_but_keeps_project_skills() {
         "{home_names:?}"
     );
 
-    ctx.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&base);
 }
 
 #[tokio::test]
 async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_catalog() {
-    use cordis::BoxFuture;
-    use mizar_core::agent_loop::{AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP};
     use mizar_core::skills::{
         SkillCandidate, SkillDefinition, SkillProvider, SkillProviderObservation, SkillSummary,
     };
@@ -631,12 +613,7 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
     .unwrap();
 
     // 1. 并发 invalidate_cache 与 collect 竞态：中途 revision 失效后不得将旧快照写入 cache
-    let ctx_race = Context::new();
-    ctx_race
-        .plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
-        .await
-        .unwrap();
-    let reg = ctx_race.skills().unwrap();
+    let reg = SkillRegistry::new(SkillRegistryConfig::default());
     let started = Arc::new(tokio::sync::Notify::new());
     let proceed = Arc::new(tokio::sync::Notify::new());
     let provider_skills = Arc::new(Mutex::new(vec![("v1-skill".into(), "V1".into())]));
@@ -651,7 +628,7 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
     let reg_task = Arc::clone(&reg);
     let fut = tokio::spawn(async move {
         reg_task
-            .list(mizar_core::skills::SkillLookupOptions {
+            .list(SkillLookupOptions {
                 cwd: None,
                 cancel: CancellationToken::new(),
             })
@@ -670,7 +647,7 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
 
     // 下次 list 不得命中 stale v1 cache，必须包含 v2-skill
     let second = reg
-        .list(mizar_core::skills::SkillLookupOptions {
+        .list(SkillLookupOptions {
             cwd: None,
             cancel: CancellationToken::new(),
         })
@@ -680,48 +657,43 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
         "expected v2-skill after concurrent invalidation, got: {:?}",
         second.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
-    ctx_race.fiber().dispose().await;
 
     // 2. 恢复会话去重 catalog + 取消的 pre-step 不锁存 gesture seq
-    let ctx1 = Context::new();
-    ctx1.plugin(mizar_session::SessionStore::plugin(), ())
-        .await
-        .unwrap();
-    ctx1.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    ctx1.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    ctx1.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
-        .await
-        .unwrap();
+    let sessions1 = SessionStore::new();
+    let tools1 = ToolRuntime::new();
+    let sp1 = SystemPrompt::new(SystemPromptConfig::default());
+    let agent1 = AgentLoop::new(
+        LlmRuntime::new(),
+        Arc::clone(&tools1),
+        Arc::clone(&sessions1),
+        sp1,
+        AgentLoopConfig::default(),
+    );
+    let reg1 = SkillRegistry::new(SkillRegistryConfig::default());
     let mut cfg = SkillsConfig::new(&base);
     cfg.include_user_roots = false;
-    ctx1.plugin(SkillsPlugin, cfg.clone()).await.unwrap();
+    let _sg1 = install_skills(reg1, tools1, &agent1, cfg.clone())
+        .await
+        .unwrap();
 
-    let dispatch_pre_step = |ctx: &Context,
+    let dispatch_pre_step = |agent: &Arc<AgentLoop>,
                              session: &Arc<mizar_session::Session>,
                              turn: u64,
                              step: usize,
                              cancel: CancellationToken| {
-        let ctx = ctx.clone();
+        let agent = Arc::clone(agent);
         let session = Arc::clone(session);
         async move {
-            let decision = ctx
-                .waterfall(
-                    EVENT_AGENT_PRE_STEP,
-                    AgentPreStepInput {
-                        session: Arc::clone(&session),
-                        turn,
-                        step,
-                        provider: None,
-                        model: None,
-                        cancel,
-                        inputs: Vec::new(),
-                    },
-                    |inp| -> BoxFuture<'static, AgentPreStepDecision> {
-                        Box::pin(async move { AgentPreStepDecision::Enter { inputs: inp.inputs } })
-                    },
-                )
+            let decision = agent
+                .run_pre_step(AgentPreStepInput {
+                    session: Arc::clone(&session),
+                    turn,
+                    step,
+                    provider: None,
+                    model: None,
+                    cancel,
+                    inputs: Vec::new(),
+                })
                 .await;
             if let AgentPreStepDecision::Enter { ref inputs } = decision {
                 for item in inputs {
@@ -732,21 +704,18 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
         }
     };
 
-    let s = ctx1
-        .sessions()
-        .unwrap()
-        .create(Some("s-skill-resume".into()));
+    let s = sessions1.create(Some("s-skill-resume".into()));
     s.append(SessionEvent::user("run /alpha please"));
-    let _ = dispatch_pre_step(&ctx1, &s, 1, 1, CancellationToken::new()).await;
+    let _ = dispatch_pre_step(&agent1, &s, 1, 1, CancellationToken::new()).await;
 
     // 模拟已取消的 pre-step 带有 /beta：不得推进 processed_gesture_seq
     s.append(SessionEvent::user("and /beta too"));
     let cancelled = CancellationToken::new();
     cancelled.cancel();
-    let _ = dispatch_pre_step(&ctx1, &s, 2, 1, cancelled).await;
+    let _ = dispatch_pre_step(&agent1, &s, 2, 1, cancelled).await;
     // 下一次未取消的 pre-step 仍应成功展开 /beta，仅此一次
-    let _ = dispatch_pre_step(&ctx1, &s, 2, 1, CancellationToken::new()).await;
-    let _ = dispatch_pre_step(&ctx1, &s, 2, 2, CancellationToken::new()).await;
+    let _ = dispatch_pre_step(&agent1, &s, 2, 1, CancellationToken::new()).await;
+    let _ = dispatch_pre_step(&agent1, &s, 2, 2, CancellationToken::new()).await;
     let beta_count = s.with_visible_entries(|entries| {
         entries
             .iter()
@@ -765,24 +734,23 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
 
     let snapshot_entries = s.all_entries();
     let snapshot_header = s.header();
-    ctx1.fiber().dispose().await;
+    drop(_sg1);
 
-    // 恢复到新 Context（空的 published_catalogs）时不应重复追加相同 catalog
-    let ctx2 = Context::new();
-    ctx2.plugin(mizar_session::SessionStore::plugin(), ())
-        .await
-        .unwrap();
-    ctx2.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    ctx2.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-        .await
-        .unwrap();
-    ctx2.plugin(SkillRegistry::plugin(), SkillRegistryConfig::default())
-        .await
-        .unwrap();
-    ctx2.plugin(SkillsPlugin, cfg).await.unwrap();
+    // 恢复到新实例（空的 published_catalogs）时不应重复追加相同 catalog
+    let sessions2 = SessionStore::new();
+    let tools2 = ToolRuntime::new();
+    let sp2 = SystemPrompt::new(SystemPromptConfig::default());
+    let agent2 = AgentLoop::new(
+        LlmRuntime::new(),
+        Arc::clone(&tools2),
+        Arc::clone(&sessions2),
+        sp2,
+        AgentLoopConfig::default(),
+    );
+    let reg2 = SkillRegistry::new(SkillRegistryConfig::default());
+    let _sg2 = install_skills(reg2, tools2, &agent2, cfg).await.unwrap();
 
     let resumed = Arc::new(mizar_session::Session::from_loaded(
-        ctx2.clone(),
         mizar_session::LoadedSession {
             header: snapshot_header,
             entries: snapshot_entries,
@@ -797,7 +765,7 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
     });
     assert_eq!(before_cat, 1);
 
-    let _ = dispatch_pre_step(&ctx2, &resumed, 3, 1, CancellationToken::new()).await;
+    let _ = dispatch_pre_step(&agent2, &resumed, 3, 1, CancellationToken::new()).await;
     let after_cat = resumed.with_visible_entries(|e| {
         e.iter()
             .filter(|x| matches!(&x.event, SessionEvent::ContextNotice { source, .. } if source == SKILL_CATALOG_SOURCE))
@@ -808,6 +776,5 @@ async fn concurrent_collect_invalidate_does_not_cache_stale_and_resumed_dedups_c
         "resumed session must hydrate catalog state instead of duplicating SKILL_CATALOG_SOURCE"
     );
 
-    ctx2.fiber().dispose().await;
     let _ = std::fs::remove_dir_all(&base);
 }

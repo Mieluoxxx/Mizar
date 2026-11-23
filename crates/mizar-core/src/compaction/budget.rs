@@ -250,10 +250,7 @@ mod tests {
 
     #[test]
     fn session_context_estimate_calibrates_with_full_prompt_tokens_including_cache() {
-        let session = std::sync::Arc::new(mizar_session::Session::new(
-            cordis::Context::new(),
-            "cache-hit-anchor",
-        ));
+        let session = std::sync::Arc::new(mizar_session::Session::new("cache-hit-anchor"));
         session.append(SessionEvent::user("inspect repo"));
         session.append(SessionEvent::Assistant {
             blocks: vec![ContentBlock::Text {

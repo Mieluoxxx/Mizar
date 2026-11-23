@@ -170,7 +170,7 @@ pub async fn execute_codemode_script(
     session_store: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
     worker_sem: Arc<Semaphore>,
     default_timeout_ms: u64,
-) -> Result<ToolOutput, cordis::BoxError> {
+) -> Result<ToolOutput, mizar_types::BoxError> {
     let permit = tokio::select! {
         _ = call_ctx.cancel.cancelled() => return Err("Operation aborted".into()),
         res = worker_sem.acquire_owned() => res.map_err(|_| "codemode worker pool closed")?,
@@ -702,15 +702,13 @@ pub async fn execute_codemode_script(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cordis::{BoxError, Context, Service};
-    use mizar_tools::{ToolDefinition, ToolExposure, ToolsContextExt};
+    use mizar_tools::{ToolDefinition, ToolExposure};
+    use mizar_types::BoxError;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn sandbox_runs_on_dedicated_os_thread_and_bounds_idle_after_timeout() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let caller_thread_id = std::thread::current().id();
         let observed_name = Arc::new(Mutex::new(None::<String>));
@@ -743,10 +741,10 @@ mod tests {
         });
 
         let call_ctx = ToolCallContext {
-            ctx: app.clone(),
             exec: ToolExecution::new("codemode", json!({}), Some("s1".into())),
             cancel: CancellationToken::new(),
             on_update: None,
+            tools: tools.clone(),
         };
         let ok_out = execute_codemode_script(
             "const end = Date.now() + 90; while (Date.now() < end) {} await tools.thread_probe({}); return 42;".into(),
@@ -775,10 +773,10 @@ mod tests {
         // 2. 死循环或未决 Promise 超时后，rt.idle() 受 200ms 上限保护，迅速返回超时错误
         let t0 = Instant::now();
         let timeout_ctx = ToolCallContext {
-            ctx: app.clone(),
             exec: ToolExecution::new("codemode", json!({}), Some("s1".into())),
             cancel: CancellationToken::new(),
             on_update: None,
+            tools: tools.clone(),
         };
         let timeout_out = execute_codemode_script(
             "// @options: {\"timeoutMs\": 120}\nawait new Promise(() => {});".into(),
@@ -794,7 +792,5 @@ mod tests {
         assert!(timeout_out.content.contains("timed out"));
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert_eq!(std::thread::current().id(), caller_thread_id);
-
-        app.fiber().dispose().await;
     }
 }

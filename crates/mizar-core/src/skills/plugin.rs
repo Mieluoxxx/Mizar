@@ -3,19 +3,18 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::agent_loop::{
-    AgentEvent, AgentPreStepDecision, AgentPreStepInput, EVENT_AGENT_PRE_STEP, TurnInput,
-    subscribe_agent_events_when_ready,
+    AgentEvent, AgentLoop, AgentPreStepDecision, AgentPreStepInput, TurnInput,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Next, Plugin};
 use mizar_session::SessionEvent;
 use mizar_tools::{
-    ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput, ToolsContextExt,
+    ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput, ToolRuntime,
 };
+use mizar_types::{BoxError, BoxFuture, HookGuard, HookOptions, Next};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::skills::filesystem::{FilesystemSkillConfig, FilesystemSkillProvider};
-use crate::skills::registry::{SkillProvider, SkillRegistry, SkillsContextExt};
+use crate::skills::registry::{SkillProvider, SkillRegistry};
 use crate::skills::types::{
     SkillLookupOptions, SkillSummary, escape_xml_text, is_skill_name, render_skill_content,
 };
@@ -273,369 +272,332 @@ fn create_skill_tool(registry: Arc<SkillRegistry>, workspace: PathBuf) -> ToolDe
     )
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct SkillsPlugin;
-
-impl Plugin for SkillsPlugin {
-    type Config = SkillsConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("skills-plugin")
+/// 安装工作区技能发现提供器、`skill` 按需加载工具与每步目录/手势注入钩子。
+pub async fn install_skills(
+    registry: Arc<SkillRegistry>,
+    tools: Arc<ToolRuntime>,
+    agent_loop: &Arc<AgentLoop>,
+    config: SkillsConfig,
+) -> Result<HookGuard, BoxError> {
+    if !config.enabled {
+        return Ok(HookGuard::noop());
     }
 
-    fn inject(&self) -> Inject {
-        Inject::from(["tools", "skills"])
+    let mut guards = Vec::new();
+
+    let fs_provider = Arc::new(FilesystemSkillProvider::new(
+        FilesystemSkillConfig {
+            provider_name: "filesystem".to_string(),
+            include_default_roots: config.include_default_roots,
+            include_user_roots: config.include_user_roots,
+            agents_home: config.agents_home.clone(),
+            custom_skill_dirs: config.custom_skill_dirs.clone(),
+            bundled_skill_dir: config.bundled_skill_dir.clone(),
+        },
+        Some(config.workspace.clone()),
+    ));
+    let reg_guard = registry
+        .register_provider(Arc::clone(&fs_provider) as Arc<dyn SkillProvider>)
+        .map_err(|msg| -> BoxError { msg.into() })?;
+    guards.push(reg_guard);
+
+    // 仅在发现至少 1 个模型可调用技能时注册 `skill` 工具；0 skills 时保持工具表精简零开销
+    // 使用 `list_raw` 避免受运行期启用开关门控影响，确保禁用启动后热启用仍具备 `skill` 工具
+    let initial_skills = registry
+        .list_raw(SkillLookupOptions {
+            cwd: Some(config.workspace.clone()),
+            cancel: CancellationToken::new(),
+        })
+        .await;
+    if initial_skills.iter().any(|s| s.is_model_invocable()) {
+        let skill_tool = create_skill_tool(Arc::clone(&registry), config.workspace.clone());
+        guards.push(tools.register(skill_tool)?);
     }
 
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            if !config.enabled {
-                return Ok(None);
+    // 监听 write / edit 工具写入完成，若命中任何技能目录则同步刷新缓存
+    {
+        let reg_for_mut = Arc::clone(&registry);
+        let fs_for_mut = Arc::clone(&fs_provider);
+        let ws_for_mut = config.workspace.clone();
+        guards.push(agent_loop.on_event(move |ev| {
+            if !reg_for_mut.is_enabled() {
+                return;
             }
-
-            let registry = ctx.skills()?;
-
-            let fs_provider = Arc::new(FilesystemSkillProvider::new(
-                ctx.clone(),
-                FilesystemSkillConfig {
-                    provider_name: "filesystem".to_string(),
-                    include_default_roots: config.include_default_roots,
-                    include_user_roots: config.include_user_roots,
-                    agents_home: config.agents_home.clone(),
-                    custom_skill_dirs: config.custom_skill_dirs.clone(),
-                    bundled_skill_dir: config.bundled_skill_dir.clone(),
-                },
-                Some(config.workspace.clone()),
-            ));
-            let reg_cleanup = registry
-                .register_provider(Arc::clone(&fs_provider) as Arc<dyn SkillProvider>)
-                .map_err(|e| -> BoxError { e.into() })?;
-            ctx.effect("skills.filesystemProvider", move || {
-                Ok::<_, cordis::CordisError>(Some(reg_cleanup))
-            })?;
-
-            // 仅在发现至少 1 个模型可调用技能时注册 `skill` 工具；0 skills 时保持工具表精简零开销
-            // 使用 `list_raw` 避免受运行期启用开关门控影响，确保禁用启动后热启用仍具备 `skill` 工具
-            let initial_skills = registry
-                .list_raw(SkillLookupOptions {
-                    cwd: Some(config.workspace.clone()),
-                    cancel: CancellationToken::new(),
-                })
-                .await;
-            if initial_skills.iter().any(|s| s.is_model_invocable()) {
-                let tools = ctx.tools()?;
-                let skill_tool = create_skill_tool(Arc::clone(&registry), config.workspace.clone());
-                ctx.effect("skills.skillTool", || {
-                    Ok::<_, mizar_tools::ToolError>(Some(tools.register(skill_tool)?))
-                })?;
+            let AgentEvent::ToolResult(ev) = ev else {
+                return;
+            };
+            if ev.is_error || !matches!(ev.name.as_str(), "write" | "edit") {
+                return;
             }
+            let path_opt = ev
+                .details
+                .as_ref()
+                .and_then(|d| d.get("path"))
+                .and_then(Value::as_str);
+            if let Some(raw_path) = path_opt {
+                let target = if PathBuf::from(raw_path).is_absolute() {
+                    PathBuf::from(raw_path)
+                } else {
+                    ws_for_mut.join(raw_path)
+                };
+                if fs_for_mut.matches_mutation_path(&target, Some(&ws_for_mut)) {
+                    reg_for_mut.invalidate_cache();
+                }
+            }
+        }));
+    }
 
-            // 监听 write / edit 工具写入完成，若命中任何技能目录则同步刷新缓存
-            {
-                let reg_for_mut = Arc::clone(&registry);
-                let fs_for_mut = Arc::clone(&fs_provider);
-                let ws_for_mut = config.workspace.clone();
-                subscribe_agent_events_when_ready(&ctx, "skills.tool-result", move |ev| {
-                    if !reg_for_mut.is_enabled() {
-                        return;
-                    }
-                    let AgentEvent::ToolResult(ev) = ev else {
-                        return;
+    // 在每步发送模型请求前：1）增量注入 <available_skills> 目录；2）展开用户 /<name> 技能手势
+    let published_catalogs: Arc<Mutex<HashMap<String, PublishedCatalogRecord>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let processed_gesture_seqs: Arc<Mutex<HashMap<String, u64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pre_step_guard = agent_loop.pre_step_hook().register_with(
+        HookOptions {
+            priority: 5,
+            ..Default::default()
+        },
+        move |input: AgentPreStepInput,
+              next: Next<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>| {
+            let reg = Arc::clone(&registry);
+            let tools_inner = Arc::clone(&tools);
+            let session = Arc::clone(&input.session);
+            let cancel = input.cancel.clone();
+            let ws = config.workspace.clone();
+            let max_desc_len = config.catalog_description_max_length.max(3);
+            let published_map = Arc::clone(&published_catalogs);
+            let processed_gestures = Arc::clone(&processed_gesture_seqs);
+
+            Box::pin(async move {
+                if cancel.is_cancelled() {
+                    return AgentPreStepDecision::Reject {
+                        reason: "cancelled".to_string(),
                     };
-                    if ev.is_error || !matches!(ev.name.as_str(), "write" | "edit") {
-                        return;
+                }
+                let decision = next.call(input).await;
+                let AgentPreStepDecision::Enter { mut inputs } = decision else {
+                    return decision;
+                };
+                if cancel.is_cancelled() {
+                    return AgentPreStepDecision::Reject {
+                        reason: "cancelled".to_string(),
+                    };
+                }
+                if !reg.is_enabled() {
+                    return AgentPreStepDecision::Enter { inputs };
+                }
+
+                let lookup = SkillLookupOptions {
+                    cwd: Some(ws),
+                    cancel: cancel.clone(),
+                };
+
+                // 1. 若当前会话声明了 `skill` 工具，按需生成 <available_skills> 目录（经 TurnInput 入账保证位于 <environment_context> / <project_instructions> 之后）
+                let mut skill_notices: Vec<TurnInput> = Vec::new();
+                let skill_tool_visible = tools_inner
+                    .list_declared(Some(&session.id))
+                    .into_iter()
+                    .any(|t| t.name == SKILL_TOOL_NAME);
+
+                if skill_tool_visible {
+                    let snap = reg.snapshot(lookup.clone()).await;
+                    if cancel.is_cancelled() {
+                        return AgentPreStepDecision::Reject {
+                            reason: "cancelled".to_string(),
+                        };
                     }
-                    let path_opt = ev
-                        .details
-                        .as_ref()
-                        .and_then(|d| d.get("path"))
-                        .and_then(Value::as_str);
-                    if let Some(raw_path) = path_opt {
-                        let target = if PathBuf::from(raw_path).is_absolute() {
-                            PathBuf::from(raw_path)
-                        } else {
-                            ws_for_mut.join(raw_path)
-                        };
-                        if fs_for_mut.matches_mutation_path(&target, Some(&ws_for_mut)) {
-                            reg_for_mut.invalidate_cache();
-                        }
-                    }
-                })
-                .await?;
-            }
+                    let next_state =
+                        build_catalog_state(&snap.skills, max_desc_len, !snap.complete);
 
-            // 在每步发送模型请求前：1）增量注入 <available_skills> 目录；2）展开用户 /<name> 技能手势
-            let published_catalogs: Arc<Mutex<HashMap<String, PublishedCatalogRecord>>> =
-                Arc::new(Mutex::new(HashMap::new()));
-            let processed_gesture_seqs: Arc<Mutex<HashMap<String, u64>>> =
-                Arc::new(Mutex::new(HashMap::new()));
-            let pre_step_ctx = ctx.clone();
-            ctx.on_waterfall_with(
-                EVENT_AGENT_PRE_STEP,
-                move |input: AgentPreStepInput,
-                      next: Next<
-                    AgentPreStepInput,
-                    BoxFuture<'static, AgentPreStepDecision>,
-                >| {
-                    let reg = Arc::clone(&registry);
-                    let ctx_inner = pre_step_ctx.clone();
-                    let session = Arc::clone(&input.session);
-                    let cancel = input.cancel.clone();
-                    let ws = config.workspace.clone();
-                    let max_desc_len = config.catalog_description_max_length.max(3);
-                    let published_map = Arc::clone(&published_catalogs);
-                    let processed_gestures = Arc::clone(&processed_gesture_seqs);
-
-                    Box::pin(async move {
-                        if cancel.is_cancelled() {
-                            return AgentPreStepDecision::Reject {
-                                reason: "cancelled".to_string(),
-                            };
-                        }
-                        let decision = next.call(input).await;
-                        let AgentPreStepDecision::Enter { mut inputs } = decision else {
-                            return decision;
-                        };
-                        if cancel.is_cancelled() {
-                            return AgentPreStepDecision::Reject {
-                                reason: "cancelled".to_string(),
-                            };
-                        }
-                        if !reg.is_enabled() {
-                            return AgentPreStepDecision::Enter { inputs };
-                        }
-
-                        let lookup = SkillLookupOptions {
-                            cwd: Some(ws),
-                            cancel: cancel.clone(),
-                        };
-
-                        // 1. 若当前会话声明了 `skill` 工具，按需生成 <available_skills> 目录（经 TurnInput 入账保证位于 <environment_context> / <project_instructions> 之后）
-                        let mut skill_notices: Vec<TurnInput> = Vec::new();
-                        let skill_tool_visible = ctx_inner
-                            .tools()
-                            .map(|rt| {
-                                rt.list_declared(Some(&session.id))
-                                    .into_iter()
-                                    .any(|t| t.name == SKILL_TOOL_NAME)
-                            })
-                            .unwrap_or(false);
-
-                        if skill_tool_visible {
-                            let snap = reg.snapshot(lookup.clone()).await;
-                            if cancel.is_cancelled() {
-                                return AgentPreStepDecision::Reject {
-                                    reason: "cancelled".to_string(),
-                                };
-                            }
-                            let next_state =
-                                build_catalog_state(&snap.skills, max_desc_len, !snap.complete);
-
-                            let prev_record =
-                                published_map.lock().unwrap().get(&session.id).cloned();
-                            let (prev_still_visible, latest_catalog) = session
-                                .with_visible_entries(|entries| {
-                                    let still_vis = prev_record.as_ref().is_some_and(|rec| {
-                                        entries.iter().any(|entry| {
-                                            matches!(
-                                                &entry.event,
-                                                SessionEvent::ContextNotice { source, text, .. }
-                                                    if source == SKILL_CATALOG_SOURCE
-                                                        && *text == rec.rendered
-                                            )
-                                        })
-                                    });
-                                    let latest =
-                                        entries.iter().rev().find_map(|entry| match &entry.event {
-                                            SessionEvent::ContextNotice {
-                                                source, text, ..
-                                            } if source == SKILL_CATALOG_SOURCE => {
-                                                Some(text.clone())
-                                            }
-                                            _ => None,
-                                        });
-                                    (still_vis, latest)
+                    let prev_record = published_map.lock().unwrap().get(&session.id).cloned();
+                    let (prev_still_visible, latest_catalog) =
+                        session.with_visible_entries(|entries| {
+                            let still_vis = prev_record.as_ref().is_some_and(|rec| {
+                                entries.iter().any(|entry| {
+                                    matches!(
+                                        &entry.event,
+                                        SessionEvent::ContextNotice { source, text, .. }
+                                            if source == SKILL_CATALOG_SOURCE
+                                                && *text == rec.rendered
+                                    )
+                                })
+                            });
+                            let latest =
+                                entries.iter().rev().find_map(|entry| match &entry.event {
+                                    SessionEvent::ContextNotice { source, text, .. }
+                                        if source == SKILL_CATALOG_SOURCE =>
+                                    {
+                                        Some(text.clone())
+                                    }
+                                    _ => None,
                                 });
+                            (still_vis, latest)
+                        });
 
-                            let mut prev_state = if prev_still_visible {
-                                prev_record.as_ref().map(|r| r.state.clone())
-                            } else {
-                                None
-                            };
+                    let mut prev_state = if prev_still_visible {
+                        prev_record.as_ref().map(|r| r.state.clone())
+                    } else {
+                        None
+                    };
 
-                            if prev_state.is_none()
-                                && let Some(ref latest_text) = latest_catalog
-                            {
-                                let matches_initial =
-                                    *latest_text == render_catalog_message(&next_state, false);
-                                let matches_update =
-                                    *latest_text == render_catalog_message(&next_state, true);
-                                if matches_initial || matches_update {
-                                    published_map.lock().unwrap().insert(
-                                        session.id.clone(),
-                                        PublishedCatalogRecord {
-                                            rendered: latest_text.clone(),
-                                            state: next_state.clone(),
-                                        },
-                                    );
-                                    prev_state = Some(next_state.clone());
-                                }
-                            }
-
-                            let should_emit = match prev_state {
-                                Some(ref prev) => *prev != next_state,
-                                None => !next_state.entries.is_empty() || next_state.incomplete,
-                            };
-
-                            if should_emit {
-                                let is_update = prev_record.is_some() || latest_catalog.is_some();
-                                let rendered = render_catalog_message(&next_state, is_update);
-                                published_map.lock().unwrap().insert(
-                                    session.id.clone(),
-                                    PublishedCatalogRecord {
-                                        rendered: rendered.clone(),
-                                        state: next_state,
-                                    },
-                                );
-                                skill_notices
-                                    .push(TurnInput::notice(SKILL_CATALOG_SOURCE, rendered));
-                            }
+                    if prev_state.is_none()
+                        && let Some(ref latest_text) = latest_catalog
+                    {
+                        let matches_initial =
+                            *latest_text == render_catalog_message(&next_state, false);
+                        let matches_update =
+                            *latest_text == render_catalog_message(&next_state, true);
+                        if matches_initial || matches_update {
+                            published_map.lock().unwrap().insert(
+                                session.id.clone(),
+                                PublishedCatalogRecord {
+                                    rendered: latest_text.clone(),
+                                    state: next_state.clone(),
+                                },
+                            );
+                            prev_state = Some(next_state.clone());
                         }
+                    }
 
-                        // 2. 扫描本步待入账的用户直输消息（或测试直接追加的未处理 User 条目）中的 `/<name>` 手势
-                        let input_user_texts: Vec<String> = inputs
-                            .iter()
-                            .filter_map(|item| match item {
-                                TurnInput::User { text, .. } => Some(text.clone()),
-                                TurnInput::Notice { .. } => None,
-                            })
-                            .collect();
-                        let from_turn_inputs = !input_user_texts.is_empty();
+                    let should_emit = match prev_state {
+                        Some(ref prev) => *prev != next_state,
+                        None => !next_state.entries.is_empty() || next_state.incomplete,
+                    };
 
-                        let (trailing_user_texts, max_user_seq) = if from_turn_inputs {
-                            (input_user_texts, None)
-                        } else {
-                            let last_done_gesture_seq = processed_gestures
-                                .lock()
-                                .unwrap()
-                                .get(&session.id)
-                                .copied()
-                                .unwrap_or(0);
-                            session.with_visible_entries(|entries| {
-                                let mut collected = Vec::new();
-                                let mut max_seq: Option<u64> = None;
-                                for entry in entries.iter().rev() {
-                                    if entry.seq <= last_done_gesture_seq {
-                                        break;
-                                    }
-                                    match &entry.event {
-                                        SessionEvent::User { text, .. } => {
-                                            max_seq = Some(
-                                                max_seq.map_or(entry.seq, |m| m.max(entry.seq)),
-                                            );
-                                            collected.push(text.clone());
-                                        }
-                                        SessionEvent::ContextNotice { source, .. }
-                                            if source != SKILL_INVOCATION_SOURCE => {}
-                                        SessionEvent::ContextNotice { .. }
-                                        | SessionEvent::Assistant { .. }
-                                        | SessionEvent::ToolResult { .. }
-                                        | SessionEvent::Compaction { .. }
-                                        | SessionEvent::BashExecution { .. }
-                                        | SessionEvent::Selection { .. }
-                                        | SessionEvent::Usage { .. }
-                                        | SessionEvent::Trace { .. } => break,
-                                    }
-                                }
-                                collected.reverse();
-                                (collected, max_seq)
-                            })
-                        };
+                    if should_emit {
+                        let is_update = prev_record.is_some() || latest_catalog.is_some();
+                        let rendered = render_catalog_message(&next_state, is_update);
+                        published_map.lock().unwrap().insert(
+                            session.id.clone(),
+                            PublishedCatalogRecord {
+                                rendered: rendered.clone(),
+                                state: next_state,
+                            },
+                        );
+                        skill_notices.push(TurnInput::notice(SKILL_CATALOG_SOURCE, rendered));
+                    }
+                }
 
-                        let mut gesture_names = Vec::new();
-                        for text in trailing_user_texts {
-                            for name in extract_skill_gestures(&text) {
-                                if !gesture_names.contains(&name) {
-                                    gesture_names.push(name);
-                                }
-                            }
-                        }
+                // 2. 扫描本步待入账的用户直输消息（或测试直接追加的未处理 User 条目）中的 `/<name>` 手势
+                let input_user_texts: Vec<String> = inputs
+                    .iter()
+                    .filter_map(|item| match item {
+                        TurnInput::User { text, .. } => Some(text.clone()),
+                        TurnInput::Notice { .. } => None,
+                    })
+                    .collect();
+                let from_turn_inputs = !input_user_texts.is_empty();
 
-                        let mut resolved_defs = Vec::new();
-                        let mut all_resolved = true;
-                        for name in gesture_names {
-                            if cancel.is_cancelled() {
-                                all_resolved = false;
+                let (trailing_user_texts, max_user_seq) = if from_turn_inputs {
+                    (input_user_texts, None)
+                } else {
+                    let last_done_gesture_seq = processed_gestures
+                        .lock()
+                        .unwrap()
+                        .get(&session.id)
+                        .copied()
+                        .unwrap_or(0);
+                    session.with_visible_entries(|entries| {
+                        let mut collected = Vec::new();
+                        let mut max_seq: Option<u64> = None;
+                        for entry in entries.iter().rev() {
+                            if entry.seq <= last_done_gesture_seq {
                                 break;
                             }
-                            match reg.get(&name, lookup.clone()).await {
-                                Ok(Some(def)) if def.summary.is_user_invocable() => {
-                                    resolved_defs.push(def);
+                            match &entry.event {
+                                SessionEvent::User { text, .. } => {
+                                    max_seq = Some(max_seq.map_or(entry.seq, |m| m.max(entry.seq)));
+                                    collected.push(text.clone());
                                 }
-                                Ok(_) => {}
-                                Err(_) => {
-                                    all_resolved = false;
-                                    break;
-                                }
+                                SessionEvent::ContextNotice { source, .. }
+                                    if source != SKILL_INVOCATION_SOURCE => {}
+                                SessionEvent::ContextNotice { .. }
+                                | SessionEvent::Assistant { .. }
+                                | SessionEvent::ToolResult { .. }
+                                | SessionEvent::Compaction { .. }
+                                | SessionEvent::BashExecution { .. }
+                                | SessionEvent::Selection { .. }
+                                | SessionEvent::Usage { .. }
+                                | SessionEvent::Trace { .. } => break,
                             }
                         }
+                        collected.reverse();
+                        (collected, max_seq)
+                    })
+                };
 
-                        if all_resolved && !cancel.is_cancelled() {
-                            for def in resolved_defs {
-                                skill_notices.push(TurnInput::notice(
-                                    SKILL_INVOCATION_SOURCE,
-                                    render_skill_content(&def),
-                                ));
-                            }
-                            if !from_turn_inputs && let Some(max_seq) = max_user_seq {
-                                processed_gestures
-                                    .lock()
-                                    .unwrap()
-                                    .entry(session.id.clone())
-                                    .and_modify(|s| *s = (*s).max(max_seq))
-                                    .or_insert(max_seq);
-                            }
+                let mut gesture_names = Vec::new();
+                for text in trailing_user_texts {
+                    for name in extract_skill_gestures(&text) {
+                        if !gesture_names.contains(&name) {
+                            gesture_names.push(name);
                         }
+                    }
+                }
 
-                        if !skill_notices.is_empty() {
-                            // 保持 `<skill-catalog>` / `<skill_content>` 紧随 `<project_instructions>` 且位于本轮用户文本之前
-                            let insert_at = inputs
-                                .iter()
-                                .position(|item| matches!(item, TurnInput::User { .. }))
-                                .unwrap_or(inputs.len());
-                            inputs.splice(insert_at..insert_at, skill_notices);
+                let mut resolved_defs = Vec::new();
+                let mut all_resolved = true;
+                for name in gesture_names {
+                    if cancel.is_cancelled() {
+                        all_resolved = false;
+                        break;
+                    }
+                    match reg.get(&name, lookup.clone()).await {
+                        Ok(Some(def)) if def.summary.is_user_invocable() => {
+                            resolved_defs.push(def);
                         }
+                        Ok(_) => {}
+                        Err(_) => {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                }
 
-                        AgentPreStepDecision::Enter { inputs }
-                    }) as BoxFuture<'static, AgentPreStepDecision>
-                },
-                cordis::EventOptions {
-                    priority: 5,
-                    ..Default::default()
-                },
-            )?;
+                if all_resolved && !cancel.is_cancelled() {
+                    for def in resolved_defs {
+                        skill_notices.push(TurnInput::notice(
+                            SKILL_INVOCATION_SOURCE,
+                            render_skill_content(&def),
+                        ));
+                    }
+                    if !from_turn_inputs && let Some(max_seq) = max_user_seq {
+                        processed_gestures
+                            .lock()
+                            .unwrap()
+                            .entry(session.id.clone())
+                            .and_modify(|s| *s = (*s).max(max_seq))
+                            .or_insert(max_seq);
+                    }
+                }
 
-            Ok(None)
-        })
-    }
+                if !skill_notices.is_empty() {
+                    // 保持 `<skill-catalog>` / `<skill_content>` 紧随 `<project_instructions>` 且位于本轮用户文本之前
+                    let insert_at = inputs
+                        .iter()
+                        .position(|item| matches!(item, TurnInput::User { .. }))
+                        .unwrap_or(inputs.len());
+                    inputs.splice(insert_at..insert_at, skill_notices);
+                }
+
+                AgentPreStepDecision::Enter { inputs }
+            }) as BoxFuture<'static, AgentPreStepDecision>
+        },
+    );
+    guards.push(pre_step_guard);
+
+    Ok(HookGuard::group(guards))
 }
 
 /// 辅助函数：读取工作区下可用技能摘要清单。
 pub async fn list_workspace_skills(
-    ctx: &Context,
+    registry: &SkillRegistry,
     workspace: &std::path::Path,
 ) -> Vec<SkillSummary> {
-    if let Ok(reg) = ctx.skills() {
-        return reg
-            .list(SkillLookupOptions {
-                cwd: Some(workspace.to_path_buf()),
-                cancel: CancellationToken::new(),
-            })
-            .await;
-    }
-    Vec::new()
+    registry
+        .list(SkillLookupOptions {
+            cwd: Some(workspace.to_path_buf()),
+            cancel: CancellationToken::new(),
+        })
+        .await
 }

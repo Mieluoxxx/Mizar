@@ -13,11 +13,9 @@ pub use filesystem::{
 pub use frontmatter::{ParsedSkillFile, parse_skill_markdown};
 pub use plugin::{
     DEFAULT_CATALOG_DESCRIPTION_MAX_LENGTH, SKILL_CATALOG_SOURCE, SKILL_INVOCATION_SOURCE,
-    SKILL_TOOL_NAME, SkillsConfig, SkillsPlugin, extract_skill_gestures, list_workspace_skills,
+    SKILL_TOOL_NAME, SkillsConfig, extract_skill_gestures, install_skills, list_workspace_skills,
 };
-pub use registry::{
-    EVENT_SKILLS_CHANGE, SkillProvider, SkillRegistry, SkillRegistryConfig, SkillsContextExt,
-};
+pub use registry::{SkillProvider, SkillRegistry, SkillRegistryConfig};
 pub use types::{
     BUNDLED_SKILL_RANK, RUNTIME_SKILL_RANK, SkillCandidate, SkillCatalogSnapshot, SkillDefinition,
     SkillInvocationPolicy, SkillLookupOptions, SkillProviderObservation, SkillRegistration,

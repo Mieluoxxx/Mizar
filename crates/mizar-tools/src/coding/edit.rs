@@ -133,9 +133,9 @@ pub fn create_edit_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
                     return Err("Operation aborted".into());
                 }
                 let (raw_path, edits) = prepare_edit_arguments(&args)
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
                 let target = resolve_to_cwd(&cwd, &raw_path, restrict_to_workspace)
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
                 let edit_count = edits.len();
 
                 let result = with_file_mutation_queue(&target, || async {
@@ -173,7 +173,7 @@ pub fn create_edit_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
                     ))
                 })
                 .await
-                .map_err(|e| -> cordis::BoxError { e.into() })?;
+                .map_err(|e| -> mizar_types::BoxError { e.into() })?;
 
                 let (diff, first_changed_line, used_fuzzy_match, replacements_applied) = result;
                 let (compact_diff, diff_truncated) =
@@ -256,7 +256,7 @@ mod tests {
             exec: ToolExecution::new("edit", args.clone(), None),
             cancel: tokio_util::sync::CancellationToken::new(),
             on_update: None,
-            ctx: cordis::Context::new(),
+            tools: crate::ToolRuntime::new(),
         }
     }
 

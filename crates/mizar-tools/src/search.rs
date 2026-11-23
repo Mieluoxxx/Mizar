@@ -6,10 +6,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    EVENT_TOOLS_CHANGE, ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure,
-    ToolOutput, ToolRuntime, ToolRuntimeInfo, ToolsContextExt,
+    ToolAnnotations, ToolDefinition, ToolError, ToolExecutionMode, ToolExposure, ToolOutput,
+    ToolRuntime, ToolRuntimeInfo,
 };
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
+use mizar_types::hooks::HookGuard;
 use serde_json::{Value, json};
 
 pub use ranker::{
@@ -120,141 +120,112 @@ pub fn search_inactive_tools(
         .collect()
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct ToolSearchPlugin;
+pub fn register_tool_search(
+    tools: Arc<ToolRuntime>,
+    config: ToolSearchConfig,
+) -> Result<Vec<HookGuard>, ToolError> {
+    let default_limit = config.default_limit.max(1);
+    let reg = tools.register(
+        ToolDefinition::async_rich_tool(
+            TOOL_SEARCH_TOOL_NAME,
+            "Search over deferred tool metadata with BM25 and expose matching tools for your next model call. Use this when a deferred (`tool_search`) MCP tool is not yet declared to you; for `codemode` servers, prefer `searchTools()` / `describeTool()` inside `codemode` scripts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query for deferred or MCP tools" },
+                    "limit": { "type": "integer", "minimum": 1, "description": format!("Maximum number of tools to return. Defaults to {default_limit}.") }
+                },
+                "required": ["query"]
+            }),
+            move |args, call_ctx| async move {
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("query must not be empty")?;
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|v| usize::try_from(v.max(1)).unwrap_or(default_limit))
+                    .unwrap_or(default_limit);
 
-impl Plugin for ToolSearchPlugin {
-    type Config = ToolSearchConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("tool-search")
-    }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let tools = ctx.tools()?;
-            let default_limit = config.default_limit.max(1);
-            let reg = ctx.effect("tool-search.register", || {
-                Ok::<_, crate::ToolError>(Some(tools.register(
-                    ToolDefinition::async_rich_tool(
-                        TOOL_SEARCH_TOOL_NAME,
-                        "Search over deferred tool metadata with BM25 and expose matching tools for your next model call. Use this when a deferred (`tool_search`) MCP tool is not yet declared to you; for `codemode` servers, prefer `searchTools()` / `describeTool()` inside `codemode` scripts.",
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "query": { "type": "string", "description": "Search query for deferred or MCP tools" },
-                                "limit": { "type": "integer", "minimum": 1, "description": format!("Maximum number of tools to return. Defaults to {default_limit}.") }
-                            },
-                            "required": ["query"]
-                        }),
-                        move |args, call_ctx| async move {
-                            let query = args
-                                .get("query")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .ok_or("query must not be empty")?;
-                            let limit = args
-                                .get("limit")
-                                .and_then(Value::as_u64)
-                                .map(|v| usize::try_from(v.max(1)).unwrap_or(default_limit))
-                                .unwrap_or(default_limit);
-
-                            let rt = call_ctx.ctx.tools()?;
-                            let loaded = search_inactive_tools(
-                                &rt,
-                                call_ctx.session_id(),
-                                query,
-                                limit,
-                            );
-                            let loaded_names: Vec<String> =
-                                loaded.iter().map(|t| t.name.clone()).collect();
-                            let text = if loaded.is_empty() {
-                                "No matching tools found.".to_string()
-                            } else {
-                                let lines: Vec<String> = loaded
-                                    .iter()
-                                    .map(|t| {
-                                        let first_line = t
-                                            .description
-                                            .trim()
-                                            .lines()
-                                            .next()
-                                            .unwrap_or("");
-                                        format!("- {}: {}", t.name, first_line)
-                                    })
-                                    .collect();
-                                format!(
-                                    "Loaded {} tool{}. They are available from your next call:\n{}",
-                                    loaded.len(),
-                                    if loaded.len() == 1 { "" } else { "s" },
-                                    lines.join("\n")
-                                )
-                            };
-
-                            let meta = json!({ "loaded": loaded_names });
-                            Ok(ToolOutput::text(text)
-                                .with_structured(meta.clone())
-                                .with_details(meta))
-                        },
+                let loaded = search_inactive_tools(
+                    &call_ctx.tools,
+                    call_ctx.session_id(),
+                    query,
+                    limit,
+                );
+                let loaded_names: Vec<String> =
+                    loaded.iter().map(|t| t.name.clone()).collect();
+                let text = if loaded.is_empty() {
+                    "No matching tools found.".to_string()
+                } else {
+                    let lines: Vec<String> = loaded
+                        .iter()
+                        .map(|t| {
+                            let first_line = t
+                                .description
+                                .trim()
+                                .lines()
+                                .next()
+                                .unwrap_or("");
+                            format!("- {}: {}", t.name, first_line)
+                        })
+                        .collect();
+                    format!(
+                        "Loaded {} tool{}. They are available from your next call:\n{}",
+                        loaded.len(),
+                        if loaded.len() == 1 { "" } else { "s" },
+                        lines.join("\n")
                     )
-                    .with_exposure(ToolExposure::ModelOnly)
-                    .with_default_active(false)
-                    .with_execution_mode(ToolExecutionMode::Sequential)
-                    .with_annotations(ToolAnnotations {
-                        read_only: true,
-                        destructive: false,
-                        idempotent: true,
-                        open_world: false,
-                    })
-                    .with_prompt_snippet("Search for unloaded MCP/deferred tools and activate matches"),
-                )?))
-            })?;
+                };
 
-            let mut handles = vec![reg];
-            if config.auto_enable {
-                let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
-                sync_auto_enable(&tools, &last_state);
-                let tools_sub = tools;
-                let last_sub = Arc::clone(&last_state);
-                let sub = ctx.on(EVENT_TOOLS_CHANGE, move |_: &()| {
-                    sync_auto_enable(&tools_sub, &last_sub);
-                })?;
-                handles.push(sub);
-            }
-
-            Ok(Some(Cleanup::async_fn(move || async move {
-                for h in handles {
-                    h.dispose().await;
-                }
-            })))
+                let meta = json!({ "loaded": loaded_names });
+                Ok(ToolOutput::text(text)
+                    .with_structured(meta.clone())
+                    .with_details(meta))
+            },
+        )
+        .with_exposure(ToolExposure::ModelOnly)
+        .with_default_active(false)
+        .with_execution_mode(ToolExecutionMode::Sequential)
+        .with_annotations(ToolAnnotations {
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
         })
+        .with_prompt_snippet("Search for unloaded MCP/deferred tools and activate matches"),
+    )?;
+
+    let mut guards = vec![reg];
+    if config.auto_enable {
+        let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
+        sync_auto_enable(&tools, &last_state);
+        let tools_weak = Arc::downgrade(&tools);
+        let last_sub = Arc::clone(&last_state);
+        guards.push(tools.on_change(move |_: &()| {
+            if let Some(rt) = tools_weak.upgrade() {
+                sync_auto_enable(&rt, &last_sub);
+            }
+        }));
     }
+
+    Ok(guards)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ToolExecution, ToolNamespace};
-    use cordis::{Context, Service};
+    use mizar_types::BoxError;
 
     #[tokio::test]
     async fn bm25_finds_and_activates_deferred_mcp_tools() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(ToolSearchPlugin, ToolSearchConfig::default())
-            .await
-            .unwrap();
-
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
+        let _guards =
+            register_tool_search(Arc::clone(&tools), ToolSearchConfig::default()).unwrap();
         assert!(
             tools.list_declared(Some("s1")).is_empty(),
             "tool_search should stay inactive until searchable tools exist"
@@ -324,7 +295,5 @@ mod tests {
 
         let declared_after = tools.list_declared(Some("s1"));
         assert!(declared_after.iter().any(|t| t.name == "mcp__fff__grep"));
-
-        app.fiber().dispose().await;
     }
 }

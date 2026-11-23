@@ -10,10 +10,11 @@ pub mod read;
 pub mod write;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
+use mizar_types::hooks::HookGuard;
 
-use crate::{ToolDefinition, ToolRuntimeInfo, ToolsContextExt};
+use crate::{ToolDefinition, ToolError, ToolRuntime, ToolRuntimeInfo};
 
 pub use bash::create_bash_tool;
 pub use edit::create_edit_tool;
@@ -156,52 +157,22 @@ pub fn build_tools_guide(declared: &[ToolRuntimeInfo]) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct CodingToolsPlugin;
-
-impl Plugin for CodingToolsPlugin {
-    type Config = CodingToolsConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("tools-coding")
+pub fn register_coding_tools(
+    tools: &Arc<ToolRuntime>,
+    config: &CodingToolsConfig,
+) -> Result<Vec<HookGuard>, ToolError> {
+    let defs = build_coding_tools(config);
+    let mut guards = Vec::with_capacity(defs.len());
+    for def in defs {
+        guards.push(tools.register(def)?);
     }
-
-    fn inject(&self) -> Inject {
-        Inject::from(["tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let tools = ctx.tools()?;
-            let defs = build_coding_tools(&config);
-            let mut cleanups = Vec::with_capacity(defs.len());
-            for def in defs {
-                let key = format!("tools-coding.{}", def.name);
-                let rt = std::sync::Arc::clone(&tools);
-                let handle = ctx.effect(key, move || {
-                    Ok::<_, crate::ToolError>(Some(rt.register(def)?))
-                })?;
-                cleanups.push(handle);
-            }
-
-            Ok(Some(Cleanup::async_fn(move || async move {
-                for h in cleanups {
-                    h.dispose().await;
-                }
-            })))
-        })
-    }
+    Ok(guards)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ToolExecution, ToolRuntime, ToolUpdate};
-    use cordis::{Context, Service};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
@@ -215,13 +186,8 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "ignored.log\n").unwrap();
         std::fs::write(root.join("ignored.log"), "secret_needle\n").unwrap();
 
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(CodingToolsPlugin, CodingToolsConfig::new(&root))
-            .await
-            .unwrap();
-
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
+        let _guards = register_coding_tools(&tools, &CodingToolsConfig::new(&root)).unwrap();
 
         // 1. write
         let write_res = tools
@@ -317,7 +283,6 @@ mod tests {
         assert!(bash_res.content.contains("2100"));
 
         let _ = std::fs::remove_dir_all(&root);
-        app.fiber().dispose().await;
     }
 
     #[tokio::test]
@@ -329,13 +294,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(CodingToolsPlugin, CodingToolsConfig::new(&root))
-            .await
-            .unwrap();
-
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
+        let _guards = register_coding_tools(&tools, &CodingToolsConfig::new(&root)).unwrap();
         let built = build_tools_guide(&tools.list_declared_infos(None)).unwrap();
         assert!(built.contains("Available tools:"), "prompt:\n{built}");
         assert!(built.contains("Tool usage:"), "prompt:\n{built}");
@@ -361,6 +321,5 @@ mod tests {
         assert!(!built_ro.contains("- `bash`:"), "s-ro:\n{built_ro}");
 
         let _ = std::fs::remove_dir_all(&root);
-        app.fiber().dispose().await;
     }
 }

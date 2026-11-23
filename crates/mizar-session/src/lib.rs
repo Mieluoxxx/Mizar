@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
+use mizar_types::hooks::{HookGuard, SyncEventBus};
 use mizar_types::llm::{ContentBlock, Message, ReasoningEffort};
 use uuid::Uuid;
 
@@ -25,17 +25,9 @@ pub use model::{
     SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
     derive_session_title,
 };
-pub use persistence::{
-    PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionPersistence,
-    SessionPersistenceContextExt, SessionPersistenceHandle,
-};
-pub use recall::{RECALL_TOOL_NAME, RecallConfig, RecallPlugin};
-pub use sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
-
-pub const EVENT_SESSION_EVENT: &str = "session/event";
-pub const EVENT_SESSION_CREATED: &str = "session/created";
-pub const EVENT_SESSION_LOADED: &str = "session/loaded";
-pub const EVENT_SESSION_TITLE_UPDATED: &str = "session/title-updated";
+pub use persistence::{PersistenceError, PersistenceResult, SessionPersistence};
+pub use recall::{RECALL_TOOL_NAME, RecallConfig, register_recall_tool};
+pub use sqlite::{SqlitePersistenceConfig, SqliteSessionPersistence};
 
 #[derive(Clone)]
 pub struct SessionEventPayload {
@@ -60,6 +52,32 @@ pub struct SessionTitleUpdatedPayload {
     pub title_source: Option<TitleSource>,
 }
 
+struct SessionShared {
+    persistence: Mutex<Option<Arc<dyn SessionPersistence>>>,
+    on_event: SyncEventBus<SessionEventPayload>,
+    on_created: SyncEventBus<SessionCreatedPayload>,
+    on_loaded: SyncEventBus<SessionLoadedPayload>,
+    on_title_updated: SyncEventBus<SessionTitleUpdatedPayload>,
+}
+
+impl Default for SessionShared {
+    fn default() -> Self {
+        Self {
+            persistence: Mutex::new(None),
+            on_event: SyncEventBus::new(),
+            on_created: SyncEventBus::new(),
+            on_loaded: SyncEventBus::new(),
+            on_title_updated: SyncEventBus::new(),
+        }
+    }
+}
+
+impl SessionShared {
+    fn persistence(&self) -> Option<Arc<dyn SessionPersistence>> {
+        self.persistence.lock().unwrap().clone()
+    }
+}
+
 struct SessionInner {
     header: SessionHeader,
     log: Vec<SessionEntry>,
@@ -70,7 +88,7 @@ pub struct Session {
     pub id: String,
     inner: Mutex<SessionInner>,
     turn_counter: AtomicU64,
-    ctx: Context,
+    shared: Arc<SessionShared>,
 }
 
 impl std::fmt::Debug for Session {
@@ -259,13 +277,17 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
 }
 
 impl Session {
-    pub fn new(ctx: Context, id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Self {
         let id = id.into();
         let header = SessionHeader::new(id.clone(), now_millis());
-        Self::from_parts(ctx, header, Vec::new())
+        Self::from_parts(Arc::new(SessionShared::default()), header, Vec::new())
     }
 
-    pub fn from_loaded(ctx: Context, loaded: LoadedSession) -> Self {
+    pub fn from_loaded(loaded: LoadedSession) -> Self {
+        Self::from_loaded_with_shared(Arc::new(SessionShared::default()), loaded)
+    }
+
+    fn from_loaded_with_shared(shared: Arc<SessionShared>, loaded: LoadedSession) -> Self {
         let entries_last = loaded.entries.last().map_or(0, |e| e.seq);
         let floor = if let Some(max_p) = loaded.max_persisted_seq {
             max_p.max(entries_last)
@@ -274,16 +296,20 @@ impl Session {
         } else {
             entries_last
         };
-        Self::from_parts_with_floor(ctx, loaded.header, loaded.entries, floor)
+        Self::from_parts_with_floor(shared, loaded.header, loaded.entries, floor)
     }
 
-    fn from_parts(ctx: Context, header: SessionHeader, log: Vec<SessionEntry>) -> Self {
+    fn from_parts(
+        shared: Arc<SessionShared>,
+        header: SessionHeader,
+        log: Vec<SessionEntry>,
+    ) -> Self {
         let floor = log.last().map_or(0, |e| e.seq);
-        Self::from_parts_with_floor(ctx, header, log, floor)
+        Self::from_parts_with_floor(shared, header, log, floor)
     }
 
     fn from_parts_with_floor(
-        ctx: Context,
+        shared: Arc<SessionShared>,
         mut header: SessionHeader,
         log: Vec<SessionEntry>,
         min_last_seq: u64,
@@ -314,7 +340,7 @@ impl Session {
                 min_last_seq,
             }),
             turn_counter: AtomicU64::new(turn_init),
-            ctx,
+            shared,
         }
     }
 
@@ -327,9 +353,9 @@ impl Session {
         self.turn_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// 追加一条事件（`Surface` 或 `LogOnly`），同步写入可选持久化队列，并广播 `session/event`。
+    /// 追加一条事件（`Surface` 或 `LogOnly`），同步写入可选持久化队列，并广播 `on_event`。
     pub fn append(self: &Arc<Self>, event: SessionEvent) {
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let (entry, emitted_title) = {
             let mut inner = self.inner.lock().unwrap();
             let seq = inner
@@ -419,22 +445,18 @@ impl Session {
             (entry, emitted_title)
         };
 
-        self.ctx.emit(
-            EVENT_SESSION_EVENT,
-            SessionEventPayload {
-                session: Arc::clone(self),
-                entry,
-            },
-        );
+        self.shared.on_event.emit(&SessionEventPayload {
+            session: Arc::clone(self),
+            entry,
+        });
         if let Some((title, title_source)) = emitted_title {
-            self.ctx.emit(
-                EVENT_SESSION_TITLE_UPDATED,
-                SessionTitleUpdatedPayload {
+            self.shared
+                .on_title_updated
+                .emit(&SessionTitleUpdatedPayload {
                     session: Arc::clone(self),
                     title,
                     title_source,
-                },
-            );
+                });
         }
     }
 
@@ -474,7 +496,7 @@ impl Session {
         if cleaned.is_empty() {
             return false;
         }
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let ts = now_millis();
         let changed = {
             let mut inner = self.inner.lock().unwrap();
@@ -509,14 +531,13 @@ impl Session {
         if !changed {
             return false;
         }
-        self.ctx.emit(
-            EVENT_SESSION_TITLE_UPDATED,
-            SessionTitleUpdatedPayload {
+        self.shared
+            .on_title_updated
+            .emit(&SessionTitleUpdatedPayload {
                 session: Arc::clone(self),
                 title: Some(cleaned),
                 title_source: Some(source),
-            },
-        );
+            });
         true
     }
 
@@ -534,7 +555,7 @@ impl Session {
         if cleaned.is_empty() {
             return Err(self.header().title);
         }
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let ts = now_millis();
         enum CasOutcome {
             Skipped(Option<String>),
@@ -579,14 +600,13 @@ impl Session {
             CasOutcome::Skipped(cur) => Err(cur),
             CasOutcome::Unchanged => Ok(cleaned),
             CasOutcome::Updated => {
-                self.ctx.emit(
-                    EVENT_SESSION_TITLE_UPDATED,
-                    SessionTitleUpdatedPayload {
+                self.shared
+                    .on_title_updated
+                    .emit(&SessionTitleUpdatedPayload {
                         session: Arc::clone(self),
                         title: Some(cleaned.clone()),
                         title_source: Some(TitleSource::Auto),
-                    },
-                );
+                    });
                 Ok(cleaned)
             }
         }
@@ -594,7 +614,7 @@ impl Session {
 
     /// 清空会话标题与来源标记。
     pub fn clear_title(self: &Arc<Self>) -> bool {
-        let persistence = self.ctx.session_persistence();
+        let persistence = self.shared.persistence();
         let ts = now_millis();
         let changed = {
             let mut inner = self.inner.lock().unwrap();
@@ -627,14 +647,13 @@ impl Session {
         if !changed {
             return false;
         }
-        self.ctx.emit(
-            EVENT_SESSION_TITLE_UPDATED,
-            SessionTitleUpdatedPayload {
+        self.shared
+            .on_title_updated
+            .emit(&SessionTitleUpdatedPayload {
                 session: Arc::clone(self),
                 title: None,
                 title_source: None,
-            },
-        );
+            });
         true
     }
 
@@ -751,7 +770,7 @@ impl Session {
     }
 
     pub fn flush(&self) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush(Some(&self.id))
         } else {
             Ok(())
@@ -759,7 +778,7 @@ impl Session {
     }
 
     pub async fn flush_async(&self) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush_async(Some(self.id.clone())).await
         } else {
             Ok(())
@@ -886,12 +905,59 @@ impl Session {
 }
 
 pub struct SessionStore {
-    ctx: Context,
+    shared: Arc<SessionShared>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     default_cwd: Mutex<Option<String>>,
 }
 
 impl SessionStore {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shared: Arc::new(SessionShared::default()),
+            sessions: Mutex::new(HashMap::new()),
+            default_cwd: Mutex::new(None),
+        })
+    }
+
+    pub fn with_persistence(persistence: Arc<dyn SessionPersistence>) -> Arc<Self> {
+        let store = Self::new();
+        store.set_persistence(Some(persistence));
+        store
+    }
+
+    pub fn set_persistence(&self, persistence: Option<Arc<dyn SessionPersistence>>) {
+        *self.shared.persistence.lock().unwrap() = persistence;
+    }
+
+    pub fn persistence(&self) -> Option<Arc<dyn SessionPersistence>> {
+        self.shared.persistence()
+    }
+
+    pub fn on_event(&self, cb: impl Fn(&SessionEventPayload) + Send + Sync + 'static) -> HookGuard {
+        self.shared.on_event.on(cb)
+    }
+
+    pub fn on_created(
+        &self,
+        cb: impl Fn(&SessionCreatedPayload) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.shared.on_created.on(cb)
+    }
+
+    pub fn on_loaded(
+        &self,
+        cb: impl Fn(&SessionLoadedPayload) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.shared.on_loaded.on(cb)
+    }
+
+    pub fn on_title_updated(
+        &self,
+        cb: impl Fn(&SessionTitleUpdatedPayload) + Send + Sync + 'static,
+    ) -> HookGuard {
+        self.shared.on_title_updated.on(cb)
+    }
+
     pub fn set_default_cwd(&self, cwd: Option<String>) {
         *self.default_cwd.lock().unwrap() = cwd;
     }
@@ -919,7 +985,7 @@ impl SessionStore {
         header.origin = opts.origin;
 
         let session = Arc::new(Session::from_parts(
-            self.ctx.clone(),
+            Arc::clone(&self.shared),
             header.clone(),
             Vec::new(),
         ));
@@ -928,7 +994,7 @@ impl SessionStore {
             .unwrap()
             .insert(id, Arc::clone(&session));
 
-        if let Some(backend) = self.ctx.session_persistence()
+        if let Some(backend) = self.shared.persistence()
             && let Err(err) = backend.create_session(&header)
         {
             tracing::warn!(
@@ -938,12 +1004,9 @@ impl SessionStore {
             );
         }
 
-        self.ctx.emit(
-            EVENT_SESSION_CREATED,
-            SessionCreatedPayload {
-                session: Arc::clone(&session),
-            },
-        );
+        self.shared.on_created.emit(&SessionCreatedPayload {
+            session: Arc::clone(&session),
+        });
         session
     }
 
@@ -967,7 +1030,7 @@ impl SessionStore {
                 skipped_events: 0,
             });
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend.load_session(id).ok().flatten()
     }
 
@@ -987,7 +1050,7 @@ impl SessionStore {
                 skipped_events: 0,
             });
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend
             .load_session_async(id.to_string())
             .await
@@ -1000,7 +1063,7 @@ impl SessionStore {
         if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
             return Some(existing.header());
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend.load_header(id).ok().flatten()
     }
 
@@ -1009,7 +1072,7 @@ impl SessionStore {
         if let Some(existing) = self.sessions.lock().unwrap().get(id).cloned() {
             return Some(existing.header());
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend
             .load_header_async(id.to_string())
             .await
@@ -1027,7 +1090,7 @@ impl SessionStore {
                 .rev()
                 .find_map(|entry| entry.event.as_selection());
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend.latest_selection(session_id).ok().flatten()
     }
 
@@ -1046,7 +1109,7 @@ impl SessionStore {
                 .rev()
                 .find_map(|entry| entry.event.as_selection());
         }
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         backend
             .latest_selection_async(session_id.to_string())
             .await
@@ -1060,7 +1123,7 @@ impl SessionStore {
             return Some(existing);
         }
 
-        let backend = self.ctx.session_persistence()?;
+        let backend = self.shared.persistence()?;
         match backend.load_session(id) {
             Ok(Some(mut loaded)) => {
                 if loaded.skipped_events > 0 {
@@ -1079,7 +1142,10 @@ impl SessionStore {
                         "持久化写入崩溃恢复条目失败 (session={id}): {err}"
                     );
                 }
-                let session = Arc::new(Session::from_loaded(self.ctx.clone(), loaded));
+                let session = Arc::new(Session::from_loaded_with_shared(
+                    Arc::clone(&self.shared),
+                    loaded,
+                ));
                 let (stored, inserted) = {
                     let mut guard = self.sessions.lock().unwrap();
                     if let Some(existing) = guard.get(id) {
@@ -1090,12 +1156,9 @@ impl SessionStore {
                     }
                 };
                 if inserted {
-                    self.ctx.emit(
-                        EVENT_SESSION_LOADED,
-                        SessionLoadedPayload {
-                            session: Arc::clone(&stored),
-                        },
-                    );
+                    self.shared.on_loaded.emit(&SessionLoadedPayload {
+                        session: Arc::clone(&stored),
+                    });
                 }
                 Some(stored)
             }
@@ -1145,7 +1208,7 @@ impl SessionStore {
         new_header.fork_seq = Some(up_to_seq);
         new_header.origin = opts.origin.or(Some(SessionOrigin::User));
 
-        let mut loaded = if let Some(backend) = self.ctx.session_persistence() {
+        let mut loaded = if let Some(backend) = self.shared.persistence() {
             backend.fork_session(from_session_id, up_to_seq, &new_header)?
         } else {
             let entries: Vec<SessionEntry> = parent
@@ -1164,22 +1227,22 @@ impl SessionStore {
 
         let repaired = repair_dangling_tool_calls(&mut loaded);
         if !repaired.is_empty()
-            && let Some(backend) = self.ctx.session_persistence()
+            && let Some(backend) = self.shared.persistence()
         {
             backend.append_events(&new_id, &repaired)?;
         }
 
-        let child = Arc::new(Session::from_loaded(self.ctx.clone(), loaded));
+        let child = Arc::new(Session::from_loaded_with_shared(
+            Arc::clone(&self.shared),
+            loaded,
+        ));
         self.sessions
             .lock()
             .unwrap()
             .insert(new_id, Arc::clone(&child));
-        self.ctx.emit(
-            EVENT_SESSION_CREATED,
-            SessionCreatedPayload {
-                session: Arc::clone(&child),
-            },
-        );
+        self.shared.on_created.emit(&SessionCreatedPayload {
+            session: Arc::clone(&child),
+        });
         Ok(child)
     }
 
@@ -1227,7 +1290,7 @@ impl SessionStore {
         &self,
         query: &RecallSearchQuery,
     ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.search_recall(query)
         } else {
             Ok(None)
@@ -1239,7 +1302,7 @@ impl SessionStore {
         &self,
         query: RecallSearchQuery,
     ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.search_recall_async(query).await
         } else {
             Ok(None)
@@ -1274,7 +1337,7 @@ impl SessionStore {
 
     /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。
     pub fn list_headers(&self, query: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             return backend.list_sessions(query);
         }
         Ok(self.list_in_memory_headers(query))
@@ -1285,14 +1348,14 @@ impl SessionStore {
         &self,
         query: SessionListQuery,
     ) -> PersistenceResult<Vec<SessionHeader>> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             return backend.list_sessions_async(query).await;
         }
         Ok(self.list_in_memory_headers(&query))
     }
 
     pub fn flush(&self, session_id: Option<&str>) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush(session_id)
         } else {
             Ok(())
@@ -1300,7 +1363,7 @@ impl SessionStore {
     }
 
     pub async fn flush_async(&self, session_id: Option<String>) -> PersistenceResult<()> {
-        if let Some(backend) = self.ctx.session_persistence() {
+        if let Some(backend) = self.shared.persistence() {
             backend.flush_async(session_id).await
         } else {
             Ok(())
@@ -1309,52 +1372,5 @@ impl SessionStore {
 
     pub fn clear(&self) {
         self.sessions.lock().unwrap().clear();
-    }
-}
-
-impl Service for SessionStore {
-    type Config = ();
-
-    fn service_name() -> &'static str {
-        "sessions"
-    }
-
-    fn plugin_name() -> &'static str {
-        "SessionStore"
-    }
-
-    fn create(ctx: &Context, _config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            sessions: Mutex::new(HashMap::new()),
-            default_cwd: Mutex::new(None),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let store = Arc::downgrade(&self);
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            // 服务卸载前刷新持久化屏障，再清掉内存会话缓存
-            ctx.effect("sessions.clear", || {
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || {
-                    if let Some(s) = store.upgrade() {
-                        let _ = s.flush(None);
-                        s.clear();
-                    }
-                })))
-            })?;
-            Ok(())
-        })
-    }
-}
-
-pub trait SessionContextExt {
-    fn sessions(&self) -> Result<Arc<SessionStore>, CordisError>;
-}
-
-impl SessionContextExt for Context {
-    fn sessions(&self) -> Result<Arc<SessionStore>, CordisError> {
-        self.service::<SessionStore>("sessions")
     }
 }

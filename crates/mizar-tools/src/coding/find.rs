@@ -338,7 +338,7 @@ pub fn create_find_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
                 }
 
                 let search_path = resolve_to_cwd(&cwd, raw_path, restrict_to_workspace)
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
                 if !tokio::fs::try_exists(&search_path).await.unwrap_or(false) {
                     return Err(format!("Path not found: {}", search_path.display()).into());
                 }
@@ -469,7 +469,7 @@ mod tests {
             exec: ToolExecution::new("find", args.clone(), None),
             cancel: tokio_util::sync::CancellationToken::new(),
             on_update: None,
-            ctx: cordis::Context::new(),
+            tools: crate::ToolRuntime::new(),
         }
     }
 

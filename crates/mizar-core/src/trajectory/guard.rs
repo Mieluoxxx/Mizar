@@ -1,24 +1,20 @@
 //! 实时重复工具调用守卫（直接对照 `deepseek-harness/packages/guard/repeat-tool-reminder`）。
 //!
-//! 挂载在 `tools/post-execute` waterfall 上：
+//! 挂载在 `tools.post_execute_hook()` waterfall 上：
 //! - 使用深度键排序规范化参数（`{"a":1,"b":2}` 与 `{"b":2,"a":1}` 视为同一次调用）
 //! - 支持 `*` 通配符 `include` / `exclude`（被排除的工具对重复链透明，既不计数也不重置）
-//! - 被 `tools/pre-execute` 拦截的调用同样会计数
-//! - 新一轮用户输入（`agent/turn-start`）自动清零该会话的重复链
+//! - 被 `tools.pre_execute_hook()` 拦截的调用同样会计数
+//! - 新一轮用户输入（`AgentEvent::TurnStart`）自动清零该会话的重复链
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentEvent, subscribe_agent_events_when_ready};
-use cordis::{
-    BoxError, BoxFuture, Cleanup, Context, Next, Plugin, ValidationError, ValidationIssue,
-};
-use mizar_tools::{EVENT_TOOLS_POST_EXECUTE, PostExecuteInput, ToolResult};
-
+use crate::agent_loop::{AgentEvent, AgentLoop};
+use mizar_tools::{PostExecuteInput, ToolResult, ToolRuntime};
 use mizar_types::trajectory::{canonicalize_json, preview_chars, wildcard_matches};
-
-pub const EVENT_GUARD_REPEAT: &str = "guard/repeat-tool";
+use mizar_types::{BoxFuture, HookGuard, Next, SyncEventBus};
+use thiserror::Error;
 
 const GENTLE_REMINDER: &str = "You are repeating the exact same tool call with identical arguments. Carefully analyze the previous result before calling again: if the task is not complete, try a different approach or different arguments instead of repeating the call.";
 
@@ -79,103 +75,88 @@ struct Chain {
     count: usize,
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct RepeatToolGuardPlugin;
+#[derive(Debug, Error)]
+pub enum RepeatGuardValidationError {
+    #[error("repeat-tool-guard: `thresholds` must not be empty")]
+    EmptyThresholds,
+    #[error("repeat-tool-guard: invalid threshold {0} — every threshold must be >= 2")]
+    ThresholdTooSmall(usize),
+    #[error("repeat-tool-guard: `thresholds` must not contain duplicates")]
+    DuplicateThreshold,
+    #[error("repeat-tool-guard: `arguments_preview_chars` must be >= 1")]
+    PreviewCharsZero,
+}
 
-impl Plugin for RepeatToolGuardPlugin {
-    type Config = RepeatGuardConfig;
-
-    fn name(&self) -> Option<&str> {
-        Some("repeat-tool-guard")
+pub fn validate_repeat_guard_config(
+    config: &RepeatGuardConfig,
+) -> Result<(), RepeatGuardValidationError> {
+    if config.thresholds.is_empty() {
+        return Err(RepeatGuardValidationError::EmptyThresholds);
     }
-
-    fn validate(&self, config: &Self::Config) -> Result<(), ValidationError> {
-        let mut issues = Vec::new();
-        if config.thresholds.is_empty() {
-            issues.push(
-                ValidationIssue::new("repeat-tool-guard: `thresholds` must not be empty")
-                    .at(["thresholds"]),
-            );
+    let mut seen = HashSet::new();
+    for &v in &config.thresholds {
+        if v < 2 {
+            return Err(RepeatGuardValidationError::ThresholdTooSmall(v));
         }
-        let mut seen = HashSet::new();
-        for &v in &config.thresholds {
-            if v < 2 {
-                issues.push(
-                    ValidationIssue::new(format!(
-                        "repeat-tool-guard: invalid threshold {v} — every threshold must be >= 2"
-                    ))
-                    .at(["thresholds"]),
-                );
-            }
-            if !seen.insert(v) {
-                issues.push(
-                    ValidationIssue::new(
-                        "repeat-tool-guard: `thresholds` must not contain duplicates",
-                    )
-                    .at(["thresholds"]),
-                );
-                break;
-            }
-        }
-        if config.arguments_preview_chars < 1 {
-            issues.push(
-                ValidationIssue::new("repeat-tool-guard: `arguments_preview_chars` must be >= 1")
-                    .at(["argumentsPreviewChars"]),
-            );
-        }
-        if issues.is_empty() {
-            Ok(())
-        } else {
-            Err(ValidationError::new(issues))
+        if !seen.insert(v) {
+            return Err(RepeatGuardValidationError::DuplicateThreshold);
         }
     }
+    if config.arguments_preview_chars < 1 {
+        return Err(RepeatGuardValidationError::PreviewCharsZero);
+    }
+    Ok(())
+}
 
-    fn apply(
-        &self,
-        ctx: Context,
-        config: Self::Config,
-    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
-        Box::pin(async move {
-            let mut thresholds = config.thresholds.clone();
-            thresholds.sort_unstable();
-            let first_threshold = thresholds[0];
-            let threshold_set: HashSet<usize> = thresholds.into_iter().collect();
-            let include = config.include;
-            let exclude = config.exclude;
-            let preview_cap = config.arguments_preview_chars;
-            let inject_reminder = config.inject_reminder;
-            let hard_block_after = config.hard_block_after;
-            let enabled_flag = config
-                .enabled_flag
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+/// 安装重复工具调用守卫，返回 `GuardRepeatEvent` 同步事件总线与组合 RAII 清理守卫。
+pub fn install_repeat_guard(
+    tools: &Arc<ToolRuntime>,
+    agent_loop: Option<&Arc<AgentLoop>>,
+    config: RepeatGuardConfig,
+) -> Result<(Arc<SyncEventBus<GuardRepeatEvent>>, HookGuard), RepeatGuardValidationError> {
+    validate_repeat_guard_config(&config)?;
 
-            let chains: Arc<Mutex<HashMap<String, Chain>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut thresholds = config.thresholds.clone();
+    thresholds.sort_unstable();
+    let first_threshold = thresholds[0];
+    let threshold_set: HashSet<usize> = thresholds.into_iter().collect();
+    let include = config.include;
+    let exclude = config.exclude;
+    let preview_cap = config.arguments_preview_chars;
+    let inject_reminder = config.inject_reminder;
+    let hard_block_after = config.hard_block_after;
+    let enabled_flag = config
+        .enabled_flag
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
 
-            let chains_post = Arc::clone(&chains);
-            let ctx_post = ctx.clone();
-            ctx.on_waterfall(
-                EVENT_TOOLS_POST_EXECUTE,
-                move |input: PostExecuteInput,
-                      next: Next<PostExecuteInput, BoxFuture<'static, ToolResult>>| {
-                    let chains = Arc::clone(&chains_post);
-                    let ctx = ctx_post.clone();
-                    let include = include.clone();
-                    let exclude = exclude.clone();
-                    let threshold_set = threshold_set.clone();
-                    let enabled_flag = Arc::clone(&enabled_flag);
+    let chains: Arc<Mutex<HashMap<String, Chain>>> = Arc::new(Mutex::new(HashMap::new()));
+    let on_repeat = Arc::new(SyncEventBus::new());
+    let mut guards = Vec::new();
 
-                    Box::pin(async move {
-                        if !enabled_flag.load(Ordering::Acquire) {
-                            return next.call(input).await;
-                        }
-                        let tool_name = input.exec.name.clone();
-                        let tracked = (include.is_empty()
-                            || include.iter().any(|p| wildcard_matches(p, &tool_name)))
-                            && !exclude.iter().any(|p| wildcard_matches(p, &tool_name));
+    {
+        let chains_post = Arc::clone(&chains);
+        let bus_post = Arc::clone(&on_repeat);
+        guards.push(tools.post_execute_hook().register(
+            move |input: PostExecuteInput,
+                  next: Next<PostExecuteInput, BoxFuture<'static, ToolResult>>| {
+                let chains = Arc::clone(&chains_post);
+                let on_repeat = Arc::clone(&bus_post);
+                let include = include.clone();
+                let exclude = exclude.clone();
+                let threshold_set = threshold_set.clone();
+                let enabled_flag = Arc::clone(&enabled_flag);
 
-                        let observation = if tracked
-                            && let Some(session_id) = input.exec.session_id.clone()
-                        {
+                Box::pin(async move {
+                    if !enabled_flag.load(Ordering::Acquire) {
+                        return next.call(input).await;
+                    }
+                    let tool_name = input.exec.name.clone();
+                    let tracked = (include.is_empty()
+                        || include.iter().any(|p| wildcard_matches(p, &tool_name)))
+                        && !exclude.iter().any(|p| wildcard_matches(p, &tool_name));
+
+                    let observation =
+                        if tracked && let Some(session_id) = input.exec.session_id.clone() {
                             let canonical = canonicalize_json(&input.exec.args);
                             let key = (tool_name.clone(), canonical.clone());
                             let count = {
@@ -192,60 +173,57 @@ impl Plugin for RepeatToolGuardPlugin {
                             None
                         };
 
-                        let mut result = next.call(input).await;
+                    let mut result = next.call(input).await;
 
-                        if let Some((session_id, canonical, count)) = observation {
-                            let hard_blocked =
-                                hard_block_after.is_some_and(|limit| count >= limit);
-                            if hard_blocked && !result.blocked {
-                                let existing_notes = std::mem::take(&mut result.additional_contexts);
-                                result = ToolResult::denied(format!(
-                                    "重复调用护栏已拦截：{tool_name} 连续使用相同参数调用了 {count} 次"
-                                ));
-                                result.additional_contexts = existing_notes;
-                            }
-
-                            if threshold_set.contains(&count) || hard_blocked {
-                                ctx.emit(
-                                    EVENT_GUARD_REPEAT,
-                                    GuardRepeatEvent {
-                                        session_id,
-                                        tool_name: tool_name.clone(),
-                                        count,
-                                        canonical_args: canonical.clone(),
-                                        blocked: hard_blocked,
-                                    },
-                                );
-                                if inject_reminder {
-                                    let text = if count == first_threshold {
-                                        GENTLE_REMINDER.to_string()
-                                    } else {
-                                        detailed_reminder(
-                                            &tool_name,
-                                            count,
-                                            &preview_chars(&canonical, preview_cap),
-                                        )
-                                    };
-                                    result = result.prepend_context("repeat-tool-reminder", text);
-                                }
-                            }
+                    if let Some((session_id, canonical, count)) = observation {
+                        let hard_blocked = hard_block_after.is_some_and(|limit| count >= limit);
+                        if hard_blocked && !result.blocked {
+                            let existing_notes = std::mem::take(&mut result.additional_contexts);
+                            result = ToolResult::denied(format!(
+                                "重复调用护栏已拦截：{tool_name} 连续使用相同参数调用了 {count} 次"
+                            ));
+                            result.additional_contexts = existing_notes;
                         }
 
-                        result
-                    })
-                },
-            )?;
+                        if threshold_set.contains(&count) || hard_blocked {
+                            on_repeat.emit(&GuardRepeatEvent {
+                                session_id,
+                                tool_name: tool_name.clone(),
+                                count,
+                                canonical_args: canonical.clone(),
+                                blocked: hard_blocked,
+                            });
+                            if inject_reminder {
+                                let text = if count == first_threshold {
+                                    GENTLE_REMINDER.to_string()
+                                } else {
+                                    detailed_reminder(
+                                        &tool_name,
+                                        count,
+                                        &preview_chars(&canonical, preview_cap),
+                                    )
+                                };
+                                result = result.prepend_context("repeat-tool-reminder", text);
+                            }
+                        }
+                    }
 
-            // 用户新一轮提问开始时重置重复链，跨轮次的合理复查不当作死循环
-            let chains_reset = Arc::clone(&chains);
-            subscribe_agent_events_when_ready(&ctx, "repeat-tool-guard.turn-start", move |ev| {
-                if let AgentEvent::TurnStart(ev) = ev {
-                    chains_reset.lock().unwrap().remove(&ev.session.id);
-                }
-            })
-            .await?;
-
-            Ok(None)
-        })
+                    result
+                })
+            },
+        ));
     }
+
+    // 用户新一轮提问开始时重置重复链，跨轮次的合理复查不当作死循环
+    if let Some(agent_loop) = agent_loop {
+        let chains_reset = Arc::clone(&chains);
+        let ev_guard = agent_loop.on_event(move |ev| {
+            if let AgentEvent::TurnStart(ev) = ev {
+                chains_reset.lock().unwrap().remove(&ev.session.id);
+            }
+        });
+        guards.push(HookGuard::new(move || drop(ev_guard)));
+    }
+
+    Ok((on_repeat, HookGuard::group(guards)))
 }

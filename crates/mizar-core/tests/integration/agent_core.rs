@@ -10,126 +10,55 @@ use axum::Router;
 use axum::body::Body;
 use axum::response::Response;
 use axum::routing::post;
-use cordis::{BoxFuture, Context, CordisError, FiberState, Next, Plugin, PluginDef, Service};
-use mizar_core::agent_loop::{AgentLoop, AgentLoopContextExt};
-use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin};
-use mizar_core::trajectory::{
-    EVENT_TRAJECTORY_ANOMALY, TimelineMode, TrajectoryAnomalyEvent, TrajectoryRuntime,
-};
-use mizar_llm::mock::MockPlugin;
-use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
-use mizar_llm::router::{LlmRouter, ProviderRouteConfig, RouterConfig};
+use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+use mizar_core::trajectory::TimelineMode;
+use mizar_llm::retry::RetryConfig;
+use mizar_llm::router::{ProviderRouteConfig, RouterConfig};
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmRuntime, Message,
-    StreamChunk, TokenUsage, ToolCall,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, Message, StreamChunk, TokenUsage,
+    ToolCall,
 };
-use mizar_session::SessionContextExt;
-use mizar_tools::{
-    EVENT_TOOLS_PRE_EXECUTE, EVENT_TOOLS_RESULT, PreExecuteDecision, ToolAnnotations,
-    ToolDefinition, ToolExecution, ToolResultEvent, ToolsContextExt,
-};
+use mizar_tools::{PreExecuteDecision, ToolAnnotations, ToolDefinition, ToolExecution};
+use mizar_types::{BoxFuture, HookGuard, Next};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Default, Clone, Copy)]
-struct TestTimePlugin;
-
-impl Plugin for TestTimePlugin {
-    type Config = ();
-
-    fn name(&self) -> Option<&str> {
-        Some("test-time")
-    }
-
-    fn inject(&self) -> cordis::Inject {
-        cordis::Inject::from(["tools"])
-    }
-
-    fn apply(
-        &self,
-        ctx: Context,
-        (): Self::Config,
-    ) -> BoxFuture<'static, Result<Option<cordis::Cleanup>, cordis::BoxError>> {
-        Box::pin(async move {
-            let tools = ctx.tools()?;
-            let def = ToolDefinition::sync_tool(
-                "get_time",
-                "Get current time",
-                json!({"type": "object", "properties": {}}),
-                |_, _| Ok::<_, mizar_tools::ToolError>("2026-01-01 12:00:00".to_string()),
-            )
-            .with_annotations(ToolAnnotations {
-                read_only: true,
-                ..Default::default()
-            });
-            ctx.effect("test-time.reg", move || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(def)?))
-            })?;
-            Ok(None)
-        })
-    }
-}
-
-async fn wait_all_settled(app: &Context) {
-    // 子插件注册与服务通知可能跨多轮异步调度完成，循环等到所有 Fiber 稳态且连续两轮状态不再变化。
-    loop {
-        tokio::task::yield_now().await;
-        let fibers: Vec<_> = app
-            .registry()
-            .values()
-            .into_iter()
-            .flat_map(|rt| rt.fibers())
-            .collect();
-        let before: Vec<_> = fibers.iter().map(|f| (f.uid(), f.state())).collect();
-        for fiber in &fibers {
-            let _ = fiber.wait_settled().await;
-        }
-        tokio::task::yield_now().await;
-        let after: Vec<_> = app
-            .registry()
-            .values()
-            .into_iter()
-            .flat_map(|rt| rt.fibers())
-            .map(|f| (f.uid(), f.state()))
-            .collect();
-        if before == after
-            && after
-                .iter()
-                .all(|(_, s)| !matches!(s, FiberState::Loading | FiberState::Unloading))
-        {
-            break;
-        }
-    }
+fn register_test_time_tool(runtime: &MizarRuntime) -> HookGuard {
+    let def = ToolDefinition::sync_tool(
+        "get_time",
+        "Get current time",
+        json!({"type": "object", "properties": {}}),
+        |_, _| Ok::<_, mizar_tools::ToolError>("2026-01-01 12:00:00".to_string()),
+    )
+    .with_annotations(ToolAnnotations {
+        read_only: true,
+        ..Default::default()
+    });
+    runtime.tools.register(def).unwrap()
 }
 
 #[tokio::test]
 async fn agent_hot_plug_and_guard_pipeline() {
-    let app = Context::new();
+    let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::current_dir().unwrap()))
+        .await
+        .unwrap();
 
     // 记录每次工具调用
     let tool_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let tc = Arc::clone(&tool_calls);
-    app.on(EVENT_TOOLS_RESULT, move |ev: &ToolResultEvent| {
+    let _result_guard = runtime.tools.on_result(move |ev| {
         tc.lock().unwrap().push(ev.exec.name.clone());
-    })
-    .unwrap();
+    });
 
-    // 1. 乱序挂载：先挂模型适配器与测试时间工具（依赖 llm/tools，先等着），再挂核心套件
-    app.plugin(MockPlugin, ());
-    app.plugin(TestTimePlugin, ());
-    app.plugin(
-        AgentSpinePlugin,
-        AgentSpineConfig::new(std::env::current_dir().unwrap()),
-    );
-    wait_all_settled(&app).await;
+    runtime.register_mock_adapter().unwrap();
+    let time_guard = register_test_time_tool(&runtime);
 
     let ask = |text: &str| {
-        let app = app.clone();
+        let rt = Arc::clone(&runtime);
         let text = text.to_string();
         async move {
-            let session = app.sessions().unwrap().create(None);
-            app.agent_loop()
-                .unwrap()
+            let session = rt.sessions.create(None);
+            rt.agent_loop
                 .run(session, text, CancellationToken::new())
                 .await
                 .unwrap()
@@ -141,64 +70,34 @@ async fn agent_hot_plug_and_guard_pipeline() {
     assert_eq!(*tool_calls.lock().unwrap(), vec!["get_time".to_string()]);
     assert!(answer.contains("工具返回了结果"), "unexpected: {answer}");
 
-    // 3. 挂一个审批插件：在 tools/pre-execute 上拦截，不用改工具和循环的代码
-    let guard = app.plugin(
-        PluginDef::sync("guard", |ctx, ()| {
-            ctx.on_waterfall(
-                EVENT_TOOLS_PRE_EXECUTE,
-                |exec: ToolExecution, next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
-                    Box::pin(async move {
-                        if exec.name == "get_time" {
-                            PreExecuteDecision::deny("演示拦截")
-                        } else {
-                            next.call(exec).await
-                        }
-                    })
-                },
-            )?;
-            Ok::<_, CordisError>(())
-        }),
-        (),
+    // 3. 挂一个拦截钩子：在 pre_execute 上拦截，不用改工具和循环的代码
+    let guard = runtime.tools.pre_execute_hook().register(
+        |exec: ToolExecution, next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+            Box::pin(async move {
+                if exec.name == "get_time" {
+                    PreExecuteDecision::deny("演示拦截")
+                } else {
+                    next.call(exec).await
+                }
+            })
+        },
     );
-    wait_all_settled(&app).await;
     let answer = ask("现在几点？").await;
     assert!(answer.contains("已拦截"), "unexpected: {answer}");
 
-    // 4. 卸载审批插件，监听自动撤销
-    guard.dispose().await;
+    // 4. 释放 HookGuard，拦截自动撤销
+    drop(guard);
     let answer = ask("现在几点？").await;
     assert!(!answer.contains("已拦截"), "unexpected: {answer}");
 
-    // 5. 拔掉工具插件：工具自动从工具表消失，模型就不会再调用它
-    if let Some(rt) = app.registry().delete(&TestTimePlugin) {
-        for fiber in rt.fibers() {
-            fiber.dispose().await;
-        }
-    }
-    wait_all_settled(&app).await;
-    assert!(
-        !app.tools()
-            .unwrap()
-            .list()
-            .iter()
-            .any(|t| t.name == "get_time")
-    );
+    // 5. 拔掉工具守卫：工具自动从工具表消失，模型就不会再调用它
+    drop(time_guard);
+    assert!(!runtime.tools.list().iter().any(|t| t.name == "get_time"));
     tool_calls.lock().unwrap().clear();
     let _ = ask("现在几点？").await;
     assert!(tool_calls.lock().unwrap().is_empty());
 
-    // 6. 拔掉核心服务 llm：依赖它的 agentLoop 自动停止
-    let llm_rt = app
-        .registry()
-        .values()
-        .into_iter()
-        .find(|r| r.name.as_deref() == Some(LlmRuntime::plugin_name()))
-        .expect("LlmRuntime registered");
-    for fiber in llm_rt.fibers() {
-        fiber.dispose().await;
-    }
-    wait_all_settled(&app).await;
-    assert!(app.get::<AgentLoop>("agentLoop").is_none());
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -280,20 +179,17 @@ async fn agent_switches_across_completions_responses_and_messages_in_one_session
         let _ = axum::serve(listener, server).await;
     });
 
-    let app = Context::new();
-    app.plugin(TestTimePlugin, ());
-    app.plugin(
-        AgentSpinePlugin,
-        AgentSpineConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
-    );
-    app.plugin(
-        LlmRetryPlugin,
-        RetryConfig {
-            max_retries: 2,
-            initial_delay: Duration::from_millis(5),
-            ..Default::default()
-        },
-    );
+    let runtime = MizarRuntime::build(AgentSpineConfig::new(PathBuf::from(env!(
+        "CARGO_MANIFEST_DIR"
+    ))))
+    .await
+    .unwrap();
+    let _time_guard = register_test_time_tool(&runtime);
+    runtime.install_retry(RetryConfig {
+        max_retries: 2,
+        initial_delay: Duration::from_millis(5),
+        ..Default::default()
+    });
 
     let base = format!("http://{addr}");
     let mut providers = BTreeMap::new();
@@ -321,11 +217,10 @@ async fn agent_switches_across_completions_responses_and_messages_in_one_session
             ..ProviderRouteConfig::anthropic_messages("UNUSED")
         },
     );
-    app.plugin(LlmRouter::plugin(), RouterConfig { providers });
-    wait_all_settled(&app).await;
+    let _router = runtime.install_router(RouterConfig { providers });
 
-    let llm = app.llm().unwrap();
-    let session = app.sessions().unwrap().create(None);
+    let llm = &runtime.llm;
+    let session = runtime.sessions.create(None);
 
     // 1. 先走 completions（触发一次 429 重试后拿到 tool_call）
     let mut s1 = llm
@@ -394,7 +289,7 @@ async fn agent_switches_across_completions_responses_and_messages_in_one_session
     }
     assert_eq!(asm3.text(), "from-responses");
 
-    app.fiber().dispose().await;
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -450,52 +345,35 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
         }
     }
 
-    let app = Context::new();
-    let anomalies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let anomalies_cb = Arc::clone(&anomalies);
-    app.on(
-        EVENT_TRAJECTORY_ANOMALY,
-        move |ev: &TrajectoryAnomalyEvent| {
-            anomalies_cb
-                .lock()
-                .unwrap()
-                .push(ev.finding.rule_id.clone());
-        },
-    )
-    .unwrap();
-
-    app.plugin(TestTimePlugin, ());
-    app.plugin(
-        AgentSpinePlugin,
+    let runtime = MizarRuntime::build(
         AgentSpineConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
             .with_disabled_plugins(["session-title"]),
-    );
-    app.plugin(
-        PluginDef::sync("looping-adapter", |ctx, ()| {
-            let llm = ctx.llm()?;
-            ctx.effect("looping.reg", || {
-                Ok::<_, mizar_llm::LlmError>(Some(
-                    llm.register_adapter("looping", Arc::new(LoopingAdapter(AtomicUsize::new(0))))?,
-                ))
-            })?;
-            Ok::<_, CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    );
-    wait_all_settled(&app).await;
+    )
+    .await
+    .unwrap();
+    let _time_guard = register_test_time_tool(&runtime);
+    let anomalies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let anomalies_cb = Arc::clone(&anomalies);
+    let traj = runtime.trajectory.as_ref().unwrap();
+    let _anom_guard = traj.on_anomaly(move |ev| {
+        anomalies_cb
+            .lock()
+            .unwrap()
+            .push(ev.finding.rule_id.clone());
+    });
+    runtime
+        .register_adapter("looping", Arc::new(LoopingAdapter(AtomicUsize::new(0))))
+        .unwrap();
 
-    let session = app.sessions().unwrap().create(None);
-    let reply = app
-        .agent_loop()
-        .unwrap()
+    let session = runtime.sessions.create(None);
+    let reply = runtime
+        .agent_loop
         .run(Arc::clone(&session), "帮我查时间", CancellationToken::new())
         .await
         .unwrap();
 
     assert_eq!(reply, "收到提醒，已跳出重复循环");
 
-    let traj = app.service::<TrajectoryRuntime>("trajectory").unwrap();
     let report = traj.inspect(&session.id, TimelineMode::Sequence).unwrap();
     assert_eq!(report.snapshot.stats.turns, 1);
     assert_eq!(report.snapshot.stats.tool_calls, 3);
@@ -525,5 +403,5 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
             .any(|id| id == "GUARD_REPEAT_TOOL" || id == "R01_REPEAT_TOOL_CALL")
     );
 
-    app.fiber().dispose().await;
+    runtime.shutdown().await;
 }

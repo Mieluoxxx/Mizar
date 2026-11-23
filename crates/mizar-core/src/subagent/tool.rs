@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::{AgentLoopContextExt, RunOptions};
-use cordis::BoxError;
-use mizar_llm::{LlmContextExt, RequestOrigin};
-use mizar_session::{SessionContextExt, SessionCreateOptions, SessionOrigin};
+use crate::agent_loop::RunOptions;
+use mizar_llm::RequestOrigin;
+use mizar_session::{SessionCreateOptions, SessionOrigin};
 use mizar_tools::{
     ToolAnnotations, ToolCallContext, ToolDefinition, ToolExecutionMode, ToolExposure, ToolOutput,
-    ToolsContextExt,
 };
+use mizar_types::BoxError;
 use serde_json::{Value, json};
 
 use crate::subagent::guardrails::{
@@ -113,15 +112,12 @@ impl SubagentRuntime {
         let requested_name =
             parse_optional_trimmed_string(&args, "name", || SubagentError::InvalidNameType)?;
 
-        let sessions = self
-            .ctx
-            .sessions()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
+        let sessions = &self.sessions;
         let parent_session_id = call_ctx.session_id().map(str::to_string);
         ensure_not_nested_parent(
             parent_session_id.as_deref(),
             &self.active_children,
-            &sessions,
+            sessions,
         )?;
 
         match action {
@@ -283,18 +279,9 @@ impl SubagentRuntime {
         let requested_model =
             parse_optional_trimmed_string(args, "model", || SubagentError::InvalidModelType)?;
 
-        let sessions = self
-            .ctx
-            .sessions()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-        let tools = self
-            .ctx
-            .tools()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-        let agent_loop = self
-            .ctx
-            .agent_loop()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
+        let sessions = &self.sessions;
+        let tools = &self.tools;
+        let agent_loop = Arc::clone(&self.agent_loop);
 
         if call_ctx.cancel.is_cancelled() || self.dispose_token.is_cancelled() {
             return Ok(ToolOutput::error("子代理已取消执行"));
@@ -318,11 +305,7 @@ impl SubagentRuntime {
             .or_else(|| sessions.default_cwd());
 
         let (parent_provider, parent_model) = self.resolve_parent_route(Some(&parent_id));
-        let providers = self
-            .ctx
-            .llm()
-            .map(|llm| llm.provider_infos())
-            .unwrap_or_default();
+        let providers = self.llm.provider_infos();
         let (provider, model) = resolve_model_route(
             requested_model.as_deref(),
             parent_provider,
@@ -365,7 +348,7 @@ impl SubagentRuntime {
         let child_guard = ChildSessionGuard::register(
             Arc::clone(&self.active_children),
             Arc::clone(&self.activity_trackers),
-            Arc::clone(&tools),
+            Arc::clone(tools),
             child_session.id.clone(),
             run_id,
             mode,
@@ -468,18 +451,9 @@ impl SubagentRuntime {
         let requested_model =
             parse_optional_trimmed_string(args, "model", || SubagentError::InvalidModelType)?;
 
-        let sessions = self
-            .ctx
-            .sessions()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-        let tools = self
-            .ctx
-            .tools()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
-        let agent_loop = self
-            .ctx
-            .agent_loop()
-            .map_err(|e| SubagentError::ServiceUnavailable(e.to_string()))?;
+        let sessions = &self.sessions;
+        let tools = &self.tools;
+        let agent_loop = Arc::clone(&self.agent_loop);
 
         if call_ctx.cancel.is_cancelled() || self.dispose_token.is_cancelled() {
             return Ok(ToolOutput::error("子代理已取消执行"));
@@ -563,7 +537,7 @@ impl SubagentRuntime {
                 let child_guard = ChildSessionGuard::register(
                     Arc::clone(&self.active_children),
                     Arc::clone(&self.activity_trackers),
-                    Arc::clone(&tools),
+                    Arc::clone(tools),
                     child_session.id.clone(),
                     run_id,
                     mode,
@@ -587,11 +561,7 @@ impl SubagentRuntime {
                 }
 
                 let (provider, model) = if requested_model.is_some() {
-                    let providers = self
-                        .ctx
-                        .llm()
-                        .map(|llm| llm.provider_infos())
-                        .unwrap_or_default();
+                    let providers = self.llm.provider_infos();
                     let (fb_provider, fb_model) = if prev_provider.is_some() || prev_model.is_some() {
                         (prev_provider, prev_model)
                     } else {

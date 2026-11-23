@@ -26,23 +26,22 @@ pub use mizar_types::llm::{
 };
 
 pub use completions::{
-    CompletionsAdapter, CompletionsCompat, CompletionsConfig, CompletionsPlugin, MaxTokensField,
-    PROTOCOL_COMPLETIONS, ThinkingFormat,
+    CompletionsAdapter, CompletionsCompat, CompletionsConfig, MaxTokensField, PROTOCOL_COMPLETIONS,
+    ThinkingFormat, register_completions_adapter,
 };
 pub use messages::{
-    DEFAULT_ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS, MessagesAdapter, MessagesConfig, MessagesPlugin,
-    PROTOCOL_MESSAGES,
+    DEFAULT_ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS, MessagesAdapter, MessagesConfig,
+    PROTOCOL_MESSAGES, register_messages_adapter,
 };
-pub use mock::{MockAdapter, MockPlugin};
-pub use responses::{PROTOCOL_RESPONSES, ResponsesAdapter, ResponsesConfig, ResponsesPlugin};
-pub use retry::{LlmRetryPlugin, MAX_RETRY_AFTER_DELAY, RetryConfig};
+pub use mock::{MockAdapter, register_mock_adapter};
+pub use responses::{
+    PROTOCOL_RESPONSES, ResponsesAdapter, ResponsesConfig, register_responses_adapter,
+};
+pub use retry::{MAX_RETRY_AFTER_DELAY, RetryConfig, install_retry};
 pub use router::{
-    CompatConfig, EVENT_ROUTER_HEADERS, LlmRouter, LlmRouterContextExt, ModelCostConfig,
-    ModelCostTierConfig, ModelOverrideConfig, PromptCacheConfig, ProtocolKind, ProviderRouteConfig,
-    RouterConfig, RouterHeaderInput, RouterModelConfig, parse_protocol_api, resolve_credential,
+    CompatConfig, LlmRouter, ModelCostConfig, ModelCostTierConfig, ModelOverrideConfig,
+    PromptCacheConfig, ProtocolKind, ProviderRouteConfig, RouterConfig, RouterHeaderInput,
+    RouterModelConfig, parse_protocol_api, resolve_credential,
 };
-pub use runtime::{
-    BoxChunkStream, EVENT_ADAPTERS_UPDATED, EVENT_LLM_AFTER_RESPONSE, EVENT_LLM_STREAM, LlmAdapter,
-    LlmAfterResponseEvent, LlmContextExt, LlmRuntime,
-};
+pub use runtime::{BoxChunkStream, LlmAdapter, LlmAfterResponseEvent, LlmRuntime};
 pub use types::{GenerateOptions, resolve_cache_retention};

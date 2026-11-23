@@ -3,17 +3,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, CordisError, PluginDef};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::AgentLoopContextExt;
-use mizar_core::spine::{AgentSpineConfig, AgentSpinePlugin};
-use mizar_core::trajectory::{TimelineMode, TrajectoryRuntime};
+use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+use mizar_core::trajectory::TimelineMode;
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError,
-    StreamChunk, TokenUsage, ToolCall,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, StreamChunk, TokenUsage, ToolCall,
 };
-use mizar_session::{SessionContextExt, SessionListQuery};
-use mizar_tools::{ToolAnnotations, ToolDefinition, ToolsContextExt};
+use mizar_session::SessionListQuery;
+use mizar_tools::{ToolAnnotations, ToolDefinition};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -96,58 +93,27 @@ async fn mount_spine_with_db(
     db_path: &PathBuf,
     ws: &PathBuf,
     adapter: Arc<TwoTurnAdapter>,
-) -> Context {
-    let app = Context::new();
-    let spine_fiber = app.plugin(
-        AgentSpinePlugin,
+) -> Arc<MizarRuntime> {
+    let runtime = MizarRuntime::build(
         AgentSpineConfig::new(ws)
             .with_session_db(db_path)
             .with_disabled_plugins(["session-title"]),
-    );
-    app.plugin(
-        PluginDef::sync("test-time", |ctx, ()| {
-            let tools = ctx.tools()?;
-            let def = ToolDefinition::sync_tool(
-                "get_time",
-                "Get current time",
-                json!({"type": "object", "properties": {}}),
-                |_, _| Ok::<_, mizar_tools::ToolError>("2026-01-01 12:00:00".to_string()),
-            )
-            .with_annotations(ToolAnnotations {
-                read_only: true,
-                ..Default::default()
-            });
-            ctx.effect("test-time.reg", move || {
-                Ok::<_, mizar_tools::ToolError>(Some(tools.register(def)?))
-            })?;
-            Ok::<_, CordisError>(())
-        })
-        .inject(["tools"]),
-        (),
     )
     .await
     .unwrap();
-    app.plugin(
-        PluginDef::sync("test-llm", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter);
-            ctx.effect("test-llm.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("test", a)?))
-            })?;
-            Ok::<_, CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
+    let def = ToolDefinition::sync_tool(
+        "get_time",
+        "Get current time",
+        json!({"type": "object", "properties": {}}),
+        |_, _| Ok::<_, mizar_tools::ToolError>("2026-01-01 12:00:00".to_string()),
     )
-    .await
-    .unwrap();
-    let _ = spine_fiber.await;
-    for rt in app.registry().values() {
-        for f in rt.fibers() {
-            let _ = f.wait_settled().await;
-        }
-    }
-    app
+    .with_annotations(ToolAnnotations {
+        read_only: true,
+        ..Default::default()
+    });
+    runtime.push_guard(runtime.tools.register(def).unwrap());
+    runtime.register_adapter("test", adapter).unwrap();
+    runtime
 }
 
 #[tokio::test]
@@ -165,11 +131,10 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
         seen_history_lens: Arc::clone(&seen1),
     });
     let app1 = mount_spine_with_db(&db_path, &ws, adapter1).await;
-    let s1 = app1.sessions().unwrap().create(Some("e2e-session".into()));
+    let s1 = app1.sessions.create(Some("e2e-session".into()));
 
     let reply1 = app1
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run(
             Arc::clone(&s1),
             "帮我看看现在几点",
@@ -183,9 +148,9 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
         Some(ws.to_string_lossy().as_ref())
     );
     assert_eq!(s1.header().title.as_deref(), Some("帮我看看现在几点"));
-    app1.fiber().dispose().await;
+    app1.shutdown().await;
 
-    // 2. 模拟进程完全重启，挂载新 Context + SQLite，恢复同一会话并继续第二轮对话
+    // 2. 模拟进程完全重启，挂载新 Runtime + SQLite，恢复同一会话并继续第二轮对话
     let seen2 = Arc::new(Mutex::new(Vec::new()));
     let adapter2 = Arc::new(TwoTurnAdapter {
         calls: AtomicUsize::new(2),
@@ -193,7 +158,7 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     });
     let app2 = mount_spine_with_db(&db_path, &ws, adapter2).await;
 
-    let sessions2 = app2.sessions().unwrap();
+    let sessions2 = &app2.sessions;
     let headers = sessions2
         .list_headers(&SessionListQuery {
             cwd: Some(ws.to_string_lossy().to_string()),
@@ -205,7 +170,7 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     assert_eq!(headers[0].id, "e2e-session");
 
     // 重启后仅靠 TrajectoryRuntime 也可直接恢复并检查第一轮完整轨迹（含 Turn/Step/ToolCall）
-    let traj2 = app2.service::<TrajectoryRuntime>("trajectory").unwrap();
+    let traj2 = app2.trajectory.as_ref().unwrap();
     let list_summaries = traj2.list_sessions();
     assert_eq!(list_summaries.len(), 1);
     assert_eq!(list_summaries[0].turns, 1);
@@ -215,8 +180,7 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     // 续聊第二轮，验证带上首轮 <environment_context> + 第一轮 4 条表面消息 + System + 新 User = 7 条
     let resumed = sessions2.get("e2e-session").unwrap();
     let reply2 = app2
-        .agent_loop()
-        .unwrap()
+        .agent_loop
         .run(resumed, "继续吧", CancellationToken::new())
         .await
         .unwrap();
@@ -230,5 +194,5 @@ async fn agent_loop_persists_surface_and_trajectory_across_process_restart() {
     assert_eq!(report2.snapshot.stats.steps, 3);
     assert_eq!(report2.snapshot.stats.tool_calls, 1);
 
-    app2.fiber().dispose().await;
+    app2.shutdown().await;
 }

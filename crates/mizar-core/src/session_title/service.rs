@@ -1,25 +1,24 @@
-//! `SessionTitleRuntime` Cordis 服务（`"sessionTitle"`）：
+//! `SessionTitleRuntime` 会话标题后台生成服务：
 //! 监听用户每轮输入事件，在后台异步生成并维护简洁的 `MMDD｜TYPE｜Topic` 会话标题。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentEvent, AgentTurnInputEvent, subscribe_agent_events_when_ready};
-use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service, ServicePlugin};
+use crate::agent_loop::{AgentEvent, AgentLoop, AgentTurnInputEvent};
 use futures::StreamExt;
 use mizar_llm::{
-    BlockAssembler, FinishReason, GenerateOptions, LlmContextExt, LlmError, ReasoningEffort,
+    BlockAssembler, FinishReason, GenerateOptions, LlmError, LlmRuntime, ReasoningEffort,
     RequestOrigin,
 };
-use mizar_session::{Session, SessionContextExt, TitleSource};
+use mizar_session::{Session, TitleSource};
+use mizar_types::HookGuard;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::session_title::format::{format_session_title, parse_model_title_output};
 use crate::session_title::prompt::{build_title_messages, extract_user_messages};
 
-pub const SERVICE_SESSION_TITLE: &str = "sessionTitle";
 pub const DEFAULT_REFRESH_INTERVAL_TURNS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +78,7 @@ impl Drop for InFlightGuard {
 }
 
 pub struct SessionTitleRuntime {
-    ctx: Context,
+    llm: Arc<LlmRuntime>,
     config: Arc<Mutex<SessionTitleConfig>>,
     module_enabled: AtomicBool,
     in_flight: Arc<Mutex<HashSet<String>>>,
@@ -88,8 +87,36 @@ pub struct SessionTitleRuntime {
 }
 
 impl SessionTitleRuntime {
-    pub fn plugin() -> ServicePlugin<Self> {
-        ServicePlugin::new()
+    pub fn new(llm: Arc<LlmRuntime>, config: SessionTitleConfig) -> Arc<Self> {
+        Arc::new(Self {
+            llm,
+            config: Arc::new(Mutex::new(config)),
+            module_enabled: AtomicBool::new(true),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            states: Arc::new(Mutex::new(HashMap::new())),
+            dispose_token: CancellationToken::new(),
+        })
+    }
+
+    pub fn install(
+        llm: Arc<LlmRuntime>,
+        agent_loop: &Arc<AgentLoop>,
+        config: SessionTitleConfig,
+    ) -> (Arc<Self>, HookGuard) {
+        let rt = Self::new(llm, config);
+        let cancel_on_dispose = rt.dispose_token.clone();
+        let dispose_guard = HookGuard::new(move || {
+            cancel_on_dispose.cancel();
+        });
+        let weak = Arc::downgrade(&rt);
+        let event_guard = agent_loop.on_event(move |ev| {
+            if let AgentEvent::TurnInput(ev) = ev
+                && let Some(rt) = weak.upgrade()
+            {
+                rt.handle_turn_input(ev);
+            }
+        });
+        (rt, HookGuard::group(vec![dispose_guard, event_guard]))
     }
 
     pub fn is_module_enabled(&self) -> bool {
@@ -127,10 +154,7 @@ impl SessionTitleRuntime {
         fallback_provider: Option<&str>,
         fallback_model: Option<&str>,
     ) -> Result<(Option<String>, Option<String>), SessionTitleError> {
-        let llm = self
-            .ctx
-            .llm()
-            .map_err(|err| SessionTitleError::LlmUnavailable(err.to_string()))?;
+        let llm = &self.llm;
 
         let (provider, model) = if cfg.provider.is_some() || cfg.model.is_some() {
             (cfg.provider.clone(), cfg.model.clone())
@@ -317,10 +341,7 @@ impl SessionTitleRuntime {
         if params.cancel.is_cancelled() {
             return Err(SessionTitleError::Llm(LlmError::cancelled()));
         }
-        let llm = self
-            .ctx
-            .llm()
-            .map_err(|err| SessionTitleError::LlmUnavailable(err.to_string()))?;
+        let llm = &self.llm;
 
         let opts = GenerateOptions {
             messages: build_title_messages(&params.user_messages),
@@ -401,70 +422,12 @@ struct GenerationParams {
     cancel: CancellationToken,
 }
 
-impl Service for SessionTitleRuntime {
-    type Config = SessionTitleConfig;
-
-    fn service_name() -> &'static str {
-        SERVICE_SESSION_TITLE
-    }
-
-    fn plugin_name() -> &'static str {
-        "session-title"
-    }
-
-    fn inject() -> Inject {
-        Inject::from(["llm", "sessions"])
-    }
-
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        let _ = ctx.sessions()?;
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            config: Arc::new(Mutex::new(config)),
-            module_enabled: AtomicBool::new(true),
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
-            states: Arc::new(Mutex::new(HashMap::new())),
-            dispose_token: CancellationToken::new(),
-        }))
-    }
-
-    fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            let rt = Arc::clone(&self);
-            let cancel_on_dispose = self.dispose_token.clone();
-            ctx.effect("session-title.dispose-token", move || {
-                Ok::<_, CordisError>(Some(Cleanup::sync(move || {
-                    cancel_on_dispose.cancel();
-                })))
-            })?;
-            subscribe_agent_events_when_ready(&ctx, "session-title.turn-input", move |ev| {
-                if let AgentEvent::TurnInput(ev) = ev {
-                    rt.handle_turn_input(ev);
-                }
-            })
-            .await?;
-            Ok(())
-        })
-    }
-}
-
-pub trait SessionTitleContextExt {
-    fn session_title(&self) -> Result<Arc<SessionTitleRuntime>, CordisError>;
-}
-
-impl SessionTitleContextExt for Context {
-    fn session_title(&self) -> Result<Arc<SessionTitleRuntime>, CordisError> {
-        self.service::<SessionTitleRuntime>(SERVICE_SESSION_TITLE)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use crate::agent_loop::{AgentLoop, AgentLoopConfig, AgentLoopContextExt};
+    use crate::agent_loop::{AgentLoop, AgentLoopConfig};
     use crate::system_prompt::{SystemPrompt, SystemPromptConfig};
     use futures::channel::mpsc;
     use mizar_llm::{BoxChunkStream, LlmAdapter, LlmRuntime, ModelInfo, ProviderInfo, StreamChunk};
@@ -512,27 +475,21 @@ mod tests {
             calls: Arc::clone(&calls),
         });
 
-        let app = Context::new();
-        app.plugin(LlmRuntime::plugin(), ()).await.unwrap();
-        app.plugin(SessionStore::plugin(), ()).await.unwrap();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        app.plugin(SystemPrompt::plugin(), SystemPromptConfig::default())
-            .await
-            .unwrap();
-        app.plugin(AgentLoop::plugin(), AgentLoopConfig::default())
-            .await
-            .unwrap();
-        let _reg = app
-            .llm()
-            .unwrap()
-            .register_adapter("real", adapter)
-            .unwrap();
-        app.plugin(SessionTitleRuntime::plugin(), SessionTitleConfig::default())
-            .await
-            .unwrap();
-        let agent = app.agent_loop().unwrap();
+        let llm = LlmRuntime::new();
+        let sessions = SessionStore::new();
+        let tools = ToolRuntime::new();
+        let sp = SystemPrompt::new(SystemPromptConfig::default());
+        let agent = AgentLoop::new(
+            Arc::clone(&llm),
+            Arc::clone(&tools),
+            Arc::clone(&sessions),
+            Arc::clone(&sp),
+            AgentLoopConfig::default(),
+        );
+        let _reg = llm.register_adapter("real", adapter).unwrap();
+        let (_title_rt, _title_guard) =
+            SessionTitleRuntime::install(Arc::clone(&llm), &agent, SessionTitleConfig::default());
 
-        let sessions = app.sessions().unwrap();
         let parent = sessions.create_with(SessionCreateOptions {
             id: Some("parent-main".into()),
             ..Default::default()
@@ -591,7 +548,5 @@ mod tests {
                 .as_deref()
                 .is_some_and(|t| t.contains("FEA｜分叉会话自动标题"))
         );
-
-        app.fiber().dispose().await;
     }
 }

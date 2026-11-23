@@ -15,7 +15,6 @@ mcp = ["dep:mizar-mcp"]
 
 [dependencies]
 chrono = { workspace = true }
-cordis = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 mizar-codemode = { workspace = true, optional = true }

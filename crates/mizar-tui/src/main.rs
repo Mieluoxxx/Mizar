@@ -47,16 +47,14 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use cordis::{Context, Service};
 use mizar_core::spine::{
-    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, load_mizar_config,
+    AgentSpineConfig, AgentToolsMode, MizarRuntime, load_mizar_config,
     resolve_default_session_db_path,
 };
 use mizar_llm::ReasoningEffort;
-use mizar_llm::mock::MockPlugin;
-use mizar_llm::retry::{LlmRetryPlugin, RetryConfig};
-use mizar_llm::router::LlmRouter;
+use mizar_llm::retry::RetryConfig;
 use mizar_tools::coding::CodingToolsPreset;
 use mizar_tui::exec::{
     ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
@@ -587,7 +585,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let app = Context::new();
     // 进入终端界面前先静默，防止启动日志先刷到 stderr 再闪屏
     let _startup_tracing_guard = mizar_client::install_silent_tracing();
 
@@ -679,15 +676,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             .push((NoticeLevel::Warn, format!("配置解析失败：{err}")));
     }
 
-    app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
+    let runtime = MizarRuntime::build(spine_cfg).await?;
+    runtime.install_retry(RetryConfig::default());
 
     if let Some(resolved) = resolved_llm {
-        app.plugin(LlmRouter::plugin(), resolved.router);
+        runtime.install_router(resolved.router);
         tui_cfg.provider = Some(resolved.active_provider);
         tui_cfg.model = resolved.active_model;
     } else {
-        app.plugin(MockPlugin, ());
+        runtime.register_mock_adapter()?;
         tui_cfg.provider = Some("mock".to_string());
         tui_cfg.model = Some("mock-v1".to_string());
         tui_cfg.startup_notices.push((
@@ -697,8 +694,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let run_res = run_tui_with_summary(app.clone(), tui_cfg).await;
-    app.fiber().dispose().await;
+    let run_res = run_tui_with_summary(Arc::clone(&runtime), tui_cfg).await;
+    runtime.shutdown().await;
     match run_res {
         Ok(summary) => {
             if std::io::stdout().is_terminal()

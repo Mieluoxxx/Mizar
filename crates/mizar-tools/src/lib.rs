@@ -1,9 +1,9 @@
 //! 工具注册表、分层暴露策略与三段执行管线（对齐 `NamiDSH` + `pi` 工具装载机制）。
 //!
-//! 每次工具调用经过三道 `waterfall`：
-//! - `tools/pre-execute`  → 执行前：拦截 / 检查（返回 `allow: false` 就不执行）
-//! - `tools/execute`      → 执行：可包一层超时、监控
-//! - `tools/post-execute` → 执行后：可改写结果或追加上下文提醒
+//! 每次工具调用经过三道 `WaterfallHook`：
+//! - `pre_execute`  → 执行前：拦截 / 检查（返回 `allow: false` 就不执行）
+//! - `execute`      → 执行：可包一层超时、监控
+//! - `post_execute` → 执行后：可改写结果或追加上下文提醒
 
 pub mod coding;
 pub mod mutation_queue;
@@ -14,18 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Service};
+use mizar_types::hooks::{BoxError, BoxFuture, HookGuard, SyncEventBus, WaterfallHook};
 use mizar_types::llm::ToolSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
-pub const EVENT_TOOLS_PRE_EXECUTE: &str = "tools/pre-execute";
-pub const EVENT_TOOLS_EXECUTE: &str = "tools/execute";
-pub const EVENT_TOOLS_POST_EXECUTE: &str = "tools/post-execute";
-pub const EVENT_TOOLS_CHANGE: &str = "tools/change";
-pub const EVENT_TOOLS_RESULT: &str = "tools/result";
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -303,7 +297,7 @@ pub struct ToolCallContext {
     pub exec: ToolExecution,
     pub cancel: CancellationToken,
     pub on_update: Option<ToolUpdateCallback>,
-    pub ctx: Context,
+    pub tools: Arc<ToolRuntime>,
 }
 
 impl ToolCallContext {
@@ -767,13 +761,52 @@ impl ToolState {
 }
 
 pub struct ToolRuntime {
-    ctx: Context,
     state: Mutex<ToolState>,
+    pre_execute: WaterfallHook<ToolExecution, BoxFuture<'static, PreExecuteDecision>>,
+    execute: WaterfallHook<ToolExecution, BoxFuture<'static, ToolResult>>,
+    post_execute: WaterfallHook<PostExecuteInput, BoxFuture<'static, ToolResult>>,
+    on_change: SyncEventBus<()>,
+    on_result: SyncEventBus<ToolResultEvent>,
 }
 
 impl ToolRuntime {
-    /// 工具插件调用它登记自己。返回的 `Cleanup` 放入 `ctx.effect` 即可随插件自动注销。
-    pub fn register(self: &Arc<Self>, tool: ToolDefinition) -> Result<Cleanup, ToolError> {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ToolState::default()),
+            pre_execute: WaterfallHook::new(),
+            execute: WaterfallHook::new(),
+            post_execute: WaterfallHook::new(),
+            on_change: SyncEventBus::new(),
+            on_result: SyncEventBus::new(),
+        })
+    }
+
+    pub fn pre_execute_hook(
+        &self,
+    ) -> &WaterfallHook<ToolExecution, BoxFuture<'static, PreExecuteDecision>> {
+        &self.pre_execute
+    }
+
+    pub fn execute_hook(&self) -> &WaterfallHook<ToolExecution, BoxFuture<'static, ToolResult>> {
+        &self.execute
+    }
+
+    pub fn post_execute_hook(
+        &self,
+    ) -> &WaterfallHook<PostExecuteInput, BoxFuture<'static, ToolResult>> {
+        &self.post_execute
+    }
+
+    pub fn on_change(&self, cb: impl Fn(&()) + Send + Sync + 'static) -> HookGuard {
+        self.on_change.on(cb)
+    }
+
+    pub fn on_result(&self, cb: impl Fn(&ToolResultEvent) + Send + Sync + 'static) -> HookGuard {
+        self.on_result.on(cb)
+    }
+
+    /// 登记工具；返回的 `HookGuard` 在析构时自动注销该工具。
+    pub fn register(self: &Arc<Self>, tool: ToolDefinition) -> Result<HookGuard, ToolError> {
         let tool_name = tool.name.clone();
         {
             let mut st = self.state.lock().unwrap();
@@ -781,7 +814,7 @@ impl ToolRuntime {
                 return Err(ToolError::DuplicateTool(tool_name));
             }
             st.tools.push(tool);
-            // 并发插件挂载顺序不固定，按暴露层级与工具名归一化以稳定 instructions 与 tools 声明前缀
+            // 并发注册顺序不固定，按暴露层级与工具名归一化以稳定 instructions 与 tools 声明前缀
             st.tools.sort_by(|a, b| {
                 a.exposure
                     .sort_rank()
@@ -790,10 +823,10 @@ impl ToolRuntime {
             });
             st.bump_version();
         }
-        self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        self.on_change.emit(&());
 
         let runtime = Arc::downgrade(self);
-        Ok(Cleanup::sync(move || {
+        Ok(HookGuard::new(move || {
             if let Some(rt) = runtime.upgrade() {
                 {
                     let mut st = rt.state.lock().unwrap();
@@ -812,7 +845,7 @@ impl ToolRuntime {
                     }
                     st.bump_version();
                 }
-                rt.ctx.emit(EVENT_TOOLS_CHANGE, ());
+                rt.on_change.emit(&());
             }
         }))
     }
@@ -830,7 +863,7 @@ impl ToolRuntime {
             !same
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
@@ -864,7 +897,7 @@ impl ToolRuntime {
             }
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
@@ -880,7 +913,7 @@ impl ToolRuntime {
             changed
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
@@ -899,7 +932,7 @@ impl ToolRuntime {
             changed
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
     }
 
@@ -948,7 +981,7 @@ impl ToolRuntime {
             st.bump_version();
             valid
         };
-        self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+        self.on_change.emit(&());
         result
     }
 
@@ -991,7 +1024,7 @@ impl ToolRuntime {
             newly_added
         };
         if !added.is_empty() {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
         added
     }
@@ -1008,7 +1041,7 @@ impl ToolRuntime {
             removed
         };
         if changed {
-            self.ctx.emit(EVENT_TOOLS_CHANGE, ());
+            self.on_change.emit(&());
         }
         changed
     }
@@ -1207,9 +1240,8 @@ impl ToolRuntime {
         let is_nested = nested || exec.nested;
         exec.nested = is_nested;
         let decision: PreExecuteDecision = self
-            .ctx
-            .waterfall(
-                EVENT_TOOLS_PRE_EXECUTE,
+            .pre_execute
+            .run(
                 exec.clone(),
                 |_| -> BoxFuture<'static, PreExecuteDecision> {
                     Box::pin(async { PreExecuteDecision::allow() })
@@ -1229,9 +1261,8 @@ impl ToolRuntime {
             let runtime = Arc::clone(self);
             let cancel_for_exec = cancel.clone();
             let update_for_exec = on_update.clone();
-            self.ctx
-                .waterfall(
-                    EVENT_TOOLS_EXECUTE,
+            self.execute
+                .run(
                     exec.clone(),
                     move |exec| -> BoxFuture<'static, ToolResult> {
                         let runtime = Arc::clone(&runtime);
@@ -1249,7 +1280,7 @@ impl ToolRuntime {
                                 exec,
                                 cancel,
                                 on_update,
-                                ctx: runtime.ctx.clone(),
+                                tools: runtime,
                             };
                             match (tool.execute)(args, call_ctx).await {
                                 Ok(output) => ToolResult::from_output(output),
@@ -1262,9 +1293,8 @@ impl ToolRuntime {
         };
 
         let result = self
-            .ctx
-            .waterfall(
-                EVENT_TOOLS_POST_EXECUTE,
+            .post_execute
+            .run(
                 PostExecuteInput {
                     exec: exec.clone(),
                     result,
@@ -1273,48 +1303,16 @@ impl ToolRuntime {
             )
             .await;
 
-        self.ctx.emit(
-            EVENT_TOOLS_RESULT,
-            ToolResultEvent {
-                exec,
-                result: result.clone(),
-            },
-        );
+        self.on_result.emit(&ToolResultEvent {
+            exec,
+            result: result.clone(),
+        });
         result
     }
 
     fn can_call_nested(&self, session_id: Option<&str>, name: &str) -> bool {
         let st = self.state.lock().unwrap();
         st.is_callable_in_sandbox(session_id, name)
-    }
-}
-
-impl Service for ToolRuntime {
-    type Config = ();
-
-    fn service_name() -> &'static str {
-        "tools"
-    }
-
-    fn plugin_name() -> &'static str {
-        "ToolRuntime"
-    }
-
-    fn create(ctx: &Context, _config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        Ok(Arc::new(Self {
-            ctx: ctx.clone(),
-            state: Mutex::new(ToolState::default()),
-        }))
-    }
-}
-
-pub trait ToolsContextExt {
-    fn tools(&self) -> Result<Arc<ToolRuntime>, CordisError>;
-}
-
-impl ToolsContextExt for Context {
-    fn tools(&self) -> Result<Arc<ToolRuntime>, CordisError> {
-        self.service::<ToolRuntime>("tools")
     }
 }
 
@@ -1333,9 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn manages_exposure_activation_loadout_and_nested_guards() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _c1 = tools
             .register(
@@ -1413,9 +1409,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_tool_policy_transitions_and_auto_default_precedence() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _r = tools
             .register(ToolDefinition::sync_tool(
@@ -1475,9 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn declares_tools_in_deterministic_order_regardless_of_registration_order() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _ts = tools
             .register(
@@ -1560,9 +1552,7 @@ mod tests {
     async fn caches_declared_loadout_across_calls_and_invalidates_on_mutations() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let hook_runs = Arc::new(AtomicUsize::new(0));
         let hook_runs_c = Arc::clone(&hook_runs);
@@ -1632,9 +1622,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_tool_group_hides_tools_without_clobbering_overrides() {
-        let app = Context::new();
-        app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-        let tools = app.tools().unwrap();
+        let tools = ToolRuntime::new();
 
         let _r = tools
             .register(ToolDefinition::sync_tool(

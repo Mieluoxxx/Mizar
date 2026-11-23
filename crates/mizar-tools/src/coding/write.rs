@@ -37,7 +37,7 @@ pub fn create_write_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefin
                 }
 
                 let target = resolve_to_cwd(&cwd, raw_path, restrict_to_workspace)
-                    .map_err(|e| -> cordis::BoxError { e.into() })?;
+                    .map_err(|e| -> mizar_types::BoxError { e.into() })?;
 
                 let content_owned = content.to_string();
                 let bytes = content_owned.len();
@@ -104,7 +104,7 @@ mod tests {
             exec: ToolExecution::new("write", args.clone(), None),
             cancel: tokio_util::sync::CancellationToken::new(),
             on_update: None,
-            ctx: cordis::Context::new(),
+            tools: crate::ToolRuntime::new(),
         }
     }
 

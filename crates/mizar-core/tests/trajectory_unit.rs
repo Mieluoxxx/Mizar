@@ -1,113 +1,111 @@
-use cordis::{BoxFuture, Context, CordisError, Next, Service};
+use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig};
+use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
 use mizar_core::trajectory::{
-    RepeatGuardConfig, RepeatToolGuardPlugin, Severity, TimelineMode, TrajectoryConfig,
-    TrajectoryRuntime,
+    RepeatGuardConfig, Severity, TimelineMode, TrajectoryConfig, TrajectoryRuntime,
+    install_repeat_guard, validate_repeat_guard_config,
 };
-use mizar_tools::{
-    EVENT_TOOLS_PRE_EXECUTE, PreExecuteDecision, ToolDefinition, ToolExecution, ToolRuntime,
-    ToolsContextExt,
-};
+use mizar_llm::LlmRuntime;
+use mizar_session::SessionStore;
+use mizar_tools::{PreExecuteDecision, ToolDefinition, ToolExecution, ToolRuntime};
+use mizar_types::{BoxError, BoxFuture, Next};
 use serde_json::json;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn repeat_guard_validates_config_fail_loud() {
-    let app = Context::new();
-    let bad_empty = app.plugin(
-        RepeatToolGuardPlugin,
+    let tools = ToolRuntime::new();
+    let bad_empty = install_repeat_guard(
+        &tools,
+        None,
         RepeatGuardConfig {
             thresholds: vec![],
             ..Default::default()
         },
     );
-    assert!(bad_empty.await.is_err());
+    assert!(bad_empty.is_err());
 
-    let bad_lt2 = app.plugin(
-        RepeatToolGuardPlugin,
-        RepeatGuardConfig {
-            thresholds: vec![1, 3],
-            ..Default::default()
-        },
-    );
-    assert!(bad_lt2.await.is_err());
+    let bad_lt2 = validate_repeat_guard_config(&RepeatGuardConfig {
+        thresholds: vec![1, 3],
+        ..Default::default()
+    });
+    assert!(bad_lt2.is_err());
 
-    let bad_dup = app.plugin(
-        RepeatToolGuardPlugin,
+    let bad_dup = install_repeat_guard(
+        &tools,
+        None,
         RepeatGuardConfig {
             thresholds: vec![3, 3],
             ..Default::default()
         },
     );
-    assert!(bad_dup.await.is_err());
+    assert!(bad_dup.is_err());
 }
 
 #[tokio::test]
 async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
-    let app = Context::new();
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(TrajectoryRuntime::plugin(), TrajectoryConfig::default())
-        .await
-        .unwrap();
-    app.plugin(
-        RepeatToolGuardPlugin,
+    let llm = LlmRuntime::new();
+    let sessions = SessionStore::new();
+    let tools = ToolRuntime::new();
+    let sp = SystemPrompt::new(SystemPromptConfig::default());
+    let agent_loop = AgentLoop::new(
+        llm,
+        Arc::clone(&tools),
+        Arc::clone(&sessions),
+        sp,
+        AgentLoopConfig::default(),
+    );
+    let (repeat_bus, _guard_handle) = install_repeat_guard(
+        &tools,
+        Some(&agent_loop),
         RepeatGuardConfig {
             thresholds: vec![2, 3],
             exclude: vec!["todo_*".into()],
             ..Default::default()
         },
     )
-    .await
     .unwrap();
+    let (traj, _traj_guard) = TrajectoryRuntime::install(
+        Some(&sessions),
+        Some(&tools),
+        Some(&agent_loop),
+        Some(&repeat_bus),
+        TrajectoryConfig::default(),
+    );
 
     // 拦截第 2 次 grep，验证被拦截的调用仍计入重复链
-    app.plugin(
-        cordis::PluginDef::sync("deny-second", |ctx, ()| {
-            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            ctx.on_waterfall(
-                EVENT_TOOLS_PRE_EXECUTE,
-                move |exec: ToolExecution,
-                      next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
-                    let calls = std::sync::Arc::clone(&calls);
-                    Box::pin(async move {
-                        if exec.name == "grep"
-                            && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
-                        {
-                            PreExecuteDecision::deny("test deny")
-                        } else {
-                            next.call(exec).await
-                        }
-                    })
-                },
-            )?;
-            Ok::<_, CordisError>(())
-        }),
-        (),
-    )
-    .await
-    .unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _deny_guard = tools.pre_execute_hook().register(
+        move |exec: ToolExecution,
+              next: Next<ToolExecution, BoxFuture<'static, PreExecuteDecision>>| {
+            let calls = std::sync::Arc::clone(&calls);
+            Box::pin(async move {
+                if exec.name == "grep"
+                    && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
+                {
+                    PreExecuteDecision::deny("test deny")
+                } else {
+                    next.call(exec).await
+                }
+            })
+        },
+    );
 
-    let tools = app.tools().unwrap();
-    app.effect("reg.tools", || {
-        let c1 = tools
-            .register(ToolDefinition::sync_tool(
-                "grep",
-                "search",
-                json!({}),
-                |_, _| Ok::<_, cordis::BoxError>("ok".into()),
-            ))
-            .unwrap();
-        let c2 = tools
-            .register(ToolDefinition::sync_tool(
-                "todo_write",
-                "note",
-                json!({}),
-                |_, _| Ok::<_, cordis::BoxError>("noted".into()),
-            ))
-            .unwrap();
-        Ok::<_, CordisError>(Some(cordis::Cleanup::sync(move || {
-            let _ = (c1, c2);
-        })))
-    })
-    .unwrap();
+    let _c1 = tools
+        .register(ToolDefinition::sync_tool(
+            "grep",
+            "search",
+            json!({}),
+            |_, _| Ok::<_, BoxError>("ok".into()),
+        ))
+        .unwrap();
+    let _c2 = tools
+        .register(ToolDefinition::sync_tool(
+            "todo_write",
+            "note",
+            json!({}),
+            |_, _| Ok::<_, BoxError>("noted".into()),
+        ))
+        .unwrap();
 
     // 1. grep {"b":2,"a":1}
     let r1 = tools
@@ -168,11 +166,7 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
         .await;
 
     // 轨迹服务已记录本次会话并产出告警报告
-    let report = app
-        .service::<TrajectoryRuntime>("trajectory")
-        .unwrap()
-        .inspect("sess-x", TimelineMode::Sequence)
-        .unwrap();
+    let report = traj.inspect("sess-x", TimelineMode::Sequence).unwrap();
     assert!(
         report
             .findings
@@ -201,28 +195,15 @@ async fn repeat_guard_counts_through_excluded_tools_and_denied_calls() {
 
 #[tokio::test]
 async fn incremental_anomaly_eval_emits_new_findings_without_duplicating_old_ones() {
-    use mizar_core::trajectory::EVENT_TRAJECTORY_ANOMALY;
-    use mizar_core::trajectory::TrajectoryAnomalyEvent;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let app = Context::new();
-    let anomalies = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<u64>)>::new()));
-    let anomalies_sink = Arc::clone(&anomalies);
-    app.on(
-        EVENT_TRAJECTORY_ANOMALY,
-        move |ev: &TrajectoryAnomalyEvent| {
-            anomalies_sink
-                .lock()
-                .unwrap()
-                .push((ev.finding.rule_id.clone(), ev.finding.seq));
-        },
-    )
-    .unwrap();
-
-    app.plugin(ToolRuntime::plugin(), ()).await.unwrap();
-    app.plugin(
-        TrajectoryRuntime::plugin(),
+    let tools = ToolRuntime::new();
+    let (traj, _traj_guard) = TrajectoryRuntime::install(
+        None,
+        Some(&tools),
+        None,
+        None,
         TrajectoryConfig {
             detector: mizar_types::trajectory::DetectorConfig {
                 repeat_threshold: 10,
@@ -231,27 +212,28 @@ async fn incremental_anomaly_eval_emits_new_findings_without_duplicating_old_one
             },
             ..Default::default()
         },
-    )
-    .await
-    .unwrap();
+    );
+    let anomalies = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<u64>)>::new()));
+    let anomalies_sink = Arc::clone(&anomalies);
+    let _anom_guard = traj.on_anomaly(move |ev| {
+        anomalies_sink
+            .lock()
+            .unwrap()
+            .push((ev.finding.rule_id.clone(), ev.finding.seq));
+    });
 
-    let tools = app.tools().unwrap();
-    app.effect("reg.failing", || {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let c1 = tools
-            .register(ToolDefinition::sync_tool(
-                "boom",
-                "failing test tool",
-                json!({}),
-                move |_, _| {
-                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    Err::<String, cordis::BoxError>(format!("err #{n}").into())
-                },
-            ))
-            .unwrap();
-        Ok::<_, CordisError>(Some(cordis::Cleanup::sync(move || drop(c1))))
-    })
-    .unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let _c1 = tools
+        .register(ToolDefinition::sync_tool(
+            "boom",
+            "failing test tool",
+            json!({}),
+            move |_, _| {
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                Err::<String, BoxError>(format!("err #{n}").into())
+            },
+        ))
+        .unwrap();
 
     for i in 1..=3 {
         let res = tools
@@ -274,7 +256,7 @@ async fn incremental_anomaly_eval_emits_new_findings_without_duplicating_old_one
     assert_eq!(r02_seqs.len(), 2, "emitted={emitted:?}");
     assert_ne!(r02_seqs[0], r02_seqs[1]);
 
-    let rt = app.service::<TrajectoryRuntime>("trajectory").unwrap();
+    let rt = &traj;
     let report = rt.inspect("sess-err-inc", TimelineMode::Sequence).unwrap();
     let events = rt.events("sess-err-inc");
     let offline = rt.inspect_events("sess-err-inc", &events, TimelineMode::Sequence);
@@ -292,12 +274,9 @@ async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic
     use mizar_session::{Session, SessionEvent, SessionTraceEvent};
     use std::sync::Arc;
 
-    let app = Context::new();
-    app.plugin(TrajectoryRuntime::plugin(), TrajectoryConfig::default())
-        .await
-        .unwrap();
+    let _traj_export = TrajectoryRuntime::new(None, TrajectoryConfig::default());
 
-    let sess = Arc::new(Session::new(app.clone(), "sess-export-unit"));
+    let sess = Arc::new(Session::new("sess-export-unit"));
     sess.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
     sess.append(SessionEvent::user("inspect project"));
     sess.append_trace(SessionTraceEvent::StepStart {
@@ -403,7 +382,7 @@ async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic
         reason: "completed".to_string(),
     });
 
-    let rt = app.service::<TrajectoryRuntime>("trajectory").unwrap();
+    let rt = &_traj_export;
     let events = mizar_core::trajectory::trace_events_from_session(&sess);
     let report = rt.inspect_events(&sess.id, &events, TimelineMode::Sequence);
     let export = sess.with_all_entries(|entries| {
@@ -476,18 +455,17 @@ async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic
 
 #[tokio::test]
 async fn findings_only_matches_inspect_findings_without_snapshot_clone() {
-    use mizar_core::trajectory::TrajectoryContextExt;
-    use mizar_session::{SessionContextExt, SessionEvent, SessionStore, SessionTraceEvent};
+    use mizar_session::{SessionEvent, SessionStore, SessionTraceEvent};
 
-    let ctx = Context::new();
-    ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
-    ctx.plugin(TrajectoryRuntime::plugin(), TrajectoryConfig::default())
-        .await
-        .unwrap();
-
-    let sessions = ctx.sessions().unwrap();
+    let sessions = SessionStore::new();
+    let (traj, _traj_guard) = TrajectoryRuntime::install(
+        Some(&sessions),
+        None,
+        None,
+        None,
+        TrajectoryConfig::default(),
+    );
     let s = sessions.create(None);
-    let traj = ctx.trajectory().unwrap();
 
     for step in 1..=4 {
         s.append_trace(SessionTraceEvent::StepStart {

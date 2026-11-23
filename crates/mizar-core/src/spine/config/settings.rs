@@ -124,7 +124,7 @@ pub struct SettingsConfig {
     pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_tools: Vec<String>,
-    /// 声明式屏蔽的内置可选 Cordis 模块 ID 列表（受保护核心模块不可禁用）。
+    /// 声明式屏蔽的内置可选模块 ID 列表（受保护核心模块不可禁用）。
     #[serde(default, rename = "disabledPlugins")]
     pub disabled_plugins: Vec<String>,
     pub restrict_to_workspace: Option<bool>,

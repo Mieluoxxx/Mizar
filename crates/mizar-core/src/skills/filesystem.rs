@@ -7,8 +7,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use cordis::Context;
-
 use crate::skills::frontmatter::parse_skill_markdown;
 use crate::skills::registry::{BoxFuture, SkillProvider};
 use crate::skills::types::{
@@ -131,17 +129,14 @@ struct CachedFingerprintEntry {
 }
 
 pub struct FilesystemSkillProvider {
-    #[allow(dead_code)]
-    ctx: Context,
     config: FilesystemSkillConfig,
     default_cwd: Option<PathBuf>,
     fp_cache: Arc<Mutex<HashMap<Option<PathBuf>, CachedFingerprintEntry>>>,
 }
 
 impl FilesystemSkillProvider {
-    pub fn new(ctx: Context, config: FilesystemSkillConfig, default_cwd: Option<PathBuf>) -> Self {
+    pub fn new(config: FilesystemSkillConfig, default_cwd: Option<PathBuf>) -> Self {
         Self {
-            ctx,
             config,
             default_cwd,
             fp_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -600,12 +595,11 @@ mod tests {
         let skill_file = skill_dir.join("SKILL.md");
         std::fs::write(&skill_file, "---\nname: alpha\ndescription: v1\n---\nv1").unwrap();
 
-        let ctx = Context::new();
         let cfg = FilesystemSkillConfig {
             include_user_roots: false,
             ..Default::default()
         };
-        let provider = FilesystemSkillProvider::new(ctx, cfg, Some(base.clone()));
+        let provider = FilesystemSkillProvider::new(cfg, Some(base.clone()));
         let opts = SkillLookupOptions {
             cwd: Some(base.clone()),
             cancel: CancellationToken::new(),

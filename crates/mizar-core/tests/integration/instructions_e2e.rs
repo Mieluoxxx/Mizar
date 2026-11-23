@@ -3,18 +3,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cordis::{Context, CordisError, PluginDef};
 use futures::channel::mpsc;
-use mizar_core::agent_loop::AgentLoopContextExt;
 use mizar_core::spine::{
-    AgentInstructions, AgentSpineConfig, AgentSpinePlugin, AgentToolsMode,
-    load_mizar_config_with_global,
+    AgentSpineConfig, AgentToolsMode, MizarRuntime, load_mizar_config_with_global,
 };
 use mizar_llm::{
-    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, Message,
-    StreamChunk, ToolCall,
+    BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, Message, StreamChunk, ToolCall,
 };
-use mizar_session::SessionContextExt;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -151,39 +146,16 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
 
     // 1. 首次启动运行：同时验证 /deploy 技能手势展开不被 ContextNotice 截断，且 read 触达 sub/ 后注入子目录指令
     let seen1 = Arc::new(Mutex::new(Vec::new()));
-    let app1 = Context::new();
-    let spine1 = app1.plugin(AgentSpinePlugin, build_cfg());
+    let runtime1 = MizarRuntime::build(build_cfg()).await.unwrap();
     let adapter1 = Arc::new(InspectAdapter {
         step: AtomicUsize::new(0),
         seen_messages: Arc::clone(&seen1),
     });
-    app1.plugin(
-        PluginDef::sync("test-llm", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter1);
-            ctx.effect("test-llm.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("test", a)?))
-            })?;
-            Ok::<_, CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    )
-    .await
-    .unwrap();
-    let _ = spine1.await;
-    for _ in 0..4 {
-        for rt in app1.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-    }
+    runtime1.register_adapter("test", adapter1).unwrap();
 
-    let s1 = app1.sessions().unwrap().create(Some("instr-sess".into()));
-    let reply1 = app1
-        .agent_loop()
-        .unwrap()
+    let s1 = runtime1.sessions.create(Some("instr-sess".into()));
+    let reply1 = runtime1
+        .agent_loop
         .run(
             Arc::clone(&s1),
             "/deploy 请读取 sub/target.txt",
@@ -229,8 +201,9 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
         assert!(step1.contains("SUB_CLAUDE_RULE"), "step1:\n{step1}");
     }
 
-    let report1 = app1
-        .service::<AgentInstructions>("agentInstructions")
+    let report1 = runtime1
+        .instructions
+        .as_ref()
         .unwrap()
         .session_report(&s1.id)
         .unwrap();
@@ -242,44 +215,21 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
             .iter()
             .any(|s| s.display_path == "sub/AGENTS.md")
     );
-    app1.fiber().dispose().await;
+    runtime1.shutdown().await;
 
     // 2. 重启进程恢复会话（且文件未改，但之前有 baseline + sub delta）：续聊应不重复追加无意义基线，且若离线改写则能感知更新
     std::fs::write(ws.join("CLAUDE.md"), "WS_CLAUDE_RULE_OFFLINE_EDIT").unwrap();
     let seen2 = Arc::new(Mutex::new(Vec::new()));
-    let app2 = Context::new();
-    let spine2 = app2.plugin(AgentSpinePlugin, build_cfg());
+    let runtime2 = MizarRuntime::build(build_cfg()).await.unwrap();
     let adapter2 = Arc::new(InspectAdapter {
         step: AtomicUsize::new(10),
         seen_messages: Arc::clone(&seen2),
     });
-    app2.plugin(
-        PluginDef::sync("test-llm-2", move |ctx, ()| {
-            let llm = ctx.llm()?;
-            let a = Arc::clone(&adapter2);
-            ctx.effect("test-llm-2.reg", move || {
-                Ok::<_, LlmError>(Some(llm.register_adapter("test", a)?))
-            })?;
-            Ok::<_, CordisError>(())
-        })
-        .inject(["llm"]),
-        (),
-    )
-    .await
-    .unwrap();
-    let _ = spine2.await;
-    for _ in 0..4 {
-        for rt in app2.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-    }
+    runtime2.register_adapter("test", adapter2).unwrap();
 
-    let resumed = app2.sessions().unwrap().get("instr-sess").unwrap();
-    let reply2 = app2
-        .agent_loop()
-        .unwrap()
+    let resumed = runtime2.sessions.get("instr-sess").unwrap();
+    let reply2 = runtime2
+        .agent_loop
         .run(resumed, "继续", CancellationToken::new())
         .await
         .unwrap();
@@ -287,5 +237,5 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
     let step2_all = seen2.lock().unwrap()[0].join("\n");
     assert!(step2_all.contains("WS_CLAUDE_RULE_OFFLINE_EDIT"));
 
-    app2.fiber().dispose().await;
+    runtime2.shutdown().await;
 }

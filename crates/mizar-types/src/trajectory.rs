@@ -1,6 +1,6 @@
 //! 纯轨迹领域模型、统计折叠投影、三泳道时间轴与异常检测规则引擎。
 //!
-//! 本 crate 不依赖 `cordis`、`tokio` 或任何在线运行时，供 `mizar-trajectory` 与纯 UI 层共用。
+//! 本 crate 不依赖 `tokio` 或任何在线运行时，供 `mizar-core::trajectory` 与纯 UI 层共用。
 
 pub mod detector;
 pub mod model;
