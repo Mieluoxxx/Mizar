@@ -9,7 +9,7 @@ use crate::{
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params_from_iter};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 const BUSY_RETRY_BUDGET: Duration = Duration::from_millis(5000);
 
 pub(crate) fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
@@ -175,23 +175,6 @@ pub(crate) fn init_schema_with_timeout(
                  payload_json TEXT NOT NULL,
                  PRIMARY KEY (session_id, seq),
                  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-             );
-             CREATE TABLE IF NOT EXISTS session_recall_docs (
-                 doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 session_id TEXT NOT NULL,
-                 seq INTEGER NOT NULL,
-                 ts_ms INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 preview TEXT NOT NULL,
-                 UNIQUE(session_id, seq),
-                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_recall_docs_session_seq
-                 ON session_recall_docs(session_id, seq);
-             CREATE VIRTUAL TABLE IF NOT EXISTS session_recall_fts USING fts5(
-                 terms,
-                 content='',
-                 tokenize='ascii'
              );",
         )
         .map_err(map_sqlite_err)?;
@@ -205,19 +188,6 @@ pub(crate) fn init_schema_with_timeout(
                 .map_err(map_sqlite_err)?;
         }
 
-        if locked_version > 0 && locked_version < 2 {
-            let session_ids: Vec<String> = {
-                let mut stmt = conn
-                    .prepare("SELECT DISTINCT session_id FROM session_events")
-                    .map_err(map_sqlite_err)?;
-                let rows = stmt.query_map([], |r| r.get(0)).map_err(map_sqlite_err)?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(map_sqlite_err)?
-            };
-            for sid in &session_ids {
-                super::recall::index_session_events_in_tx(conn, sid)?;
-            }
-        }
         if locked_version > 0 && locked_version < 3 {
             conn.execute(
                 "UPDATE sessions
@@ -230,8 +200,12 @@ pub(crate) fn init_schema_with_timeout(
             )
             .map_err(map_sqlite_err)?;
         }
-        conn.execute_batch("PRAGMA user_version = 3;")
-            .map_err(map_sqlite_err)?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS session_recall_fts;
+             DROP TABLE IF EXISTS session_recall_docs;
+             PRAGMA user_version = 4;",
+        )
+        .map_err(map_sqlite_err)?;
         Ok(())
     })();
 

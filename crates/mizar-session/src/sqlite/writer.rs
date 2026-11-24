@@ -3,14 +3,13 @@
 use std::sync::mpsc;
 
 use crate::{
-    LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
-    SESSION_FORMAT_VERSION, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
-    SessionListQuery, SessionOrigin, SessionSelection, TitlePatch, TitleSource, TitleSourcePatch,
+    LoadedSession, PersistenceError, PersistenceResult, SESSION_FORMAT_VERSION, SessionEntry,
+    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin,
+    SessionSelection, TitlePatch, TitleSource, TitleSourcePatch,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::oneshot;
 
-use super::recall::{index_entry_in_tx, search_recall_from_conn};
 use super::schema::{
     is_sqlite_busy, latest_selection_from_conn, list_sessions_from_conn, load_header_from_conn,
     load_session_from_conn, map_sqlite_err, millis_to_i64, visibility_str,
@@ -70,10 +69,6 @@ pub enum WriteCmd {
         query: SessionListQuery,
         reply: ReadReply<Vec<SessionHeader>>,
     },
-    SearchRecall {
-        query: RecallSearchQuery,
-        reply: ReadReply<Vec<RecallSearchHit>>,
-    },
     Flush(BarrierReply),
     Shutdown(mpsc::SyncSender<PersistenceResult<()>>),
 }
@@ -86,7 +81,6 @@ fn stops_batch_collection(cmd: &WriteCmd) -> bool {
             | WriteCmd::LoadHeader { .. }
             | WriteCmd::LatestSelection { .. }
             | WriteCmd::ListSessions { .. }
-            | WriteCmd::SearchRecall { .. }
             | WriteCmd::Shutdown(_)
     )
 }
@@ -109,10 +103,6 @@ fn map_batch_sqlite_err(err: rusqlite::Error) -> BatchWriteError {
     } else {
         BatchWriteError::Fatal(map_sqlite_err(err))
     }
-}
-
-fn map_batch_persistence_err(err: PersistenceError) -> BatchWriteError {
-    BatchWriteError::Fatal(err)
 }
 
 fn clone_err_res(res: &PersistenceResult<()>) -> PersistenceResult<()> {
@@ -244,13 +234,6 @@ pub fn run_writer_loop(
                 WriteCmd::ListSessions { query, reply } => {
                     let res = match write_res {
                         Ok(()) => list_sessions_from_conn(&conn, &query),
-                        Err(err) => Err(err),
-                    };
-                    reply.send(res);
-                }
-                WriteCmd::SearchRecall { query, reply } => {
-                    let res = match write_res {
-                        Ok(()) => search_recall_from_conn(&conn, &query),
                         Err(err) => Err(err),
                     };
                     reply.send(res);
@@ -418,7 +401,6 @@ fn append_entries_in_tx(
                         max_compacted.map_or(*first_kept_seq, |prev| prev.max(*first_kept_seq)),
                     );
                 }
-                index_entry_in_tx(tx, session_id, entry).map_err(map_batch_persistence_err)?;
             }
         }
     }
@@ -578,7 +560,6 @@ fn exec_fork(
     )
     .map_err(map_sqlite_err)?;
 
-    // 不在写锁内重算父会话全量 FTS5：父会话 seq <= up_to_seq 已有现成索引，检索时按 (parent_id, fork_seq) 继承回溯。
     let loaded = load_session_from_conn(&tx, &new_header.id)?
         .ok_or_else(|| PersistenceError::NotFound(new_header.id.clone()))?;
     tx.commit().map_err(map_sqlite_err)?;

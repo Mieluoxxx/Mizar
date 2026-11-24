@@ -290,94 +290,6 @@ async fn persists_and_reloads_bash_execution_context_and_local_only() {
 }
 
 #[tokio::test]
-async fn fts5_ngram_recall_searches_cjk_code_across_compaction_and_fork() {
-    use mizar_session::RecallSearchQuery;
-
-    let db = temp_db_path("recall_fts5");
-    let _guard = TempDbGuard(db.clone());
-
-    let backend = SqliteSessionPersistence::open_async(&db).await.unwrap();
-    let store = SessionStore::with_persistence(backend.clone());
-    let s1 = store.create_with(SessionCreateOptions {
-        id: Some("s1".into()),
-        cwd: Some("/ws/alpha".into()),
-        ..Default::default()
-    });
-    s1.append(SessionEvent::user(
-        "早期决策：使用 compacted_up_to_seq 追踪历史压缩水位",
-    ));
-    s1.append(SessionEvent::user(
-        "我们来排查 Ryugi 画板与任务看板的双向状态同步问题",
-    ));
-    s1.append(SessionEvent::ToolResult {
-        tool_call_id: "tc-1".into(),
-        name: "read".into(),
-        content: "fn resolve_anchor_node() { /* unique_anchor_marker_99 */ }".into(),
-        is_error: false,
-    });
-    // 即使发生压缩，压缩前的原始事件仍必须可穿透检索
-    s1.compact("已确认看板边界", 0, Some(1000));
-    s1.flush_async().await.unwrap();
-
-    // 分叉子会话也应自动具备前缀事件的 FTS5 索引
-    let forked = store
-        .fork("s1", 2, SessionCreateOptions::default())
-        .unwrap();
-    forked.flush_async().await.unwrap();
-
-    // Rust 标识符检索
-    let hits_ident = store
-        .search_recall(&RecallSearchQuery {
-            query: "compacted_up_to_seq".into(),
-            session_ids: vec![forked.id.clone()],
-            cwd: None,
-            limit: 10,
-        })
-        .unwrap()
-        .expect("sqlite backend should return Some(hits)");
-    assert!(
-        hits_ident
-            .iter()
-            .any(|h| h.session_id == forked.id && h.seq == 1),
-        "expected forked session FTS hit, got: {hits_ident:?}"
-    );
-
-    // 中文 2 字短词检索（穿透 Compaction 边界）
-    let hits_cjk = store
-        .search_recall(&RecallSearchQuery {
-            query: "画板".into(),
-            session_ids: vec!["s1".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .unwrap()
-        .unwrap();
-    assert!(
-        hits_cjk.iter().any(|h| h.session_id == "s1" && h.seq == 2),
-        "expected Chinese 2-char hit across compaction, got: {hits_cjk:?}"
-    );
-
-    // ToolResult 原文子串检索（穿透 Compaction 边界）
-    let hits_tool = store
-        .search_recall(&RecallSearchQuery {
-            query: "unique_anchor_marker_99".into(),
-            session_ids: vec!["s1".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .unwrap()
-        .unwrap();
-    assert!(
-        hits_tool.iter().any(|h| h.session_id == "s1" && h.seq == 3),
-        "expected tool result hit across compaction, got: {hits_tool:?}"
-    );
-
-    let _ = store.flush_async(None).await;
-    drop(store);
-    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
-}
-
-#[tokio::test]
 async fn persists_and_derives_user_images_through_sqlite() {
     use mizar_types::llm::ImageAttachment;
 
@@ -469,7 +381,7 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         .unwrap();
     }
 
-    // 2. 启动迁移，验证 user_version=3 与 title_source 读写
+    // 2. 启动迁移，验证 user_version=4 与 title_source 读写
     let backend1 = SqliteSessionPersistence::open_async(&db_path)
         .await
         .unwrap();
@@ -480,7 +392,7 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
         let ver: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 3);
+        assert_eq!(ver, 4);
     }
 
     let migrated = store1.get("v1-sess").unwrap();
@@ -530,34 +442,15 @@ async fn migrates_v1_schema_to_v2_and_persists_title_source_clear_and_fork() {
     );
     assert_eq!(s2_reloaded.header().title_source, Some(TitleSource::Auto));
 
-    // v1->v2 迁移应自动回填旧事件至 FTS5 回溯索引
-    let v1_hits = store2
-        .search_recall(&mizar_session::RecallSearchQuery {
-            query: "legacy".into(),
-            session_ids: vec!["v1-sess".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .unwrap()
-        .unwrap();
-    assert!(
-        v1_hits
-            .iter()
-            .any(|h| h.session_id == "v1-sess" && h.seq == 1),
-        "v1->v2 migration must backfill FTS5 recall docs: {v1_hits:?}"
-    );
-
     let _ = store2.flush_async(None).await;
     drop(store2);
     let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }
 
 #[tokio::test]
-async fn supports_out_of_order_create_fork_compaction_deep_recall_and_writer_lifecycle() {
+async fn supports_out_of_order_create_fork_compaction_and_writer_lifecycle() {
     use mizar_session::sqlite::SqliteSessionPersistence;
-    use mizar_session::{
-        PersistenceError, RecallSearchQuery, SessionEntry, SessionHeader, SessionPersistence,
-    };
+    use mizar_session::{PersistenceError, SessionEntry, SessionHeader, SessionPersistence};
 
     let db_path = temp_db_path("edge_cases");
     let _guard = TempDbGuard(db_path.clone());
@@ -588,7 +481,7 @@ async fn supports_out_of_order_create_fork_compaction_deep_recall_and_writer_lif
     assert_eq!(loaded_ooo.header.parent_id.as_deref(), Some("root-anc"));
     assert_eq!(loaded_ooo.header.fork_seq, Some(9));
 
-    // 2. 4001..=16384 字符截断区间的词条必须通过 FTS5 + 全文复查检索到
+    // 2. 写入较大 ToolResult 与 Compaction 事件
     let mut deep_text = "x".repeat(5200);
     deep_text.push_str(" DEEP_NEEDLE_98765 ");
     persistence
@@ -623,19 +516,6 @@ async fn supports_out_of_order_create_fork_compaction_deep_recall_and_writer_lif
         )
         .unwrap();
     persistence.flush(None).unwrap();
-
-    let deep_hits = persistence
-        .search_recall(&RecallSearchQuery {
-            query: "DEEP_NEEDLE_98765".into(),
-            session_ids: vec!["out-of-order".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(deep_hits.len(), 1);
-    assert_eq!(deep_hits[0].seq, 2);
-    assert!(deep_hits[0].snippet.contains("DEEP_NEEDLE_98765"));
 
     // 3. fork 前缀若包含 Compaction，子会话 compacted_up_to_seq 必须被推导保存
     let forked = persistence
@@ -930,7 +810,7 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
         .unwrap();
     }
 
-    // 2. 启动迁移到 v3 并核验回填结果
+    // 2. 启动迁移到 v4 并核验回填结果与旧 recall 表清理
     let backend = SqliteSessionPersistence::open_async(&db_path)
         .await
         .unwrap();
@@ -941,7 +821,16 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
         let ver: u32 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 3);
+        assert_eq!(ver, 4);
+        let leftover_recall_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('session_recall_docs', 'session_recall_fts');",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover_recall_tables, 0);
     }
 
     assert_eq!(
@@ -987,14 +876,99 @@ async fn migrates_v2_sessions_backfilling_origin_and_filters_explicit_subagent_f
 }
 
 #[tokio::test]
-async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_recompute() {
-    use mizar_session::sqlite::{
-        SqliteSessionPersistence,
-        recall::{MAX_RECALL_SEARCH_HITS, MAX_RECALL_SEARCH_TOTAL_BYTES},
-    };
-    use mizar_session::{
-        RecallSearchQuery, SessionEntry, SessionHeader, SessionPersistence, SessionSelection,
-    };
+async fn drops_legacy_recall_tables_when_migrating_v3_database() {
+    let db_path = temp_db_path("migrate_v3_to_v4_drop_recall");
+    let _guard = TempDbGuard(db_path.clone());
+
+    {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 format_version INTEGER NOT NULL,
+                 cwd TEXT,
+                 title TEXT,
+                 title_source TEXT,
+                 parent_id TEXT,
+                 fork_seq INTEGER,
+                 origin TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 event_count INTEGER NOT NULL DEFAULT 0,
+                 surface_count INTEGER NOT NULL DEFAULT 0,
+                 compacted_up_to_seq INTEGER
+             );
+             CREATE TABLE session_events (
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 visibility TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 PRIMARY KEY (session_id, seq)
+             );
+             CREATE TABLE session_recall_docs (
+                 doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 preview TEXT NOT NULL,
+                 UNIQUE(session_id, seq)
+             );
+             CREATE INDEX idx_recall_docs_session_seq ON session_recall_docs(session_id, seq);
+             CREATE VIRTUAL TABLE session_recall_fts USING fts5(terms, content='', tokenize='ascii');
+             INSERT INTO sessions (id, format_version, cwd, origin, created_at_ms, updated_at_ms, event_count, surface_count)
+             VALUES ('v3-keep', 1, '/work/v3', 'user', 1000, 1000, 1, 1);
+             INSERT INTO session_events (session_id, seq, ts_ms, visibility, kind, payload_json)
+             VALUES ('v3-keep', 1, 1000, 'surface', 'user', '{\"type\":\"user\",\"text\":\"preserved across v4\"}');
+             INSERT INTO session_recall_docs (session_id, seq, ts_ms, kind, preview)
+             VALUES ('v3-keep', 1, 1000, 'user', 'preserved across v4');
+             INSERT INTO session_recall_fts (rowid, terms) VALUES (1, 'preserved');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+
+    let backend = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store = SessionStore::with_persistence(backend.clone());
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let ver: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 4);
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('session_recall_docs', 'session_recall_fts', 'idx_recall_docs_session_seq');",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
+    }
+
+    let kept = store.get("v3-keep").unwrap();
+    assert_eq!(
+        kept.derive_messages(),
+        vec![Message::user("preserved across v4")]
+    );
+
+    drop(store);
+    let _ = tokio::task::spawn_blocking(move || backend.shutdown()).await;
+}
+
+#[tokio::test]
+async fn async_reads_and_transient_busy_do_not_poison_writer() {
+    use mizar_session::sqlite::SqliteSessionPersistence;
+    use mizar_session::{SessionEntry, SessionHeader, SessionPersistence, SessionSelection};
     use std::time::Duration;
 
     let db_path = temp_db_path("async_busy_fork");
@@ -1058,7 +1032,7 @@ async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_
         }
     );
 
-    // 3. fork_session 不应在写锁内重算并复制父会话 FTS5 行，但子会话检索仍可按谱系命中 <= fork_seq 的前缀且不泄漏 > fork_seq
+    // 3. fork_session 仅复制 <= fork_seq 的前缀且不泄漏 > fork_seq
     let mut child_h = SessionHeader::new("child-async", 2000);
     child_h.cwd = Some("/ws/async".into());
     let _forked = persistence
@@ -1076,75 +1050,21 @@ async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_
         .unwrap();
     persistence.flush_async(None).await.unwrap();
 
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let child_inherited_fts_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_recall_docs WHERE session_id = 'child-async' AND seq <= 2",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            child_inherited_fts_rows, 0,
-            "fork_session must not duplicate parent FTS5 docs"
-        );
-    }
-
-    let child_inherited_hits = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "PARENT_TOKEN_111".into(),
-            session_ids: vec!["child-async".into()],
-            cwd: None,
-            limit: 10,
-        })
+    let child_loaded = persistence
+        .load_session_async("child-async".into())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(child_inherited_hits.len(), 1);
-    assert_eq!(child_inherited_hits[0].session_id, "child-async");
-    assert_eq!(child_inherited_hits[0].seq, 1);
-
-    let child_leaked_hits = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "PARENT_AFTER_FORK_999".into(),
-            session_ids: vec!["child-async".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        child_leaked_hits.is_empty(),
-        "child must not see parent events with seq > fork_seq: {child_leaked_hits:?}"
-    );
-
-    let lineage_hits = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "PARENT_TOKEN_111".into(),
-            session_ids: vec!["child-async".into(), "parent-async".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(lineage_hits.len(), 1);
-    assert_eq!(lineage_hits[0].session_id, "parent-async");
-
-    let child_own_hits = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "CHILD_POST_FORK_222".into(),
-            session_ids: vec!["child-async".into()],
-            cwd: None,
-            limit: 10,
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(child_own_hits.len(), 1);
-    assert_eq!(child_own_hits[0].seq, 3);
+    let child_seqs: Vec<u64> = child_loaded.entries.iter().map(|e| e.seq).collect();
+    assert_eq!(child_seqs, vec![1, 2, 3]);
+    assert!(matches!(
+        &child_loaded.entries[0].event,
+        SessionEvent::User { text, .. } if text.contains("PARENT_TOKEN_111")
+    ));
+    assert!(matches!(
+        &child_loaded.entries[2].event,
+        SessionEvent::User { text, .. } if text.contains("CHILD_POST_FORK_222")
+    ));
 
     // 4. 瞬时跨连接写锁冲突 (SQLITE_BUSY) 不得永久毒化 sticky_error / last_error
     let blocker = rusqlite::Connection::open(&db_path).unwrap();
@@ -1179,51 +1099,17 @@ async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_
     persistence.flush_async(None).await.unwrap();
 
     let recovered = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "RECOVERED_AFTER_BUSY".into(),
-            session_ids: vec!["child-async".into()],
-            cwd: None,
-            limit: 10,
-        })
+        .load_session_async("child-async".into())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].seq, 4);
-
-    // 5. FTS5 结果条数与总字节数硬上限
-    let mut bulk = Vec::new();
-    for i in 10..40u64 {
-        bulk.push(SessionEntry {
-            seq: i,
-            event: SessionEvent::user(format!("CAP_NEEDLE_WORD {} {}", i, "z".repeat(400))),
-            ts: 3000 + u128::from(i),
-        });
-    }
-    persistence.append_events("child-async", &bulk).unwrap();
-    persistence.flush_async(None).await.unwrap();
-
-    let capped_hits = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "CAP_NEEDLE_WORD".into(),
-            session_ids: vec!["child-async".into()],
-            cwd: None,
-            limit: 50,
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(capped_hits.len() <= MAX_RECALL_SEARCH_HITS);
-    let total_bytes: usize = capped_hits
-        .iter()
-        .map(|h| {
-            h.session_id.len()
-                + h.session_title.as_deref().map_or(0, str::len)
-                + h.kind.len()
-                + h.snippet.len()
-        })
-        .sum();
-    assert!(total_bytes <= MAX_RECALL_SEARCH_TOTAL_BYTES);
+    assert!(recovered.entries.iter().any(|e| {
+        e.seq == 4
+            && matches!(
+                &e.event,
+                SessionEvent::User { text, .. } if text.contains("RECOVERED_AFTER_BUSY")
+            )
+    }));
 
     persistence.shutdown().unwrap();
 
@@ -1242,7 +1128,7 @@ async fn async_reads_and_transient_busy_do_not_poison_writer_and_fork_skips_fts_
 
 #[tokio::test]
 async fn transient_busy_in_prior_batch_surfaces_to_subsequent_flush_without_poisoning() {
-    use mizar_session::{RecallSearchQuery, SessionEntry, SessionHeader};
+    use mizar_session::{SessionEntry, SessionHeader};
     use tokio::time::{Duration, sleep};
 
     let db_path = temp_db_path("prior_batch_busy");
@@ -1295,17 +1181,16 @@ async fn transient_busy_in_prior_batch_surfaces_to_subsequent_flush_without_pois
     persistence.flush_async(None).await.unwrap();
 
     let recovered = persistence
-        .search_recall_async(RecallSearchQuery {
-            query: "PRIOR_BUSY_RECOVERED".into(),
-            session_ids: vec!["prior-busy".into()],
-            cwd: None,
-            limit: 10,
-        })
+        .load_session_async("prior-busy".into())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].seq, 1);
+    assert_eq!(recovered.entries.len(), 1);
+    assert_eq!(recovered.entries[0].seq, 1);
+    assert!(matches!(
+        &recovered.entries[0].event,
+        SessionEvent::User { text, .. } if text.contains("PRIOR_BUSY_RECOVERED")
+    ));
 
     persistence.shutdown().unwrap();
 }

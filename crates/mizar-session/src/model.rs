@@ -511,32 +511,6 @@ pub struct SessionListQuery {
     pub exclude_subagents: bool,
 }
 
-/// 面向情景回溯（`recall`）的持久化层检索参数。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RecallSearchQuery {
-    pub query: String,
-    /// 限定搜索的会话 ID 列表；为空时结合 `cwd` 搜索工作区会话。
-    #[serde(default)]
-    pub session_ids: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    pub limit: usize,
-}
-
-/// 单条情景回溯命中结果（带会话来源与 `seq` 锚点）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RecallSearchHit {
-    pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_title: Option<String>,
-    pub seq: u64,
-    pub ts: u128,
-    pub kind: String,
-    pub snippet: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
     pub header: SessionHeader,

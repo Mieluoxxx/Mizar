@@ -223,19 +223,6 @@ impl LoadedMizarConfig {
                 dst.keep_recent_tokens = v;
             }
         }
-        if let Some(rec) = &self.settings.recall
-            && let Some(dst) = spine.recall.as_mut()
-        {
-            if let Some(v) = rec.enabled {
-                dst.enabled = v;
-            }
-            if let Some(v) = rec.default_search_limit {
-                dst.default_search_limit = v;
-            }
-            if let Some(v) = rec.read_char_limit {
-                dst.read_char_limit = v;
-            }
-        }
 
         if let Some(st) = &self.settings.session_title
             && let Some(dst) = spine.session_title.as_mut()

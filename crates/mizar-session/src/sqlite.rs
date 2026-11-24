@@ -1,6 +1,5 @@
 //! 基于嵌入式 SQLite（WAL + Single-Writer 后台线程）的 `SessionPersistence` 实现。
 
-pub mod recall;
 pub mod schema;
 pub mod writer;
 
@@ -10,15 +9,13 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::{
-    LoadedSession, PersistenceError, PersistenceResult, RecallSearchHit, RecallSearchQuery,
-    SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionPersistence,
-    SessionSelection,
+    LoadedSession, PersistenceError, PersistenceResult, SessionEntry, SessionHeader,
+    SessionHeaderPatch, SessionListQuery, SessionPersistence, SessionSelection,
 };
 use mizar_types::hooks::BoxFuture;
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::oneshot;
 
-use crate::sqlite::recall::search_recall_from_conn;
 use crate::sqlite::schema::{
     configure_reader_connection_with_timeout, init_schema_with_timeout, latest_selection_from_conn,
     list_sessions_from_conn, load_header_from_conn, load_session_from_conn, map_sqlite_err,
@@ -399,60 +396,5 @@ impl SessionPersistence for SqliteSessionPersistence {
             reply: reply_tx,
         })?;
         reply_rx.recv().map_err(|_| PersistenceError::Closed)?
-    }
-
-    fn search_recall(
-        &self,
-        query: &RecallSearchQuery,
-    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(ref reader) = self.reader {
-            self.flush(None)?;
-            let conn = reader.lock().unwrap();
-            search_recall_from_conn(&conn, query).map(Some)
-        } else {
-            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-            self.send_cmd(WriteCmd::SearchRecall {
-                query: query.clone(),
-                reply: ReadReply::Sync(reply_tx),
-            })?;
-            reply_rx
-                .recv()
-                .map_err(|_| PersistenceError::Closed)?
-                .map(Some)
-        }
-    }
-
-    fn search_recall_async(
-        &self,
-        query: RecallSearchQuery,
-    ) -> BoxFuture<'static, PersistenceResult<Option<Vec<RecallSearchHit>>>> {
-        if let Some(ref reader) = self.reader {
-            let reader = Arc::clone(reader);
-            let flush_fut = self.flush_async(None);
-            Box::pin(async move {
-                flush_fut.await?;
-                tokio::task::spawn_blocking(move || {
-                    let conn = reader.lock().unwrap();
-                    search_recall_from_conn(&conn, &query).map(Some)
-                })
-                .await
-                .map_err(|err| {
-                    PersistenceError::Backend(format!("sqlite recall task failed: {err}"))
-                })?
-            })
-        } else {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let send_res = self.send_cmd(WriteCmd::SearchRecall {
-                query,
-                reply: ReadReply::Async(reply_tx),
-            });
-            Box::pin(async move {
-                send_res?;
-                reply_rx
-                    .await
-                    .map_err(|_| PersistenceError::Closed)?
-                    .map(Some)
-            })
-        }
     }
 }

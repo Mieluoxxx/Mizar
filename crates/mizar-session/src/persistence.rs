@@ -4,8 +4,8 @@ use mizar_types::hooks::BoxFuture;
 use thiserror::Error;
 
 use crate::model::{
-    LoadedSession, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionHeader,
-    SessionHeaderPatch, SessionListQuery, SessionSelection,
+    LoadedSession, SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    SessionSelection,
 };
 
 #[derive(Debug, Error)]
@@ -102,20 +102,4 @@ pub trait SessionPersistence: Send + Sync + 'static {
         up_to_seq: u64,
         new_header: &SessionHeader,
     ) -> PersistenceResult<LoadedSession>;
-
-    /// 可选的全文情景检索（如 SQLite FTS5 N-gram）；未实现时返回 `Ok(None)` 由上层退回内存扫描。
-    fn search_recall(
-        &self,
-        _query: &RecallSearchQuery,
-    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        Ok(None)
-    }
-
-    fn search_recall_async(
-        &self,
-        query: RecallSearchQuery,
-    ) -> BoxFuture<'static, PersistenceResult<Option<Vec<RecallSearchHit>>>> {
-        let res = self.search_recall(&query);
-        Box::pin(async move { res })
-    }
 }

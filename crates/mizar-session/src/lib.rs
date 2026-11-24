@@ -6,7 +6,6 @@
 
 pub mod model;
 pub mod persistence;
-pub mod recall;
 pub mod sqlite;
 
 use std::collections::HashMap;
@@ -19,14 +18,12 @@ use mizar_types::llm::{ContentBlock, Message, ReasoningEffort};
 use uuid::Uuid;
 
 pub use model::{
-    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, RecallSearchHit,
-    RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry, SessionEvent,
-    SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin, SessionSelection,
-    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
-    derive_session_title,
+    CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, SESSION_FORMAT_VERSION,
+    SessionCreateOptions, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
+    SessionListQuery, SessionOrigin, SessionSelection, SessionTraceEvent, TitlePatch, TitleSource,
+    TitleSourcePatch, TraceSeverity, derive_session_title,
 };
 pub use persistence::{PersistenceError, PersistenceResult, SessionPersistence};
-pub use recall::{RECALL_TOOL_NAME, RecallConfig, register_recall_tool};
 pub use sqlite::{SqlitePersistenceConfig, SqliteSessionPersistence};
 
 #[derive(Clone)]
@@ -182,7 +179,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
             for pin in &digest.pinned_inputs {
                 out.push_str(&format!("[input seq #{}]", pin.seq));
                 if pin.truncated {
-                    out.push_str(" (truncated; use recall for full text)");
+                    out.push_str(" (truncated)");
                 }
                 out.push('\n');
                 out.push_str(&pin.text);
@@ -194,7 +191,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
     out.push_str("<mizar-summary>\n");
     out.push_str(summary.trim());
     out.push_str("\n</mizar-summary>\n");
-    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
+    out.push_str("Note: Earlier messages were compacted. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
     out.push_str("</mizar-compaction>");
     out
 }
@@ -1283,30 +1280,6 @@ impl SessionStore {
                 .and_then(|h| h.parent_id);
         }
         chain
-    }
-
-    /// 委托给持久化后端执行全文情景回溯（未启用或不支持索引时返回 `Ok(None)`）。
-    pub fn search_recall(
-        &self,
-        query: &RecallSearchQuery,
-    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(backend) = self.shared.persistence() {
-            backend.search_recall(query)
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// 异步委托给持久化后端执行全文情景回溯。
-    pub async fn search_recall_async(
-        &self,
-        query: RecallSearchQuery,
-    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(backend) = self.shared.persistence() {
-            backend.search_recall_async(query).await
-        } else {
-            Ok(None)
-        }
     }
 
     fn list_in_memory_headers(&self, query: &SessionListQuery) -> Vec<SessionHeader> {

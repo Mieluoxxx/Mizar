@@ -56,14 +56,6 @@ pub struct CompactionSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct RecallSettings {
-    pub enabled: Option<bool>,
-    pub default_search_limit: Option<usize>,
-    pub read_char_limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
 pub struct SessionTitleSettings {
     pub enabled: Option<bool>,
     pub model: Option<String>,
@@ -134,7 +126,6 @@ pub struct SettingsConfig {
     pub skills: Option<SkillsSettings>,
     pub instructions: Option<InstructionsSettings>,
     pub compaction: Option<CompactionSettings>,
-    pub recall: Option<RecallSettings>,
     pub session_title: Option<SessionTitleSettings>,
     pub subagent: Option<SubagentSettings>,
     pub ui: Option<UiSettings>,
@@ -273,18 +264,6 @@ impl SettingsConfig {
             }
             if comp.keep_recent_tokens.is_some() {
                 dst.keep_recent_tokens = comp.keep_recent_tokens;
-            }
-        }
-        if let Some(rec) = other.recall {
-            let dst = self.recall.get_or_insert_with(Default::default);
-            if rec.enabled.is_some() {
-                dst.enabled = rec.enabled;
-            }
-            if rec.default_search_limit.is_some() {
-                dst.default_search_limit = rec.default_search_limit;
-            }
-            if rec.read_char_limit.is_some() {
-                dst.read_char_limit = rec.read_char_limit;
             }
         }
         if let Some(st) = other.session_title {
@@ -480,7 +459,7 @@ mod disabled_plugins_tests {
         std::fs::write(
             proj.join(".mizar/settings.json"),
             r#"{
-                "disabledPlugins": ["recall", "mcp", "compaction"]
+                "disabledPlugins": ["repeat-guard", "mcp", "compaction"]
             }"#,
         )
         .unwrap();
@@ -493,7 +472,7 @@ mod disabled_plugins_tests {
                 "codemode".to_string(),
                 "compaction".to_string(),
                 "mcp".to_string(),
-                "recall".to_string(),
+                "repeat-guard".to_string(),
                 "skills".to_string(),
             ]
         );
@@ -507,7 +486,7 @@ mod disabled_plugins_tests {
                 "codemode".to_string(),
                 "compaction".to_string(),
                 "mcp".to_string(),
-                "recall".to_string(),
+                "repeat-guard".to_string(),
                 "skills".to_string(),
                 "trajectory".to_string(),
             ]

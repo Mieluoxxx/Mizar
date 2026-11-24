@@ -20,7 +20,6 @@ use mizar_llm::{
     BoxChunkStream, ContentBlock, FinishReason, GenerateOptions, LlmAdapter, LlmError, LlmRuntime,
     Message, ModelInfo, ProviderInfo, RequestOrigin, StreamChunk, ToolCall,
 };
-use mizar_session::recall::{RecallConfig, register_recall_tool};
 use mizar_session::sqlite::SqliteSessionPersistence;
 use mizar_session::{SessionOrigin, SessionPersistence, SessionStore, TitleSource};
 use mizar_tools::coding::{CodingToolsConfig, register_coding_tools};
@@ -287,11 +286,6 @@ async fn parallel_read_only_subagents_isolate_history_and_persist_lineage() {
         app.push_guard(tools.register(gt).unwrap());
         app.push_guard(tools.register(ld).unwrap());
         app.push_guard(tools.register(rf).unwrap());
-    }
-    if let Some(recall_g) =
-        register_recall_tool(&app.tools(), app.sessions(), RecallConfig::default()).unwrap()
-    {
-        app.push_guard(recall_g);
     }
     let (_title_rt, title_g) =
         SessionTitleRuntime::install(app.llm(), &app.agent_loop(), SessionTitleConfig::default());

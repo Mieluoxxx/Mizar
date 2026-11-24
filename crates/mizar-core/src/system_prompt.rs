@@ -25,7 +25,7 @@ Runtime context blocks in conversation messages:
 - `<environment_context>`: current workspace path and date.
 - `<project_instructions>` (or `<system-reminder>`): workspace instruction files (e.g. AGENTS.md) and skill catalog updates; follow them alongside the user's request.
 - `<skill_content>`: loaded skill instructions; follow them without re-calling `skill`.
-- `<mizar-compaction>`: compacted summary of earlier turns; trust newer messages or current files on conflict and use `recall` for verbatim history.";
+- `<mizar-compaction>`: compacted summary of earlier turns; trust newer messages or current files on conflict.";
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemPromptConfig {

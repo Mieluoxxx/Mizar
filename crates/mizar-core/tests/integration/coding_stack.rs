@@ -283,12 +283,11 @@ async fn full_coding_stack_end_to_end_with_mcp_tool_search_codemode_and_empty_re
         );
     }
 
-    // 校验工具可见性演化：step1 有 tool_search/codemode/recall 且无 skill（0 skills）与 mcp__fff__*；step2 多出 mcp__fff__find_files 且始终没有 multi_grep
+    // 校验工具可见性演化：step1 有 tool_search/codemode 且无 skill（0 skills）与 mcp__fff__*；step2 多出 mcp__fff__find_files 且始终没有 multi_grep
     {
         let steps = seen_tools.lock().unwrap();
         assert!(steps[1].contains(&"tool_search".to_string()));
         assert!(steps[1].contains(&"codemode".to_string()));
-        assert!(steps[1].contains(&"recall".to_string()));
         assert!(!steps[1].contains(&"skill".to_string()));
         assert!(!steps[1].contains(&"mcp__fff__find_files".to_string()));
         assert!(!steps[1].contains(&"mcp__fff__multi_grep".to_string()));
