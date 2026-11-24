@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::EventStream;
-use mizar_client::actor::{SessionActor, SessionActorConfig};
+use mizar_client::actor::{SessionActor, SessionActorConfig, SessionActorHandle};
 use mizar_client::logging::{env_log_level_override, install_tracing_handler};
-use mizar_client::run_dir::{check_session_writable, ensure_run_dir, resolve_run_dir};
+use mizar_client::rpc_server::{RpcServer, RpcServerConfig, RpcServerHandle};
+use mizar_client::run_dir::{
+    ProcessMeta, ProcessRegistration, check_session_writable, ensure_run_dir, resolve_run_dir,
+};
 use mizar_client::workspace::collect_user_skill_names;
 use mizar_core::spine::MizarRuntime;
 use mizar_core::system_prompt::{PromptSection, SystemPrompt};
@@ -719,6 +722,21 @@ pub async fn run_tui_with_summary(
     actor_cfg.host_extensions = ext_flags;
 
     let actor = SessionActor::spawn(Arc::clone(&runtime), Arc::clone(&active_session), actor_cfg);
+    let mut rpc_server = match start_tui_rpc_server(
+        &actor,
+        effective_run_dir.as_deref(),
+        config.enable_rpc_socket,
+        &config.workspace,
+        &active_session.id,
+        app.provider.clone(),
+        app.model.clone(),
+    ) {
+        Ok(srv) => srv,
+        Err(err_msg) => {
+            app.push_notice(NoticeLevel::Warn, err_msg);
+            None
+        }
+    };
     let mut client_rx = actor.subscribe_client_events();
     let mut sync = TuiActorSync::new(&active_session, &app);
 
@@ -985,6 +1003,9 @@ pub async fn run_tui_with_summary(
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     emit_program_status(ProgramStatusState::Idle, None, None);
     task_state.abort_for_session_switch();
+    if let Some(rpc) = rpc_server.take() {
+        rpc.shutdown().await;
+    }
     actor.shutdown().await;
     for guard in guards.into_iter().rev() {
         drop(guard);
@@ -995,6 +1016,36 @@ pub async fn run_tui_with_summary(
         session_id: app.session_id.clone(),
         persisted: runtime.persistence.is_some(),
     })
+}
+
+fn start_tui_rpc_server(
+    actor: &SessionActorHandle,
+    run_dir: Option<&Path>,
+    enable_rpc_socket: bool,
+    workspace: &Path,
+    session_id: &str,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Result<Option<RpcServerHandle>, String> {
+    if !enable_rpc_socket {
+        return Ok(None);
+    }
+    let Some(rd) = run_dir else {
+        return Ok(None);
+    };
+    ensure_run_dir(rd).map_err(|err| format!("运行目录初始化失败：{err}"))?;
+    let meta = ProcessMeta::for_current_process(
+        rd,
+        session_id,
+        workspace.display().to_string(),
+        provider,
+        model,
+    );
+    let registration = ProcessRegistration::create(rd, meta)
+        .map_err(|err| format!("进程元数据注册失败：{err}"))?;
+    RpcServer::start(actor.clone(), registration, RpcServerConfig::default())
+        .map(Some)
+        .map_err(|err| format!("Unix Socket RPC 启动失败：{err}"))
 }
 
 #[cfg(test)]
@@ -2756,5 +2807,105 @@ mod tests {
             reason: super::UiTurnEndReason::Completed,
         });
         assert_eq!(super::inline_finalized_commit_limit(&app), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_tui_rpc_server_respects_flag_serves_socket_and_cleans_up_on_shutdown() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+
+        use mizar_client::actor::{SessionActor, SessionActorConfig};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 1_000_000;
+        let root = PathBuf::from(format!("/tmp/mz_tui_rpc_{}_{uniq}", std::process::id()));
+        let ws = root.join("ws");
+        let run_dir = root.join("r");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(&ws))
+            .await
+            .unwrap();
+        let session = runtime.sessions.create(Some("tui-rpc".into()));
+        let actor = SessionActor::spawn(
+            Arc::clone(&runtime),
+            Arc::clone(&session),
+            SessionActorConfig::new(&ws).with_run_dir(&run_dir),
+        );
+
+        // 1. enable_rpc_socket=false 时不得绑定 socket 或写入 run_dir
+        let disabled = super::start_tui_rpc_server(
+            &actor,
+            Some(&run_dir),
+            false,
+            &ws,
+            &session.id,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(disabled.is_none());
+        assert!(!run_dir.exists());
+
+        // 2. enable_rpc_socket=true 时应创建 p-<pid>.sock/.json 并响应 JSON-RPC 请求
+        let rpc = super::start_tui_rpc_server(
+            &actor,
+            Some(&run_dir),
+            true,
+            &ws,
+            &session.id,
+            Some("mock".into()),
+            Some("m1".into()),
+        )
+        .unwrap()
+        .expect("rpc server must start when enabled");
+        let sock_path = rpc.socket_path().to_path_buf();
+        let meta_path = rpc.meta_path().to_path_buf();
+        assert!(sock_path.exists());
+        assert!(meta_path.exists());
+
+        let sid = session.id.clone();
+        let sock_for_client = sock_path.clone();
+        let resp_line = tokio::task::spawn_blocking(move || {
+            let mut stream = UnixStream::connect(&sock_for_client).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let req = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"capabilities.list","params":{{"session_id":"{sid}"}}}}"#
+            );
+            writeln!(stream, "{req}").unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line
+        })
+        .await
+        .unwrap();
+        let resp_val: serde_json::Value = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp_val["id"], 1);
+        assert!(resp_val["result"]["commands"].is_array());
+
+        // 3. 切换新会话时应原子更新 p-<pid>.json
+        let s2 = actor.new_session(Some("second".into())).await.unwrap();
+        let meta_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta_json["session_id"], s2.id);
+
+        // 4. shutdown 必须清理 .sock 与 .json
+        rpc.shutdown().await;
+        assert!(!sock_path.exists());
+        assert!(!meta_path.exists());
+
+        actor.shutdown().await;
+        runtime.shutdown().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
