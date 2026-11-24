@@ -40,7 +40,6 @@ pub struct InstructionsSettings {
     pub project_root_markers: Option<Vec<String>>,
     pub max_bytes: Option<usize>,
     pub max_source_bytes: Option<usize>,
-    pub follow_subdirs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -249,9 +248,6 @@ impl SettingsConfig {
             }
             if inst.max_source_bytes.is_some() {
                 dst.max_source_bytes = inst.max_source_bytes;
-            }
-            if inst.follow_subdirs.is_some() {
-                dst.follow_subdirs = inst.follow_subdirs;
             }
         }
         if let Some(comp) = other.compaction {

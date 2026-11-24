@@ -114,7 +114,14 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
         vec!["bash", "edit", "find", "grep", "read", "recall", "write"]
     );
 
-    // 2. 首步 pre-step 应注入 AGENTS.md
+    // 2. 启动静态注入应使系统提示词包含 AGENTS.md
+    assert!(
+        runtime
+            .system_prompt
+            .build_for_session(Some(&session.id))
+            .contains("Always preserve determinism"),
+        "expected AGENTS.md in system prompt before compaction"
+    );
     session.append(SessionEvent::user("早期关键约束：暗号为 星尘压缩密钥_2026"));
     if let AgentPreStepDecision::Enter { inputs } = agent_loop
         .run_pre_step(AgentPreStepInput {
@@ -132,13 +139,6 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
             session.append(item.into_session_event());
         }
     }
-    assert!(
-        session
-            .visible_log()
-            .iter()
-            .any(|e| matches!(&e.event, SessionEvent::ContextNotice { text, .. } if text.contains("Always preserve determinism"))),
-        "expected AGENTS.md baseline before compaction"
-    );
 
     session.append(SessionEvent::assistant_text("已收到早期约束"));
     session.append(SessionEvent::user("继续执行下一阶段任务"));
@@ -170,7 +170,7 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
         "tools list must stay frozen across compaction"
     );
 
-    // 4. 压后下一步 pre-step：mizar-instructions 应立即重注 AGENTS.md
+    // 4. 压后下一步 pre-step：系统提示词静态段仍保留 AGENTS.md
     if let AgentPreStepDecision::Enter { inputs } = agent_loop
         .run_pre_step(AgentPreStepInput {
             session: Arc::clone(&session),
@@ -188,11 +188,11 @@ async fn full_spine_compaction_reinjects_instructions_and_activates_sqlite_recal
         }
     }
     assert!(
-        session
-            .visible_log()
-            .iter()
-            .any(|e| matches!(&e.event, SessionEvent::ContextNotice { text, .. } if text.contains("Always preserve determinism"))),
-        "expected AGENTS.md to be re-injected immediately after compaction"
+        runtime
+            .system_prompt
+            .build_for_session(Some(&session.id))
+            .contains("Always preserve determinism"),
+        "expected AGENTS.md to remain in system prompt after compaction"
     );
 
     // 5. 通过单一静态 recall 穿透压缩边界与 SQLite FTS5 找回早期中文暗号

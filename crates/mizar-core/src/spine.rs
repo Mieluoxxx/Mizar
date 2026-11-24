@@ -16,8 +16,8 @@ pub use crate::compaction::{
     CompactionTrigger, ContextPressureReport, ManualCompactOptions, strip_summary_wrapper,
 };
 pub use crate::instructions::{
-    AGENT_INSTRUCTIONS_SOURCE, AgentInstructions, InstructionScopeKind, InstructionScopeStatus,
-    InstructionsConfig, SessionInstructionsReport,
+    AgentInstructions, InstructionScopeKind, InstructionScopeStatus, InstructionsConfig,
+    SessionInstructionsReport,
 };
 pub use crate::session_title::{
     DEFAULT_REFRESH_INTERVAL_TURNS, ParsedModelTitle, SessionTitleConfig, SessionTitleError,
@@ -450,8 +450,7 @@ impl MizarRuntime {
                 );
                 skills = Some(skill_reg);
 
-                let (instr_rt, instr_guard) =
-                    AgentInstructions::install(&tools, &agent_loop, instr_cfg);
+                let (instr_rt, instr_guard) = AgentInstructions::install(&system_prompt, instr_cfg);
                 guards.push(instr_guard);
                 instructions = Some(instr_rt);
             }

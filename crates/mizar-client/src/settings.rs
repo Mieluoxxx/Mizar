@@ -524,16 +524,13 @@ mod tests {
         }
         let runtime = MizarRuntime::build(cfg).await.unwrap();
 
-        let session = runtime.sessions.create(None);
         let snap = SettingsViewSnapshot::default();
         assert!(
             crate::workspace::collect_user_skill_names(&runtime, &ws)
                 .await
                 .contains(&"client-demo".to_string())
         );
-        assert!(
-            !crate::workspace::collect_instructions_summary(&runtime, Some(&session.id)).is_empty()
-        );
+        assert!(!crate::workspace::collect_instructions_summary(&runtime).is_empty());
 
         // 启动时 compaction 被屏蔽：设置列表中不含 [压缩] 配置项，且 plugin.compaction 为 false
         let initial_entries = build_settings_entries(&runtime, &snap);
@@ -615,9 +612,7 @@ mod tests {
                 .await
                 .is_empty()
         );
-        assert!(
-            crate::workspace::collect_instructions_summary(&runtime, Some(&session.id)).is_empty()
-        );
+        assert!(crate::workspace::collect_instructions_summary(&runtime).is_empty());
         assert!(!runtime.compaction.as_ref().unwrap().is_module_enabled());
         let after_disable = build_settings_entries(&runtime, &snap);
         assert!(!after_disable.iter().any(|e| e.category == "压缩"));

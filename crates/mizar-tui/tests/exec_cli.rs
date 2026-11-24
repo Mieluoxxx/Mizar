@@ -2345,7 +2345,7 @@ async fn exec_turn0_prompt_wire_format_order_file_mentions_and_trace_out() {
         "tools declaration must stay identical across turns"
     );
     let b1_dev = r_b1.body["input"][0]["content"].as_str().unwrap();
-    assert!(!b1_dev.contains("WORKSPACE_RULE_W15"));
+    assert!(b1_dev.contains("WORKSPACE_RULE_W15"));
     assert!(!b1_dev.contains("HELPER_SKILL_BODY"));
     assert!(!b1_dev.contains("SAMPLE_AT_FILE_CONTENT"));
 
@@ -2364,19 +2364,17 @@ async fn exec_turn0_prompt_wire_format_order_file_mentions_and_trace_out() {
             .unwrap_or_else(|| panic!("missing `{needle}` in input: {b1_texts:?}"))
     };
     let pos_env = find_pos("<environment_context>");
-    let pos_instr = find_pos("WORKSPACE_RULE_W15");
     let pos_catalog = find_pos("<available_skills>");
     let pos_skill = find_pos("HELPER_SKILL_BODY");
     let pos_user = find_pos("Check @src/sample.txt with /helper");
     let pos_mention = find_pos("SAMPLE_AT_FILE_CONTENT");
     assert_eq!(pos_env, 1, "input[1] must be <environment_context>");
     assert!(
-        pos_env < pos_instr
-            && pos_instr < pos_catalog
+        pos_env < pos_catalog
             && pos_catalog < pos_skill
             && pos_skill < pos_user
             && pos_user < pos_mention,
-        "unexpected Turn-0 input order: env={pos_env}, instr={pos_instr}, catalog={pos_catalog}, skill={pos_skill}, user={pos_user}, mention={pos_mention}, items={b1_texts:?}"
+        "unexpected Turn-0 input order: env={pos_env}, catalog={pos_catalog}, skill={pos_skill}, user={pos_user}, mention={pos_mention}, items={b1_texts:?}"
     );
 
     // C. disabledPlugins=["file-mentions"] 时应跳过 @path 展开
