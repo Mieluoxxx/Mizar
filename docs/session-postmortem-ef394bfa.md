@@ -237,9 +237,9 @@
 
 ### Phase 2：`herdr-app` 多端接入（详见第六节，Phase 1 收尾后启动）
 
-- [ ] **M1（`mizar-client::SessionActor` 内核解耦）**：将 `mizar-tui/src/runner` 私有控制态、`ActiveTurnBuffer`、`PendingInteractions`（`request_id -> oneshot`）、唯一 `queued_inputs`、`FollowUp` 唤醒循环与 `SubagentTaskSnapshot` 广播下沉至 `mizar-client`，`mizar-tui` 退化为薄客户端并回归全部测试。
-- [ ] **M2（Per-PID Socket 与核心 RPC 闭环）**：落地 `~/.mizar/run/p-<pid>.sock`（`0600`）与 `p-<pid>.json`（含 `ppid`/`tty`/`herdr_pane_id` 及单写者会话锁）、按需补齐 OSC 7501 `pid` 字段，实现核心 RPC（`session.subscribe`、`turn.submit`、`turn.cancel`、`interaction.resolve`、`session.config`、`session.events`）、`30~50ms` delta 合并与慢客户端断连保护。
-- [ ] **M3（持久化渲染质感升级）**：将 `ToolResult.details` 精选字段持久化为 `tool-result.meta`（`derive_messages()` 忽略，零上下文污染），新增 `approval`（`LogOnly`）事件与 `turn-end.summary` 纯规则统计，补齐 `capabilities.list` 与 `session.fork`/`tree`。
+- [x] **M1（`mizar-client::SessionActor` 内核解耦）**：将 `mizar-tui/src/runner` 私有控制态、`ActiveTurnBuffer`、`PendingInteractions`（`request_id -> oneshot`）、唯一 `queued_inputs`、`FollowUp` 唤醒循环与 `SubagentTaskSnapshot` 广播下沉至 `mizar-client`，`mizar-tui` 退化为薄客户端并回归全部测试。
+- [x] **M2（Per-PID Socket 与核心 RPC 闭环）**：落地 `~/.mizar/run/p-<pid>.sock`（`0600`）与 `p-<pid>.json`（含 `ppid`/`tty`/`herdr_pane_id` 及单写者会话锁）、补齐 OSC 7501 `pid` 字段，实现核心 RPC（`session.subscribe`、`turn.submit`、`turn.cancel`、`interaction.resolve`、`session.config`、`session.events`）、`40ms` delta 合并与 `256` 帧慢客户端断连保护。
+- [x] **M3（持久化渲染质感升级）**：将 `ToolResult.details` 精选字段持久化为 `tool-result.meta`（`derive_messages()` 忽略，零上下文污染），新增 `approval`（`LogOnly`）事件与 `turn-end.summary` 纯规则统计，补齐 `capabilities.list` 与 `session.fork`/`tree`。
 - [ ] **M4（前端接入与按需远程化）**：在 `~/workspace/herdr-mayonaka` 接入 `p-<pid>.sock` 构建 Mizar 交互视图；`mizar serve`（仅 `127.0.0.1` + Origin 校验 + Tailscale Serve）待有独立 Web/PWA 需求时后置启动。
 
 ---
