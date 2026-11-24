@@ -366,6 +366,7 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
         name: "edit".into(),
         content: "LARGE_TOOL_OUTPUT_UNPRUNED ".repeat(400),
         is_error: false,
+        meta: None,
     });
     s.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
@@ -381,6 +382,7 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
         name: "bash".into(),
         content: "all passed".into(),
         is_error: false,
+        meta: None,
     });
     s.append(SessionEvent::user(
         "BOUNDARY_MARKER_NEXT_TASK: continue parser cleanup".repeat(5),
@@ -682,6 +684,7 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
         name: "read".into(),
         content: r_big.content.clone(),
         is_error: false,
+        meta: None,
     });
 
     let v2_content: String = (1..=60).map(|i| format!("v2_line_{i:02}\n")).collect();
@@ -806,6 +809,7 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
                         name: "read".into(),
                         content: "line v3\n".repeat(60),
                         is_error: false,
+                        meta: None,
                     },
                 },
                 SessionEntry {

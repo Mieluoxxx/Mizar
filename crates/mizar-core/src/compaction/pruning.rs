@@ -307,6 +307,7 @@ pub fn plan_tail_pruning(
                 name,
                 content,
                 is_error,
+                ..
             } = &entry.event
             else {
                 continue;
@@ -369,6 +370,7 @@ pub fn plan_tail_pruning(
                 name,
                 content,
                 is_error,
+                ..
             } = &entry.event
             else {
                 continue;
@@ -525,6 +527,7 @@ mod tests {
                 name: name.into(),
                 content: content.into(),
                 is_error,
+                meta: None,
             },
         )
     }
@@ -861,6 +864,7 @@ mod tests {
             name: "read".into(),
             content: "old content".repeat(50),
             is_error: false,
+            meta: None,
         });
         s.append(SessionEvent::Assistant {
             blocks: vec![ContentBlock::ToolCall {
@@ -876,6 +880,7 @@ mod tests {
             name: "read".into(),
             content: "File not found".into(),
             is_error: true,
+            meta: None,
         });
 
         // 新的失败 read 不得覆盖旧的成功 read
@@ -897,6 +902,7 @@ mod tests {
             name: "read".into(),
             content: "fresh content".into(),
             is_error: false,
+            meta: None,
         });
 
         let second = prune_session_tail(&s, None, &TailPruneOptions::default());

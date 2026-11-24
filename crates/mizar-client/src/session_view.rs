@@ -741,11 +741,13 @@ pub fn project_session_view(
                 tool_call_id,
                 content,
                 is_error,
+                meta,
                 ..
             } => items.push(SessionReplayItem::ToolResult {
                 tool_call_id,
                 content,
                 is_error,
+                meta,
             }),
             SessionEvent::BashExecution {
                 command,
@@ -1170,11 +1172,13 @@ mod tests {
             turn: 1,
             reason: "max_steps".into(),
             error: None,
+            summary: None,
         });
         session.append_trace(SessionTraceEvent::TurnEnd {
             turn: 2,
             reason: "truncated".into(),
             error: None,
+            summary: None,
         });
 
         assert!(
@@ -1417,5 +1421,41 @@ mod tests {
         let sel = latest_workspace_selection(&store, &ws).expect("should find parent selection");
         assert_eq!(sel.provider.as_deref(), Some("anthropic"));
         assert_eq!(sel.model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn project_session_view_forwards_tool_result_meta() {
+        use mizar_session::SessionStore;
+        use serde_json::json;
+
+        let store = SessionStore::new();
+        let session = store.create(None);
+        let meta = json!({
+            "kind": "diff",
+            "path": "src/lib.rs",
+            "added": 1,
+            "removed": 1,
+            "diff": "--- a\n+++ b\n-old\n+new",
+        });
+        session.append_tool_result_with_meta("c1", "edit", "ok", false, Some(meta.clone()));
+        session.append_tool_result_with_meta("c2", "read", "body", false, None);
+
+        let view = project_session_view(&session, "ok");
+        assert!(matches!(
+            &view.items[0],
+            SessionReplayItem::ToolResult {
+                tool_call_id,
+                meta: Some(m),
+                ..
+            } if tool_call_id == "c1" && m == &meta
+        ));
+        assert!(matches!(
+            &view.items[1],
+            SessionReplayItem::ToolResult {
+                tool_call_id,
+                meta: None,
+                ..
+            } if tool_call_id == "c2"
+        ));
     }
 }

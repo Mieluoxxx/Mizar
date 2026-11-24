@@ -1,12 +1,9 @@
 //! `UiEvent` 异步后端事件消费与状态归约（含流式增量、工具卡片与上下文压缩进度）。
 
-use serde_json::Value;
-
 use super::{
     ActivityState, AppState, ChatItem, NoticeLevel, ToolExtraMeta, ToolState, UiAgentStatus,
     UiEvent, UiLogLevel, UiStepOutcome, UiTurnEndReason, bash_inline_meta, bash_scope_label,
-    extract_inline_meta, summarize_live_preview, summarize_tool_args, summarize_tool_result,
-    turn_end_program_status,
+    summarize_live_preview, summarize_tool_args, summarize_tool_result, turn_end_program_status,
 };
 use crate::reveal::RevealSlot;
 use crate::terminal::{ProgramStatusState, emit_terminal_progress};
@@ -275,23 +272,13 @@ impl AppState {
                     ToolState::Done
                 };
                 let failed = is_error || blocked;
-                let diff_raw = if !failed && name == "edit" {
-                    details
-                        .as_ref()
-                        .and_then(|d| d.get("diff"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                } else {
-                    None
-                };
-                let inline_meta = extract_inline_meta(&name, &content, details.as_ref(), failed);
-                {
-                    let extra = self.tool_extras.entry(call_id.clone()).or_default();
-                    extra.full_content = content.clone();
-                    extra.diff_raw = diff_raw;
-                    extra.inline_meta = inline_meta;
-                }
-                let preview = summarize_tool_result(&name, &content, details.as_ref(), failed);
+                let preview = self.apply_tool_result_extras(
+                    &call_id,
+                    &name,
+                    &content,
+                    details.as_ref(),
+                    failed,
+                );
                 let idx = if let Some(pos) = self.items.iter().rposition(|item| match item {
                     ChatItem::ToolCall { id, .. } => id == &call_id,
                     _ => false,

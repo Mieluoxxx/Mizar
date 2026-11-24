@@ -186,6 +186,7 @@ async fn turn1_and_periodic_cadence_update_title_using_only_user_messages() {
         name: "read".into(),
         content: "TOOL_SECRET".into(),
         is_error: false,
+        meta: None,
     });
     app.agent_loop
         .emit_event(AgentEvent::TurnInput(AgentTurnInputEvent {

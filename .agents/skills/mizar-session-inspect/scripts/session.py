@@ -264,6 +264,7 @@ def turn_rollup(entries):
                 "errors": 0,
                 "unclosed": 0,
                 "error": None,
+                "summary": None,
             }
             order.append(turn_no)
         turn = turns[turn_no]
@@ -321,6 +322,8 @@ def turn_rollup(entries):
             turn["reason"] = detail.get("reason")
             if detail.get("error"):
                 turn["error"] = detail["error"]
+            if isinstance(detail.get("summary"), dict):
+                turn["summary"] = detail["summary"]
     return turns, order
 
 
@@ -505,8 +508,32 @@ def describe_entry(entry, width):
             detail.get("tool_call_id", "?")[:16],
             "被拦截" if detail.get("blocked") else "放行",
         )
+    if kind == "approval":
+        return "%s (%s) → %s via %s" % (
+            detail.get("tool") or "?",
+            (detail.get("tool_call_id") or "?")[:16],
+            detail.get("decision") or "?",
+            detail.get("resolved_by") or "?",
+        )
     if kind == "turn-end":
         base = "turn %s → %s" % (detail.get("turn"), detail.get("reason"))
+        summary = detail.get("summary")
+        if isinstance(summary, dict):
+            s_bits = []
+            dur = summary.get("durationMs")
+            if dur is not None:
+                s_bits.append(fmt_duration(dur))
+            files = summary.get("filesChanged") or []
+            if files:
+                s_bits.append("%d files" % len(files))
+            cmds = summary.get("commandsRun") or 0
+            if cmds:
+                s_bits.append("%d cmds" % cmds)
+            errs = summary.get("toolErrors") or 0
+            if errs:
+                s_bits.append("%d err" % errs)
+            if s_bits:
+                base = "%s · %s" % (base, " · ".join(s_bits))
         err = detail.get("error")
         if err:
             return "%s | %s" % (base, one_line(err, max(20, width - len(base) - 3)))
@@ -746,6 +773,8 @@ def cmd_stats(conn, args):
         turn = turns[turn_no]
         if turn["start"] and turn["end"]:
             span = fmt_duration(turn["end"] - turn["start"])
+        elif isinstance(turn.get("summary"), dict) and turn["summary"].get("durationMs") is not None:
+            span = fmt_duration(turn["summary"]["durationMs"])
         elif turn["start"]:
             span = "进行中"
         else:
@@ -809,6 +838,44 @@ def cmd_stats(conn, args):
         print("%-14s %5s %10s %5s" % ("tool", "次数", "输出量", "错误"))
         for name, bucket in sorted(histogram.items(), key=lambda kv: -kv[1]["n"]):
             print("%-14s %5d %10s %5d" % (name, bucket["n"], fmt_size(bucket["bytes"]), bucket["err"]))
+
+    summaries = [(t, turns[t]["summary"]) for t in order if isinstance(turns[t].get("summary"), dict)]
+    if summaries:
+        print("")
+        print("turn-summary")
+        for turn_no, summary in summaries:
+            files = summary.get("filesChanged") or []
+            files_desc = ", ".join(files[:4])
+            if len(files) > 4:
+                files_desc += " (+%d)" % (len(files) - 4)
+            print(
+                "  turn %s: %s · files=%d%s · cmds=%d · tool_err=%d"
+                % (
+                    turn_no,
+                    fmt_duration(summary.get("durationMs") or 0),
+                    len(files),
+                    (" [%s]" % files_desc) if files_desc else "",
+                    summary.get("commandsRun") or 0,
+                    summary.get("toolErrors") or 0,
+                )
+            )
+
+    approvals = [e for e in entries if e["kind"] == "approval"]
+    if approvals:
+        print("")
+        print("approval")
+        for entry in approvals:
+            detail = entry["payload"].get("detail") or {}
+            print(
+                "  seq %s %s (%s) → %s via %s"
+                % (
+                    entry["seq"],
+                    detail.get("tool") or "?",
+                    (detail.get("tool_call_id") or "?")[:16],
+                    detail.get("decision") or "?",
+                    detail.get("resolved_by") or "?",
+                )
+            )
 
     anomalies = [e for e in entries if e["kind"] == "anomaly"]
     if anomalies:

@@ -15,13 +15,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mizar_types::hooks::{HookGuard, SyncEventBus};
 use mizar_types::llm::{ContentBlock, Message, ReasoningEffort};
+use serde_json::Value;
 use uuid::Uuid;
 
 pub use model::{
     CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, SESSION_FORMAT_VERSION,
     SessionCreateOptions, SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch,
     SessionListQuery, SessionOrigin, SessionSelection, SessionTraceEvent, TitlePatch, TitleSource,
-    TitleSourcePatch, TraceSeverity, derive_session_title,
+    TitleSourcePatch, TraceSeverity, TurnEndSummary, derive_session_title,
 };
 pub use persistence::{PersistenceError, PersistenceResult, SessionPersistence};
 pub use sqlite::{SqlitePersistenceConfig, SqliteSessionPersistence};
@@ -268,6 +269,7 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
                 content: "[会话恢复：上次运行意外中断，工具结果未知 (TOOL_OUTCOME_UNKNOWN)]"
                     .to_string(),
                 is_error: true,
+                meta: None,
             },
             ts,
         };
@@ -479,13 +481,13 @@ impl Session {
         };
         let repaired = pending.len();
         for (tool_call_id, name) in pending {
-            self.append(SessionEvent::ToolResult {
+            self.append_tool_result_with_meta(
                 tool_call_id,
                 name,
-                content: "[会话恢复：上次运行意外中断或超时，工具结果未知 (TOOL_OUTCOME_UNKNOWN)]"
-                    .to_string(),
-                is_error: true,
-            });
+                "[会话恢复：上次运行意外中断或超时，工具结果未知 (TOOL_OUTCOME_UNKNOWN)]",
+                true,
+                None,
+            );
         }
         repaired
     }
@@ -673,6 +675,40 @@ impl Session {
         self.append(SessionEvent::Trace { detail });
     }
 
+    /// 追加一条带可选展示元数据 `meta` 的 `ToolResult` 事件。
+    pub fn append_tool_result_with_meta(
+        self: &Arc<Self>,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+        meta: Option<Value>,
+    ) {
+        self.append(SessionEvent::ToolResult {
+            tool_call_id: tool_call_id.into(),
+            name: name.into(),
+            content: content.into(),
+            is_error,
+            meta,
+        });
+    }
+
+    /// 追加一条工具审批审计事件（`LogOnly`）。
+    pub fn append_approval(
+        self: &Arc<Self>,
+        tool_call_id: impl Into<String>,
+        tool: impl Into<String>,
+        decision: impl Into<String>,
+        resolved_by: impl Into<String>,
+    ) {
+        self.append_trace(SessionTraceEvent::Approval {
+            tool_call_id: tool_call_id.into(),
+            tool: tool.into(),
+            decision: decision.into(),
+            resolved_by: resolved_by.into(),
+        });
+    }
+
     /// 最新一条 `Selection` 快照（含 `LogOnly`）。
     pub fn latest_selection(&self) -> Option<SessionSelection> {
         let inner = self.inner.lock().unwrap();
@@ -836,6 +872,38 @@ impl Session {
     pub fn with_all_entries<R>(&self, f: impl FnOnce(&[SessionEntry]) -> R) -> R {
         let inner = self.inner.lock().unwrap();
         f(&inner.log)
+    }
+
+    /// 按游标进行双向事件分页（返回按 `seq` 升序排列的切片及是否仍有更多条目 `has_more`）。
+    ///
+    /// - 仅传 `after_seq`（或同时传 `after_seq` 与 `before_seq`）：从旧到新返回紧邻 `after_seq` 之后的最多 `limit` 条；
+    /// - 传 `before_seq`（未传 `after_seq`）或两者皆为 `None`：从新到旧截取最近 `limit` 条后恢复 `seq` 升序返回。
+    pub fn list_events_paged(
+        &self,
+        before_seq: Option<u64>,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> (Vec<SessionEntry>, bool) {
+        let inner = self.inner.lock().unwrap();
+        let mut filtered: Vec<&SessionEntry> = inner
+            .log
+            .iter()
+            .filter(|e| after_seq.is_none_or(|a| e.seq > a) && before_seq.is_none_or(|b| e.seq < b))
+            .collect();
+        if !filtered.windows(2).all(|w| w[0].seq <= w[1].seq) {
+            filtered.sort_by_key(|e| e.seq);
+        }
+        if limit == 0 {
+            return (Vec::new(), !filtered.is_empty());
+        }
+        let has_more = filtered.len() > limit;
+        let slice = if after_seq.is_some() {
+            &filtered[..filtered.len().min(limit)]
+        } else {
+            let start = filtered.len().saturating_sub(limit);
+            &filtered[start..]
+        };
+        (slice.iter().map(|e| (*e).clone()).collect(), has_more)
     }
 
     /// 返回当前会话通过 `ToolResultPrune` 标记投影替换的工具结果映射（`target_seq -> notice`）。

@@ -407,6 +407,7 @@ mod tests {
                     name: "write".into(),
                     content: "ok".into(),
                     is_error: false,
+                    meta: None,
                 },
             ),
             mk(
@@ -428,6 +429,7 @@ mod tests {
                     name: "bash".into(),
                     content: "ok".into(),
                     is_error: false,
+                    meta: None,
                 },
             ),
             mk(
