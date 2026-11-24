@@ -9,6 +9,7 @@ pub mod images;
 pub mod local_bash;
 pub mod logging;
 pub mod mentions;
+pub mod rpc_server;
 pub mod run_dir;
 pub mod session_view;
 pub mod settings;
@@ -43,6 +44,10 @@ pub use mentions::{
     FileMentionsConfig, MENTION_MAX_DIR_ENTRIES, MENTION_MAX_FILE_CHARS, MENTION_MAX_TOTAL_CHARS,
     MentionExpansionResult, expand_text_mentions, install_file_mentions,
     mentions_resolve_any_image, register_mention_hook, register_mention_hook_with,
+};
+pub use rpc_server::{
+    DEFAULT_CLIENT_QUEUE_CAPACITY, DEFAULT_COALESCE_WINDOW, DEFAULT_MAX_DELTA_FRAME_BYTES,
+    RpcServer, RpcServerConfig, RpcServerHandle,
 };
 pub use run_dir::{
     ProcessMeta, ProcessRegistration, SessionLockError, check_session_writable, ensure_run_dir,
