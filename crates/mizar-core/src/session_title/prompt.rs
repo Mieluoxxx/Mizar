@@ -135,6 +135,7 @@ mod tests {
                     name: "bash".into(),
                     content: "TOOL_OUTPUT_SHOULD_NOT_LEAK".into(),
                     is_error: false,
+                    meta: None,
                 },
             },
             SessionEntry {

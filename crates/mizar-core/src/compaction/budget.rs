@@ -337,6 +337,7 @@ mod tests {
             name: "read".into(),
             content: "very long file body ".repeat(1_000),
             is_error: false,
+            meta: None,
         });
         session.append(SessionEvent::Assistant {
             blocks: vec![ContentBlock::Text {

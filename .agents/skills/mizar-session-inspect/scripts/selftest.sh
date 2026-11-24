@@ -73,13 +73,21 @@ rows = [
     (7, "log_only", "tool-result-prune", {"type": "trace", "detail": {"kind": "tool-result-prune", "target_seq": 6, "notice": "[Superseded by a newer read of this file]"}}),
     (8, "log_only", "step-end", {"type": "trace", "detail": {"kind": "step-end", "turn": 1, "step": 1, "outcome": "error", "error": "upstream stream reset"}}),
     (9, "log_only", "turn-end", {"type": "trace", "detail": {"kind": "turn-end", "turn": 1, "reason": "error", "error": "upstream stream reset"}}),
+    (10, "log_only", "turn-start", {"type": "trace", "detail": {"kind": "turn-start", "turn": 2}}),
+    (11, "surface", "user", {"type": "user", "text": "继续修复"}),
+    (12, "log_only", "step-start", {"type": "trace", "detail": {"kind": "step-start", "turn": 2, "step": 1, "system_prompt_chars": 10, "tools_count": 1}}),
+    (13, "log_only", "tool-call", {"type": "trace", "detail": {"kind": "tool-call", "turn": 2, "step": 1, "call_id": "c2", "name": "edit", "arguments": "{}"}}),
+    (14, "log_only", "approval", {"type": "trace", "detail": {"kind": "approval", "tool_call_id": "c2", "tool": "edit", "decision": "allow_once", "resolved_by": "tui"}}),
+    (15, "surface", "tool-result", {"type": "tool-result", "tool_call_id": "c2", "name": "edit", "content": "ok", "is_error": False, "meta": {"kind": "diff", "path": "src/lib.rs", "added": 2, "removed": 1, "diff": "--- a\n+++ b\n-old\n+new\n+more"}}),
+    (16, "log_only", "step-end", {"type": "trace", "detail": {"kind": "step-end", "turn": 2, "step": 1, "outcome": "completed"}}),
+    (17, "log_only", "turn-end", {"type": "trace", "detail": {"kind": "turn-end", "turn": 2, "reason": "completed", "summary": {"durationMs": 420, "filesChanged": ["src/lib.rs"], "commandsRun": 1, "toolErrors": 0, "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}}}),
 ]
 conn.executemany("INSERT INTO session_events VALUES (?,?,?,?,?,?)", [
     (sid, seq, base + seq * 1000, vis, kind, json.dumps(payload, ensure_ascii=False))
     for seq, vis, kind, payload in rows
 ])
 conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-             (sid, 1, "/tmp/smoke", "冒烟会话", None, None, base + 8000, base + 8000, len(rows), 3, None))
+             (sid, 1, "/tmp/smoke", "冒烟会话", None, None, base + 8000, base + 17000, len(rows), 5, None))
 conn.commit()
 PY
 ok "测试库已生成（mode=$(sqlite3 "$DB" 'PRAGMA journal_mode;' 2>/dev/null || echo unknown)）"
@@ -103,8 +111,24 @@ case $stats_out in
     *"turn 0"*|*"0      "*) fail "stats 不应出现虚假 turn 0: $stats_out" ;;
 esac
 case $stats_out in
-    *"upstream stream reset"*) ok "stats 跳过 selection 且展示 detail.error" ;;
+    *"upstream stream reset"*) ok "stats 跳过 selection/approval 且展示 detail.error" ;;
     *) fail "stats 未展示 detail.error: $stats_out" ;;
+esac
+case $stats_out in
+    *"turn-summary"*) ;;
+    *) fail "stats 未展示 turn-summary: $stats_out" ;;
+esac
+case $stats_out in
+    *"files=1 [src/lib.rs]"*) ;;
+    *) fail "stats turn-summary 缺少 filesChanged: $stats_out" ;;
+esac
+case $stats_out in
+    *"cmds=1"*) ;;
+    *) fail "stats turn-summary 缺少 cmds=1: $stats_out" ;;
+esac
+case $stats_out in
+    *"allow_once via tui"*) ok "stats 展示 turn-end.summary 与 approval" ;;
+    *) fail "stats 未展示 approval: $stats_out" ;;
 esac
 show_out=$("$PY" "$SESSION_PY" --db "$DB" --width 120 show 11111111)
 case $show_out in
@@ -112,7 +136,19 @@ case $show_out in
     *) fail "show 未展示 detail.error: $show_out" ;;
 esac
 case $show_out in
-    *"seq #6"*) ok "show 展示 detail.error 与 tool-result-prune" ;;
+    *"allow_once via tui"*) ;;
+    *) fail "show 未展示 approval: $show_out" ;;
+esac
+case $show_out in
+    *"1 files"*) ;;
+    *) fail "show 未展示 turn-end.summary files: $show_out" ;;
+esac
+case $show_out in
+    *"1 cmds"*) ;;
+    *) fail "show 未展示 turn-end.summary cmds: $show_out" ;;
+esac
+case $show_out in
+    *"seq #6"*) ok "show 展示 detail.error、tool-result-prune、approval 与 turn-end.summary" ;;
     *) fail "show 未展示 tool-result-prune: $show_out" ;;
 esac
 

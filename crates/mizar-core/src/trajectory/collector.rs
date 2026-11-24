@@ -129,6 +129,7 @@ fn entry_to_trace_event(
             name,
             content,
             is_error,
+            ..
         } => TraceEventKind::ToolResult {
             tool_call_id: tool_call_id.clone(),
             name: name.clone(),
@@ -239,7 +240,8 @@ fn entry_to_trace_event(
             SessionTraceEvent::CompactionStart { .. }
             | SessionTraceEvent::CompactionEnd { .. }
             | SessionTraceEvent::TurnNotice { .. }
-            | SessionTraceEvent::ToolResultPrune { .. } => {
+            | SessionTraceEvent::ToolResultPrune { .. }
+            | SessionTraceEvent::Approval { .. } => {
                 return None;
             }
         },

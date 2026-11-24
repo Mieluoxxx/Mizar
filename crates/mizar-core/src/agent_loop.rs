@@ -6,9 +6,9 @@
 
 pub mod inbox;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::system_prompt::SystemPrompt;
 use futures::StreamExt;
@@ -20,7 +20,9 @@ use mizar_llm::{
     BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmError, LlmErrorCode,
     LlmRuntime, Message, ReasoningEffort, RequestOrigin, StreamChunk, TokenUsage, ToolCall,
 };
-use mizar_session::{Session, SessionEvent, SessionStore, SessionTraceEvent, TraceSeverity};
+use mizar_session::{
+    Session, SessionEvent, SessionStore, SessionTraceEvent, TraceSeverity, TurnEndSummary,
+};
 use mizar_tools::{
     ToolExecution, ToolExecutionMode, ToolResult, ToolRuntime, ToolUpdate, ToolUpdateCallback,
 };
@@ -443,6 +445,8 @@ fn partition_tool_batches(tools: &ToolRuntime, calls: Vec<ToolCall>) -> Vec<Vec<
 }
 
 const TRACE_ERROR_MAX_BYTES: usize = 2_000;
+const TOOL_RESULT_META_MAX_BYTES: usize = 64 * 1024;
+const META_PATH_MAX_BYTES: usize = 4 * 1024;
 
 fn truncate_trace_error(message: &str) -> String {
     if message.len() <= TRACE_ERROR_MAX_BYTES {
@@ -451,16 +455,344 @@ fn truncate_trace_error(message: &str) -> String {
     message[..message.floor_char_boundary(TRACE_ERROR_MAX_BYTES)].to_string()
 }
 
+fn json_byte_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn truncate_utf8_prefix(raw: &str, max_bytes: usize) -> &str {
+    if raw.len() <= max_bytes {
+        return raw;
+    }
+    &raw[..raw.floor_char_boundary(max_bytes)]
+}
+
+/// 按 UTF-8 安全边界二分搜索满足 JSON 序列化体积上限 `TOOL_RESULT_META_MAX_BYTES` 的最长前缀，
+/// 并在 `snap_newline` 为真且能保留超过一半前缀时尽量对齐到行尾。
+fn fit_meta_with_capped_text<F>(
+    raw: &str,
+    suffix: &str,
+    snap_newline: bool,
+    build: F,
+) -> Option<Value>
+where
+    F: Fn(&str) -> Value,
+{
+    let full = build(raw);
+    if json_byte_len(&full) <= TOOL_RESULT_META_MAX_BYTES {
+        return Some(full);
+    }
+
+    let mut lo = 0usize;
+    let mut hi = raw.len();
+    let mut best = 0usize;
+    let mut found = false;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let cut = raw.floor_char_boundary(mid);
+        let candidate_text = if cut == 0 {
+            suffix.trim_start_matches('\n').to_string()
+        } else {
+            format!("{}{suffix}", &raw[..cut])
+        };
+        if json_byte_len(&build(&candidate_text)) <= TOOL_RESULT_META_MAX_BYTES {
+            best = cut;
+            found = true;
+            if mid == raw.len() {
+                break;
+            }
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    let cut = if snap_newline {
+        raw[..best]
+            .rfind('\n')
+            .filter(|&idx| idx > best / 2)
+            .unwrap_or(best)
+    } else {
+        best
+    };
+    let final_text = if cut == 0 {
+        suffix.trim_start_matches('\n').to_string()
+    } else {
+        format!("{}{suffix}", &raw[..cut])
+    };
+    let capped = build(&final_text);
+    (json_byte_len(&capped) <= TOOL_RESULT_META_MAX_BYTES).then_some(capped)
+}
+
+fn count_diff_added_removed(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line == "+++" || line.starts_with("+++ ") || line == "---" || line.starts_with("--- ") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// 从工具运行时 `details` 与调用参数中提取用于持久化及多端展示的结构化元数据（严格隔离于 `derive_messages()`）。
+pub fn extract_tool_result_meta(
+    name: &str,
+    args: &Value,
+    details: Option<&Value>,
+) -> Option<Value> {
+    let d = details?;
+    if d.is_null() {
+        return None;
+    }
+
+    let lookup_path = || {
+        let raw = d
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("path").and_then(Value::as_str))
+            .or_else(|| args.get("file_path").and_then(Value::as_str))
+            .unwrap_or("");
+        truncate_utf8_prefix(raw, META_PATH_MAX_BYTES)
+    };
+
+    match name {
+        "edit" => {
+            let diff = d.get("diff").and_then(Value::as_str)?;
+            let path = lookup_path();
+            let (added, removed) = count_diff_added_removed(diff);
+            fit_meta_with_capped_text(diff, "\n... (diff truncated)", true, |diff_text| {
+                json!({
+                    "kind": "diff",
+                    "path": path,
+                    "added": added,
+                    "removed": removed,
+                    "diff": diff_text,
+                })
+            })
+        }
+        "write" => {
+            let path = lookup_path();
+            let content_arg = args.get("content").and_then(Value::as_str);
+            let bytes = d
+                .get("bytes")
+                .and_then(Value::as_u64)
+                .or_else(|| content_arg.map(|c| c.len() as u64));
+            let lines = d.get("lines").and_then(Value::as_u64).or_else(|| {
+                content_arg.map(|c| {
+                    if c.is_empty() {
+                        0
+                    } else {
+                        c.lines().count() as u64
+                    }
+                })
+            });
+            Some(json!({
+                "kind": "write",
+                "path": path,
+                "bytes": bytes,
+                "lines": lines,
+            }))
+        }
+        "bash" => {
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .or_else(|| d.get("command").and_then(Value::as_str))
+                .unwrap_or("");
+            let exit_code = d.get("exit_code").and_then(Value::as_i64);
+            let duration_ms = d.get("duration_ms").and_then(Value::as_u64);
+            let timed_out = d.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+            let cancelled = d.get("cancelled").and_then(Value::as_bool).unwrap_or(false);
+            let full_output_path = d
+                .get("full_output_path")
+                .and_then(Value::as_str)
+                .map(|p| truncate_utf8_prefix(p, META_PATH_MAX_BYTES));
+            fit_meta_with_capped_text(command, "... (truncated)", false, |cmd| {
+                json!({
+                    "kind": "bash",
+                    "command": cmd,
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                    "timed_out": timed_out,
+                    "cancelled": cancelled,
+                    "full_output_path": full_output_path,
+                })
+            })
+        }
+        "read" => {
+            let path = lookup_path();
+            Some(json!({
+                "kind": "read",
+                "path": path,
+                "start_line": d.get("start_line").and_then(Value::as_u64),
+                "end_line": d.get("end_line").and_then(Value::as_u64),
+                "total_lines": d.get("total_lines").and_then(Value::as_u64),
+                "truncated": d.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+            }))
+        }
+        "grep" => Some(json!({
+            "kind": "grep",
+            "mode": d.get("mode").and_then(Value::as_str),
+            "matches": d.get("matches").and_then(Value::as_u64),
+            "backend": d.get("backend").and_then(Value::as_str),
+            "limit_reached": d.get("limit_reached").and_then(Value::as_bool).unwrap_or(false),
+        })),
+        "find" => Some(json!({
+            "kind": "find",
+            "count": d.get("count").and_then(Value::as_u64),
+            "backend": d.get("backend").and_then(Value::as_str),
+            "limit_reached": d.get("limit_reached").and_then(Value::as_bool).unwrap_or(false),
+        })),
+        _ => {
+            if json_byte_len(d) <= TOOL_RESULT_META_MAX_BYTES {
+                Some(d.clone())
+            } else {
+                let raw = serde_json::to_string(d).ok()?;
+                fit_meta_with_capped_text(&raw, "... (truncated)", false, |preview| {
+                    json!({
+                        "truncated": true,
+                        "preview": preview,
+                    })
+                })
+            }
+        }
+    }
+}
+
+/// 纯规则轮次摘要累加器：零模型调用统计单轮耗时、改动文件、命令执行数、工具报错数与 Token 用量。
+#[derive(Debug)]
+struct TurnSummaryAccumulator {
+    started_at: Instant,
+    files_changed: Vec<String>,
+    seen_files: HashSet<String>,
+    commands_run: u32,
+    tool_errors: u32,
+    usage: Option<TokenUsage>,
+}
+
+impl TurnSummaryAccumulator {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            files_changed: Vec::new(),
+            seen_files: HashSet::new(),
+            commands_run: 0,
+            tool_errors: 0,
+            usage: None,
+        }
+    }
+
+    fn record_usage(&mut self, step_usage: Option<TokenUsage>) {
+        let Some(step_usage) = step_usage else {
+            return;
+        };
+        let acc = self.usage.get_or_insert_with(TokenUsage::default);
+        acc.input_tokens = acc.input_tokens.saturating_add(step_usage.input_tokens);
+        acc.output_tokens = acc.output_tokens.saturating_add(step_usage.output_tokens);
+        if let Some(cr) = step_usage.cache_read_tokens {
+            acc.cache_read_tokens = Some(acc.cache_read_tokens.unwrap_or(0).saturating_add(cr));
+        }
+        if let Some(cw) = step_usage.cache_write_tokens {
+            acc.cache_write_tokens = Some(acc.cache_write_tokens.unwrap_or(0).saturating_add(cw));
+        }
+        if let Some(r) = step_usage.reasoning_tokens {
+            acc.reasoning_tokens = Some(acc.reasoning_tokens.unwrap_or(0).saturating_add(r));
+        }
+        acc.total_tokens = Some(acc.grand_total());
+    }
+
+    fn record_tool_result(
+        &mut self,
+        name: &str,
+        args: &Value,
+        details: Option<&Value>,
+        is_error: bool,
+        blocked: bool,
+        executed: bool,
+    ) {
+        if is_error {
+            self.tool_errors = self.tool_errors.saturating_add(1);
+        }
+        if !executed || blocked {
+            return;
+        }
+        if name == "bash" {
+            self.commands_run = self.commands_run.saturating_add(1);
+        } else if matches!(name, "edit" | "write")
+            && !is_error
+            && let Some(path) = details
+                .and_then(|d| d.get("path"))
+                .or_else(|| args.get("path"))
+                .or_else(|| args.get("file_path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            && self.seen_files.insert(path.to_string())
+        {
+            self.files_changed.push(path.to_string());
+        }
+    }
+
+    fn finish(&self) -> TurnEndSummary {
+        TurnEndSummary {
+            duration_ms: u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            files_changed: self.files_changed.clone(),
+            commands_run: self.commands_run,
+            tool_errors: self.tool_errors,
+            usage: self.usage,
+        }
+    }
+}
+
 struct TurnGuard {
     events: Arc<AgentEventBus>,
     session: Arc<Session>,
     turn: u64,
     reason: TurnEndReason,
+    summary: TurnSummaryAccumulator,
 }
 
 impl TurnGuard {
+    fn new(events: Arc<AgentEventBus>, session: Arc<Session>, turn: u64) -> Self {
+        Self {
+            events,
+            session,
+            turn,
+            reason: TurnEndReason::Cancelled,
+            summary: TurnSummaryAccumulator::new(),
+        }
+    }
+
     fn set_reason(&mut self, reason: TurnEndReason) {
         self.reason = reason;
+    }
+
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        self.summary.record_usage(usage);
+    }
+
+    fn record_tool_result(
+        &mut self,
+        name: &str,
+        args: &Value,
+        details: Option<&Value>,
+        is_error: bool,
+        blocked: bool,
+        executed: bool,
+    ) {
+        self.summary
+            .record_tool_result(name, args, details, is_error, blocked, executed);
     }
 }
 
@@ -472,10 +804,12 @@ impl Drop for TurnGuard {
             }
             _ => None,
         };
+        let summary = self.summary.finish();
         self.session.append_trace(SessionTraceEvent::TurnEnd {
             turn: self.turn,
             reason: self.reason.as_str().to_string(),
             error,
+            summary: Some(summary),
         });
         self.events.emit(AgentEvent::TurnEnd(AgentTurnEndEvent {
             session: Arc::clone(&self.session),
@@ -506,6 +840,16 @@ impl StepGuard {
         self.outcome = outcome;
         self.usage = usage;
     }
+}
+
+fn finish_step(
+    step_guard: &mut StepGuard,
+    turn_guard: &mut TurnGuard,
+    outcome: StepOutcome,
+    usage: Option<TokenUsage>,
+) {
+    turn_guard.record_usage(usage);
+    step_guard.finish(outcome, usage);
 }
 
 impl Drop for StepGuard {
@@ -880,12 +1224,7 @@ impl AgentLoop {
             session: Arc::clone(&session),
             status: AgentStatus::Busy,
         }));
-        let mut turn_guard = TurnGuard {
-            events: Arc::clone(&self.events),
-            session: Arc::clone(&session),
-            turn,
-            reason: TurnEndReason::Cancelled,
-        };
+        let mut turn_guard = TurnGuard::new(Arc::clone(&self.events), Arc::clone(&session), turn);
 
         let mut pending_entry = Some(entry_input);
         let mut turn_input_emitted = false;
@@ -1031,7 +1370,12 @@ impl AgentLoop {
                 Ok(s) => s,
                 Err(err) => {
                     if err.code == LlmErrorCode::Cancelled {
-                        step_guard.finish(StepOutcome::Cancelled, None);
+                        finish_step(
+                            &mut step_guard,
+                            &mut turn_guard,
+                            StepOutcome::Cancelled,
+                            None,
+                        );
                         turn_guard.set_reason(TurnEndReason::Cancelled);
                         return Err(AgentError::Llm(err));
                     }
@@ -1054,7 +1398,9 @@ impl AgentLoop {
                         )
                         .await
                     {
-                        step_guard.finish(
+                        finish_step(
+                            &mut step_guard,
+                            &mut turn_guard,
                             StepOutcome::Error {
                                 message: "request error recovered; retrying".to_string(),
                             },
@@ -1065,7 +1411,9 @@ impl AgentLoop {
                         continue;
                     }
                     let msg = err.to_string();
-                    step_guard.finish(
+                    finish_step(
+                        &mut step_guard,
+                        &mut turn_guard,
                         StepOutcome::Error {
                             message: msg.clone(),
                         },
@@ -1085,7 +1433,12 @@ impl AgentLoop {
                     Err(err) => {
                         if err.code == LlmErrorCode::Cancelled {
                             flush_interrupted_assistant(&session, &assembler);
-                            step_guard.finish(StepOutcome::Cancelled, assembler.usage());
+                            finish_step(
+                                &mut step_guard,
+                                &mut turn_guard,
+                                StepOutcome::Cancelled,
+                                assembler.usage(),
+                            );
                             turn_guard.set_reason(TurnEndReason::Cancelled);
                             return Err(AgentError::Llm(err));
                         }
@@ -1200,7 +1553,9 @@ impl AgentLoop {
                     if err.code == LlmErrorCode::EmptyResponse {
                         recovery.empty_response_retries += 1;
                     }
-                    step_guard.finish(
+                    finish_step(
+                        &mut step_guard,
+                        &mut turn_guard,
                         StepOutcome::Error {
                             message: "stream error recovered; retrying".to_string(),
                         },
@@ -1211,7 +1566,9 @@ impl AgentLoop {
                     continue;
                 }
                 let msg = err.to_string();
-                step_guard.finish(
+                finish_step(
+                    &mut step_guard,
+                    &mut turn_guard,
                     StepOutcome::Error {
                         message: msg.clone(),
                     },
@@ -1225,7 +1582,12 @@ impl AgentLoop {
             match &finish_reason {
                 FinishReason::Aborted => {
                     flush_interrupted_assistant(&session, &assembler);
-                    step_guard.finish(StepOutcome::Cancelled, assembler.usage());
+                    finish_step(
+                        &mut step_guard,
+                        &mut turn_guard,
+                        StepOutcome::Cancelled,
+                        assembler.usage(),
+                    );
                     turn_guard.set_reason(TurnEndReason::Cancelled);
                     return Err(AgentError::Llm(LlmError::cancelled()));
                 }
@@ -1243,7 +1605,12 @@ impl AgentLoop {
                     };
                     if err.code == LlmErrorCode::Cancelled {
                         flush_interrupted_assistant(&session, &assembler);
-                        step_guard.finish(StepOutcome::Cancelled, assembler.usage());
+                        finish_step(
+                            &mut step_guard,
+                            &mut turn_guard,
+                            StepOutcome::Cancelled,
+                            assembler.usage(),
+                        );
                         turn_guard.set_reason(TurnEndReason::Cancelled);
                         return Err(AgentError::Llm(err));
                     }
@@ -1276,13 +1643,15 @@ impl AgentLoop {
                             message: "request error recovered; retrying".to_string(),
                         };
                         last_step_outcome = Some(outcome.clone());
-                        step_guard.finish(outcome, None);
+                        finish_step(&mut step_guard, &mut turn_guard, outcome, None);
                         drop(step_guard);
                         step = step.saturating_sub(1);
                         continue;
                     }
                     let msg = err.to_string();
-                    step_guard.finish(
+                    finish_step(
+                        &mut step_guard,
+                        &mut turn_guard,
                         StepOutcome::Error {
                             message: msg.clone(),
                         },
@@ -1348,7 +1717,7 @@ impl AgentLoop {
                         message: "implicit cutoff overflow recovered; retrying".to_string(),
                     };
                     last_step_outcome = Some(outcome.clone());
-                    step_guard.finish(outcome, usage);
+                    finish_step(&mut step_guard, &mut turn_guard, outcome, usage);
                     drop(step_guard);
                     step = step.saturating_sub(1);
                     continue;
@@ -1389,14 +1758,16 @@ impl AgentLoop {
                         message: "empty response; retrying".to_string(),
                     };
                     last_step_outcome = Some(outcome.clone());
-                    step_guard.finish(outcome, usage);
+                    finish_step(&mut step_guard, &mut turn_guard, outcome, usage);
                     drop(step_guard);
                     step = step.saturating_sub(1);
                     continue;
                 }
                 let err = LlmError::new(LlmErrorCode::EmptyResponse, detail);
                 let msg = err.to_string();
-                step_guard.finish(
+                finish_step(
+                    &mut step_guard,
+                    &mut turn_guard,
                     StepOutcome::Error {
                         message: msg.clone(),
                     },
@@ -1422,7 +1793,7 @@ impl AgentLoop {
                 StepOutcome::Completed
             };
             last_step_outcome = Some(step_outcome.clone());
-            step_guard.finish(step_outcome, usage);
+            finish_step(&mut step_guard, &mut turn_guard, step_outcome, usage);
             drop(step_guard);
 
             if calls.is_empty() {
@@ -1478,6 +1849,14 @@ impl AgentLoop {
                 if cancel.is_cancelled() {
                     for pending in batches[batch_idx..].iter().flatten() {
                         let content = "已取消执行".to_string();
+                        turn_guard.record_tool_result(
+                            &pending.name,
+                            &Value::Null,
+                            None,
+                            true,
+                            false,
+                            false,
+                        );
                         self.emit_event(AgentEvent::ToolResult(AgentToolResultEvent {
                             session: Arc::clone(&session),
                             tool_call_id: pending.id.clone(),
@@ -1487,18 +1866,21 @@ impl AgentLoop {
                             blocked: false,
                             details: None,
                         }));
-                        session.append(SessionEvent::ToolResult {
-                            tool_call_id: pending.id.clone(),
-                            name: pending.name.clone(),
+                        session.append_tool_result_with_meta(
+                            pending.id.clone(),
+                            pending.name.clone(),
                             content,
-                            is_error: true,
-                        });
+                            true,
+                            None,
+                        );
                     }
                     turn_guard.set_reason(TurnEndReason::Cancelled);
                     return Err(AgentError::Llm(LlmError::cancelled()));
                 }
 
                 let mut results: Vec<Option<ToolResult>> = vec![None; batch.len()];
+                let mut parsed_args: Vec<Value> = vec![Value::Null; batch.len()];
+                let mut executed_flags: Vec<bool> = vec![false; batch.len()];
                 let mut futs = Vec::new();
                 let mut fut_indices = Vec::new();
                 for (idx, call) in batch.iter().enumerate() {
@@ -1521,6 +1903,8 @@ impl AgentLoop {
                             continue;
                         }
                     };
+                    parsed_args[idx] = args.clone();
+                    executed_flags[idx] = true;
                     let update_events = Arc::clone(&self.events);
                     let update_session = Arc::clone(&session);
                     let call_id_for_upd = call.id.clone();
@@ -1558,11 +1942,24 @@ impl AgentLoop {
                     .map(|r| r.expect("tool result populated"))
                     .collect();
 
-                for (call, result) in batch.iter().zip(results) {
+                for (idx, (call, result)) in batch.iter().zip(results).enumerate() {
                     if result.end_turn && !result.is_error && !result.blocked {
                         end_turn_message.get_or_insert_with(|| result.content.clone());
                     }
                     let extra_contexts = result.additional_contexts.clone();
+                    let meta = extract_tool_result_meta(
+                        &call.name,
+                        &parsed_args[idx],
+                        result.details.as_ref(),
+                    );
+                    turn_guard.record_tool_result(
+                        &call.name,
+                        &parsed_args[idx],
+                        result.details.as_ref(),
+                        result.is_error,
+                        result.blocked,
+                        executed_flags[idx],
+                    );
                     self.emit_event(AgentEvent::ToolResult(AgentToolResultEvent {
                         session: Arc::clone(&session),
                         tool_call_id: call.id.clone(),
@@ -1578,12 +1975,13 @@ impl AgentLoop {
                             blocked: true,
                         });
                     }
-                    session.append(SessionEvent::ToolResult {
-                        tool_call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        content: result.content,
-                        is_error: result.is_error,
-                    });
+                    session.append_tool_result_with_meta(
+                        call.id.clone(),
+                        call.name.clone(),
+                        result.content,
+                        result.is_error,
+                        meta,
+                    );
                     for note in extra_contexts {
                         session.append(SessionEvent::context_notice(note.source, note.text));
                     }
@@ -3210,5 +3608,412 @@ mod tests {
             }
             other => panic!("unexpected second event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_tool_result_meta_covers_builtin_tools_caps_and_fallback() {
+        assert!(extract_tool_result_meta("edit", &json!({}), None).is_none());
+        assert!(extract_tool_result_meta("read", &json!({}), Some(&Value::Null)).is_none());
+
+        // edit: 统计 +/- 行并跳过 +++/--- 头，不跳过内容行 ++++/----
+        let edit_diff =
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,4 @@\n-old\n-----\n+new\n++++\n+added";
+        let edit_meta = extract_tool_result_meta(
+            "edit",
+            &json!({ "path": "src/lib.rs" }),
+            Some(&json!({ "diff": edit_diff })),
+        )
+        .unwrap();
+        assert_eq!(edit_meta["kind"], "diff");
+        assert_eq!(edit_meta["path"], "src/lib.rs");
+        assert_eq!(edit_meta["added"], 3);
+        assert_eq!(edit_meta["removed"], 2);
+        assert_eq!(edit_meta["diff"], edit_diff);
+
+        // edit 超大 diff 安全截断在 64 KiB 内，且保留完整统计计数
+        let huge_diff = format!(
+            "--- a/big.txt\n+++ b/big.txt\n{}",
+            "+line_内容\n".repeat(8_000)
+        );
+        let capped_edit = extract_tool_result_meta(
+            "edit",
+            &json!({ "path": "big.txt" }),
+            Some(&json!({ "path": "big.txt", "diff": huge_diff })),
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&capped_edit).unwrap().len() <= TOOL_RESULT_META_MAX_BYTES);
+        assert_eq!(capped_edit["added"], 8_000);
+        assert_eq!(capped_edit["removed"], 0);
+        assert!(
+            capped_edit["diff"]
+                .as_str()
+                .unwrap()
+                .ends_with("... (diff truncated)")
+        );
+
+        // write
+        let write_meta = extract_tool_result_meta(
+            "write",
+            &json!({ "path": "out.txt" }),
+            Some(&json!({ "path": "out.txt", "bytes": 42, "lines": 3 })),
+        )
+        .unwrap();
+        assert_eq!(
+            write_meta,
+            json!({ "kind": "write", "path": "out.txt", "bytes": 42, "lines": 3 })
+        );
+
+        // bash
+        let bash_meta = extract_tool_result_meta(
+            "bash",
+            &json!({ "command": "cargo test" }),
+            Some(&json!({
+                "exit_code": 1,
+                "duration_ms": 120,
+                "timed_out": false,
+                "cancelled": false,
+                "full_output_path": "/tmp/out.log",
+                "ignored_field": "skip",
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            bash_meta,
+            json!({
+                "kind": "bash",
+                "command": "cargo test",
+                "exit_code": 1,
+                "duration_ms": 120,
+                "timed_out": false,
+                "cancelled": false,
+                "full_output_path": "/tmp/out.log",
+            })
+        );
+
+        // read
+        let read_meta = extract_tool_result_meta(
+            "read",
+            &json!({ "path": "src/main.rs" }),
+            Some(&json!({
+                "path": "src/main.rs",
+                "start_line": 1,
+                "end_line": 50,
+                "total_lines": 200,
+                "truncated": true,
+                "next_offset": 51,
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            read_meta,
+            json!({
+                "kind": "read",
+                "path": "src/main.rs",
+                "start_line": 1,
+                "end_line": 50,
+                "total_lines": 200,
+                "truncated": true,
+            })
+        );
+
+        // grep & find
+        let grep_meta = extract_tool_result_meta(
+            "grep",
+            &json!({}),
+            Some(
+                &json!({ "mode": "content", "matches": 7, "backend": "rg", "limit_reached": true }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            grep_meta,
+            json!({ "kind": "grep", "mode": "content", "matches": 7, "backend": "rg", "limit_reached": true })
+        );
+
+        let find_meta = extract_tool_result_meta(
+            "find",
+            &json!({}),
+            Some(&json!({ "count": 12, "backend": "fd", "limit_reached": false })),
+        )
+        .unwrap();
+        assert_eq!(
+            find_meta,
+            json!({ "kind": "find", "count": 12, "backend": "fd", "limit_reached": false })
+        );
+
+        // 其他工具：小体积原样保留，超 64 KiB 安全裁剪
+        let small_other = extract_tool_result_meta(
+            "tool_search",
+            &json!({}),
+            Some(&json!({ "loaded": ["mcp__x"] })),
+        )
+        .unwrap();
+        assert_eq!(small_other, json!({ "loaded": ["mcp__x"] }));
+
+        let big_other = extract_tool_result_meta(
+            "custom_mcp",
+            &json!({}),
+            Some(&json!({ "blob": "x".repeat(90_000) })),
+        )
+        .unwrap();
+        assert!(serde_json::to_vec(&big_other).unwrap().len() <= TOOL_RESULT_META_MAX_BYTES);
+        assert_eq!(big_other["truncated"], true);
+    }
+
+    #[test]
+    fn turn_summary_accumulator_tracks_files_commands_errors_and_usage() {
+        let mut acc = TurnSummaryAccumulator::new();
+        acc.record_usage(Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: Some(120),
+            cache_read_tokens: Some(30),
+            cache_write_tokens: None,
+            reasoning_tokens: Some(5),
+        }));
+        acc.record_usage(Some(TokenUsage {
+            input_tokens: 50,
+            output_tokens: 10,
+            total_tokens: Some(60),
+            cache_read_tokens: Some(15),
+            cache_write_tokens: Some(5),
+            reasoning_tokens: None,
+        }));
+
+        // 成功 edit/write 去重记录；失败 edit/write 与 read 不记入 files_changed
+        acc.record_tool_result(
+            "edit",
+            &json!({ "path": "src/a.rs" }),
+            None,
+            false,
+            false,
+            true,
+        );
+        acc.record_tool_result(
+            "write",
+            &json!({ "path": "src/a.rs" }),
+            None,
+            false,
+            false,
+            true,
+        );
+        acc.record_tool_result(
+            "write",
+            &json!({ "path": "src/b.rs" }),
+            None,
+            false,
+            false,
+            true,
+        );
+        acc.record_tool_result(
+            "edit",
+            &json!({ "path": "src/fail.rs" }),
+            None,
+            true,
+            false,
+            true,
+        );
+        acc.record_tool_result(
+            "read",
+            &json!({ "path": "src/c.rs" }),
+            None,
+            false,
+            false,
+            true,
+        );
+
+        // bash 仅在真实执行且未被拦截时计入 commands_run；出错计入 tool_errors
+        acc.record_tool_result(
+            "bash",
+            &json!({ "command": "ls" }),
+            None,
+            false,
+            false,
+            true,
+        );
+        acc.record_tool_result(
+            "bash",
+            &json!({ "command": "false" }),
+            None,
+            true,
+            false,
+            true,
+        );
+        acc.record_tool_result(
+            "bash",
+            &json!({ "command": "rm -rf" }),
+            None,
+            true,
+            true,
+            true,
+        );
+        acc.record_tool_result("bash", &json!({}), None, true, false, false);
+
+        let summary = acc.finish();
+        assert_eq!(summary.files_changed, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(summary.commands_run, 2);
+        assert_eq!(summary.tool_errors, 4);
+        assert_eq!(
+            summary.usage,
+            Some(TokenUsage {
+                input_tokens: 150,
+                output_tokens: 30,
+                total_tokens: Some(230),
+                cache_read_tokens: Some(45),
+                cache_write_tokens: Some(5),
+                reasoning_tokens: Some(5),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_persists_tool_result_meta_and_turn_end_summary() {
+        struct MetaTurnAdapter(AtomicUsize);
+        impl LlmAdapter for MetaTurnAdapter {
+            fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+                let step = self.0.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::unbounded();
+                tokio::spawn(async move {
+                    if step == 0 {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::BlockEnd {
+                            index: 0,
+                            block: mizar_llm::ContentBlock::ToolCall {
+                                id: "c_write".into(),
+                                name: "write".into(),
+                                arguments: r#"{"path":"src/demo.rs","content":"fn main() {}\n"}"#
+                                    .into(),
+                            },
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::BlockEnd {
+                            index: 1,
+                            block: mizar_llm::ContentBlock::ToolCall {
+                                id: "c_bash".into(),
+                                name: "bash".into(),
+                                arguments: r#"{"command":"echo hi"}"#.into(),
+                            },
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Usage {
+                            usage: TokenUsage {
+                                input_tokens: 40,
+                                output_tokens: 10,
+                                ..Default::default()
+                            },
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("all done")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Usage {
+                            usage: TokenUsage {
+                                input_tokens: 20,
+                                output_tokens: 5,
+                                ..Default::default()
+                            },
+                        }));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let app = setup_app_with_adapter(MetaTurnAdapter(AtomicUsize::new(0)));
+        let _g_write = app
+            .tools
+            .register(mizar_tools::ToolDefinition::async_rich_tool(
+                "write",
+                "write",
+                json!({}),
+                |args, _| async move {
+                    Ok(mizar_tools::ToolOutput::text("ok").with_details(json!({
+                        "path": args["path"],
+                        "bytes": 13,
+                        "lines": 1,
+                    })))
+                },
+            ))
+            .unwrap();
+        let _g_bash = app
+            .tools
+            .register(mizar_tools::ToolDefinition::async_rich_tool(
+                "bash",
+                "bash",
+                json!({}),
+                |_, _| async move {
+                    Ok(mizar_tools::ToolOutput::text("hi").with_details(json!({
+                        "exit_code": 0,
+                        "duration_ms": 12,
+                        "timed_out": false,
+                        "cancelled": false,
+                        "full_output_path": null,
+                    })))
+                },
+            ))
+            .unwrap();
+
+        let sess = app.sessions.create(None);
+        let reply = app
+            .agent_loop
+            .run(Arc::clone(&sess), "run tools", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(reply, "all done");
+
+        let write_meta = sess
+            .log()
+            .into_iter()
+            .find_map(|e| match e.event {
+                SessionEvent::ToolResult {
+                    tool_call_id, meta, ..
+                } if tool_call_id == "c_write" => meta,
+                _ => None,
+            })
+            .expect("write tool result must persist meta");
+        assert_eq!(
+            write_meta,
+            json!({ "kind": "write", "path": "src/demo.rs", "bytes": 13, "lines": 1 })
+        );
+
+        let bash_meta = sess
+            .log()
+            .into_iter()
+            .find_map(|e| match e.event {
+                SessionEvent::ToolResult {
+                    tool_call_id, meta, ..
+                } if tool_call_id == "c_bash" => meta,
+                _ => None,
+            })
+            .expect("bash tool result must persist meta");
+        assert_eq!(bash_meta["kind"], "bash");
+        assert_eq!(bash_meta["command"], "echo hi");
+        assert_eq!(bash_meta["exit_code"], 0);
+
+        let turn_summary = sess
+            .all_entries()
+            .into_iter()
+            .find_map(|e| match e.event {
+                SessionEvent::Trace {
+                    detail: SessionTraceEvent::TurnEnd { summary, .. },
+                } => summary,
+                _ => None,
+            })
+            .expect("TurnEnd must persist summary");
+        assert_eq!(turn_summary.files_changed, vec!["src/demo.rs"]);
+        assert_eq!(turn_summary.commands_run, 1);
+        assert_eq!(turn_summary.tool_errors, 0);
+        assert_eq!(
+            turn_summary.usage,
+            Some(TokenUsage {
+                input_tokens: 60,
+                output_tokens: 15,
+                total_tokens: Some(75),
+                ..Default::default()
+            })
+        );
     }
 }

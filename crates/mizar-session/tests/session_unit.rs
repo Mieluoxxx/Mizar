@@ -175,6 +175,7 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
         turn: 1,
         reason: "completed".into(),
         error: None,
+        summary: None,
     });
 
     s.append_trace(SessionTraceEvent::TurnStart { turn: 2 });
@@ -197,6 +198,7 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
         name: "read".into(),
         content: "file body".into(),
         is_error: false,
+        meta: None,
     });
     s.append(SessionEvent::assistant_text("完成"));
 
@@ -325,6 +327,7 @@ fn repair_helper_noop_when_tool_already_resolved() {
                     name: "read".into(),
                     content: "ok".into(),
                     is_error: false,
+                    meta: None,
                 },
                 ts: 2,
             },
@@ -1168,10 +1171,12 @@ fn trace_end_events_preserve_legacy_json_and_serialize_optional_error() {
             turn: 1,
             reason: "error".into(),
             error: None,
+            summary: None,
         }
     );
     let turn_json = serde_json::to_string(&legacy_turn).unwrap();
     assert!(!turn_json.contains(r#""error":"#));
+    assert!(!turn_json.contains(r#""summary":"#));
 
     let err_step = SessionTraceEvent::StepEnd {
         turn: 1,
@@ -1210,6 +1215,7 @@ fn tool_result_prune_is_log_only_projects_in_derive_messages_and_preserves_fork_
         name: "read".into(),
         content: "ORIGINAL_LARGE_BODY".into(),
         is_error: false,
+        meta: None,
     });
     s.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
@@ -1225,6 +1231,7 @@ fn tool_result_prune_is_log_only_projects_in_derive_messages_and_preserves_fork_
         name: "read".into(),
         content: "NEWER_COMPLETE_BODY".into(),
         is_error: false,
+        meta: None,
     });
 
     // 剪枝标记落盘为 LogOnly，不修改原始 seq=3 的 ToolResult
@@ -1274,4 +1281,178 @@ fn tool_result_prune_is_log_only_projects_in_derive_messages_and_preserves_fork_
         .fork(&s.id, 6, SessionCreateOptions::default())
         .unwrap();
     assert_eq!(post_prune_fork.derive_messages(), live_msgs);
+}
+
+#[test]
+fn m3_legacy_json_approval_visibility_and_derive_messages_parity() {
+    use mizar_session::{EntryVisibility, TurnEndSummary};
+    use serde_json::json;
+
+    // 1. 旧版 ToolResult JSON 缺少 meta 字段时应正常反序列化为 meta: None，且序列化时省略 None
+    let legacy_res: SessionEvent = serde_json::from_str(
+        r#"{"type":"tool-result","tool_call_id":"c1","name":"read","content":"hi","is_error":false}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy_res,
+        SessionEvent::ToolResult {
+            tool_call_id: "c1".into(),
+            name: "read".into(),
+            content: "hi".into(),
+            is_error: false,
+            meta: None,
+        }
+    );
+    let legacy_res_json = serde_json::to_string(&legacy_res).unwrap();
+    assert!(!legacy_res_json.contains(r#""meta""#));
+
+    // 2. Approval 事件具备 LogOnly 可见性与 "approval" kind_name
+    let approval_ev = SessionEvent::Trace {
+        detail: SessionTraceEvent::Approval {
+            tool_call_id: "call_app".into(),
+            tool: "bash".into(),
+            decision: "allow_once".into(),
+            resolved_by: "tui".into(),
+        },
+    };
+    assert_eq!(approval_ev.visibility(), EntryVisibility::LogOnly);
+    assert_eq!(approval_ev.kind_name(), "approval");
+    let approval_json = serde_json::to_string(&approval_ev).unwrap();
+    assert_eq!(
+        serde_json::from_str::<SessionEvent>(&approval_json).unwrap(),
+        approval_ev
+    );
+
+    // 3. 含 ToolResult.meta、Approval 与 TurnEnd.summary 的会话与不含它们的镜像会话 derive_messages() 完全一致
+    let store = SessionStore::new();
+    let rich = store.create_with(SessionCreateOptions {
+        id: Some("rich".into()),
+        ..Default::default()
+    });
+    let plain = store.create_with(SessionCreateOptions {
+        id: Some("plain".into()),
+        ..Default::default()
+    });
+
+    for (sess, with_meta) in [(&rich, true), (&plain, false)] {
+        sess.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
+        sess.append(SessionEvent::user("patch lib.rs"));
+        sess.append(SessionEvent::Assistant {
+            blocks: vec![ContentBlock::ToolCall {
+                id: "c1".into(),
+                name: "edit".into(),
+                arguments: r#"{"path":"src/lib.rs"}"#.into(),
+            }],
+            replay: None,
+            usage: Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Default::default()
+            }),
+        });
+        if with_meta {
+            sess.append_approval("c1", "edit", "allow_once", "tui");
+            sess.append_tool_result_with_meta(
+                "c1",
+                "edit",
+                "ok",
+                false,
+                Some(json!({
+                    "kind": "diff",
+                    "path": "src/lib.rs",
+                    "added": 2,
+                    "removed": 1,
+                    "diff": "--- a\n+++ b\n-old\n+new\n+more"
+                })),
+            );
+        } else {
+            sess.append_tool_result_with_meta("c1", "edit", "ok", false, None);
+        }
+        sess.append(SessionEvent::assistant_text("done"));
+        sess.append_trace(SessionTraceEvent::TurnEnd {
+            turn: 1,
+            reason: "completed".into(),
+            error: None,
+            summary: with_meta.then(|| TurnEndSummary {
+                duration_ms: 250,
+                files_changed: vec!["src/lib.rs".into()],
+                commands_run: 0,
+                tool_errors: 0,
+                usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    total_tokens: Some(120),
+                    ..Default::default()
+                }),
+            }),
+        });
+    }
+
+    assert_eq!(rich.derive_messages(), plain.derive_messages());
+    assert_eq!(rich.log().len(), plain.log().len());
+    assert_eq!(rich.all_entries().len(), plain.all_entries().len() + 1);
+}
+
+#[test]
+fn list_events_paged_supports_bidirectional_cursors_bounds_and_ascending_order() {
+    let store = SessionStore::new();
+    let s = store.create_with(SessionCreateOptions {
+        id: Some("paged".into()),
+        ..Default::default()
+    });
+    for i in 1..=6 {
+        s.append(SessionEvent::user(format!("msg-{i}")));
+    }
+    let seqs = |items: &[mizar_session::SessionEntry]| -> Vec<u64> {
+        items.iter().map(|e| e.seq).collect()
+    };
+
+    // 无游标：取最新 limit 条，保持 seq 升序
+    let (tail, more) = s.list_events_paged(None, None, 3);
+    assert_eq!(seqs(&tail), vec![4, 5, 6]);
+    assert!(more);
+
+    let (all_tail, more) = s.list_events_paged(None, None, 6);
+    assert_eq!(seqs(&all_tail), vec![1, 2, 3, 4, 5, 6]);
+    assert!(!more);
+
+    // 向前翻页（before_seq）：返回严格小于游标的最新 limit 条，仍保持 seq 升序
+    let (prev, more) = s.list_events_paged(Some(4), None, 2);
+    assert_eq!(seqs(&prev), vec![2, 3]);
+    assert!(more);
+
+    let (oldest, more) = s.list_events_paged(Some(3), None, 2);
+    assert_eq!(seqs(&oldest), vec![1, 2]);
+    assert!(!more);
+
+    // 向后增量拉取（after_seq）：返回严格大于游标的最旧 limit 条
+    let (next, more) = s.list_events_paged(None, Some(2), 2);
+    assert_eq!(seqs(&next), vec![3, 4]);
+    assert!(more);
+
+    let (end_next, more) = s.list_events_paged(None, Some(4), 3);
+    assert_eq!(seqs(&end_next), vec![5, 6]);
+    assert!(!more);
+
+    // 双向区间游标（after_seq < seq < before_seq）
+    let (mid, more) = s.list_events_paged(Some(6), Some(1), 2);
+    assert_eq!(seqs(&mid), vec![2, 3]);
+    assert!(more);
+
+    let (mid_exact, more) = s.list_events_paged(Some(5), Some(2), 2);
+    assert_eq!(seqs(&mid_exact), vec![3, 4]);
+    assert!(!more);
+
+    // 边界：limit=0 与空结果集
+    let (zero, more) = s.list_events_paged(None, None, 0);
+    assert!(zero.is_empty());
+    assert!(more);
+
+    let (empty_before, more) = s.list_events_paged(Some(1), None, 5);
+    assert!(empty_before.is_empty());
+    assert!(!more);
+
+    let (empty_after, more) = s.list_events_paged(None, Some(6), 5);
+    assert!(empty_after.is_empty());
+    assert!(!more);
 }

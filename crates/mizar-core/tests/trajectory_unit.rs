@@ -324,6 +324,7 @@ async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic
         name: "read".to_string(),
         content: big_result,
         is_error: false,
+        meta: None,
     });
     sess.append_trace(SessionTraceEvent::StepEnd {
         turn: 1,
@@ -383,6 +384,7 @@ async fn build_trajectory_export_captures_ttft_usage_tools_compaction_and_atomic
         turn: 1,
         reason: "completed".to_string(),
         error: None,
+        summary: None,
     });
 
     let rt = &_traj_export;
@@ -489,6 +491,7 @@ async fn findings_only_matches_inspect_findings_without_snapshot_clone() {
             name: "read".into(),
             content: "err".into(),
             is_error: true,
+            meta: None,
         });
         s.append_trace(SessionTraceEvent::StepEnd {
             turn: 1,
@@ -561,6 +564,7 @@ async fn export_file_streams_jsonl_lines_incrementally_appends_and_coexists_with
         turn: 1,
         reason: "stop".into(),
         error: None,
+        summary: None,
     });
     let expected_s1 = traj1.export_jsonl(&s1.id).unwrap();
     let file_after_s1 = std::fs::read_to_string(&jsonl_path).unwrap();

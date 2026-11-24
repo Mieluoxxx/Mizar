@@ -25,6 +25,18 @@ pub enum TraceSeverity {
     Error,
 }
 
+/// 轮次结束时的纯规则汇总指标（零模型调用生成，仅用于轨迹诊断与多端概览）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEndSummary {
+    pub duration_ms: u64,
+    pub files_changed: Vec<String>,
+    pub commands_run: u32,
+    pub tool_errors: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+}
+
 /// 仅用于轨迹回放与诊断审计的边界事件（不直接发给 LLM）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -37,6 +49,8 @@ pub enum SessionTraceEvent {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<TurnEndSummary>,
     },
     StepStart {
         turn: u64,
@@ -108,6 +122,13 @@ pub enum SessionTraceEvent {
         target_seq: u64,
         notice: String,
     },
+    /// 工具交互审批审计记录（`LogOnly`）。
+    Approval {
+        tool_call_id: String,
+        tool: String,
+        decision: String,
+        resolved_by: String,
+    },
 }
 
 impl SessionTraceEvent {
@@ -125,6 +146,7 @@ impl SessionTraceEvent {
             Self::CompactionEnd { .. } => "compaction-end",
             Self::TurnNotice { .. } => "turn-notice",
             Self::ToolResultPrune { .. } => "tool-result-prune",
+            Self::Approval { .. } => "approval",
         }
     }
 }
@@ -186,6 +208,8 @@ pub enum SessionEvent {
         name: String,
         content: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// 上下文压缩节点：将 `seq < first_kept_seq` 的表面历史折叠为摘要，原始事件仍保留在持久日志中。
     Compaction {

@@ -77,6 +77,7 @@ async fn persists_and_hydrates_sessions_across_restarts() {
         turn: 1,
         reason: "completed".into(),
         error: None,
+        summary: None,
     });
     s1.flush_async().await.unwrap();
     drop(store1);
@@ -495,6 +496,7 @@ async fn supports_out_of_order_create_fork_compaction_and_writer_lifecycle() {
                     name: "read".into(),
                     content: deep_text,
                     is_error: false,
+                    meta: None,
                 },
                 ts: 2500,
             }],
@@ -1194,4 +1196,133 @@ async fn transient_busy_in_prior_batch_surfaces_to_subsequent_flush_without_pois
     ));
 
     persistence.shutdown().unwrap();
+}
+
+#[tokio::test]
+async fn persists_and_reloads_tool_result_meta_approval_and_turn_end_summary() {
+    use mizar_session::{EntryVisibility, TurnEndSummary};
+    use serde_json::json;
+
+    let db_path = temp_db_path("m3_meta_approval_summary");
+    let _guard = TempDbGuard(db_path.clone());
+
+    let expected_meta = json!({
+        "kind": "diff",
+        "path": "src/main.rs",
+        "added": 2,
+        "removed": 1,
+        "diff": "--- a/src/main.rs\n+++ b/src/main.rs\n-old\n+new\n+extra",
+    });
+    let expected_summary = TurnEndSummary {
+        duration_ms: 842,
+        files_changed: vec!["src/main.rs".into()],
+        commands_run: 1,
+        tool_errors: 0,
+        usage: Some(TokenUsage {
+            input_tokens: 120,
+            output_tokens: 35,
+            total_tokens: Some(155),
+            cache_read_tokens: Some(60),
+            cache_write_tokens: None,
+            reasoning_tokens: Some(10),
+        }),
+    };
+
+    let backend1 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store1 = SessionStore::with_persistence(backend1.clone());
+    let s1 = store1.create_with(SessionCreateOptions {
+        id: Some("s-m3".into()),
+        cwd: Some("/work/m3".into()),
+        ..Default::default()
+    });
+    s1.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
+    s1.append(SessionEvent::user("edit main.rs"));
+    s1.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::ToolCall {
+            id: "call_edit".into(),
+            name: "edit".into(),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        }],
+        replay: None,
+        usage: expected_summary.usage,
+    });
+    s1.append_approval("call_edit", "edit", "allow_once", "tui");
+    s1.append_tool_result_with_meta(
+        "call_edit",
+        "edit",
+        "Successfully replaced 1 block(s)",
+        false,
+        Some(expected_meta.clone()),
+    );
+    s1.append(SessionEvent::assistant_text("已修改完成"));
+    s1.append_trace(SessionTraceEvent::TurnEnd {
+        turn: 1,
+        reason: "completed".into(),
+        error: None,
+        summary: Some(expected_summary.clone()),
+    });
+    let expected_msgs = s1.derive_messages();
+    s1.flush_async().await.unwrap();
+    drop(store1);
+    let _ = tokio::task::spawn_blocking(move || backend1.shutdown()).await;
+
+    // 冷重启重载验证 SQLite 反序列化一致性
+    let backend2 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
+    let restored = store2.get("s-m3").expect("must hydrate from sqlite");
+
+    // Approval 为 LogOnly，不进 surface log()
+    assert_eq!(restored.log().len(), 4);
+    assert_eq!(restored.all_entries().len(), 7);
+    assert_eq!(restored.derive_messages(), expected_msgs);
+
+    assert!(restored.all_entries().iter().any(|e| {
+        e.visibility() == EntryVisibility::LogOnly
+            && matches!(
+                &e.event,
+                SessionEvent::Trace {
+                    detail: SessionTraceEvent::Approval {
+                        tool_call_id,
+                        tool,
+                        decision,
+                        resolved_by,
+                    }
+                } if tool_call_id == "call_edit"
+                    && tool == "edit"
+                    && decision == "allow_once"
+                    && resolved_by == "tui"
+            )
+    }));
+
+    assert!(restored.log().iter().any(|e| matches!(
+        &e.event,
+        SessionEvent::ToolResult {
+            tool_call_id,
+            meta: Some(m),
+            ..
+        } if tool_call_id == "call_edit" && m == &expected_meta
+    )));
+
+    assert!(restored.all_entries().iter().any(|e| matches!(
+        &e.event,
+        SessionEvent::Trace {
+            detail: SessionTraceEvent::TurnEnd {
+                turn: 1,
+                summary: Some(sum),
+                ..
+            }
+        } if sum == &expected_summary
+    )));
+
+    // 验证冷重载后的双向分页结果
+    let (page, has_more) = restored.list_events_paged(Some(6), None, 2);
+    assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![4, 5]);
+    assert!(has_more);
+
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
 }

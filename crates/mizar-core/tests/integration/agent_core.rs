@@ -248,6 +248,7 @@ async fn agent_switches_across_completions_responses_and_messages_in_one_session
         name: "get_time".into(),
         content: "2026/11/18 02:45:00".into(),
         is_error: false,
+        meta: None,
     });
 
     // 2. 同一会话切到 Anthropic Messages 继续回答

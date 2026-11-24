@@ -37,6 +37,7 @@ async fn sqlite_resume_and_fork_match_live_prefix_with_tool_result_prune() {
         name: "read".into(),
         content: "STALE_READ_BODY".into(),
         is_error: false,
+        meta: None,
     });
     live.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
@@ -52,6 +53,7 @@ async fn sqlite_resume_and_fork_match_live_prefix_with_tool_result_prune() {
         name: "grep".into(),
         content: "No matches found".into(),
         is_error: false,
+        meta: None,
     });
     live.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
@@ -67,6 +69,7 @@ async fn sqlite_resume_and_fork_match_live_prefix_with_tool_result_prune() {
         name: "read".into(),
         content: "FRESH_READ_BODY".into(),
         is_error: false,
+        meta: None,
     });
     live.append_trace(SessionTraceEvent::ToolResultPrune {
         target_seq: 3,
