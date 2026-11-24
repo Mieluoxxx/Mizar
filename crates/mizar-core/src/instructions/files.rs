@@ -1,46 +1,16 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
-use crate::instructions::config::{InstructionScopeKind, InstructionsConfig};
 use crate::instructions::digest::trimmed_instruction_digest;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ScopeRoot {
-    MizarGlobal,
-    AgentsGlobal,
-    Project(PathBuf),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ScopeKey {
-    pub root: ScopeRoot,
-    pub filename: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FsFingerprint {
-    pub len: u64,
-    pub modified_ns: Option<u128>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChainKind {
-    UserGlobal,
-    Project,
-}
+use crate::instructions::{InstructionScopeKind, InstructionsConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredFile {
-    pub scope: ScopeKey,
     pub canonical_path: PathBuf,
     pub display_path: String,
-    pub scope_dir_display: String,
-    pub chain: ChainKind,
     pub scope_kind: InstructionScopeKind,
     pub content: String,
     pub digest: String,
-    pub fingerprint: FsFingerprint,
     pub bytes: usize,
 }
 
@@ -208,39 +178,17 @@ pub fn relative_display(from_dir: &Path, target: &Path) -> String {
     }
 }
 
-fn format_global_display(dir: &Path, default_suffix: &str, filename: &str) -> (String, String) {
+fn format_global_display(dir: &Path, default_suffix: &str, filename: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let canon_home = canonical_or_abs(&home);
         let canon_dir = canonical_or_abs(dir);
         let default_dir = canon_home.join(default_suffix);
         if canon_dir == default_dir {
-            let dir_disp = format!("~/{default_suffix}");
-            return (format!("{dir_disp}/{filename}"), dir_disp);
+            return format!("~/{default_suffix}/{filename}");
         }
     }
     let dir_disp = dir.to_string_lossy().replace('\\', "/");
-    (format!("{dir_disp}/{filename}"), dir_disp)
-}
-
-pub fn read_fingerprint(path: &Path) -> std::io::Result<Option<FsFingerprint>> {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return Ok(None);
-            }
-            let modified_ns = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos());
-            Ok(Some(FsFingerprint {
-                len: meta.len(),
-                modified_ns,
-            }))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
+    format!("{dir_disp}/{filename}")
 }
 
 enum ReadCandidate {
@@ -250,7 +198,6 @@ enum ReadCandidate {
         canonical_path: PathBuf,
         content: String,
         digest: String,
-        fingerprint: FsFingerprint,
         bytes: usize,
     },
 }
@@ -307,11 +254,6 @@ fn read_candidate_file(path: &Path, max_source_bytes: usize) -> ReadCandidate {
     if clean.trim().is_empty() {
         return ReadCandidate::MissingOrEmpty;
     }
-    let modified_ns = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos());
     let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical(path));
     let digest = trimmed_instruction_digest(clean);
     let bytes = clean.len();
@@ -319,15 +261,12 @@ fn read_candidate_file(path: &Path, max_source_bytes: usize) -> ReadCandidate {
         canonical_path,
         content: clean.to_string(),
         digest,
-        fingerprint: FsFingerprint { len, modified_ns },
         bytes,
     }
 }
 
 struct GroupProbe<'a> {
     dir: &'a Path,
-    scope_root: ScopeRoot,
-    chain: ChainKind,
     scope_kind: InstructionScopeKind,
     filenames: &'a [String],
     default_global_suffix: Option<&'a str>,
@@ -338,10 +277,10 @@ fn probe_group(
     workspace: &Path,
     max_source_bytes: usize,
     seen_canonical: &mut HashSet<PathBuf>,
+    digest_dedup: &mut HashSet<String>,
     out: &mut Vec<DiscoveredFile>,
     warnings: &mut Vec<String>,
 ) {
-    let mut group_digests: HashSet<String> = HashSet::new();
     for filename in probe.filenames {
         let path = probe.dir.join(filename);
         match read_candidate_file(&path, max_source_bytes) {
@@ -351,40 +290,30 @@ fn probe_group(
                 canonical_path,
                 content,
                 digest,
-                fingerprint,
                 bytes,
             } => {
                 if !seen_canonical.insert(canonical_path.clone()) {
                     continue;
                 }
-                if !group_digests.insert(digest.clone()) {
+                if !digest_dedup.insert(digest.clone()) {
                     continue;
                 }
-                let (display_path, scope_dir_display) =
-                    if let Some(suffix) = probe.default_global_suffix {
-                        format_global_display(probe.dir, suffix, filename)
+                let display_path = if let Some(suffix) = probe.default_global_suffix {
+                    format_global_display(probe.dir, suffix, filename)
+                } else {
+                    let rel_dir = relative_display(workspace, probe.dir);
+                    if rel_dir == "." {
+                        filename.clone()
                     } else {
-                        let rel_dir = relative_display(workspace, probe.dir);
-                        let file_disp = if rel_dir == "." {
-                            filename.clone()
-                        } else {
-                            format!("{rel_dir}/{filename}")
-                        };
-                        (file_disp, rel_dir)
-                    };
+                        format!("{rel_dir}/{filename}")
+                    }
+                };
                 out.push(DiscoveredFile {
-                    scope: ScopeKey {
-                        root: probe.scope_root.clone(),
-                        filename: filename.clone(),
-                    },
                     canonical_path,
                     display_path,
-                    scope_dir_display,
-                    chain: probe.chain,
                     scope_kind: probe.scope_kind.clone(),
                     content,
                     digest,
-                    fingerprint,
                     bytes,
                 });
             }
@@ -392,10 +321,7 @@ fn probe_group(
     }
 }
 
-pub fn discover_instructions(
-    config: &InstructionsConfig,
-    extra_subdirs: &[PathBuf],
-) -> DiscoveryResult {
+pub fn discover_instructions(config: &InstructionsConfig) -> DiscoveryResult {
     let effective_ws = canonical_or_abs(&config.workspace);
     let project_root = find_project_root(&effective_ws, &config.project_root_markers);
     let base_candidates = sanitize_candidates(&config.candidates);
@@ -414,12 +340,9 @@ pub fn discover_instructions(
             base_candidates.clone()
         };
         if let Some(mizar_home) = resolve_mizar_home(config.mizar_home.as_deref()) {
-            let mut tmp = Vec::new();
             probe_group(
                 GroupProbe {
                     dir: &mizar_home,
-                    scope_root: ScopeRoot::MizarGlobal,
-                    chain: ChainKind::UserGlobal,
                     scope_kind: InstructionScopeKind::UserGlobal,
                     filenames: &mizar_candidates,
                     default_global_suffix: Some(".mizar"),
@@ -427,23 +350,16 @@ pub fn discover_instructions(
                 &effective_ws,
                 config.max_source_bytes,
                 &mut seen_canonical,
-                &mut tmp,
+                &mut global_digests,
+                &mut global_files,
                 &mut warnings,
             );
-            for file in tmp {
-                if global_digests.insert(file.digest.clone()) {
-                    global_files.push(file);
-                }
-            }
         }
         if let Some(agents_home) = resolve_agents_home(config.agents_home.as_deref()) {
             let agents_candidates = vec!["AGENTS.md".to_string()];
-            let mut tmp = Vec::new();
             probe_group(
                 GroupProbe {
                     dir: &agents_home,
-                    scope_root: ScopeRoot::AgentsGlobal,
-                    chain: ChainKind::UserGlobal,
                     scope_kind: InstructionScopeKind::UserGlobal,
                     filenames: &agents_candidates,
                     default_global_suffix: Some(".agents"),
@@ -451,49 +367,24 @@ pub fn discover_instructions(
                 &effective_ws,
                 config.max_source_bytes,
                 &mut seen_canonical,
-                &mut tmp,
+                &mut global_digests,
+                &mut global_files,
                 &mut warnings,
             );
-            for file in tmp {
-                if global_digests.insert(file.digest.clone()) {
-                    global_files.push(file);
-                }
-            }
         }
     }
 
-    let mut project_dirs: Vec<(PathBuf, InstructionScopeKind)> =
-        ancestor_chain(&project_root, &effective_ws)
-            .into_iter()
-            .map(|dir| {
-                let kind = if dir == effective_ws {
-                    InstructionScopeKind::Workspace
-                } else {
-                    InstructionScopeKind::ProjectAncestor
-                };
-                (dir, kind)
-            })
-            .collect();
-
-    let mut seen_dirs: HashSet<PathBuf> = project_dirs.iter().map(|(d, _)| d.clone()).collect();
-    for sub in extra_subdirs {
-        let canon_sub = canonical_or_abs(sub);
-        if canon_sub.starts_with(&effective_ws)
-            && canon_sub != effective_ws
-            && seen_dirs.insert(canon_sub.clone())
-        {
-            project_dirs.push((canon_sub, InstructionScopeKind::Subdir));
-        }
-    }
-
-    for (dir, kind) in project_dirs {
-        let scope_root = ScopeRoot::Project(dir.clone());
+    for dir in ancestor_chain(&project_root, &effective_ws) {
+        let kind = if dir == effective_ws {
+            InstructionScopeKind::Workspace
+        } else {
+            InstructionScopeKind::ProjectAncestor
+        };
         if !base_candidates.is_empty() {
+            let mut group_digests = HashSet::new();
             probe_group(
                 GroupProbe {
                     dir: &dir,
-                    scope_root: scope_root.clone(),
-                    chain: ChainKind::Project,
                     scope_kind: kind.clone(),
                     filenames: &base_candidates,
                     default_global_suffix: None,
@@ -501,16 +392,16 @@ pub fn discover_instructions(
                 &effective_ws,
                 config.max_source_bytes,
                 &mut seen_canonical,
+                &mut group_digests,
                 &mut project_files,
                 &mut warnings,
             );
         }
         if !local_candidates.is_empty() {
+            let mut group_digests = HashSet::new();
             probe_group(
                 GroupProbe {
                     dir: &dir,
-                    scope_root,
-                    chain: ChainKind::Project,
                     scope_kind: kind,
                     filenames: &local_candidates,
                     default_global_suffix: None,
@@ -518,6 +409,7 @@ pub fn discover_instructions(
                 &effective_ws,
                 config.max_source_bytes,
                 &mut seen_canonical,
+                &mut group_digests,
                 &mut project_files,
                 &mut warnings,
             );
@@ -532,55 +424,10 @@ pub fn discover_instructions(
     }
 }
 
-/// 抽取一次文件工具访问所穿越的 `workspace` 内部子目录（按浅到深顺序）。
-pub fn descendant_dirs_between(workspace: &Path, raw_touched_path: &str) -> Vec<PathBuf> {
-    let trimmed = raw_touched_path.trim();
-    let without_at = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    if without_at.is_empty() {
-        return Vec::new();
-    }
-    let expanded = if without_at == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
-    } else if let Some(rest) = without_at.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(without_at))
-    } else {
-        PathBuf::from(without_at)
-    };
-
-    let effective_ws = canonical_or_abs(workspace);
-    let candidate = if expanded.is_absolute() {
-        expanded
-    } else {
-        effective_ws.join(expanded)
-    };
-    let target = canonical_or_abs(&candidate);
-    let Some(parent) = target.parent() else {
-        return Vec::new();
-    };
-    let Ok(rel) = parent.strip_prefix(&effective_ws) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    let mut cur = effective_ws;
-    for comp in rel.components() {
-        if let Component::Normal(seg) = comp {
-            let s = seg.to_string_lossy();
-            if s == ".git" || s == ".mizar" {
-                return Vec::new();
-            }
-            cur = cur.join(seg);
-            out.push(cur.clone());
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instructions::DEFAULT_MAX_SOURCE_BYTES;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -612,7 +459,7 @@ mod tests {
 
         let mut cfg = InstructionsConfig::new(&sub);
         cfg.include_default_global = false;
-        let res = discover_instructions(&cfg, &[]);
+        let res = discover_instructions(&cfg);
 
         let paths: Vec<&str> = res
             .project_files
@@ -632,23 +479,33 @@ mod tests {
     }
 
     #[test]
-    fn collects_descendant_dirs_only_inside_workspace() {
-        let root = temp_dir("descendants");
+    fn global_dirs_dedup_identical_content_and_warn_on_oversize() {
+        let root = temp_dir("global_oversize");
         let _ = std::fs::remove_dir_all(&root);
-        let ws = root.join("repo");
-        std::fs::create_dir_all(ws.join("src/nested")).unwrap();
-        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let mizar_home = root.join("mizar");
+        let agents_home = root.join("agents");
+        let ws = root.join("ws");
+        std::fs::create_dir_all(&mizar_home).unwrap();
+        std::fs::create_dir_all(&agents_home).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
 
-        let dirs = descendant_dirs_between(&ws, "src/nested/mod.rs");
-        let canon_ws = canonical_or_abs(&ws);
-        assert_eq!(
-            dirs,
-            vec![canon_ws.join("src"), canon_ws.join("src/nested")]
-        );
+        std::fs::write(mizar_home.join("AGENTS.md"), "same global rule").unwrap();
+        std::fs::write(agents_home.join("AGENTS.md"), "  same global rule\n").unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "too big rule").unwrap();
 
-        assert!(descendant_dirs_between(&ws, "lib.rs").is_empty());
-        assert!(descendant_dirs_between(&ws, "../outside/secret.txt").is_empty());
-        assert!(descendant_dirs_between(&ws, ".git/config").is_empty());
+        let mut cfg = InstructionsConfig::new(&ws);
+        cfg.mizar_home = Some(mizar_home);
+        cfg.agents_home = Some(agents_home);
+        cfg.max_source_bytes = 5;
+        let res = discover_instructions(&cfg);
+        assert!(res.global_files.is_empty());
+        assert!(res.project_files.is_empty());
+        assert_eq!(res.warnings.len(), 3);
+
+        cfg.max_source_bytes = DEFAULT_MAX_SOURCE_BYTES;
+        let res2 = discover_instructions(&cfg);
+        assert_eq!(res2.global_files.len(), 1);
+        assert_eq!(res2.project_files.len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

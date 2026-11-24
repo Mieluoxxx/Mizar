@@ -1077,7 +1077,7 @@ pub(super) async fn handle_action(
         }
         AppAction::ShowInstructions => {
             if let Some(inst) = runtime.instructions.as_ref() {
-                let report = inst.probe_report(Some(&app.session_id));
+                let report = inst.report();
                 if !report.enabled {
                     app.push_notice(
                         NoticeLevel::Info,

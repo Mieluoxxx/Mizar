@@ -305,9 +305,6 @@ impl LoadedMizarConfig {
                 if let Some(v) = inst.max_source_bytes {
                     instructions.max_source_bytes = v;
                 }
-                if let Some(v) = inst.follow_subdirs {
-                    instructions.follow_subdirs = v;
-                }
             }
             if let Some(sk) = &self.settings.skills {
                 if let Some(v) = sk.enabled {
@@ -407,7 +404,7 @@ mod tests {
                 "reasoningEffort": "medium",
                 "instructions": {
                     "maxBytes": 32768,
-                    "followSubdirs": false
+                    "maxSourceBytes": 131072
                 }
             }"#,
         )
@@ -475,7 +472,7 @@ mod tests {
                 assert_eq!(mcp.global_config_dir.as_deref(), Some(global.as_path()));
                 assert_eq!(instructions.mizar_home.as_deref(), Some(global.as_path()));
                 assert_eq!(instructions.max_bytes, 32768);
-                assert!(!instructions.follow_subdirs);
+                assert_eq!(instructions.max_source_bytes, 131_072);
             }
             _ => panic!("expected coding mode"),
         }

@@ -219,6 +219,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     assert!(!prompt.build().contains("Available tools:"));
     assert!(!prompt.build().contains("Subagent delegation"));
     assert!(!prompt.build().contains("当前工作目录："));
+    assert!(!prompt.build().contains("HOT_RELOAD_RULE"));
 
     // 2. 启用与禁用基础编程工具 (`tools-coding`)，含 tools_guide 系统提示词切换验证
     assert!(ctrl.set_enabled("tools-coding", true).await.unwrap());
@@ -245,6 +246,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     assert!(runtime.mcp().await.is_some());
     assert!(runtime.skills.as_ref().unwrap().is_enabled());
     assert!(runtime.instructions.as_ref().unwrap().is_enabled());
+    assert!(prompt.build().contains("HOT_RELOAD_RULE"));
 
     let enabled_tool_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
@@ -254,7 +256,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     // 0 个外部 MCP 工具时，tool_search 仍保持按需自动激活语义
     assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
 
-    // 触发一次 pre-step，验证 instructions 与 skills 监听器均正常向会话注入上下文
+    // 触发一次 pre-step，验证 skills 监听器正常向会话注入上下文
     let session = sessions.create(None);
     session.append(SessionEvent::user("hello"));
     if let AgentPreStepDecision::Enter { inputs } = runtime
@@ -276,10 +278,6 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     }
     assert!(session.visible_log().iter().any(|e| matches!(
         &e.event,
-        SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE")
-    )));
-    assert!(session.visible_log().iter().any(|e| matches!(
-        &e.event,
         SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
     )));
 
@@ -289,6 +287,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     }
     assert!(!runtime.skills.as_ref().unwrap().is_enabled());
     assert!(!runtime.instructions.as_ref().unwrap().is_enabled());
+    assert!(!prompt.build().contains("HOT_RELOAD_RULE"));
     let after_unload_names: HashSet<String> =
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
@@ -296,7 +295,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
         HashSet::from(["probe_echo".to_string()])
     );
 
-    // 确认 instructions 与 skills 已停止注入：新建会话不再收到对应 ContextNotice
+    // 确认 skills 已停止注入：新建会话不再收到对应 ContextNotice
     let session_after_unload = sessions.create(None);
     session_after_unload.append(SessionEvent::user("after disable"));
     if let AgentPreStepDecision::Enter { inputs } = runtime
@@ -318,7 +317,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     }
     assert!(!session_after_unload.visible_log().iter().any(|e| matches!(
         &e.event,
-        SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE") || text.contains("demo-skill")
+        SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
     )));
 
     // 再次启用 skills 与 instructions，验证可重复恢复
@@ -326,6 +325,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     assert!(ctrl.set_enabled("instructions", true).await.unwrap());
     assert!(runtime.skills.as_ref().unwrap().is_enabled());
     assert!(runtime.instructions.as_ref().unwrap().is_enabled());
+    assert!(prompt.build().contains("HOT_RELOAD_RULE"));
     if let AgentPreStepDecision::Enter { inputs } = runtime
         .agent_loop
         .run_pre_step(AgentPreStepInput {
@@ -343,10 +343,6 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
             session_after_unload.append(item.into_session_event());
         }
     }
-    assert!(session_after_unload.visible_log().iter().any(|e| matches!(
-        &e.event,
-        SessionEvent::ContextNotice { text, .. } if text.contains("HOT_RELOAD_RULE")
-    )));
     assert!(session_after_unload.visible_log().iter().any(|e| matches!(
         &e.event,
         SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
