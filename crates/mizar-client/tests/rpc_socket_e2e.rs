@@ -1,17 +1,19 @@
-//! `mizar-client` Unix Domain Socket（NDJSON / JSON-RPC 2.0）端到端集成测试。
+//! `mizar-client` Unix Domain Socket 与回环 TCP（NDJSON / JSON-RPC 2.0）端到端集成测试。
 //!
-//! 覆盖 7 项核心契约：
-//! 1. `0700` `run_dir` 与 `0600` `p-<pid>.sock` 权限、`p-<pid>.json` 原子元数据及停机清理；
+//! 覆盖 8 项核心契约：
+//! 1. `0700` `run_dir`、`0600` `p-<pid>.sock` 与 `0600` `p-<pid>.json` 权限、原子元数据（含 `tcp_addr`/`rpc_token`）及停机清理；
 //! 2. 流式半途 `session.subscribe` 水合快照（`active_turn` / `subagents` / `queued_inputs` / `after_seq`）；
 //! 3. `stream.delta` 40ms/16 KiB UTF-8 聚合拆分及在 `event.committed` 前强制刷出；
 //! 4. 双客户端并发 `interaction.resolve` 原子抢占 + `interaction.resolved` 广播 + SQLite `Approval` 落盘；
 //! 5. `switch_session` 广播 `session.switched` 与 `p-<pid>.json` 热更新且保持 Socket 不断连；
 //! 6. 慢客户端队列满（>256 帧）主动断连保护，不影响同实例健康客户端连续收帧；
-//! 7. 真实 NDJSON Socket 覆盖 `session.config`、`session.list`、`session.events`、`session.fork`、`session.tree` 与 `capabilities.list`。
+//! 7. 真实 NDJSON Socket 覆盖 `session.config`、`session.list`、`session.events`、`session.fork`、`session.tree` 与 `capabilities.list`；
+//! 8. 回环 TCP 旁路首帧 `auth.hello` 常量时间鉴权、未认证/错误 token 返回 `-32003` 即断连，以及认证后全链路流式与审批闭环。
 
 #![cfg(unix)]
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
@@ -37,18 +39,19 @@ use mizar_tools::{ToolAnnotations, ToolDefinition, ToolOutput};
 use mizar_types::ApprovalMode;
 use mizar_types::BoxError;
 use mizar_types::rpc::{
-    CapabilitiesListResult, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, ERR_PARSE_ERROR,
-    ERR_SESSION_NOT_FOUND, InteractionResolveResult, JsonRpcId, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, QueuePopAllResult, QueueRemoveResult, ResolvedBy,
-    RpcApprovalDecision, RpcApprovalMode, RpcNotification, RpcSubagentStatus, SessionConfigResult,
-    SessionEventsResult, SessionForkResult, SessionListResult, SessionRuntimeState,
-    SessionSubscribeSnapshot, SessionTreeResult, StreamDeltaKind, SubmitMode, TurnCancelResult,
-    TurnSubmitResult,
+    AuthHelloResult, CapabilitiesListResult, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
+    ERR_PARSE_ERROR, ERR_SESSION_NOT_FOUND, ERR_UNAUTHORIZED, InteractionResolveResult, JsonRpcId,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, METHOD_AUTH_HELLO, QueuePopAllResult,
+    QueueRemoveResult, ResolvedBy, RpcApprovalDecision, RpcApprovalMode, RpcNotification,
+    RpcSubagentStatus, SessionConfigResult, SessionEventsResult, SessionForkResult,
+    SessionListResult, SessionRuntimeState, SessionSubscribeSnapshot, SessionTreeResult,
+    StreamDeltaKind, SubmitMode, TurnCancelResult, TurnSubmitResult,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::watch;
 
 /// 电平触发同步信号：保留常驻接收端，即使先触发后等待也不会丢失唤醒。
@@ -223,19 +226,42 @@ impl LlmAdapter for ScriptedAdapter {
     }
 }
 
-struct RpcTestClient {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+struct RpcTestClient<S> {
+    reader: BufReader<ReadHalf<S>>,
+    writer: WriteHalf<S>,
     pending_notifs: VecDeque<(String, RpcNotification)>,
     next_id: i64,
 }
 
-impl RpcTestClient {
+impl RpcTestClient<UnixStream> {
     async fn connect(socket_path: &std::path::Path) -> Self {
         let stream = UnixStream::connect(socket_path)
             .await
             .expect("connect unix rpc socket");
-        let (read_half, write_half) = stream.into_split();
+        Self::from_stream(stream)
+    }
+}
+
+impl RpcTestClient<TcpStream> {
+    async fn connect_tcp(addr: SocketAddr) -> Self {
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("connect loopback tcp rpc");
+        Self::from_stream(stream)
+    }
+
+    async fn auth_hello(&mut self, token: &str) -> AuthHelloResult {
+        self.call_ok(METHOD_AUTH_HELLO, Some(json!({ "token": token })))
+            .await
+    }
+}
+
+impl<S> RpcTestClient<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn from_stream(stream: S) -> Self {
+        let (read_half, write_half) = tokio::io::split(stream);
         Self {
             reader: BufReader::new(read_half),
             writer: write_half,
@@ -396,19 +422,34 @@ async fn e2e_1_run_dir_socket_permissions_meta_errors_and_cleanup() {
     assert_eq!(sock_path, stale_sock);
     assert_eq!(meta_path, meta_path_for_pid(&run_dir, std::process::id()));
 
-    // 验证 0700 run_dir 与 0600 p-<pid>.sock 权限
+    // 验证 0700 run_dir、0600 p-<pid>.sock 与 0600 p-<pid>.json 权限
     let run_mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
     let sock_mode = std::fs::metadata(&sock_path).unwrap().permissions().mode() & 0o777;
+    let meta_mode = std::fs::metadata(&meta_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(run_mode, 0o700);
     assert_eq!(sock_mode, 0o600);
+    assert_eq!(meta_mode, 0o600);
 
-    // 验证原子落盘 p-<pid>.json 元数据字段完整准确
+    // 验证原子落盘 p-<pid>.json 元数据字段完整准确（含回环 TCP 地址与 64 位 hex rpc_token）
     let disk_meta: ProcessMeta =
         serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
     assert_eq!(disk_meta.pid, std::process::id());
     assert_eq!(disk_meta.session_id, sess.id);
     assert_eq!(disk_meta.cwd, ws.path().display().to_string());
     assert_eq!(disk_meta.socket, sock_path.to_string_lossy());
+    let tcp_addr = server.tcp_addr().expect("loopback tcp addr");
+    assert!(tcp_addr.ip().is_loopback());
+    let rpc_token = server.rpc_token().expect("rpc token");
+    assert_eq!(rpc_token.len(), 64);
+    assert!(rpc_token.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(
+        disk_meta.tcp_addr.as_deref(),
+        Some(tcp_addr.to_string().as_str())
+    );
+    assert_eq!(disk_meta.rpc_token.as_deref(), Some(rpc_token));
+    let redacted = disk_meta.without_secret();
+    assert_eq!(redacted.tcp_addr, disk_meta.tcp_addr);
+    assert_eq!(redacted.rpc_token, None);
     assert_eq!(disk_meta.provider.as_deref(), Some("scripted"));
     assert_eq!(disk_meta.model.as_deref(), Some("script-v1"));
     assert!(disk_meta.started_at_ms > 0);
@@ -1542,5 +1583,251 @@ async fn e2e_7_config_list_events_fork_tree_cancel_queue_and_capabilities() {
     drop(client);
     server.shutdown().await;
     actor.shutdown().await;
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_8_loopback_tcp_auth_gate_and_live_rpc_roundtrip() {
+    let ws = TempDirGuard::new("s8");
+    let run_dir = ws.path().join("run");
+    let db_path = ws.path().join("sessions.sqlite");
+    let rt = MizarRuntime::build(AgentSpineConfig::new(ws.path()).with_session_db(&db_path))
+        .await
+        .unwrap();
+
+    let _danger_guard = rt
+        .tools
+        .register(
+            ToolDefinition::sync_tool(
+                "tcp_guarded_write",
+                "dangerous write for tcp e2e",
+                json!({ "type": "object", "properties": {} }),
+                |_, _| Ok::<_, BoxError>("tcp_tool_ok".to_string()),
+            )
+            .with_annotations(ToolAnnotations {
+                read_only: false,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+    let adapter = ScriptedAdapter::new(vec![
+        ScriptStep::Immediate(vec![
+            StreamChunk::tool_call(
+                0,
+                ToolCall {
+                    id: "call-tcp-1".into(),
+                    name: "tcp_guarded_write".into(),
+                    arguments: r#"{"target":"tcp"}"#.into(),
+                },
+            ),
+            StreamChunk::Finish {
+                reason: FinishReason::ToolCalls,
+                replay: None,
+            },
+        ]),
+        ScriptStep::Immediate(vec![
+            StreamChunk::TextDelta {
+                index: 0,
+                text: "你好，".into(),
+            },
+            StreamChunk::TextDelta {
+                index: 0,
+                text: "TCP".into(),
+            },
+            StreamChunk::Finish {
+                reason: FinishReason::Stop,
+                replay: None,
+            },
+        ]),
+    ]);
+    rt.register_adapter("scripted", adapter).unwrap();
+
+    let sess = rt.sessions.create(Some("sess-s8".into()));
+    let actor = SessionActor::spawn(
+        Arc::clone(&rt),
+        Arc::clone(&sess),
+        SessionActorConfig::new(ws.path())
+            .with_run_dir(&run_dir)
+            .with_approval_mode(ApprovalMode::Ask)
+            .with_provider_model(Some("scripted".into()), Some("script-v1".into()), None),
+    );
+    let meta = ProcessMeta::for_current_process(
+        &run_dir,
+        &sess.id,
+        ws.path().display().to_string(),
+        Some("scripted".into()),
+        Some("script-v1".into()),
+    );
+    let reg = ProcessRegistration::create(&run_dir, meta).unwrap();
+    let server = RpcServer::start(actor.clone(), reg, RpcServerConfig::default()).unwrap();
+
+    // 1. 验证 p-<pid>.json 为 0600 权限且含有效 tcp_addr 与 64 位 hex rpc_token
+    let meta_mode = std::fs::metadata(server.meta_path())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(meta_mode, 0o600);
+    let disk_meta: ProcessMeta =
+        serde_json::from_slice(&std::fs::read(server.meta_path()).unwrap()).unwrap();
+    let tcp_addr = server.tcp_addr().expect("tcp_addr enabled by default");
+    let token = server
+        .rpc_token()
+        .expect("rpc_token enabled by default")
+        .to_string();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(
+        disk_meta.tcp_addr.as_deref(),
+        Some(tcp_addr.to_string().as_str())
+    );
+    assert_eq!(disk_meta.rpc_token.as_deref(), Some(token.as_str()));
+    assert_eq!(disk_meta.without_secret().rpc_token, None);
+
+    // 2. 未鉴权直接调用业务方法 -> 返回 -32003 并立即断开 TCP
+    let mut unauth_client = RpcTestClient::connect_tcp(tcp_addr).await;
+    let unauth_resp = unauth_client
+        .call_raw("session.list", Some(json!({})))
+        .await;
+    assert_eq!(unauth_resp.error.unwrap().code, ERR_UNAUTHORIZED);
+    assert!(
+        unauth_client.read_raw_line().await.is_none(),
+        "unauthenticated TCP connection must be closed immediately"
+    );
+
+    // 3. 错误 rpc_token（等长篡改末位与不等长）-> 返回 -32003 并立即断开 TCP
+    let mut wrong_token = token.clone();
+    let last_replacement = if wrong_token.ends_with('0') { '1' } else { '0' };
+    wrong_token.pop();
+    wrong_token.push(last_replacement);
+    let mut bad_token_client = RpcTestClient::connect_tcp(tcp_addr).await;
+    let bad_token_resp = bad_token_client
+        .call_raw(METHOD_AUTH_HELLO, Some(json!({ "token": wrong_token })))
+        .await;
+    assert_eq!(bad_token_resp.error.unwrap().code, ERR_UNAUTHORIZED);
+    assert!(bad_token_client.read_raw_line().await.is_none());
+
+    let mut invalid_params_client = RpcTestClient::connect_tcp(tcp_addr).await;
+    let invalid_params_resp = invalid_params_client
+        .call_raw(METHOD_AUTH_HELLO, Some(json!({})))
+        .await;
+    assert_eq!(invalid_params_resp.error.unwrap().code, ERR_UNAUTHORIZED);
+    assert!(invalid_params_client.read_raw_line().await.is_none());
+
+    // 4. 首帧畸形 JSON -> 返回 -32700 并立即断开 TCP
+    let mut bad_json_client = RpcTestClient::connect_tcp(tcp_addr).await;
+    bad_json_client.send_raw_line("{bad_json").await;
+    let bad_json_line = bad_json_client.read_raw_line().await.unwrap();
+    let bad_json_resp: JsonRpcResponse = serde_json::from_str(bad_json_line.trim_end()).unwrap();
+    assert_eq!(bad_json_resp.error.unwrap().code, ERR_PARSE_ERROR);
+    assert!(bad_json_client.read_raw_line().await.is_none());
+
+    // 5. 合法 auth.hello 鉴权后解锁 session.subscribe / turn.submit / live stream.delta / event.committed / interaction.resolve
+    let mut client = RpcTestClient::connect_tcp(tcp_addr).await;
+    let auth_res = client.auth_hello(&token).await;
+    assert!(auth_res.ok);
+
+    let snap = client.subscribe(&sess.id, None).await;
+    assert_eq!(snap.session.id, sess.id);
+
+    let submit_res: TurnSubmitResult = client
+        .call_ok(
+            "turn.submit",
+            Some(json!({
+                "session_id": sess.id,
+                "text": "hello via tcp",
+            })),
+        )
+        .await;
+    assert!(submit_res.accepted);
+
+    let (_, req_notif) = client
+        .next_notification_matching(|n| matches!(n, RpcNotification::InteractionRequested(_)))
+        .await;
+    let request_id = match req_notif {
+        RpcNotification::InteractionRequested(req) => {
+            assert_eq!(req.tool, "tcp_guarded_write");
+            req.request_id
+        }
+        _ => unreachable!(),
+    };
+
+    let resolve_res: InteractionResolveResult = client
+        .call_ok(
+            "interaction.resolve",
+            Some(json!({
+                "session_id": sess.id,
+                "request_id": request_id,
+                "decision": "allow_once",
+            })),
+        )
+        .await;
+    assert!(resolve_res.ok);
+
+    let mut streamed_text = String::new();
+    let mut saw_committed = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, notif) = client.next_notification().await;
+            match notif {
+                RpcNotification::StreamDelta(d) if d.kind == StreamDeltaKind::Text => {
+                    streamed_text.push_str(&d.delta);
+                }
+                RpcNotification::EventCommitted(_) => {
+                    saw_committed = true;
+                }
+                RpcNotification::TurnState(ts)
+                    if ts.session_id == sess.id && ts.state == SessionRuntimeState::Idle =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for TCP turn completion");
+
+    assert_eq!(streamed_text, "你好，TCP");
+    assert!(saw_committed);
+
+    drop(client);
+    server.shutdown().await;
+    actor.shutdown().await;
+
+    // 6. 验证 enable_loopback_tcp = false 时仅绑定 Unix Socket，不暴露 TCP 或写入密钥
+    let run_dir_no_tcp = ws.path().join("run_no_tcp");
+    let actor_no_tcp = SessionActor::spawn(
+        Arc::clone(&rt),
+        Arc::clone(&sess),
+        SessionActorConfig::new(ws.path()).with_run_dir(&run_dir_no_tcp),
+    );
+    let meta_no_tcp = ProcessMeta::for_current_process(
+        &run_dir_no_tcp,
+        &sess.id,
+        ws.path().display().to_string(),
+        None,
+        None,
+    );
+    let reg_no_tcp = ProcessRegistration::create(&run_dir_no_tcp, meta_no_tcp).unwrap();
+    let server_no_tcp = RpcServer::start(
+        actor_no_tcp.clone(),
+        reg_no_tcp,
+        RpcServerConfig {
+            enable_loopback_tcp: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(server_no_tcp.tcp_addr(), None);
+    assert_eq!(server_no_tcp.rpc_token(), None);
+    let disk_no_tcp: ProcessMeta =
+        serde_json::from_slice(&std::fs::read(server_no_tcp.meta_path()).unwrap()).unwrap();
+    assert_eq!(disk_no_tcp.tcp_addr, None);
+    assert_eq!(disk_no_tcp.rpc_token, None);
+
+    server_no_tcp.shutdown().await;
+    actor_no_tcp.shutdown().await;
     rt.shutdown().await;
 }

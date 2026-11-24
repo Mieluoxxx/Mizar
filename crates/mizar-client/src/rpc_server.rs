@@ -1,20 +1,26 @@
-//! 基于 Unix Domain Socket（NDJSON / JSON-RPC 2.0）的 Mizar 本地进程间 RPC 服务端。
+//! 基于 Unix Domain Socket 与受鉴权回环 TCP（NDJSON / JSON-RPC 2.0）的 Mizar 本地进程间 RPC 服务端。
 //!
 //! 职责：
 //! - 绑定 `<run_dir>/p-<pid>.sock` 并收敛为 `0600` 权限，同时清理已失活残留的 `.sock` 文件；
-//! - 向外部客户端提供全量 12 个 JSON-RPC 2.0 方法并映射 [`ActorError`] 错误码；
+//! - 默认同步绑定 `127.0.0.1:0` 回环 TCP 旁路、生成 256-bit 随机 `rpc_token` 并以 `0600` 写入 `p-<pid>.json`；
+//! - TCP 连接首帧必须通过 `auth.hello` 常量时间校验 `rpc_token`，否则返回 `-32003`（畸形 JSON 返回 `-32700`）并立即断连；
+//! - 向已认证客户端提供全量 12 个 JSON-RPC 2.0 方法并映射 [`ActorError`] 错误码；
 //! - 为每个已订阅连接独立维护 40ms / 16 KiB 的 `stream.delta` 聚合器与 256 帧有界出站队列，
 //!   在非增量通知（如 `event.committed` / `turn.state`）前强制刷出待发增量，并在慢客户端队列溢出时主动断开以保护主循环。
 
 use std::io;
+#[cfg(unix)]
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mizar_types::rpc::{
-    CapabilitiesListParams, InteractionResolveParams, JsonRpcError, JsonRpcId, JsonRpcRequest,
-    JsonRpcResponse, METHOD_CAPABILITIES_LIST, METHOD_INTERACTION_RESOLVE, METHOD_QUEUE_POP_ALL,
+    AuthHelloParams, AuthHelloResult, CapabilitiesListParams, InteractionResolveParams,
+    JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, METHOD_AUTH_HELLO,
+    METHOD_CAPABILITIES_LIST, METHOD_INTERACTION_RESOLVE, METHOD_QUEUE_POP_ALL,
     METHOD_QUEUE_REMOVE, METHOD_SESSION_CONFIG, METHOD_SESSION_EVENTS, METHOD_SESSION_FORK,
     METHOD_SESSION_LIST, METHOD_SESSION_SUBSCRIBE, METHOD_SESSION_TREE, METHOD_TURN_CANCEL,
     METHOD_TURN_SUBMIT, QueuePopAllParams, QueueRemoveParams, ResolvedBy, RpcNotification,
@@ -25,16 +31,17 @@ use mizar_types::rpc::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 #[cfg(unix)]
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+#[cfg(unix)]
+use uuid::Uuid;
 
 use crate::actor::SessionActorHandle;
 use crate::run_dir::{self, ProcessRegistration};
@@ -55,6 +62,8 @@ pub struct RpcServerConfig {
     pub max_delta_frame_bytes: usize,
     /// 单客户端出站有界队列容量（默认 256；满则立即断开慢客户端）。
     pub client_queue_capacity: usize,
+    /// 是否启用 `127.0.0.1:0` 回环 TCP 旁路（需首帧 `auth.hello` 鉴权，默认开启）。
+    pub enable_loopback_tcp: bool,
 }
 
 impl Default for RpcServerConfig {
@@ -63,21 +72,25 @@ impl Default for RpcServerConfig {
             coalesce_window: DEFAULT_COALESCE_WINDOW,
             max_delta_frame_bytes: DEFAULT_MAX_DELTA_FRAME_BYTES,
             client_queue_capacity: DEFAULT_CLIENT_QUEUE_CAPACITY,
+            enable_loopback_tcp: true,
         }
     }
 }
 
-/// Mizar Unix Socket JSON-RPC 2.0 服务端构建入口。
+/// Mizar Unix Socket / 回环 TCP JSON-RPC 2.0 服务端构建入口。
 #[derive(Debug)]
 pub struct RpcServer;
 
-/// 已启动的 RPC Unix Socket 服务端句柄，支持优雅停机并在 `Drop` 时兜底清理文件。
+/// 已启动的 RPC 服务端句柄，支持优雅停机并在 `Drop` 时兜底清理文件。
 #[derive(Debug)]
 pub struct RpcServerHandle {
     socket_path: PathBuf,
     meta_path: PathBuf,
+    tcp_addr: Option<SocketAddr>,
+    rpc_token: Option<String>,
     cancel: CancellationToken,
     accept_task: Option<JoinHandle<()>>,
+    tcp_accept_task: Option<JoinHandle<()>>,
     cleaned_up: Arc<AtomicBool>,
 }
 
@@ -92,10 +105,23 @@ impl RpcServerHandle {
         &self.meta_path
     }
 
+    /// 返回已启用的回环 TCP 监听地址（禁用回环 TCP 时为 `None`）。
+    pub fn tcp_addr(&self) -> Option<SocketAddr> {
+        self.tcp_addr
+    }
+
+    /// 返回当前进程回环 TCP 鉴权密钥（禁用回环 TCP 时为 `None`）。
+    pub fn rpc_token(&self) -> Option<&str> {
+        self.rpc_token.as_deref()
+    }
+
     /// 优雅停止监听器与全部活跃客户端任务，并删除 `.sock` 与 `.json` 运行态文件。
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
         if let Some(task) = self.accept_task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.tcp_accept_task.take() {
             let _ = task.await;
         }
         self.cleanup_files();
@@ -115,16 +141,19 @@ impl Drop for RpcServerHandle {
         if let Some(task) = self.accept_task.take() {
             task.abort();
         }
+        if let Some(task) = self.tcp_accept_task.take() {
+            task.abort();
+        }
         self.cleanup_files();
     }
 }
 
 impl RpcServer {
-    /// 启动 Unix Socket RPC 服务：确保运行目录 `0700`、绑定并设为 `0600`、挂接进程注册句柄并开始监听。
+    /// 启动 RPC 服务：确保运行目录 `0700`、绑定并设为 `0600`、按需启用回环 TCP 旁路、挂接进程注册句柄并开始监听。
     #[cfg(unix)]
     pub fn start(
         handle: SessionActorHandle,
-        registration: ProcessRegistration,
+        mut registration: ProcessRegistration,
         config: RpcServerConfig,
     ) -> io::Result<RpcServerHandle> {
         let socket_path = registration.socket_path().to_path_buf();
@@ -150,17 +179,52 @@ impl RpcServer {
             return Err(err);
         }
 
+        let (tcp_listener, tcp_addr, rpc_token) = if config.enable_loopback_tcp {
+            match bind_loopback_tcp_and_token(&mut registration) {
+                Ok((tcp_listener, addr, token)) => (Some(tcp_listener), Some(addr), Some(token)),
+                Err(err) => {
+                    let _ = std::fs::remove_file(&socket_path);
+                    return Err(err);
+                }
+            }
+        } else {
+            if (registration.meta().tcp_addr.is_some() || registration.meta().rpc_token.is_some())
+                && let Err(err) = registration.update_tcp_endpoint(None, None)
+            {
+                let _ = std::fs::remove_file(&socket_path);
+                return Err(err);
+            }
+            (None, None, None)
+        };
+
         handle.attach_registration(registration);
 
         let cancel = CancellationToken::new();
-        let accept_cancel = cancel.clone();
-        let accept_task = tokio::spawn(run_accept_loop(listener, handle, config, accept_cancel));
+        let accept_task = tokio::spawn(run_unix_accept_loop(
+            listener,
+            handle.clone(),
+            config,
+            cancel.clone(),
+        ));
+        let tcp_accept_task = match (tcp_listener, rpc_token.as_deref()) {
+            (Some(tcp_listener), Some(token)) => Some(tokio::spawn(run_tcp_accept_loop(
+                tcp_listener,
+                handle,
+                config,
+                Arc::<str>::from(token),
+                cancel.clone(),
+            ))),
+            _ => None,
+        };
 
         Ok(RpcServerHandle {
             socket_path,
             meta_path,
+            tcp_addr,
+            rpc_token,
             cancel,
             accept_task: Some(accept_task),
+            tcp_accept_task,
             cleaned_up: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -177,6 +241,24 @@ impl RpcServer {
             "Unix Domain Socket RPC 仅支持 Unix 平台",
         ))
     }
+}
+
+#[cfg(unix)]
+fn generate_rpc_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+#[cfg(unix)]
+fn bind_loopback_tcp_and_token(
+    registration: &mut ProcessRegistration,
+) -> io::Result<(TcpListener, SocketAddr, String)> {
+    let std_tcp = std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    std_tcp.set_nonblocking(true)?;
+    let tcp_listener = TcpListener::from_std(std_tcp)?;
+    let addr = tcp_listener.local_addr()?;
+    let token = generate_rpc_token();
+    registration.update_tcp_endpoint(Some(addr.to_string()), Some(token.clone()))?;
+    Ok((tcp_listener, addr, token))
 }
 
 #[cfg(unix)]
@@ -221,7 +303,7 @@ fn remove_stale_socket_if_unattached(socket_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-async fn run_accept_loop(
+async fn run_unix_accept_loop(
     listener: UnixListener,
     handle: SessionActorHandle,
     config: RpcServerConfig,
@@ -238,10 +320,53 @@ async fn run_accept_loop(
                     Ok((stream, _addr)) => {
                         let conn_handle = handle.clone();
                         let conn_cancel = cancel.child_token();
-                        clients.spawn(run_connection(stream, conn_handle, config, conn_cancel));
+                        clients.spawn(run_connection(stream, conn_handle, config, None, conn_cancel));
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "RPC UnixListener accept 失败");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
+                    }
+                }
+            }
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+        }
+    }
+    clients.shutdown().await;
+}
+
+#[cfg(unix)]
+async fn run_tcp_accept_loop(
+    listener: TcpListener,
+    handle: SessionActorHandle,
+    config: RpcServerConfig,
+    auth_token: Arc<str>,
+    cancel: CancellationToken,
+) {
+    let mut clients = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((stream, _addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        let conn_handle = handle.clone();
+                        let conn_cancel = cancel.child_token();
+                        clients.spawn(run_connection(
+                            stream,
+                            conn_handle,
+                            config,
+                            Some(Arc::clone(&auth_token)),
+                            conn_cancel,
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "RPC TcpListener accept 失败");
                         tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -261,14 +386,16 @@ struct SubscriptionActivation {
     notif_rx: broadcast::Receiver<RpcNotification>,
 }
 
-#[cfg(unix)]
-async fn run_connection(
-    stream: UnixStream,
+async fn run_connection<S>(
+    stream: S,
     handle: SessionActorHandle,
     config: RpcServerConfig,
+    auth_token: Option<Arc<str>>,
     conn_cancel: CancellationToken,
-) {
-    let (read_half, write_half) = stream.into_split();
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
     let queue_cap = config.client_queue_capacity.max(1);
     let (outbound_tx, outbound_rx) = mpsc::channel::<String>(queue_cap);
     let (sub_cmd_tx, sub_cmd_rx) = mpsc::unbounded_channel::<SubscriptionActivation>();
@@ -281,24 +408,27 @@ async fn run_connection(
         handle,
         outbound_tx,
         sub_cmd_tx,
+        auth_token,
         conn_cancel.clone(),
     );
 
     tokio::join!(writer_fut, notifier_fut, reader_fut);
 }
 
-#[cfg(unix)]
-async fn run_writer_loop(
-    mut write_half: tokio::net::unix::OwnedWriteHalf,
+async fn run_writer_loop<W>(
+    mut write_half: W,
     mut outbound_rx: mpsc::Receiver<String>,
     conn_cancel: CancellationToken,
-) {
+) where
+    W: AsyncWrite + Unpin,
+{
     loop {
         tokio::select! {
             biased;
             _ = conn_cancel.cancelled() => break,
             maybe_line = outbound_rx.recv() => {
                 let Some(line) = maybe_line else {
+                    let _ = write_half.shutdown().await;
                     break;
                 };
                 let write_res = tokio::select! {
@@ -410,17 +540,32 @@ async fn run_notifier_loop(
     }
 }
 
-#[cfg(unix)]
-async fn run_reader_loop(
-    read_half: tokio::net::unix::OwnedReadHalf,
+/// 常量时间字节序列相等比较（覆盖内容与长度，避免时序侧信道泄露 `rpc_token`）。
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..max_len {
+        let ba = a.get(i).copied().unwrap_or(0);
+        let bb = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(ba ^ bb);
+    }
+    std::hint::black_box(diff) == 0
+}
+
+async fn run_reader_loop<R>(
+    read_half: R,
     handle: SessionActorHandle,
     outbound_tx: mpsc::Sender<String>,
     sub_cmd_tx: mpsc::UnboundedSender<SubscriptionActivation>,
+    auth_token: Option<Arc<str>>,
     conn_cancel: CancellationToken,
-) {
+) where
+    R: AsyncRead + Unpin,
+{
     let mut reader = BufReader::new(read_half);
     let mut raw_buf = Vec::with_capacity(1024);
     let mut has_subscribed = false;
+    let mut authenticated = auth_token.is_none();
 
     loop {
         raw_buf.clear();
@@ -448,7 +593,7 @@ async fn run_reader_loop(
                 None,
                 JsonRpcError::parse_error("invalid UTF-8 in JSON-RPC request"),
             );
-            if !enqueue_response(&outbound_tx, &resp, &conn_cancel) {
+            if !enqueue_response(&outbound_tx, &resp, &conn_cancel) || !authenticated {
                 break;
             }
             continue;
@@ -462,7 +607,7 @@ async fn run_reader_loop(
             Ok(v) => v,
             Err(err) => {
                 let resp = JsonRpcResponse::err(None, JsonRpcError::parse_error(err.to_string()));
-                if !enqueue_response(&outbound_tx, &resp, &conn_cancel) {
+                if !enqueue_response(&outbound_tx, &resp, &conn_cancel) || !authenticated {
                     break;
                 }
                 continue;
@@ -475,26 +620,70 @@ async fn run_reader_loop(
         let req: JsonRpcRequest = match serde_json::from_value(raw_value) {
             Ok(r) => r,
             Err(err) => {
-                let resp = JsonRpcResponse::err(
-                    extracted_id,
-                    JsonRpcError::invalid_request(err.to_string()),
-                );
-                if !enqueue_response(&outbound_tx, &resp, &conn_cancel) {
+                let err_obj = if authenticated {
+                    JsonRpcError::invalid_request(err.to_string())
+                } else {
+                    JsonRpcError::unauthorized(
+                        "authentication required: invalid auth.hello request",
+                    )
+                };
+                let resp = JsonRpcResponse::err(extracted_id, err_obj);
+                if !enqueue_response(&outbound_tx, &resp, &conn_cancel) || !authenticated {
                     break;
                 }
                 continue;
             }
         };
         if !req.is_valid_version() {
-            let resp = JsonRpcResponse::err(
-                req.id,
+            let err_obj = if authenticated {
                 JsonRpcError::invalid_request(format!(
                     "unsupported jsonrpc version: {}",
                     req.jsonrpc
-                )),
-            );
-            if !enqueue_response(&outbound_tx, &resp, &conn_cancel) {
+                ))
+            } else {
+                JsonRpcError::unauthorized("authentication required: invalid jsonrpc version")
+            };
+            let resp = JsonRpcResponse::err(req.id, err_obj);
+            if !enqueue_response(&outbound_tx, &resp, &conn_cancel) || !authenticated {
                 break;
+            }
+            continue;
+        }
+
+        if !authenticated {
+            let Some(expected) = auth_token.as_deref() else {
+                break;
+            };
+            if req.method != METHOD_AUTH_HELLO {
+                let resp = JsonRpcResponse::err(
+                    req.id,
+                    JsonRpcError::unauthorized(
+                        "authentication required: first frame must be auth.hello",
+                    ),
+                );
+                let _ = enqueue_response(&outbound_tx, &resp, &conn_cancel);
+                break;
+            }
+            let Ok(params) = parse_required_params::<AuthHelloParams>(req.params) else {
+                let resp = JsonRpcResponse::err(
+                    req.id,
+                    JsonRpcError::unauthorized("invalid auth.hello params"),
+                );
+                let _ = enqueue_response(&outbound_tx, &resp, &conn_cancel);
+                break;
+            };
+            if expected.is_empty() || !ct_eq(params.token.as_bytes(), expected.as_bytes()) {
+                let resp =
+                    JsonRpcResponse::err(req.id, JsonRpcError::unauthorized("invalid rpc token"));
+                let _ = enqueue_response(&outbound_tx, &resp, &conn_cancel);
+                break;
+            }
+            authenticated = true;
+            if let Some(id) = req.id {
+                let resp = ok_response(id, &AuthHelloResult { ok: true });
+                if !enqueue_response(&outbound_tx, &resp, &conn_cancel) {
+                    break;
+                }
             }
             continue;
         }
@@ -669,7 +858,6 @@ fn matches_subscription(
     }
 }
 
-#[cfg(unix)]
 fn enqueue_response(
     tx: &mpsc::Sender<String>,
     resp: &JsonRpcResponse,
@@ -1045,5 +1233,28 @@ mod tests {
             reassembled.push_str(&parsed.delta);
         }
         assert_eq!(reassembled, payload);
+    }
+
+    #[test]
+    fn constant_time_token_equality_covers_content_and_length() {
+        assert!(ct_eq(b"abcdef0123456789", b"abcdef0123456789"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"abcdef0123456789", b"Xbcdef0123456789"));
+        assert!(!ct_eq(b"abcdef0123456789", b"abcdef01X3456789"));
+        assert!(!ct_eq(b"abcdef0123456789", b"abcdef012345678X"));
+        assert!(!ct_eq(b"abcdef0123456789", b"abcdef012345678"));
+        assert!(!ct_eq(b"abcdef012345678", b"abcdef0123456789"));
+        assert!(!ct_eq(b"", b"a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_rpc_token_is_64_lowercase_hex_chars() {
+        let t1 = generate_rpc_token();
+        let t2 = generate_rpc_token();
+        assert_eq!(t1.len(), 64);
+        assert_eq!(t2.len(), 64);
+        assert_ne!(t1, t2);
+        assert!(t1.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
     }
 }
