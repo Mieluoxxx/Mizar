@@ -413,7 +413,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     let sub = runtime.subagent.as_ref().unwrap();
     assert!(sub.is_module_enabled());
     sub.update_config(|c| {
-        c.default_max_steps = 8;
+        c.read_only_soft_budget = 8;
         c.timeout_secs = 45;
     });
     assert!(ctrl.set_enabled("subagent", false).await.unwrap());
@@ -426,7 +426,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     );
     assert!(ctrl.set_enabled("subagent", true).await.unwrap());
     assert!(sub.is_module_enabled());
-    assert_eq!(sub.config().default_max_steps, 8);
+    assert_eq!(sub.config().read_only_soft_budget, 8);
     assert_eq!(sub.config().timeout_secs, 45);
     assert!(ctrl.set_enabled("subagent", false).await.unwrap());
 

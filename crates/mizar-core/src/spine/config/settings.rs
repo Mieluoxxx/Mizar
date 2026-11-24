@@ -73,8 +73,8 @@ pub struct SessionTitleSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SubagentSettings {
-    pub max_steps: Option<usize>,
-    pub max_steps_cap: Option<usize>,
+    pub read_only_soft_budget: Option<usize>,
+    pub edit_soft_budget: Option<usize>,
     pub timeout_secs: Option<u64>,
     pub max_concurrent: Option<usize>,
     pub stall_timeout_secs: Option<u64>,
@@ -301,11 +301,11 @@ impl SettingsConfig {
         }
         if let Some(sub) = other.subagent {
             let dst = self.subagent.get_or_insert_with(Default::default);
-            if sub.max_steps.is_some() {
-                dst.max_steps = sub.max_steps;
+            if sub.read_only_soft_budget.is_some() {
+                dst.read_only_soft_budget = sub.read_only_soft_budget;
             }
-            if sub.max_steps_cap.is_some() {
-                dst.max_steps_cap = sub.max_steps_cap;
+            if sub.edit_soft_budget.is_some() {
+                dst.edit_soft_budget = sub.edit_soft_budget;
             }
             if sub.timeout_secs.is_some() {
                 dst.timeout_secs = sub.timeout_secs;
@@ -632,7 +632,8 @@ mod disabled_plugins_tests {
             global.join("settings.json"),
             r#"{
                 "subagent": {
-                    "maxSteps": 25,
+                    "readOnlySoftBudget": 120,
+                    "editSoftBudget": 0,
                     "timeoutSecs": 240,
                     "stallTimeoutSecs": 60
                 }
@@ -654,7 +655,8 @@ mod disabled_plugins_tests {
         let loaded = load_mizar_config_with_global(&proj, Some(&global));
         assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
         let s = loaded.settings.subagent.as_ref().unwrap();
-        assert_eq!(s.max_steps, Some(25));
+        assert_eq!(s.read_only_soft_budget, Some(120));
+        assert_eq!(s.edit_soft_budget, Some(0));
         assert_eq!(s.timeout_secs, Some(240));
         assert_eq!(s.max_concurrent, Some(6));
         assert_eq!(s.stall_timeout_secs, Some(30));
@@ -664,7 +666,8 @@ mod disabled_plugins_tests {
             let mut spine = AgentSpineConfig::new(&proj);
             loaded.apply_to_spine(&mut spine);
             let sub = spine.subagent.unwrap();
-            assert_eq!(sub.default_max_steps, 25);
+            assert_eq!(sub.read_only_soft_budget, 120);
+            assert_eq!(sub.edit_soft_budget, 0);
             assert_eq!(sub.timeout_secs, 240);
             assert_eq!(sub.max_concurrent_per_parent, 6);
             assert_eq!(sub.stall_timeout_secs, 30);

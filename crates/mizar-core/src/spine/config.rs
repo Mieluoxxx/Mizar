@@ -260,11 +260,11 @@ impl LoadedMizarConfig {
         if let Some(sub) = &self.settings.subagent
             && let Some(dst) = spine.subagent.as_mut()
         {
-            if let Some(v) = sub.max_steps {
-                dst.default_max_steps = v;
+            if let Some(v) = sub.read_only_soft_budget {
+                dst.read_only_soft_budget = v;
             }
-            if let Some(v) = sub.max_steps_cap {
-                dst.max_steps_cap = v;
+            if let Some(v) = sub.edit_soft_budget {
+                dst.edit_soft_budget = v;
             }
             if let Some(v) = sub.timeout_secs {
                 dst.timeout_secs = v;
