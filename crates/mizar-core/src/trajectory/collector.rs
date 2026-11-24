@@ -5,7 +5,7 @@
 //! 当未挂载 `SessionStore`（如独立的工具级单元测试）时，仍保留轻量内存缓冲作为兜底。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,6 +45,22 @@ pub struct TrajectoryConfig {
     pub detector: DetectorConfig,
     /// 可选：将每条轨迹事件实时追加写入 `{export_dir}/{session_id}.jsonl`。
     pub export_dir: Option<PathBuf>,
+    /// 可选：将每条轨迹事件实时追加写入指定 JSONL 文件路径。
+    pub export_file: Option<PathBuf>,
+}
+
+/// 预创建轨迹 JSONL 父目录并以追加模式校验文件可写（不截断既有内容）。
+pub fn prepare_trace_jsonl_file(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    Ok(())
 }
 
 fn now_millis() -> u128 {
@@ -339,6 +355,8 @@ pub struct TrajectoryRuntime {
     config: TrajectoryConfig,
     enabled: AtomicBool,
     buffers: Mutex<HashMap<String, SessionTraceBuffer>>,
+    export_lock: Mutex<()>,
+    export_file_error_reported: AtomicBool,
     on_event: SyncEventBus<TrajectoryEventEmitted>,
     on_anomaly: SyncEventBus<TrajectoryAnomalyEvent>,
 }
@@ -360,6 +378,8 @@ impl TrajectoryRuntime {
             config,
             enabled: AtomicBool::new(true),
             buffers: Mutex::new(HashMap::new()),
+            export_lock: Mutex::new(()),
+            export_file_error_reported: AtomicBool::new(false),
             on_event: SyncEventBus::new(),
             on_anomaly: SyncEventBus::new(),
         })
@@ -806,18 +826,42 @@ impl TrajectoryRuntime {
     }
 
     fn write_export_line(&self, session_id: &str, event: &TraceEvent) {
+        if self.config.export_dir.is_none() && self.config.export_file.is_none() {
+            return;
+        }
+        let Ok(line) = serde_json::to_string(event) else {
+            return;
+        };
+        let _lock = self.export_lock.lock().unwrap();
+        use std::io::Write;
         if let Some(dir) = &self.config.export_dir {
             let _ = std::fs::create_dir_all(dir);
             let file_path = dir.join(format!("{session_id}.jsonl"));
-            if let Ok(line) = serde_json::to_string(event) {
-                use std::io::Write;
-                if let Ok(mut file) = std::fs::OpenOptions::new()
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(file_path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+        if let Some(path) = &self.config.export_file {
+            let write_res: std::io::Result<()> = (|| {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut file = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(file_path)
-                {
-                    let _ = writeln!(file, "{line}");
-                }
+                    .open(path)?;
+                writeln!(file, "{line}")
+            })();
+            if let Err(err) = write_res
+                && !self.export_file_error_reported.swap(true, Ordering::AcqRel)
+            {
+                tracing::warn!(path = %path.display(), error = %err, "写入轨迹 JSONL 失败");
             }
         }
     }

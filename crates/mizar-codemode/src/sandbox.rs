@@ -696,6 +696,7 @@ pub async fn execute_codemode_script(
         is_error,
         structured_content: structured,
         details: Some(details),
+        ..ToolOutput::default()
     })
 }
 

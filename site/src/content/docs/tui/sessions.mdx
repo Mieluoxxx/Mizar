@@ -65,6 +65,15 @@ mizar --no-persist
 - <kbd>Enter</kbd>：展开当前选中 Span 的完整耗时细分与详细元信息
 - <kbd>Esc</kbd>：关闭轨迹分析器返回对话
 
+### 实时落盘 JSONL 轨迹日志（`--trace-jsonl`）
+
+除会话内按 <kbd>Ctrl</kbd>+<kbd>T</kbd> 查看之外，还可在启动时通过 `--trace-jsonl <PATH>`（或环境变量 `MIZAR_TRACE_JSONL`，CLI 参数优先）将每条 `TraceEvent` 实时流式追加写入指定 JSONL 文件。交互式 TUI 与无头 `mizar exec` 均支持该参数，每行格式与 `/trace` 导出完全兼容；即便进程因异常或 `--timeout` 中断，已写入的事件也不会丢失（详见 [CLI 参数](/tui/cli/)）：
+
+```bash title="实时输出轨迹 JSONL 日志"
+mizar --trace-jsonl ./logs/tui-trace.jsonl
+mizar exec --isolated --trace-jsonl ./logs/exec-trace.jsonl "运行单测并总结失败原因"
+```
+
 <Callout type="tip">
 
 注意区分 [本地 Bash 模式](/tui/bash-mode/) 中的 `!` 与 `!!`：纯本地的 `!!` 命令不会发起 LLM 请求，自然也不会拖慢模型首包延迟；排查模型吞吐瓶颈时，看 `/trace` 里的模型调用 Span 最为准确。

@@ -503,3 +503,91 @@ async fn findings_only_matches_inspect_findings_without_snapshot_clone() {
     assert!(!fast.is_empty());
     assert_eq!(fast, expected);
 }
+
+#[tokio::test]
+async fn export_file_streams_jsonl_lines_incrementally_appends_and_coexists_with_export_dir() {
+    use mizar_core::trajectory::prepare_trace_jsonl_file;
+    use mizar_session::{SessionEvent, SessionStore, SessionTraceEvent};
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "mizar_traj_export_file_{}_{}",
+        std::process::id(),
+        uniq
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let jsonl_path = root.join("nested/dir/trace.jsonl");
+    let export_dir = root.join("by_session");
+
+    // 预检：嵌套文件可成功预创建，已存在目录应报错
+    prepare_trace_jsonl_file(&jsonl_path).unwrap();
+    assert!(jsonl_path.exists());
+    std::fs::create_dir_all(&export_dir).unwrap();
+    assert!(prepare_trace_jsonl_file(&export_dir).is_err());
+
+    // 第一次运行：写入事件并实时校验在会话结束前即可读出合法 JSONL
+    let sessions1 = SessionStore::new();
+    let (traj1, guard1) = TrajectoryRuntime::install(
+        Some(&sessions1),
+        None,
+        None,
+        None,
+        TrajectoryConfig {
+            export_dir: Some(export_dir.clone()),
+            export_file: Some(jsonl_path.clone()),
+            ..Default::default()
+        },
+    );
+    let s1 = sessions1.create(None);
+    s1.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
+    s1.append(SessionEvent::User {
+        text: "first run".into(),
+        images: Vec::new(),
+    });
+
+    // 会话尚未结束时已实时落盘
+    let mid_raw = std::fs::read_to_string(&jsonl_path).unwrap();
+    let mid_events = TrajectoryRuntime::parse_jsonl(&mid_raw).unwrap();
+    assert_eq!(mid_events.len(), 2);
+
+    s1.append_trace(SessionTraceEvent::TurnEnd {
+        turn: 1,
+        reason: "stop".into(),
+    });
+    let expected_s1 = traj1.export_jsonl(&s1.id).unwrap();
+    let file_after_s1 = std::fs::read_to_string(&jsonl_path).unwrap();
+    assert_eq!(file_after_s1, expected_s1);
+    let dir_s1 = std::fs::read_to_string(export_dir.join(format!("{}.jsonl", s1.id))).unwrap();
+    assert_eq!(dir_s1, expected_s1);
+    drop(guard1);
+
+    // 第二次运行指向同一路径：应以追加模式保留前序记录
+    let sessions2 = SessionStore::new();
+    let (_traj2, guard2) = TrajectoryRuntime::install(
+        Some(&sessions2),
+        None,
+        None,
+        None,
+        TrajectoryConfig {
+            export_file: Some(jsonl_path.clone()),
+            ..Default::default()
+        },
+    );
+    let s2 = sessions2.create(None);
+    s2.append(SessionEvent::User {
+        text: "second run".into(),
+        images: Vec::new(),
+    });
+    drop(guard2);
+
+    let combined_raw = std::fs::read_to_string(&jsonl_path).unwrap();
+    let combined = TrajectoryRuntime::parse_jsonl(&combined_raw).unwrap();
+    assert_eq!(combined.len(), 4);
+    assert_eq!(combined[0].session_id, s1.id);
+    assert_eq!(combined[3].session_id, s2.id);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

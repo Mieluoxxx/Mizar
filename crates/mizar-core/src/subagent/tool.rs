@@ -1,4 +1,4 @@
-//! `subagent` 工具定义与 4 动作分发实现（`spawn` / `send` / `status` / `stop`）。
+//! `subagent` 工具定义与动作分发（`spawn` / `send` / `status` / `stop` / `yield`）。
 
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ enum SubagentAction {
     Send,
     Status,
     Stop,
+    Yield,
 }
 
 impl SubagentAction {
@@ -37,6 +38,7 @@ impl SubagentAction {
             "send" => Ok(Self::Send),
             "status" => Ok(Self::Status),
             "stop" => Ok(Self::Stop),
+            "yield" => Ok(Self::Yield),
             other => Err(SubagentError::InvalidAction(other.to_string())),
         }
     }
@@ -48,15 +50,20 @@ pub(crate) fn build_subagent_tool_definition(runtime: Arc<SubagentRuntime>) -> T
         "Delegate a focused, single-layer child agent task or follow up on running/settled subagents. \
 Use action=\"spawn\" (default) with `prompt` to launch a background subagent (`read_only` default or `edit`). \
 Use action=\"send\" with `name` and `prompt` to steer a running subagent or wake a settled subagent to continue with its existing session memory. \
-Use action=\"status\" (optional `name`) to inspect real-time progress (step, tool, idle_secs) and summaries, or action=\"stop\" (`name` or \"all\") to cancel.",
+Use action=\"status\" (optional `name`) for requested progress checks or watchdog alerts, or action=\"stop\" (`name` or \"all\") to cancel. \
+Use action=\"yield\" with `message` when the next useful step needs a subagent result. It ends your turn without waiting or stopping the children; results arrive as follow-ups.",
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "send", "status", "stop"],
+                    "enum": ["spawn", "send", "status", "stop", "yield"],
                     "default": "spawn",
-                    "description": "Operation to perform: \"spawn\" (default), \"send\", \"status\", or \"stop\"."
+                    "description": "Operation to perform: spawn (default), send, status, stop, or yield."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Brief user-facing progress message explaining what is pending (required for yield)."
                 },
                 "prompt": {
                     "type": "string",
@@ -93,7 +100,7 @@ Use action=\"status\" (optional `name`) to inspect real-time progress (step, too
         open_world: false,
     })
     .with_prompt_snippet(
-        "Delegate or follow up with isolated single-layer child agent sessions (`spawn` default, `send`, `status`, `stop`)",
+        "Delegate or follow up with isolated single-layer child agent sessions (`spawn` default, `send`, `status`, `stop`, `yield`)",
     )
 }
 
@@ -121,6 +128,14 @@ impl SubagentRuntime {
         )?;
 
         match action {
+            SubagentAction::Yield => {
+                parent_session_id.ok_or(SubagentError::MissingParentSession)?;
+                let message = parse_optional_trimmed_string(&args, "message", || {
+                    SubagentError::InvalidYieldMessageType
+                })?
+                .ok_or(SubagentError::MissingYieldMessage)?;
+                Ok(ToolOutput::end_turn(message))
+            }
             SubagentAction::Status => {
                 Ok(self
                     .execute_status_action(parent_session_id.as_deref(), requested_name.as_deref()))

@@ -1482,3 +1482,123 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     ctx_restarted.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn tui_runtime_with_trace_jsonl_streams_complete_trace_events() {
+    use futures::stream;
+    use mizar_core::trajectory::{TraceEventKind, TrajectoryRuntime};
+    use mizar_tui::exec::configure_spine_trace_jsonl;
+
+    struct StaticReplyAdapter;
+
+    impl LlmAdapter for StaticReplyAdapter {
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            let chunks = vec![
+                Ok(StreamChunk::text("TUI_TRACE_JSONL_OK")),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }),
+            ];
+            Box::pin(stream::iter(chunks))
+        }
+    }
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!(
+        "mizar_tui_trace_jsonl_{}_{}",
+        std::process::id(),
+        uniq
+    ));
+    let ws = tmp.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let jsonl_path = tmp.join("out/tui-session.jsonl");
+
+    let mut spine_cfg =
+        AgentSpineConfig::coding(&ws).with_disabled_plugins(["session-title", "trajectory"]);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = spine_cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    configure_spine_trace_jsonl(&mut spine_cfg, Some(&jsonl_path));
+
+    let runtime = MizarRuntime::build(spine_cfg).await.unwrap();
+    runtime
+        .register_adapter("static-tui", Arc::new(StaticReplyAdapter))
+        .unwrap();
+
+    let session = runtime.sessions.create(None);
+    let reply = runtime
+        .agent_loop
+        .run_with_options(
+            Arc::clone(&session),
+            "hello tui trace",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("static-tui".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "TUI_TRACE_JSONL_OK");
+
+    let raw = std::fs::read_to_string(&jsonl_path).expect("TUI trace JSONL must be written");
+    let events = TrajectoryRuntime::parse_jsonl(&raw).expect("TUI trace JSONL must parse cleanly");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::UserMessage { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnStart { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepStart { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::FirstToken { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::AssistantMessage { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepEnd { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnEnd { .. }))
+    );
+
+    let expected = runtime
+        .trajectory
+        .as_ref()
+        .unwrap()
+        .export_jsonl(&session.id)
+        .unwrap();
+    assert_eq!(raw, expected);
+
+    runtime.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -17,6 +17,7 @@
 //! - `--timeout <secs>`：限制无头单次任务总超时秒数
 //! - `--output-format <fmt>` / `--json`：无头输出格式（`text` / `json`）
 //! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
+//! - `--trace-jsonl <path>`：实时流式追加轨迹事件到指定 JSONL 文件（支持无头与 TUI 模式，可用环境变量 `MIZAR_TRACE_JSONL` 指定，CLI 优先）
 //! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
 //! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
@@ -44,6 +45,7 @@
 //! - `MIZAR_SKIP_VERSION_CHECK` / `MIZAR_OFFLINE`：跳过启动时版本检查（`MIZAR_OFFLINE` 同时禁用更新下载）
 //! - `MIZAR_RELEASE_BASE_URL`：覆盖 GitHub Release 基址（默认为 `https://github.com/Mieluoxxx/Mizar`）
 //! - `MIZAR_TRACE_OUT`：无头模式结构化轨迹 JSON 导出路径（低于 `--trace-out` 优先级）
+//! - `MIZAR_TRACE_JSONL`：实时轨迹 JSONL 日志文件路径（低于 `--trace-jsonl` 优先级）
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -53,11 +55,13 @@ use mizar_core::spine::{
     AgentSpineConfig, AgentToolsMode, MizarRuntime, load_mizar_config,
     resolve_default_session_db_path,
 };
+use mizar_core::trajectory::prepare_trace_jsonl_file;
 use mizar_llm::ReasoningEffort;
 use mizar_llm::retry::RetryConfig;
 use mizar_tools::coding::CodingToolsPreset;
 use mizar_tui::exec::{
-    ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
+    ExecConfig, ExecOutputFormat, configure_spine_trace_jsonl, resolve_exec_prompt,
+    resolve_trace_jsonl_path, resolve_trace_out_path, run_exec_cli,
 };
 use mizar_tui::update::{current_version, run_update_cli, should_check_for_updates_at_startup};
 use mizar_tui::{
@@ -98,6 +102,7 @@ struct CliArgs {
     timeout_secs: Option<u64>,
     output_format: Option<ExecOutputFormat>,
     trace_out: Option<PathBuf>,
+    trace_jsonl: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -151,6 +156,7 @@ Options:
       --output-format <fmt>     Headless output format (text, json)
       --json                    Shorthand for --output-format json
       --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
+      --trace-jsonl <path>      Stream TraceEvent JSONL log to file (env: MIZAR_TRACE_JSONL)
       --isolated                Skip personal global config, MCP, skills, instructions, and DB
       --minimal                 Enable minimal coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
@@ -441,6 +447,13 @@ where
                 }
                 out.trace_out = Some(PathBuf::from(val));
             }
+            "--trace-jsonl" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--trace-jsonl 路径不能为空".to_string());
+                }
+                out.trace_jsonl = Some(PathBuf::from(val));
+            }
             "--timeout" => {
                 let val = take_value(flag, inline, &mut args)?;
                 let parsed = val
@@ -518,6 +531,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let explicit_workspace = cli.workspace.clone();
+    let trace_jsonl =
+        resolve_trace_jsonl_path(cli.trace_jsonl.clone(), env_non_empty("MIZAR_TRACE_JSONL"));
     let workspace = cli
         .workspace
         .clone()
@@ -570,6 +585,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             resume_session: cli.resume_session,
             output_format: cli.output_format.unwrap_or_default(),
             trace_out: resolve_trace_out_path(cli.trace_out, env_non_empty("MIZAR_TRACE_OUT")),
+            trace_jsonl,
         })
         .await;
         if code != 0 {
@@ -596,6 +612,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
+    configure_spine_trace_jsonl(&mut spine_cfg, trace_jsonl.as_deref());
     if cli.no_persist {
         spine_cfg.session_db_path = None;
     }
@@ -636,7 +653,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // 两者都没有时 `model` 仍可能是 `models.json` 推导出来的，那不算显式指定。
     tui_cfg.model_from_env = env_non_empty("MODEL").is_some();
     tui_cfg.model_from_settings = loaded_cfg.settings.default_model.is_some();
-    tui_cfg.disabled_plugins = loaded_cfg.settings.disabled_plugins.clone();
+    tui_cfg.disabled_plugins = spine_cfg.disabled_plugins.clone();
     if let Some(ui) = &loaded_cfg.settings.ui {
         if let Some(ref theme_name) = ui.theme {
             tui_cfg.theme_preset = mizar_tui_ui::theme::ThemePreset::parse(theme_name);
@@ -674,6 +691,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         tui_cfg
             .startup_notices
             .push((NoticeLevel::Warn, format!("配置解析失败：{err}")));
+    }
+    if let Some(ref path) = trace_jsonl
+        && let Err(err) = prepare_trace_jsonl_file(path)
+    {
+        tui_cfg.startup_notices.push((
+            NoticeLevel::Warn,
+            format!("无法创建轨迹 JSONL 日志 \"{}\": {err}", path.display()),
+        ));
     }
 
     let runtime = MizarRuntime::build(spine_cfg).await?;
@@ -864,5 +889,35 @@ mod tests {
         );
         assert!(format_help_text().contains("--trace-out <path>"));
         assert!(format_help_text().contains("MIZAR_TRACE_OUT"));
+    }
+
+    #[test]
+    fn parse_trace_jsonl_flag_and_validation() {
+        let exec_parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--trace-jsonl".to_string(),
+            "artifacts/trace.jsonl".to_string(),
+            "run".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            exec_parsed.trace_jsonl.as_deref(),
+            Some(std::path::Path::new("artifacts/trace.jsonl"))
+        );
+        assert!(exec_parsed.is_exec_mode());
+
+        let tui_parsed =
+            parse_cli_args_from(["--trace-jsonl=/tmp/tui-trace.jsonl".to_string()]).unwrap();
+        assert_eq!(
+            tui_parsed.trace_jsonl.as_deref(),
+            Some(std::path::Path::new("/tmp/tui-trace.jsonl"))
+        );
+        assert!(!tui_parsed.is_exec_mode());
+        assert!(!tui_parsed.has_exec_only_flags());
+
+        assert!(parse_cli_args_from(["--trace-jsonl".into(), "   ".into()]).is_err());
+        assert!(parse_cli_args_from(["--trace-jsonl".into()]).is_err());
+        assert!(format_help_text().contains("--trace-jsonl <path>"));
+        assert!(format_help_text().contains("MIZAR_TRACE_JSONL"));
     }
 }

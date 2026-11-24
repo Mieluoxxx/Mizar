@@ -699,7 +699,7 @@ async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
         content,
         is_error,
         structured_content: structured,
-        details: None,
+        ..ToolOutput::default()
     })
 }
 

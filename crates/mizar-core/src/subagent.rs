@@ -113,10 +113,16 @@ impl SubagentMode {
 
 #[derive(Debug, Error)]
 pub enum SubagentError {
-    #[error("无效的 action 参数 `{0}`，仅支持 \"spawn\"、\"send\"、\"status\" 或 \"stop\"")]
+    #[error(
+        "无效的 action 参数 `{0}`，仅支持 \"spawn\"、\"send\"、\"status\"、\"stop\" 或 \"yield\""
+    )]
     InvalidAction(String),
     #[error("action 参数必须为字符串")]
     InvalidActionType,
+    #[error("yield 操作缺少或传入空的 message 参数")]
+    MissingYieldMessage,
+    #[error("message 参数必须为字符串")]
+    InvalidYieldMessageType,
     #[error("缺少或为空的 prompt 参数")]
     MissingPrompt,
     #[error("prompt 参数必须为字符串")]
@@ -149,7 +155,7 @@ pub enum SubagentError {
     ModelChangeWhileRunning(String),
     #[error("无法加载子代理 `{0}` 对应的会话 `{1}`")]
     SessionUnavailable(String, String),
-    #[error("缺少父会话上下文，无法启动后台子代理")]
+    #[error("缺少父会话上下文，无法执行子代理操作")]
     MissingParentSession,
     #[error("同名后台子代理 `{0}` 正在运行中")]
     NameAlreadyRunning(String),
@@ -346,9 +352,10 @@ impl SubagentRuntime {
                     Some(
                         "Subagent delegation (`subagent` tool, only when available):\n\
 - Balance responsiveness and efficiency: handle quick 1-3 step lookups directly, and delegate heavy, multi-file, log-heavy, or parallel tasks to background subagents (`action: \"spawn\"`, default) so you stay responsive to the user immediately.\n\
-- Launch independent subagents together in one step, give the user a brief acknowledgement, and end your turn instead of sleeping or polling — settled results arrive as follow-up notices.\n\
-- Use `action: \"send\"` (`name`, `prompt`) to steer a running subagent or wake a settled one with its retained session memory; use `action: \"status\"` for live step/tool/idle inspection or `action: \"stop\"` to cancel.\n\
-- When a `subagent-watchdog:*` alert arrives, inspect the snapshot and decide whether to reassure the user and wait, redirect via `send`, or cancel via `stop`."
+- Launch independent subagents together. While they run, only do independent work that advances the user's request; do not redo delegated work.\n\
+- If the next useful step depends on a pending subagent result, call `subagent(action=\"yield\", message=\"...\")` with a brief user-facing update. This ends your turn; results arrive as follow-ups. Do not sleep or poll.\n\
+- On follow-up, use the results already delivered. If your next step still needs another result, yield again. Use `status` only when the user asks for progress or when investigating a `subagent-watchdog:*` alert.\n\
+- Use `send` to redirect or resume a subagent, or `stop` to cancel it. On a watchdog alert, inspect once, then decide whether to yield, redirect, or cancel."
                             .to_string(),
                     )
                 },

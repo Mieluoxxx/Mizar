@@ -7,7 +7,7 @@ pub mod guard;
 
 pub use collector::{
     TrajectoryAnomalyEvent, TrajectoryConfig, TrajectoryEventEmitted, TrajectoryRuntime,
-    trace_events_from_entries, trace_events_from_session,
+    prepare_trace_jsonl_file, trace_events_from_entries, trace_events_from_session,
 };
 pub use export::{
     DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TRAJECTORY_EXPORT_SCHEMA_VERSION, TraceCompactionEvent,

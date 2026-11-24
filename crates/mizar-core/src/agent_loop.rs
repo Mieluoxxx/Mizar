@@ -1450,6 +1450,7 @@ impl AgentLoop {
             }
 
             let batches = partition_tool_batches(&tools, calls);
+            let mut end_turn_message = None;
             for (batch_idx, batch) in batches.iter().enumerate() {
                 if cancel.is_cancelled() {
                     for pending in batches[batch_idx..].iter().flatten() {
@@ -1535,6 +1536,9 @@ impl AgentLoop {
                     .collect();
 
                 for (call, result) in batch.iter().zip(results) {
+                    if result.end_turn && !result.is_error && !result.blocked {
+                        end_turn_message.get_or_insert_with(|| result.content.clone());
+                    }
                     let extra_contexts = result.additional_contexts.clone();
                     self.emit_event(AgentEvent::ToolResult(AgentToolResultEvent {
                         session: Arc::clone(&session),
@@ -1561,6 +1565,20 @@ impl AgentLoop {
                         session.append(SessionEvent::context_notice(note.source, note.text));
                     }
                 }
+            }
+            // 完整写回同一模型请求的工具结果；正常收尾，不清空等待交付的 FollowUp。
+            if let Some(message) = end_turn_message {
+                if cancel.is_cancelled() {
+                    turn_guard.set_reason(TurnEndReason::Cancelled);
+                    return Err(AgentError::Llm(LlmError::cancelled()));
+                }
+                turn_guard.set_reason(TurnEndReason::Completed);
+                return Ok(TurnRunReport {
+                    text: message,
+                    reason: TurnEndReason::Completed,
+                    last_step_outcome,
+                    steps: steps_executed,
+                });
             }
         }
 

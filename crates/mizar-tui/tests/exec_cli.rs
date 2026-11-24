@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use mizar_core::trajectory::TrajectoryExport;
+use mizar_core::trajectory::{TraceEventKind, TrajectoryExport, TrajectoryRuntime};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -2412,5 +2412,262 @@ async fn exec_turn0_prompt_wire_format_order_file_mentions_and_trace_out() {
         !r_c.body.to_string().contains("SAMPLE_AT_FILE_CONTENT"),
         "disabledPlugins file-mentions should suppress @file expansion: {}",
         r_c.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_trace_jsonl_streaming_env_precedence_append_and_errors() {
+    let tmp = TempRoot::new("exec_trace_jsonl");
+    let home = tmp.path().join("home");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("note.txt"), "hello jsonl\n").unwrap();
+
+    let state = GatewayState::new(
+        vec![
+            MockStep::CompletionsToolCallWithUsage {
+                content_prefix: Some("Reading...".into()),
+                id: "call_jsonl_read".into(),
+                name: "read".into(),
+                args: json!({ "path": "note.txt" }),
+                usage: json!({
+                    "prompt_tokens": 80,
+                    "completion_tokens": 12,
+                }),
+            },
+            MockStep::CompletionsTextWithUsage {
+                text: "JSONL_NORMAL_OK".into(),
+                usage: json!({
+                    "prompt_tokens": 120,
+                    "completion_tokens": 8,
+                }),
+            },
+        ],
+        MockStep::CompletionsText("UNEXPECTED".into()),
+    );
+    let url = start_gateway(Arc::clone(&state)).await;
+    let base_v1 = format!("{url}/v1");
+
+    // A. --isolated + --trace-jsonl <nested/path.jsonl> + --trace-out 共存
+    let jsonl_a = tmp.path().join("nested/logs/trace.jsonl");
+    let trace_out_a = tmp.path().join("nested/logs/trace.json");
+    let mut cmd_a = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-jsonl",
+            jsonl_a.to_str().unwrap(),
+            "--trace-out",
+            trace_out_a.to_str().unwrap(),
+            "read note.txt",
+        ],
+    );
+    cmd_a.env("API_KEY", "sk-jsonl-test");
+    let out_a = run_with_stdin(cmd_a, None).await;
+    assert!(
+        out_a.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out_a.stdout), "JSONL_NORMAL_OK\n");
+
+    let events_a = TrajectoryRuntime::parse_jsonl(&std::fs::read_to_string(&jsonl_a).unwrap())
+        .expect("trace.jsonl must be valid JSONL");
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::UserMessage { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnStart { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepStart { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::FirstToken { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::ToolCall { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::AssistantMessage { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::ToolResult { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepEnd { .. }))
+    );
+    assert!(
+        events_a
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnEnd { .. }))
+    );
+    let export_a: TrajectoryExport =
+        serde_json::from_str(&std::fs::read_to_string(&trace_out_a).unwrap()).unwrap();
+    assert_eq!(export_a.exit_code, 0);
+
+    // B. 连跑第二次指向同一文件验证追加语义（使用 MIZAR_TRACE_JSONL 环境变量）
+    state.set_script(vec![MockStep::CompletionsText("JSONL_SECOND_OK".into())]);
+    let mut cmd_b = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "second run",
+        ],
+    );
+    cmd_b.env("API_KEY", "sk-jsonl-test");
+    cmd_b.env("MIZAR_TRACE_JSONL", &jsonl_a);
+    let out_b = run_with_stdin(cmd_b, None).await;
+    assert!(out_b.status.success());
+    let events_ab =
+        TrajectoryRuntime::parse_jsonl(&std::fs::read_to_string(&jsonl_a).unwrap()).unwrap();
+    assert!(events_ab.len() > events_a.len());
+    assert_ne!(
+        events_ab.first().unwrap().session_id,
+        events_ab.last().unwrap().session_id
+    );
+
+    // C. --trace-jsonl 优先级高于 MIZAR_TRACE_JSONL，且即使 settings.json 禁用了 trajectory 也能写盘
+    std::fs::create_dir_all(ws.join(".mizar")).unwrap();
+    std::fs::write(
+        ws.join(".mizar/settings.json"),
+        r#"{"disabledPlugins":["trajectory"]}"#,
+    )
+    .unwrap();
+    state.set_script(vec![MockStep::CompletionsText("JSONL_OVERRIDE_OK".into())]);
+    let jsonl_cli = tmp.path().join("cli_wins.jsonl");
+    let jsonl_env = tmp.path().join("env_ignored.jsonl");
+    let mut cmd_c = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-jsonl",
+            jsonl_cli.to_str().unwrap(),
+            "override check",
+        ],
+    );
+    cmd_c.env("API_KEY", "sk-jsonl-test");
+    cmd_c.env("MIZAR_TRACE_JSONL", &jsonl_env);
+    let out_c = run_with_stdin(cmd_c, None).await;
+    assert!(
+        out_c.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_c.stderr)
+    );
+    assert!(jsonl_cli.exists());
+    assert!(!jsonl_env.exists());
+    let events_c =
+        TrajectoryRuntime::parse_jsonl(&std::fs::read_to_string(&jsonl_cli).unwrap()).unwrap();
+    assert!(
+        events_c
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnEnd { .. }))
+    );
+    let _ = std::fs::remove_file(ws.join(".mizar/settings.json"));
+
+    // D. 目标路径为已存在目录时，打 [W trace] 告警但主任务保持成功退出
+    state.set_script(vec![MockStep::CompletionsText("JSONL_DIR_WARN_OK".into())]);
+    let bad_dir = tmp.path().join("existing_jsonl_dir");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    let mut cmd_d = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--trace-jsonl",
+            bad_dir.to_str().unwrap(),
+            "bad dir",
+        ],
+    );
+    cmd_d.env("API_KEY", "sk-jsonl-test");
+    let out_d = run_with_stdin(cmd_d, None).await;
+    assert!(out_d.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out_d.stdout),
+        "JSONL_DIR_WARN_OK\n"
+    );
+    let err_d = String::from_utf8_lossy(&out_d.stderr);
+    assert!(err_d.contains("[W trace]"), "{err_d}");
+
+    // E. 超时中断前已经产生的轨迹事件应已实时落盘
+    state.set_script(vec![MockStep::HangForever]);
+    let jsonl_timeout = tmp.path().join("timeout/stream.jsonl");
+    let mut cmd_e = clean_env_cmd(
+        &home,
+        &ws,
+        &[
+            "exec",
+            "--isolated",
+            "--base-url",
+            &base_v1,
+            "--model",
+            "gpt-trace",
+            "--timeout",
+            "1",
+            "--trace-jsonl",
+            jsonl_timeout.to_str().unwrap(),
+            "timeout streaming",
+        ],
+    );
+    cmd_e.env("API_KEY", "sk-jsonl-test");
+    let out_e = run_with_stdin(cmd_e, None).await;
+    assert_eq!(out_e.status.code(), Some(124));
+    let events_e =
+        TrajectoryRuntime::parse_jsonl(&std::fs::read_to_string(&jsonl_timeout).unwrap())
+            .expect("partial streamed JSONL before timeout must parse cleanly");
+    assert!(
+        events_e
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::UserMessage { .. }))
+    );
+    assert!(
+        events_e
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnStart { .. }))
+    );
+    assert!(
+        events_e
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepStart { .. }))
     );
 }

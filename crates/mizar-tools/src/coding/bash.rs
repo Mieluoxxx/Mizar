@@ -617,6 +617,7 @@ pub fn create_bash_tool(cwd: PathBuf) -> ToolDefinition {
                     is_error,
                     structured_content: Some(structured),
                     details: Some(details),
+                    ..ToolOutput::default()
                 })
             }
         },

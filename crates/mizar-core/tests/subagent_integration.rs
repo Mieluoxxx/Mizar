@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt;
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, RunOptions, TurnInput};
+use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, RunOptions, TurnEndReason, TurnInput};
 use mizar_core::session_title::{SessionTitleConfig, SessionTitleRuntime};
 use mizar_core::subagent::{
     SUBAGENT_TOOL_NAME, SubagentConfig, SubagentMode, SubagentRunStatus, SubagentRuntime,
@@ -1347,6 +1348,191 @@ async fn parent_turn_route_is_inherited_without_session_selection() {
 }
 
 #[tokio::test]
+async fn yield_returns_control_before_child_settles() {
+    assert_yield_delivers_followup_once(false).await;
+}
+
+#[tokio::test]
+async fn yield_keeps_followup_that_arrives_before_parent_finishes() {
+    assert_yield_delivers_followup_once(true).await;
+}
+
+async fn assert_yield_delivers_followup_once(child_finishes_first: bool) {
+    const PROGRESS: &str = "已派发调研，等待结果。";
+    const FINDING: &str = "YIELD_CHILD_FINDING";
+
+    struct YieldAdapter {
+        parent_requests: AtomicUsize,
+        child_gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl LlmAdapter for YieldAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let finish = |reason| StreamChunk::Finish {
+                reason,
+                replay: None,
+            };
+            if options.origin == RequestOrigin::Subagent {
+                let gate = Arc::clone(&self.child_gate);
+                return Box::pin(
+                    futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok(StreamChunk::text(FINDING))
+                    })
+                    .chain(futures::stream::iter([Ok(finish(FinishReason::Stop))])),
+                );
+            }
+            let chunks = if self.parent_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                let call = |index, id: &str, name: &str, args: serde_json::Value| {
+                    StreamChunk::tool_call(
+                        index,
+                        ToolCall {
+                            id: id.into(),
+                            name: name.into(),
+                            arguments: args.to_string(),
+                        },
+                    )
+                };
+                vec![
+                    call(0, "spawn", "subagent", json!({"prompt": "调研"})),
+                    call(
+                        1,
+                        "yield",
+                        "subagent",
+                        json!({"action": "yield", "message": PROGRESS}),
+                    ),
+                    call(2, "sibling", "independent_check", json!({})),
+                    finish(FinishReason::ToolCalls),
+                ]
+            } else {
+                let count: usize = options
+                    .messages
+                    .iter()
+                    .map(|msg| msg.text_content().matches(FINDING).count())
+                    .sum();
+                vec![
+                    StreamChunk::text(format!("收到 {count} 份子代理结果")),
+                    finish(FinishReason::Stop),
+                ]
+            };
+            Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+        }
+    }
+
+    let ws = temp_dir("yield");
+    let _dir = DirGuard(ws.clone());
+    std::fs::create_dir_all(&ws).unwrap();
+    let (app, _) = setup_base_app(&ws, SubagentConfig::default(), false).await;
+    let parent = app
+        .sessions()
+        .create_with(mizar_session::SessionCreateOptions {
+            cwd: Some(ws.display().to_string()),
+            ..Default::default()
+        });
+    let mut watch = StateWatch::attach(&app, &parent.id);
+    let agent_loop = app.agent_loop();
+    let inbox = agent_loop.inbox();
+    let child_gate = Arc::new(tokio::sync::Notify::new());
+    let adapter = Arc::new(YieldAdapter {
+        parent_requests: AtomicUsize::new(0),
+        child_gate: Arc::clone(&child_gate),
+    });
+    let _llm = app.llm().register_adapter("main", adapter.clone()).unwrap();
+    let (sibling_started, sibling_release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let _sibling = app
+        .tools()
+        .register(ToolDefinition::async_tool(
+            "independent_check",
+            "Complete an independent check",
+            json!({"type": "object"}),
+            {
+                let started = Arc::clone(&sibling_started);
+                let release = Arc::clone(&sibling_release);
+                move |_, _| {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok::<_, mizar_tools::ToolError>("独立检查已完成".to_string())
+                    }
+                }
+            },
+        ))
+        .unwrap();
+
+    let parent_run = tokio::spawn({
+        let agent_loop = Arc::clone(&agent_loop);
+        let parent = Arc::clone(&parent);
+        async move {
+            agent_loop
+                .run_with_report(
+                    parent,
+                    "调研",
+                    CancellationToken::new(),
+                    RunOptions::default(),
+                )
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), sibling_started.notified())
+        .await
+        .unwrap();
+    if child_finishes_first {
+        child_gate.notify_one();
+        assert_eq!(
+            watch.wait_all_settled(5).await.status,
+            SubagentRunStatus::Completed
+        );
+        assert!(!parent_run.is_finished());
+    }
+    sibling_release.notify_one();
+    let report = tokio::time::timeout(Duration::from_secs(5), parent_run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.reason, TurnEndReason::Completed);
+    assert_eq!(report.text, PROGRESS);
+    assert_eq!(report.steps, 1);
+    assert_eq!(adapter.parent_requests.load(Ordering::SeqCst), 1);
+    for (id, expected) in [("yield", PROGRESS), ("sibling", "独立检查已完成")] {
+        assert!(parent.log().iter().any(|entry| matches!(&entry.event,
+            mizar_session::SessionEvent::ToolResult { tool_call_id, content, is_error: false, .. }
+            if tool_call_id == id && content == expected
+        )));
+    }
+
+    if !child_finishes_first {
+        assert!(inbox.pop_followup(&parent.id).is_none());
+        child_gate.notify_one();
+        assert_eq!(
+            watch.wait_all_settled(5).await.status,
+            SubagentRunStatus::Completed
+        );
+    }
+    let input = inbox
+        .pop_followup(&parent.id)
+        .expect("子代理结果应当保留到下一回合");
+    assert!(inbox.pop_followup(&parent.id).is_none());
+    let reply = agent_loop
+        .run_with_options(
+            Arc::clone(&parent),
+            input,
+            CancellationToken::new(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "收到 1 份子代理结果");
+    assert_eq!(adapter.parent_requests.load(Ordering::SeqCst), 2);
+    app.dispose().await;
+}
+
+#[tokio::test]
 async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
     let ws = temp_dir("bg_fire_and_notify");
     let _guard = DirGuard(ws.clone());
@@ -1358,7 +1544,7 @@ async fn background_spawn_batches_parallel_followups_and_emits_state_events() {
 
     let sys_prompt = app.system_prompt().build();
     assert!(
-        sys_prompt.contains("end your turn instead of sleeping or polling"),
+        sys_prompt.contains("subagent(action=\"yield\", message=\"...\")"),
         "system prompt missing background contract:\n{sys_prompt}"
     );
 

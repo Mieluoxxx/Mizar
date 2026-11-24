@@ -22,8 +22,8 @@ use mizar_core::spine::{
     load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
 };
 use mizar_core::trajectory::{
-    DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryExport,
-    write_trace_export_atomic,
+    DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryConfig,
+    TrajectoryExport, prepare_trace_jsonl_file, write_trace_export_atomic,
 };
 use mizar_llm::retry::RetryConfig;
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
@@ -74,11 +74,29 @@ pub struct ExecConfig {
     pub resume_session: Option<ResumeTarget>,
     pub output_format: ExecOutputFormat,
     pub trace_out: Option<PathBuf>,
+    pub trace_jsonl: Option<PathBuf>,
 }
 
 /// 解析无头轨迹导出路径：CLI `--trace-out` 优先级高于环境变量 `MIZAR_TRACE_OUT`。
 pub fn resolve_trace_out_path(cli: Option<PathBuf>, env: Option<String>) -> Option<PathBuf> {
     cli.or_else(|| env.filter(|s| !s.trim().is_empty()).map(PathBuf::from))
+}
+
+/// 解析轨迹 JSONL 输出路径：CLI `--trace-jsonl` 优先级高于环境变量 `MIZAR_TRACE_JSONL`。
+pub fn resolve_trace_jsonl_path(cli: Option<PathBuf>, env: Option<String>) -> Option<PathBuf> {
+    cli.or_else(|| env.filter(|s| !s.trim().is_empty()).map(PathBuf::from))
+}
+
+/// 将显式请求的轨迹 JSONL 文件路径装配到 `AgentSpineConfig`，并确保 `trajectory` 不会被配置屏蔽。
+pub fn configure_spine_trace_jsonl(spine_cfg: &mut AgentSpineConfig, trace_jsonl: Option<&Path>) {
+    let Some(path) = trace_jsonl else {
+        return;
+    };
+    spine_cfg
+        .trajectory
+        .get_or_insert_with(TrajectoryConfig::default)
+        .export_file = Some(path.to_path_buf());
+    spine_cfg.disabled_plugins.retain(|id| id != "trajectory");
 }
 
 /// 解析来自命令行参数、文件或标准输入的任务文本；拒绝空白与冲突来源。
@@ -477,6 +495,16 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let exec_started = std::time::Instant::now();
     let env_override = EnvLlmOverride::from_env();
     let log_secrets = Arc::new(Mutex::new(env_override.collect_secrets()));
+    if let Some(path) = cfg.trace_jsonl.as_deref()
+        && let Err(err) = prepare_trace_jsonl_file(path)
+    {
+        let guard = log_secrets.lock().unwrap();
+        let clean = single_line(&sanitize_diagnostic_text(&err.to_string(), &guard));
+        eprintln!(
+            "[W trace] failed to prepare trajectory JSONL at \"{}\": {clean}",
+            path.display()
+        );
+    }
     let make_meta = |exit_code: i32,
                      termination_reason: &str,
                      error: Option<String>,
@@ -661,6 +689,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
+    configure_spine_trace_jsonl(&mut spine_cfg, cfg.trace_jsonl.as_deref());
     // 一次性无头 exec 由 codemode 承担确定性并行与上下文减负，关闭异步交互分身插件
     disable_exec_subagent(&mut spine_cfg);
     if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.session_db.is_none()) {
@@ -1448,5 +1477,42 @@ mod tests {
         assert_eq!(parsed.exit_code, 1);
         assert_eq!(parsed.termination_reason, "error");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_trace_jsonl_and_configure_spine_overrides_disabled_trajectory() {
+        assert_eq!(
+            resolve_trace_jsonl_path(
+                Some(PathBuf::from("cli/trace.jsonl")),
+                Some("env/trace.jsonl".to_string())
+            ),
+            Some(PathBuf::from("cli/trace.jsonl"))
+        );
+        assert_eq!(
+            resolve_trace_jsonl_path(None, Some("env/trace.jsonl".to_string())),
+            Some(PathBuf::from("env/trace.jsonl"))
+        );
+        assert_eq!(
+            resolve_trace_jsonl_path(None, Some("   ".to_string())),
+            None
+        );
+        assert_eq!(resolve_trace_jsonl_path(None, None), None);
+
+        let mut spine = AgentSpineConfig::coding(PathBuf::from("/tmp"))
+            .with_disabled_plugins(["trajectory", "mcp"]);
+        spine.trajectory = None;
+
+        let target = PathBuf::from("logs/session-trace.jsonl");
+        configure_spine_trace_jsonl(&mut spine, Some(&target));
+
+        assert_eq!(
+            spine
+                .trajectory
+                .as_ref()
+                .and_then(|c| c.export_file.as_ref()),
+            Some(&target)
+        );
+        assert!(!spine.disabled_plugins.iter().any(|id| id == "trajectory"));
+        assert!(spine.disabled_plugins.iter().any(|id| id == "mcp"));
     }
 }

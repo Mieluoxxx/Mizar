@@ -57,12 +57,14 @@
 | `compaction` | `CompactionRuntime::install` | `llm`、`sessions`、`tools`、`agent_loop`、`system_prompt` | 单阶段检查点压缩（真实可用窗口 80% 触发、`<mizar-digest>` 硬事实、膨胀保护、溢出 `retain=0` 恢复）与压后写文件/读去重守卫，提供 `on_start`/`on_progress`/`on_end` |
 | `instructions` | `AgentInstructions::install` | `tools`、`agent_loop` | 扫描 `~/.mizar/`、`~/.agents/`、项目根到工作区祖先链及触达子目录的 `AGENTS.md` / `CLAUDE.md`，去重裁切并在 `pre_step_hook` 注入 `ContextNotice` |
 | `skills` | `SkillRegistry`、`install_skills` | `tools`、`sessions`、`agent_loop` | 分层发现 `SKILL.md`、注册 `skill` 工具、目录注入、写入命中热失效及 `on_change` |
-| `trajectory` | `TrajectoryRuntime::install`、`install_repeat_guard` | `agent_loop`、`tools`、`sessions` | 实时采集 `TraceEvent`、`on_anomaly` 异常检测、`trajectory.jsonl` 导出与连续重复失败工具调用拦截 |
+| `trajectory` | `TrajectoryRuntime::install`、`install_repeat_guard` | `agent_loop`、`tools`、`sessions` | 实时采集 `TraceEvent`、`on_anomaly` 异常检测、`trajectory.jsonl` 导出与单文件实时流式追加（`export_file` / `--trace-jsonl` / `MIZAR_TRACE_JSONL`）、以及连续重复失败工具调用拦截 |
 | `session_title` | `SessionTitleRuntime::install` | `llm`、`agent_loop` | 异步生成与刷新 `MMDD｜TYPE｜Topic` 会话标题，尊重 `/rename` 人工所有权，自动跳过子代理 |
-| `subagent` | `SubagentRuntime::install` | `llm`、`tools`、`sessions`、`agent_loop`、`system_prompt` | UNIX 进程式单层后台常驻分身 `subagent`（`ModelOnly`），支持 `spawn`/`send`/`status`/`stop`、零 Token 活性看门狗、深度 1 护栏与 `on_state` |
+| `subagent` | `SubagentRuntime::install` | `llm`、`tools`、`sessions`、`agent_loop`、`system_prompt` | UNIX 进程式单层后台常驻分身 `subagent`（`ModelOnly`），支持 `spawn`/`send`/`status`/`stop`/`yield`、零 Token 活性看门狗、深度 1 护栏与 `on_state` |
 | `spine` | `MizarRuntime::build`、`SpinePlugins`、`build_tools_guide_section`、`LoadedMizarConfig` | 静态组合根 | 按编译期 DAG 顺序静态构造核心服务与 12 个内置可选模块，托管 `HookGuard` 并在 `shutdown()` 时按 LIFO 逆序清理；`SpinePlugins` 控制可选模块原子启停（`mcp` 启动禁用时延后首次按需启动；核心自保护、`tools_guide` `order=20` 段落、识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主扩展 ID），并承载 `settings.json` / `models.json` / CLI 路由解析 |
 
 **内部 Crate 依赖**：`mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`，以及按 Cargo feature 选配的 `mizar-codemode`、`mizar-mcp`。
+
+`subagent(action="yield", message="…")` 用于交还主代理回合：写回当前模型请求发出的全部工具结果（含面向用户的进度说明）后正常结束，不等待或取消子任务，也不发额外的模型请求。后台结果仍由 `SessionInbox` 的 `FollowUp` 交给宿主；单次无头 `exec` 不启用子代理。
 
 ### Cargo Features 清单
 

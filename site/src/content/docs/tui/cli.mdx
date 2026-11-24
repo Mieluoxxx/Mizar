@@ -77,7 +77,11 @@ mizar --no-persist --no-instructions
 
 ```bash title="无头执行、隔离环境与轨迹导出"
 # 隔离模式运行单次任务（跳过个人 ~/.mizar / ~/.agents 配置、MCP、Skills 与全局历史库）
-mizar exec --isolated -C /path/to/repo --output-format json --trace-out /tmp/trace.json "修复单测并汇报结果"
+# 同时导出退出汇总 JSON（--trace-out）与实时流式 JSONL 轨迹日志（--trace-jsonl）
+mizar exec --isolated -C /path/to/repo --output-format json --trace-out /tmp/trace.json --trace-jsonl /tmp/trace.jsonl "修复单测并汇报结果"
+
+# 交互式 TUI 同样支持实时流式写入 JSONL 轨迹日志
+mizar --trace-jsonl /tmp/tui-trace.jsonl
 
 # 从标准输入读取任务文本
 echo "Summarize README.md" | mizar exec --read-only
@@ -92,6 +96,7 @@ echo "Summarize README.md" | mizar exec --read-only
 | `--reasoning-effort <LVL>` / `--max-steps <N>` / `--max-tokens <N>` / `--timeout <SECS>` | 调整思考档位、单轮最大工具步数、单次最大输出 Token 与总超时 |
 | `--output-format <FMT>` / `--json` | 输出格式（`text` 或结构化 `json`） |
 | `--trace-out <PATH>` | 退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先） |
+| `--trace-jsonl <PATH>` | 实时流式追加每条 `TraceEvent` 到单个 JSONL 轨迹日志文件（TUI 与无头模式通用；可用环境变量 `MIZAR_TRACE_JSONL` 指定，CLI 优先；自动创建父目录、覆盖 `disabledPlugins` 中的 `"trajectory"`，可与 `--trace-out` 并用） |
 
 ## 检查与原地更新
 
