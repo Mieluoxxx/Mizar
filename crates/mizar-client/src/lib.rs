@@ -2,6 +2,7 @@
 //!
 //! 供 `mizar-tui` 与桌面端（Merak）共同复用，严禁引入 `ratatui`、`crossterm` 或 `mizar-tui-ui`。
 
+pub mod actor;
 pub mod approval;
 pub mod events;
 pub mod images;
@@ -13,9 +14,15 @@ pub mod session_view;
 pub mod settings;
 pub mod workspace;
 
+pub use actor::{
+    ACTIVE_TURN_OUTPUT_TAIL_MAX_BYTES, ActiveTurnBuffer, ActorError, SessionActor,
+    SessionActorConfig, SessionActorHandle, subagent_snapshot_to_dto, tail_utf8_capped,
+};
 pub use approval::{
-    ApprovalGateConfig, ApprovalSnapshot, install_approval_gate, register_approval_hook,
-    register_approval_hook_with, tool_needs_approval,
+    ApprovalGateConfig, ApprovalResolveMeta, ApprovalSideEffects, ApprovalSnapshot,
+    PendingInteractionEntry, PendingInteractions, ResolveInteractionError, install_approval_gate,
+    register_approval_hook, register_approval_hook_with, register_approval_hook_with_interactions,
+    tool_needs_approval,
 };
 pub use events::{
     ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, steer_session,

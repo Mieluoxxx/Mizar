@@ -443,14 +443,20 @@ impl AppState {
                 self.refresh_context_breakdown();
             }
             UiEvent::ApprovalRequested {
+                request_id,
+                call_id,
                 tool_name,
                 args_preview,
                 responder,
             } => {
                 if let Some(tx) = responder.lock().unwrap().take() {
-                    let opened_now =
-                        self.overlay
-                            .open_approval(tool_name.clone(), args_preview, tx);
+                    let opened_now = self.overlay.open_approval(
+                        request_id,
+                        call_id,
+                        tool_name.clone(),
+                        args_preview,
+                        tx,
+                    );
                     if opened_now {
                         self.record_program_status(
                             ProgramStatusState::Blocked,
@@ -460,6 +466,20 @@ impl AppState {
                     }
                 }
             }
+            UiEvent::ApprovalResolved { request_id } => {
+                if self.overlay.dismiss_approval(&request_id) && !self.promote_next_approval() {
+                    self.record_program_status(
+                        if self.is_busy() {
+                            ProgramStatusState::Working
+                        } else {
+                            ProgramStatusState::Idle
+                        },
+                        None,
+                        None,
+                    );
+                }
+            }
+            UiEvent::SessionSwitched { .. } | UiEvent::QueueUpdated { .. } => {}
             UiEvent::CompactionStarted { trigger } => {
                 let label = match trigger.as_str() {
                     "manual" => "手动压缩中…",
