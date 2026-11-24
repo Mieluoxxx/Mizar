@@ -1,13 +1,13 @@
-//! 异步运行循环：将 `MizarRuntime`（AgentLoop / Trajectory / Spine）事件接入终端界面，并按 `disabledPlugins` 条件挂载客户端与 TUI 扩展。
+//! 异步运行循环：通过 `SessionActor` / `SessionActorHandle` 驱动单会话核心循环，并将零序列化 `ClientEvent` 接入终端界面。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::EventStream;
-use mizar_client::approval::{ApprovalSnapshot, install_approval_gate};
+use mizar_client::actor::{SessionActor, SessionActorConfig};
 use mizar_client::logging::{env_log_level_override, install_tracing_handler};
-use mizar_client::mentions::{FileMentionsConfig, install_file_mentions};
+use mizar_client::run_dir::{check_session_writable, ensure_run_dir, resolve_run_dir};
 use mizar_client::workspace::collect_user_skill_names;
 use mizar_core::spine::MizarRuntime;
 use mizar_core::system_prompt::{PromptSection, SystemPrompt};
@@ -49,7 +49,10 @@ pub use mizar_client::settings::{
     persist_setting_change, persist_setting_change_to, toggle_spine_module,
 };
 
-use actions::{SidePanelRefreshController, handle_action, populate_side_panel_data};
+use actions::{
+    SidePanelRefreshController, TuiActorSync, handle_action, populate_side_panel_data,
+    process_actor_client_event_dirty, sync_queue_after_term_event,
+};
 use terminal_io::{
     create_terminal, flush_inline_scrollback, handle_term_event_dirty, insert_scrollback_lines,
     poll_term_event, process_loop_ui_msg_dirty,
@@ -221,6 +224,10 @@ pub struct TuiConfig {
     pub mouse_capture: Option<bool>,
     pub resume_session: Option<ResumeTarget>,
     pub session_db_path: Option<PathBuf>,
+    /// 单写者锁与本地 Socket 运行目录（测试默认 `None` 以避免触碰全局 `~/.mizar/run/`）。
+    pub run_dir: Option<PathBuf>,
+    /// 是否启用本地 RPC Unix Socket（`TuiConfig::new` 默认 `false`，交互式 CLI 启动设为 `true`）。
+    pub enable_rpc_socket: bool,
     pub restrict_to_workspace: bool,
     pub check_for_updates: bool,
     pub disabled_plugins: Vec<String>,
@@ -247,6 +254,8 @@ impl TuiConfig {
             mouse_capture: None,
             resume_session: None,
             session_db_path: None,
+            run_dir: None,
+            enable_rpc_socket: false,
             restrict_to_workspace: false,
             check_for_updates: false,
             disabled_plugins: Vec::new(),
@@ -414,15 +423,20 @@ pub(super) fn process_loop_ui_msg(
     }
 
     if let UiEvent::RunFinished(ref res) = event {
-        let Some(finished_task) = task_state.finish_if_current(
-            run_id,
-            msg_session_id.as_deref(),
-            &app.session_id,
-            ActiveTaskKind::AgentRun,
-        ) else {
-            return AppAction::None;
+        let finished_task = if run_id.is_some() {
+            let Some(task) = task_state.finish_if_current(
+                run_id,
+                msg_session_id.as_deref(),
+                &app.session_id,
+                ActiveTaskKind::AgentRun,
+            ) else {
+                return AppAction::None;
+            };
+            Some(task)
+        } else {
+            None
         };
-        let was_aborted = finished_task.user_cancelled
+        let was_aborted = finished_task.as_ref().is_some_and(|t| t.user_cancelled)
             || res.as_ref().is_err_and(|e| e.contains("request aborted"))
             || matches!(app.last_turn_end_reason, Some(UiTurnEndReason::Cancelled));
         let is_ok = res.is_ok();
@@ -433,25 +447,7 @@ pub(super) fn process_loop_ui_msg(
             );
         app.apply_ui_event(event);
 
-        if !was_aborted
-            && turn_completed
-            && let Some(next) = app.dequeue_next()
-        {
-            if !next.images.is_empty() && !app.active_model_supports_images() {
-                app.input
-                    .replace_draft_from_queue_with_images(&next.text, &next.images);
-                app.reject_unsupported_images_notice();
-                return AppAction::RefreshSidePanelData;
-            }
-            app.push_user_message(&next.text);
-            if next.images.is_empty() {
-                return AppAction::SubmitPrompt(next.text);
-            }
-            return AppAction::SubmitPromptWithImages {
-                text: next.text,
-                images: next.images.into_iter().map(|(_, img)| img).collect(),
-            };
-        }
+        // 队列自动出队由 SessionActor 内部 run_wake_loop 独占驱动，此处仅在非正常结束时提示保留条数
         if !was_aborted && !turn_completed && !app.queue.is_empty() {
             app.push_notice(
                 NoticeLevel::Warn,
@@ -465,12 +461,13 @@ pub(super) fn process_loop_ui_msg(
     AppAction::None
 }
 
-async fn poll_inbox_wake(
-    rx: Option<&mut tokio::sync::broadcast::Receiver<String>>,
-) -> Result<String, tokio::sync::broadcast::error::RecvError> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
+async fn poll_client_event(rx: &mut tokio::sync::broadcast::Receiver<UiEvent>) -> Option<UiEvent> {
+    loop {
+        match rx.recv().await {
+            Ok(ev) => return Some(ev),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }
 
@@ -494,6 +491,24 @@ pub async fn run_tui_with_summary(
 
     let sessions = &runtime.sessions;
     let mut resume_notice: Option<(NoticeLevel, String)> = None;
+    let effective_run_dir = match &config.run_dir {
+        Some(dir) => match ensure_run_dir(dir) {
+            Ok(()) => Some(dir.clone()),
+            Err(err) => {
+                resume_notice = Some((NoticeLevel::Warn, format!("运行目录初始化失败：{err}")));
+                None
+            }
+        },
+        None if config.enable_rpc_socket => match resolve_run_dir() {
+            Ok(dir) => Some(dir),
+            Err(err) => {
+                resume_notice = Some((NoticeLevel::Warn, format!("运行目录初始化失败：{err}")));
+                None
+            }
+        },
+        None => None,
+    };
+
     let mut startup_picker_items: Option<Vec<SessionPickerItem>> = None;
     let (initial_session, resumed) = match &config.resume_session {
         Some(ResumeTarget::Picker) => {
@@ -502,7 +517,17 @@ pub async fn run_tui_with_summary(
         }
         Some(ResumeTarget::Id(target_id)) => {
             if let Some(found) = sessions.get(target_id) {
-                (found, true)
+                if let Some(ref rd) = effective_run_dir
+                    && let Err(lock_err) = check_session_writable(rd, &found.id, std::process::id())
+                {
+                    resume_notice = Some((
+                        NoticeLevel::Error,
+                        format!("无法恢复会话 `{target_id}`：{lock_err}，已开启新会话"),
+                    ));
+                    (sessions.create(None), false)
+                } else {
+                    (found, true)
+                }
             } else {
                 resume_notice = Some((
                     NoticeLevel::Warn,
@@ -525,7 +550,17 @@ pub async fn run_tui_with_summary(
             if let Some(id) = latest_id
                 && let Some(found) = sessions.get(&id)
             {
-                (found, true)
+                if let Some(ref rd) = effective_run_dir
+                    && let Err(lock_err) = check_session_writable(rd, &found.id, std::process::id())
+                {
+                    resume_notice = Some((
+                        NoticeLevel::Error,
+                        format!("无法恢复最近会话 `{}`：{lock_err}，已开启新会话", found.id),
+                    ));
+                    (sessions.create(None), false)
+                } else {
+                    (found, true)
+                }
             } else {
                 resume_notice = Some((
                     NoticeLevel::Info,
@@ -553,18 +588,7 @@ pub async fn run_tui_with_summary(
     });
 
     let mut active_session = Arc::clone(&initial_session);
-    let active_sid = Arc::new(RwLock::new(active_session.id.clone()));
     let mut guards = Vec::new();
-    {
-        let bus_tx = loop_tx.clone();
-        guards.push(subscribe_session_events_into(
-            &runtime,
-            Arc::clone(&active_sid),
-            move |ev| {
-                let _ = bus_tx.send(LoopClientMsg::Bus(ev));
-            },
-        ));
-    }
 
     let mut app = AppState::new(
         config.workspace.clone(),
@@ -682,37 +706,21 @@ pub async fn run_tui_with_summary(
         guards.push(guard);
     }
 
-    // 共享审批快照（供 tools.pre_execute_hook 异步瀑布流无锁读取当前审批策略）
-    let approval_snap = Arc::new(RwLock::new(ApprovalSnapshot {
-        mode: app.approval_mode,
-        always_allowed: app.always_allowed_tools.clone(),
-    }));
-    if ext_flags.approval_gate {
-        let approval_tx = loop_tx.clone();
-        guards.push(install_approval_gate(
-            &runtime,
-            mizar_client::approval::ApprovalGateConfig::with_callback(
-                Arc::clone(&active_sid),
-                Arc::clone(&approval_snap),
-                move |ev| {
-                    let _ = approval_tx.send(LoopClientMsg::Bus(ev));
-                },
-            ),
-        ));
-    }
-    if ext_flags.file_mentions {
-        let mention_tx = loop_tx.clone();
-        guards.push(install_file_mentions(
-            &runtime,
-            FileMentionsConfig::with_callback(
-                config.workspace.clone(),
-                config.restrict_to_workspace,
-                move |ev| {
-                    let _ = mention_tx.send(LoopClientMsg::Bus(ev));
-                },
-            ),
-        ));
-    }
+    let mut actor_cfg = SessionActorConfig::new(&config.workspace);
+    actor_cfg.session_db_path = config.session_db_path.clone();
+    actor_cfg.run_dir = effective_run_dir.clone();
+    actor_cfg.provider = app.provider.clone();
+    actor_cfg.model = app.model.clone();
+    actor_cfg.reasoning_effort = app.reasoning_effort;
+    actor_cfg.approval_mode = app.approval_mode;
+    actor_cfg.always_allowed_tools = app.always_allowed_tools.clone();
+    actor_cfg.max_steps = config.max_steps;
+    actor_cfg.restrict_to_workspace = config.restrict_to_workspace;
+    actor_cfg.host_extensions = ext_flags;
+
+    let actor = SessionActor::spawn(Arc::clone(&runtime), Arc::clone(&active_session), actor_cfg);
+    let mut client_rx = actor.subscribe_client_events();
+    let mut sync = TuiActorSync::new(&active_session, &app);
 
     if app.features.side_panel && app.side_panel.open {
         populate_side_panel_data(&runtime, &mut app).await;
@@ -729,8 +737,6 @@ pub async fn run_tui_with_summary(
 
         let mut term_stream = Some(EventStream::new());
         let (mut panel_ctrl, mut panel_rx) = SidePanelRefreshController::new();
-        let mut wake_rx = Some(runtime.agent_loop.inbox().subscribe_wake());
-        let mut inbox_wake_ready = false;
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(90));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut reveal_tick = tokio::time::interval(Duration::from_millis(33));
@@ -768,6 +774,7 @@ pub async fn run_tui_with_summary(
                     maybe_term = poll_term_event(term_stream.as_mut()) => {
                         match maybe_term {
                             Some(Ok(ev)) => {
+                                let prev_queue = app.queue.items().to_vec();
                                 let (mut next_action, mut dirty) = handle_term_event_dirty(&mut app, ev);
                                 // 使用非阻塞 poll(0)+read() 排空底层就绪的连发键盘/滚动/鼠标事件，
                                 // 绝不向 EventStream 注入 noop_waker（否则会占住后台 wake_task 导致后续输入失活）。
@@ -794,11 +801,65 @@ pub async fn run_tui_with_summary(
                                         }
                                     }
                                 }
+                                if sync_queue_after_term_event(
+                                    &actor,
+                                    &config,
+                                    &mut app,
+                                    &mut sync,
+                                    &prev_queue,
+                                )
+                                .await
+                                {
+                                    dirty = true;
+                                }
                                 (next_action, dirty)
                             }
                             Some(Err(err)) => {
                                 app.push_notice(NoticeLevel::Error, format!("终端事件读取失败：{err}"));
                                 (AppAction::None, true)
+                            }
+                            None => (AppAction::Quit, true),
+                        }
+                    }
+                    maybe_client = poll_client_event(&mut client_rx) => {
+                        match maybe_client {
+                            Some(ev) => {
+                                let (mut next_action, mut dirty) = process_actor_client_event_dirty(
+                                    &actor,
+                                    &mut active_session,
+                                    &mut app,
+                                    &mut task_state,
+                                    &mut sync,
+                                    ev,
+                                );
+                                // 把缓冲区积压的 delta 一次性排空，降低高并发流式输出时的重绘次数
+                                if next_action == AppAction::None {
+                                    loop {
+                                        match client_rx.try_recv() {
+                                            Ok(more) => {
+                                                let (act, ev_dirty) = process_actor_client_event_dirty(
+                                                    &actor,
+                                                    &mut active_session,
+                                                    &mut app,
+                                                    &mut task_state,
+                                                    &mut sync,
+                                                    more,
+                                                );
+                                                dirty |= ev_dirty;
+                                                if act != AppAction::None {
+                                                    next_action = act;
+                                                    break;
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                                            Err(
+                                                tokio::sync::broadcast::error::TryRecvError::Empty
+                                                | tokio::sync::broadcast::error::TryRecvError::Closed,
+                                            ) => break,
+                                        }
+                                    }
+                                }
+                                (next_action, dirty)
                             }
                             None => (AppAction::Quit, true),
                         }
@@ -811,7 +872,6 @@ pub async fn run_tui_with_summary(
                                     &mut task_state,
                                     msg,
                                 );
-                                // 把缓冲区积压的 delta 一次性排空，降低高并发流式输出时的重绘次数
                                 if next_action == AppAction::None {
                                     while let Ok(more) = loop_rx.try_recv() {
                                         let (act, ev_dirty) = process_loop_ui_msg_dirty(
@@ -873,24 +933,6 @@ pub async fn run_tui_with_summary(
                         }
                         (AppAction::None, dirty)
                     }
-                    maybe_wake = poll_inbox_wake(wake_rx.as_mut()), if !app.is_running_activity() && task_state.active_task().is_none() => {
-                        match maybe_wake {
-                            Ok(sid) => {
-                                if sid == active_session.id {
-                                    inbox_wake_ready = true;
-                                }
-                                (AppAction::None, false)
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                inbox_wake_ready = true;
-                                (AppAction::None, false)
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                wake_rx = None;
-                                (AppAction::None, false)
-                            }
-                        }
-                    }
                     Some((panel_gen, panel_sid, snapshot)) = panel_rx.recv() => {
                         let dirty = if panel_gen == panel_ctrl.current_gen()
                             && panel_sid == app.session_id
@@ -908,60 +950,25 @@ pub async fn run_tui_with_summary(
 
                 needs_redraw |= step_dirty || action != AppAction::None;
 
-                let was_cancel_run = matches!(action, AppAction::CancelRun);
+                if action != AppAction::None {
+                    sync.sync_config_if_changed(&actor, &app).await;
+                }
                 handle_action(
+                    &actor,
                     &runtime,
                     &config,
                     &mut app,
                     &mut active_session,
                     &mut terminal,
                     &mut term_stream,
-                    &active_sid,
                     &loop_tx,
                     &mut task_state,
                     &mut panel_ctrl,
+                    &mut sync,
                     action,
                 )
                 .await;
-                if was_cancel_run {
-                    if let Some(ref mut rx) = wake_rx {
-                        while let Ok(_)
-                        | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) =
-                            rx.try_recv()
-                        {}
-                    }
-                    inbox_wake_ready = false;
-                }
-
-                let can_drain_inbox_followup = !app.is_running_activity()
-                    && task_state.active_task().is_none()
-                    && (inbox_wake_ready
-                        || matches!(
-                            app.last_turn_end_reason,
-                            None | Some(UiTurnEndReason::Completed)
-                        ));
-                inbox_wake_ready = false;
-                if can_drain_inbox_followup
-                    && actions::drain_next_inbox_followup(
-                        &runtime,
-                        &config,
-                        &mut app,
-                        &active_session,
-                        &loop_tx,
-                        &mut task_state,
-                    )
-                {
-                    needs_redraw = true;
-                }
-
-                if let Ok(mut guard) = approval_snap.write() {
-                    if guard.mode != app.approval_mode {
-                        guard.mode = app.approval_mode;
-                    }
-                    if guard.always_allowed != app.always_allowed_tools {
-                        guard.always_allowed = app.always_allowed_tools.clone();
-                    }
-                }
+                sync.sync_config_if_changed(&actor, &app).await;
             }
             Ok(())
         }
@@ -978,9 +985,7 @@ pub async fn run_tui_with_summary(
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     emit_program_status(ProgramStatusState::Idle, None, None);
     task_state.abort_for_session_switch();
-    if let Some(sub) = runtime.subagent.as_ref() {
-        sub.cancel_parent_subagents(&app.session_id);
-    }
+    actor.shutdown().await;
     for guard in guards.into_iter().rev() {
         drop(guard);
     }
@@ -1050,12 +1055,9 @@ mod tests {
             &mut task_state,
             UiEvent::RunFinished(Ok("done".into())),
         );
-        assert_eq!(act2, AppAction::SubmitPrompt("queued follow-up".into()));
-        assert!(app.queue.is_empty());
-        assert!(matches!(
-            app.items.last(),
-            Some(ChatItem::User { text }) if text == "queued follow-up"
-        ));
+        // 正常结束时由 SessionActor run_wake_loop 独占出队并经 QueueUpdated 同步，runner 不得重复派发 SubmitPrompt
+        assert_eq!(act2, AppAction::RefreshSidePanelData);
+        assert_eq!(app.queue.len(), 1);
     }
 
     #[tokio::test]
@@ -1336,7 +1338,7 @@ mod tests {
             )));
         }
 
-        // 正常 Completed 时应继续自动出队下一条。
+        // 正常 Completed 时保留给 SessionActor 自动出队，process_loop_ui_msg 不提前清空或重复 SubmitPrompt。
         let mut app = AppState::new(
             PathBuf::from("."),
             "sess-queued-complete",
@@ -1361,8 +1363,8 @@ mod tests {
             &mut task_state,
             UiEvent::RunFinished(Ok("done".into())),
         );
-        assert_eq!(action, AppAction::SubmitPrompt("auto dequeue me".into()));
-        assert!(app.queue.is_empty());
+        assert_eq!(action, AppAction::RefreshSidePanelData);
+        assert_eq!(app.queue.len(), 1);
     }
 
     #[test]
@@ -1844,6 +1846,7 @@ mod tests {
         use std::sync::Arc;
 
         use futures::channel::mpsc as futures_mpsc;
+        use mizar_client::actor::{SessionActor, SessionActorConfig};
         use mizar_core::agent_loop::{DeliveryMode, TurnInput};
         use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
         use mizar_llm::{
@@ -1851,7 +1854,8 @@ mod tests {
             ProviderInfo, ReasoningEffort, StreamChunk, ToolCall,
         };
         use mizar_tools::{ToolDefinition, ToolOutput};
-        use tokio::sync::{Notify, mpsc};
+        use mizar_types::client::ClientEvent;
+        use tokio::sync::Notify;
 
         struct SteerTuiAdapter {
             recorded: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
@@ -1968,7 +1972,7 @@ mod tests {
             ))
             .unwrap();
 
-        let sess = runtime.sessions.create(None);
+        let mut sess = runtime.sessions.create(None);
         let cfg = super::TuiConfig::new(std::env::temp_dir());
         let mut app = AppState::new(
             std::env::temp_dir(),
@@ -1978,65 +1982,81 @@ mod tests {
             Some("m-tui".into()),
             None,
         );
-        let (loop_tx, mut loop_rx) = mpsc::unbounded_channel::<super::LoopClientMsg>();
+        let actor = SessionActor::spawn(
+            Arc::clone(&runtime),
+            Arc::clone(&sess),
+            SessionActorConfig::new(std::env::temp_dir()).with_provider_model(
+                Some("mock-tui".into()),
+                Some("m-tui".into()),
+                None,
+            ),
+        );
+        let mut client_rx = actor.subscribe_client_events();
+        let mut sync = super::actions::TuiActorSync::new(&sess, &app);
         let mut task_state = super::RunController::default();
 
-        // 1. 启动第一轮（进入阻塞工具），然后发温和 SteerPrompt：不得取消活跃 CancellationToken
-        super::actions::spawn_agent_run(
-            &runtime,
-            &cfg,
+        // 1. 启动第一轮（进入阻塞工具），然后发温和 SteerPrompt：不得取消活跃轮次
+        app.push_user_message("first turn");
+        super::actions::submit_turn_via_actor(
+            &actor,
             &mut app,
-            &sess,
-            &loop_tx,
-            &mut task_state,
+            &mut sync,
             "first turn".into(),
             Vec::new(),
-        );
+        )
+        .await;
         started_round.notified().await;
 
-        super::actions::handle_steer_prompt(
-            &runtime,
+        super::actions::handle_steer_prompt_via_actor(
+            &actor,
             &cfg,
             &mut app,
-            &sess,
-            &loop_tx,
-            &mut task_state,
+            &mut sync,
             "gentle steer".into(),
             Vec::new(),
         )
         .await;
-
-        let active_task = task_state.active_task().unwrap();
-        assert!(!active_task.cancel.is_cancelled());
-        assert!(!active_task.user_cancelled);
         assert!(app.active_flash().is_some_and(|s| s.contains("步间插话")));
 
         release_round.notify_one();
         let finish_msg = loop {
-            match loop_rx.recv().await.unwrap() {
-                super::LoopClientMsg::Task {
-                    event: super::UiEvent::RunFinished(res),
-                    ..
-                } => break res,
-                _ => continue,
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let is_done = match &ev {
+                ClientEvent::RunFinished(res) => Some(res.clone()),
+                _ => None,
+            };
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if let Some(res) = is_done {
+                break res;
             }
         };
         assert_eq!(finish_msg.unwrap(), "steered reply");
-        task_state.active = None;
-        app.set_busy_state(false);
+        assert_eq!(
+            app.items
+                .iter()
+                .filter(|it| matches!(it, ChatItem::User { text } if text == "gentle steer"))
+                .count(),
+            1
+        );
 
-        // 2. 启动第二轮并预塞 FollowUp，然后执行硬取消 cancel_active_run：立即取消且清空收件箱
+        // 2. 启动第二轮并预塞 FollowUp，然后执行硬取消：立即取消、清空用户项并保留后台通知为 Inject
         let agent_loop = &runtime.agent_loop;
-        super::actions::spawn_agent_run(
-            &runtime,
-            &cfg,
+        app.push_user_message("abort turn");
+        super::actions::submit_turn_via_actor(
+            &actor,
             &mut app,
-            &sess,
-            &loop_tx,
-            &mut task_state,
+            &mut sync,
             "abort turn".into(),
             Vec::new(),
-        );
+        )
+        .await;
         started_round.notified().await;
         agent_loop.inbox().push(
             &sess.id,
@@ -2051,9 +2071,8 @@ mod tests {
             "subagent:batch",
         );
 
-        super::actions::cancel_active_run(&runtime, &mut app, &sess, &mut task_state);
-        assert!(task_state.active_task().unwrap().cancel.is_cancelled());
-        assert!(task_state.active_task().unwrap().user_cancelled);
+        super::actions::cancel_active_run_via_actor(&actor, &mut app, &mut task_state, &mut sync)
+            .await;
         assert!(agent_loop.inbox().pop_followup(&sess.id).is_none());
         let kept = agent_loop.inbox().snapshot(&sess.id);
         assert_eq!(kept.len(), 1);
@@ -2062,20 +2081,26 @@ mod tests {
         agent_loop.inbox().clear(&sess.id);
 
         let abort_res = loop {
-            match loop_rx.recv().await.unwrap() {
-                super::LoopClientMsg::Task {
-                    event: super::UiEvent::RunFinished(res),
-                    ..
-                } => break res,
-                _ => continue,
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let is_done = match &ev {
+                ClientEvent::RunFinished(res) => Some(res.clone()),
+                _ => None,
+            };
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if let Some(res) = is_done {
+                break res;
             }
         };
         assert!(abort_res.is_err());
-        task_state.active = None;
-        app.set_busy_state(false);
 
-        // 3. 空闲时推送 FollowUp 应唤醒 poll_inbox_wake 并由 drain_next_inbox_followup 启动下一轮
-        let mut wake_rx = agent_loop.inbox().subscribe_wake();
+        // 3. 空闲时推送 FollowUp 由 SessionActor 内部唤醒循环自动启动，无需 runner 自己订阅 subscribe_wake
         let wake_push = agent_loop.inbox().push(
             &sess.id,
             DeliveryMode::FollowUp,
@@ -2083,28 +2108,602 @@ mod tests {
         );
         assert_eq!(wake_push.effective_mode, DeliveryMode::FollowUp);
         assert!(!wake_push.degraded);
-        let woken_sid = super::poll_inbox_wake(Some(&mut wake_rx)).await.unwrap();
-        assert_eq!(woken_sid, sess.id);
 
-        assert!(super::actions::drain_next_inbox_followup(
-            &runtime,
-            &cfg,
-            &mut app,
-            &sess,
-            &loop_tx,
-            &mut task_state,
-        ));
         let followup_res = loop {
-            match loop_rx.recv().await.unwrap() {
-                super::LoopClientMsg::Task {
-                    event: super::UiEvent::RunFinished(res),
-                    ..
-                } => break res,
-                _ => continue,
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let is_done = match &ev {
+                ClientEvent::RunFinished(res) => Some(res.clone()),
+                _ => None,
+            };
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if let Some(res) = is_done {
+                break res;
             }
         };
         assert_eq!(followup_res.unwrap(), "woke followup ok");
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            ChatItem::Notice { text, .. } if text.contains("[cron] wake check")
+        )));
 
+        actor.shutdown().await;
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_actor_tui_dismisses_active_approval_overlay_on_approval_resolved() {
+        use std::sync::Arc;
+
+        use futures::channel::mpsc as futures_mpsc;
+        use mizar_client::actor::{SessionActor, SessionActorConfig};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+        use mizar_llm::{
+            BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, ModelInfo, ProviderInfo,
+            StreamChunk, ToolCall,
+        };
+        use mizar_tools::{ToolDefinition, ToolOutput};
+        use mizar_tui_ui::app::ApprovalMode;
+        use mizar_tui_ui::overlay::OverlayKind;
+        use mizar_types::client::ClientEvent;
+        use mizar_types::rpc::{InteractionResolveParams, ResolvedBy, RpcApprovalDecision};
+
+        struct ApprovalTuiAdapter;
+
+        impl LlmAdapter for ApprovalTuiAdapter {
+            fn info(&self) -> Option<ProviderInfo> {
+                Some(ProviderInfo {
+                    id: "mock-apr".into(),
+                    name: "Mock Approval".into(),
+                    protocol: "mock".into(),
+                    models: vec![ModelInfo {
+                        id: "m-apr".into(),
+                        name: "Mock Approval".into(),
+                        ..Default::default()
+                    }],
+                })
+            }
+
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                let joined: String = options
+                    .messages
+                    .iter()
+                    .map(|m| m.text_content())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let has_tool_done = joined.contains("secret written");
+                let (tx, rx) = futures_mpsc::unbounded();
+                tokio::spawn(async move {
+                    if !has_tool_done {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
+                                id: "call-apr-tui".into(),
+                                name: "write_secret".into(),
+                                arguments: r#"{"file":"a.txt"}"#.into(),
+                            },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("approval completed")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let ws = std::env::temp_dir().join(format!("mizar_tui_apr_dismiss_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(&ws))
+            .await
+            .unwrap();
+        runtime
+            .register_adapter("mock-apr", Arc::new(ApprovalTuiAdapter))
+            .unwrap();
+        let _tool_reg = runtime
+            .tools
+            .register(ToolDefinition::async_rich_tool(
+                "write_secret",
+                "requires interactive approval",
+                serde_json::json!({}),
+                |_, _| async { Ok::<_, mizar_types::BoxError>(ToolOutput::text("secret written")) },
+            ))
+            .unwrap();
+
+        let mut sess = runtime.sessions.create(None);
+        let mut app = AppState::new(
+            ws.clone(),
+            &sess.id,
+            Vec::new(),
+            Some("mock-apr".into()),
+            Some("m-apr".into()),
+            None,
+        );
+        app.approval_mode = ApprovalMode::Ask;
+
+        let actor = SessionActor::spawn(
+            Arc::clone(&runtime),
+            Arc::clone(&sess),
+            SessionActorConfig::new(&ws)
+                .with_approval_mode(ApprovalMode::Ask)
+                .with_provider_model(Some("mock-apr".into()), Some("m-apr".into()), None),
+        );
+        let mut client_rx = actor.subscribe_client_events();
+        let mut sync = super::actions::TuiActorSync::new(&sess, &app);
+        let mut task_state = super::RunController::default();
+
+        app.push_user_message("run write_secret");
+        super::actions::submit_turn_via_actor(
+            &actor,
+            &mut app,
+            &mut sync,
+            "run write_secret".into(),
+            Vec::new(),
+        )
+        .await;
+
+        let req_id = loop {
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if let Some(OverlayKind::Approval(ref ap)) = app.overlay.active {
+                break ap.request_id.clone();
+            }
+        };
+
+        // 异源（RPC）抢占裁决后，SessionActor 广播 ClientEvent::ApprovalResolved，TUI 应立即关闭弹窗并完成工具执行
+        let res = actor
+            .resolve_interaction(
+                InteractionResolveParams {
+                    session_id: Some(sess.id.clone()),
+                    request_id: req_id.clone(),
+                    decision: RpcApprovalDecision::AllowOnce,
+                    note: None,
+                },
+                ResolvedBy::Rpc,
+            )
+            .await
+            .unwrap();
+        assert!(res.ok);
+
+        let mut saw_resolved = false;
+        let finish_res = loop {
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let resolved_hit = matches!(
+                &ev,
+                ClientEvent::ApprovalResolved { request_id: rid } if rid == &req_id
+            );
+            let done = match &ev {
+                ClientEvent::RunFinished(r) => Some(r.clone()),
+                _ => None,
+            };
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if resolved_hit {
+                saw_resolved = true;
+                assert!(
+                    app.overlay.active.is_none(),
+                    "active approval overlay must dismiss on ApprovalResolved"
+                );
+            }
+            if let Some(r) = done {
+                break r;
+            }
+        };
+        assert!(saw_resolved);
+        assert_eq!(finish_res.unwrap(), "approval completed");
+        assert!(app.overlay.active.is_none());
+
+        actor.shutdown().await;
+        runtime.shutdown().await;
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn resume_session_on_locked_session_surfaces_error_without_switching_active_session() {
+        use std::process::{Child, Command, Stdio};
+        use std::sync::Arc;
+
+        use mizar_client::actor::{SessionActor, SessionActorConfig};
+        use mizar_client::run_dir::{ProcessMeta, meta_path_for_pid};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+        use mizar_tui_ui::app::NoticeLevel;
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mizar_tui_locked_resume_{}_{uniq}",
+            std::process::id()
+        ));
+        let ws = root.join("ws");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let mut cfg = super::TuiConfig::new(&ws);
+        assert!(!cfg.enable_rpc_socket);
+        assert!(cfg.run_dir.is_none());
+        cfg.run_dir = Some(run_dir.clone());
+
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(&ws))
+            .await
+            .unwrap();
+        let mut active_session = runtime.sessions.create(Some("sess-init".into()));
+        let sess_locked = runtime.sessions.create(Some("sess-locked".into()));
+        let sess_free = runtime.sessions.create(Some("sess-free".into()));
+
+        let sleeper = ChildGuard(
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let other_pid = sleeper.0.id();
+        let other_meta = ProcessMeta {
+            pid: other_pid,
+            ppid: None,
+            tty: None,
+            herdr_pane_id: None,
+            session_id: sess_locked.id.clone(),
+            cwd: ws.display().to_string(),
+            socket: run_dir
+                .join(format!("p-{other_pid}.sock"))
+                .display()
+                .to_string(),
+            provider: None,
+            model: None,
+            started_at_ms: 1,
+        };
+        std::fs::write(
+            meta_path_for_pid(&run_dir, other_pid),
+            serde_json::to_vec(&other_meta).unwrap(),
+        )
+        .unwrap();
+
+        let actor = SessionActor::spawn(
+            Arc::clone(&runtime),
+            Arc::clone(&active_session),
+            SessionActorConfig::new(&ws).with_run_dir(&run_dir),
+        );
+        let mut app = AppState::new(ws.clone(), &active_session.id, Vec::new(), None, None, None);
+        let mut sync = super::actions::TuiActorSync::new(&active_session, &app);
+        let mut task_state = super::RunController::default();
+
+        let switched_locked = super::actions::resume_session_via_actor(
+            &actor,
+            &runtime,
+            &cfg,
+            &mut app,
+            &mut active_session,
+            &mut sync,
+            &mut task_state,
+            &sess_locked.id,
+        )
+        .await;
+        assert!(!switched_locked);
+        assert_eq!(active_session.id, "sess-init");
+        assert_eq!(actor.active_session_id(), "sess-init");
+        assert_eq!(app.session_id, "sess-init");
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            ChatItem::Notice {
+                level: NoticeLevel::Error,
+                text,
+            } if text.contains(&other_pid.to_string()) && text.contains("单写者锁")
+        )));
+
+        // 未被占用的会话应正常切换
+        let switched_free = super::actions::resume_session_via_actor(
+            &actor,
+            &runtime,
+            &cfg,
+            &mut app,
+            &mut active_session,
+            &mut sync,
+            &mut task_state,
+            &sess_free.id,
+        )
+        .await;
+        assert!(switched_free);
+        assert_eq!(active_session.id, "sess-free");
+        assert_eq!(actor.active_session_id(), "sess-free");
+        assert_eq!(app.session_id, "sess-free");
+
+        actor.shutdown().await;
+        runtime.shutdown().await;
+        drop(sleeper);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_actor_tui_queue_drain_and_config_sync_work_end_to_end() {
+        use std::sync::Arc;
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use futures::channel::mpsc as futures_mpsc;
+        use mizar_client::actor::{SessionActor, SessionActorConfig};
+        use mizar_core::spine::{AgentSpineConfig, MizarRuntime};
+        use mizar_llm::{
+            BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, ModelInfo, ProviderInfo,
+            ReasoningEffort, StreamChunk, ToolCall,
+        };
+        use mizar_tools::{ToolDefinition, ToolOutput};
+        use mizar_tui_ui::app::ApprovalMode;
+        use mizar_types::client::ClientEvent;
+        use mizar_types::rpc::RpcApprovalMode;
+        use tokio::sync::Notify;
+
+        type SeenModelCalls = Arc<std::sync::Mutex<Vec<(Option<String>, Option<ReasoningEffort>)>>>;
+
+        struct QueueSyncAdapter {
+            seen_models: SeenModelCalls,
+        }
+
+        impl LlmAdapter for QueueSyncAdapter {
+            fn info(&self) -> Option<ProviderInfo> {
+                Some(ProviderInfo {
+                    id: "mock-q".into(),
+                    name: "Mock Queue".into(),
+                    protocol: "mock".into(),
+                    models: vec![
+                        ModelInfo {
+                            id: "m-1".into(),
+                            name: "M1".into(),
+                            reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                            ..Default::default()
+                        },
+                        ModelInfo {
+                            id: "m-2".into(),
+                            name: "M2".into(),
+                            ..Default::default()
+                        },
+                    ],
+                })
+            }
+
+            fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+                self.seen_models
+                    .lock()
+                    .unwrap()
+                    .push((options.model.clone(), options.reasoning_effort));
+                let joined: String = options
+                    .messages
+                    .iter()
+                    .map(|m| m.text_content())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let is_second = joined.contains("queued-msg");
+                let needs_gate = !is_second && !joined.contains("qgate_done");
+                let (tx, rx) = futures_mpsc::unbounded();
+                tokio::spawn(async move {
+                    if needs_gate {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
+                                id: "call-qgate".into(),
+                                name: "qgate".into(),
+                                arguments: "{}".into(),
+                            },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    } else if is_second {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("queued done")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    } else {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("first done")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                });
+                Box::pin(rx)
+            }
+        }
+
+        let runtime = MizarRuntime::build(AgentSpineConfig::new(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let seen_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = Arc::new(QueueSyncAdapter {
+            seen_models: Arc::clone(&seen_models),
+        });
+        runtime.register_adapter("mock-q", adapter).unwrap();
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let s_sig = Arc::clone(&started);
+        let r_sig = Arc::clone(&release);
+        let _tool = runtime
+            .tools
+            .register(ToolDefinition::async_rich_tool(
+                "qgate",
+                "blocks for queue test",
+                serde_json::json!({}),
+                move |_, _| {
+                    let s = Arc::clone(&s_sig);
+                    let r = Arc::clone(&r_sig);
+                    async move {
+                        s.notify_one();
+                        r.notified().await;
+                        Ok::<_, mizar_types::BoxError>(ToolOutput::text("qgate_done"))
+                    }
+                },
+            ))
+            .unwrap();
+
+        let mut sess = runtime.sessions.create(None);
+        let cfg = super::TuiConfig::new(std::env::temp_dir());
+        let mut app = AppState::new(
+            std::env::temp_dir(),
+            &sess.id,
+            runtime.llm.provider_infos(),
+            Some("mock-q".into()),
+            Some("m-1".into()),
+            Some(ReasoningEffort::Low),
+        );
+        let actor = SessionActor::spawn(
+            Arc::clone(&runtime),
+            Arc::clone(&sess),
+            SessionActorConfig::new(std::env::temp_dir()).with_provider_model(
+                Some("mock-q".into()),
+                Some("m-1".into()),
+                Some(ReasoningEffort::Low),
+            ),
+        );
+        let mut client_rx = actor.subscribe_client_events();
+        let mut sync = super::actions::TuiActorSync::new(&sess, &app);
+        let mut task_state = super::RunController::default();
+
+        // 1. 发起首轮并在工具阻塞期间通过键盘排队一条消息 -> 同步进 SessionActor 队列
+        app.push_user_message("first prompt");
+        super::actions::submit_turn_via_actor(
+            &actor,
+            &mut app,
+            &mut sync,
+            "first prompt".into(),
+            Vec::new(),
+        )
+        .await;
+        started.notified().await;
+        app.set_busy_state(true);
+
+        let prev_q = app.queue.items().to_vec();
+        app.input.insert_str("queued-msg");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppAction::None
+        );
+        assert!(
+            super::actions::sync_queue_after_term_event(
+                &actor, &cfg, &mut app, &mut sync, &prev_q,
+            )
+            .await
+        );
+        let snap = actor.subscribe_snapshot(&sess.id, None).await.unwrap();
+        assert_eq!(snap.queued_inputs.len(), 1);
+        assert_eq!(snap.queued_inputs[0].text, "queued-msg");
+        assert_eq!(app.queue.items()[0].id, snap.queued_inputs[0].id);
+
+        // 2. 放行第一轮 -> SessionActor 自动出队执行 queued-msg，TUI 队列清空且渲染 queued-msg 气泡
+        release.notify_one();
+        let mut finished_count = 0;
+        loop {
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let is_fin = matches!(ev, ClientEvent::RunFinished(_));
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if is_fin {
+                finished_count += 1;
+                if finished_count == 2 {
+                    break;
+                }
+            }
+        }
+        assert!(app.queue.is_empty());
+        assert!(app.items.iter().any(|it| matches!(
+            it,
+            ChatItem::User { text } if text == "queued-msg"
+        )));
+
+        // 3. 切换 /effort、/approval 与 /model 并通过 sync_config_if_changed 同步到 SessionActor，验证后续回合生效
+        app.input.set_text_end("/approval ask");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.input.set_text_end("/effort high");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.model = Some("m-2".into());
+        sync.sync_config_if_changed(&actor, &app).await;
+        let snap_after = actor.subscribe_snapshot(&sess.id, None).await.unwrap();
+        assert_eq!(snap_after.config.approval_mode, RpcApprovalMode::Ask);
+        assert_eq!(
+            snap_after.config.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(snap_after.config.model.as_deref(), Some("m-2"));
+        assert_eq!(app.approval_mode, ApprovalMode::Ask);
+
+        app.push_user_message("verify updated config");
+        super::actions::submit_turn_via_actor(
+            &actor,
+            &mut app,
+            &mut sync,
+            "verify updated config".into(),
+            Vec::new(),
+        )
+        .await;
+        loop {
+            let ev = super::poll_client_event(&mut client_rx).await.unwrap();
+            let done = matches!(ev, ClientEvent::RunFinished(_));
+            let _ = super::actions::process_actor_client_event_dirty(
+                &actor,
+                &mut sess,
+                &mut app,
+                &mut task_state,
+                &mut sync,
+                ev,
+            );
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            seen_models.lock().unwrap().last(),
+            Some(&(Some("m-2".into()), Some(ReasoningEffort::High)))
+        );
+
+        actor.shutdown().await;
         runtime.shutdown().await;
     }
 

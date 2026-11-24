@@ -644,6 +644,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut tui_cfg = TuiConfig::new(workspace);
+    tui_cfg.enable_rpc_socket = true;
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
     tui_cfg.session_db_path = spine_cfg.session_db_path.clone();
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;

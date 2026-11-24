@@ -8,6 +8,7 @@ use mizar_client::events::{LoopClientMsg, RunController};
 use mizar_tui_ui::app::{AppAction, AppState, ChatItem, UiEvent};
 use mizar_tui_ui::terminal::{BEGIN_SYNCHRONIZED_OUTPUT, END_SYNCHRONIZED_OUTPUT, ScreenMode};
 use mizar_tui_ui::ui::{build_item_lines_for_scrollback_at, build_welcome_lines_for_scrollback};
+use mizar_types::client::ClientEvent;
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -154,6 +155,15 @@ pub(super) fn process_loop_ui_msg_dirty(
         && had_assistant
         && app.reveal.generation() == prev_reveal_gen;
     (AppAction::None, !can_defer_to_reveal)
+}
+
+/// 将 `SessionActor` 广播的同进程零序列化 `ClientEvent` 接入脏帧门控与 UI 归约。
+pub(super) fn process_client_event_dirty(
+    app: &mut AppState,
+    task_state: &mut RunController,
+    event: ClientEvent,
+) -> (AppAction, bool) {
+    process_loop_ui_msg_dirty(app, task_state, LoopClientMsg::Bus(event))
 }
 
 pub(super) fn create_terminal(mode: ScreenMode) -> Result<BufferedTerminal, std::io::Error> {
