@@ -405,3 +405,355 @@ async fn agent_trajectory_detects_repeat_loop_and_recovers_after_guard_reminder(
 
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn step_and_turn_error_traces_persist_with_utf8_2000_byte_truncation() {
+    use mizar_llm::LlmErrorCode;
+    use mizar_session::{SessionEvent, SessionTraceEvent};
+
+    struct FailOrOkAdapter(AtomicUsize);
+    impl LlmAdapter for FailOrOkAdapter {
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            let idx = self.0.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            if idx == 0 {
+                let message = format!("ERR_{}", "测".repeat(800));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: FinishReason::Error {
+                        code: LlmErrorCode::InvalidRequest,
+                        message,
+                        status: Some(400),
+                        retry_after_ms: None,
+                    },
+                    replay: None,
+                }));
+            } else {
+                let _ = tx.unbounded_send(Ok(StreamChunk::text("ok")));
+                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }));
+            }
+            Box::pin(rx)
+        }
+    }
+
+    let runtime = MizarRuntime::build(
+        AgentSpineConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .with_disabled_plugins(["session-title"]),
+    )
+    .await
+    .unwrap();
+    runtime
+        .register_adapter("fail-or-ok", Arc::new(FailOrOkAdapter(AtomicUsize::new(0))))
+        .unwrap();
+
+    // 1. 报错结束时，StepEnd 与 TurnEnd 落盘截断后的错误文本（UTF-8 安全且 <= 2000 字节）
+    let s_err = runtime.sessions.create(None);
+    let err = runtime
+        .agent_loop
+        .run(
+            Arc::clone(&s_err),
+            "trigger error",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("ERR_"));
+
+    let entries = s_err.all_entries();
+    let step_end = entries
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::Trace {
+                detail: SessionTraceEvent::StepEnd { outcome, error, .. },
+            } => Some((outcome.clone(), error.clone())),
+            _ => None,
+        })
+        .expect("missing StepEnd trace");
+    assert_eq!(step_end.0, "error");
+    let step_err = step_end.1.expect("StepEnd.error should be Some");
+    assert!(step_err.len() <= 2_000);
+    assert_eq!(step_err.len(), 1_999);
+    assert!(step_err.starts_with("ERR_测"));
+
+    let turn_end = entries
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::Trace {
+                detail: SessionTraceEvent::TurnEnd { reason, error, .. },
+            } => Some((reason.clone(), error.clone())),
+            _ => None,
+        })
+        .expect("missing TurnEnd trace");
+    assert_eq!(turn_end.0, "error");
+    let turn_err = turn_end.1.expect("TurnEnd.error should be Some");
+    assert!(turn_err.len() <= 2_000);
+    assert_eq!(turn_err.len(), 1_999);
+    assert!(turn_err.starts_with("ERR_测"));
+
+    // 2. 正常结束时，StepEnd 与 TurnEnd 的 error 为 None 且不序列化 "error" 字段
+    let s_ok = runtime.sessions.create(None);
+    let reply = runtime
+        .agent_loop
+        .run(Arc::clone(&s_ok), "hello", CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(reply, "ok");
+
+    for entry in s_ok.all_entries() {
+        if let SessionEvent::Trace {
+            detail:
+                detail @ (SessionTraceEvent::StepEnd { error, .. }
+                | SessionTraceEvent::TurnEnd { error, .. }),
+        } = &entry.event
+        {
+            assert!(error.is_none());
+            let raw = serde_json::to_string(detail).unwrap();
+            assert!(
+                !raw.contains(r#""error":"#),
+                "unexpected error field: {raw}"
+            );
+        }
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn compaction_tail_pruning_enforces_cache_guards_and_resume_parity_end_to_end() {
+    use mizar_core::compaction::{CompactionConfig, SUPERSEDED_NOTICE, USELESS_NOTICE};
+    use mizar_llm::{ModelInfo, ProviderInfo, ReasoningEffort};
+    use mizar_session::{
+        SessionCreateOptions, SessionEvent, SessionStore, SessionTraceEvent,
+        SqliteSessionPersistence,
+    };
+    use mizar_tools::coding::{CodingToolsConfig, register_coding_tools};
+
+    struct SequenceAdapter {
+        protocol: &'static str,
+        reasoning: bool,
+        calls: Arc<Mutex<Vec<GenerateOptions>>>,
+        step: AtomicUsize,
+        target_path: String,
+    }
+
+    impl LlmAdapter for SequenceAdapter {
+        fn info(&self) -> Option<ProviderInfo> {
+            Some(ProviderInfo {
+                id: "seq-mock".into(),
+                name: "Sequence Mock".into(),
+                protocol: self.protocol.into(),
+                models: vec![ModelInfo {
+                    id: "seq-model".into(),
+                    name: "Seq Model".into(),
+                    context_window: Some(200_000),
+                    max_tokens: Some(8_192),
+                    reasoning_efforts: if self.reasoning {
+                        vec![ReasoningEffort::Medium]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }],
+            })
+        }
+
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            self.calls.lock().unwrap().push(options);
+            let idx = self.step.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            match idx {
+                0 => {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                        0,
+                        ToolCall {
+                            id: "call_r1".into(),
+                            name: "read".into(),
+                            arguments: json!({"path": self.target_path}).to_string(),
+                        },
+                    )));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                        1,
+                        ToolCall {
+                            id: "call_g1".into(),
+                            name: "grep".into(),
+                            arguments: json!({
+                                "pattern": "NO_SUCH_SYMBOL_12345",
+                                "path": self.target_path,
+                            })
+                            .to_string(),
+                        },
+                    )));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::ToolCalls,
+                        replay: None,
+                    }));
+                }
+                1 => {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                        0,
+                        ToolCall {
+                            id: "call_r2".into(),
+                            name: "read".into(),
+                            arguments: json!({"path": self.target_path}).to_string(),
+                        },
+                    )));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::ToolCalls,
+                        replay: None,
+                    }));
+                }
+                _ => {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text("all checked")));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                }
+            }
+            Box::pin(rx)
+        }
+    }
+
+    assert_eq!(CompactionConfig::default().max_context_tokens, None);
+
+    let root = std::env::temp_dir().join(format!("mizar_prune_e2e_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let target_file = root.join("demo.txt");
+    std::fs::write(&target_file, "alpha\nbeta\ngamma\n").unwrap();
+    let db_path = root.join("sessions.sqlite");
+
+    // 1. 普通模型（openai-completions）热尾 <= 8,000 tokens：自动剪枝旧 read + 0 命中 grep，并保证 resume 前缀字节一致
+    let calls_warm = Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = AgentSpineConfig::new(root.clone()).with_disabled_plugins(["session-title"]);
+    cfg.session_db_path = Some(db_path.clone());
+    let runtime = MizarRuntime::build(cfg).await.unwrap();
+    let _coding_guards =
+        register_coding_tools(&runtime.tools, &CodingToolsConfig::new(&root)).unwrap();
+    runtime
+        .register_adapter(
+            "seq-mock",
+            Arc::new(SequenceAdapter {
+                protocol: "openai-completions",
+                reasoning: false,
+                calls: Arc::clone(&calls_warm),
+                step: AtomicUsize::new(0),
+                target_path: "demo.txt".into(),
+            }),
+        )
+        .unwrap();
+
+    let sess = runtime.sessions.create_with(SessionCreateOptions {
+        id: Some("e2e-warm".into()),
+        cwd: Some(root.display().to_string()),
+        ..Default::default()
+    });
+    let reply = runtime
+        .agent_loop
+        .run(
+            Arc::clone(&sess),
+            "inspect demo.txt",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "all checked");
+
+    {
+        let recorded = calls_warm.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        let step3_msgs = &recorded[2].messages;
+        assert!(
+            step3_msgs.iter().any(|m| matches!(
+                m,
+                Message::Tool { tool_call_id, content, is_error, .. }
+                    if tool_call_id == "call_r1" && !is_error && content == SUPERSEDED_NOTICE
+            )),
+            "expected call_r1 superseded in {step3_msgs:?}"
+        );
+        assert!(
+            step3_msgs.iter().any(|m| matches!(
+                m,
+                Message::Tool { tool_call_id, content, is_error, .. }
+                    if tool_call_id == "call_g1" && !is_error && content == USELESS_NOTICE
+            )),
+            "expected call_g1 elided in {step3_msgs:?}"
+        );
+        assert!(
+            step3_msgs.iter().any(|m| matches!(
+                m,
+                Message::Tool { tool_call_id, content, is_error, .. }
+                    if tool_call_id == "call_r2" && !is_error && content.contains("alpha")
+            )),
+            "expected call_r2 intact in {step3_msgs:?}"
+        );
+    }
+
+    let live_derived = sess.derive_messages();
+    sess.flush_async().await.unwrap();
+    drop(_coding_guards);
+    runtime.shutdown().await;
+
+    let backend2 = SqliteSessionPersistence::open_async(&db_path)
+        .await
+        .unwrap();
+    let store2 = SessionStore::with_persistence(backend2.clone());
+    let resumed = store2.get("e2e-warm").unwrap();
+    assert_eq!(resumed.derive_messages(), live_derived);
+    drop(resumed);
+    drop(store2);
+    let _ = tokio::task::spawn_blocking(move || backend2.shutdown()).await;
+
+    // 2. 前缀绑定思考模型（anthropic-messages + reasoning）：热缓存阶段不改写历史 read
+    let calls_prefix = Arc::new(Mutex::new(Vec::new()));
+    let runtime_pb = MizarRuntime::build(
+        AgentSpineConfig::new(root.clone()).with_disabled_plugins(["session-title"]),
+    )
+    .await
+    .unwrap();
+    let _coding_guards_pb =
+        register_coding_tools(&runtime_pb.tools, &CodingToolsConfig::new(&root)).unwrap();
+    runtime_pb
+        .register_adapter(
+            "seq-mock",
+            Arc::new(SequenceAdapter {
+                protocol: "anthropic-messages",
+                reasoning: true,
+                calls: Arc::clone(&calls_prefix),
+                step: AtomicUsize::new(0),
+                target_path: "demo.txt".into(),
+            }),
+        )
+        .unwrap();
+    let sess_pb = runtime_pb.sessions.create_with(SessionCreateOptions {
+        id: Some("e2e-prefix-bound".into()),
+        cwd: Some(root.display().to_string()),
+        ..Default::default()
+    });
+    let reply_pb = runtime_pb
+        .agent_loop
+        .run(
+            Arc::clone(&sess_pb),
+            "inspect demo.txt",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply_pb, "all checked");
+
+    assert!(
+        !sess_pb.all_entries().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Trace {
+                detail: SessionTraceEvent::ToolResultPrune { target_seq: 3, .. }
+            }
+        )),
+        "prefix-bound thinking model must not prune warm read with trailing suffix"
+    );
+    let _ = calls_prefix;
+    drop(_coding_guards_pb);
+    runtime_pb.shutdown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}

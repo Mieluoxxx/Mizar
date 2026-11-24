@@ -442,6 +442,15 @@ fn partition_tool_batches(tools: &ToolRuntime, calls: Vec<ToolCall>) -> Vec<Vec<
     batches
 }
 
+const TRACE_ERROR_MAX_BYTES: usize = 2_000;
+
+fn truncate_trace_error(message: &str) -> String {
+    if message.len() <= TRACE_ERROR_MAX_BYTES {
+        return message.to_string();
+    }
+    message[..message.floor_char_boundary(TRACE_ERROR_MAX_BYTES)].to_string()
+}
+
 struct TurnGuard {
     events: Arc<AgentEventBus>,
     session: Arc<Session>,
@@ -457,9 +466,16 @@ impl TurnGuard {
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
+        let error = match &self.reason {
+            TurnEndReason::Error { message } if !message.is_empty() => {
+                Some(truncate_trace_error(message))
+            }
+            _ => None,
+        };
         self.session.append_trace(SessionTraceEvent::TurnEnd {
             turn: self.turn,
             reason: self.reason.as_str().to_string(),
+            error,
         });
         self.events.emit(AgentEvent::TurnEnd(AgentTurnEndEvent {
             session: Arc::clone(&self.session),
@@ -494,11 +510,18 @@ impl StepGuard {
 
 impl Drop for StepGuard {
     fn drop(&mut self) {
+        let error = match &self.outcome {
+            StepOutcome::Error { message } if !message.is_empty() => {
+                Some(truncate_trace_error(message))
+            }
+            _ => None,
+        };
         self.session.append_trace(SessionTraceEvent::StepEnd {
             turn: self.turn,
             step: self.step,
             outcome: self.outcome.as_str().to_string(),
             usage: self.usage,
+            error,
         });
         self.events.emit(AgentEvent::StepEnd(AgentStepEndEvent {
             session: Arc::clone(&self.session),

@@ -167,7 +167,7 @@ fn entry_to_trace_event(
         SessionEvent::Selection { .. } | SessionEvent::Usage { .. } => return None,
         SessionEvent::Trace { detail } => match detail {
             SessionTraceEvent::TurnStart { turn } => TraceEventKind::TurnStart { turn: *turn },
-            SessionTraceEvent::TurnEnd { turn, reason } => TraceEventKind::TurnEnd {
+            SessionTraceEvent::TurnEnd { turn, reason, .. } => TraceEventKind::TurnEnd {
                 turn: *turn,
                 reason: reason.clone(),
             },
@@ -191,6 +191,7 @@ fn entry_to_trace_event(
                 step,
                 outcome,
                 usage,
+                ..
             } => TraceEventKind::StepEnd {
                 turn: *turn,
                 step: *step,
@@ -237,7 +238,8 @@ fn entry_to_trace_event(
             },
             SessionTraceEvent::CompactionStart { .. }
             | SessionTraceEvent::CompactionEnd { .. }
-            | SessionTraceEvent::TurnNotice { .. } => {
+            | SessionTraceEvent::TurnNotice { .. }
+            | SessionTraceEvent::ToolResultPrune { .. } => {
                 return None;
             }
         },

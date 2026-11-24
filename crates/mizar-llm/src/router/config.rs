@@ -72,6 +72,7 @@ pub struct CompatConfig {
     pub supports_mid_convo_effort: Option<bool>,
     pub supports_additional_tools: Option<bool>,
     pub supports_tool_search_output: Option<bool>,
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl From<CompletionsCompat> for CompatConfig {
@@ -96,6 +97,7 @@ impl From<CompletionsCompat> for CompatConfig {
             session_affinity_format: affinity_fmt,
             supports_long_cache_retention: c.supports_long_cache_retention,
             supports_prompt_cache_key: c.supports_prompt_cache_key,
+            parallel_tool_calls: c.parallel_tool_calls,
             ..Default::default()
         }
     }
@@ -155,6 +157,7 @@ impl CompatConfig {
             supports_tool_search_output: overlay
                 .supports_tool_search_output
                 .or(self.supports_tool_search_output),
+            parallel_tool_calls: overlay.parallel_tool_calls.or(self.parallel_tool_calls),
         }
     }
 
@@ -192,6 +195,9 @@ impl CompatConfig {
         }
         if let Some(pck) = self.supports_prompt_cache_key {
             base.supports_prompt_cache_key = Some(pck);
+        }
+        if let Some(parallel) = self.parallel_tool_calls {
+            base.parallel_tool_calls = Some(parallel);
         }
         base
     }
@@ -961,5 +967,24 @@ mod tests {
         assert_eq!(merged.supports_mid_convo_effort, Some(true));
         assert_eq!(merged.supports_additional_tools, Some(false));
         assert_eq!(merged.supports_tool_search_output, Some(true));
+
+        let with_parallel: CompatConfig = serde_json::from_str(
+            r#"{
+                "parallelToolCalls": true
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(with_parallel.parallel_tool_calls, Some(true));
+        let comp = with_parallel.to_completions_compat(CompletionsCompat::openai());
+        assert_eq!(comp.parallel_tool_calls, Some(true));
+        assert_eq!(CompatConfig::from(comp).parallel_tool_calls, Some(true));
+
+        let merged_parallel = with_parallel.merge_overlay(&CompatConfig {
+            parallel_tool_calls: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(merged_parallel.parallel_tool_calls, Some(false));
+        let kept_parallel = with_parallel.merge_overlay(&CompatConfig::default());
+        assert_eq!(kept_parallel.parallel_tool_calls, Some(true));
     }
 }
