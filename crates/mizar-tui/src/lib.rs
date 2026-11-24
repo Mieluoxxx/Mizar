@@ -3,6 +3,7 @@
 pub mod clipboard;
 pub mod exec;
 pub mod runner;
+pub mod serve;
 pub mod update;
 
 pub use mizar_client::events::{
@@ -48,3 +49,4 @@ pub use runner::{
     install_tui_emphasis, mount_reply_guidance_section, resume_session_into_app, run_tui,
     run_tui_with_summary,
 };
+pub use serve::{ServeConfig, ServeError, ServeHandle, run_serve_cli, start_serve};

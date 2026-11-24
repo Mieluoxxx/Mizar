@@ -13,6 +13,7 @@ name = "mizar"
 path = "src/main.rs"
 
 [dependencies]
+axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
@@ -27,9 +28,10 @@ mizar-tui-ui = { workspace = true }
 mizar-types = { workspace = true }
 ratatui = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 
@@ -37,6 +39,4 @@ tracing = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-axum = { workspace = true }
 image = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
