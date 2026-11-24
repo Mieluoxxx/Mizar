@@ -10,6 +10,7 @@
 pub mod budget;
 pub mod digest;
 pub mod guards;
+pub mod pruning;
 pub mod service;
 pub mod summarizer;
 
@@ -21,6 +22,11 @@ pub use budget::{
     ContextBudget, compute_budget, estimate_session_context_tokens, estimate_text_tokens,
 };
 pub use digest::{CutPlan, build_compaction_digest, plan_compaction_cut};
+pub use pruning::{
+    DEFAULT_IDLE_FLUSH_MS, DEFAULT_WARM_SUFFIX_TOKEN_LIMIT, PruneMarker, SUPERSEDED_NOTICE,
+    TailPruneOptions, TailPrunePlan, TailPruneReport, USELESS_NOTICE, plan_tail_pruning,
+    prune_session_tail,
+};
 pub use service::CompactionRuntime;
 pub use summarizer::strip_summary_wrapper;
 
@@ -77,6 +83,14 @@ pub struct CompactionConfig {
     pub max_context_tokens: Option<u64>,
     pub trigger_ratio: f64,
     pub keep_recent_tokens: u64,
+    /// 是否裁剪被同文件后续完整 `read` 覆盖的旧 `read` 结果（默认 `true`）。
+    pub supersede_reads: bool,
+    /// 是否裁剪零命中/无信息量工具结果（默认 `true`）。
+    pub drop_useless: bool,
+    /// 热缓存期间尾部可裁剪的后续消息估算 token 上限（默认 `8_000`）。
+    pub prune_warm_suffix_tokens: u64,
+    /// 会话闲置达到该毫秒数后允许清仓最新压缩边界之后的全部可见候选（默认 90 分钟）。
+    pub prune_idle_flush_ms: u128,
 }
 
 impl Default for CompactionConfig {
@@ -88,6 +102,10 @@ impl Default for CompactionConfig {
             max_context_tokens: None,
             trigger_ratio: 0.80,
             keep_recent_tokens: 20_000,
+            supersede_reads: true,
+            drop_useless: true,
+            prune_warm_suffix_tokens: DEFAULT_WARM_SUFFIX_TOKEN_LIMIT,
+            prune_idle_flush_ms: DEFAULT_IDLE_FLUSH_MS,
         }
     }
 }

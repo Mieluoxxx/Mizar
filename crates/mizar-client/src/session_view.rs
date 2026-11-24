@@ -1169,10 +1169,12 @@ mod tests {
         session.append_trace(SessionTraceEvent::TurnEnd {
             turn: 1,
             reason: "max_steps".into(),
+            error: None,
         });
         session.append_trace(SessionTraceEvent::TurnEnd {
             turn: 2,
             reason: "truncated".into(),
+            error: None,
         });
 
         assert!(

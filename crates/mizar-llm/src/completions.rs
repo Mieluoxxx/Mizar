@@ -58,6 +58,7 @@ pub struct CompletionsCompat {
     pub session_affinity_mode: Option<SessionAffinityMode>,
     pub supports_long_cache_retention: Option<bool>,
     pub supports_prompt_cache_key: Option<bool>,
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl CompletionsCompat {
@@ -322,6 +323,9 @@ pub fn build_request_body(
             .map(|t| json!({ "type": "function", "function": t }))
             .collect();
         body["tools"] = Value::Array(tools);
+        if let Some(parallel) = config.compat.parallel_tool_calls {
+            body["parallel_tool_calls"] = json!(parallel);
+        }
     }
     body
 }
@@ -1139,5 +1143,61 @@ mod tests {
         assert_eq!(calls[2]["function"]["arguments"], "{}");
         assert_eq!(calls[3]["function"]["arguments"], "{}");
         assert_eq!(calls[4]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn parallel_tool_calls_emits_only_when_configured_and_tools_nonempty() {
+        let tool = crate::ToolSchema {
+            name: "read".into(),
+            description: "Read file".into(),
+            parameters: json!({ "type": "object" }),
+        };
+
+        let mut cfg_unset = CompletionsConfig::new("k");
+        let body_unset = build_request_body(
+            &cfg_unset,
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools: vec![tool.clone()],
+                ..Default::default()
+            },
+            "gpt-4o",
+        );
+        assert!(body_unset.get("parallel_tool_calls").is_none());
+
+        cfg_unset.compat.parallel_tool_calls = Some(true);
+        let body_true = build_request_body(
+            &cfg_unset,
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools: vec![tool.clone()],
+                ..Default::default()
+            },
+            "gpt-4o",
+        );
+        assert_eq!(body_true["parallel_tool_calls"], true);
+
+        let body_no_tools = build_request_body(
+            &cfg_unset,
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools: Vec::new(),
+                ..Default::default()
+            },
+            "gpt-4o",
+        );
+        assert!(body_no_tools.get("parallel_tool_calls").is_none());
+
+        cfg_unset.compat.parallel_tool_calls = Some(false);
+        let body_false = build_request_body(
+            &cfg_unset,
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools: vec![tool],
+                ..Default::default()
+            },
+            "gpt-4o",
+        );
+        assert_eq!(body_false["parallel_tool_calls"], false);
     }
 }

@@ -76,6 +76,7 @@ async fn persists_and_hydrates_sessions_across_restarts() {
     s1.append_trace(SessionTraceEvent::TurnEnd {
         turn: 1,
         reason: "completed".into(),
+        error: None,
     });
     s1.flush_async().await.unwrap();
     drop(store1);

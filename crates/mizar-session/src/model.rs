@@ -35,6 +35,8 @@ pub enum SessionTraceEvent {
     TurnEnd {
         turn: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     StepStart {
         turn: u64,
@@ -54,6 +56,8 @@ pub enum SessionTraceEvent {
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     ToolCall {
         turn: u64,
@@ -99,6 +103,11 @@ pub enum SessionTraceEvent {
         severity: TraceSeverity,
         text: String,
     },
+    /// 工具结果裁剪标记（`LogOnly`）：投影层按 `target_seq -> notice` 替换对应 `ToolResult` 正文，不修改原始事件。
+    ToolResultPrune {
+        target_seq: u64,
+        notice: String,
+    },
 }
 
 impl SessionTraceEvent {
@@ -115,6 +124,7 @@ impl SessionTraceEvent {
             Self::CompactionStart { .. } => "compaction-start",
             Self::CompactionEnd { .. } => "compaction-end",
             Self::TurnNotice { .. } => "turn-notice",
+            Self::ToolResultPrune { .. } => "tool-result-prune",
         }
     }
 }

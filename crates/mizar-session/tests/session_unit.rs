@@ -174,6 +174,7 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
     s.append_trace(SessionTraceEvent::TurnEnd {
         turn: 1,
         reason: "completed".into(),
+        error: None,
     });
 
     s.append_trace(SessionTraceEvent::TurnStart { turn: 2 });
@@ -1139,4 +1140,138 @@ async fn lightweight_header_and_selection_queries_avoid_full_load_session() {
         Some("claude-sonnet-4-5")
     );
     assert_eq!(backend.load_session_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn trace_end_events_preserve_legacy_json_and_serialize_optional_error() {
+    let legacy_step: SessionTraceEvent =
+        serde_json::from_str(r#"{"kind":"step-end","turn":1,"step":2,"outcome":"completed"}"#)
+            .unwrap();
+    assert_eq!(
+        legacy_step,
+        SessionTraceEvent::StepEnd {
+            turn: 1,
+            step: 2,
+            outcome: "completed".into(),
+            usage: None,
+            error: None,
+        }
+    );
+    let step_json = serde_json::to_string(&legacy_step).unwrap();
+    assert!(!step_json.contains(r#""error":"#));
+
+    let legacy_turn: SessionTraceEvent =
+        serde_json::from_str(r#"{"kind":"turn-end","turn":1,"reason":"error"}"#).unwrap();
+    assert_eq!(
+        legacy_turn,
+        SessionTraceEvent::TurnEnd {
+            turn: 1,
+            reason: "error".into(),
+            error: None,
+        }
+    );
+    let turn_json = serde_json::to_string(&legacy_turn).unwrap();
+    assert!(!turn_json.contains(r#""error":"#));
+
+    let err_step = SessionTraceEvent::StepEnd {
+        turn: 1,
+        step: 1,
+        outcome: "error".into(),
+        usage: None,
+        error: Some("upstream timeout".into()),
+    };
+    let err_step_json = serde_json::to_string(&err_step).unwrap();
+    assert!(err_step_json.contains(r#""error":"upstream timeout""#));
+    assert_eq!(
+        serde_json::from_str::<SessionTraceEvent>(&err_step_json).unwrap(),
+        err_step
+    );
+}
+
+#[test]
+fn tool_result_prune_is_log_only_projects_in_derive_messages_and_preserves_fork_parity() {
+    let store = SessionStore::new();
+    let s = store.create_with(SessionCreateOptions {
+        id: Some("prune-mem".into()),
+        ..Default::default()
+    });
+    s.append(SessionEvent::user("check foo.rs"));
+    s.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"foo.rs"}"#.into(),
+        }],
+        replay: None,
+        usage: None,
+    });
+    s.append(SessionEvent::ToolResult {
+        tool_call_id: "c1".into(),
+        name: "read".into(),
+        content: "ORIGINAL_LARGE_BODY".into(),
+        is_error: false,
+    });
+    s.append(SessionEvent::Assistant {
+        blocks: vec![ContentBlock::ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"foo.rs"}"#.into(),
+        }],
+        replay: None,
+        usage: None,
+    });
+    s.append(SessionEvent::ToolResult {
+        tool_call_id: "c2".into(),
+        name: "read".into(),
+        content: "NEWER_COMPLETE_BODY".into(),
+        is_error: false,
+    });
+
+    // 剪枝标记落盘为 LogOnly，不修改原始 seq=3 的 ToolResult
+    s.append_trace(SessionTraceEvent::ToolResultPrune {
+        target_seq: 3,
+        notice: "[Superseded by a newer read of this file]".into(),
+    });
+    assert_eq!(s.log().len(), 5, "ToolResultPrune must stay LogOnly");
+    assert_eq!(s.all_entries().len(), 6);
+    assert!(matches!(
+        &s.log()[2].event,
+        SessionEvent::ToolResult { content, .. } if content == "ORIGINAL_LARGE_BODY"
+    ));
+
+    let live_msgs = s.derive_messages();
+    assert_eq!(
+        live_msgs[2],
+        Message::Tool {
+            content: "[Superseded by a newer read of this file]".into(),
+            tool_call_id: "c1".into(),
+            is_error: false,
+        }
+    );
+    assert_eq!(
+        live_msgs[4],
+        Message::Tool {
+            content: "NEWER_COMPLETE_BODY".into(),
+            tool_call_id: "c2".into(),
+            is_error: false,
+        }
+    );
+
+    // 剪枝前切点 fork 保留原文；剪枝后切点 fork 与 live derive_messages 字节一致
+    let pre_prune_fork = store
+        .fork(&s.id, 5, SessionCreateOptions::default())
+        .unwrap();
+    assert_eq!(
+        pre_prune_fork.derive_messages()[2],
+        Message::Tool {
+            content: "ORIGINAL_LARGE_BODY".into(),
+            tool_call_id: "c1".into(),
+            is_error: false,
+        }
+    );
+
+    let post_prune_fork = store
+        .fork(&s.id, 6, SessionCreateOptions::default())
+        .unwrap();
+    assert_eq!(post_prune_fork.derive_messages(), live_msgs);
 }

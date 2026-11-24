@@ -12,7 +12,7 @@ use mizar_llm::ContentBlock;
 use mizar_session::{CompactionDigest, PinnedInput, SessionEntry, SessionEvent};
 use serde_json::Value;
 
-use crate::compaction::budget::estimate_entry_tokens;
+use crate::compaction::budget::estimate_entry_tokens_with_pruned;
 
 const MAX_MODIFIED_FILES: usize = 64;
 const MAX_COMMANDS_RUN: usize = 32;
@@ -45,6 +45,23 @@ pub fn plan_compaction_cut(
     last_seq: u64,
     keep_recent_tokens: u64,
     force_zero_tail: bool,
+) -> Option<CutPlan> {
+    plan_compaction_cut_with_pruned(
+        visible,
+        last_seq,
+        keep_recent_tokens,
+        force_zero_tail,
+        &HashMap::new(),
+    )
+}
+
+/// 规划压缩切分点（支持结合 `ToolResultPrune` 映射按实际投影后 token 估算切分位置）。
+pub fn plan_compaction_cut_with_pruned(
+    visible: &[SessionEntry],
+    last_seq: u64,
+    keep_recent_tokens: u64,
+    force_zero_tail: bool,
+    pruned_map: &HashMap<u64, String>,
 ) -> Option<CutPlan> {
     let mut previous_summary: Option<String> = None;
     let mut previous_digest = CompactionDigest::default();
@@ -87,7 +104,7 @@ pub fn plan_compaction_cut(
         let mut idx = regular.len();
         while idx > 0 {
             let entry = regular[idx - 1];
-            let tok = estimate_entry_tokens(entry);
+            let tok = estimate_entry_tokens_with_pruned(entry, pruned_map);
             if idx < regular.len() && kept_acc.saturating_add(tok) > keep_recent_tokens {
                 break;
             }
@@ -110,8 +127,14 @@ pub fn plan_compaction_cut(
         .first()
         .map_or(last_seq.saturating_add(1), |e| e.seq);
 
-    let compacted_tokens: u64 = compacted_entries.iter().map(estimate_entry_tokens).sum();
-    let kept_tokens: u64 = kept_entries.iter().map(estimate_entry_tokens).sum();
+    let compacted_tokens: u64 = compacted_entries
+        .iter()
+        .map(|e| estimate_entry_tokens_with_pruned(e, pruned_map))
+        .sum();
+    let kept_tokens: u64 = kept_entries
+        .iter()
+        .map(|e| estimate_entry_tokens_with_pruned(e, pruned_map))
+        .sum();
 
     let pinned_inputs = detect_split_turn_pinned_inputs(&compacted_entries, &kept_entries);
 

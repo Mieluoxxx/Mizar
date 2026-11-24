@@ -152,6 +152,20 @@ fn collect_visible_indices(log: &[SessionEntry]) -> Vec<usize> {
     indices
 }
 
+/// 从会话事件流收集只追加的工具结果裁剪映射（`target_seq -> notice`）。
+pub fn collect_pruned_map(log: &[SessionEntry]) -> HashMap<u64, String> {
+    let mut map = HashMap::new();
+    for entry in log {
+        if let SessionEvent::Trace {
+            detail: SessionTraceEvent::ToolResultPrune { target_seq, notice },
+        } = &entry.event
+        {
+            map.insert(*target_seq, notice.clone());
+        }
+    }
+    map
+}
+
 /// 将压缩检查点统一格式化为发给模型的软硬分离上下文块。
 pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> String {
     let mut out = String::new();
@@ -824,10 +838,17 @@ impl Session {
         f(&inner.log)
     }
 
-    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口并跳过 `LogOnly` 事件）。
+    /// 返回当前会话通过 `ToolResultPrune` 标记投影替换的工具结果映射（`target_seq -> notice`）。
+    pub fn pruned_map(&self) -> HashMap<u64, String> {
+        let inner = self.inner.lock().unwrap();
+        collect_pruned_map(&inner.log)
+    }
+
+    /// 从日志推导出发给模型的消息列表（自动应用最新 `Compaction` 窗口与 `ToolResultPrune` 投影并跳过 `LogOnly` 事件）。
     pub fn derive_messages(&self) -> Vec<Message> {
         let inner = self.inner.lock().unwrap();
         let indices = collect_visible_indices(&inner.log);
+        let pruned_map = collect_pruned_map(&inner.log);
         let mut messages = Vec::with_capacity(indices.len());
         for idx in indices {
             let entry = &inner.log[idx];
@@ -852,8 +873,12 @@ impl Session {
                     is_error,
                     ..
                 } => {
+                    let effective_content = pruned_map
+                        .get(&entry.seq)
+                        .cloned()
+                        .unwrap_or_else(|| content.clone());
                     messages.push(Message::Tool {
-                        content: content.clone(),
+                        content: effective_content,
                         tool_call_id: tool_call_id.clone(),
                         is_error: *is_error,
                     });
