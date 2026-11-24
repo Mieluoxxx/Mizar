@@ -80,8 +80,8 @@
 
 | Crate | 入口 / 挂载函数 | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- |
-| **`mizar-client`** | `SessionActor`、`RpcServer`、`ProcessRegistration`、`PendingInteractions`、`install_file_mentions`、`install_approval_gate` | **跨端宿主运行时（严禁引入 `ratatui` / `crossterm` / `mizar-tui-ui`）**：供 `mizar-tui`、Herdr Mod 与桌面端 Merak 共用。包含单会话核 `SessionActor`/`SessionActorHandle`（`actor`：`ActiveTurnBuffer`、单源 `queued_inputs`、`FollowUp` 唤醒循环、双向事件分页、`session.fork`/`tree` 与能力清单）、Per-PID 运行态与单写者锁（`run_dir`：`~/.mizar/run/p-<pid>.{sock,json}`）、Unix Socket JSON-RPC 2.0 服务端（`rpc_server`：`40ms` `stream.delta` 聚合与 `256` 帧慢客户端断连保护）、高危审批门禁与双端原子抢占（`approval`：`PendingInteractions`）、`@` 引用展开（`mentions`）、图片压缩与 EXIF 校正（`images`）、会话投影（`session_view`）、设置热写回（`settings`）、本地 Shell（`local_bash`）、运行控制（`events`）及工作区面板快照（`workspace`） | `mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`、`mizar-mcp`、`mizar-core` |
-| **`mizar-tui`** | `mizar` 二进制、`install_tui_emphasis` | **薄终端宿主客户端**：解析 CLI 参数与 `mizar exec` 无头单次执行，实例化 `MizarRuntime` 与 `SessionActor`，通过进程内零序列化 `ClientEvent` 流交互（并可选自动启动 `RpcServer` 暴露 `p-<pid>.sock`），专注终端 I/O、剪贴板、`mizar-tui-ui` 渲染桥接及按 `HostExtensionFlags` 挂载终端扩展 | `mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`、`mizar-mcp`、`mizar-core`、`mizar-client`、`mizar-tui-ui` |
+| **`mizar-client`** | `SessionActor`、`RpcServer`、`ProcessRegistration`、`PendingInteractions`、`install_file_mentions`、`install_approval_gate` | **跨端宿主运行时（严禁引入 `ratatui` / `crossterm` / `mizar-tui-ui`）**：供 `mizar-tui`、Herdr Mod 与桌面端 Merak 共用。包含单会话核 `SessionActor`/`SessionActorHandle`（`actor`：`ActiveTurnBuffer`、单源 `queued_inputs`、`FollowUp` 唤醒循环、双向事件分页、`session.fork`/`tree` 与能力清单）、Per-PID 运行态与单写者锁（`run_dir`：`~/.mizar/run/p-<pid>.sock` 与 `0600` `p-<pid>.json`，含 `without_secret()` 脱敏投影）、Unix Socket + `127.0.0.1:0` 认证回环 TCP 双通道 JSON-RPC 2.0 服务端（`rpc_server`：TCP 首帧常量时间 `auth.hello` 鉴权/`-32003`、`40ms` `stream.delta` 聚合与 `256` 帧慢客户端断连保护）、高危审批门禁与双端原子抢占（`approval`：`PendingInteractions`）、`@` 引用展开（`mentions`）、图片压缩与 EXIF 校正（`images`）、会话投影（`session_view`）、设置热写回（`settings`）、本地 Shell（`local_bash`）、运行控制（`events`）及工作区面板快照（`workspace`） | `mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`、`mizar-mcp`、`mizar-core` |
+| **`mizar-tui`** | `mizar` 二进制、`mizar serve`、`install_tui_emphasis` | **薄终端宿主客户端与回环网关**：解析 CLI 参数、`mizar exec` 无头单次执行与 `mizar serve` 回环 HTTP/WebSocket 网关（`serve.rs`：强制回环地址绑定与严格 `Origin` 校验、`/health`、脱敏 `/api/processes`、`/api/sessions`、`/ws` 代理活 `p-<pid>.sock` 或为静态 SQLite 会话按需拉起 headless `SessionActor`），实例化 `MizarRuntime` 与 `SessionActor`，通过进程内零序列化 `ClientEvent` 流交互（并可选自动启动 `RpcServer`），专注终端 I/O、剪贴板、`mizar-tui-ui` 渲染桥接及按 `HostExtensionFlags` 挂载终端扩展 | `mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`、`mizar-mcp`、`mizar-core`、`mizar-client`、`mizar-tui-ui` |
 
 ---
 
@@ -89,7 +89,7 @@
 
 ```text
 ┌─ 终端入口与跨端宿主层 ──────────────────────────────────────────────────────────┐
-│  mizar-tui (CLI + exec + 终端桥接)              Merak Desktop（桌面端直嵌）     │
+│  mizar-tui (CLI + exec + serve + 终端桥接)      Merak Desktop（桌面端直嵌）     │
 │    ├─► mizar-tui-ui (纯终端 UI：零 tokio)             │                         │
 │    │     └────────────────────────────────────────────┼──► mizar-types          │
 │    └───────────────────────┬──────────────────────────┘                         │

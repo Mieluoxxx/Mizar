@@ -130,6 +130,6 @@ Verified:
 | 会话日志 / SQLite | `crates/mizar-session/src/{lib,model,persistence,sqlite}.rs` |
 | 主循环与 Agent 领域核 | `crates/mizar-core/src/{lib,agent_loop,system_prompt,compaction,instructions,skills,trajectory,session_title,subagent}.rs` |
 | UI 渲染与状态机 | `crates/mizar-tui-ui/src/`（`ui.rs`、`markdown.rs`、`features.rs`、`app.rs`、`app/{cache,events,input}.rs`） |
-| TUI 宿主循环与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
+| TUI 宿主循环、`serve` 网关与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`、`crates/mizar-tui/src/serve.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
 | 静态组合根与扩展 ID | `crates/mizar-core/src/spine.rs`（`MizarRuntime::build`）与 `crates/mizar-core/src/spine/plugins.rs`（`SpinePlugins`、`KNOWN_HOST_EXTENSION_IDS`、`build_tools_guide_section`） |
 | 配置字段 | `crates/mizar-core/src/spine/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第七节 |

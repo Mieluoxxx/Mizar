@@ -240,7 +240,10 @@
 - [x] **M1（`mizar-client::SessionActor` 内核解耦）**：将 `mizar-tui/src/runner` 私有控制态、`ActiveTurnBuffer`、`PendingInteractions`（`request_id -> oneshot`）、唯一 `queued_inputs`、`FollowUp` 唤醒循环与 `SubagentTaskSnapshot` 广播下沉至 `mizar-client`，`mizar-tui` 退化为薄客户端并回归全部测试。
 - [x] **M2（Per-PID Socket 与核心 RPC 闭环）**：落地 `~/.mizar/run/p-<pid>.sock`（`0600`）与 `p-<pid>.json`（含 `ppid`/`tty`/`herdr_pane_id` 及单写者会话锁）、补齐 OSC 7501 `pid` 字段，实现核心 RPC（`session.subscribe`、`turn.submit`、`turn.cancel`、`interaction.resolve`、`session.config`、`session.events`）、`40ms` delta 合并与 `256` 帧慢客户端断连保护。
 - [x] **M3（持久化渲染质感升级）**：将 `ToolResult.details` 精选字段持久化为 `tool-result.meta`（`derive_messages()` 忽略，零上下文污染），新增 `approval`（`LogOnly`）事件与 `turn-end.summary` 纯规则统计，补齐 `capabilities.list` 与 `session.fork`/`tree`。
-- [ ] **M4（前端接入与按需远程化）**：在 `~/workspace/herdr-mayonaka` 接入 `p-<pid>.sock` 构建 Mizar 交互视图；`mizar serve`（仅 `127.0.0.1` + Origin 校验 + Tailscale Serve）待有独立 Web/PWA 需求时后置启动。
+- [x] **M4（前端接入与按需远程化）**：
+  - M4.1：为 `mizar-client` 增设 `127.0.0.1:0` 认证回环 TCP 旁路、`0600` `p-<pid>.json` `rpc_token`（`ProcessRegistration::without_secret()` 脱敏）及首帧常量时间 `auth.hello` 校验（失败返回 `-32003` 并断连）。
+  - M4.2：落地 `mizar serve` 回环 HTTP/WebSocket 网关（仅允许回环地址绑定 + 严格 `Origin` 校验 `/403`、`/health`、脱敏 `/api/processes`、`/api/sessions`、`/ws` 代理活 `p-<pid>.sock` 或按需拉起静态 SQLite 会话 headless `SessionActor`，远程可叠加 Tailscale Serve）。
+  - M4.3：在 `~/workspace/herdr-mayonaka`（分支 `feat/mizar-mod`）建成原生 GPUI `mayonaka-mizar` 模块并接入 `layouts/mayonaka.json`、`mayonaka-tabs`（`⌘⌥M`）、`mayonaka-palette` 与 `mayonaka-pane` 状态标识（注：第四节决策 6 的 `gpt-6.2-sol` 线上实测仍待有真实凭据时交互验证）。
 
 ---
 
@@ -250,14 +253,14 @@
 
 ### 1. 总体架构与 Crate 归位
 
-核心原则：TUI 降级为会话内核的一个进程内本地客户端（in-proc 零序列化），与 `herdr-mayonaka`（Unix Socket）、Merak Desktop（直嵌）及未来可选 `mizar serve`（Web / 手机 PWA）平等地连到同一份 `SessionActor` 运行时。
+核心原则：TUI 降级为会话内核的一个进程内本地客户端（in-proc 零序列化），与 `herdr-mayonaka`（Unix Socket / 认证回环 TCP）、Merak Desktop（直嵌）及 `mizar serve`（Web / 手机 PWA）平等地连到同一份 `SessionActor` 运行时。
 
 ```text
   ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
-  │    Mizar TUI     │   │  herdr-mayonaka  │   │  Web / PWA (M4)  │
-  │   (终端薄前端)    │   │   (Herdr Mod)    │   │   (可选远程端)    │
+  │    Mizar TUI     │   │  herdr-mayonaka  │   │    Web / PWA     │
+  │   (终端薄前端)    │   │   (Herdr Mod)    │   │   (mizar serve)  │
   └────────┬─────────┘   └────────┬─────────┘   └────────┬─────────┘
-           │ in-proc              │ Unix Socket          │ WS (via mizar serve)
+           │ in-proc              │ Socket / 127.0.0.1   │ WS (via mizar serve)
            ▼                      ▼                      ▼
   ┌──────────────────────────────────────────────────────────────────┐
   │              mizar-client::SessionActor (零终端依赖)              │
@@ -284,7 +287,7 @@
 - **运行目录**：`~/.mizar/run/`（目录权限 `0700`）。
 - **每活进程文件**：
   - Socket：`~/.mizar/run/p-<pid>.sock`（权限 `0600`），按进程 PID 命名，确保 TUI 执行 `/resume` 或 `/new` 切换会话时不断连，仅广播 `session.switched` 并原子更新元信息文件。
-  - 元信息文件：`~/.mizar/run/p-<pid>.json`（写临时文件后 `rename` 原子替换，正常退出时删除；前端通过 `kill(pid, 0)` 自动忽略并清理残留死文件）：
+  - 元信息文件：`~/.mizar/run/p-<pid>.json`（权限 `0600`，写临时文件后 `rename` 原子替换，正常退出时删除；前端通过 `kill(pid, 0)` 自动忽略并清理残留死文件，对外 `/api/processes` 使用 `without_secret()` 剥离 `rpc_token`）：
     ```json
     {
       "pid": 48210,
@@ -294,6 +297,8 @@
       "session_id": "01J...",
       "cwd": "/Users/moguw/workspace/herdr-mayonaka",
       "socket": "/Users/moguw/.mizar/run/p-48210.sock",
+      "tcp_addr": "127.0.0.1:49201",
+      "rpc_token": "<64-hex-token>",
       "provider": "magpie",
       "model": "isok/gpt-6.2-sol",
       "started_at_ms": 1763971200000
@@ -364,7 +369,7 @@
 - **双端审批抢占**：`PendingInteractions` 使用 `HashMap<RequestId, oneshot::Sender<ApprovalDecision>>`，`resolve()` 通过 `map.remove(&request_id)` 原子抢占——先到者胜出返回 `{ ok: true }` 并广播 `interaction.resolved`；后到者直接返回 `{ ok: false, reason: "already_resolved" }`，前端静默收起卡片。
 - **高频流式节流**：广播 `stream.delta` 前加 `30~50ms` coalescing 缓冲（按 `(kind, call_id)` 合并，单帧上限 `16 KB`）；`ActiveTurnBuffer` 的 `output_tail` 限制保留最后 `64 KB`，防止刷屏输出撑爆内存。
 - **慢客户端断连保护**：每个 Socket 连接设置 `256` 条有界发送队列；队满即主动断开该慢客户端，绝不阻塞 `SessionActor` 或 TUI 主循环；客户端重连通过 `session.subscribe(after_seq)` 无损恢复。
-- **安全边界**：`~/.mizar/run/` 权限 `0700`、Socket `0600`；未来 M4 若启动 `mizar serve`，强制只监听 `127.0.0.1`、严格校验 `Origin`，远程加密与认证交由 Tailscale Serve。
+- **安全边界**：`~/.mizar/run/` 权限 `0700`、Socket 与 `p-<pid>.json` 权限 `0600`；`127.0.0.1:0` 认证回环 TCP 强制首帧常量时间 `auth.hello` 校验（错误返回 `-32003` 并断开）；`mizar serve` 强制仅允许回环地址绑定、严格校验 `Origin`（非法返回 `403`），远程加密与认证交由 Tailscale Serve。
 
 ### 6. 相较原始提案的 6 项关键优化汇总
 
