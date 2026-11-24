@@ -65,7 +65,6 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "skills",
     "instructions",
     "compaction",
-    "recall",
     "session-title",
     "subagent",
     "trajectory",
@@ -159,7 +158,6 @@ fn tool_group_for_module(id: &str) -> Option<(&'static [&'static str], &'static 
             &["mcp__"],
         )),
         "skills" => Some((&["skill"], &[])),
-        "recall" => Some((&["recall"], &[])),
         "subagent" => Some((&["subagent"], &[])),
         _ => None,
     }

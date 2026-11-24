@@ -2267,7 +2267,7 @@ async fn exec_turn0_prompt_wire_format_order_file_mentions_and_trace_out() {
     iso_tools.sort();
     assert_eq!(
         iso_tools,
-        vec!["bash", "edit", "find", "grep", "read", "recall", "write"]
+        vec!["bash", "edit", "find", "grep", "read", "write"]
     );
 
     // B. Turn-0 ContextNotice 顺序 + @file 展开 + 跨轮 developer/tools 字节一致 + --trace-out

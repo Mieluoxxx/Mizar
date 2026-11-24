@@ -8,9 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc;
 use mizar_core::agent_loop::{AgentPreStepDecision, AgentPreStepInput};
-use mizar_core::spine::{
-    AgentSpineConfig, MizarRuntime, RECALL_TOOL_NAME, SUBAGENT_TOOL_NAME, SpinePluginError,
-};
+use mizar_core::spine::{AgentSpineConfig, MizarRuntime, SUBAGENT_TOOL_NAME, SpinePluginError};
 use mizar_llm::{
     BoxChunkStream, FinishReason, GenerateOptions, LlmAdapter, ModelInfo, ProviderInfo, StreamChunk,
 };
@@ -160,7 +158,6 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
         "mcp",
         "skills",
         "instructions",
-        "recall",
         "session-title",
         "subagent",
         "trajectory",
@@ -191,7 +188,7 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     let sessions = &runtime.sessions;
 
     // 1. 启动阶段全部可选模块处于禁用状态：MCP 延迟未挂载，其余模块门控为 false 且工具被屏蔽
-    assert_eq!(ctrl.disabled_ids().len(), 12);
+    assert_eq!(ctrl.disabled_ids().len(), 11);
     assert!(
         runtime.mcp().await.is_none(),
         "mcp must stay unmounted while disabled at startup"
@@ -241,15 +238,8 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     );
     assert!(!prompt.build().contains("Available tools:"));
 
-    // 3. 启用 tool-search / codemode / mcp / skills / instructions / recall
-    for id in [
-        "tool-search",
-        "codemode",
-        "mcp",
-        "skills",
-        "instructions",
-        "recall",
-    ] {
+    // 3. 启用 tool-search / codemode / mcp / skills / instructions
+    for id in ["tool-search", "codemode", "mcp", "skills", "instructions"] {
         assert!(ctrl.set_enabled(id, true).await.unwrap(), "enable {id}");
     }
     assert!(runtime.mcp().await.is_some());
@@ -261,7 +251,6 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
     assert!(enabled_tool_names.contains("tool_search"));
     assert!(enabled_tool_names.contains("codemode"));
     assert!(enabled_tool_names.contains("skill"));
-    assert!(enabled_tool_names.contains(RECALL_TOOL_NAME));
     // 0 个外部 MCP 工具时，tool_search 仍保持按需自动激活语义
     assert!(!tools.list().iter().any(|t| t.name == "tool_search"));
 
@@ -294,15 +283,8 @@ async fn optional_modules_startup_disable_and_runtime_toggle_cleanly() {
         SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
     )));
 
-    // 4. 禁用 tool-search / codemode / mcp / skills / instructions / recall
-    for id in [
-        "tool-search",
-        "codemode",
-        "mcp",
-        "skills",
-        "instructions",
-        "recall",
-    ] {
+    // 4. 禁用 tool-search / codemode / mcp / skills / instructions
+    for id in ["tool-search", "codemode", "mcp", "skills", "instructions"] {
         assert!(ctrl.set_enabled(id, false).await.unwrap(), "disable {id}");
     }
     assert!(!runtime.skills.as_ref().unwrap().is_enabled());

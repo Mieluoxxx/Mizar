@@ -675,7 +675,7 @@ impl CompactionRuntime {
         // 落盘 Compaction 检查点
         let tokens_after_est = resident_overhead + checkpoint_tokens + cut.kept_tokens;
 
-        // 压后联动：清空本会话临时激活的延迟工具（recall 会由其事件监听重新激活）
+        // 压后联动：清空本会话临时激活的延迟工具
         self.tools.reset_session_activations(&session.id);
 
         session.compact_at(

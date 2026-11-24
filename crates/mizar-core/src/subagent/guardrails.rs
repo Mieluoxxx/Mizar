@@ -18,7 +18,6 @@ pub const READ_ONLY_TOOL_ALLOWLIST: &[&str] = &[
     "list_dir",
     "read_file",
     "get_time",
-    "recall",
     "skill",
     "list_mcp_resources",
     "list_mcp_resource_templates",
