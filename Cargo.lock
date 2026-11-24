@@ -1589,7 +1589,6 @@ dependencies = [
 name = "mizar-session"
 version = "0.2.1"
 dependencies = [
- "mizar-tools",
  "mizar-types",
  "rusqlite",
  "serde",

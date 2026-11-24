@@ -127,7 +127,7 @@ Verified:
 | 跨端宿主运行时 | `crates/mizar-client/src/lib.rs`（`install_file_mentions`、`install_approval_gate`、`events`、`settings`、`session_view`、`workspace`） |
 | 加工具 | `crates/mizar-tools/src/{lib,coding,search}.rs` |
 | 加 LLM 协议适配器 / 路由 | `crates/mizar-llm/src/{lib,runtime,http,completions,messages,responses,router,retry,mock}.rs` |
-| 会话日志 / SQLite / Recall | `crates/mizar-session/src/{lib,model,persistence,sqlite,recall}.rs` |
+| 会话日志 / SQLite | `crates/mizar-session/src/{lib,model,persistence,sqlite}.rs` |
 | 主循环与 Agent 领域核 | `crates/mizar-core/src/{lib,agent_loop,system_prompt,compaction,instructions,skills,trajectory,session_title,subagent}.rs` |
 | UI 渲染与状态机 | `crates/mizar-tui-ui/src/`（`ui.rs`、`markdown.rs`、`features.rs`、`app.rs`、`app/{cache,events,input}.rs`） |
 | TUI 宿主循环与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |

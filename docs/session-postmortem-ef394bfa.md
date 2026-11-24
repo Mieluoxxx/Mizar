@@ -223,17 +223,17 @@
 
 ### Phase 1：内核收敛与问题修复（前置，优先执行）
 
-- [ ] **彻底移除 `recall` 工具与 `session_recall_*` FTS5 索引（已决策：方案 A）**：按第四节决策 1 清理 `mizar-session` / `mizar-core` / `mizar-client` / `docs/plugins.md` 与 SQLite 历史表。
-- [ ] **持久化错误摘要到轨迹事件（已决策：决策 5）**：在 `SessionTraceEvent::StepEnd` / `TurnEnd` 增加可选 `error: Option<String>`（`StepGuard::drop`/`TurnGuard::drop` 按 2,000 字节 UTF-8 安全截断写入），并在 `session.py` 中展示 `detail.error`。
-- [ ] **落地 Subagent 编排与预算治理（已决策：决策 2）**：
+- [x] **彻底移除 `recall` 工具与 `session_recall_*` FTS5 索引（已决策：方案 A）**：按第四节决策 1 清理 `mizar-session` / `mizar-core` / `mizar-client` / `docs/plugins.md` 与 SQLite 历史表。
+- [x] **持久化错误摘要到轨迹事件（已决策：决策 5）**：在 `SessionTraceEvent::StepEnd` / `TurnEnd` 增加可选 `error: Option<String>`（`StepGuard::drop`/`TurnGuard::drop` 按 2,000 字节 UTF-8 安全截断写入），并在 `session.py` 中展示 `detail.error`。
+- [x] **落地 Subagent 编排与预算治理（已决策：决策 2）**：
   - 补齐 `yield` 助手消息发射/落盘、无在跑/待投递回执防死锁校验与并发 barrier，并完成全量 CI 检查（`test` / `clippy` / `fmt` / `--no-default-features`）。
   - 用按模式软步数预算（`read_only=100` / `edit=200`，`1.0× Steer` + `1.5×` 空工具集强制总结）与默认 `timeout_secs=0` 替换 `max_steps=20` / `180s` 硬截断。
   - 将 `SessionInbox` 的 `subagent:settled` / `subagent:watchdog` 改造为按 `(child_session_id, run_id)` 维护的结构化槽位，支持 `send`/`stop`/重结算/`status(name)` 撤回与去重。
   - 为 `ManagedTask` 增加终态全文保留及 `12,000` 字符超限落盘（附 `5,000` 字符预览），让 `status(name="...")` 返回完整输出并消费未投递回执。
-- [ ] **简化 `instructions` 为启动静态加载（已决策：决策 3 / 方案 B）**：按第四节决策 3 移除 `follow_subdirs`、子目录动态发现、每步 stat 热感知与 `ContextNotice` 状态机，改为启动时仅读取配置目录与项目根到 `workspace` 链并注入 `SystemPrompt` 静态段，同步清理配置项与 `docs/plugins.md`。
-- [ ] **落地 Cache-Aware 尾部剪枝（已决策：决策 4 / 方案 B）**：按第四节决策 4 在 `mizar-session` / `mizar-core::compaction` 实现 `supersedeReads` + `dropUseless`（热尾 `<= 8,000 tokens`、冷缓存 `>= 90m` 全段清、append-only 剪枝标记事件持久化以保证 `--resume` 前缀一致）。
-- [ ] **补齐并行 Tool Call 基础能力（已决策：决策 6）**：在 `mizar-llm` 增加 `compat.parallel_tool_calls: Option<bool>` 按需透传，并在 `DEFAULT_PERSONA` 补充静态并行引导；随后实测验证 `gpt-6.2-sol` 是否解锁。
-- [ ] **修复复盘脚本 `turn 0` 假阳性（已决策：决策 5）**：在 `.agents/skills/mizar-session-inspect/scripts/session.py` 的 `turn_rollup()` 中跳过 `selection` 等无 `turn` 属性的会话级元数据事件，并同步到 `~/.agents/skills/mizar-session-inspect/`。
+- [x] **简化 `instructions` 为启动静态加载（已决策：决策 3 / 方案 B）**：按第四节决策 3 移除 `follow_subdirs`、子目录动态发现、每步 stat 热感知与 `ContextNotice` 状态机，改为启动时仅读取配置目录与项目根到 `workspace` 链并注入 `SystemPrompt` 静态段，同步清理配置项与 `docs/plugins.md`。
+- [x] **落地 Cache-Aware 尾部剪枝（已决策：决策 4 / 方案 B）**：按第四节决策 4 在 `mizar-session` / `mizar-core::compaction` 实现 `supersedeReads` + `dropUseless`（热尾 `<= 8,000 tokens`、冷缓存 `>= 90m` 全段清、append-only 剪枝标记事件持久化以保证 `--resume` 前缀一致）。
+- [x] **补齐并行 Tool Call 基础能力（已决策：决策 6）**：在 `mizar-llm` 增加 `compat.parallel_tool_calls: Option<bool>` 按需透传，并在 `DEFAULT_PERSONA` 补充静态并行引导（基础能力已合入；待在线实测 `gpt-6.2-sol` 是否解锁）。
+- [x] **修复复盘脚本 `turn 0` 假阳性（已决策：决策 5）**：在 `.agents/skills/mizar-session-inspect/scripts/session.py` 的 `turn_rollup()` 中跳过 `selection` 等无 `turn` 属性的会话级元数据事件，并同步到 `~/.agents/skills/mizar-session-inspect/`。
 
 ### Phase 2：`herdr-app` 多端接入（详见第六节，Phase 1 收尾后启动）
 

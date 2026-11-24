@@ -21,13 +21,13 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-llm`** | `runtime` / `http` / `completions` / `messages` / `responses` / `router` / `retry` / `mock` | `LlmRuntime`、`LlmRouter`、`install_retry`、`CompletionsAdapter`、`ResponsesAdapter`、`MessagesAdapter`、`register_mock_adapter` | 抽象 LLM 服务与 `stream_hook` / `on_after_response` / `on_adapters_updated` 强类型钩子；共享 `reqwest` 客户端与 SSE 驱动（`http`）；三大协议适配器；声明式多提供方路由与热更新（`router`）；未发可见内容前瞬时错误自动退避重试（`retry`）；离线规则假模型（`mock`） | `mizar-types` |
 | **`mizar-tools`** | `lib` / `truncate` / `mutation_queue` / `coding` / `search` | `ToolRuntime`、`register_coding_tools`、`register_tool_search` | 工具注册表、三段强类型管线（`pre_execute_hook` → `execute_hook` → `post_execute_hook`）、事件总线（`on_change` / `on_result`）与同路径写串行队列；编码 6 件套（`read`/`bash`/`edit`/`write`/`grep`/`find`，三档预设 `All`/`MinimalCoding`/`ReadOnly` + 纯函数 `build_tools_guide`）；BM25 `tool_search` 工具检索与按需激活 | `mizar-types` |
-| **`mizar-session`** | `lib` / `model` / `persistence` / `sqlite` / `recall` | `SessionStore`、`SqliteSessionPersistence`、`register_recall_tool` | 只追加会话事件日志（含 `Surface` / `LogOnly` 分级、`Selection` / `Usage` 账务、`derive_messages` 推导与 `on_event`/`on_created`/`on_loaded`/`on_title_updated` 总线）；嵌入式 SQLite（WAL + Single-Writer 后台线程 + FTS5 1..=3 Unicode scalar n-gram 索引）；`recall` 穿透压缩与谱系边界只读回溯工具 | `mizar-types`、`mizar-tools` |
+| **`mizar-session`** | `lib` / `model` / `persistence` / `sqlite` | `SessionStore`、`SqliteSessionPersistence` | 只追加会话事件日志（含 `Surface` / `LogOnly` 分级、`Selection` / `Usage` / `ToolResultPrune` / `StepEnd.error` / `TurnEnd.error` 账务、`derive_messages` 投影与 `on_event`/`on_created`/`on_loaded`/`on_title_updated` 总线）；嵌入式 SQLite（WAL + Single-Writer 后台线程，schema v4 自动清理历史 FTS 表） | `mizar-types` |
 
 ### 工具分层暴露策略（`mizar-tools::ToolExposure`）
 
 | `ToolExposure` | 直接声明给模型 | 可被 `codemode` 脚本调用 | 列在 `codemode` 描述中 | 典型使用者 |
 | :--- | :--- | :--- | :--- | :--- |
-| `Direct` | ✓ 激活后 | ✓ | — | `read` / `bash` / `edit` / `write` / `grep` / `find` / `skill` / `recall` |
+| `Direct` | ✓ 激活后 | ✓ | — | `read` / `bash` / `edit` / `write` / `grep` / `find` / `skill` |
 | `ModelOnly` | ✓ 激活后 | ✗（自身是编排工具） | — | `tool_search`、`codemode`、`subagent` |
 | `Codemode` | ✗（需激活） | ✓ | ✓ | MCP 工具默认、`codemode` 内部依赖的工具 |
 | `Deferred` | ✗（需激活） | ✓ | ✗（靠 `tool_search` / `searchTools()` 发现） | MCP 工具可选项 |
@@ -54,17 +54,17 @@
 | :--- | :--- | :--- | :--- |
 | `system_prompt` | `SystemPrompt`、`PromptSection` | 无 | 按 `order` 动态聚合系统提示词段落（内置 `persona` 与 `runtime_protocol`），`section()` 返回 `HookGuard` |
 | `agent_loop` | `AgentLoop`、`AgentEvent`、`SessionInbox`、`TurnInput` | `llm`、`tools`、`sessions`、`system_prompt` | 托管 `SessionInbox`（`Steer`/`FollowUp`/`Inject`），串联强类型 `pre_step_hook` → 冻结 `GenerateOptions` 调模型 → 工具并发/串行管线 → `request_error_hook` / `turn_stopping_hook`，通过 `AgentEventBus`（`subscribe` / `on_event`）广播强类型 `AgentEvent` |
-| `compaction` | `CompactionRuntime::install` | `llm`、`sessions`、`tools`、`agent_loop`、`system_prompt` | 单阶段检查点压缩（真实可用窗口 80% 触发、`<mizar-digest>` 硬事实、膨胀保护、溢出 `retain=0` 恢复）与压后写文件/读去重守卫，提供 `on_start`/`on_progress`/`on_end` |
-| `instructions` | `AgentInstructions::install` | `tools`、`agent_loop` | 扫描 `~/.mizar/`、`~/.agents/`、项目根到工作区祖先链及触达子目录的 `AGENTS.md` / `CLAUDE.md`，去重裁切并在 `pre_step_hook` 注入 `ContextNotice` |
+| `compaction` | `CompactionRuntime::install` | `llm`、`sessions`、`tools`、`agent_loop`、`system_prompt` | 单阶段检查点压缩（真实可用窗口 80% 触发、`<mizar-digest>` 硬事实、膨胀保护、溢出 `retain=0` 恢复）、压后写文件/读去重守卫，以及 Cache-Aware 尾部剪枝（`supersedeReads` / `dropUseless`、8K 热尾 / 90m 冷缓存 Prompt Cache 守卫与 `ToolResultPrune` 持久化标记），提供 `on_start`/`on_progress`/`on_end` |
+| `instructions` | `AgentInstructions::install` | `system_prompt` | 启动时静态扫描 `~/.mizar/`、`~/.agents/` 与项目根到工作区祖先链的 `AGENTS.md` / `CLAUDE.md`（及 `.local.md`），去重裁切后通过 `SystemPrompt::section("agent_instructions", 50)` 静态注入（移除子目录动态发现与 `ContextNotice`） |
 | `skills` | `SkillRegistry`、`install_skills` | `tools`、`sessions`、`agent_loop` | 分层发现 `SKILL.md`、注册 `skill` 工具、目录注入、写入命中热失效及 `on_change` |
 | `trajectory` | `TrajectoryRuntime::install`、`install_repeat_guard` | `agent_loop`、`tools`、`sessions` | 实时采集 `TraceEvent`、`on_anomaly` 异常检测、`trajectory.jsonl` 导出与单文件实时流式追加（`export_file` / `--trace-jsonl` / `MIZAR_TRACE_JSONL`）、以及连续重复失败工具调用拦截 |
 | `session_title` | `SessionTitleRuntime::install` | `llm`、`agent_loop` | 异步生成与刷新 `MMDD｜TYPE｜Topic` 会话标题，尊重 `/rename` 人工所有权，自动跳过子代理 |
-| `subagent` | `SubagentRuntime::install` | `llm`、`tools`、`sessions`、`agent_loop`、`system_prompt` | UNIX 进程式单层后台常驻分身 `subagent`（`ModelOnly`），支持 `spawn`/`send`/`status`/`stop`/`yield`、零 Token 活性看门狗、深度 1 护栏与 `on_state` |
-| `spine` | `MizarRuntime::build`、`SpinePlugins`、`build_tools_guide_section`、`LoadedMizarConfig` | 静态组合根 | 按编译期 DAG 顺序静态构造核心服务与 12 个内置可选模块，托管 `HookGuard` 并在 `shutdown()` 时按 LIFO 逆序清理；`SpinePlugins` 控制可选模块原子启停（`mcp` 启动禁用时延后首次按需启动；核心自保护、`tools_guide` `order=20` 段落、识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主扩展 ID），并承载 `settings.json` / `models.json` / CLI 路由解析 |
+| `subagent` | `SubagentRuntime::install` | `llm`、`tools`、`sessions`、`agent_loop`、`system_prompt` | UNIX 进程式单层后台常驻分身 `subagent`（`ModelOnly`），支持 `spawn`/`send`/`status`/`stop`/`yield`、按模式软步数预算（`read_only=100` / `edit=200` + `1.0× Steer` / `1.5×` 空工具集收尾）、默认无墙钟硬超时、零 Token 活性看门狗、结构化回执去重、`yield` 并发屏障、终态全文/超限落盘与深度 1 护栏 |
+| `spine` | `MizarRuntime::build`、`SpinePlugins`、`build_tools_guide_section`、`LoadedMizarConfig` | 静态组合根 | 按编译期 DAG 顺序静态构造核心服务与 11 个内置可选模块，托管 `HookGuard` 并在 `shutdown()` 时按 LIFO 逆序清理；`SpinePlugins` 控制可选模块原子启停（`mcp` 启动禁用时延后首次按需启动；核心自保护、`tools_guide` `order=20` 段落、识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主扩展 ID），并承载 `settings.json` / `models.json` / CLI 路由解析 |
 
 **内部 Crate 依赖**：`mizar-types`、`mizar-llm`、`mizar-tools`、`mizar-session`，以及按 Cargo feature 选配的 `mizar-codemode`、`mizar-mcp`。
 
-`subagent(action="yield", message="…")` 用于交还主代理回合：写回当前模型请求发出的全部工具结果（含面向用户的进度说明）后正常结束，不等待或取消子任务，也不发额外的模型请求。后台结果仍由 `SessionInbox` 的 `FollowUp` 交给宿主；单次无头 `exec` 不启用子代理。
+`subagent(action="yield", message="…")` 用于交还主代理回合：若 `message` 非空则发射并持久化一条助手回复，在无在跑子任务且无待投递回执时拒绝执行，写回全部工具结果后触发并发 barrier（正常结算等待全部在跑子任务完成后聚合唤醒，失败/看门狗/人工输入立即打断）；单次无头 `exec` 不启用子代理。
 
 ### Cargo Features 清单
 
@@ -100,9 +100,9 @@
 └────┴───────────────────────┬──────────────────────────┬─────────────────────────┘
                              │                          │ (optional features)
                              v                          v
-┌─ 会话/工具/隔离扩展层 ─────┴──────────┐    ┌──────────┴─────────────────────────┐
-│  mizar-session (sessions + sqlite     │    │  mizar-codemode (rquickjs 隔离)    │
-│                 + recall)             │    │  mizar-mcp (外部 stdio/HTTP MCP)   │
+┌─ 会话与隔离扩展层 ─────────┴──────────┐    ┌──────────┴─────────────────────────┐
+│  mizar-session (sessions + sqlite)    │    │  mizar-codemode (rquickjs 隔离)    │
+│  （仅依赖 mizar-types）               │    │  mizar-mcp (外部 stdio/HTTP MCP)   │
 └────────────────┬──────────────────────┘    └──────────┬─────────────────────────┘
                  │                                      │
                  v                                      v
@@ -141,11 +141,10 @@
 | `codemode` | object | `autoEnable` / `onlyMode` / `inlineBudget` / `timeoutMs` |
 | `toolSearch` | object | `autoEnable` / `defaultLimit` |
 | `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
-| `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` / `followSubdirs` |
+| `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` |
 | `compaction` | object | `enabled` / `autoCompact` / `defaultContextWindow` / `maxContextTokens` / `triggerRatio` / `keepRecentTokens` |
-| `recall` | object | `enabled` / `defaultSearchLimit`（默认 `8`）/ `readCharLimit`（默认 `6000`） |
 | `sessionTitle` | object | `enabled`（默认 `true`）/ `model`（可选 `provider/model`，省略则跟随当前会话模型）/ `thinkingLevel`（默认 `"low"`） |
-| `subagent` | object | `maxSteps`（默认 `20`）/ `maxStepsCap`（默认 `40`）/ `timeoutSecs`（默认 `180`，最小钳位 `1`）/ `maxConcurrent`（默认 `4`）/ `stallTimeoutSecs`（默认 `45`，设为 `0` 关闭看门狗）/ `maxWatchdogAlerts`（默认 `2`） |
+| `subagent` | object | `readOnlySoftBudget`（默认 `100`，`0` 关闭）/ `editSoftBudget`（默认 `200`，`0` 关闭）/ `timeoutSecs`（默认 `0`，`0` 关闭墙钟硬超时）/ `maxConcurrent`（默认 `4`）/ `stallTimeoutSecs`（默认 `45`，设为 `0` 关闭看门狗）/ `maxWatchdogAlerts`（默认 `2`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 
 ### 客户端宿主与 TUI 扩展模块 ID（`disabledPlugins`）
