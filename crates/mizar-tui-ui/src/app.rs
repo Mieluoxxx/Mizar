@@ -2721,11 +2721,15 @@ mod tests {
         let (tx1, mut rx1) = futures::channel::oneshot::channel();
         let (tx2, mut rx2) = futures::channel::oneshot::channel();
         app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-1".into(),
+            call_id: Some("call-1".into()),
             tool_name: "bash".into(),
             args_preview: "ls".into(),
             responder: Arc::new(std::sync::Mutex::new(Some(tx1))),
         });
         app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-2".into(),
+            call_id: Some("call-2".into()),
             tool_name: "write".into(),
             args_preview: "a.txt".into(),
             responder: Arc::new(std::sync::Mutex::new(Some(tx2))),
@@ -2750,6 +2754,36 @@ mod tests {
         ));
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(rx2.try_recv().unwrap(), Some(ApprovalDecision::Deny));
+        assert!(!app.overlay.is_open());
+
+        // 异源（如 RPC）先一步裁决时，UiEvent::ApprovalResolved 应静默关闭对应弹窗并提升队列下一项
+        let (tx3, mut rx3) = futures::channel::oneshot::channel();
+        let (tx4, _rx4) = futures::channel::oneshot::channel();
+        app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-remote-1".into(),
+            call_id: None,
+            tool_name: "bash".into(),
+            args_preview: "pwd".into(),
+            responder: Arc::new(std::sync::Mutex::new(Some(tx3))),
+        });
+        app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-remote-2".into(),
+            call_id: None,
+            tool_name: "edit".into(),
+            args_preview: "b.rs".into(),
+            responder: Arc::new(std::sync::Mutex::new(Some(tx4))),
+        });
+        app.apply_ui_event(UiEvent::ApprovalResolved {
+            request_id: "req-remote-1".into(),
+        });
+        assert!(rx3.try_recv().is_err());
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::Approval(ref ap)) if ap.request_id == "req-remote-2"
+        ));
+        app.apply_ui_event(UiEvent::ApprovalResolved {
+            request_id: "req-remote-2".into(),
+        });
         assert!(!app.overlay.is_open());
 
         app.effective_scroll(20, 100);

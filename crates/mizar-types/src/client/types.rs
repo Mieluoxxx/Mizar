@@ -67,6 +67,8 @@ pub enum ApprovalDecision {
 
 #[derive(Debug)]
 pub struct PendingApproval {
+    pub request_id: String,
+    pub call_id: Option<String>,
     pub tool_name: String,
     pub args_preview: String,
     pub editing_reason: bool,
@@ -510,9 +512,21 @@ pub enum ClientEvent {
         output: Result<LocalBashOutput, String>,
     },
     ApprovalRequested {
+        request_id: String,
+        call_id: Option<String>,
         tool_name: String,
         args_preview: String,
         responder: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
+    },
+    ApprovalResolved {
+        request_id: String,
+    },
+    SessionSwitched {
+        old_session_id: String,
+        new_session_id: String,
+    },
+    QueueUpdated {
+        items: Vec<crate::rpc::QueuedInputDto>,
     },
     CompactionStarted {
         trigger: String,

@@ -371,6 +371,8 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     // 2. 审批弹窗 `[r]` 附加拒绝理由并回传
     let (tx, rx) = futures::channel::oneshot::channel();
     state.apply_ui_event(UiEvent::ApprovalRequested {
+        request_id: "req-headless-1".into(),
+        call_id: Some("call-headless-1".into()),
         tool_name: "bash".into(),
         args_preview: "{\"command\":\"rm -rf tmp\"}".into(),
         responder: Arc::new(std::sync::Mutex::new(Some(tx))),
