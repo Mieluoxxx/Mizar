@@ -1,8 +1,8 @@
 //! 每进程运行目录（`~/.mizar/run/`）、进程元信息注册表、死进程清理与单写者会话锁。
 //!
 //! 对齐 `docs/session-postmortem-ef394bfa.md` 第 6.2 节：
-//! - 运行目录权限 `0700`，进程套接字权限 `0600`；
-//! - 每个活跃 Mizar 进程原子写入 `p-<pid>.json`（附带 `ppid` / `tty` / `herdr_pane_id` 供 Herdr 精准关联）；
+//! - 运行目录权限 `0700`，进程套接字与 `p-<pid>.json` 权限 `0600`（防止泄露回环 TCP 鉴权密钥）；
+//! - 每个活跃 Mizar 进程原子写入 `p-<pid>.json`（附带 `ppid` / `tty` / `herdr_pane_id` 与可选 `tcp_addr` / `rpc_token`）；
 //! - 扫描时通过 `kill(pid, 0)` 自动清理残留死进程的 `.json` / `.sock`；
 //! - 同一 `session_id` 任一时刻仅允许一个活进程持有写锁。
 
@@ -39,6 +39,10 @@ pub struct ProcessMeta {
     pub cwd: String,
     pub socket: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -66,10 +70,19 @@ impl ProcessMeta {
             session_id: session_id.into(),
             cwd: cwd.into(),
             socket,
+            tcp_addr: None,
+            rpc_token: None,
             provider,
             model,
             started_at_ms: now_unix_ms(),
         }
+    }
+
+    /// 返回剥离 `rpc_token` 密钥字段的公开元数据副本（供 HTTP 发现端点安全对外展示）。
+    pub fn without_secret(&self) -> Self {
+        let mut copy = self.clone();
+        copy.rpc_token = None;
+        copy
     }
 }
 
@@ -292,6 +305,17 @@ impl ProcessRegistration {
         self.meta.model = model;
         write_meta_atomic(&self.meta_path, &self.meta)
     }
+
+    /// 原子更新回环 TCP 监听地址与鉴权密钥（`0600` 落盘）。
+    pub fn update_tcp_endpoint(
+        &mut self,
+        tcp_addr: Option<String>,
+        rpc_token: Option<String>,
+    ) -> io::Result<()> {
+        self.meta.tcp_addr = tcp_addr;
+        self.meta.rpc_token = rpc_token;
+        write_meta_atomic(&self.meta_path, &self.meta)
+    }
 }
 
 impl Drop for ProcessRegistration {
@@ -323,6 +347,8 @@ fn write_meta_atomic(meta_path: &Path, meta: &ProcessMeta) -> io::Result<()> {
 
     let write_res = (|| -> io::Result<()> {
         let mut file = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         Ok(())
@@ -583,6 +609,8 @@ mod tests {
             socket: socket_path_for_pid(&dir, pid)
                 .to_string_lossy()
                 .into_owned(),
+            tcp_addr: None,
+            rpc_token: None,
             provider: Some("magpie".into()),
             model: Some("gpt-a".into()),
             started_at_ms: 1000,
@@ -600,15 +628,39 @@ mod tests {
             assert!(meta_path.exists());
             assert!(sock_path.exists());
 
+            #[cfg(unix)]
+            {
+                let mode = std::fs::metadata(&meta_path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+
             reg.update_session("sess-b").unwrap();
             reg.update_model(Some("isok".into()), Some("gpt-b".into()))
                 .unwrap();
+            reg.update_tcp_endpoint(Some("127.0.0.1:45678".into()), Some("deadbeef".repeat(8)))
+                .unwrap();
+
+            #[cfg(unix)]
+            {
+                let mode = std::fs::metadata(&meta_path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600);
+            }
 
             let parsed: ProcessMeta =
                 serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
             assert_eq!(parsed.session_id, "sess-b");
             assert_eq!(parsed.provider.as_deref(), Some("isok"));
             assert_eq!(parsed.model.as_deref(), Some("gpt-b"));
+            assert_eq!(parsed.tcp_addr.as_deref(), Some("127.0.0.1:45678"));
+            assert_eq!(
+                parsed.rpc_token.as_deref(),
+                Some("deadbeef".repeat(8).as_str())
+            );
+
+            let redacted = parsed.without_secret();
+            assert_eq!(redacted.tcp_addr.as_deref(), Some("127.0.0.1:45678"));
+            assert_eq!(redacted.rpc_token, None);
+            assert_eq!(redacted.session_id, "sess-b");
 
             // 原子替换不得残留临时文件。
             let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -644,6 +696,8 @@ mod tests {
             socket: socket_path_for_pid(&dir, dead_pid)
                 .to_string_lossy()
                 .into_owned(),
+            tcp_addr: None,
+            rpc_token: None,
             provider: None,
             model: None,
             started_at_ms: 100,
@@ -671,6 +725,8 @@ mod tests {
             socket: socket_path_for_pid(&dir, owner_pid)
                 .to_string_lossy()
                 .into_owned(),
+            tcp_addr: None,
+            rpc_token: None,
             provider: Some("magpie".into()),
             model: Some("gpt-6".into()),
             started_at_ms: 200,

@@ -2441,6 +2441,8 @@ mod tests {
                 .join(format!("p-{other_pid}.sock"))
                 .display()
                 .to_string(),
+            tcp_addr: None,
+            rpc_token: None,
             provider: None,
             model: None,
             started_at_ms: 1,

@@ -22,7 +22,9 @@ pub const ERR_INTERNAL_ERROR: i64 = -32603;
 
 pub const ERR_SESSION_LOCKED: i64 = -32001;
 pub const ERR_SESSION_NOT_FOUND: i64 = -32002;
+pub const ERR_UNAUTHORIZED: i64 = -32003;
 
+pub const METHOD_AUTH_HELLO: &str = "auth.hello";
 pub const METHOD_SESSION_SUBSCRIBE: &str = "session.subscribe";
 pub const METHOD_TURN_SUBMIT: &str = "turn.submit";
 pub const METHOD_TURN_CANCEL: &str = "turn.cancel";
@@ -130,6 +132,10 @@ impl JsonRpcError {
             ERR_SESSION_NOT_FOUND,
             format!("Session not found: {session_id}"),
         )
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(ERR_UNAUTHORIZED, message)
     }
 }
 
@@ -899,6 +905,18 @@ pub struct SessionTreeResult {
     pub entries: Vec<SessionTreeEntry>,
 }
 
+/// `auth.hello` 请求参数（回环 TCP 旁路连接首帧鉴权）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthHelloParams {
+    pub token: String,
+}
+
+/// `auth.hello` 响应结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthHelloResult {
+    pub ok: bool,
+}
+
 /// `capabilities.list` 请求参数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilitiesListParams {
@@ -946,6 +964,13 @@ mod tests {
         assert_eq!(ERR_INTERNAL_ERROR, -32603);
         assert_eq!(ERR_SESSION_LOCKED, -32001);
         assert_eq!(ERR_SESSION_NOT_FOUND, -32002);
+        assert_eq!(ERR_UNAUTHORIZED, -32003);
+        assert_eq!(METHOD_AUTH_HELLO, "auth.hello");
+
+        let unauth = JsonRpcError::unauthorized("invalid rpc token");
+        assert_eq!(unauth.code, ERR_UNAUTHORIZED);
+        assert_eq!(unauth.message, "invalid rpc token");
+        assert_eq!(unauth.data, None);
 
         for id in [JsonRpcId::from(42), JsonRpcId::from("req-abc")] {
             let req = JsonRpcRequest::new(
@@ -1482,6 +1507,21 @@ mod tests {
             serde_json::from_str::<CapabilitiesListResult>(&serde_json::to_string(&cap_r).unwrap())
                 .unwrap(),
             cap_r
+        );
+
+        let auth_p = AuthHelloParams {
+            token: "0123456789abcdef".repeat(4),
+        };
+        let auth_r = AuthHelloResult { ok: true };
+        assert_eq!(
+            serde_json::from_str::<AuthHelloParams>(&serde_json::to_string(&auth_p).unwrap())
+                .unwrap(),
+            auth_p
+        );
+        assert_eq!(
+            serde_json::from_str::<AuthHelloResult>(&serde_json::to_string(&auth_r).unwrap())
+                .unwrap(),
+            auth_r
         );
     }
 }
