@@ -9,8 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use futures::channel::mpsc;
-use mizar_core::agent_loop::{AgentLoop, AgentLoopConfig, RunOptions, TurnEndReason, TurnInput};
+use mizar_core::agent_loop::{
+    AgentEvent, AgentLoop, AgentLoopConfig, RunOptions, TurnEndReason, TurnInput,
+};
 use mizar_core::session_title::{SessionTitleConfig, SessionTitleRuntime};
+use mizar_core::subagent::tasks::{
+    SUBAGENT_OUTPUT_INLINE_MAX_CHARS, SUBAGENT_OUTPUT_PREVIEW_CHARS,
+};
 use mizar_core::subagent::{
     SUBAGENT_TOOL_NAME, SubagentConfig, SubagentMode, SubagentRunStatus, SubagentRuntime,
     SubagentStateEvent,
@@ -21,7 +26,7 @@ use mizar_llm::{
     Message, ModelInfo, ProviderInfo, RequestOrigin, StreamChunk, ToolCall,
 };
 use mizar_session::sqlite::SqliteSessionPersistence;
-use mizar_session::{SessionOrigin, SessionPersistence, SessionStore, TitleSource};
+use mizar_session::{SessionEvent, SessionOrigin, SessionPersistence, SessionStore, TitleSource};
 use mizar_tools::coding::{CodingToolsConfig, register_coding_tools};
 use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecution, ToolExposure, ToolRuntime};
 use mizar_types::HookGuard;
@@ -1037,67 +1042,119 @@ async fn pre_cancelled_spawn_is_rejected_and_parent_cleanup_cancels_worker() {
 }
 
 #[tokio::test]
-async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
-    assert_eq!(
-        SubagentConfig {
-            default_max_steps: 99,
-            max_steps_cap: 40,
-            timeout_secs: 180,
-            ..SubagentConfig::default()
-        }
-        .effective_max_steps(),
-        40
-    );
+async fn enforces_soft_step_budget_forced_wrapup_timeout_and_validates_args() {
+    let default_cfg = SubagentConfig::default();
+    assert_eq!(default_cfg.read_only_soft_budget, 100);
+    assert_eq!(default_cfg.edit_soft_budget, 200);
+    assert_eq!(default_cfg.timeout_secs, 0);
 
-    // 1. max_steps 上限验证（单轮 steps/max_steps 格式）
-    let ws1 = temp_dir("max_steps");
+    // 1. 软步数预算两阶段收尾：
+    //    (a) 1.0x 注入 Steer 提醒并收尾完成；
+    //    (b) 1.5x 停工具执行 1 步强制总结交付部分发现；
+    //    (c) 强制总结仍不收敛时兜底硬中止为 MaxSteps；
+    //    (d) 设为 0 关闭预算限制。
+    #[derive(Clone, Copy)]
+    enum BudgetMode {
+        ObeySteer,
+        IgnoreSteerWrapOnEmptyTools,
+        RefuseEvenWithEmptyTools,
+        Unlimited,
+    }
+
+    struct SoftBudgetAdapter {
+        mode: BudgetMode,
+        calls: Arc<AtomicUsize>,
+        saw_budget_steer: Arc<AtomicBool>,
+        saw_empty_tools_wrapup: Arc<AtomicBool>,
+    }
+
+    impl LlmAdapter for SoftBudgetAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let saw_steer = options
+                .messages
+                .iter()
+                .any(|m| m.text_content().contains("[budget notice]"));
+            if saw_steer {
+                self.saw_budget_steer.store(true, Ordering::SeqCst);
+            }
+            let empty_tools = options.tools.is_empty();
+            if empty_tools {
+                self.saw_empty_tools_wrapup.store(true, Ordering::SeqCst);
+            }
+            let mode = self.mode;
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                match mode {
+                    BudgetMode::ObeySteer if saw_steer => {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("STEER_WRAPPED_UP")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                    BudgetMode::IgnoreSteerWrapOnEmptyTools if empty_tools => {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("FORCED_WRAPUP_PARTIAL")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                    BudgetMode::Unlimited if n >= 4 => {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::text("UNLIMITED_FINISHED")));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::Stop,
+                            replay: None,
+                        }));
+                    }
+                    _ => {
+                        let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                            0,
+                            ToolCall {
+                                id: format!("loop_{n}"),
+                                name: "find".into(),
+                                arguments: json!({"pattern": "*"}).to_string(),
+                            },
+                        )));
+                        let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                            reason: FinishReason::ToolCalls,
+                            replay: None,
+                        }));
+                    }
+                }
+            });
+            Box::pin(rx)
+        }
+    }
+
+    // 1a. 参数校验 + 1.0x Steer 唤醒收尾
+    let ws1 = temp_dir("soft_budget_steer");
     let _g1 = DirGuard(ws1.clone());
     std::fs::create_dir_all(&ws1).unwrap();
     let (app1, _) = setup_base_app(
         &ws1,
         SubagentConfig {
-            default_max_steps: 10,
-            max_steps_cap: 2,
-            timeout_secs: 180,
+            read_only_soft_budget: 2,
+            edit_soft_budget: 4,
+            timeout_secs: 0,
             ..SubagentConfig::default()
         },
         false,
     )
     .await;
 
-    struct EndlessToolAdapter {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl LlmAdapter for EndlessToolAdapter {
-        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            let (tx, rx) = mpsc::unbounded();
-            tokio::spawn(async move {
-                let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
-                    0,
-                    ToolCall {
-                        id: format!("loop_{n}"),
-                        name: "find".into(),
-                        arguments: json!({"pattern": "*"}).to_string(),
-                    },
-                )));
-                let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
-                    reason: FinishReason::ToolCalls,
-                    replay: None,
-                }));
-            });
-            Box::pin(rx)
-        }
-    }
-
-    let step_calls = Arc::new(AtomicUsize::new(0));
+    let calls1 = Arc::new(AtomicUsize::new(0));
+    let steer1 = Arc::new(AtomicBool::new(false));
+    let empty1 = Arc::new(AtomicBool::new(false));
     let _reg1 = app1
         .llm()
         .register_adapter(
             "main",
-            Arc::new(EndlessToolAdapter {
-                calls: Arc::clone(&step_calls),
+            Arc::new(SoftBudgetAdapter {
+                mode: BudgetMode::ObeySteer,
+                calls: Arc::clone(&calls1),
+                saw_budget_steer: Arc::clone(&steer1),
+                saw_empty_tools_wrapup: Arc::clone(&empty1),
             }),
         )
         .unwrap();
@@ -1126,43 +1183,201 @@ async fn enforces_max_steps_cap_and_timeout_and_validates_args() {
     assert!(bad_mode.content.contains("无效的 mode 参数"));
 
     let mut watch1 = StateWatch::attach(&app1, &parent1.id);
-    let max_spawn = tools1
+    let sp1 = tools1
         .execute(ToolExecution::new(
             SUBAGENT_TOOL_NAME,
-            json!({ "prompt": "keep searching" }),
+            json!({ "prompt": "search and obey steer" }),
             Some(parent1.id.clone()),
         ))
         .await;
-    assert!(!max_spawn.is_error, "{}", max_spawn.content);
+    assert!(!sp1.is_error, "{}", sp1.content);
 
     let ev1 = watch1.wait_all_settled(5).await;
-    assert_eq!(ev1.status, SubagentRunStatus::MaxSteps);
+    assert_eq!(ev1.status, SubagentRunStatus::Completed);
+    assert!(steer1.load(Ordering::SeqCst), "must inject Steer at 1.0x");
     assert!(
-        ev1.notice
-            .as_deref()
-            .is_some_and(|n| n.contains("单轮上限 2") && n.contains("累计 2 步")),
-        "{:?}",
-        ev1.notice
+        !empty1.load(Ordering::SeqCst),
+        "must not force wrapup if steer succeeded"
     );
-    assert_eq!(step_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls1.load(Ordering::SeqCst), 3);
     let f1 = app1.agent_loop().inbox().pop_followup(&parent1.id).unwrap();
-    assert!(
-        f1.text().contains("Reached max_steps limit (2/2)"),
-        "{}",
-        f1.text()
-    );
-    assert_eq!(app1.subagent().active_child_count(), 0);
+    assert!(f1.text().contains("STEER_WRAPPED_UP"), "{}", f1.text());
     app1.dispose().await;
 
-    // 2. timeout_secs 超时封顶验证
+    // 1b. 无视 1.0x Steer 时，在 1.5x (3步) 停掉工具执行第 4 步空工具强制总结交付部分发现
+    let ws1b = temp_dir("soft_budget_force");
+    let _g1b = DirGuard(ws1b.clone());
+    std::fs::create_dir_all(&ws1b).unwrap();
+    let (app1b, _) = setup_base_app(
+        &ws1b,
+        SubagentConfig {
+            read_only_soft_budget: 2,
+            ..SubagentConfig::default()
+        },
+        false,
+    )
+    .await;
+    let calls1b = Arc::new(AtomicUsize::new(0));
+    let steer1b = Arc::new(AtomicBool::new(false));
+    let empty1b = Arc::new(AtomicBool::new(false));
+    let _reg1b = app1b
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(SoftBudgetAdapter {
+                mode: BudgetMode::IgnoreSteerWrapOnEmptyTools,
+                calls: Arc::clone(&calls1b),
+                saw_budget_steer: Arc::clone(&steer1b),
+                saw_empty_tools_wrapup: Arc::clone(&empty1b),
+            }),
+        )
+        .unwrap();
+    let parent1b = app1b.sessions().create(None);
+    let mut watch1b = StateWatch::attach(&app1b, &parent1b.id);
+    let sp1b = app1b
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "prompt": "keep digging past soft budget" }),
+            Some(parent1b.id.clone()),
+        ))
+        .await;
+    assert!(!sp1b.is_error, "{}", sp1b.content);
+    let ev1b = watch1b.wait_all_settled(5).await;
+    assert_eq!(ev1b.status, SubagentRunStatus::Completed);
+    assert!(steer1b.load(Ordering::SeqCst));
+    assert!(
+        empty1b.load(Ordering::SeqCst),
+        "1.5x must invoke empty-tool forced wrap-up"
+    );
+    assert_eq!(calls1b.load(Ordering::SeqCst), 4);
+    let f1b = app1b
+        .agent_loop()
+        .inbox()
+        .pop_followup(&parent1b.id)
+        .unwrap();
+    assert!(
+        f1b.text().contains("FORCED_WRAPUP_PARTIAL"),
+        "{}",
+        f1b.text()
+    );
+    assert_eq!(app1b.subagent().active_child_count(), 0);
+    app1b.dispose().await;
+
+    // 1c. 强制收尾仍不收敛（即便空工具仍调工具）时兜底硬中止为 MaxSteps
+    let ws1c = temp_dir("soft_budget_abort");
+    let _g1c = DirGuard(ws1c.clone());
+    std::fs::create_dir_all(&ws1c).unwrap();
+    let (app1c, _) = setup_base_app(
+        &ws1c,
+        SubagentConfig {
+            read_only_soft_budget: 2,
+            ..SubagentConfig::default()
+        },
+        false,
+    )
+    .await;
+    let calls1c = Arc::new(AtomicUsize::new(0));
+    let empty1c = Arc::new(AtomicBool::new(false));
+    let _reg1c = app1c
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(SoftBudgetAdapter {
+                mode: BudgetMode::RefuseEvenWithEmptyTools,
+                calls: Arc::clone(&calls1c),
+                saw_budget_steer: Arc::new(AtomicBool::new(false)),
+                saw_empty_tools_wrapup: Arc::clone(&empty1c),
+            }),
+        )
+        .unwrap();
+    let parent1c = app1c.sessions().create(None);
+    let mut watch1c = StateWatch::attach(&app1c, &parent1c.id);
+    let sp1c = app1c
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "prompt": "refuse wrapup" }),
+            Some(parent1c.id.clone()),
+        ))
+        .await;
+    assert!(!sp1c.is_error, "{}", sp1c.content);
+    let ev1c = watch1c.wait_all_settled(5).await;
+    assert_eq!(ev1c.status, SubagentRunStatus::MaxSteps);
+    assert!(empty1c.load(Ordering::SeqCst));
+    assert_eq!(calls1c.load(Ordering::SeqCst), 4);
+    assert!(
+        ev1c.notice
+            .as_deref()
+            .is_some_and(|n| n.contains("阈值 3") && n.contains("软预算 2")),
+        "{:?}",
+        ev1c.notice
+    );
+    let f1c = app1c
+        .agent_loop()
+        .inbox()
+        .pop_followup(&parent1c.id)
+        .unwrap();
+    assert!(
+        f1c.text().contains("Reached 1.5x step limit (3/3)"),
+        "{}",
+        f1c.text()
+    );
+    app1c.dispose().await;
+
+    // 1d. 软预算设为 0 时关闭限制，允许自由跑完 5 步且无预算警告
+    let ws1d = temp_dir("soft_budget_disabled");
+    let _g1d = DirGuard(ws1d.clone());
+    std::fs::create_dir_all(&ws1d).unwrap();
+    let (app1d, _) = setup_base_app(
+        &ws1d,
+        SubagentConfig {
+            read_only_soft_budget: 0,
+            ..SubagentConfig::default()
+        },
+        false,
+    )
+    .await;
+    let calls1d = Arc::new(AtomicUsize::new(0));
+    let steer1d = Arc::new(AtomicBool::new(false));
+    let empty1d = Arc::new(AtomicBool::new(false));
+    let _reg1d = app1d
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(SoftBudgetAdapter {
+                mode: BudgetMode::Unlimited,
+                calls: Arc::clone(&calls1d),
+                saw_budget_steer: Arc::clone(&steer1d),
+                saw_empty_tools_wrapup: Arc::clone(&empty1d),
+            }),
+        )
+        .unwrap();
+    let parent1d = app1d.sessions().create(None);
+    let mut watch1d = StateWatch::attach(&app1d, &parent1d.id);
+    let sp1d = app1d
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "prompt": "unlimited run" }),
+            Some(parent1d.id.clone()),
+        ))
+        .await;
+    assert!(!sp1d.is_error, "{}", sp1d.content);
+    let ev1d = watch1d.wait_all_settled(5).await;
+    assert_eq!(ev1d.status, SubagentRunStatus::Completed);
+    assert!(!steer1d.load(Ordering::SeqCst));
+    assert!(!empty1d.load(Ordering::SeqCst));
+    assert_eq!(calls1d.load(Ordering::SeqCst), 5);
+    app1d.dispose().await;
+
+    // 2. timeout_secs 显式 > 0 时仍可执行硬超时封顶验证
     let ws2 = temp_dir("timeout");
     let _g2 = DirGuard(ws2.clone());
     std::fs::create_dir_all(&ws2).unwrap();
     let (app2, _) = setup_base_app(
         &ws2,
         SubagentConfig {
-            default_max_steps: 20,
-            max_steps_cap: 40,
             timeout_secs: 1,
             stall_timeout_secs: 0,
             ..SubagentConfig::default()
@@ -1458,6 +1673,17 @@ async fn assert_yield_delivers_followup_once(child_finishes_first: bool) {
         ))
         .unwrap();
 
+    let emitted_deltas = Arc::new(Mutex::new(Vec::<String>::new()));
+    let delta_sink = Arc::clone(&emitted_deltas);
+    let parent_id_for_delta = parent.id.clone();
+    let _delta_guard = agent_loop.on_event(move |ev| {
+        if let AgentEvent::TextDelta(e) = ev
+            && e.session.id == parent_id_for_delta
+        {
+            delta_sink.lock().unwrap().push(e.text.clone());
+        }
+    });
+
     let parent_run = tokio::spawn({
         let agent_loop = Arc::clone(&agent_loop);
         let parent = Arc::clone(&parent);
@@ -1493,6 +1719,19 @@ async fn assert_yield_delivers_followup_once(child_finishes_first: bool) {
     assert_eq!(report.text, PROGRESS);
     assert_eq!(report.steps, 1);
     assert_eq!(adapter.parent_requests.load(Ordering::SeqCst), 1);
+    assert!(
+        emitted_deltas.lock().unwrap().iter().any(|t| t == PROGRESS),
+        "yield end_turn must emit TextDelta so live TUI renders assistant text: {:?}",
+        *emitted_deltas.lock().unwrap()
+    );
+    assert!(
+        parent.log().iter().any(|entry| matches!(
+            &entry.event,
+            SessionEvent::Assistant { blocks, .. }
+            if blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == PROGRESS))
+        )),
+        "yield end_turn must persist SessionEvent::Assistant for --resume"
+    );
     for (id, expected) in [("yield", PROGRESS), ("sibling", "独立检查已完成")] {
         assert!(parent.log().iter().any(|entry| matches!(&entry.event,
             mizar_session::SessionEvent::ToolResult { tool_call_id, content, is_error: false, .. }
@@ -3034,5 +3273,741 @@ async fn status_exposes_live_step_tool_and_idle_seconds() {
 
     let _ = release_tool_tx.send(true);
     watch.wait_all_settled(5).await;
+    app.dispose().await;
+}
+
+#[tokio::test]
+async fn yield_refuses_end_turn_when_idle_and_allows_when_followup_pending() {
+    let ws = temp_dir("yield_empty_guard");
+    let _guard = DirGuard(ws.clone());
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let (app, _) = setup_base_app(&ws, SubagentConfig::default(), false).await;
+
+    struct IdleYieldAdapter {
+        step: AtomicUsize,
+    }
+    impl LlmAdapter for IdleYieldAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let n = self.step.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::unbounded();
+            tokio::spawn(async move {
+                if n == 0 {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                        0,
+                        ToolCall {
+                            id: "idle_yield".into(),
+                            name: "subagent".into(),
+                            arguments: json!({"action": "yield", "message": "waiting"}).to_string(),
+                        },
+                    )));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::ToolCalls,
+                        replay: None,
+                    }));
+                } else {
+                    let tool_text = options
+                        .messages
+                        .iter()
+                        .rev()
+                        .find_map(|m| match m {
+                            Message::Tool { content, .. } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    assert!(
+                        tool_text.contains("Answer the user directly"),
+                        "expected refusal guidance, got: {tool_text}"
+                    );
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text("DIRECT_ANSWER_AFTER_REFUSAL")));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                }
+            });
+            Box::pin(rx)
+        }
+    }
+
+    let _llm = app
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(IdleYieldAdapter {
+                step: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap();
+
+    let parent = app.sessions().create(None);
+    // 1. 无运行中子代理且父信箱无待投递 FollowUp：yield 必须拒绝 end_turn，防止死锁
+    let report = app
+        .agent_loop()
+        .run_with_report(
+            Arc::clone(&parent),
+            "check directly",
+            CancellationToken::new(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.reason, TurnEndReason::Completed);
+    assert_eq!(report.steps, 2);
+    assert_eq!(report.text, "DIRECT_ANSWER_AFTER_REFUSAL");
+
+    // 2. running == 0 但父信箱已有待投递 FollowUp 时，允许 yield end_turn 交出控制权
+    app.agent_loop().inbox().push(
+        &parent.id,
+        mizar_core::agent_loop::DeliveryMode::FollowUp,
+        TurnInput::notice("subagent:done", "queued result"),
+    );
+    let out = app
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "yield", "message": "passing baton" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!out.is_error);
+    assert_eq!(out.details.as_ref().unwrap()["yielded"], true);
+
+    app.dispose().await;
+}
+
+#[tokio::test]
+async fn yield_barrier_waits_for_all_children_and_breaks_on_failure_watchdog_and_human() {
+    // Part A: 两并发子代理 yield 后等待全员完成再单次唤醒
+    let ws1 = temp_dir("yield_barrier_batch");
+    let _g1 = DirGuard(ws1.clone());
+    std::fs::create_dir_all(&ws1).unwrap();
+    let (app1, _) = setup_base_app(&ws1, SubagentConfig::default(), false).await;
+
+    let gate_a = Arc::new(tokio::sync::Notify::new());
+    let gate_b = Arc::new(tokio::sync::Notify::new());
+
+    struct TwoChildAdapter {
+        gate_a: Arc<tokio::sync::Notify>,
+        gate_b: Arc<tokio::sync::Notify>,
+    }
+    impl LlmAdapter for TwoChildAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let prompt = options
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if options.origin == RequestOrigin::Subagent {
+                let gate = if prompt.contains("task-a") {
+                    Arc::clone(&self.gate_a)
+                } else {
+                    Arc::clone(&self.gate_b)
+                };
+                let label = if prompt.contains("task-a") {
+                    "RES_A"
+                } else {
+                    "RES_B"
+                };
+                return Box::pin(
+                    futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok(StreamChunk::text(label))
+                    })
+                    .chain(futures::stream::iter([Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    })])),
+                );
+            }
+            let chunks = vec![
+                StreamChunk::tool_call(
+                    0,
+                    ToolCall {
+                        id: "sp_a".into(),
+                        name: "subagent".into(),
+                        arguments: json!({"name": "ca", "prompt": "task-a"}).to_string(),
+                    },
+                ),
+                StreamChunk::tool_call(
+                    1,
+                    ToolCall {
+                        id: "sp_b".into(),
+                        name: "subagent".into(),
+                        arguments: json!({"name": "cb", "prompt": "task-b"}).to_string(),
+                    },
+                ),
+                StreamChunk::tool_call(
+                    2,
+                    ToolCall {
+                        id: "yd".into(),
+                        name: "subagent".into(),
+                        arguments: json!({"action": "yield", "message": "等两个结果"}).to_string(),
+                    },
+                ),
+                StreamChunk::Finish {
+                    reason: FinishReason::ToolCalls,
+                    replay: None,
+                },
+            ];
+            Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+        }
+    }
+
+    let _llm1 = app1
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(TwoChildAdapter {
+                gate_a: Arc::clone(&gate_a),
+                gate_b: Arc::clone(&gate_b),
+            }),
+        )
+        .unwrap();
+    let parent1 = app1.sessions().create(None);
+    let loop1 = app1.agent_loop();
+    let inbox1 = loop1.inbox();
+    let mut wake_rx1 = inbox1.subscribe_wake();
+    let mut watch1 = StateWatch::attach(&app1, &parent1.id);
+
+    let report = app1
+        .agent_loop()
+        .run_with_report(
+            Arc::clone(&parent1),
+            "launch two",
+            CancellationToken::new(),
+            RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.text, "等两个结果");
+    assert!(inbox1.has_yield_barrier(&parent1.id));
+
+    // ca 先结束：被 barrier 拦截，既不发 wake_rx 也不允许 pop_followup
+    gate_a.notify_one();
+    watch1
+        .wait_for_event(5, |ev| {
+            ev.name == "ca" && ev.status == SubagentRunStatus::Completed
+        })
+        .await;
+    assert!(
+        wake_rx1.try_recv().is_err(),
+        "barrier must suppress wake after first child"
+    );
+    assert!(inbox1.pop_followup(&parent1.id).is_none());
+
+    // cb 也结束：全员结算，单次唤醒并打包交付 RES_A + RES_B
+    gate_b.notify_one();
+    watch1.wait_all_settled(5).await;
+    let woken = tokio::time::timeout(Duration::from_secs(3), wake_rx1.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(woken, parent1.id);
+    assert!(!inbox1.has_yield_barrier(&parent1.id));
+    let batch = inbox1.pop_followup(&parent1.id).unwrap();
+    assert!(batch.text().contains("RES_A"), "{}", batch.text());
+    assert!(batch.text().contains("RES_B"), "{}", batch.text());
+    assert!(inbox1.pop_followup(&parent1.id).is_none());
+    app1.dispose().await;
+
+    // Part B: 任一子代理失败立即打破 barrier 提前唤醒
+    let ws2 = temp_dir("yield_barrier_fail");
+    let _g2 = DirGuard(ws2.clone());
+    std::fs::create_dir_all(&ws2).unwrap();
+    let (app2, _) = setup_base_app(&ws2, SubagentConfig::default(), false).await;
+    let fail_gate = Arc::new(tokio::sync::Notify::new());
+    let hold_gate = Arc::new(tokio::sync::Notify::new());
+
+    struct FailBreakAdapter {
+        fail_gate: Arc<tokio::sync::Notify>,
+        hold_gate: Arc<tokio::sync::Notify>,
+    }
+    impl LlmAdapter for FailBreakAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let prompt = options
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if prompt.contains("fail-me") {
+                let gate = Arc::clone(&self.fail_gate);
+                return Box::pin(futures::stream::once(async move {
+                    gate.notified().await;
+                    Err(LlmError::new(mizar_llm::LlmErrorCode::Server, "boom"))
+                }));
+            }
+            let gate = Arc::clone(&self.hold_gate);
+            Box::pin(
+                futures::stream::once(async move {
+                    gate.notified().await;
+                    Ok(StreamChunk::text("HELD_DONE"))
+                })
+                .chain(futures::stream::iter([Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                })])),
+            )
+        }
+    }
+
+    let _llm2 = app2
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(FailBreakAdapter {
+                fail_gate: Arc::clone(&fail_gate),
+                hold_gate: Arc::clone(&hold_gate),
+            }),
+        )
+        .unwrap();
+    let parent2 = app2.sessions().create(None);
+    let loop2 = app2.agent_loop();
+    let inbox2 = loop2.inbox();
+    let mut wake_rx2 = inbox2.subscribe_wake();
+    let mut watch2 = StateWatch::attach(&app2, &parent2.id);
+
+    for (name, prompt) in [("failing", "fail-me"), ("slow", "hold-me")] {
+        let out = app2
+            .tools()
+            .execute(ToolExecution::new(
+                SUBAGENT_TOOL_NAME,
+                json!({ "name": name, "prompt": prompt }),
+                Some(parent2.id.clone()),
+            ))
+            .await;
+        assert!(!out.is_error);
+    }
+    let yd = app2
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "yield", "message": "wait" }),
+            Some(parent2.id.clone()),
+        ))
+        .await;
+    assert!(yd.end_turn);
+    assert!(inbox2.has_yield_barrier(&parent2.id));
+
+    fail_gate.notify_one();
+    watch2
+        .wait_for_event(5, |ev| {
+            ev.name == "failing" && ev.status == SubagentRunStatus::Failed
+        })
+        .await;
+    let woken2 = tokio::time::timeout(Duration::from_secs(3), wake_rx2.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(woken2, parent2.id);
+    assert!(!inbox2.has_yield_barrier(&parent2.id));
+    let fail_msg = inbox2.pop_followup(&parent2.id).unwrap();
+    assert!(fail_msg.text().contains("boom"), "{}", fail_msg.text());
+
+    hold_gate.notify_one();
+    watch2.wait_all_settled(5).await;
+    app2.dispose().await;
+
+    // Part C: 看门狗告警与人类用户插话立即打破 yield barrier
+    let ws3 = temp_dir("yield_barrier_wd_human");
+    let _g3 = DirGuard(ws3.clone());
+    std::fs::create_dir_all(&ws3).unwrap();
+    let (app3, _) = setup_base_app(
+        &ws3,
+        SubagentConfig {
+            stall_timeout_secs: 1,
+            max_watchdog_alerts: 2,
+            ..SubagentConfig::default()
+        },
+        false,
+    )
+    .await;
+    let gate_wd = Arc::new(tokio::sync::Notify::new());
+    struct StallBreakAdapter(Arc<tokio::sync::Notify>);
+    impl LlmAdapter for StallBreakAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let gate = Arc::clone(&self.0);
+            Box::pin(
+                futures::stream::once(async move {
+                    tokio::select! {
+                        _ = options.cancel.cancelled() => Err(LlmError::cancelled()),
+                        _ = gate.notified() => Ok(StreamChunk::text("AFTER_WD_AND_HUMAN")),
+                    }
+                })
+                .chain(futures::stream::iter([Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                })])),
+            )
+        }
+    }
+    let _llm3 = app3
+        .llm()
+        .register_adapter("main", Arc::new(StallBreakAdapter(Arc::clone(&gate_wd))))
+        .unwrap();
+    let parent3 = app3.sessions().create(None);
+    let loop3 = app3.agent_loop();
+    let inbox3 = loop3.inbox();
+    let mut wake_rx3 = inbox3.subscribe_wake();
+    let mut watch3 = StateWatch::attach(&app3, &parent3.id);
+
+    let sp3 = app3
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "name": "wd-c", "prompt": "slow" }),
+            Some(parent3.id.clone()),
+        ))
+        .await;
+    assert!(!sp3.is_error);
+    let yd3 = app3
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "yield", "message": "wait" }),
+            Some(parent3.id.clone()),
+        ))
+        .await;
+    assert!(yd3.end_turn);
+    assert!(inbox3.has_yield_barrier(&parent3.id));
+
+    watch3
+        .wait_for_event(5, |ev| {
+            ev.notice.as_deref().is_some_and(|n| n.contains("已静默"))
+        })
+        .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), wake_rx3.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        parent3.id
+    );
+    assert!(!inbox3.has_yield_barrier(&parent3.id));
+    assert!(
+        inbox3
+            .pop_followup(&parent3.id)
+            .unwrap()
+            .text()
+            .contains("watchdog")
+    );
+
+    // 再次 yield 后由人类输入直接打破 barrier
+    let yd4 = app3
+        .tools()
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "yield", "message": "wait again" }),
+            Some(parent3.id.clone()),
+        ))
+        .await;
+    assert!(yd4.end_turn);
+    assert!(inbox3.has_yield_barrier(&parent3.id));
+    inbox3.record_human_input(&parent3.id);
+    assert!(!inbox3.has_yield_barrier(&parent3.id));
+
+    gate_wd.notify_one();
+    watch3.wait_all_settled(5).await;
+    app3.dispose().await;
+}
+
+#[tokio::test]
+async fn inbox_slot_dedup_invalidates_stale_notices_on_send_stop_and_status_read() {
+    let ws = temp_dir("slot_dedup");
+    let _guard = DirGuard(ws.clone());
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let (app, _) = setup_base_app(
+        &ws,
+        SubagentConfig {
+            read_only_soft_budget: 1, // 1.5x = 2 steps
+            stall_timeout_secs: 1,
+            max_watchdog_alerts: 2,
+            ..SubagentConfig::default()
+        },
+        false,
+    )
+    .await;
+
+    struct DedupAdapter {
+        step: AtomicUsize,
+        stall_gate: Arc<tokio::sync::Notify>,
+    }
+    impl LlmAdapter for DedupAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let prompt = options
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let (tx, rx) = mpsc::unbounded();
+            if prompt.contains("stall-then-stop") {
+                let gate = Arc::clone(&self.stall_gate);
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = options.cancel.cancelled() => {
+                            let _ = tx.unbounded_send(Err(LlmError::cancelled()));
+                        }
+                        _ = gate.notified() => {
+                            let _ = tx.unbounded_send(Ok(StreamChunk::text("NEVER")));
+                            let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                                reason: FinishReason::Stop,
+                                replay: None,
+                            }));
+                        }
+                    }
+                });
+                return Box::pin(rx);
+            }
+            let n = self.step.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if n < 3 {
+                    // 第1轮硬中止：即使空工具也继续输出 tool call，产生 MaxSteps 旧结算
+                    let _ = tx.unbounded_send(Ok(StreamChunk::tool_call(
+                        0,
+                        ToolCall {
+                            id: format!("c_{n}"),
+                            name: "find".into(),
+                            arguments: json!({"pattern": "*"}).to_string(),
+                        },
+                    )));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::ToolCalls,
+                        replay: None,
+                    }));
+                } else {
+                    let _ = tx.unbounded_send(Ok(StreamChunk::text("FRESH_RESUMED_RESULT")));
+                    let _ = tx.unbounded_send(Ok(StreamChunk::Finish {
+                        reason: FinishReason::Stop,
+                        replay: None,
+                    }));
+                }
+            });
+            Box::pin(rx)
+        }
+    }
+
+    let stall_gate = Arc::new(tokio::sync::Notify::new());
+    let _llm = app
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(DedupAdapter {
+                step: AtomicUsize::new(0),
+                stall_gate: Arc::clone(&stall_gate),
+            }),
+        )
+        .unwrap();
+
+    let tools = app.tools();
+    let parent = app.sessions().create(None);
+    let agent_loop = app.agent_loop();
+    let inbox = agent_loop.inbox();
+    let mut watch = StateWatch::attach(&app, &parent.id);
+
+    // 1. 子代理 w1 首轮 MaxSteps 结算后留存旧槽位，未读取前直接 send 续跑 -> 旧槽位必须被清理
+    let sp1 = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "name": "w1", "prompt": "go" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!sp1.is_error);
+    let ev1 = watch.wait_all_settled(5).await;
+    assert_eq!(ev1.status, SubagentRunStatus::MaxSteps);
+    assert!(inbox.has_pending_followup_key(&parent.id, "subagent:settled"));
+
+    let send_out = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "send", "name": "w1", "prompt": "summarize now" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!send_out.is_error, "{}", send_out.content);
+
+    let ev2 = watch.wait_all_settled(5).await;
+    assert_eq!(ev2.status, SubagentRunStatus::Completed);
+    let followup = inbox.pop_followup(&parent.id).unwrap();
+    assert!(followup.text().contains("FRESH_RESUMED_RESULT"));
+    assert!(!followup.text().contains("Reached 1.5x step limit"));
+    assert!(inbox.pop_followup(&parent.id).is_none());
+
+    // 2. 子代理 w2 触发看门狗后被 stop 取消：过时 watchdog 槽位整条移除，不留空唤醒
+    let sp2 = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "name": "w2", "prompt": "stall-then-stop" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!sp2.is_error);
+    watch
+        .wait_for_event(5, |ev| {
+            ev.name == "w2" && ev.notice.as_deref().is_some_and(|n| n.contains("已静默"))
+        })
+        .await;
+    assert!(inbox.has_pending_followup_key(&parent.id, "subagent:watchdog"));
+
+    let stop_out = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "stop", "name": "w2" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!stop_out.is_error);
+    assert!(!inbox.has_pending_followup_key(&parent.id, "subagent:watchdog"));
+    assert!(inbox.pop_followup(&parent.id).is_none());
+
+    app.dispose().await;
+}
+
+#[tokio::test]
+async fn status_name_returns_full_or_spilled_output_and_consumes_settled_slot() {
+    let ws = temp_dir("full_output_delivery");
+    let _guard = DirGuard(ws.clone());
+    std::fs::create_dir_all(&ws).unwrap();
+    let (app, _) = setup_base_app(&ws, SubagentConfig::default(), false).await;
+
+    let inline_body = format!("HEAD_500_{}_TAIL_INLINE", "x".repeat(4_800));
+    let large_body = format!("LARGE_HEAD_{}\n{}", "m".repeat(5_500), "z".repeat(8_000));
+    assert!(inline_body.chars().count() < SUBAGENT_OUTPUT_INLINE_MAX_CHARS);
+    assert!(large_body.chars().count() > SUBAGENT_OUTPUT_INLINE_MAX_CHARS);
+
+    struct OutputAdapter {
+        inline_body: String,
+        large_body: String,
+    }
+    impl LlmAdapter for OutputAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let prompt = options
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let text = if prompt.contains("large") {
+                self.large_body.clone()
+            } else {
+                self.inline_body.clone()
+            };
+            let chunks = vec![
+                Ok(StreamChunk::text(text)),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }),
+            ];
+            Box::pin(futures::stream::iter(chunks))
+        }
+    }
+
+    let _llm = app
+        .llm()
+        .register_adapter(
+            "main",
+            Arc::new(OutputAdapter {
+                inline_body: inline_body.clone(),
+                large_body: large_body.clone(),
+            }),
+        )
+        .unwrap();
+
+    let tools = app.tools();
+    let parent = app.sessions().create(None);
+    let agent_loop = app.agent_loop();
+    let inbox = agent_loop.inbox();
+    let mut watch = StateWatch::attach(&app, &parent.id);
+
+    // 1. <= 12,000 字符：列表保持 120 字摘要；status(name="inline-w") 返回全文且消费 settled 槽位
+    let sp1 = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "name": "inline-w", "prompt": "produce inline output" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!sp1.is_error);
+    watch.wait_all_settled(5).await;
+
+    let list_status = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "status" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!list_status.content.contains("TAIL_INLINE"));
+    assert!(inbox.has_pending_followup_key(&parent.id, "subagent:settled"));
+
+    let full_status = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "status", "name": "inline-w" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(full_status.content.contains(&inline_body));
+    assert!(
+        !inbox.has_pending_followup_key(&parent.id, "subagent:settled"),
+        "status(name) must consume undelivered settled slot"
+    );
+    assert!(inbox.pop_followup(&parent.id).is_none());
+
+    // 2. > 12,000 字符：落盘临时文件 + 5,000 字符预览 + 路径
+    let sp2 = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "name": "large-w", "prompt": "produce large output" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    assert!(!sp2.is_error);
+    watch.wait_all_settled(5).await;
+
+    let large_status = tools
+        .execute(ToolExecution::new(
+            SUBAGENT_TOOL_NAME,
+            json!({ "action": "status", "name": "large-w" }),
+            Some(parent.id.clone()),
+        ))
+        .await;
+    let out_path = large_status.details.as_ref().unwrap()["outputPath"]
+        .as_str()
+        .expect("large output must expose outputPath")
+        .to_string();
+    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), large_body);
+    assert!(large_status.content.contains("LARGE_HEAD_"));
+    assert!(large_status.content.contains(&out_path));
+    assert!(!large_status.content.contains(&"z".repeat(8_000)));
+    let preview_len = large_status.details.as_ref().unwrap()["output"]
+        .as_str()
+        .unwrap()
+        .split("\n\n[Output truncated:")
+        .next()
+        .unwrap()
+        .chars()
+        .count();
+    assert!(preview_len <= SUBAGENT_OUTPUT_PREVIEW_CHARS);
+    assert!(inbox.pop_followup(&parent.id).is_none());
+
+    let _ = std::fs::remove_file(out_path);
     app.dispose().await;
 }

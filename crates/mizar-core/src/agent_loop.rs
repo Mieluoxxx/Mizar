@@ -1566,11 +1566,25 @@ impl AgentLoop {
                     }
                 }
             }
-            // 完整写回同一模型请求的工具结果；正常收尾，不清空等待交付的 FollowUp。
+            // 完整写回同一模型请求的工具结果，并将 end_turn 文本作为正式助手输出发射与落盘；不清空等待交付的 FollowUp。
             if let Some(message) = end_turn_message {
                 if cancel.is_cancelled() {
                     turn_guard.set_reason(TurnEndReason::Cancelled);
                     return Err(AgentError::Llm(LlmError::cancelled()));
+                }
+                if !message.trim().is_empty() {
+                    self.emit_event(AgentEvent::TextDelta(AgentTextDeltaEvent {
+                        session: Arc::clone(&session),
+                        text: message.clone(),
+                        ts_ms: now_millis(),
+                    }));
+                    session.append(SessionEvent::Assistant {
+                        blocks: vec![mizar_llm::ContentBlock::Text {
+                            text: message.clone(),
+                        }],
+                        replay: None,
+                        usage: None,
+                    });
                 }
                 turn_guard.set_reason(TurnEndReason::Completed);
                 return Ok(TurnRunReport {

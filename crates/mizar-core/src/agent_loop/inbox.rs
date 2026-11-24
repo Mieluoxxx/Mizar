@@ -172,6 +172,104 @@ pub enum DeliveryMode {
     Inject,
 }
 
+/// 子代理结构化批次类别（对应 `omp` `YieldQueue` 的延迟去重通道）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentSlotKind {
+    Settled,
+    Watchdog,
+}
+
+impl SubagentSlotKind {
+    pub const fn coalesce_key(self) -> &'static str {
+        match self {
+            Self::Settled => "subagent:settled",
+            Self::Watchdog => "subagent:watchdog",
+        }
+    }
+
+    pub const fn batch_source(self) -> &'static str {
+        match self {
+            Self::Settled => "subagent:batch",
+            Self::Watchdog => "subagent-watchdog:batch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSlot {
+    pub child_session_id: String,
+    pub run_id: u64,
+    pub source: String,
+    pub text: String,
+    /// 失败 / 超时 / 看门狗等紧急告警会立即打破 `yield` barrier 提前唤醒。
+    pub urgent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MailboxPayload {
+    Plain(TurnInput),
+    SubagentBatch {
+        kind: SubagentSlotKind,
+        slots: Vec<SubagentSlot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailboxEntry {
+    id: u64,
+    mode: DeliveryMode,
+    coalesce_key: Option<String>,
+    payload: MailboxPayload,
+}
+
+impl MailboxEntry {
+    fn is_user(&self) -> bool {
+        matches!(&self.payload, MailboxPayload::Plain(input) if input.is_user())
+    }
+
+    fn is_subagent_batch(&self) -> bool {
+        matches!(self.payload, MailboxPayload::SubagentBatch { .. })
+    }
+
+    fn has_urgent_slot(&self) -> bool {
+        matches!(
+            &self.payload,
+            MailboxPayload::SubagentBatch { slots, .. } if slots.iter().any(|s| s.urgent)
+        )
+    }
+
+    fn materialize_input(&self) -> TurnInput {
+        match &self.payload {
+            MailboxPayload::Plain(input) => input.clone(),
+            MailboxPayload::SubagentBatch { kind, slots } => {
+                if slots.len() == 1 {
+                    TurnInput::notice(slots[0].source.clone(), slots[0].text.clone())
+                } else {
+                    let mut combined = String::new();
+                    for slot in slots {
+                        if !slot.text.is_empty() {
+                            if !combined.is_empty() {
+                                combined.push_str("\n\n---\n\n");
+                            }
+                            combined.push_str(&slot.text);
+                        }
+                    }
+                    TurnInput::notice(kind.batch_source(), combined)
+                }
+            }
+        }
+    }
+
+    fn to_inbox_item(&self) -> InboxItem {
+        InboxItem {
+            id: self.id,
+            mode: self.mode,
+            input: self.materialize_input(),
+            coalesce_key: self.coalesce_key.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxItem {
     pub id: u64,
@@ -189,9 +287,13 @@ pub struct InboxPushResult {
 
 #[derive(Debug)]
 struct SessionMailbox {
-    items: Vec<InboxItem>,
+    items: Vec<MailboxEntry>,
     auto_wakes_since_human: usize,
     auto_wake_limit: usize,
+    /// 按 `child_session_id` 记录已知最新运行代次 `run_id`，用于在 flush 前过滤旧代次残留槽位。
+    latest_child_run: HashMap<String, u64>,
+    /// 主代理主动调用 `subagent(action="yield")` 后持有的并发等待 barrier。
+    yield_barrier: bool,
 }
 
 impl Default for SessionMailbox {
@@ -200,7 +302,63 @@ impl Default for SessionMailbox {
             items: Vec::new(),
             auto_wakes_since_human: 0,
             auto_wake_limit: DEFAULT_AUTO_WAKE_LIMIT,
+            latest_child_run: HashMap::new(),
+            yield_barrier: false,
         }
+    }
+}
+
+impl SessionMailbox {
+    /// 按最新代次过滤结构化子代理槽位，槽位全空时整条移除并归还未投递的自动唤醒计数。
+    fn prune_and_compact(&mut self) {
+        let latest = &self.latest_child_run;
+        let mut dropped_followups = 0usize;
+        self.items.retain_mut(|entry| {
+            let MailboxPayload::SubagentBatch { slots, .. } = &mut entry.payload else {
+                return true;
+            };
+            let mut kept_rev = Vec::with_capacity(slots.len());
+            let mut seen_children = HashSet::new();
+            for slot in slots.iter().rev() {
+                if let Some(&latest_run) = latest.get(&slot.child_session_id)
+                    && slot.run_id < latest_run
+                {
+                    continue;
+                }
+                if seen_children.insert(slot.child_session_id.clone()) {
+                    kept_rev.push(slot.clone());
+                }
+            }
+            kept_rev.reverse();
+            *slots = kept_rev;
+            let keep = !slots.is_empty();
+            if !keep && entry.mode == DeliveryMode::FollowUp {
+                dropped_followups = dropped_followups.saturating_add(1);
+            }
+            keep
+        });
+        if dropped_followups > 0 {
+            self.auto_wakes_since_human = self
+                .auto_wakes_since_human
+                .saturating_sub(dropped_followups);
+        }
+    }
+
+    fn is_entry_deliverable_followup(&self, entry: &MailboxEntry) -> bool {
+        entry.mode == DeliveryMode::FollowUp
+            && !(self.yield_barrier && entry.is_subagent_batch() && !entry.has_urgent_slot())
+    }
+
+    fn has_deliverable_followup(&self) -> bool {
+        self.items
+            .iter()
+            .any(|entry| self.is_entry_deliverable_followup(entry))
+    }
+
+    fn has_urgent_or_user_followup(&self) -> bool {
+        self.items.iter().any(|entry| {
+            entry.mode == DeliveryMode::FollowUp && (entry.is_user() || entry.has_urgent_slot())
+        })
     }
 }
 
@@ -272,11 +430,12 @@ impl SessionInbox {
         self.wake_tx.subscribe()
     }
 
-    /// 显式标记人类直接提交了输入，清零该会话的连续自动唤醒计数。
+    /// 显式标记人类直接提交了输入，清零连续自动唤醒计数并立即打破 `yield` barrier。
     pub fn record_human_input(&self, session_id: &str) {
         let mut state = self.state.lock().unwrap();
         let mailbox = state.mailboxes.entry(session_id.to_string()).or_default();
         mailbox.auto_wakes_since_human = 0;
+        mailbox.yield_barrier = false;
     }
 
     /// 供 `AgentLoop` 与独立单测标记会话忙闲态。
@@ -312,9 +471,10 @@ impl SessionInbox {
             let mut state = self.state.lock().unwrap();
             state.active_sessions.remove(session_id);
             if let Some(mailbox) = state.mailboxes.get_mut(session_id) {
+                mailbox.prune_and_compact();
                 for item in &mut mailbox.items {
                     if item.mode == DeliveryMode::Steer {
-                        if item.input.is_user() {
+                        if item.is_user() {
                             item.mode = DeliveryMode::FollowUp;
                         } else {
                             let next_wakes = mailbox.auto_wakes_since_human.saturating_add(1);
@@ -327,10 +487,7 @@ impl SessionInbox {
                         }
                     }
                 }
-                mailbox
-                    .items
-                    .iter()
-                    .any(|item| item.mode == DeliveryMode::FollowUp)
+                mailbox.has_deliverable_followup()
             } else {
                 false
             }
@@ -338,6 +495,230 @@ impl SessionInbox {
         if has_followup {
             let _ = self.wake_tx.send(session_id.to_string());
         }
+    }
+
+    /// 为主动调用 `subagent(action="yield")` 的父会话挂载并发等待 barrier；
+    /// 若箱内已存在人类输入或看门狗/失败等紧急 `FollowUp` 则立即拒绝/打破并返回 `false`。
+    pub fn arm_yield_barrier(&self, session_id: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let mailbox = state.mailboxes.entry(session_id.to_string()).or_default();
+        mailbox.prune_and_compact();
+        if mailbox.has_urgent_or_user_followup() {
+            mailbox.yield_barrier = false;
+            return false;
+        }
+        mailbox.yield_barrier = true;
+        true
+    }
+
+    /// 在所有子代理结算（或被停止归零）时释放 `yield` barrier；若有可投递 `FollowUp` 则唤醒一次。
+    pub fn release_yield_barrier(&self, session_id: &str) {
+        let should_wake = {
+            let mut state = self.state.lock().unwrap();
+            let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
+                return;
+            };
+            let was_barrier = mailbox.yield_barrier;
+            mailbox.yield_barrier = false;
+            mailbox.prune_and_compact();
+            was_barrier && mailbox.has_deliverable_followup()
+        };
+        if should_wake {
+            let _ = self.wake_tx.send(session_id.to_string());
+        }
+    }
+
+    pub fn has_yield_barrier(&self, session_id: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        state
+            .mailboxes
+            .get(session_id)
+            .is_some_and(|mb| mb.yield_barrier)
+    }
+
+    /// 记录子代理推进到更新代次 `run_id`，并清除该子代理旧代次残留槽位。
+    pub fn advance_subagent_generation(
+        &self,
+        session_id: &str,
+        child_session_id: &str,
+        new_run_id: u64,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
+            return;
+        };
+        let entry = mailbox
+            .latest_child_run
+            .entry(child_session_id.to_string())
+            .or_insert(new_run_id);
+        if new_run_id > *entry {
+            *entry = new_run_id;
+        }
+        let target_gen = *entry;
+        for item in &mut mailbox.items {
+            if let MailboxPayload::SubagentBatch { slots, .. } = &mut item.payload {
+                slots.retain(|slot| {
+                    slot.child_session_id != child_session_id || slot.run_id >= target_gen
+                });
+            }
+        }
+        mailbox.prune_and_compact();
+    }
+
+    /// 按 `child_session_id`（及可选槽位类别）立即移除待投递条目；槽位全空时整条移除不唤醒。
+    pub fn invalidate_subagent_slots(
+        &self,
+        session_id: &str,
+        child_session_id: &str,
+        kind: Option<SubagentSlotKind>,
+    ) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        for item in &mut mailbox.items {
+            if let MailboxPayload::SubagentBatch {
+                kind: batch_kind,
+                slots,
+            } = &mut item.payload
+                && kind.is_none_or(|k| k == *batch_kind)
+            {
+                let before = slots.len();
+                slots.retain(|slot| slot.child_session_id != child_session_id);
+                removed += before.saturating_sub(slots.len());
+            }
+        }
+        mailbox.prune_and_compact();
+        removed
+    }
+
+    /// 推送结构化子代理通知槽位（`subagent:settled` / `subagent:watchdog`）：
+    /// - 以 `(child_session_id, run_id)` 去重并清理旧代次/已过时的看门狗槽位；
+    /// - 在 `yield` barrier 期间缓存非紧急结算，直到全员结算（`release_barrier`）或触发紧急打破（`urgent`）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_subagent_slot(
+        &self,
+        session_id: &str,
+        mode: DeliveryMode,
+        kind: SubagentSlotKind,
+        child_session_id: impl Into<String>,
+        run_id: u64,
+        source: impl Into<String>,
+        text: impl Into<String>,
+        urgent: bool,
+        release_barrier: bool,
+    ) -> InboxPushResult {
+        let child_id = child_session_id.into();
+        let source = source.into();
+        let text = text.into();
+
+        let (result, should_wake) = {
+            let mut state = self.state.lock().unwrap();
+            let is_active = state.active_sessions.contains(session_id);
+            let mailbox = state.mailboxes.entry(session_id.to_string()).or_default();
+            let was_barrier = mailbox.yield_barrier;
+
+            if let Some(&latest_gen) = mailbox.latest_child_run.get(&child_id)
+                && run_id < latest_gen
+            {
+                if urgent || release_barrier {
+                    mailbox.yield_barrier = false;
+                }
+                mailbox.prune_and_compact();
+                let wake =
+                    !mailbox.yield_barrier && was_barrier && mailbox.has_deliverable_followup();
+                (
+                    InboxPushResult {
+                        id: 0,
+                        effective_mode: DeliveryMode::Inject,
+                        degraded: false,
+                    },
+                    wake,
+                )
+            } else {
+                mailbox.latest_child_run.insert(child_id.clone(), run_id);
+
+                // 同子代理结算时清理其残留看门狗和旧结算；发新看门狗时覆盖同子代理旧看门狗
+                for item in &mut mailbox.items {
+                    if let MailboxPayload::SubagentBatch {
+                        kind: batch_kind,
+                        slots,
+                    } = &mut item.payload
+                        && (*batch_kind == SubagentSlotKind::Watchdog
+                            || kind == SubagentSlotKind::Settled)
+                    {
+                        slots.retain(|slot| slot.child_session_id != child_id);
+                    }
+                }
+                mailbox.prune_and_compact();
+
+                let batch_key = kind.coalesce_key();
+                let (effective_mode, degraded) =
+                    resolve_push_delivery(mailbox, is_active, mode, false, Some(batch_key));
+
+                let new_slot = SubagentSlot {
+                    child_session_id: child_id,
+                    run_id,
+                    source,
+                    text,
+                    urgent,
+                };
+
+                let res = if let Some(existing) = mailbox.items.iter_mut().find(|item| {
+                    item.mode == effective_mode
+                        && matches!(
+                            item.payload,
+                            MailboxPayload::SubagentBatch { kind: k, .. } if k == kind
+                        )
+                }) {
+                    if let MailboxPayload::SubagentBatch { slots, .. } = &mut existing.payload {
+                        slots.push(new_slot);
+                    }
+                    InboxPushResult {
+                        id: existing.id,
+                        effective_mode,
+                        degraded,
+                    }
+                } else {
+                    state.next_id = state.next_id.wrapping_add(1).max(1);
+                    let id = state.next_id;
+                    state
+                        .mailboxes
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .items
+                        .push(MailboxEntry {
+                            id,
+                            mode: effective_mode,
+                            coalesce_key: Some(batch_key.to_string()),
+                            payload: MailboxPayload::SubagentBatch {
+                                kind,
+                                slots: vec![new_slot],
+                            },
+                        });
+                    InboxPushResult {
+                        id,
+                        effective_mode,
+                        degraded,
+                    }
+                };
+
+                let mailbox = state.mailboxes.get_mut(session_id).expect("mailbox exists");
+                if urgent || release_barrier {
+                    mailbox.yield_barrier = false;
+                }
+                let wake = !mailbox.yield_barrier
+                    && (res.effective_mode == DeliveryMode::FollowUp
+                        || (was_barrier && mailbox.has_deliverable_followup()));
+                (res, wake)
+            }
+        };
+
+        if should_wake {
+            let _ = self.wake_tx.send(session_id.to_string());
+        }
+        result
     }
 
     pub fn push(&self, session_id: &str, mode: DeliveryMode, input: TurnInput) -> InboxPushResult {
@@ -377,25 +758,31 @@ impl SessionInbox {
         coalesce_key: Option<String>,
         append_batch_source: Option<String>,
     ) -> InboxPushResult {
-        let result = {
+        let (result, should_wake) = {
             let mut state = self.state.lock().unwrap();
             let is_active = state.active_sessions.contains(session_id);
             let is_human = input.is_user();
 
             let mailbox = state.mailboxes.entry(session_id.to_string()).or_default();
+            mailbox.prune_and_compact();
+            let was_barrier = mailbox.yield_barrier;
+            if is_human {
+                mailbox.yield_barrier = false;
+            }
             let (effective_mode, degraded) =
                 resolve_push_delivery(mailbox, is_active, mode, is_human, coalesce_key.as_deref());
 
-            if let Some(ref key) = coalesce_key
+            let res = if let Some(ref key) = coalesce_key
                 && let Some(existing) = mailbox.items.iter_mut().find(|item| {
                     item.mode == effective_mode
                         && item.coalesce_key.as_deref() == Some(key.as_str())
-                })
-            {
+                }) {
+                let mut current = existing.materialize_input();
                 if let Some(ref batch_source) = append_batch_source {
-                    existing.input.append_batch(input, batch_source);
+                    current.append_batch(input, batch_source);
+                    existing.payload = MailboxPayload::Plain(current);
                 } else {
-                    existing.input = input;
+                    existing.payload = MailboxPayload::Plain(input);
                 }
                 InboxPushResult {
                     id: existing.id,
@@ -410,21 +797,27 @@ impl SessionInbox {
                     .entry(session_id.to_string())
                     .or_default()
                     .items
-                    .push(InboxItem {
+                    .push(MailboxEntry {
                         id,
                         mode: effective_mode,
-                        input,
                         coalesce_key,
+                        payload: MailboxPayload::Plain(input),
                     });
                 InboxPushResult {
                     id,
                     effective_mode,
                     degraded,
                 }
-            }
+            };
+
+            let mailbox = state.mailboxes.get(session_id).expect("mailbox exists");
+            let wake = !mailbox.yield_barrier
+                && (res.effective_mode == DeliveryMode::FollowUp
+                    || (is_human && was_barrier && mailbox.has_deliverable_followup()));
+            (res, wake)
         };
 
-        if result.effective_mode == DeliveryMode::FollowUp {
+        if should_wake {
             let _ = self.wake_tx.send(session_id.to_string());
         }
         result
@@ -436,11 +829,14 @@ impl SessionInbox {
         let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
             return Vec::new();
         };
+        mailbox.prune_and_compact();
         let mut drained = Vec::new();
         let mut remaining = Vec::with_capacity(mailbox.items.len());
         for item in mailbox.items.drain(..) {
             match item.mode {
-                DeliveryMode::Steer | DeliveryMode::Inject => drained.push(item.input),
+                DeliveryMode::Steer | DeliveryMode::Inject => {
+                    drained.push(item.materialize_input())
+                }
                 DeliveryMode::FollowUp => remaining.push(item),
             }
         }
@@ -449,19 +845,20 @@ impl SessionInbox {
     }
 
     pub fn has_pending_steer(&self, session_id: &str) -> bool {
-        let state = self.state.lock().unwrap();
-        state
-            .mailboxes
-            .get(session_id)
-            .is_some_and(|mb| mb.items.iter().any(|item| item.mode == DeliveryMode::Steer))
+        let mut state = self.state.lock().unwrap();
+        state.mailboxes.get_mut(session_id).is_some_and(|mb| {
+            mb.prune_and_compact();
+            mb.items.iter().any(|item| item.mode == DeliveryMode::Steer)
+        })
     }
 
     pub fn has_pending_user_steer(&self, session_id: &str) -> bool {
-        let state = self.state.lock().unwrap();
-        state.mailboxes.get(session_id).is_some_and(|mb| {
+        let mut state = self.state.lock().unwrap();
+        state.mailboxes.get_mut(session_id).is_some_and(|mb| {
+            mb.prune_and_compact();
             mb.items
                 .iter()
-                .any(|item| item.mode == DeliveryMode::Steer && item.input.is_user())
+                .any(|item| item.mode == DeliveryMode::Steer && item.is_user())
         })
     }
 
@@ -472,9 +869,10 @@ impl SessionInbox {
         let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
             return 0;
         };
+        mailbox.prune_and_compact();
         let mut count = 0usize;
         for item in &mut mailbox.items {
-            if item.mode == DeliveryMode::Steer && !item.input.is_user() {
+            if item.mode == DeliveryMode::Steer && !item.is_user() {
                 item.mode = DeliveryMode::Inject;
                 count += 1;
             }
@@ -485,26 +883,32 @@ impl SessionInbox {
     pub fn pop_followup(&self, session_id: &str) -> Option<TurnInput> {
         let mut state = self.state.lock().unwrap();
         let mailbox = state.mailboxes.get_mut(session_id)?;
+        mailbox.prune_and_compact();
         let idx = mailbox
             .items
             .iter()
-            .position(|item| item.mode == DeliveryMode::FollowUp)?;
-        Some(mailbox.items.remove(idx).input)
+            .position(|item| mailbox.is_entry_deliverable_followup(item))?;
+        Some(mailbox.items.remove(idx).materialize_input())
     }
 
     pub fn snapshot(&self, session_id: &str) -> Vec<InboxItem> {
-        let state = self.state.lock().unwrap();
-        state
-            .mailboxes
-            .get(session_id)
-            .map(|mb| mb.items.clone())
-            .unwrap_or_default()
+        let mut state = self.state.lock().unwrap();
+        let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
+            return Vec::new();
+        };
+        mailbox.prune_and_compact();
+        mailbox
+            .items
+            .iter()
+            .map(MailboxEntry::to_inbox_item)
+            .collect()
     }
 
     pub fn clear(&self, session_id: &str) {
         let mut state = self.state.lock().unwrap();
         if let Some(mailbox) = state.mailboxes.get_mut(session_id) {
             mailbox.items.clear();
+            mailbox.yield_barrier = false;
         }
     }
 
@@ -515,8 +919,10 @@ impl SessionInbox {
         let Some(mailbox) = state.mailboxes.get_mut(session_id) else {
             return 0;
         };
+        mailbox.prune_and_compact();
+        mailbox.yield_barrier = false;
         let before = mailbox.items.len();
-        mailbox.items.retain(|item| !item.input.is_user());
+        mailbox.items.retain(|item| !item.is_user());
         let mut affected = before.saturating_sub(mailbox.items.len());
         for item in &mut mailbox.items {
             if matches!(item.mode, DeliveryMode::FollowUp | DeliveryMode::Steer) {
@@ -560,11 +966,21 @@ impl SessionInbox {
     }
 
     pub fn has_pending_followup_key(&self, session_id: &str, key: &str) -> bool {
-        let state = self.state.lock().unwrap();
-        state.mailboxes.get(session_id).is_some_and(|mb| {
+        let mut state = self.state.lock().unwrap();
+        state.mailboxes.get_mut(session_id).is_some_and(|mb| {
+            mb.prune_and_compact();
             mb.items.iter().any(|item| {
                 item.mode == DeliveryMode::FollowUp && item.coalesce_key.as_deref() == Some(key)
             })
+        })
+    }
+
+    /// 判断当前是否存在可立即投递（未被 `yield` barrier 拦住、且非空）的 `FollowUp`。
+    pub fn has_deliverable_followup(&self, session_id: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.mailboxes.get_mut(session_id).is_some_and(|mb| {
+            mb.prune_and_compact();
+            mb.has_deliverable_followup()
         })
     }
 }
@@ -773,5 +1189,192 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].mode, DeliveryMode::Inject);
         assert_eq!(snap[0].input.text(), "important summary");
+    }
+
+    #[test]
+    fn subagent_slots_dedup_by_generation_and_drop_empty_batch_and_clear_watchdog() {
+        let inbox = SessionInbox::new();
+        inbox.set_auto_wake_limit("p1", 1);
+
+        // 1. child-a 触发看门狗后结算：结算槽位自动清掉同 child 的未投递看门狗槽位
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Watchdog,
+            "child-a",
+            1,
+            "subagent-watchdog:a",
+            "wd-1",
+            true,
+            true,
+        );
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "child-a",
+            1,
+            "subagent:a",
+            "settled-run1",
+            false,
+            true,
+        );
+        let snap = inbox.snapshot("p1");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].input.text(), "settled-run1");
+        assert!(!inbox.has_pending_followup_key("p1", "subagent:watchdog"));
+
+        // 2. 推进代次（send 续跑 run2）：旧代次 settled 槽位失效并整条移除，且归还自动唤醒额度
+        inbox.advance_subagent_generation("p1", "child-a", 2);
+        assert!(!inbox.has_pending_followup_key("p1", "subagent:settled"));
+        assert!(inbox.pop_followup("p1").is_none());
+        assert_eq!(inbox.remaining_auto_wakes("p1"), 1);
+
+        // 3. 过期 run1 再尝试投递必须被忽略；run2 与 child-b 合并，失效 child-a 后仅保留 child-b
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "child-a",
+            1,
+            "subagent:a",
+            "stale-run1",
+            false,
+            false,
+        );
+        assert!(inbox.pop_followup("p1").is_none());
+
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "child-a",
+            2,
+            "subagent:a",
+            "settled-run2",
+            false,
+            false,
+        );
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "child-b",
+            3,
+            "subagent:b",
+            "settled-b",
+            false,
+            true,
+        );
+        assert_eq!(
+            inbox.invalidate_subagent_slots("p1", "child-a", Some(SubagentSlotKind::Settled)),
+            1
+        );
+        let msg = inbox.pop_followup("p1").unwrap();
+        assert_eq!(msg.text(), "settled-b");
+        assert!(inbox.pop_followup("p1").is_none());
+    }
+
+    #[test]
+    fn yield_barrier_holds_non_urgent_settlements_and_breaks_on_urgent_or_human() {
+        let inbox = SessionInbox::new();
+        let mut wake_rx = inbox.subscribe_wake();
+
+        // 1. 挂载 barrier 后，首个子代理正常完成不得提前唤醒或被 pop_followup 消费
+        assert!(inbox.arm_yield_barrier("p1"));
+        assert!(inbox.has_yield_barrier("p1"));
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "c1",
+            1,
+            "subagent:c1",
+            "result-c1",
+            false,
+            false,
+        );
+        assert!(wake_rx.try_recv().is_err());
+        assert!(!inbox.has_deliverable_followup("p1"));
+        assert!(inbox.pop_followup("p1").is_none());
+
+        // 第二个子代理全部完成（release_barrier = true），一次唤醒打包投递两者
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "c2",
+            2,
+            "subagent:c2",
+            "result-c2",
+            false,
+            true,
+        );
+        assert!(!inbox.has_yield_barrier("p1"));
+        assert_eq!(wake_rx.try_recv().unwrap(), "p1");
+        let batched = inbox.pop_followup("p1").unwrap();
+        assert!(batched.text().contains("result-c1"));
+        assert!(batched.text().contains("result-c2"));
+        assert!(inbox.pop_followup("p1").is_none());
+
+        // 2. 子代理失败/看门狗（urgent = true）立即打破 barrier
+        assert!(inbox.arm_yield_barrier("p1"));
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "c3",
+            3,
+            "subagent:c3",
+            "ok-c3",
+            false,
+            false,
+        );
+        assert!(wake_rx.try_recv().is_err());
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Watchdog,
+            "c4",
+            4,
+            "subagent-watchdog:c4",
+            "stalled-c4",
+            true,
+            false,
+        );
+        assert!(!inbox.has_yield_barrier("p1"));
+        assert_eq!(wake_rx.try_recv().unwrap(), "p1");
+        assert!(inbox.pop_followup("p1").unwrap().text().contains("ok-c3"));
+        assert!(
+            inbox
+                .pop_followup("p1")
+                .unwrap()
+                .text()
+                .contains("stalled-c4")
+        );
+
+        // 3. 人类输入立即打破 barrier
+        assert!(inbox.arm_yield_barrier("p1"));
+        inbox.push_subagent_slot(
+            "p1",
+            DeliveryMode::FollowUp,
+            SubagentSlotKind::Settled,
+            "c5",
+            5,
+            "subagent:c5",
+            "ok-c5",
+            false,
+            false,
+        );
+        assert!(inbox.pop_followup("p1").is_none());
+        inbox.push(
+            "p1",
+            DeliveryMode::FollowUp,
+            TurnInput::user("human interrupt"),
+        );
+        assert!(!inbox.has_yield_barrier("p1"));
+        assert_eq!(wake_rx.try_recv().unwrap(), "p1");
+        assert!(inbox.pop_followup("p1").is_some());
+        assert!(inbox.pop_followup("p1").is_some());
     }
 }

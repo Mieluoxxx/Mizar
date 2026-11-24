@@ -25,10 +25,11 @@ pub use crate::session_title::{
     parse_model_title_output,
 };
 pub use crate::subagent::{
-    DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_MAX_STEPS_CAP,
-    DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS, DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS,
-    DEFAULT_SUBAGENT_TIMEOUT_SECS, SUBAGENT_TOOL_NAME, SubagentConfig, SubagentError, SubagentMode,
-    SubagentRunStatus, SubagentRuntime, SubagentStateEvent, SubagentTaskSnapshot,
+    DEFAULT_SUBAGENT_EDIT_SOFT_BUDGET, DEFAULT_SUBAGENT_MAX_CONCURRENT,
+    DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS, DEFAULT_SUBAGENT_READ_ONLY_SOFT_BUDGET,
+    DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS, DEFAULT_SUBAGENT_TIMEOUT_SECS, SUBAGENT_TOOL_NAME,
+    SubagentConfig, SubagentError, SubagentMode, SubagentRunStatus, SubagentRuntime,
+    SubagentStateEvent, SubagentTaskSnapshot,
 };
 pub use config::{
     CONFIG_DIR_NAME, CliLlmOverride, CodemodeSettings, CompactionSettings, EnvLlmOverride,
