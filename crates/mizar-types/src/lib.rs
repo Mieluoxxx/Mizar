@@ -6,6 +6,7 @@
 pub mod client;
 pub mod hooks;
 pub mod llm;
+pub mod rpc;
 pub mod trajectory;
 
 pub use hooks::{

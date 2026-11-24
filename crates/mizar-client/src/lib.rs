@@ -8,6 +8,7 @@ pub mod images;
 pub mod local_bash;
 pub mod logging;
 pub mod mentions;
+pub mod run_dir;
 pub mod session_view;
 pub mod settings;
 pub mod workspace;
@@ -35,6 +36,11 @@ pub use mentions::{
     FileMentionsConfig, MENTION_MAX_DIR_ENTRIES, MENTION_MAX_FILE_CHARS, MENTION_MAX_TOTAL_CHARS,
     MentionExpansionResult, expand_text_mentions, install_file_mentions,
     mentions_resolve_any_image, register_mention_hook, register_mention_hook_with,
+};
+pub use run_dir::{
+    ProcessMeta, ProcessRegistration, SessionLockError, check_session_writable, ensure_run_dir,
+    is_pid_alive, meta_path_for_pid, resolve_run_dir, resolve_run_dir_path, scan_live_processes,
+    set_socket_permissions_0600, socket_path_for_pid,
 };
 pub use session_view::{
     SelectionSources, build_session_info_report, build_session_info_report_at,
