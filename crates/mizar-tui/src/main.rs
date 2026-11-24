@@ -2,6 +2,7 @@
 //!
 //! 子命令：
 //! - `mizar exec [<prompt>]`：非交互单次无头执行（无 explicit prompt 且 stdin 非 TTY 时读取 stdin 至 EOF）
+//! - `mizar serve [--host <host>] [--port <port>] [--run-dir <dir>] [--workspace <dir>] [--session-db <path>]`：启动仅监听回环地址的 HTTP/WebSocket JSON-RPC 2.0 网关（远程访问通过 Tailscale Serve）
 //! - `mizar update [--version <ver>] [--force] [--check]`：从 GitHub Releases 检查并更新 `mizar` 二进制
 //!
 //! CLI 参数：
@@ -63,6 +64,7 @@ use mizar_tui::exec::{
     ExecConfig, ExecOutputFormat, configure_spine_trace_jsonl, resolve_exec_prompt,
     resolve_trace_jsonl_path, resolve_trace_out_path, run_exec_cli,
 };
+use mizar_tui::serve::run_serve_cli;
 use mizar_tui::update::{current_version, run_update_cli, should_check_for_updates_at_startup};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -134,10 +136,12 @@ Terminal-native AI coding workbench
 Usage:
   mizar [OPTIONS]
   mizar exec [OPTIONS] [<prompt>]
+  mizar serve [OPTIONS]
   mizar update [OPTIONS]
 
 Commands:
   exec                          Run a single non-interactive task and exit
+  serve                         Start the loopback-only HTTP/WebSocket JSON-RPC gateway
   update                        Check and install the latest release binary
 
 Options:
@@ -504,14 +508,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some((cmd, rest)) = raw_args.split_first()
-        && cmd == "update"
-    {
-        if let Err(err) = run_update_cli(rest).await {
-            eprintln!("error: {err}");
-            std::process::exit(1);
+    if let Some((cmd, rest)) = raw_args.split_first() {
+        if cmd == "update" {
+            if let Err(err) = run_update_cli(rest).await {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
-        return Ok(());
+        if cmd == "serve" {
+            if let Err(err) = run_serve_cli(rest).await {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
     }
 
     let cli = match parse_cli_args_from(raw_args) {
@@ -920,5 +931,6 @@ mod tests {
         assert!(parse_cli_args_from(["--trace-jsonl".into()]).is_err());
         assert!(format_help_text().contains("--trace-jsonl <path>"));
         assert!(format_help_text().contains("MIZAR_TRACE_JSONL"));
+        assert!(format_help_text().contains("mizar serve [OPTIONS]"));
     }
 }
