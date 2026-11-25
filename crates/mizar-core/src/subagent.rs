@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::{AgentEvent, AgentLoop};
+use crate::agent_loop::{AgentEvent, AgentLoop, DeliveryMode, StepOutcome, TurnInput};
 use crate::system_prompt::{PromptSection, SystemPrompt};
 use mizar_llm::LlmRuntime;
 use mizar_session::SessionStore;
@@ -38,17 +38,20 @@ pub use tasks::{SubagentRunStatus, SubagentStateEvent, SubagentTaskSnapshot};
 use tool::build_subagent_tool_definition;
 
 pub const SUBAGENT_TOOL_NAME: &str = "subagent";
-pub const DEFAULT_SUBAGENT_MAX_STEPS: usize = 20;
-pub const DEFAULT_SUBAGENT_MAX_STEPS_CAP: usize = 40;
-pub const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_SUBAGENT_READ_ONLY_SOFT_BUDGET: usize = 100;
+pub const DEFAULT_SUBAGENT_EDIT_SOFT_BUDGET: usize = 200;
+pub const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 0;
 pub const DEFAULT_SUBAGENT_MAX_CONCURRENT: usize = 4;
 pub const DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS: u64 = 45;
 pub const DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentConfig {
-    pub default_max_steps: usize,
-    pub max_steps_cap: usize,
+    /// 只读模式单轮软步数预算（`1.0x` 注入 Steer 提醒收尾，`1.5x` 停工具强制总结；`0` 表示不限制）。
+    pub read_only_soft_budget: usize,
+    /// 编辑模式单轮软步数预算（`1.0x` 注入 Steer 提醒收尾，`1.5x` 停工具强制总结；`0` 表示不限制）。
+    pub edit_soft_budget: usize,
+    /// 墙钟硬超时秒数；默认 `0` 表示关闭，依赖 45s 活性看门狗与软预算兜底。
     pub timeout_secs: u64,
     pub max_concurrent_per_parent: usize,
     pub stall_timeout_secs: u64,
@@ -58,8 +61,8 @@ pub struct SubagentConfig {
 impl Default for SubagentConfig {
     fn default() -> Self {
         Self {
-            default_max_steps: DEFAULT_SUBAGENT_MAX_STEPS,
-            max_steps_cap: DEFAULT_SUBAGENT_MAX_STEPS_CAP,
+            read_only_soft_budget: DEFAULT_SUBAGENT_READ_ONLY_SOFT_BUDGET,
+            edit_soft_budget: DEFAULT_SUBAGENT_EDIT_SOFT_BUDGET,
             timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
             max_concurrent_per_parent: DEFAULT_SUBAGENT_MAX_CONCURRENT,
             stall_timeout_secs: DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS,
@@ -69,10 +72,17 @@ impl Default for SubagentConfig {
 }
 
 impl SubagentConfig {
-    /// 返回经 `max_steps_cap` 封顶后的有效单轮最大步数（至少为 1）。
-    pub fn effective_max_steps(&self) -> usize {
-        let cap = self.max_steps_cap.max(1);
-        self.default_max_steps.clamp(1, cap)
+    /// 按执行模式返回单轮软步数预算（`0` 表示关闭软预算限制）。
+    pub fn soft_budget_for(&self, mode: SubagentMode) -> usize {
+        match mode {
+            SubagentMode::ReadOnly => self.read_only_soft_budget,
+            SubagentMode::Edit => self.edit_soft_budget,
+        }
+    }
+
+    /// 计算 `1.5x` 强制收尾阈值（`0` 关闭时返回 `None`）。
+    pub fn force_stop_steps(soft_budget: usize) -> Option<usize> {
+        (soft_budget > 0).then(|| soft_budget.saturating_mul(3).div_ceil(2))
     }
 
     /// 返回单父会话允许并发运行的后台子代理上限（至少为 1）。
@@ -80,9 +90,9 @@ impl SubagentConfig {
         self.max_concurrent_per_parent.max(1)
     }
 
-    /// 返回有效单轮超时秒数（至少为 1）。
+    /// 返回有效单轮墙钟硬超时秒数；`0` 表示关闭。
     pub fn effective_timeout_secs(&self) -> u64 {
-        self.timeout_secs.max(1)
+        self.timeout_secs
     }
 }
 
@@ -113,10 +123,16 @@ impl SubagentMode {
 
 #[derive(Debug, Error)]
 pub enum SubagentError {
-    #[error("无效的 action 参数 `{0}`，仅支持 \"spawn\"、\"send\"、\"status\" 或 \"stop\"")]
+    #[error(
+        "无效的 action 参数 `{0}`，仅支持 \"spawn\"、\"send\"、\"status\"、\"stop\" 或 \"yield\""
+    )]
     InvalidAction(String),
     #[error("action 参数必须为字符串")]
     InvalidActionType,
+    #[error("yield 操作缺少或传入空的 message 参数")]
+    MissingYieldMessage,
+    #[error("message 参数必须为字符串")]
+    InvalidYieldMessageType,
     #[error("缺少或为空的 prompt 参数")]
     MissingPrompt,
     #[error("prompt 参数必须为字符串")]
@@ -149,7 +165,7 @@ pub enum SubagentError {
     ModelChangeWhileRunning(String),
     #[error("无法加载子代理 `{0}` 对应的会话 `{1}`")]
     SessionUnavailable(String, String),
-    #[error("缺少父会话上下文，无法启动后台子代理")]
+    #[error("缺少父会话上下文，无法执行子代理操作")]
     MissingParentSession,
     #[error("同名后台子代理 `{0}` 正在运行中")]
     NameAlreadyRunning(String),
@@ -305,11 +321,25 @@ impl SubagentRuntime {
                             .unwrap()
                             .remove(&ev.session.id);
                     }
+                    AgentEvent::StepEnd(ev) => {
+                        if let Some(tracker) = rt_events.tracker_for_child(&ev.session.id) {
+                            tracker.touch();
+                            if ev.outcome == StepOutcome::ToolCalls
+                                && let Some(notice) =
+                                    tracker.take_budget_steer_notice_if_due(ev.step)
+                            {
+                                rt_events.agent_loop.inbox().push(
+                                    &ev.session.id,
+                                    DeliveryMode::Steer,
+                                    TurnInput::notice("subagent-budget", notice),
+                                );
+                            }
+                        }
+                    }
                     AgentEvent::Status(_)
                     | AgentEvent::Request(_)
                     | AgentEvent::TurnStart(_)
                     | AgentEvent::StepFirstToken(_)
-                    | AgentEvent::StepEnd(_)
                     | AgentEvent::Usage(_) => {}
                 }
             });
@@ -346,9 +376,10 @@ impl SubagentRuntime {
                     Some(
                         "Subagent delegation (`subagent` tool, only when available):\n\
 - Balance responsiveness and efficiency: handle quick 1-3 step lookups directly, and delegate heavy, multi-file, log-heavy, or parallel tasks to background subagents (`action: \"spawn\"`, default) so you stay responsive to the user immediately.\n\
-- Launch independent subagents together in one step, give the user a brief acknowledgement, and end your turn instead of sleeping or polling — settled results arrive as follow-up notices.\n\
-- Use `action: \"send\"` (`name`, `prompt`) to steer a running subagent or wake a settled one with its retained session memory; use `action: \"status\"` for live step/tool/idle inspection or `action: \"stop\"` to cancel.\n\
-- When a `subagent-watchdog:*` alert arrives, inspect the snapshot and decide whether to reassure the user and wait, redirect via `send`, or cancel via `stop`."
+- Launch independent subagents together. While they run, only do independent work that advances the user's request; do not redo delegated work.\n\
+- If the next useful step depends on a pending subagent result, call `subagent(action=\"yield\", message=\"...\")` with a brief user-facing update. This ends your turn; results arrive as follow-ups. Do not sleep or poll.\n\
+- On follow-up, use the results already delivered. If your next step still needs another result, yield again. Use `status` only when the user asks for progress or when investigating a `subagent-watchdog:*` alert.\n\
+- Use `send` to redirect or resume a subagent, or `stop` to cancel it. On a watchdog alert, inspect once, then decide whether to yield, redirect, or cancel."
                             .to_string(),
                     )
                 },
@@ -433,7 +464,11 @@ impl SubagentRuntime {
 
     /// 取消指定父会话名下全部仍在运行的后台子代理（供切换会话或退出清理调用）。
     pub fn cancel_parent_subagents(&self, parent_session_id: &str) -> usize {
-        let stopped = self.tasks.lock().unwrap().cancel_parent(parent_session_id);
+        let stopped = self
+            .tasks
+            .lock()
+            .unwrap()
+            .cancel_parent(parent_session_id, self.agent_loop.inbox());
         let count = stopped.len();
         if let Some((name, child_session_id, mode)) = stopped.into_iter().last() {
             self.emit_state_event(SubagentStateEvent {
@@ -500,9 +535,9 @@ mod tests {
             "scout-a",
             SubagentRunStatus::Completed,
             3,
-            20,
+            100,
             2,
-            180,
+            0,
             false,
         );
         assert!(normal.contains("交由主代理汇总"), "{normal}");
@@ -511,9 +546,9 @@ mod tests {
             "scout-b",
             SubagentRunStatus::Completed,
             3,
-            20,
+            100,
             2,
-            180,
+            0,
             true,
         );
         assert!(degraded.contains("连续自动唤醒上限"), "{degraded}");
@@ -521,16 +556,25 @@ mod tests {
     }
 
     #[test]
-    fn config_clamps_effective_timeout_and_steps() {
+    fn config_resolves_mode_soft_budgets_and_zero_timeout_default() {
+        let def = SubagentConfig::default();
+        assert_eq!(def.soft_budget_for(SubagentMode::ReadOnly), 100);
+        assert_eq!(def.soft_budget_for(SubagentMode::Edit), 200);
+        assert_eq!(def.effective_timeout_secs(), 0);
+        assert_eq!(SubagentConfig::force_stop_steps(100), Some(150));
+        assert_eq!(SubagentConfig::force_stop_steps(200), Some(300));
+        assert_eq!(SubagentConfig::force_stop_steps(0), None);
+
         let cfg = SubagentConfig {
-            default_max_steps: 99,
-            max_steps_cap: 15,
+            read_only_soft_budget: 0,
+            edit_soft_budget: 50,
             timeout_secs: 0,
             max_concurrent_per_parent: 0,
             ..Default::default()
         };
-        assert_eq!(cfg.effective_max_steps(), 15);
-        assert_eq!(cfg.effective_timeout_secs(), 1);
+        assert_eq!(cfg.soft_budget_for(SubagentMode::ReadOnly), 0);
+        assert_eq!(cfg.soft_budget_for(SubagentMode::Edit), 50);
+        assert_eq!(cfg.effective_timeout_secs(), 0);
         assert_eq!(cfg.effective_max_concurrent(), 1);
     }
 }

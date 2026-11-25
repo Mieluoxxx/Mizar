@@ -4,8 +4,10 @@
 //! 推导触发阈值，并以固定的 `keep_recent_tokens`（小窗自动钳位）切分保留尾部；
 //! 实测校准锚点使用 `u.prompt_tokens()`（已含 `cache_read` 与 `cache_write`）。
 
+use std::collections::HashMap;
+
 use mizar_llm::{ContentBlock, ImageAttachment, Message};
-use mizar_session::{Session, SessionEntry, SessionEvent};
+use mizar_session::{Session, SessionEntry, SessionEvent, SessionTraceEvent};
 
 use crate::compaction::CompactionConfig;
 
@@ -153,6 +155,19 @@ pub fn estimate_entry_tokens(entry: &SessionEntry) -> u64 {
     }
 }
 
+/// 估算单条会话事件在应用 `ToolResultPrune` 投影替换后的上下文 token 数。
+pub fn estimate_entry_tokens_with_pruned(
+    entry: &SessionEntry,
+    pruned_map: &HashMap<u64, String>,
+) -> u64 {
+    if let SessionEvent::ToolResult { .. } = &entry.event
+        && let Some(notice) = pruned_map.get(&entry.seq)
+    {
+        return 8 + 8 + estimate_text_tokens(notice);
+    }
+    estimate_entry_tokens(entry)
+}
+
 /// 估算当前会话发往模型的总上下文 token 数：
 /// 若最新一次边界变更之后存在有效的实测 `Assistant.usage.prompt_tokens()`，
 /// 则以该实测值（含 `cache_read` + `cache_write`）作为锚点，加上锚点之后新增条目的增量估算；
@@ -164,13 +179,17 @@ pub fn estimate_session_context_tokens(
 ) -> u64 {
     let visible = session.visible_log();
     let all = session.all_entries();
+    let pruned_map = session.pruned_map();
 
-    // 找到最近一次改变前缀形态的边界序号（Compaction）
+    // 找到最近一次改变前缀形态的边界序号（Compaction 或 ToolResultPrune）
     let last_mutation_seq = all
         .iter()
         .rev()
-        .find_map(|e| match e.event {
-            SessionEvent::Compaction { .. } => Some(e.seq),
+        .find_map(|e| match &e.event {
+            SessionEvent::Compaction { .. }
+            | SessionEvent::Trace {
+                detail: SessionTraceEvent::ToolResultPrune { .. },
+            } => Some(e.seq),
             _ => None,
         })
         .unwrap_or(0);
@@ -194,7 +213,7 @@ pub fn estimate_session_context_tokens(
         let mut total = anchor_input;
         for entry in &visible {
             if entry.seq >= anchor_seq {
-                total = total.saturating_add(estimate_entry_tokens(entry));
+                total = total.saturating_add(estimate_entry_tokens_with_pruned(entry, &pruned_map));
             }
         }
         return total;
@@ -203,7 +222,7 @@ pub fn estimate_session_context_tokens(
     let mut total =
         estimate_text_tokens(system_prompt_text) + (tools_schema_chars as u64).div_ceil(4);
     for entry in &visible {
-        total = total.saturating_add(estimate_entry_tokens(entry));
+        total = total.saturating_add(estimate_entry_tokens_with_pruned(entry, &pruned_map));
     }
     total
 }
@@ -307,5 +326,43 @@ mod tests {
             event: SessionEvent::user_with_images("看图", vec![img]),
         };
         assert!(estimate_entry_tokens(&entry_img) > estimate_entry_tokens(&entry_text));
+    }
+
+    #[test]
+    fn session_context_estimate_reflects_tool_result_prune_and_invalidates_stale_anchor() {
+        let session = std::sync::Arc::new(mizar_session::Session::new("prune-budget"));
+        session.append(SessionEvent::user("inspect file"));
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "c1".into(),
+            name: "read".into(),
+            content: "very long file body ".repeat(1_000),
+            is_error: false,
+            meta: None,
+        });
+        session.append(SessionEvent::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            replay: None,
+            usage: Some(TokenUsage {
+                input_tokens: 15_000,
+                output_tokens: 50,
+                ..TokenUsage::default()
+            }),
+        });
+
+        let before = estimate_session_context_tokens(&session, "", 0);
+        assert!(before >= 15_000, "before={before}");
+
+        session.append_trace(SessionTraceEvent::ToolResultPrune {
+            target_seq: 2,
+            notice: "[Superseded by a newer read of this file]".into(),
+        });
+
+        let after = estimate_session_context_tokens(&session, "", 0);
+        assert!(
+            after < 200,
+            "ToolResultPrune must drop stale pre-prune prompt_tokens anchor and reflect notice size: after={after}"
+        );
     }
 }

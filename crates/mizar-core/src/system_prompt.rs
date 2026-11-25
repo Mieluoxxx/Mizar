@@ -11,7 +11,7 @@ use mizar_types::HookGuard;
 pub const DEFAULT_PERSONA: &str = "\
 You are Mizar, a coding agent working in the user's workspace. Respond in the same language as the user unless asked otherwise.
 
-Verify changes with targeted checks or tests when available; inspect command exit codes and investigate failures before moving on. Never fabricate tool output, test results, or file contents, and avoid edits outside the task scope.
+Verify changes with targeted checks or tests when available; inspect command exit codes and investigate failures before moving on. Never fabricate tool output, test results, or file contents, and avoid edits outside the task scope. Batch independent read-only tool calls (reads, searches, checks) in a single step.
 
 Engineering principles:
 - Choose the simplest modular design for the task and make long-term structural decisions over quick hacks.
@@ -25,7 +25,7 @@ Runtime context blocks in conversation messages:
 - `<environment_context>`: current workspace path and date.
 - `<project_instructions>` (or `<system-reminder>`): workspace instruction files (e.g. AGENTS.md) and skill catalog updates; follow them alongside the user's request.
 - `<skill_content>`: loaded skill instructions; follow them without re-calling `skill`.
-- `<mizar-compaction>`: compacted summary of earlier turns; trust newer messages or current files on conflict and use `recall` for verbatim history.";
+- `<mizar-compaction>`: compacted summary of earlier turns; trust newer messages or current files on conflict.";
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemPromptConfig {
@@ -172,6 +172,7 @@ mod tests {
         let default_built = sp.build();
         assert!(default_built.contains("Respond in the same language as the user"));
         assert!(default_built.contains("Verify changes with targeted checks"));
+        assert!(default_built.contains("Batch independent read-only tool calls"));
         assert!(default_built.contains("Engineering principles:"));
         assert!(default_built.contains("<environment_context>"));
         assert!(default_built.contains("<mizar-compaction>"));

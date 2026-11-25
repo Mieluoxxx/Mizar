@@ -202,8 +202,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'CLI Flags',
         },
         description: {
-          zh: '按场景组合命令行启动参数，覆盖模型、工作区、视口、工具集、无头 exec 与 --trace-out。',
-          en: 'Combine CLI startup flags across workspace, models, headless exec, --trace-out, and approvals.',
+          zh: '按场景组合命令行启动参数，覆盖模型、工作区、视口、工具集、无头 exec、--trace-out 与 --trace-jsonl。',
+          en: 'Combine CLI startup flags across workspace, models, headless exec, --trace-out, --trace-jsonl, and approvals.',
         },
       },
       {

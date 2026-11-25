@@ -1,18 +1,21 @@
-//! 工作台动作执行器：派发代理回合、本地 Bash、会话切换/恢复、剪贴板粘贴、侧栏数据采集与设置热更新。
+//! 工作台动作执行器：通过 `SessionActorHandle` 派发代理回合/审批/队列/会话切换，并承载本地 Bash、剪贴板粘贴、侧栏数据采集与设置热更新。
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use chrono::{DateTime, Local};
 use crossterm::event::EventStream;
-use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController, steer_session};
+use mizar_client::actor::{ActorError, SessionActorHandle};
+use mizar_client::events::{ActiveTaskKind, LoopClientMsg, RunController};
 use mizar_client::images;
 use mizar_client::local_bash::{execute_local_bash_for_session, next_local_bash_call_id};
 use mizar_client::mentions;
+use mizar_client::run_dir::check_session_writable;
 use mizar_client::session_view::{
-    SelectionSources, collect_session_picker_items, project_fork_view, project_resume_view,
-    project_session_tree, resolve_model_switch, resolve_selection, to_ui_selection,
+    SelectionSources, project_fork_view, project_resume_view, resolve_model_switch,
+    resolve_selection, to_ui_selection,
 };
 use mizar_client::settings::{
     apply_runtime_setting_change, persist_setting_change, toggle_spine_module,
@@ -21,23 +24,29 @@ use mizar_client::workspace::{
     WorkspacePanelSnapshot, collect_mcps_summary, collect_tools_summary, collect_user_skill_names,
     collect_workspace_panel_snapshot,
 };
-use mizar_core::agent_loop::{DeliveryMode, RunOptions, TurnInput};
 use mizar_core::skills::SkillLookupOptions;
 use mizar_core::spine::{
     CompactionError, ManualCompactOptions, MizarRuntime, resolve_global_settings_path,
 };
 use mizar_core::trajectory::TimelineMode;
-use mizar_llm::ImageAttachment;
+use mizar_llm::{ImageAttachment, ReasoningEffort};
 use mizar_mcp::McpConnectionState;
-use mizar_session::{Session, SessionCreateOptions};
+use mizar_session::{Session, SessionEvent};
 use mizar_tools::ToolExposure;
-use mizar_tui_ui::app::{AppAction, AppState, ChatItem, NoticeLevel, SessionSelection, UiEvent};
-use mizar_tui_ui::overlay::{ApprovalDecision, SkillPickerItem};
+use mizar_tui_ui::app::{
+    AppAction, AppState, ApprovalMode, ChatItem, NoticeLevel, QueuedPrompt, SessionSelection,
+    UiEvent,
+};
+use mizar_tui_ui::overlay::{ApprovalDecision, SessionPickerItem, SkillPickerItem};
 use mizar_tui_ui::terminal::{
     ScreenMode, apply_terminal_modes, resume_after_external_editor, set_mouse_capture_enabled,
     suspend_for_external_editor,
 };
-use mizar_types::client::{HostExtensionFlags, short_id};
+use mizar_types::client::{ClientEvent, HostExtensionFlags, short_id};
+use mizar_types::rpc::{
+    QueuedInputDto, ResolvedBy, RpcApprovalMode, RpcAttachmentDto, SessionConfigParams,
+    SessionForkParams, SessionListItemDto, SessionListParams, SubmitMode, TurnSubmitParams,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -160,141 +169,457 @@ pub async fn apply_clipboard_content(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_agent_run(
-    runtime: &Arc<MizarRuntime>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncedActorConfig {
+    session_id: String,
+    provider: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    approval_mode: ApprovalMode,
+}
+
+impl SyncedActorConfig {
+    fn from_app(app: &AppState) -> Self {
+        Self {
+            session_id: app.session_id.clone(),
+            provider: app.provider.clone(),
+            model: app.model.clone(),
+            reasoning_effort: app.reasoning_effort,
+            approval_mode: app.approval_mode,
+        }
+    }
+}
+
+/// TUI 终端状态与 `SessionActor` 内核之间的增量同步器（已提交用户输入回声去重 + 运行配置同步）。
+pub(super) struct TuiActorSync {
+    last_synced_entry_seq: u64,
+    pending_tui_user_echoes: VecDeque<String>,
+    synced_config: SyncedActorConfig,
+}
+
+impl TuiActorSync {
+    pub(super) fn new(session: &Session, app: &AppState) -> Self {
+        Self {
+            last_synced_entry_seq: max_entry_seq(session),
+            pending_tui_user_echoes: VecDeque::new(),
+            synced_config: SyncedActorConfig::from_app(app),
+        }
+    }
+
+    pub(super) fn reset_for_session(&mut self, session: &Session, app: &AppState) {
+        self.last_synced_entry_seq = max_entry_seq(session);
+        self.pending_tui_user_echoes.clear();
+        self.synced_config = SyncedActorConfig::from_app(app);
+    }
+
+    pub(super) fn mark_session_id(&mut self, session_id: String) {
+        self.synced_config.session_id = session_id;
+    }
+
+    pub(super) fn record_user_echo(&mut self, text: String) {
+        self.pending_tui_user_echoes.push_back(text);
+    }
+
+    pub(super) fn rollback_user_echo(&mut self, text: &str) {
+        if let Some(pos) = self
+            .pending_tui_user_echoes
+            .iter()
+            .rposition(|item| item == text)
+        {
+            self.pending_tui_user_echoes.remove(pos);
+        }
+    }
+
+    pub(super) fn clear_user_echoes(&mut self) {
+        self.pending_tui_user_echoes.clear();
+    }
+
+    /// 扫描当前活跃会话新增的已提交 `User` 与外部 `ContextNotice` 条目，补齐由 `SessionActor`
+    /// 自动排空排队/唤醒 `FollowUp`/外部 RPC 触发的回合气泡（跳过本地已先推入的回声）。
+    pub(super) fn sync_committed_session_inputs(
+        &mut self,
+        session: &Session,
+        app: &mut AppState,
+    ) -> bool {
+        let since = self.last_synced_entry_seq;
+        let mut max_seq = since;
+        let mut committed = Vec::new();
+        session.with_all_entries(|entries| {
+            for entry in entries.iter().rev() {
+                if entry.seq <= since {
+                    break;
+                }
+                max_seq = max_seq.max(entry.seq);
+                match &entry.event {
+                    SessionEvent::User { text, .. } => {
+                        committed.push((true, text.clone(), None));
+                    }
+                    SessionEvent::ContextNotice { source, text, .. }
+                        if !is_internal_context_notice_source(source) =>
+                    {
+                        committed.push((false, text.clone(), Some(source.clone())));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if max_seq > self.last_synced_entry_seq {
+            self.last_synced_entry_seq = max_seq;
+        }
+        if committed.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        committed.reverse();
+        for (is_user, text, source) in committed {
+            if is_user {
+                if let Some(pos) = self.pending_tui_user_echoes.iter().position(|p| p == &text) {
+                    self.pending_tui_user_echoes.remove(pos);
+                } else {
+                    app.push_user_message(&text);
+                    changed = true;
+                }
+            } else if let Some(src) = source {
+                app.push_notice(NoticeLevel::Info, format!("[{src}] {text}"));
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 当 `/model`、`Ctrl+L`、`/effort`、`Tab`、`/approval` 或 `/settings` 变更运行配置时同步到 `SessionActor`。
+    pub(super) async fn sync_config_if_changed(
+        &mut self,
+        actor: &SessionActorHandle,
+        app: &AppState,
+    ) {
+        let current = SyncedActorConfig::from_app(app);
+        if current == self.synced_config {
+            return;
+        }
+        let provider = (current.provider != self.synced_config.provider)
+            .then(|| current.provider.clone().unwrap_or_default());
+        let model = (current.model != self.synced_config.model)
+            .then(|| current.model.clone().unwrap_or_default());
+        let reasoning_effort = (current.reasoning_effort != self.synced_config.reasoning_effort)
+            .then_some(current.reasoning_effort)
+            .flatten();
+        let approval_mode = (current.approval_mode != self.synced_config.approval_mode)
+            .then(|| RpcApprovalMode::from(current.approval_mode));
+
+        if provider.is_some()
+            || model.is_some()
+            || reasoning_effort.is_some()
+            || approval_mode.is_some()
+        {
+            let _ = actor
+                .update_config(SessionConfigParams {
+                    session_id: app.session_id.clone(),
+                    provider,
+                    model,
+                    reasoning_effort,
+                    approval_mode,
+                })
+                .await;
+        }
+        self.synced_config = current;
+    }
+}
+
+fn max_entry_seq(session: &Session) -> u64 {
+    session.with_all_entries(|entries| entries.last().map_or(0, |e| e.seq))
+}
+
+fn is_internal_context_notice_source(source: &str) -> bool {
+    source == "file-mentions"
+        || source == "environment-context"
+        || source == "skill-catalog"
+        || source == "agent-instructions"
+        || source == "subagent-budget"
+        || source.starts_with("subagent:")
+        || source.starts_with("subagent-watchdog:")
+}
+
+fn ui_images_to_attachments(images: &[ImageAttachment]) -> Vec<RpcAttachmentDto> {
+    images
+        .iter()
+        .map(|img| RpcAttachmentDto {
+            path: None,
+            mime: Some(img.media_type.clone()),
+            data: Some(img.data.clone()),
+        })
+        .collect()
+}
+
+fn attachments_to_ui_images(attachments: &[RpcAttachmentDto]) -> Vec<(String, ImageAttachment)> {
+    attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, att)| {
+            let data = att.data.as_ref()?.trim();
+            if data.is_empty() {
+                return None;
+            }
+            let mime = att.mime.clone().unwrap_or_else(|| "image/png".to_string());
+            Some((
+                format!("[image #{}]", idx + 1),
+                ImageAttachment::new(mime, data.to_string()),
+            ))
+        })
+        .collect()
+}
+
+fn replace_local_queue_item_id(app: &mut AppState, local_id: u64, actor_id: u64) {
+    if local_id == actor_id {
+        return;
+    }
+    let prev_selected = app.queue.selected_id();
+    let items: Vec<QueuedPrompt> = app
+        .queue
+        .items()
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if item.id == local_id {
+                item.id = actor_id;
+            }
+            item
+        })
+        .collect();
+    app.queue.clear();
+    for item in items {
+        app.queue.push_raw(item);
+    }
+    if let Some(sel) = prev_selected {
+        app.queue
+            .set_selected(Some(if sel == local_id { actor_id } else { sel }));
+    }
+}
+
+pub(super) fn apply_queue_snapshot_to_app(app: &mut AppState, items: Vec<QueuedInputDto>) {
+    let prev_items = app.queue.items().to_vec();
+    let prev_selected = app.queue.selected_id();
+    let selected_pos = prev_selected.and_then(|sel| prev_items.iter().position(|it| it.id == sel));
+
+    app.queue.clear();
+    for (idx, dto) in items.into_iter().enumerate() {
+        let images = prev_items
+            .iter()
+            .find(|old| old.id == dto.id)
+            .or_else(|| {
+                prev_items
+                    .get(idx)
+                    .filter(|old| old.text == dto.text && old.images.len() == dto.attachments.len())
+            })
+            .map(|old| old.images.clone())
+            .unwrap_or_else(|| attachments_to_ui_images(&dto.attachments));
+        app.queue.push_raw(QueuedPrompt {
+            id: dto.id,
+            text: dto.text,
+            images,
+        });
+    }
+    if let Some(sel_id) = prev_selected {
+        if app.queue.items().iter().any(|it| it.id == sel_id) {
+            app.queue.set_selected(Some(sel_id));
+        } else if let Some(pos) = selected_pos
+            && let Some(it) = app.queue.items().get(pos)
+        {
+            app.queue.set_selected(Some(it.id));
+        }
+    }
+}
+
+/// 按键批处理后同步 TUI 本地队列操作（入队 / 撤回 / 丢弃 / 队首发送）到 `SessionActor` 单真源队列。
+pub(super) async fn sync_queue_after_term_event(
+    actor: &SessionActorHandle,
     config: &TuiConfig,
     app: &mut AppState,
-    active_session: &Arc<Session>,
-    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
+    sync: &mut TuiActorSync,
+    prev_queue: &[QueuedPrompt],
+) -> bool {
+    let curr_queue = app.queue.items().to_vec();
+    if curr_queue == prev_queue {
+        return false;
+    }
+
+    let mut dirty = false;
+    let file_mentions_enabled =
+        HostExtensionFlags::from_disabled_plugins(&config.disabled_plugins).file_mentions;
+
+    for old in prev_queue {
+        if !curr_queue.iter().any(|cur| cur.id == old.id) {
+            let _ = actor.queue_remove(&app.session_id, old.id).await;
+            dirty = true;
+        }
+    }
+
+    for new in curr_queue {
+        if prev_queue.iter().any(|old| old.id == new.id) {
+            continue;
+        }
+        if new.images.is_empty()
+            && file_mentions_enabled
+            && new.text.contains('@')
+            && !app.active_model_supports_images()
+            && mentions::mentions_resolve_any_image(
+                &config.workspace,
+                config.restrict_to_workspace,
+                &new.text,
+            )
+            .await
+        {
+            app.dequeue_prompt(new.id);
+            if app.input.is_empty() {
+                app.input.set_text_end(&new.text);
+            }
+            app.reject_unsupported_images_notice();
+            dirty = true;
+            continue;
+        }
+
+        let raw_images: Vec<ImageAttachment> =
+            new.images.iter().map(|(_, img)| img.clone()).collect();
+        let attachments = ui_images_to_attachments(&raw_images);
+        match actor
+            .submit_turn(TurnSubmitParams {
+                session_id: app.session_id.clone(),
+                text: new.text.clone(),
+                attachments: (!attachments.is_empty()).then_some(attachments),
+                mode: Some(SubmitMode::Send),
+            })
+            .await
+        {
+            Ok(res) if res.mode == SubmitMode::Send => {
+                app.dequeue_prompt(new.id);
+                app.push_user_message(&new.text);
+                sync.record_user_echo(new.text);
+                app.set_busy_state(true);
+                dirty = true;
+            }
+            Ok(res) => {
+                if let Some(actor_id) = res.queue_id {
+                    replace_local_queue_item_id(app, new.id, actor_id);
+                }
+                dirty = true;
+            }
+            Err(err) => {
+                app.dequeue_prompt(new.id);
+                app.push_notice(NoticeLevel::Error, format!("消息入队失败：{err}"));
+                dirty = true;
+            }
+        }
+    }
+
+    dirty
+}
+
+/// 消费 `SessionActor` 发出的同进程零序列化 `ClientEvent` 并同步会话切换、队列快照与用户输入气泡。
+pub(super) fn process_actor_client_event_dirty(
+    actor: &SessionActorHandle,
+    active_session: &mut Arc<Session>,
+    app: &mut AppState,
     task_state: &mut RunController,
+    sync: &mut TuiActorSync,
+    event: ClientEvent,
+) -> (AppAction, bool) {
+    match event {
+        ClientEvent::QueueUpdated { items } => {
+            apply_queue_snapshot_to_app(app, items);
+            (AppAction::None, true)
+        }
+        ClientEvent::SessionSwitched { new_session_id, .. } => {
+            if app.session_id == new_session_id {
+                return (AppAction::None, false);
+            }
+            let next = actor.active_session();
+            if next.id != new_session_id {
+                return (AppAction::None, false);
+            }
+            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+            task_state.abort_for_session_switch();
+            if app.is_running_activity() {
+                app.set_idle_state();
+            }
+            if next.all_entries().is_empty() {
+                app.reset_for_new_session(next.id.clone(), next.header().title);
+            } else {
+                app.restore_session_view(project_resume_view(&next));
+            }
+            *active_session = next;
+            sync.reset_for_session(active_session, app);
+            (AppAction::RefreshSidePanelData, true)
+        }
+        other => {
+            let mut extra_dirty = false;
+            if matches!(
+                other,
+                ClientEvent::StepStart { .. }
+                    | ClientEvent::TurnEnd { .. }
+                    | ClientEvent::RunFinished(_)
+            ) {
+                extra_dirty |= sync.sync_committed_session_inputs(active_session, app);
+            }
+            let (act, ev_dirty) =
+                super::terminal_io::process_client_event_dirty(app, task_state, other);
+            (act, extra_dirty || ev_dirty)
+        }
+    }
+}
+
+pub(super) async fn submit_turn_via_actor(
+    actor: &SessionActorHandle,
+    app: &mut AppState,
+    sync: &mut TuiActorSync,
     prompt: String,
     images: Vec<ImageAttachment>,
 ) {
-    spawn_agent_run_input(
-        runtime,
-        config,
-        app,
-        active_session,
-        loop_tx,
-        task_state,
-        TurnInput::user_with_images(prompt, images),
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_agent_run_input(
-    runtime: &Arc<MizarRuntime>,
-    config: &TuiConfig,
-    app: &mut AppState,
-    active_session: &Arc<Session>,
-    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
-    task_state: &mut RunController,
-    input: TurnInput,
-) {
-    let agent_loop = Arc::clone(&runtime.agent_loop);
-    let (run_id, cancel) = task_state.start(active_session.id.clone(), ActiveTaskKind::AgentRun);
-    app.set_busy_state(true);
-
-    // 每次真正发请求前快照当前选择：`/model`、Ctrl+L 选择器、`/effort`、Tab、`/settings`
-    // 五条路最终都汇到这里，无需在 UI 层（纯前端、无 Session 句柄）重复埋点。
-    // `record_selection` 内部去重，与最新一条相同时不写。
-    active_session.record_selection(
-        app.provider.clone(),
-        app.model.clone(),
-        app.reasoning_effort,
-    );
-
-    let session: Arc<Session> = Arc::clone(active_session);
-    let task_session_id = session.id.clone();
-    let run_opts = RunOptions {
-        provider: app.provider.clone(),
-        model: app.model.clone(),
-        max_steps: config.max_steps,
-        max_tokens: None,
-        temperature: None,
-        reasoning_effort: app.reasoning_effort,
-        images: Vec::new(),
-        ..Default::default()
-    };
-    let tx = loop_tx.clone();
-    tokio::spawn(async move {
-        let res = agent_loop
-            .run_with_options(session, input, cancel, run_opts)
-            .await
-            .map_err(|e| e.to_string());
-        let _ = tx.send(LoopClientMsg::Task {
-            run_id,
-            session_id: task_session_id,
-            event: UiEvent::RunFinished(res),
-        });
-    });
-}
-
-/// 从 `SessionInbox` 出队当前活跃会话的下一条待唤醒 `FollowUp` 并启动一轮对话。
-pub(super) fn drain_next_inbox_followup(
-    runtime: &Arc<MizarRuntime>,
-    config: &TuiConfig,
-    app: &mut AppState,
-    active_session: &Arc<Session>,
-    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
-    task_state: &mut RunController,
-) -> bool {
-    if runtime.agent_loop.is_session_busy(&active_session.id) {
-        return false;
-    }
-    let Some(next_input) = runtime.agent_loop.inbox().pop_followup(&active_session.id) else {
-        return false;
-    };
-    match &next_input {
-        TurnInput::User { text, images } => {
-            if !images.is_empty() && !app.active_model_supports_images() {
-                app.reject_unsupported_images_notice();
-                return true;
-            }
-            app.push_user_message(text);
+    let attachments = ui_images_to_attachments(&images);
+    sync.record_user_echo(prompt.clone());
+    match actor
+        .submit_turn(TurnSubmitParams {
+            session_id: app.session_id.clone(),
+            text: prompt.clone(),
+            attachments: (!attachments.is_empty()).then_some(attachments),
+            mode: Some(SubmitMode::Send),
+        })
+        .await
+    {
+        Ok(res) if res.mode == SubmitMode::Queue => {
+            // 若在空闲判定与投递瞬间已被另一端抢占并转入排队，撤回早先推入的气泡，交由队列展示
+            sync.rollback_user_echo(&prompt);
+            rollback_trailing_user_bubble(app, &prompt);
         }
-        TurnInput::Notice { source, text, .. } => {
-            if !(source.starts_with("subagent:") || source.starts_with("subagent-watchdog:")) {
-                app.push_notice(NoticeLevel::Info, format!("[{source}] {text}"));
-            }
+        Ok(_) => {
+            app.set_busy_state(true);
+        }
+        Err(err) => {
+            sync.rollback_user_echo(&prompt);
+            rollback_trailing_user_bubble(app, &prompt);
+            app.push_notice(NoticeLevel::Error, format!("发送消息失败：{err}"));
         }
     }
-    spawn_agent_run_input(
-        runtime,
-        config,
-        app,
-        active_session,
-        loop_tx,
-        task_state,
-        next_input,
-    );
-    true
 }
 
-/// 执行硬取消：关闭审批浮层、触发 `CancellationToken` 并清理用户输入项（已落箱后台回执转 `Inject` 保留）。
-pub(super) fn cancel_active_run(
-    runtime: &MizarRuntime,
+/// 执行硬取消：关闭审批浮层、中止本地任务并委托 `SessionActor` 取消当前回合。
+pub(super) async fn cancel_active_run_via_actor(
+    actor: &SessionActorHandle,
     app: &mut AppState,
-    active_session: &Session,
     task_state: &mut RunController,
+    sync: &mut TuiActorSync,
 ) {
     app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
     task_state.cancel_active();
-    runtime
-        .agent_loop
-        .inbox()
-        .clear_user_items_and_defer_notices(&active_session.id);
+    sync.clear_user_echoes();
+    let _ = actor.cancel_turn_by(&app.session_id, ResolvedBy::Tui).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_steer_prompt(
-    runtime: &Arc<MizarRuntime>,
+pub(super) async fn handle_steer_prompt_via_actor(
+    actor: &SessionActorHandle,
     config: &TuiConfig,
     app: &mut AppState,
-    active_session: &Arc<Session>,
-    loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
-    task_state: &mut RunController,
+    sync: &mut TuiActorSync,
     prompt: String,
     images: Vec<ImageAttachment>,
 ) {
@@ -320,39 +645,32 @@ pub(super) async fn handle_steer_prompt(
         return;
     }
 
-    let is_active_agent_run = task_state.active_task().is_some_and(|task| {
-        task.kind == ActiveTaskKind::AgentRun && task.session_id == active_session.id
-    });
-
-    if is_active_agent_run {
+    if app.is_busy() {
         app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-        let push_res = steer_session(
-            &runtime.agent_loop,
-            &active_session.id,
-            TurnInput::user_with_images(prompt.clone(), images.clone()),
-        );
-        if push_res.effective_mode == DeliveryMode::Steer {
+    }
+    let attachments = ui_images_to_attachments(&images);
+    match actor
+        .submit_turn(TurnSubmitParams {
+            session_id: app.session_id.clone(),
+            text: prompt.clone(),
+            attachments: (!attachments.is_empty()).then_some(attachments),
+            mode: Some(SubmitMode::Steer),
+        })
+        .await
+    {
+        Ok(res) => {
             app.push_user_message(&prompt);
-            app.set_flash("⚡ 已投递步间插话，将在当前步完成后继续…");
-            return;
+            sync.record_user_echo(prompt);
+            if res.mode == SubmitMode::Steer {
+                app.set_flash("⚡ 已投递步间插话，将在当前步完成后继续…");
+            } else {
+                app.set_busy_state(true);
+            }
         }
-        if push_res.effective_mode == DeliveryMode::FollowUp {
-            app.set_flash("⚡ 已排入下一轮续接…");
-            return;
+        Err(err) => {
+            app.push_notice(NoticeLevel::Error, format!("发送步间插话失败：{err}"));
         }
     }
-
-    app.push_user_message(&prompt);
-    spawn_agent_run(
-        runtime,
-        config,
-        app,
-        active_session,
-        loop_tx,
-        task_state,
-        prompt,
-        images,
-    );
 }
 
 pub(super) fn spawn_local_bash_run(
@@ -610,6 +928,62 @@ pub(super) async fn apply_host_setting_change(
     }
 }
 
+fn format_picker_cwd_tail(raw: Option<&str>) -> String {
+    let Some(cwd) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "-".to_string();
+    };
+    let segs: Vec<&str> = cwd.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    match segs.len() {
+        0 => cwd.to_string(),
+        1 => segs[0].to_string(),
+        n => {
+            let two = format!("{}/{}", segs[n - 2], segs[n - 1]);
+            if two.chars().count() <= 20 {
+                two
+            } else {
+                segs[n - 1].to_string()
+            }
+        }
+    }
+}
+
+fn format_picker_updated_at(ms: u64) -> String {
+    i64::try_from(ms)
+        .ok()
+        .filter(|&v| v > 0)
+        .and_then(DateTime::from_timestamp_millis)
+        .map(|utc| utc.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn build_picker_items_from_list(items: Vec<SessionListItemDto>) -> Vec<SessionPickerItem> {
+    let self_pid = std::process::id();
+    items
+        .into_iter()
+        .filter(|h| h.event_count > 0)
+        .map(|h| {
+            let base_title = h
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("(无标题 #{})", short_id(&h.id)));
+            let title = match h.active_writer_pid {
+                Some(pid) if pid != self_pid => format!("{base_title} [PID {pid} 占用]"),
+                _ => base_title,
+            };
+            SessionPickerItem {
+                title,
+                cwd_tail: format_picker_cwd_tail(h.cwd.as_deref()),
+                event_count: h.event_count,
+                updated_at: format_picker_updated_at(h.updated_at_ms),
+                session_id: h.id,
+            }
+        })
+        .collect()
+}
+
 /// 在已运行的 TUI 状态上切换到指定历史会话（`/resume` 选择器与 `--resume` 共用投影与路由恢复）。
 pub async fn resume_session_into_app(
     runtime: &MizarRuntime,
@@ -619,6 +993,16 @@ pub async fn resume_session_into_app(
     active_sid: &Arc<RwLock<String>>,
     target_id: &str,
 ) -> bool {
+    if let Some(ref run_dir) = config.run_dir
+        && let Err(err) = check_session_writable(run_dir, target_id, std::process::id())
+    {
+        app.push_notice(
+            NoticeLevel::Error,
+            format!("无法恢复会话 `{target_id}`：{err}（单写者锁已拒绝双写）"),
+        );
+        app.set_flash(format!("⚠ 会话被 PID {} 锁定，未切换", err.owner_pid));
+        return false;
+    }
     let Some(next) = runtime.sessions.get(target_id) else {
         app.push_notice(NoticeLevel::Warn, format!("未找到历史会话 `{target_id}`"));
         return false;
@@ -654,18 +1038,94 @@ pub async fn resume_session_into_app(
     true
 }
 
+/// 通过 `SessionActorHandle::switch_session` 执行带单写者锁校验的会话切换，并同步恢复 TUI 投影与模型选择。
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn resume_session_via_actor(
+    actor: &SessionActorHandle,
+    runtime: &MizarRuntime,
+    config: &TuiConfig,
+    app: &mut AppState,
+    active_session: &mut Arc<Session>,
+    sync: &mut TuiActorSync,
+    task_state: &mut RunController,
+    target_id: &str,
+) -> bool {
+    let next = match actor.switch_session(target_id).await {
+        Ok(sess) => sess,
+        Err(ActorError::SessionLocked(err)) => {
+            app.push_notice(
+                NoticeLevel::Error,
+                format!("无法恢复会话 `{target_id}`：{err}（单写者锁已拒绝双写）"),
+            );
+            app.set_flash(format!("⚠ 会话被 PID {} 锁定，未切换", err.owner_pid));
+            return false;
+        }
+        Err(ActorError::SessionNotFound(id)) => {
+            app.push_notice(NoticeLevel::Warn, format!("未找到历史会话 `{id}`"));
+            return false;
+        }
+        Err(err) => {
+            app.push_notice(NoticeLevel::Error, format!("切换会话失败：{err}"));
+            return false;
+        }
+    };
+
+    app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+    task_state.abort_for_session_switch();
+    if app.is_running_activity() {
+        app.set_idle_state();
+    }
+    app.pending_settings_model_pick = None;
+
+    let sources = SelectionSources {
+        model_from_env: config.model_from_env,
+        model_from_settings: config.model_from_settings,
+        reasoning_effort_from_settings: config.reasoning_effort_from_settings,
+        startup: SessionSelection {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort,
+        },
+        session: next.latest_selection().map(to_ui_selection),
+        latest_workspace: None,
+    };
+    if let Some(resolved) = resolve_selection(&sources, true) {
+        app.provider = resolved.provider;
+        app.model = resolved.model;
+        app.reasoning_effort = resolved.reasoning_effort;
+    }
+
+    app.restore_session_view(project_resume_view(&next));
+    *active_session = next;
+    if let Ok(snap) = actor.subscribe_snapshot(&active_session.id, None).await
+        && !snap.queued_inputs.is_empty()
+    {
+        apply_queue_snapshot_to_app(app, snap.queued_inputs);
+    }
+    sync.mark_session_id(active_session.id.clone());
+    sync.sync_config_if_changed(actor, app).await;
+    sync.reset_for_session(active_session, app);
+
+    if app.features.side_panel && app.side_panel.open {
+        populate_side_panel_data(runtime, app).await;
+    }
+    app.set_flash(format!("✓ 已恢复会话 ({})", short_id(target_id)));
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_action(
+    actor: &SessionActorHandle,
     runtime: &Arc<MizarRuntime>,
     config: &TuiConfig,
     app: &mut AppState,
     active_session: &mut Arc<Session>,
     terminal: &mut BufferedTerminal,
     term_stream: &mut Option<EventStream>,
-    active_sid: &Arc<RwLock<String>>,
     loop_tx: &mpsc::UnboundedSender<LoopClientMsg>,
     task_state: &mut RunController,
     panel_ctrl: &mut SidePanelRefreshController,
+    sync: &mut TuiActorSync,
     action: AppAction,
 ) {
     match action {
@@ -690,7 +1150,7 @@ pub(super) async fn handle_action(
             apply_clipboard_content(app, &config.workspace, res).await;
         }
         AppAction::CancelRun => {
-            cancel_active_run(runtime, app, active_session, task_state);
+            cancel_active_run_via_actor(actor, app, task_state, sync).await;
         }
         AppAction::CompactSession(focus) => {
             if app.is_running_activity() {
@@ -747,43 +1207,59 @@ pub(super) async fn handle_action(
                 }
             });
         }
-        AppAction::NewSession => {
-            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-            task_state.abort_for_session_switch();
-            if let Some(sub) = runtime.subagent.as_ref() {
-                sub.cancel_parent_subagents(&active_session.id);
+        AppAction::NewSession => match actor.new_session(None).await {
+            Ok(next) => {
+                app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+                task_state.abort_for_session_switch();
+                if app.is_running_activity() {
+                    app.set_idle_state();
+                }
+                let title = next.header().title;
+                app.reset_for_new_session(next.id.clone(), title);
+                *active_session = next;
+                sync.reset_for_session(active_session, app);
+                schedule_side_panel_refresh(runtime, app, panel_ctrl);
             }
-            runtime.agent_loop.inbox().clear(&active_session.id);
-            if app.is_running_activity() {
-                app.set_idle_state();
+            Err(err) => {
+                app.push_notice(NoticeLevel::Error, format!("开启新会话失败：{err}"));
             }
-            let next = runtime.sessions.create(None);
-            let title = next.header().title;
-            *active_sid.write().unwrap() = next.id.clone();
-            app.reset_for_new_session(next.id.clone(), title);
-            *active_session = next;
-            schedule_side_panel_refresh(runtime, app, panel_ctrl);
-        }
+        },
         AppAction::OpenSessionPicker => {
-            let items = collect_session_picker_items(&runtime.sessions);
-            if items.is_empty() {
-                app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
-            } else {
-                app.overlay.open_session_picker(items);
+            match actor
+                .list_sessions(SessionListParams {
+                    cwd: None,
+                    query: None,
+                    limit: Some(100),
+                    cursor: None,
+                    exclude_subagents: Some(true),
+                })
+                .await
+            {
+                Ok(res) => {
+                    let items = build_picker_items_from_list(res.sessions);
+                    if items.is_empty() {
+                        app.push_notice(NoticeLevel::Info, "暂无可恢复的历史会话");
+                    } else {
+                        app.overlay.open_session_picker(items);
+                    }
+                }
+                Err(err) => {
+                    app.push_notice(NoticeLevel::Error, format!("读取历史会话列表失败：{err}"));
+                }
             }
         }
         AppAction::ResumeSession(target_id) => {
-            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-            task_state.abort_for_session_switch();
-            if let Some(sub) = runtime.subagent.as_ref() {
-                sub.cancel_parent_subagents(&active_session.id);
-            }
-            runtime.agent_loop.inbox().clear(&active_session.id);
-            if app.is_running_activity() {
-                app.set_idle_state();
-            }
-            if resume_session_into_app(runtime, config, app, active_session, active_sid, &target_id)
-                .await
+            if resume_session_via_actor(
+                actor,
+                runtime,
+                config,
+                app,
+                active_session,
+                sync,
+                task_state,
+                &target_id,
+            )
+            .await
             {
                 schedule_side_panel_refresh(runtime, app, panel_ctrl);
             }
@@ -856,16 +1332,7 @@ pub(super) async fn handle_action(
                 app.reject_unsupported_images_notice();
                 return;
             }
-            spawn_agent_run(
-                runtime,
-                config,
-                app,
-                active_session,
-                loop_tx,
-                task_state,
-                prompt,
-                Vec::new(),
-            );
+            submit_turn_via_actor(actor, app, sync, prompt, Vec::new()).await;
         }
         AppAction::SubmitPromptWithImages { text, images } => {
             if !app.active_model_supports_images() {
@@ -873,42 +1340,13 @@ pub(super) async fn handle_action(
                 app.reject_unsupported_images_notice();
                 return;
             }
-            spawn_agent_run(
-                runtime,
-                config,
-                app,
-                active_session,
-                loop_tx,
-                task_state,
-                text,
-                images,
-            );
+            submit_turn_via_actor(actor, app, sync, text, images).await;
         }
         AppAction::SteerPrompt(prompt) => {
-            handle_steer_prompt(
-                runtime,
-                config,
-                app,
-                active_session,
-                loop_tx,
-                task_state,
-                prompt,
-                Vec::new(),
-            )
-            .await;
+            handle_steer_prompt_via_actor(actor, config, app, sync, prompt, Vec::new()).await;
         }
         AppAction::SteerPromptWithImages { text, images } => {
-            handle_steer_prompt(
-                runtime,
-                config,
-                app,
-                active_session,
-                loop_tx,
-                task_state,
-                text,
-                images,
-            )
-            .await;
+            handle_steer_prompt_via_actor(actor, config, app, sync, text, images).await;
         }
         AppAction::RunLocalBash {
             command,
@@ -1077,7 +1515,7 @@ pub(super) async fn handle_action(
         }
         AppAction::ShowInstructions => {
             if let Some(inst) = runtime.instructions.as_ref() {
-                let report = inst.probe_report(Some(&app.session_id));
+                let report = inst.report();
                 if !report.enabled {
                     app.push_notice(
                         NoticeLevel::Info,
@@ -1195,9 +1633,12 @@ pub(super) async fn handle_action(
                 .and_then(|traj| traj.inspect(&app.session_id, mode));
             app.open_trajectory_with_report(report);
         }
-        AppAction::OpenSessionTree => {
-            app.open_session_tree_with(project_session_tree(active_session));
-        }
+        AppAction::OpenSessionTree => match actor.session_tree(&app.session_id).await {
+            Ok(res) => app.open_session_tree_with(res.entries),
+            Err(err) => {
+                app.push_notice(NoticeLevel::Error, format!("读取会话树失败：{err}"));
+            }
+        },
         AppAction::OpenSettings(initial_query) => {
             app.pending_settings_model_pick = None;
             let items = super::build_settings_entries(runtime, app);
@@ -1261,26 +1702,29 @@ pub(super) async fn handle_action(
             }
         }
         AppAction::ForkSessionAtSeq(target_seq) => {
-            app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
-            task_state.abort_for_session_switch();
-            if let Some(sub) = runtime.subagent.as_ref() {
-                sub.cancel_parent_subagents(&active_session.id);
-            }
-            runtime.agent_loop.inbox().clear(&active_session.id);
-            if app.is_running_activity() {
-                app.set_idle_state();
-            }
-            match runtime.sessions.fork(
-                &app.session_id,
-                target_seq,
-                SessionCreateOptions::default(),
-            ) {
-                Ok(next) => {
-                    *active_sid.write().unwrap() = next.id.clone();
-                    app.restore_session_view(project_fork_view(&next, target_seq));
-                    *active_session = next;
-                    schedule_side_panel_refresh(runtime, app, panel_ctrl);
-                }
+            match actor
+                .fork_session(SessionForkParams {
+                    session_id: app.session_id.clone(),
+                    at_seq: target_seq,
+                })
+                .await
+            {
+                Ok(forked) => match actor.switch_session(&forked.session.id).await {
+                    Ok(next) => {
+                        app.overlay.resolve_all_approvals(ApprovalDecision::Deny);
+                        task_state.abort_for_session_switch();
+                        if app.is_running_activity() {
+                            app.set_idle_state();
+                        }
+                        app.restore_session_view(project_fork_view(&next, target_seq));
+                        *active_session = next;
+                        sync.reset_for_session(active_session, app);
+                        schedule_side_panel_refresh(runtime, app, panel_ctrl);
+                    }
+                    Err(err) => {
+                        app.push_notice(NoticeLevel::Error, format!("切换分叉会话失败：{err}"));
+                    }
+                },
                 Err(err) => {
                     app.push_notice(NoticeLevel::Error, format!("分叉会话失败：{err}"));
                 }

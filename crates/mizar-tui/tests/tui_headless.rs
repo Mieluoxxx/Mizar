@@ -371,6 +371,8 @@ async fn supports_session_tree_fork_approval_reason_skill_picker_and_sparklines(
     // 2. 审批弹窗 `[r]` 附加拒绝理由并回传
     let (tx, rx) = futures::channel::oneshot::channel();
     state.apply_ui_event(UiEvent::ApprovalRequested {
+        request_id: "req-headless-1".into(),
+        call_id: Some("call-headless-1".into()),
         tool_name: "bash".into(),
         args_preview: "{\"command\":\"rm -rf tmp\"}".into(),
         responder: Arc::new(std::sync::Mutex::new(Some(tx))),
@@ -1480,5 +1482,331 @@ async fn e2e_session_title_generation_sqlite_persistence_rename_and_resume_picke
     assert_eq!(reloaded.header().title_source, Some(TitleSource::Manual));
 
     ctx_restarted.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn tui_runtime_with_trace_jsonl_streams_complete_trace_events() {
+    use futures::stream;
+    use mizar_core::trajectory::{TraceEventKind, TrajectoryRuntime};
+    use mizar_tui::exec::configure_spine_trace_jsonl;
+
+    struct StaticReplyAdapter;
+
+    impl LlmAdapter for StaticReplyAdapter {
+        fn stream(&self, _options: GenerateOptions) -> BoxChunkStream {
+            let chunks = vec![
+                Ok(StreamChunk::text("TUI_TRACE_JSONL_OK")),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::Stop,
+                    replay: None,
+                }),
+            ];
+            Box::pin(stream::iter(chunks))
+        }
+    }
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!(
+        "mizar_tui_trace_jsonl_{}_{}",
+        std::process::id(),
+        uniq
+    ));
+    let ws = tmp.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let jsonl_path = tmp.join("out/tui-session.jsonl");
+
+    let mut spine_cfg =
+        AgentSpineConfig::coding(&ws).with_disabled_plugins(["session-title", "trajectory"]);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = spine_cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    configure_spine_trace_jsonl(&mut spine_cfg, Some(&jsonl_path));
+
+    let runtime = MizarRuntime::build(spine_cfg).await.unwrap();
+    runtime
+        .register_adapter("static-tui", Arc::new(StaticReplyAdapter))
+        .unwrap();
+
+    let session = runtime.sessions.create(None);
+    let reply = runtime
+        .agent_loop
+        .run_with_options(
+            Arc::clone(&session),
+            "hello tui trace",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("static-tui".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "TUI_TRACE_JSONL_OK");
+
+    let raw = std::fs::read_to_string(&jsonl_path).expect("TUI trace JSONL must be written");
+    let events = TrajectoryRuntime::parse_jsonl(&raw).expect("TUI trace JSONL must parse cleanly");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::UserMessage { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnStart { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepStart { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::FirstToken { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::AssistantMessage { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::StepEnd { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceEventKind::TurnEnd { .. }))
+    );
+
+    let expected = runtime
+        .trajectory
+        .as_ref()
+        .unwrap()
+        .export_jsonl(&session.id)
+        .unwrap();
+    assert_eq!(raw, expected);
+
+    runtime.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn subagent_yield_renders_assistant_message_persists_resume_and_delivers_batched_wake() {
+    use futures::StreamExt;
+    use mizar_llm::{ContentBlock, RequestOrigin, ToolCall};
+    use serde_json::json;
+
+    const YIELD_MSG: &str = "正在后台分析模块 A 与模块 B，请稍候。";
+
+    struct YieldTuiAdapter {
+        parent_calls: std::sync::atomic::AtomicUsize,
+        child_gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl LlmAdapter for YieldTuiAdapter {
+        fn stream(&self, options: GenerateOptions) -> BoxChunkStream {
+            let finish = |reason| StreamChunk::Finish {
+                reason,
+                replay: None,
+            };
+            if options.origin == RequestOrigin::Subagent {
+                let gate = Arc::clone(&self.child_gate);
+                return Box::pin(
+                    futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok(StreamChunk::text("TUI_CHILD_REPORT"))
+                    })
+                    .chain(futures::stream::iter([Ok(finish(FinishReason::Stop))])),
+                );
+            }
+            let call_n = self
+                .parent_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let chunks = if call_n == 0 {
+                vec![
+                    StreamChunk::tool_call(
+                        0,
+                        ToolCall {
+                            id: "sp_1".into(),
+                            name: "subagent".into(),
+                            arguments: json!({"name": "tui-scout", "prompt": "inspect A"})
+                                .to_string(),
+                        },
+                    ),
+                    StreamChunk::tool_call(
+                        1,
+                        ToolCall {
+                            id: "yd_1".into(),
+                            name: "subagent".into(),
+                            arguments: json!({"action": "yield", "message": YIELD_MSG}).to_string(),
+                        },
+                    ),
+                    finish(FinishReason::ToolCalls),
+                ]
+            } else {
+                let saw_child = options
+                    .messages
+                    .iter()
+                    .any(|m| m.text_content().contains("TUI_CHILD_REPORT"));
+                let reply = if saw_child {
+                    "已汇总 TUI 子代理发现。"
+                } else {
+                    "MISSING_CHILD_REPORT"
+                };
+                vec![StreamChunk::text(reply), finish(FinishReason::Stop)]
+            };
+            Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)))
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "mizar_tui_subagent_yield_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let ws = tmp.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let mut spine_cfg = AgentSpineConfig::coding(&ws).with_disabled_plugins(["session-title"]);
+    if let AgentToolsMode::Coding {
+        ref mut mcp,
+        ref mut skills,
+        ref mut instructions,
+        ..
+    } = spine_cfg.tools_mode
+    {
+        mcp.load_config_files = false;
+        skills.include_default_roots = false;
+        instructions.include_default_global = false;
+    }
+    let runtime = MizarRuntime::build(spine_cfg).await.unwrap();
+    let child_gate = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .register_adapter(
+            "yield-tui",
+            Arc::new(YieldTuiAdapter {
+                parent_calls: std::sync::atomic::AtomicUsize::new(0),
+                child_gate: Arc::clone(&child_gate),
+            }),
+        )
+        .unwrap();
+
+    let session = runtime.sessions.create_with(SessionCreateOptions {
+        cwd: Some(ws.display().to_string()),
+        ..Default::default()
+    });
+    let active_sid = Arc::new(RwLock::new(session.id.clone()));
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+    let _handles = subscribe_session_events(&runtime, Arc::clone(&active_sid), ui_tx.clone());
+    let mut wake_rx = runtime.agent_loop.inbox().subscribe_wake();
+
+    let mut state = AppState::new(
+        ws.clone(),
+        &session.id,
+        Vec::new(),
+        Some("yield-tui".into()),
+        Some("m1".into()),
+        None,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+
+    state.items.push(ChatItem::User {
+        text: "调研项目".into(),
+    });
+    let reply1 = runtime
+        .agent_loop
+        .run_with_options(
+            Arc::clone(&session),
+            "调研项目",
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("yield-tui".into()),
+                model: Some("m1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply1, YIELD_MSG);
+    let _ = ui_tx.send(UiEvent::RunFinished(Ok(reply1)));
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    while let Ok(ev) = ui_rx.try_recv() {
+        state.apply_ui_event(ev);
+    }
+
+    // 1. 实时 TUI 必须将 yield message 作为正式 Assistant 气泡渲染，而非仅藏在 ToolResult
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|item| matches!(item, ChatItem::Assistant { text, .. } if text == YIELD_MSG)),
+        "expected ChatItem::Assistant with yield message, items={:?}",
+        state.items
+    );
+    terminal.draw(|f| render(f, &mut state)).unwrap();
+    let screen = buffer_text(terminal.backend());
+    assert!(screen.contains(YIELD_MSG), "screen:\n{screen}");
+
+    // 2. --resume 投影必须保留 yield assistant 消息
+    let resume_view = project_resume_view(&session);
+    assert!(
+        resume_view.items.iter().any(|item| matches!(
+            item,
+            SessionReplayItem::Assistant { blocks }
+            if blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == YIELD_MSG))
+        )),
+        "resume view missing yield assistant message: {:?}",
+        resume_view.items
+    );
+
+    // 3. 放行子代理后，wake_rx 收到唤醒并由 FollowUp 驱动第二轮合成回复
+    child_gate.notify_one();
+    let woken_sid = tokio::time::timeout(Duration::from_secs(5), wake_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(woken_sid, session.id);
+
+    let followup = runtime
+        .agent_loop
+        .inbox()
+        .pop_followup(&session.id)
+        .expect("follow-up must arrive after child settles");
+    let reply2 = runtime
+        .agent_loop
+        .run_with_options(
+            Arc::clone(&session),
+            followup,
+            CancellationToken::new(),
+            RunOptions {
+                provider: Some("yield-tui".into()),
+                model: Some("m1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply2, "已汇总 TUI 子代理发现。");
+
+    runtime.shutdown().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }

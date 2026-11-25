@@ -16,8 +16,8 @@ pub use crate::compaction::{
     CompactionTrigger, ContextPressureReport, ManualCompactOptions, strip_summary_wrapper,
 };
 pub use crate::instructions::{
-    AGENT_INSTRUCTIONS_SOURCE, AgentInstructions, InstructionScopeKind, InstructionScopeStatus,
-    InstructionsConfig, SessionInstructionsReport,
+    AgentInstructions, InstructionScopeKind, InstructionScopeStatus, InstructionsConfig,
+    SessionInstructionsReport,
 };
 pub use crate::session_title::{
     DEFAULT_REFRESH_INTERVAL_TURNS, ParsedModelTitle, SessionTitleConfig, SessionTitleError,
@@ -25,21 +25,21 @@ pub use crate::session_title::{
     parse_model_title_output,
 };
 pub use crate::subagent::{
-    DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_MAX_STEPS_CAP,
-    DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS, DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS,
-    DEFAULT_SUBAGENT_TIMEOUT_SECS, SUBAGENT_TOOL_NAME, SubagentConfig, SubagentError, SubagentMode,
-    SubagentRunStatus, SubagentRuntime, SubagentStateEvent, SubagentTaskSnapshot,
+    DEFAULT_SUBAGENT_EDIT_SOFT_BUDGET, DEFAULT_SUBAGENT_MAX_CONCURRENT,
+    DEFAULT_SUBAGENT_MAX_WATCHDOG_ALERTS, DEFAULT_SUBAGENT_READ_ONLY_SOFT_BUDGET,
+    DEFAULT_SUBAGENT_STALL_TIMEOUT_SECS, DEFAULT_SUBAGENT_TIMEOUT_SECS, SUBAGENT_TOOL_NAME,
+    SubagentConfig, SubagentError, SubagentMode, SubagentRunStatus, SubagentRuntime,
+    SubagentStateEvent, SubagentTaskSnapshot,
 };
 pub use config::{
     CONFIG_DIR_NAME, CliLlmOverride, CodemodeSettings, CompactionSettings, EnvLlmOverride,
-    EnvProviderKind, InstructionsSettings, LlmRouteError, LoadedMizarConfig, RecallSettings,
-    ResolvedLlmRouter, SessionTitleSettings, SettingsConfig, SkillsSettings, ToolSearchSettings,
-    UiSettings, load_mizar_config, load_mizar_config_isolated, load_mizar_config_with_global,
+    EnvProviderKind, InstructionsSettings, LlmRouteError, LoadedMizarConfig, ResolvedLlmRouter,
+    SessionTitleSettings, SettingsConfig, SkillsSettings, ToolSearchSettings, UiSettings,
+    load_mizar_config, load_mizar_config_isolated, load_mizar_config_with_global,
     normalize_disabled_plugins, normalize_session_title_thinking_level, patch_settings_file,
     persist_disabled_plugins, resolve_default_session_db_path, resolve_global_config_dir,
     resolve_global_settings_path, resolve_project_config_dir,
 };
-pub use mizar_session::recall::{RECALL_TOOL_NAME, RecallConfig, register_recall_tool};
 pub use plugins::{
     KNOWN_HOST_EXTENSION_IDS, SpineModuleStatus, SpinePluginError, SpinePlugins,
     is_protected_module_id,
@@ -125,8 +125,6 @@ pub struct AgentSpineConfig {
     pub repeat_guard: Option<RepeatGuardConfig>,
     /// 是否启用上下文压缩与压后工具守卫服务（默认开启）。
     pub compaction: Option<CompactionConfig>,
-    /// 是否启用无损情景回溯工具（静态常驻 `recall`，默认开启）。
-    pub recall: Option<RecallConfig>,
     /// 是否启用基于对话主题的会话标题自动生成服务（默认关闭，由交互式 TUI 按需开启）。
     pub session_title: Option<SessionTitleConfig>,
     /// 是否启用 UNIX 式单层 Subagent 调度工具（默认开启）。
@@ -149,7 +147,6 @@ impl AgentSpineConfig {
             trajectory: Some(TrajectoryConfig::default()),
             repeat_guard: Some(RepeatGuardConfig::default()),
             compaction: Some(CompactionConfig::default()),
-            recall: Some(RecallConfig::default()),
             session_title: None,
             subagent: Some(SubagentConfig::default()),
             session_db_path: None,
@@ -178,7 +175,6 @@ impl AgentSpineConfig {
             trajectory: Some(TrajectoryConfig::default()),
             repeat_guard: Some(RepeatGuardConfig::default()),
             compaction: Some(CompactionConfig::default()),
-            recall: Some(RecallConfig::default()),
             session_title: None,
             subagent: Some(SubagentConfig::default()),
             session_db_path: None,
@@ -324,14 +320,6 @@ impl MizarRuntime {
                 "自动发现并注入 AGENTS.md / CLAUDE.md 指令规范",
             );
         }
-        if config.recall.is_some() {
-            push_meta(
-                &mut metas,
-                "recall",
-                "情景记忆回溯",
-                "静态常驻的历史会话检索与回溯工具 (recall)",
-            );
-        }
         if config.session_title.is_some() {
             push_meta(
                 &mut metas,
@@ -368,9 +356,9 @@ impl MizarRuntime {
         let prepared = PreparedToggles::prepare(metas, config.disabled_plugins);
         let mut guards: Vec<HookGuard> = Vec::new();
 
-        // 6. 在 `instructions` / `skills` / `recall` 之前装配 `compaction`：
+        // 6. 在 `instructions` / `skills` 之前装配 `compaction`：
         // 使同一次 `pre_step` 中先完成压缩推进 `compacted_up_to_seq`，
-        // 随后指令、技能与回溯工具立即可见新压缩边界并当步完成重注/激活。
+        // 随后指令与技能立即可见新压缩边界并当步完成重注/激活。
         let compaction = if let Some(compaction_cfg) = config.compaction {
             let (rt, guard) = CompactionRuntime::install(
                 Arc::clone(&llm),
@@ -450,21 +438,13 @@ impl MizarRuntime {
                 );
                 skills = Some(skill_reg);
 
-                let (instr_rt, instr_guard) =
-                    AgentInstructions::install(&tools, &agent_loop, instr_cfg);
+                let (instr_rt, instr_guard) = AgentInstructions::install(&system_prompt, instr_cfg);
                 guards.push(instr_guard);
                 instructions = Some(instr_rt);
             }
         }
 
-        // 8. 情景回溯工具
-        if let Some(recall_cfg) = config.recall
-            && let Some(guard) = register_recall_tool(&tools, Arc::clone(&sessions), recall_cfg)?
-        {
-            guards.push(guard);
-        }
-
-        // 9. 会话标题自动生成
+        // 8. 会话标题自动生成
         let session_title = if let Some(st_cfg) = config.session_title {
             let (rt, guard) = SessionTitleRuntime::install(Arc::clone(&llm), &agent_loop, st_cfg);
             guards.push(guard);

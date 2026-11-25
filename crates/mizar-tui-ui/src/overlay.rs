@@ -318,6 +318,18 @@ impl OverlayState {
         }
     }
 
+    /// 静默关闭指定 `request_id` 对应的激活或排队审批弹窗（用于异源已抢占裁决时的 UI 同步）。
+    ///
+    /// 返回 `true` 表示关闭的是当前正处于激活状态的审批弹窗（调用方应尝试提升队列下一项或恢复状态指示）。
+    pub fn dismiss_approval(&mut self, request_id: &str) -> bool {
+        if matches!(&self.active, Some(OverlayKind::Approval(ap)) if ap.request_id == request_id) {
+            self.active = None;
+            return true;
+        }
+        self.approval_queue.retain(|ap| ap.request_id != request_id);
+        false
+    }
+
     pub fn open_model_picker(&mut self, providers: &[ProviderInfo], current_model: Option<&str>) {
         self.open_model_picker_with_follow(providers, current_model, false);
     }
@@ -498,11 +510,15 @@ impl OverlayState {
     /// 返回 `true` 表示该审批立即成为当前活动弹窗；返回 `false` 表示已排队等待当前浮层关闭。
     pub fn open_approval(
         &mut self,
+        request_id: String,
+        call_id: Option<String>,
         tool_name: String,
         args_preview: String,
         responder: oneshot::Sender<ApprovalDecision>,
     ) -> bool {
         let req = PendingApproval {
+            request_id,
+            call_id,
             tool_name,
             args_preview,
             editing_reason: false,

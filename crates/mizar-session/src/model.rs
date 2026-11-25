@@ -25,6 +25,18 @@ pub enum TraceSeverity {
     Error,
 }
 
+/// 轮次结束时的纯规则汇总指标（零模型调用生成，仅用于轨迹诊断与多端概览）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEndSummary {
+    pub duration_ms: u64,
+    pub files_changed: Vec<String>,
+    pub commands_run: u32,
+    pub tool_errors: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+}
+
 /// 仅用于轨迹回放与诊断审计的边界事件（不直接发给 LLM）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -35,6 +47,10 @@ pub enum SessionTraceEvent {
     TurnEnd {
         turn: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<TurnEndSummary>,
     },
     StepStart {
         turn: u64,
@@ -54,6 +70,8 @@ pub enum SessionTraceEvent {
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     ToolCall {
         turn: u64,
@@ -99,6 +117,18 @@ pub enum SessionTraceEvent {
         severity: TraceSeverity,
         text: String,
     },
+    /// 工具结果裁剪标记（`LogOnly`）：投影层按 `target_seq -> notice` 替换对应 `ToolResult` 正文，不修改原始事件。
+    ToolResultPrune {
+        target_seq: u64,
+        notice: String,
+    },
+    /// 工具交互审批审计记录（`LogOnly`）。
+    Approval {
+        tool_call_id: String,
+        tool: String,
+        decision: String,
+        resolved_by: String,
+    },
 }
 
 impl SessionTraceEvent {
@@ -115,6 +145,8 @@ impl SessionTraceEvent {
             Self::CompactionStart { .. } => "compaction-start",
             Self::CompactionEnd { .. } => "compaction-end",
             Self::TurnNotice { .. } => "turn-notice",
+            Self::ToolResultPrune { .. } => "tool-result-prune",
+            Self::Approval { .. } => "approval",
         }
     }
 }
@@ -176,6 +208,8 @@ pub enum SessionEvent {
         name: String,
         content: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     /// 上下文压缩节点：将 `seq < first_kept_seq` 的表面历史折叠为摘要，原始事件仍保留在持久日志中。
     Compaction {
@@ -509,32 +543,6 @@ pub struct SessionListQuery {
     pub limit: Option<usize>,
     /// 排除子代理派生会话（按 `SessionHeader::is_subagent_child` 判定），保留根会话与用户 Fork 分支。
     pub exclude_subagents: bool,
-}
-
-/// 面向情景回溯（`recall`）的持久化层检索参数。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RecallSearchQuery {
-    pub query: String,
-    /// 限定搜索的会话 ID 列表；为空时结合 `cwd` 搜索工作区会话。
-    #[serde(default)]
-    pub session_ids: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    pub limit: usize,
-}
-
-/// 单条情景回溯命中结果（带会话来源与 `seq` 锚点）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RecallSearchHit {
-    pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_title: Option<String>,
-    pub seq: u64,
-    pub ts: u128,
-    pub kind: String,
-    pub snippet: String,
 }
 
 #[derive(Debug, Clone)]

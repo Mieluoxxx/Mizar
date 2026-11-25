@@ -77,7 +77,11 @@ For CI, automation scripts, or benchmark evaluations, run a single non-interacti
 
 ```bash title="Headless execution, isolated mode, and trace export"
 # Isolated single-shot run (skips personal ~/.mizar, ~/.agents, MCP, Skills, global rules, and global SQLite)
-mizar exec --isolated -C /path/to/repo --output-format json --trace-out /tmp/trace.json "Fix the failing test and report"
+# Export both exit summary JSON (--trace-out) and streaming JSONL event log (--trace-jsonl)
+mizar exec --isolated -C /path/to/repo --output-format json --trace-out /tmp/trace.json --trace-jsonl /tmp/trace.jsonl "Fix the failing test and report"
+
+# Interactive TUI also supports streaming TraceEvent logs via --trace-jsonl / MIZAR_TRACE_JSONL
+mizar --trace-jsonl /tmp/tui-trace.jsonl
 
 # Read task prompt from stdin
 echo "Summarize README.md" | mizar exec --read-only
@@ -92,6 +96,7 @@ echo "Summarize README.md" | mizar exec --read-only
 | `--reasoning-effort <LVL>` / `--max-steps <N>` / `--max-tokens <N>` / `--timeout <SECS>` | Override reasoning effort, step cap, per-call output token cap, and total execution timeout |
 | `--output-format <FMT>` / `--json` | Choose output format (`text` or structured `json`) |
 | `--trace-out <PATH>` | Export structured trajectory JSON before exiting (falls back to `MIZAR_TRACE_OUT`; CLI takes precedence) |
+| `--trace-jsonl <PATH>` | Stream each `TraceEvent` incrementally in append mode to a JSONL trajectory log (works in both TUI and headless modes; falls back to `MIZAR_TRACE_JSONL`; auto-creates parent dirs, overrides `"trajectory"` in `disabledPlugins`, and composes with `--trace-out`) |
 
 ## Self-Update
 

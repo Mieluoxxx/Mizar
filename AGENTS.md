@@ -123,13 +123,13 @@ Verified:
 | 想做什么 | 看 |
 | :--- | :--- |
 | 整体架构 | `docs/plugins.md` |
-| 跨端纯契约、算法与强类型钩子 | `crates/mizar-types/src/{lib,hooks,client,llm,trajectory}.rs`（`HookGuard`、`SyncEventBus`、`WaterfallHook`、`SerialHook`、`HostExtensionFlags`、`ClientEvent`） |
-| 跨端宿主运行时 | `crates/mizar-client/src/lib.rs`（`install_file_mentions`、`install_approval_gate`、`events`、`settings`、`session_view`、`workspace`） |
+| 跨端纯契约、算法与强类型钩子 | `crates/mizar-types/src/{lib,hooks,client,llm,trajectory,rpc}.rs`（`HookGuard`、`SyncEventBus`、`WaterfallHook`、`SerialHook`、`HostExtensionFlags`、`ClientEvent`、JSON-RPC 2.0 契约） |
+| 跨端宿主运行时 | `crates/mizar-client/src/lib.rs`（`SessionActor`/`SessionActorHandle`、`PendingInteractions`、`run_dir`、`rpc_server`、`install_file_mentions`、`install_approval_gate`、`events`、`settings`、`session_view`、`workspace`） |
 | 加工具 | `crates/mizar-tools/src/{lib,coding,search}.rs` |
 | 加 LLM 协议适配器 / 路由 | `crates/mizar-llm/src/{lib,runtime,http,completions,messages,responses,router,retry,mock}.rs` |
-| 会话日志 / SQLite / Recall | `crates/mizar-session/src/{lib,model,persistence,sqlite,recall}.rs` |
+| 会话日志 / SQLite | `crates/mizar-session/src/{lib,model,persistence,sqlite}.rs` |
 | 主循环与 Agent 领域核 | `crates/mizar-core/src/{lib,agent_loop,system_prompt,compaction,instructions,skills,trajectory,session_title,subagent}.rs` |
 | UI 渲染与状态机 | `crates/mizar-tui-ui/src/`（`ui.rs`、`markdown.rs`、`features.rs`、`app.rs`、`app/{cache,events,input}.rs`） |
-| TUI 宿主循环与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
+| TUI 宿主循环、`rpc`/`serve` 入口与 CLI 参数 | `crates/mizar-tui/src/runner.rs`、`runner/{terminal_io,actions}.rs`、`crates/mizar-tui/src/{rpc_host,serve}.rs`；CLI 参数表见 `crates/mizar-tui/src/main.rs` 顶部 `//!` |
 | 静态组合根与扩展 ID | `crates/mizar-core/src/spine.rs`（`MizarRuntime::build`）与 `crates/mizar-core/src/spine/plugins.rs`（`SpinePlugins`、`KNOWN_HOST_EXTENSION_IDS`、`build_tools_guide_section`） |
 | 配置字段 | `crates/mizar-core/src/spine/config.rs`、`config/{settings,route}.rs` + `docs/plugins.md` 第七节 |

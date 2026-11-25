@@ -67,6 +67,8 @@ pub enum ApprovalDecision {
 
 #[derive(Debug)]
 pub struct PendingApproval {
+    pub request_id: String,
+    pub call_id: Option<String>,
     pub tool_name: String,
     pub args_preview: String,
     pub editing_reason: bool,
@@ -198,6 +200,8 @@ pub enum SessionReplayItem {
         tool_call_id: String,
         content: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
     },
     BashExecution {
         command: String,
@@ -508,9 +512,21 @@ pub enum ClientEvent {
         output: Result<LocalBashOutput, String>,
     },
     ApprovalRequested {
+        request_id: String,
+        call_id: Option<String>,
         tool_name: String,
         args_preview: String,
         responder: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
+    },
+    ApprovalResolved {
+        request_id: String,
+    },
+    SessionSwitched {
+        old_session_id: String,
+        new_session_id: String,
+    },
+    QueueUpdated {
+        items: Vec<crate::rpc::QueuedInputDto>,
     },
     CompactionStarted {
         trigger: String,
@@ -603,6 +619,35 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SessionViewData>(&view_json).unwrap(),
             view
+        );
+
+        // 旧版 SessionReplayItem::ToolResult 无 meta 字段应向后兼容反序列化，None 时不输出 meta 键
+        let legacy_tool_result: SessionReplayItem = serde_json::from_str(
+            r#"{"ToolResult":{"tool_call_id":"c1","content":"ok","is_error":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_tool_result,
+            SessionReplayItem::ToolResult {
+                tool_call_id: "c1".into(),
+                content: "ok".into(),
+                is_error: false,
+                meta: None,
+            }
+        );
+        let serialized_legacy = serde_json::to_string(&legacy_tool_result).unwrap();
+        assert!(!serialized_legacy.contains(r#""meta""#));
+
+        let with_meta = SessionReplayItem::ToolResult {
+            tool_call_id: "c2".into(),
+            content: "patched".into(),
+            is_error: false,
+            meta: Some(serde_json::json!({"kind": "diff", "added": 2, "removed": 1})),
+        };
+        let meta_json = serde_json::to_string(&with_meta).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SessionReplayItem>(&meta_json).unwrap(),
+            with_meta
         );
     }
 }

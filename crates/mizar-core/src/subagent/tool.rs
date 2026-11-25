@@ -1,4 +1,4 @@
-//! `subagent` 工具定义与 4 动作分发实现（`spawn` / `send` / `status` / `stop`）。
+//! `subagent` 工具定义与动作分发（`spawn` / `send` / `status` / `stop` / `yield`）。
 
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ enum SubagentAction {
     Send,
     Status,
     Stop,
+    Yield,
 }
 
 impl SubagentAction {
@@ -37,6 +38,7 @@ impl SubagentAction {
             "send" => Ok(Self::Send),
             "status" => Ok(Self::Status),
             "stop" => Ok(Self::Stop),
+            "yield" => Ok(Self::Yield),
             other => Err(SubagentError::InvalidAction(other.to_string())),
         }
     }
@@ -48,15 +50,20 @@ pub(crate) fn build_subagent_tool_definition(runtime: Arc<SubagentRuntime>) -> T
         "Delegate a focused, single-layer child agent task or follow up on running/settled subagents. \
 Use action=\"spawn\" (default) with `prompt` to launch a background subagent (`read_only` default or `edit`). \
 Use action=\"send\" with `name` and `prompt` to steer a running subagent or wake a settled subagent to continue with its existing session memory. \
-Use action=\"status\" (optional `name`) to inspect real-time progress (step, tool, idle_secs) and summaries, or action=\"stop\" (`name` or \"all\") to cancel.",
+Use action=\"status\" (optional `name`) for requested progress checks or watchdog alerts, or action=\"stop\" (`name` or \"all\") to cancel. \
+Use action=\"yield\" with `message` when the next useful step needs a subagent result. It ends your turn without waiting or stopping the children; results arrive as follow-ups.",
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["spawn", "send", "status", "stop"],
+                    "enum": ["spawn", "send", "status", "stop", "yield"],
                     "default": "spawn",
-                    "description": "Operation to perform: \"spawn\" (default), \"send\", \"status\", or \"stop\"."
+                    "description": "Operation to perform: spawn (default), send, status, stop, or yield."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Brief user-facing progress message explaining what is pending (required for yield)."
                 },
                 "prompt": {
                     "type": "string",
@@ -93,7 +100,7 @@ Use action=\"status\" (optional `name`) to inspect real-time progress (step, too
         open_world: false,
     })
     .with_prompt_snippet(
-        "Delegate or follow up with isolated single-layer child agent sessions (`spawn` default, `send`, `status`, `stop`)",
+        "Delegate or follow up with isolated single-layer child agent sessions (`spawn` default, `send`, `status`, `stop`, `yield`)",
     )
 }
 
@@ -121,6 +128,40 @@ impl SubagentRuntime {
         )?;
 
         match action {
+            SubagentAction::Yield => {
+                let parent_id = parent_session_id.ok_or(SubagentError::MissingParentSession)?;
+                let message = parse_optional_trimmed_string(&args, "message", || {
+                    SubagentError::InvalidYieldMessageType
+                })?
+                .ok_or(SubagentError::MissingYieldMessage)?;
+                let inbox = self.agent_loop.inbox();
+                let (running, has_followup) = {
+                    let reg = self.tasks.lock().unwrap();
+                    let running = reg.running_count(&parent_id);
+                    let has_followup = if running > 0 {
+                        inbox.arm_yield_barrier(&parent_id);
+                        true
+                    } else {
+                        inbox.has_deliverable_followup(&parent_id)
+                    };
+                    (running, has_followup)
+                };
+                if running == 0 && !has_followup {
+                    return Ok(ToolOutput::text(
+                        "No background subagents are currently running and no pending follow-up results are queued. Answer the user directly instead of calling yield.",
+                    )
+                    .with_details(json!({
+                        "action": "yield",
+                        "yielded": false,
+                        "running": 0,
+                    })));
+                }
+                Ok(ToolOutput::end_turn(message).with_details(json!({
+                    "action": "yield",
+                    "yielded": true,
+                    "running": running,
+                })))
+            }
             SubagentAction::Status => {
                 Ok(self
                     .execute_status_action(parent_session_id.as_deref(), requested_name.as_deref()))
@@ -148,9 +189,9 @@ impl SubagentRuntime {
             return ToolOutput::text("No parent session context; no background subagents.")
                 .with_details(json!({ "action": "status", "running": 0, "tasks": [] }));
         };
-        let (snapshots, running) = {
+        let (snapshots, running, single_detail) = {
             let reg = self.tasks.lock().unwrap();
-            (reg.snapshots(pid, filter_name), reg.running_count(pid))
+            reg.inspect_status(pid, filter_name, self.agent_loop.inbox())
         };
         if snapshots.is_empty() {
             let msg = match filter_name {
@@ -159,6 +200,35 @@ impl SubagentRuntime {
             };
             return ToolOutput::text(msg)
                 .with_details(json!({ "action": "status", "running": running, "tasks": [] }));
+        }
+        if let Some(detail) = single_detail {
+            let t = &detail.snapshot;
+            let body = detail
+                .last_output
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(t.summary.as_deref().filter(|s| !s.is_empty()))
+                .unwrap_or("(no output)");
+            let text = format!(
+                "Subagent \"{}\" [{}] mode={} steps={} elapsed={}s session={}:\n\n{}",
+                t.name,
+                t.status.as_str(),
+                t.mode.as_str(),
+                t.steps,
+                t.elapsed_secs,
+                t.child_session_id,
+                body
+            );
+            let mut details = json!({
+                "action": "status",
+                "running": running,
+                "tasks": snapshots,
+                "output": body,
+            });
+            if let Some(ref path) = detail.last_output_path {
+                details["outputPath"] = json!(path.display().to_string());
+            }
+            return ToolOutput::text(text).with_details(details);
         }
         let lines: Vec<String> = snapshots
             .iter()
@@ -215,7 +285,7 @@ impl SubagentRuntime {
         let parent_id = parent_session_id.ok_or(SubagentError::MissingParentSession)?;
         let (stopped, running_count) = {
             let mut reg = self.tasks.lock().unwrap();
-            let stopped = reg.request_stop(parent_id, target);
+            let stopped = reg.request_stop(parent_id, target, self.agent_loop.inbox());
             let running_count = reg.running_count(parent_id);
             (stopped, running_count)
         };
@@ -326,6 +396,7 @@ impl SubagentRuntime {
         let all_infos = tools.list_all();
         let allowed_tools = compute_allowed_tools(&candidate_tools, &all_infos, mode);
 
+        let soft_budget = cfg.soft_budget_for(mode);
         let child_cancel = self.dispose_token.child_token();
         let (run_id, assigned_name, running_count, activity) = {
             let mut reg = self.tasks.lock().unwrap();
@@ -342,6 +413,8 @@ impl SubagentRuntime {
                 short_prompt.clone(),
                 child_cancel.clone(),
                 cfg.effective_max_concurrent(),
+                soft_budget,
+                agent_loop.inbox(),
             )?
         };
 
@@ -366,6 +439,10 @@ impl SubagentRuntime {
                 SubagentRunStatus::Stopped,
                 0,
                 Some("子代理已取消执行".into()),
+                Some("子代理已取消执行".into()),
+                None,
+                agent_loop.inbox(),
+                None,
             );
             return Ok(ToolOutput::error("子代理已取消执行"));
         }
@@ -386,12 +463,10 @@ impl SubagentRuntime {
             )),
         });
 
-        let max_steps = cfg.effective_max_steps();
         let timeout_secs = cfg.effective_timeout_secs();
         let run_opts = RunOptions {
             provider,
             model,
-            max_steps: Some(max_steps),
             origin: Some(RequestOrigin::Subagent),
             ..Default::default()
         };
@@ -408,7 +483,8 @@ impl SubagentRuntime {
             initial_prompt: prompt,
             run_opts,
             mode,
-            max_steps,
+            soft_budget,
+            allowed_tools,
             timeout_secs,
             stall_timeout_secs: cfg.stall_timeout_secs,
             max_watchdog_alerts: cfg.max_watchdog_alerts,
@@ -469,7 +545,7 @@ impl SubagentRuntime {
             requested_model.as_deref(),
             agent_loop.inbox(),
             &prompt,
-            cfg.effective_max_concurrent(),
+            &cfg,
             &self.dispose_token,
         )?;
 
@@ -593,12 +669,11 @@ impl SubagentRuntime {
                     notice: Some(format!("后台子代理 {name} 已唤醒继续执行")),
                 });
 
-                let max_steps = cfg.effective_max_steps();
+                let soft_budget = cfg.soft_budget_for(mode);
                 let timeout_secs = cfg.effective_timeout_secs();
                 let run_opts = RunOptions {
                     provider,
                     model,
-                    max_steps: Some(max_steps),
                     origin: Some(RequestOrigin::Subagent),
                     ..Default::default()
                 };
@@ -615,7 +690,8 @@ impl SubagentRuntime {
                     initial_prompt: prompt,
                     run_opts,
                     mode,
-                    max_steps,
+                    soft_budget,
+                    allowed_tools,
                     timeout_secs,
                     stall_timeout_secs: cfg.stall_timeout_secs,
                     max_watchdog_alerts: cfg.max_watchdog_alerts,

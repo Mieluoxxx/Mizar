@@ -2,7 +2,9 @@
 
 pub mod clipboard;
 pub mod exec;
+pub mod rpc_host;
 pub mod runner;
+pub mod serve;
 pub mod update;
 
 pub use mizar_client::events::{
@@ -42,9 +44,11 @@ pub use mizar_tui_ui::{
     app, editor, markdown, overlay, reveal, selection, side_panel, terminal, theme, timeline_rail,
     trajectory_scene, ui,
 };
+pub use rpc_host::{RpcHostError, run_rpc_host_cli};
 pub use runner::{
     ResumeTarget, TuiConfig, TuiExitSummary, build_session_info_report,
     build_session_info_report_at, build_settings_entries, format_resume_command,
     install_tui_emphasis, mount_reply_guidance_section, resume_session_into_app, run_tui,
     run_tui_with_summary,
 };
+pub use serve::{ServeConfig, ServeError, ServeHandle, run_serve_cli, start_serve};

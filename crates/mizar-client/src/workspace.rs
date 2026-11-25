@@ -58,7 +58,7 @@ pub async fn collect_workspace_panel_snapshot(
     workspace: &Path,
     session_id: Option<&str>,
 ) -> WorkspacePanelSnapshot {
-    let instructions = collect_instructions_summary(runtime, session_id);
+    let instructions = collect_instructions_summary(runtime);
     let ((git_changes, git_diff_stat), mcp_mgr) =
         tokio::join!(collect_git_summary(workspace), runtime.mcp());
     let tools = collect_tools_summary(runtime, session_id);
@@ -151,15 +151,12 @@ pub fn collect_mcps_summary(runtime: &MizarRuntime) -> Vec<McpSummaryRow> {
     )
 }
 
-/// 探测并返回当前工作区/会话加载的 `AGENTS.md` / `CLAUDE.md` 指令作用域摘要。
-pub fn collect_instructions_summary(
-    runtime: &MizarRuntime,
-    session_id: Option<&str>,
-) -> Vec<InstructionSummaryRow> {
+/// 返回当前工作区启动期加载的 `AGENTS.md` / `CLAUDE.md` 指令作用域摘要。
+pub fn collect_instructions_summary(runtime: &MizarRuntime) -> Vec<InstructionSummaryRow> {
     let Some(inst) = runtime.instructions.as_ref() else {
         return Vec::new();
     };
-    let report = inst.probe_report(session_id);
+    let report = inst.report();
     report
         .scopes
         .into_iter()

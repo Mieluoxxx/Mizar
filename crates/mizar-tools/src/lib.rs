@@ -154,6 +154,9 @@ pub struct ToolResult {
     /// 面向 UI 展示的附加细节（例如 diff、exit_code、loaded_tools，不拼进发给模型的纯文本）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// 运行时控制信号；不进入工具的序列化返回值。
+    #[serde(skip)]
+    pub end_turn: bool,
 }
 
 impl ToolResult {
@@ -165,6 +168,7 @@ impl ToolResult {
             additional_contexts: Vec::new(),
             structured_content: None,
             details: None,
+            end_turn: false,
         }
     }
 
@@ -176,6 +180,7 @@ impl ToolResult {
             additional_contexts: Vec::new(),
             structured_content: None,
             details: None,
+            end_turn: false,
         }
     }
 
@@ -187,6 +192,7 @@ impl ToolResult {
             additional_contexts: Vec::new(),
             structured_content: None,
             details: None,
+            end_turn: false,
         }
     }
 
@@ -198,6 +204,7 @@ impl ToolResult {
             additional_contexts: Vec::new(),
             structured_content: output.structured_content,
             details: output.details,
+            end_turn: output.end_turn,
         }
     }
 
@@ -238,24 +245,29 @@ pub struct ToolOutput {
     pub is_error: bool,
     pub structured_content: Option<Value>,
     pub details: Option<Value>,
+    /// 写回当前模型请求的所有工具结果后结束本轮。
+    pub end_turn: bool,
 }
 
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
-            is_error: false,
-            structured_content: None,
-            details: None,
+            ..Self::default()
+        }
+    }
+
+    pub fn end_turn(content: impl Into<String>) -> Self {
+        Self {
+            end_turn: true,
+            ..Self::text(content)
         }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
             is_error: true,
-            structured_content: None,
-            details: None,
+            ..Self::text(content)
         }
     }
 

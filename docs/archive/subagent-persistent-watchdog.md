@@ -1,9 +1,9 @@
 # Mizar Subagent 常驻分身、零 Token 活性看门狗与无头正交精简设计（v3）
 
 > **状态**：已实现并全量验收通过（v3）  
-> **适用范围**：`mizar-session` / `mizar-session-sqlite` / `mizar-session-title` / `mizar-agent-loop` / `mizar-subagent` / `mizar-agent-spine` / `mizar-tui` / `mizar-tui-ui` / [plugins.md](plugins.md)  
-> **v0.3 路径映射说明**：v0.3 工作区拍扁后，文中历史 crate 名 `mizar-session-sqlite` 与 `mizar-session-title` / `mizar-agent-loop` / `mizar-subagent` / `mizar-agent-spine` 已分别收口进 `mizar-session` 与 `mizar-core`（现行 10-Crate 拓扑见 [plugins.md](plugins.md)）。  
-> **前置背景与关联文档**：当前装配拓扑见 [plugins.md](plugins.md)；编译隔离与仓库规范见 [AGENTS.md](../AGENTS.md)。
+> **适用范围**：`mizar-session` / `mizar-session-sqlite` / `mizar-session-title` / `mizar-agent-loop` / `mizar-subagent` / `mizar-agent-spine` / `mizar-tui` / `mizar-tui-ui` / [plugins.md](../plugins.md)  
+> **v0.3 路径映射说明**：v0.3 工作区拍扁后，文中历史 crate 名 `mizar-session-sqlite` 与 `mizar-session-title` / `mizar-agent-loop` / `mizar-subagent` / `mizar-agent-spine` 已分别收口进 `mizar-session` 与 `mizar-core`（现行 10-Crate 拓扑见 [plugins.md](../plugins.md)）。  
+> **前置背景与关联文档**：当前装配拓扑见 [plugins.md](../plugins.md)；编译隔离与仓库规范见 [AGENTS.md](../../AGENTS.md)。
 
 ---
 

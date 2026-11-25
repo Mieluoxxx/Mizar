@@ -397,6 +397,7 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 supports_tool_search_output: compat_cfg
                     .supports_tool_search_output
                     .unwrap_or(false),
+                parallel_tool_calls: compat_cfg.parallel_tool_calls,
                 send_session_affinity_headers: compat_cfg.send_session_affinity_headers,
                 session_affinity_mode: compat_cfg.parsed_session_affinity_mode(),
                 supports_long_cache_retention: compat_cfg
@@ -1382,5 +1383,122 @@ mod tests {
         assert_eq!(bodies[1]["instructions"], "be crisp");
         assert_eq!(bodies[1]["input"][0]["role"], "user");
         assert_eq!(bodies[1]["tools"][0]["strict"], false);
+    }
+
+    #[tokio::test]
+    async fn forwards_parallel_tool_calls_compat_across_protocols() {
+        use crate::ToolSchema;
+        use axum::Router;
+        use axum::body::Body;
+        use axum::response::Response;
+        use axum::routing::post;
+        use futures::StreamExt;
+        use std::sync::Mutex;
+        use tokio::net::TcpListener;
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        let cap_comp = Arc::clone(&seen);
+        let cap_resp = Arc::clone(&seen);
+        let app_router = Router::new()
+            .route(
+                "/chat/completions",
+                post(move |body: axum::Json<serde_json::Value>| {
+                    let cap = Arc::clone(&cap_comp);
+                    async move {
+                        cap.lock().unwrap().push(("completions".into(), body.0));
+                        Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                            ))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/responses",
+                post(move |body: axum::Json<serde_json::Value>| {
+                    let cap = Arc::clone(&cap_resp);
+                    async move {
+                        cap.lock().unwrap().push(("responses".into(), body.0));
+                        Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_p\"}}\n\n",
+                            ))
+                            .unwrap()
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app_router).await;
+        });
+
+        let cfg_json = format!(
+            r#"{{
+              "providers": {{
+                "comp-p": {{
+                  "baseUrl": "http://{addr}",
+                  "api": "openai-completions",
+                  "apiKey": "k-comp",
+                  "compat": {{ "parallelToolCalls": true }},
+                  "models": [
+                    {{ "id": "m-inherit" }},
+                    {{ "id": "m-override", "compat": {{ "parallelToolCalls": false }} }}
+                  ]
+                }},
+                "resp-p": {{
+                  "baseUrl": "http://{addr}",
+                  "api": "openai-responses",
+                  "apiKey": "k-resp",
+                  "models": [
+                    {{ "id": "r-unset" }},
+                    {{ "id": "r-true", "compat": {{ "parallelToolCalls": true }} }}
+                  ]
+                }}
+              }}
+            }}"#
+        );
+        let cfg: RouterConfig = serde_json::from_str(&cfg_json).unwrap();
+        let llm = LlmRuntime::new();
+        let _router = LlmRouter::new(Arc::clone(&llm), cfg);
+        let tool = ToolSchema {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+
+        for (provider, model) in [
+            ("comp-p", "m-inherit"),
+            ("comp-p", "m-override"),
+            ("resp-p", "r-unset"),
+            ("resp-p", "r-true"),
+        ] {
+            let mut s = llm
+                .stream(GenerateOptions {
+                    provider: Some(provider.into()),
+                    model: Some(model.into()),
+                    messages: vec![Message::user("hi")],
+                    tools: vec![tool.clone()],
+                    ..Default::default()
+                })
+                .unwrap();
+            while let Some(chunk) = s.next().await {
+                let _ = chunk.unwrap();
+            }
+        }
+
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies[0].0, "completions");
+        assert_eq!(bodies[0].1["parallel_tool_calls"], true);
+        assert_eq!(bodies[1].0, "completions");
+        assert_eq!(bodies[1].1["parallel_tool_calls"], false);
+        assert_eq!(bodies[2].0, "responses");
+        assert!(bodies[2].1.get("parallel_tool_calls").is_none());
+        assert_eq!(bodies[3].0, "responses");
+        assert_eq!(bodies[3].1["parallel_tool_calls"], true);
     }
 }

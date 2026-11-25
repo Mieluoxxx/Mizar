@@ -924,6 +924,45 @@ impl AppState {
         );
     }
 
+    /// 同步在线运行与历史回放的工具展示扩展态（`diff_raw`、`inline_meta`、`full_content`）并生成折叠预览。
+    pub(super) fn apply_tool_result_extras(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        content: &str,
+        details: Option<&Value>,
+        failed: bool,
+    ) -> String {
+        let diff_raw = if !failed && name == "edit" {
+            details
+                .and_then(|d| d.get("diff"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        let inline_meta = if !failed
+            && name == "edit"
+            && let Some(d) = details
+            && let (Some(added), Some(removed)) = (
+                d.get("added").and_then(Value::as_u64),
+                d.get("removed").and_then(Value::as_u64),
+            ) {
+            format_diff_stat(added as usize, removed as usize)
+        } else if !name.is_empty() {
+            extract_inline_meta(name, content, details, failed)
+        } else {
+            None
+        };
+        {
+            let extra = self.tool_extras.entry(call_id.to_string()).or_default();
+            extra.full_content = content.to_string();
+            extra.diff_raw = diff_raw;
+            extra.inline_meta = inline_meta;
+        }
+        summarize_tool_result(name, content, details, failed)
+    }
+
     /// 从投影后的纯会话视图重建界面对话流（供 `/tree` 分叉回溯与 `--resume` / `--continue` 使用）。
     pub fn restore_session_view(&mut self, view: SessionViewData) {
         self.reset_for_new_session(view.session_id, view.session_title);
@@ -1004,32 +1043,39 @@ impl AppState {
                     tool_call_id,
                     content,
                     is_error,
+                    meta,
                 } => {
-                    let mut matched_name = String::new();
-                    if let Some(ChatItem::ToolCall {
-                        name,
-                        status,
-                        output_preview,
-                        ..
-                    }) = self.items.iter_mut().rev().find(|it| match it {
+                    let matched_pos = self.items.iter().rposition(|it| match it {
                         ChatItem::ToolCall { id, .. } => id == &tool_call_id,
                         _ => false,
-                    }) {
-                        matched_name = name.clone();
+                    });
+                    let matched_name = matched_pos
+                        .and_then(|pos| match &self.items[pos] {
+                            ChatItem::ToolCall { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let preview = self.apply_tool_result_extras(
+                        &tool_call_id,
+                        &matched_name,
+                        &content,
+                        meta.as_ref(),
+                        is_error,
+                    );
+                    if let Some(pos) = matched_pos
+                        && let ChatItem::ToolCall {
+                            status,
+                            output_preview,
+                            ..
+                        } = &mut self.items[pos]
+                    {
                         *status = if is_error {
                             ToolState::Error
                         } else {
                             ToolState::Done
                         };
-                        *output_preview =
-                            summarize_tool_result(&matched_name, &content, None, is_error);
+                        *output_preview = preview;
                     }
-                    let inline_meta = (!matched_name.is_empty())
-                        .then(|| extract_inline_meta(&matched_name, &content, None, is_error))
-                        .flatten();
-                    let ext = self.tool_extras.entry(tool_call_id).or_default();
-                    ext.full_content = content;
-                    ext.inline_meta = inline_meta;
                 }
                 SessionReplayItem::BashExecution {
                     command,
@@ -2675,11 +2721,15 @@ mod tests {
         let (tx1, mut rx1) = futures::channel::oneshot::channel();
         let (tx2, mut rx2) = futures::channel::oneshot::channel();
         app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-1".into(),
+            call_id: Some("call-1".into()),
             tool_name: "bash".into(),
             args_preview: "ls".into(),
             responder: Arc::new(std::sync::Mutex::new(Some(tx1))),
         });
         app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-2".into(),
+            call_id: Some("call-2".into()),
             tool_name: "write".into(),
             args_preview: "a.txt".into(),
             responder: Arc::new(std::sync::Mutex::new(Some(tx2))),
@@ -2704,6 +2754,36 @@ mod tests {
         ));
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(rx2.try_recv().unwrap(), Some(ApprovalDecision::Deny));
+        assert!(!app.overlay.is_open());
+
+        // 异源（如 RPC）先一步裁决时，UiEvent::ApprovalResolved 应静默关闭对应弹窗并提升队列下一项
+        let (tx3, mut rx3) = futures::channel::oneshot::channel();
+        let (tx4, _rx4) = futures::channel::oneshot::channel();
+        app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-remote-1".into(),
+            call_id: None,
+            tool_name: "bash".into(),
+            args_preview: "pwd".into(),
+            responder: Arc::new(std::sync::Mutex::new(Some(tx3))),
+        });
+        app.apply_ui_event(UiEvent::ApprovalRequested {
+            request_id: "req-remote-2".into(),
+            call_id: None,
+            tool_name: "edit".into(),
+            args_preview: "b.rs".into(),
+            responder: Arc::new(std::sync::Mutex::new(Some(tx4))),
+        });
+        app.apply_ui_event(UiEvent::ApprovalResolved {
+            request_id: "req-remote-1".into(),
+        });
+        assert!(rx3.try_recv().is_err());
+        assert!(matches!(
+            app.overlay.active,
+            Some(OverlayKind::Approval(ref ap)) if ap.request_id == "req-remote-2"
+        ));
+        app.apply_ui_event(UiEvent::ApprovalResolved {
+            request_id: "req-remote-2".into(),
+        });
         assert!(!app.overlay.is_open());
 
         app.effective_scroll(20, 100);
@@ -2885,5 +2965,113 @@ mod tests {
         );
         assert!(wd_replayed.starts_with("[subagent-watchdog:scout] Subagent watchdog notice"));
         assert!(!wd_replayed.contains("detail instructions"));
+    }
+
+    #[test]
+    fn restore_session_view_reconstructs_diff_raw_and_inline_meta_from_tool_result_meta() {
+        let mut app = AppState::new(
+            PathBuf::from("."),
+            "sess-replay-meta",
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        let diff_text = "--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new\n+more";
+        app.restore_session_view(SessionViewData {
+            session_id: "sess-replay-meta".into(),
+            session_title: Some("Meta Replay".into()),
+            items: vec![
+                SessionReplayItem::Assistant {
+                    blocks: vec![
+                        ContentBlock::ToolCall {
+                            id: "c_edit".into(),
+                            name: "edit".into(),
+                            arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c_write".into(),
+                            name: "write".into(),
+                            arguments: r#"{"path":"out.txt"}"#.into(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c_bash".into(),
+                            name: "bash".into(),
+                            arguments: r#"{"command":"false"}"#.into(),
+                        },
+                        ContentBlock::ToolCall {
+                            id: "c_read".into(),
+                            name: "read".into(),
+                            arguments: r#"{"path":"a.rs"}"#.into(),
+                        },
+                    ],
+                },
+                SessionReplayItem::ToolResult {
+                    tool_call_id: "c_edit".into(),
+                    content: "Successfully replaced 1 block(s)".into(),
+                    is_error: false,
+                    meta: Some(serde_json::json!({
+                        "kind": "diff",
+                        "path": "src/lib.rs",
+                        "added": 2,
+                        "removed": 1,
+                        "diff": diff_text,
+                    })),
+                },
+                SessionReplayItem::ToolResult {
+                    tool_call_id: "c_write".into(),
+                    content: "Successfully wrote 18 bytes".into(),
+                    is_error: false,
+                    meta: Some(serde_json::json!({
+                        "kind": "write",
+                        "path": "out.txt",
+                        "bytes": 18,
+                        "lines": 3,
+                    })),
+                },
+                SessionReplayItem::ToolResult {
+                    tool_call_id: "c_bash".into(),
+                    content: "Command exited with code 2".into(),
+                    is_error: true,
+                    meta: Some(serde_json::json!({
+                        "kind": "bash",
+                        "command": "false",
+                        "exit_code": 2,
+                        "duration_ms": 8,
+                        "timed_out": false,
+                        "cancelled": false,
+                        "full_output_path": null,
+                    })),
+                },
+                SessionReplayItem::ToolResult {
+                    tool_call_id: "c_read".into(),
+                    content: "1\thello".into(),
+                    is_error: false,
+                    meta: Some(serde_json::json!({
+                        "kind": "read",
+                        "path": "a.rs",
+                        "start_line": 1,
+                        "end_line": 20,
+                        "total_lines": 100,
+                        "truncated": true,
+                    })),
+                },
+            ],
+            finish_notice: "已恢复".into(),
+            ..SessionViewData::default()
+        });
+
+        let edit_ext = app.tool_extras.get("c_edit").unwrap();
+        assert_eq!(edit_ext.diff_raw.as_deref(), Some(diff_text));
+        assert_eq!(edit_ext.inline_meta.as_deref(), Some("+2 -1"));
+
+        let write_ext = app.tool_extras.get("c_write").unwrap();
+        assert_eq!(write_ext.inline_meta.as_deref(), Some("3 lines"));
+
+        let bash_ext = app.tool_extras.get("c_bash").unwrap();
+        assert_eq!(bash_ext.inline_meta.as_deref(), Some("exit 2"));
+
+        let read_ext = app.tool_extras.get("c_read").unwrap();
+        assert_eq!(read_ext.inline_meta.as_deref(), Some("L1-20/100"));
     }
 }

@@ -65,6 +65,15 @@ The trajectory analyzer lays out every interaction along a shared millisecond ti
 - <kbd>Enter</kbd>: Expand full timing breakdown and detailed metadata for the selected span
 - <kbd>Esc</kbd>: Close the trajectory analyzer and return to the conversation
 
+### Streaming JSONL Trajectory Logs (`--trace-jsonl`)
+
+Beyond inspecting `/trace` interactively with <kbd>Ctrl</kbd>+<kbd>T</kbd>, pass `--trace-jsonl <PATH>` at launch (or set `MIZAR_TRACE_JSONL`; CLI takes precedence) to append every `TraceEvent` in real time to a single JSONL log file. Both interactive TUI and headless `mizar exec` support it using the exact same line schema as `/trace` exports, so events emitted before a crash or `--timeout` interruption remain preserved on disk (see [CLI Flags](/en/tui/cli/)):
+
+```bash title="Stream TraceEvent JSONL logs in TUI or headless mode"
+mizar --trace-jsonl ./logs/tui-trace.jsonl
+mizar exec --isolated --trace-jsonl ./logs/exec-trace.jsonl "Run unit tests and summarize failures"
+```
+
 <Callout type="tip">
 
 Keep the distinction between `!` and `!!` in [Local Bash Mode](/en/tui/bash-mode/) in mind: strictly local `!!` commands do not trigger LLM requests and therefore never add to model time-to-first-token latency. When diagnosing model throughput bottlenecks, focus on the LLM invocation spans inside `/trace`.

@@ -39,6 +39,7 @@ pub struct ResponsesConfig {
     pub supports_mid_convo_effort: bool,
     pub supports_additional_tools: bool,
     pub supports_tool_search_output: bool,
+    pub parallel_tool_calls: Option<bool>,
     pub send_session_affinity_headers: Option<bool>,
     pub session_affinity_mode: Option<SessionAffinityMode>,
     pub supports_long_cache_retention: bool,
@@ -64,6 +65,7 @@ impl Default for ResponsesConfig {
             supports_mid_convo_effort: false,
             supports_additional_tools: false,
             supports_tool_search_output: false,
+            parallel_tool_calls: None,
             send_session_affinity_headers: None,
             session_affinity_mode: None,
             supports_long_cache_retention: true,
@@ -1111,6 +1113,11 @@ fn build_request_with_metadata(
             config.supports_strict_mode,
             false,
         ));
+    }
+    if !options.tools.is_empty()
+        && let Some(parallel) = config.parallel_tool_calls
+    {
+        body["parallel_tool_calls"] = json!(parallel);
     }
 
     BuiltResponsesRequest {
@@ -2837,6 +2844,50 @@ mod tests {
             top_instr_body["reasoning"],
             json!({ "effort": "xhigh", "summary": "auto" })
         );
+        assert!(default_body.get("parallel_tool_calls").is_none());
+
+        let parallel_true = build_request_body(
+            &ResponsesConfig {
+                parallel_tool_calls: Some(true),
+                ..Default::default()
+            },
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools: tools.clone(),
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert_eq!(parallel_true["parallel_tool_calls"], true);
+
+        let parallel_no_tools = build_request_body(
+            &ResponsesConfig {
+                parallel_tool_calls: Some(true),
+                ..Default::default()
+            },
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools: Vec::new(),
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert!(parallel_no_tools.get("parallel_tool_calls").is_none());
+
+        let parallel_false_additional = build_request_body(
+            &ResponsesConfig {
+                supports_additional_tools: true,
+                parallel_tool_calls: Some(false),
+                ..Default::default()
+            },
+            &GenerateOptions {
+                messages: vec![Message::user("hi")],
+                tools,
+                ..Default::default()
+            },
+            "gpt-5",
+        );
+        assert_eq!(parallel_false_additional["parallel_tool_calls"], false);
     }
 
     #[test]

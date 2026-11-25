@@ -53,7 +53,7 @@ cargo install --path crates/mizar-tui
 - **Local Bash (`!` / `!!`)**: Run `!cmd` to feed command output into the next model turn, or `!!cmd` to run locally with zero token cost.
 - **Rules & Skills**: Hierarchical `AGENTS.md` / `CLAUDE.md` discovery under a `64 KiB` budget plus hot-reloaded `SKILL.md` workflows.
 - **MCP & Codemode**: Connect Stdio/HTTP MCP servers via `mcp.json`, discover large tool catalogs on demand with `tool_search`, and batch-call tools inside an isolated QuickJS (`rquickjs`) sandbox.
-- **Providers, Compaction & Execution**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by WAL SQLite sessions (`/tree` branching, single-stage checkpoint `/compact` + static `recall` with FTS5, `/trace` profiler, headless `mizar exec --trace-out`, and persistent `subagent`).
+- **Providers, Compaction & Execution**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by WAL SQLite sessions (`/tree` branching, single-stage checkpoint `/compact` + static `recall` with FTS5, `/trace` profiler, headless `mizar exec --trace-out`, streaming `--trace-jsonl` trajectory logs, and persistent `subagent`).
 
 ### Documentation & Development
 

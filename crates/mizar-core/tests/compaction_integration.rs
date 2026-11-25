@@ -315,8 +315,7 @@ async fn high_cache_hit_prompt_tokens_triggers_auto_compaction() {
 }
 
 #[tokio::test]
-async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_rewrites_tail_note_and_recall()
- {
+async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_rewrites_tail_note() {
     let (adapter, calls) = RecordingAdapter::new(
         64_000,
         Some(4_096),
@@ -367,6 +366,7 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
         name: "edit".into(),
         content: "LARGE_TOOL_OUTPUT_UNPRUNED ".repeat(400),
         is_error: false,
+        meta: None,
     });
     s.append(SessionEvent::Assistant {
         blocks: vec![ContentBlock::ToolCall {
@@ -382,6 +382,7 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
         name: "bash".into(),
         content: "all passed".into(),
         is_error: false,
+        meta: None,
     });
     s.append(SessionEvent::user(
         "BOUNDARY_MARKER_NEXT_TASK: continue parser cleanup".repeat(5),
@@ -405,7 +406,7 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 2);
 
-        // 首次摘要请求：无 temperature，强制 ReasoningEffort::Off，引用 recall 而非 recall_read，tail_note 不含 seq #
+        // 首次摘要请求：无 temperature，强制 ReasoningEffort::Off，不含 recall 引用，tail_note 不含 seq #
         let first = &recorded[0];
         assert_eq!(first.origin, RequestOrigin::Compaction);
         assert_eq!(first.temperature, None);
@@ -414,7 +415,7 @@ async fn summarizer_omits_temperature_sets_reasoning_off_preserves_prefix_and_re
             mizar_llm::Message::User { content, .. } => content.clone(),
             other => format!("{other:?}"),
         };
-        assert!(prompt_str.contains("`recall`"), "{prompt_str}");
+        assert!(!prompt_str.contains("`recall`"), "{prompt_str}");
         assert!(!prompt_str.contains("recall_read"), "{prompt_str}");
         assert!(
             !prompt_str.contains("starting at seq #") && !prompt_str.contains("BEFORE seq #"),
@@ -683,6 +684,7 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
         name: "read".into(),
         content: r_big.content.clone(),
         is_error: false,
+        meta: None,
     });
 
     let v2_content: String = (1..=60).map(|i| format!("v2_line_{i:02}\n")).collect();
@@ -807,6 +809,7 @@ async fn unified_write_guard_enforces_50_line_first_read_and_post_compaction_rer
                         name: "read".into(),
                         content: "line v3\n".repeat(60),
                         is_error: false,
+                        meta: None,
                     },
                 },
                 SessionEntry {

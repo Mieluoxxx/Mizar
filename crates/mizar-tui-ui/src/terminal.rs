@@ -66,7 +66,20 @@ pub fn format_osc_7501(
     kind: Option<&str>,
     message: Option<&str>,
 ) -> String {
+    format_osc_7501_with_pid(state, kind, message, None)
+}
+
+/// 生成符合 OSC 7501（Program Status Protocol）的控制序列；传入 `pid` 时在 `app=mizar` 后追加 `pid=<pid>`。
+pub fn format_osc_7501_with_pid(
+    state: ProgramStatusState,
+    kind: Option<&str>,
+    message: Option<&str>,
+    pid: Option<u32>,
+) -> String {
     let mut parts = vec![format!("state={}", state.as_str()), "app=mizar".to_string()];
+    if let Some(pid) = pid {
+        parts.push(format!("pid={pid}"));
+    }
     if state == ProgramStatusState::Blocked
         && let Some(k) = kind
     {
@@ -94,7 +107,7 @@ pub fn emit_program_status(state: ProgramStatusState, kind: Option<&str>, messag
     ) {
         return;
     }
-    let seq = format_osc_7501(state, kind, message);
+    let seq = format_osc_7501_with_pid(state, kind, message, Some(std::process::id()));
     let mut out = io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
@@ -436,5 +449,22 @@ mod tests {
         );
         assert!(seq.starts_with("\x1b]7501;state=blocked:app=mizar:kind=permission:msg="));
         assert!(seq.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn formats_osc7501_status_sequence_with_pid() {
+        let seq = format_osc_7501_with_pid(
+            ProgramStatusState::Blocked,
+            Some("permission"),
+            Some("Run cargo test"),
+            Some(48210),
+        );
+        assert!(
+            seq.starts_with("\x1b]7501;state=blocked:app=mizar:pid=48210:kind=permission:msg=")
+        );
+        assert!(seq.ends_with("\x1b\\"));
+
+        let working = format_osc_7501_with_pid(ProgramStatusState::Working, None, None, Some(99));
+        assert_eq!(working, "\x1b]7501;state=working:app=mizar:pid=99\x1b\\");
     }
 }

@@ -223,19 +223,6 @@ impl LoadedMizarConfig {
                 dst.keep_recent_tokens = v;
             }
         }
-        if let Some(rec) = &self.settings.recall
-            && let Some(dst) = spine.recall.as_mut()
-        {
-            if let Some(v) = rec.enabled {
-                dst.enabled = v;
-            }
-            if let Some(v) = rec.default_search_limit {
-                dst.default_search_limit = v;
-            }
-            if let Some(v) = rec.read_char_limit {
-                dst.read_char_limit = v;
-            }
-        }
 
         if let Some(st) = &self.settings.session_title
             && let Some(dst) = spine.session_title.as_mut()
@@ -260,11 +247,11 @@ impl LoadedMizarConfig {
         if let Some(sub) = &self.settings.subagent
             && let Some(dst) = spine.subagent.as_mut()
         {
-            if let Some(v) = sub.max_steps {
-                dst.default_max_steps = v;
+            if let Some(v) = sub.read_only_soft_budget {
+                dst.read_only_soft_budget = v;
             }
-            if let Some(v) = sub.max_steps_cap {
-                dst.max_steps_cap = v;
+            if let Some(v) = sub.edit_soft_budget {
+                dst.edit_soft_budget = v;
             }
             if let Some(v) = sub.timeout_secs {
                 dst.timeout_secs = v;
@@ -317,9 +304,6 @@ impl LoadedMizarConfig {
                 }
                 if let Some(v) = inst.max_source_bytes {
                     instructions.max_source_bytes = v;
-                }
-                if let Some(v) = inst.follow_subdirs {
-                    instructions.follow_subdirs = v;
                 }
             }
             if let Some(sk) = &self.settings.skills {
@@ -420,7 +404,7 @@ mod tests {
                 "reasoningEffort": "medium",
                 "instructions": {
                     "maxBytes": 32768,
-                    "followSubdirs": false
+                    "maxSourceBytes": 131072
                 }
             }"#,
         )
@@ -488,7 +472,7 @@ mod tests {
                 assert_eq!(mcp.global_config_dir.as_deref(), Some(global.as_path()));
                 assert_eq!(instructions.mizar_home.as_deref(), Some(global.as_path()));
                 assert_eq!(instructions.max_bytes, 32768);
-                assert!(!instructions.follow_subdirs);
+                assert_eq!(instructions.max_source_bytes, 131_072);
             }
             _ => panic!("expected coding mode"),
         }

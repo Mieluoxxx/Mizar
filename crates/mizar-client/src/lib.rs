@@ -2,19 +2,28 @@
 //!
 //! 供 `mizar-tui` 与桌面端（Merak）共同复用，严禁引入 `ratatui`、`crossterm` 或 `mizar-tui-ui`。
 
+pub mod actor;
 pub mod approval;
 pub mod events;
 pub mod images;
 pub mod local_bash;
 pub mod logging;
 pub mod mentions;
+pub mod rpc_server;
+pub mod run_dir;
 pub mod session_view;
 pub mod settings;
 pub mod workspace;
 
+pub use actor::{
+    ACTIVE_TURN_OUTPUT_TAIL_MAX_BYTES, ActiveTurnBuffer, ActorError, SessionActor,
+    SessionActorConfig, SessionActorHandle, subagent_snapshot_to_dto, tail_utf8_capped,
+};
 pub use approval::{
-    ApprovalGateConfig, ApprovalSnapshot, install_approval_gate, register_approval_hook,
-    register_approval_hook_with, tool_needs_approval,
+    ApprovalGateConfig, ApprovalResolveMeta, ApprovalSideEffects, ApprovalSnapshot,
+    PendingInteractionEntry, PendingInteractions, ResolveInteractionError, install_approval_gate,
+    register_approval_hook, register_approval_hook_with, register_approval_hook_with_interactions,
+    tool_needs_approval,
 };
 pub use events::{
     ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, steer_session,
@@ -35,6 +44,15 @@ pub use mentions::{
     FileMentionsConfig, MENTION_MAX_DIR_ENTRIES, MENTION_MAX_FILE_CHARS, MENTION_MAX_TOTAL_CHARS,
     MentionExpansionResult, expand_text_mentions, install_file_mentions,
     mentions_resolve_any_image, register_mention_hook, register_mention_hook_with,
+};
+pub use rpc_server::{
+    DEFAULT_CLIENT_QUEUE_CAPACITY, DEFAULT_COALESCE_WINDOW, DEFAULT_MAX_DELTA_FRAME_BYTES,
+    RpcServer, RpcServerConfig, RpcServerHandle,
+};
+pub use run_dir::{
+    ProcessMeta, ProcessRegistration, SessionLockError, check_session_writable, ensure_run_dir,
+    is_pid_alive, meta_path_for_pid, resolve_run_dir, resolve_run_dir_path, scan_live_processes,
+    set_socket_permissions_0600, socket_path_for_pid, write_meta_atomic,
 };
 pub use session_view::{
     SelectionSources, build_session_info_report, build_session_info_report_at,

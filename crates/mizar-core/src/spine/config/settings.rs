@@ -40,7 +40,6 @@ pub struct InstructionsSettings {
     pub project_root_markers: Option<Vec<String>>,
     pub max_bytes: Option<usize>,
     pub max_source_bytes: Option<usize>,
-    pub follow_subdirs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,14 +55,6 @@ pub struct CompactionSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct RecallSettings {
-    pub enabled: Option<bool>,
-    pub default_search_limit: Option<usize>,
-    pub read_char_limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
 pub struct SessionTitleSettings {
     pub enabled: Option<bool>,
     pub model: Option<String>,
@@ -73,8 +64,8 @@ pub struct SessionTitleSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SubagentSettings {
-    pub max_steps: Option<usize>,
-    pub max_steps_cap: Option<usize>,
+    pub read_only_soft_budget: Option<usize>,
+    pub edit_soft_budget: Option<usize>,
     pub timeout_secs: Option<u64>,
     pub max_concurrent: Option<usize>,
     pub stall_timeout_secs: Option<u64>,
@@ -134,7 +125,6 @@ pub struct SettingsConfig {
     pub skills: Option<SkillsSettings>,
     pub instructions: Option<InstructionsSettings>,
     pub compaction: Option<CompactionSettings>,
-    pub recall: Option<RecallSettings>,
     pub session_title: Option<SessionTitleSettings>,
     pub subagent: Option<SubagentSettings>,
     pub ui: Option<UiSettings>,
@@ -250,9 +240,6 @@ impl SettingsConfig {
             if inst.max_source_bytes.is_some() {
                 dst.max_source_bytes = inst.max_source_bytes;
             }
-            if inst.follow_subdirs.is_some() {
-                dst.follow_subdirs = inst.follow_subdirs;
-            }
         }
         if let Some(comp) = other.compaction {
             let dst = self.compaction.get_or_insert_with(Default::default);
@@ -275,18 +262,6 @@ impl SettingsConfig {
                 dst.keep_recent_tokens = comp.keep_recent_tokens;
             }
         }
-        if let Some(rec) = other.recall {
-            let dst = self.recall.get_or_insert_with(Default::default);
-            if rec.enabled.is_some() {
-                dst.enabled = rec.enabled;
-            }
-            if rec.default_search_limit.is_some() {
-                dst.default_search_limit = rec.default_search_limit;
-            }
-            if rec.read_char_limit.is_some() {
-                dst.read_char_limit = rec.read_char_limit;
-            }
-        }
         if let Some(st) = other.session_title {
             let dst = self.session_title.get_or_insert_with(Default::default);
             if st.enabled.is_some() {
@@ -301,11 +276,11 @@ impl SettingsConfig {
         }
         if let Some(sub) = other.subagent {
             let dst = self.subagent.get_or_insert_with(Default::default);
-            if sub.max_steps.is_some() {
-                dst.max_steps = sub.max_steps;
+            if sub.read_only_soft_budget.is_some() {
+                dst.read_only_soft_budget = sub.read_only_soft_budget;
             }
-            if sub.max_steps_cap.is_some() {
-                dst.max_steps_cap = sub.max_steps_cap;
+            if sub.edit_soft_budget.is_some() {
+                dst.edit_soft_budget = sub.edit_soft_budget;
             }
             if sub.timeout_secs.is_some() {
                 dst.timeout_secs = sub.timeout_secs;
@@ -480,7 +455,7 @@ mod disabled_plugins_tests {
         std::fs::write(
             proj.join(".mizar/settings.json"),
             r#"{
-                "disabledPlugins": ["recall", "mcp", "compaction"]
+                "disabledPlugins": ["repeat-guard", "mcp", "compaction"]
             }"#,
         )
         .unwrap();
@@ -493,7 +468,7 @@ mod disabled_plugins_tests {
                 "codemode".to_string(),
                 "compaction".to_string(),
                 "mcp".to_string(),
-                "recall".to_string(),
+                "repeat-guard".to_string(),
                 "skills".to_string(),
             ]
         );
@@ -507,7 +482,7 @@ mod disabled_plugins_tests {
                 "codemode".to_string(),
                 "compaction".to_string(),
                 "mcp".to_string(),
-                "recall".to_string(),
+                "repeat-guard".to_string(),
                 "skills".to_string(),
                 "trajectory".to_string(),
             ]
@@ -632,7 +607,8 @@ mod disabled_plugins_tests {
             global.join("settings.json"),
             r#"{
                 "subagent": {
-                    "maxSteps": 25,
+                    "readOnlySoftBudget": 120,
+                    "editSoftBudget": 0,
                     "timeoutSecs": 240,
                     "stallTimeoutSecs": 60
                 }
@@ -654,7 +630,8 @@ mod disabled_plugins_tests {
         let loaded = load_mizar_config_with_global(&proj, Some(&global));
         assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
         let s = loaded.settings.subagent.as_ref().unwrap();
-        assert_eq!(s.max_steps, Some(25));
+        assert_eq!(s.read_only_soft_budget, Some(120));
+        assert_eq!(s.edit_soft_budget, Some(0));
         assert_eq!(s.timeout_secs, Some(240));
         assert_eq!(s.max_concurrent, Some(6));
         assert_eq!(s.stall_timeout_secs, Some(30));
@@ -664,7 +641,8 @@ mod disabled_plugins_tests {
             let mut spine = AgentSpineConfig::new(&proj);
             loaded.apply_to_spine(&mut spine);
             let sub = spine.subagent.unwrap();
-            assert_eq!(sub.default_max_steps, 25);
+            assert_eq!(sub.read_only_soft_budget, 120);
+            assert_eq!(sub.edit_soft_budget, 0);
             assert_eq!(sub.timeout_secs, 240);
             assert_eq!(sub.max_concurrent_per_parent, 6);
             assert_eq!(sub.stall_timeout_secs, 30);

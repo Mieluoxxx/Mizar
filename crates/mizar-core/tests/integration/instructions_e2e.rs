@@ -33,7 +33,7 @@ impl Drop for DirGuard {
 }
 
 #[tokio::test]
-async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_restart() {
+async fn coding_stack_loads_static_instructions_ignores_subdirs_and_reloads_on_restart() {
     let tmp = temp_dir("e2e");
     let _guard = DirGuard(tmp.clone());
 
@@ -48,7 +48,7 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
     std::fs::create_dir_all(ws.join(".mizar")).unwrap();
     std::fs::create_dir_all(ws.join("sub")).unwrap();
 
-    // settings.json 定制 instructions，并同时写入 AGENTS.md、CLAUDE.md、技能与子目录指令
+    // settings.json 定制 instructions，并同时写入 AGENTS.md、CLAUDE.md、技能与不应加载的子目录指令
     std::fs::write(
         ws.join(".mizar/settings.json"),
         r#"{
@@ -144,7 +144,7 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
         cfg
     };
 
-    // 1. 首次启动运行：同时验证 /deploy 技能手势展开不被 ContextNotice 截断，且 read 触达 sub/ 后注入子目录指令
+    // 1. 首次启动运行：指令进 SystemPrompt 静态段，/deploy 技能展开保留在消息流，且 read 触达 sub/ 后仍不注入子目录指令
     let seen1 = Arc::new(Mutex::new(Vec::new()));
     let runtime1 = MizarRuntime::build(build_cfg()).await.unwrap();
     let adapter1 = Arc::new(InspectAdapter {
@@ -169,14 +169,25 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
         let steps = seen1.lock().unwrap();
         assert_eq!(steps.len(), 2);
         let step0_msgs = &steps[0];
+        let step1_msgs = &steps[1];
+
+        let sys0 = &step0_msgs[0];
+        let sys1 = &step1_msgs[0];
+        assert!(sys0.starts_with("SYS:"));
+        assert_eq!(
+            sys0, sys1,
+            "system prompt must stay byte-identical across tool calls"
+        );
+        assert!(sys0.contains("GLOBAL_MIZAR_RULE"), "sys0:\n{sys0}");
+        assert!(sys0.contains("WS_AGENTS_RULE"), "sys0:\n{sys0}");
+        assert!(sys0.contains("WS_CLAUDE_RULE"), "sys0:\n{sys0}");
+        assert!(!sys0.contains("SUB_AGENTS_RULE"), "sys0:\n{sys0}");
+        assert!(!sys0.contains("SUB_CLAUDE_RULE"), "sys0:\n{sys0}");
+
         let pos_env = step0_msgs
             .iter()
             .position(|m| m.contains("<environment_context>"))
             .expect("missing <environment_context>");
-        let pos_instr = step0_msgs
-            .iter()
-            .position(|m| m.contains("GLOBAL_MIZAR_RULE"))
-            .expect("missing GLOBAL_MIZAR_RULE");
         let pos_skill = step0_msgs
             .iter()
             .position(|m| m.contains("DEPLOY_SKILL_BODY"))
@@ -186,38 +197,33 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
             .position(|m| m.contains("/deploy 请读取 sub/target.txt"))
             .expect("missing user message");
         assert!(
-            pos_env < pos_instr && pos_instr < pos_skill && pos_skill < pos_user,
-            "unexpected Turn-0 ContextNotice ordering: env={pos_env}, instr={pos_instr}, skill={pos_skill}, user={pos_user}, msgs={step0_msgs:?}"
+            pos_env < pos_skill && pos_skill < pos_user,
+            "unexpected Turn-0 ordering: env={pos_env}, skill={pos_skill}, user={pos_user}, msgs={step0_msgs:?}"
         );
-        let step0 = step0_msgs.join("\n");
-        assert!(step0.contains("GLOBAL_MIZAR_RULE"), "step0:\n{step0}");
-        assert!(step0.contains("WS_AGENTS_RULE"), "step0:\n{step0}");
-        assert!(step0.contains("WS_CLAUDE_RULE"), "step0:\n{step0}");
-        assert!(step0.contains("DEPLOY_SKILL_BODY"), "step0:\n{step0}");
-        assert!(!step0.contains("SUB_AGENTS_RULE"), "step0:\n{step0}");
 
-        let step1 = steps[1].join("\n");
-        assert!(step1.contains("SUB_AGENTS_RULE"), "step1:\n{step1}");
-        assert!(step1.contains("SUB_CLAUDE_RULE"), "step1:\n{step1}");
+        let step1_all = step1_msgs.join("\n");
+        assert!(
+            !step1_all.contains("SUB_AGENTS_RULE"),
+            "step1:\n{step1_all}"
+        );
+        assert!(
+            !step1_all.contains("SUB_CLAUDE_RULE"),
+            "step1:\n{step1_all}"
+        );
     }
 
-    let report1 = runtime1
-        .instructions
-        .as_ref()
-        .unwrap()
-        .session_report(&s1.id)
-        .unwrap();
+    let report1 = runtime1.instructions.as_ref().unwrap().report();
     assert!(report1.scopes.iter().any(|s| s.display_path == "AGENTS.md"));
     assert!(report1.scopes.iter().any(|s| s.display_path == "CLAUDE.md"));
     assert!(
-        report1
+        !report1
             .scopes
             .iter()
             .any(|s| s.display_path == "sub/AGENTS.md")
     );
     runtime1.shutdown().await;
 
-    // 2. 重启进程恢复会话（且文件未改，但之前有 baseline + sub delta）：续聊应不重复追加无意义基线，且若离线改写则能感知更新
+    // 2. 重启进程恢复会话：离线改写 CLAUDE.md 后新实例启动静态段立即反映新内容
     std::fs::write(ws.join("CLAUDE.md"), "WS_CLAUDE_RULE_OFFLINE_EDIT").unwrap();
     let seen2 = Arc::new(Mutex::new(Vec::new()));
     let runtime2 = MizarRuntime::build(build_cfg()).await.unwrap();
@@ -234,8 +240,8 @@ async fn coding_stack_loads_agents_claude_skills_subdirs_and_persists_across_res
         .await
         .unwrap();
     assert_eq!(reply2, "done_turn");
-    let step2_all = seen2.lock().unwrap()[0].join("\n");
-    assert!(step2_all.contains("WS_CLAUDE_RULE_OFFLINE_EDIT"));
+    let step2_sys = seen2.lock().unwrap()[0][0].clone();
+    assert!(step2_sys.contains("WS_CLAUDE_RULE_OFFLINE_EDIT"));
 
     runtime2.shutdown().await;
 }

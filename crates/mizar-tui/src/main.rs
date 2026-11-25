@@ -2,6 +2,8 @@
 //!
 //! 子命令：
 //! - `mizar exec [<prompt>]`：非交互单次无头执行（无 explicit prompt 且 stdin 非 TTY 时读取 stdin 至 EOF）
+//! - `mizar rpc [OPTIONS]`：启动无头单会话 JSON-RPC 2.0 宿主（供 Herdr 等前端直接拉起并挂载 `p-<pid>.{sock,json}`）
+//! - `mizar serve [--host <host>] [--port <port>] [--run-dir <dir>] [--workspace <dir>] [--session-db <path>]`：启动仅监听回环地址的 HTTP/WebSocket JSON-RPC 2.0 网关（远程访问通过 Tailscale Serve）
 //! - `mizar update [--version <ver>] [--force] [--check]`：从 GitHub Releases 检查并更新 `mizar` 二进制
 //!
 //! CLI 参数：
@@ -17,6 +19,7 @@
 //! - `--timeout <secs>`：限制无头单次任务总超时秒数
 //! - `--output-format <fmt>` / `--json`：无头输出格式（`text` / `json`）
 //! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
+//! - `--trace-jsonl <path>`：实时流式追加轨迹事件到指定 JSONL 文件（支持无头与 TUI 模式，可用环境变量 `MIZAR_TRACE_JSONL` 指定，CLI 优先）
 //! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
 //! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
@@ -44,6 +47,7 @@
 //! - `MIZAR_SKIP_VERSION_CHECK` / `MIZAR_OFFLINE`：跳过启动时版本检查（`MIZAR_OFFLINE` 同时禁用更新下载）
 //! - `MIZAR_RELEASE_BASE_URL`：覆盖 GitHub Release 基址（默认为 `https://github.com/Mieluoxxx/Mizar`）
 //! - `MIZAR_TRACE_OUT`：无头模式结构化轨迹 JSON 导出路径（低于 `--trace-out` 优先级）
+//! - `MIZAR_TRACE_JSONL`：实时轨迹 JSONL 日志文件路径（低于 `--trace-jsonl` 优先级）
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -53,12 +57,16 @@ use mizar_core::spine::{
     AgentSpineConfig, AgentToolsMode, MizarRuntime, load_mizar_config,
     resolve_default_session_db_path,
 };
+use mizar_core::trajectory::prepare_trace_jsonl_file;
 use mizar_llm::ReasoningEffort;
 use mizar_llm::retry::RetryConfig;
 use mizar_tools::coding::CodingToolsPreset;
 use mizar_tui::exec::{
-    ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
+    ExecConfig, ExecOutputFormat, configure_spine_trace_jsonl, resolve_exec_prompt,
+    resolve_trace_jsonl_path, resolve_trace_out_path, run_exec_cli,
 };
+use mizar_tui::rpc_host::run_rpc_host_cli;
+use mizar_tui::serve::run_serve_cli;
 use mizar_tui::update::{current_version, run_update_cli, should_check_for_updates_at_startup};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -98,6 +106,7 @@ struct CliArgs {
     timeout_secs: Option<u64>,
     output_format: Option<ExecOutputFormat>,
     trace_out: Option<PathBuf>,
+    trace_jsonl: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -129,10 +138,14 @@ Terminal-native AI coding workbench
 Usage:
   mizar [OPTIONS]
   mizar exec [OPTIONS] [<prompt>]
+  mizar rpc [OPTIONS]
+  mizar serve [OPTIONS]
   mizar update [OPTIONS]
 
 Commands:
   exec                          Run a single non-interactive task and exit
+  rpc                           Start a headless single-session JSON-RPC host
+  serve                         Start the loopback-only HTTP/WebSocket JSON-RPC gateway
   update                        Check and install the latest release binary
 
 Options:
@@ -151,6 +164,7 @@ Options:
       --output-format <fmt>     Headless output format (text, json)
       --json                    Shorthand for --output-format json
       --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
+      --trace-jsonl <path>      Stream TraceEvent JSONL log to file (env: MIZAR_TRACE_JSONL)
       --isolated                Skip personal global config, MCP, skills, instructions, and DB
       --minimal                 Enable minimal coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
@@ -441,6 +455,13 @@ where
                 }
                 out.trace_out = Some(PathBuf::from(val));
             }
+            "--trace-jsonl" => {
+                let val = take_value(flag, inline, &mut args)?;
+                if val.trim().is_empty() {
+                    return Err("--trace-jsonl 路径不能为空".to_string());
+                }
+                out.trace_jsonl = Some(PathBuf::from(val));
+            }
             "--timeout" => {
                 let val = take_value(flag, inline, &mut args)?;
                 let parsed = val
@@ -491,14 +512,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some((cmd, rest)) = raw_args.split_first()
-        && cmd == "update"
-    {
-        if let Err(err) = run_update_cli(rest).await {
-            eprintln!("error: {err}");
-            std::process::exit(1);
+    if let Some((cmd, rest)) = raw_args.split_first() {
+        if cmd == "update" {
+            if let Err(err) = run_update_cli(rest).await {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
-        return Ok(());
+        if cmd == "serve" {
+            if let Err(err) = run_serve_cli(rest).await {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        if cmd == "rpc" {
+            if let Err(err) = run_rpc_host_cli(rest).await {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
     }
 
     let cli = match parse_cli_args_from(raw_args) {
@@ -518,6 +553,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let explicit_workspace = cli.workspace.clone();
+    let trace_jsonl =
+        resolve_trace_jsonl_path(cli.trace_jsonl.clone(), env_non_empty("MIZAR_TRACE_JSONL"));
     let workspace = cli
         .workspace
         .clone()
@@ -570,6 +607,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             resume_session: cli.resume_session,
             output_format: cli.output_format.unwrap_or_default(),
             trace_out: resolve_trace_out_path(cli.trace_out, env_non_empty("MIZAR_TRACE_OUT")),
+            trace_jsonl,
         })
         .await;
         if code != 0 {
@@ -596,6 +634,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
+    configure_spine_trace_jsonl(&mut spine_cfg, trace_jsonl.as_deref());
     if cli.no_persist {
         spine_cfg.session_db_path = None;
     }
@@ -627,6 +666,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut tui_cfg = TuiConfig::new(workspace);
+    tui_cfg.enable_rpc_socket = true;
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
     tui_cfg.session_db_path = spine_cfg.session_db_path.clone();
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
@@ -636,7 +676,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // 两者都没有时 `model` 仍可能是 `models.json` 推导出来的，那不算显式指定。
     tui_cfg.model_from_env = env_non_empty("MODEL").is_some();
     tui_cfg.model_from_settings = loaded_cfg.settings.default_model.is_some();
-    tui_cfg.disabled_plugins = loaded_cfg.settings.disabled_plugins.clone();
+    tui_cfg.disabled_plugins = spine_cfg.disabled_plugins.clone();
     if let Some(ui) = &loaded_cfg.settings.ui {
         if let Some(ref theme_name) = ui.theme {
             tui_cfg.theme_preset = mizar_tui_ui::theme::ThemePreset::parse(theme_name);
@@ -674,6 +714,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         tui_cfg
             .startup_notices
             .push((NoticeLevel::Warn, format!("配置解析失败：{err}")));
+    }
+    if let Some(ref path) = trace_jsonl
+        && let Err(err) = prepare_trace_jsonl_file(path)
+    {
+        tui_cfg.startup_notices.push((
+            NoticeLevel::Warn,
+            format!("无法创建轨迹 JSONL 日志 \"{}\": {err}", path.display()),
+        ));
     }
 
     let runtime = MizarRuntime::build(spine_cfg).await?;
@@ -864,5 +912,37 @@ mod tests {
         );
         assert!(format_help_text().contains("--trace-out <path>"));
         assert!(format_help_text().contains("MIZAR_TRACE_OUT"));
+    }
+
+    #[test]
+    fn parse_trace_jsonl_flag_and_validation() {
+        let exec_parsed = parse_cli_args_from([
+            "exec".to_string(),
+            "--trace-jsonl".to_string(),
+            "artifacts/trace.jsonl".to_string(),
+            "run".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            exec_parsed.trace_jsonl.as_deref(),
+            Some(std::path::Path::new("artifacts/trace.jsonl"))
+        );
+        assert!(exec_parsed.is_exec_mode());
+
+        let tui_parsed =
+            parse_cli_args_from(["--trace-jsonl=/tmp/tui-trace.jsonl".to_string()]).unwrap();
+        assert_eq!(
+            tui_parsed.trace_jsonl.as_deref(),
+            Some(std::path::Path::new("/tmp/tui-trace.jsonl"))
+        );
+        assert!(!tui_parsed.is_exec_mode());
+        assert!(!tui_parsed.has_exec_only_flags());
+
+        assert!(parse_cli_args_from(["--trace-jsonl".into(), "   ".into()]).is_err());
+        assert!(parse_cli_args_from(["--trace-jsonl".into()]).is_err());
+        assert!(format_help_text().contains("--trace-jsonl <path>"));
+        assert!(format_help_text().contains("MIZAR_TRACE_JSONL"));
+        assert!(format_help_text().contains("mizar rpc [OPTIONS]"));
+        assert!(format_help_text().contains("mizar serve [OPTIONS]"));
     }
 }

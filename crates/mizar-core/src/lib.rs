@@ -32,5 +32,5 @@ pub use system_prompt::{
 pub use trajectory::{
     GuardRepeatEvent, RepeatGuardConfig, RepeatGuardValidationError, TrajectoryAnomalyEvent,
     TrajectoryConfig, TrajectoryEventEmitted, TrajectoryExport, TrajectoryRuntime,
-    install_repeat_guard, validate_repeat_guard_config,
+    install_repeat_guard, prepare_trace_jsonl_file, validate_repeat_guard_config,
 };

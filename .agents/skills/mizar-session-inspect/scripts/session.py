@@ -31,6 +31,14 @@ SURFACE_KINDS = {
     "bash-execution",
 }
 
+TURN_EVENT_KINDS = {
+    "turn-start",
+    "step-start",
+    "step-end",
+    "tool-call",
+    "turn-end",
+}
+
 HEADER_FIELDS = (
     "id, format_version, cwd, title, parent_id, fork_seq, "
     "created_at_ms, updated_at_ms, event_count, surface_count, compacted_up_to_seq"
@@ -255,6 +263,8 @@ def turn_rollup(entries):
                 "tools": 0,
                 "errors": 0,
                 "unclosed": 0,
+                "error": None,
+                "summary": None,
             }
             order.append(turn_no)
         turn = turns[turn_no]
@@ -263,11 +273,13 @@ def turn_rollup(entries):
         return turn
     for entry in entries:
         kind = entry["kind"]
-        if kind in SURFACE_KINDS:
+        if kind in SURFACE_KINDS or kind not in TURN_EVENT_KINDS:
             continue
         detail = entry["payload"].get("detail") or {}
         turn_no = detail.get("turn")
         if turn_no is None:
+            if current_turn <= 0:
+                continue
             turn_no = current_turn
         else:
             current_turn = turn_no
@@ -282,21 +294,36 @@ def turn_rollup(entries):
                 turn["start"] = entry["ts"]
         elif kind == "step-start":
             turn["steps"].append(
-                {"step": detail.get("step"), "start": entry["ts"], "end": None, "outcome": None}
+                {
+                    "step": detail.get("step"),
+                    "start": entry["ts"],
+                    "end": None,
+                    "outcome": None,
+                    "error": None,
+                }
             )
         elif kind == "step-end":
             for step in reversed(turn["steps"]):
                 if step["end"] is None:
                     step["end"] = entry["ts"]
                     step["outcome"] = detail.get("outcome")
+                    err = detail.get("error")
+                    if err:
+                        step["error"] = err
                     if detail.get("outcome") == "error":
                         turn["errors"] += 1
+                        if err:
+                            turn["error"] = err
                     break
         elif kind == "tool-call":
             turn["tools"] += 1
         elif kind == "turn-end":
             turn["end"] = entry["ts"]
             turn["reason"] = detail.get("reason")
+            if detail.get("error"):
+                turn["error"] = detail["error"]
+            if isinstance(detail.get("summary"), dict):
+                turn["summary"] = detail["summary"]
     return turns, order
 
 
@@ -362,10 +389,14 @@ def render_header(conn, header, entries, all_entries, out=None):
             )
         emit("trace     %s" % " · ".join(parts))
         errored = [t for t in order if turns[t]["reason"] == "error"]
-        if errored:
+        with_error = [t for t in errored if turns[t]["error"]]
+        without_error = [t for t in errored if not turns[t]["error"]]
+        for t in with_error:
+            emit("error     turn %s: %s" % (t, one_line(turns[t]["error"], 120)))
+        if without_error:
             emit(
                 "          注意：%d 个 turn 以 error 结束，但 turn-end / step-end 只落盘结局字符串，"
-                "错误文本本身不在库里" % len(errored)
+                "错误文本本身不在库里" % len(without_error)
             )
     else:
         emit("trace     (无轨迹事件)")
@@ -443,9 +474,14 @@ def describe_entry(entry, width):
             one_line(payload.get("command", ""), width),
             payload.get("exit_code"),
         )
-    if kind == "tool-result-prune":
-        return "pruned %d 条" % len(payload.get("pruned") or [])
     detail = payload.get("detail") or {}
+    if kind == "tool-result-prune":
+        if "target_seq" in detail:
+            return "seq #%s → %s" % (
+                detail.get("target_seq"),
+                one_line(detail.get("notice", ""), max(20, width - 16)),
+            )
+        return "pruned %d 条" % len(payload.get("pruned") or [])
     if kind in ("step-start", "first-token"):
         return "turn %s step %s%s" % (
             detail.get("turn"),
@@ -456,7 +492,15 @@ def describe_entry(entry, width):
             else "",
         )
     if kind == "step-end":
-        return "turn %s step %s → %s" % (detail.get("turn"), detail.get("step"), detail.get("outcome"))
+        base = "turn %s step %s → %s" % (
+            detail.get("turn"),
+            detail.get("step"),
+            detail.get("outcome"),
+        )
+        err = detail.get("error")
+        if err:
+            return "%s | %s" % (base, one_line(err, max(20, width - len(base) - 3)))
+        return base
     if kind == "tool-call":
         return "%s %s" % (detail.get("name"), one_line(detail.get("arguments", ""), max(20, width - 20)))
     if kind == "tool-outcome":
@@ -464,8 +508,36 @@ def describe_entry(entry, width):
             detail.get("tool_call_id", "?")[:16],
             "被拦截" if detail.get("blocked") else "放行",
         )
+    if kind == "approval":
+        return "%s (%s) → %s via %s" % (
+            detail.get("tool") or "?",
+            (detail.get("tool_call_id") or "?")[:16],
+            detail.get("decision") or "?",
+            detail.get("resolved_by") or "?",
+        )
     if kind == "turn-end":
-        return "turn %s → %s" % (detail.get("turn"), detail.get("reason"))
+        base = "turn %s → %s" % (detail.get("turn"), detail.get("reason"))
+        summary = detail.get("summary")
+        if isinstance(summary, dict):
+            s_bits = []
+            dur = summary.get("durationMs")
+            if dur is not None:
+                s_bits.append(fmt_duration(dur))
+            files = summary.get("filesChanged") or []
+            if files:
+                s_bits.append("%d files" % len(files))
+            cmds = summary.get("commandsRun") or 0
+            if cmds:
+                s_bits.append("%d cmds" % cmds)
+            errs = summary.get("toolErrors") or 0
+            if errs:
+                s_bits.append("%d err" % errs)
+            if s_bits:
+                base = "%s · %s" % (base, " · ".join(s_bits))
+        err = detail.get("error")
+        if err:
+            return "%s | %s" % (base, one_line(err, max(20, width - len(base) - 3)))
+        return base
     if kind == "turn-start":
         return "turn %s" % detail.get("turn")
     if kind == "compaction-start":
@@ -701,10 +773,18 @@ def cmd_stats(conn, args):
         turn = turns[turn_no]
         if turn["start"] and turn["end"]:
             span = fmt_duration(turn["end"] - turn["start"])
+        elif isinstance(turn.get("summary"), dict) and turn["summary"].get("durationMs") is not None:
+            span = fmt_duration(turn["summary"]["durationMs"])
         elif turn["start"]:
             span = "进行中"
         else:
             span = "-"
+        outcome_col = turn["reason"] or "未结束"
+        if turn["error"]:
+            outcome_col = "%s: %s" % (
+                outcome_col,
+                one_line(turn["error"], max(20, args.width - 52)),
+            )
         print(
             "%-6s %-10s %-10s %6d %6d %7s  %s"
             % (
@@ -714,10 +794,23 @@ def cmd_stats(conn, args):
                 len(turn["steps"]),
                 turn["tools"],
                 span,
-                turn["reason"] or "未结束",
+                outcome_col,
             )
         )
     print("")
+    turn_errors = []
+    for turn_no in order:
+        turn = turns[turn_no]
+        for step in turn["steps"]:
+            if step.get("error"):
+                turn_errors.append(("turn %s step %s" % (turn_no, step.get("step")), step["error"]))
+        if turn.get("error") and not any(s.get("error") == turn["error"] for s in turn["steps"]):
+            turn_errors.append(("turn %s" % turn_no, turn["error"]))
+    if turn_errors:
+        print("error")
+        for label, err in turn_errors:
+            print("  %s — %s" % (label, one_line(err, max(40, args.width - 24))))
+        print("")
     if models:
         print("model     %s" % ", ".join(models))
     print(
@@ -745,6 +838,44 @@ def cmd_stats(conn, args):
         print("%-14s %5s %10s %5s" % ("tool", "次数", "输出量", "错误"))
         for name, bucket in sorted(histogram.items(), key=lambda kv: -kv[1]["n"]):
             print("%-14s %5d %10s %5d" % (name, bucket["n"], fmt_size(bucket["bytes"]), bucket["err"]))
+
+    summaries = [(t, turns[t]["summary"]) for t in order if isinstance(turns[t].get("summary"), dict)]
+    if summaries:
+        print("")
+        print("turn-summary")
+        for turn_no, summary in summaries:
+            files = summary.get("filesChanged") or []
+            files_desc = ", ".join(files[:4])
+            if len(files) > 4:
+                files_desc += " (+%d)" % (len(files) - 4)
+            print(
+                "  turn %s: %s · files=%d%s · cmds=%d · tool_err=%d"
+                % (
+                    turn_no,
+                    fmt_duration(summary.get("durationMs") or 0),
+                    len(files),
+                    (" [%s]" % files_desc) if files_desc else "",
+                    summary.get("commandsRun") or 0,
+                    summary.get("toolErrors") or 0,
+                )
+            )
+
+    approvals = [e for e in entries if e["kind"] == "approval"]
+    if approvals:
+        print("")
+        print("approval")
+        for entry in approvals:
+            detail = entry["payload"].get("detail") or {}
+            print(
+                "  seq %s %s (%s) → %s via %s"
+                % (
+                    entry["seq"],
+                    detail.get("tool") or "?",
+                    (detail.get("tool_call_id") or "?")[:16],
+                    detail.get("decision") or "?",
+                    detail.get("resolved_by") or "?",
+                )
+            )
 
     anomalies = [e for e in entries if e["kind"] == "anomaly"]
     if anomalies:

@@ -19,8 +19,9 @@ use tokio_util::sync::CancellationToken;
 use crate::compaction::budget::{
     ContextBudget, compute_budget, estimate_session_context_tokens, estimate_text_tokens,
 };
-use crate::compaction::digest::{build_compaction_digest, plan_compaction_cut};
+use crate::compaction::digest::{build_compaction_digest, plan_compaction_cut_with_pruned};
 use crate::compaction::guards::FileGuardTracker;
+use crate::compaction::pruning::{TailPruneOptions, prune_session_tail};
 use crate::compaction::summarizer::{SummarizeParams, generate_checkpoint_summary};
 use crate::compaction::{
     CompactionConfig, CompactionEndEvent, CompactionError, CompactionOutcome,
@@ -293,34 +294,77 @@ impl CompactionRuntime {
         })
     }
 
-    /// 结合 `LlmRuntime::provider_infos()` 查表推导当前路由的模型窗口与最大输出；
+    /// 结合 `LlmRuntime::provider_infos()` 查表推导当前路由的模型窗口、最大输出与是否属于前缀绑定思考模型；
     /// 当明确指定 `model` 但未在模型表中命中时直接回退 `default_window`，不借用其它模型窗口。
+    fn resolve_provider_and_model(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> (Option<String>, Option<mizar_llm::ModelInfo>) {
+        let providers = self.llm.provider_infos();
+        let found = match provider {
+            Some(pid) => providers.iter().find(|p| p.id == pid).map(|p| {
+                let m = match model {
+                    Some(mid) => p.models.iter().find(|m| m.id == mid).cloned(),
+                    None => p.models.first().cloned(),
+                };
+                (p.protocol.clone(), m)
+            }),
+            None => match model {
+                Some(mid) => providers.iter().find_map(|p| {
+                    p.models
+                        .iter()
+                        .find(|m| m.id == mid)
+                        .map(|m| (p.protocol.clone(), Some(m.clone())))
+                }),
+                None => providers
+                    .first()
+                    .map(|p| (p.protocol.clone(), p.models.first().cloned())),
+            },
+        };
+        match found {
+            Some((proto, m)) => (Some(proto), m),
+            None => (None, None),
+        }
+    }
+
     fn resolve_model_limits(
         &self,
         provider: Option<&str>,
         model: Option<&str>,
         default_window: u64,
     ) -> (u64, Option<u32>) {
-        let providers = self.llm.provider_infos();
-        let chosen_model = match provider {
-            Some(pid) => providers
-                .iter()
-                .find(|p| p.id == pid)
-                .and_then(|p| match model {
-                    Some(mid) => p.models.iter().find(|m| m.id == mid),
-                    None => p.models.first(),
-                }),
-            None => match model {
-                Some(mid) => providers
-                    .iter()
-                    .find_map(|p| p.models.iter().find(|m| m.id == mid)),
-                None => providers.first().and_then(|p| p.models.first()),
-            },
-        };
-        if let Some(m) = chosen_model {
+        if let (_, Some(m)) = self.resolve_provider_and_model(provider, model) {
             return (m.context_window.unwrap_or(default_window), m.max_tokens);
         }
         (default_window, None)
+    }
+
+    fn is_prefix_bound_thinking(
+        &self,
+        session: &Session,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> bool {
+        if let (Some(proto), Some(m)) = self.resolve_provider_and_model(provider, model)
+            && proto == "anthropic-messages"
+            && (m.force_adaptive_thinking || !m.reasoning_efforts.is_empty())
+        {
+            return true;
+        }
+        session.with_visible_entries(|entries| {
+            entries.iter().any(|entry| {
+                matches!(
+                    &entry.event,
+                    mizar_session::SessionEvent::Assistant { replay: Some(r), .. }
+                        if r.protocol == "anthropic-messages"
+                            && r.response.get("prefixDigest").is_some()
+                            && r.blocks.iter().any(|b| {
+                                b.get("signature").is_some() || b.get("redacted").is_some()
+                            })
+                )
+            })
+        })
     }
 
     fn compute_session_budget(
@@ -396,7 +440,28 @@ impl CompactionRuntime {
             return;
         }
         let cfg = self.config();
-        if !cfg.enabled || !cfg.auto_compact {
+        if !cfg.enabled {
+            return;
+        }
+        if (cfg.supersede_reads || cfg.drop_useless)
+            && let Ok(_lock) = self.try_lock_session(&ev.session.id)
+        {
+            let workspace = ev.session.header().cwd;
+            let opts = TailPruneOptions {
+                supersede_reads: cfg.supersede_reads,
+                drop_useless: cfg.drop_useless,
+                warm_suffix_tokens: cfg.prune_warm_suffix_tokens,
+                idle_flush_ms: cfg.prune_idle_flush_ms,
+                is_prefix_bound_thinking: self.is_prefix_bound_thinking(
+                    &ev.session,
+                    ev.provider.as_deref(),
+                    ev.model.as_deref(),
+                ),
+                now_ms: None,
+            };
+            prune_session_tail(&ev.session, workspace.as_deref(), &opts);
+        }
+        if !cfg.auto_compact {
             return;
         }
         let budget = self.compute_session_budget(ev.provider.as_deref(), ev.model.as_deref(), &cfg);
@@ -544,6 +609,7 @@ impl CompactionRuntime {
         // 切分规划（单阶段检查点，不再做 L1 剪枝与 Re-plan 二次硬切）
         let visible = session.visible_log();
         let last_seq = session.last_seq();
+        let pruned_map = session.pruned_map();
 
         let keep_target = match trigger {
             CompactionTrigger::Manual => (budget.keep_recent_tokens / 2).max(512),
@@ -551,14 +617,20 @@ impl CompactionRuntime {
             CompactionTrigger::AutoThreshold => budget.keep_recent_tokens,
         };
 
-        let cut_opt =
-            plan_compaction_cut(&visible, last_seq, keep_target, force_overflow).or_else(|| {
-                if matches!(trigger, CompactionTrigger::Manual) {
-                    plan_compaction_cut(&visible, last_seq, 0, true)
-                } else {
-                    None
-                }
-            });
+        let cut_opt = plan_compaction_cut_with_pruned(
+            &visible,
+            last_seq,
+            keep_target,
+            force_overflow,
+            &pruned_map,
+        )
+        .or_else(|| {
+            if matches!(trigger, CompactionTrigger::Manual) {
+                plan_compaction_cut_with_pruned(&visible, last_seq, 0, true, &pruned_map)
+            } else {
+                None
+            }
+        });
 
         let Some(cut) = cut_opt else {
             let report = CompactionReport {
@@ -675,7 +747,7 @@ impl CompactionRuntime {
         // 落盘 Compaction 检查点
         let tokens_after_est = resident_overhead + checkpoint_tokens + cut.kept_tokens;
 
-        // 压后联动：清空本会话临时激活的延迟工具（recall 会由其事件监听重新激活）
+        // 压后联动：清空本会话临时激活的延迟工具
         self.tools.reset_session_activations(&session.id);
 
         session.compact_at(
