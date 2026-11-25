@@ -106,7 +106,7 @@ pub struct SettingsConfig {
     #[serde(alias = "defaultThinkingLevel")]
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_steps: Option<usize>,
-    pub persona: Option<String>,
+    pub personality: Option<String>,
     /// `"all"` | `"minimal"` | `"read-only"`
     pub tools_preset: Option<String>,
     pub tools: Option<Vec<String>>,
@@ -153,8 +153,8 @@ impl SettingsConfig {
         if other.max_steps.is_some() {
             self.max_steps = other.max_steps;
         }
-        if other.persona.is_some() {
-            self.persona = other.persona;
+        if other.personality.is_some() {
+            self.personality = other.personality;
         }
         if other.tools_preset.is_some() {
             self.tools_preset = other.tools_preset;

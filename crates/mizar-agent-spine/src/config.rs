@@ -175,8 +175,8 @@ pub fn load_mizar_config_with_global(
 
 impl LoadedMizarConfig {
     pub fn apply_to_spine(&self, spine: &mut AgentSpineConfig) {
-        if let Some(persona) = &self.settings.persona {
-            spine.persona = Some(persona.clone());
+        if let Some(personality) = &self.settings.personality {
+            spine.personality = Some(personality.clone());
         }
         if let Some(provider) = &self.settings.default_provider {
             spine.agent.provider = Some(provider.clone());

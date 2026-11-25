@@ -208,7 +208,7 @@ pub fn mount_reply_guidance_section(
     let prompt = reply_guidance_prompt();
     Ok(Some(sp.section(PromptSection::new(
         "tui_reply_guidance",
-        95,
+        50,
         move || Some(prompt.clone()),
     ))))
 }

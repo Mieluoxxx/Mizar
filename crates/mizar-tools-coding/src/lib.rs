@@ -137,17 +137,6 @@ pub fn build_tools_guide(declared: &[ToolRuntimeInfo]) -> Option<String> {
     for g in extra_guidelines {
         usage.push(format!("- {g}"));
     }
-    if has("edit") || has("write") || has("bash") {
-        usage.push(
-            "- Batch independent tool calls in one turn: issue parallel `read`, `grep`, `find`, cross-file `edit`/`write`, and independent `bash` calls together when they have no data dependency. Run calls sequentially only when a later step depends on an earlier result."
-                .into(),
-        );
-    } else {
-        usage.push(
-            "- Batch independent read-only tool calls (`read`, `grep`, `find`) in one turn when they have no data dependency. Run calls sequentially only when a later step depends on an earlier result."
-                .into(),
-        );
-    }
 
     if !usage.is_empty() {
         lines.push("Tool usage:".into());
@@ -198,7 +187,7 @@ impl Plugin for CodingToolsPlugin {
                             Ok::<_, cordis::CordisError>(Some(sp.section(
                                 PromptSection::new_for_session(
                                     "coding_tools",
-                                    20,
+                                    30,
                                     move |session_id| {
                                         let declared = tools.list_declared_infos(session_id);
                                         build_tools_guide(&declared)

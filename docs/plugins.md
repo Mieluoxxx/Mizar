@@ -28,7 +28,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-llm`** | `LlmRuntime` | `"llm"` | 抽象 LLM 服务：重导出 `mizar-llm-types`，提供 `llm/stream` 拦截通道并管理协议适配器注册（无内置 HTTP 栈） | 无 | `cordis`、`mizar-llm-types` |
 | **`mizar-session`** | `SessionStore` | `"sessions"` | 会话事件日志管理：以只追加日志保存对话、工具调用与回放状态，推导出发往模型的消息列表，并定义 `SessionPersistence` 持久化 trait 占位 `"sessionPersistence"` | 无 | `cordis`、`mizar-llm` |
-| **`mizar-system-prompt`** | `SystemPrompt` | `"systemPrompt"` | 系统提示词动态组装：支持多插件按 `order` 贡献段落并自动拼接（内置 `persona` 与当前日期） | 无 | `cordis` |
+| **`mizar-system-prompt`** | `SystemPrompt` | `"systemPrompt"` | 系统提示词动态组装：支持多插件按 `order` 贡献段落并自动拼接（内置 `identity (0)` / `engineering (10)` / `personality (20)` 与可选 `runtime_protocol (40)`） | 无 | `cordis` |
 | **`mizar-tools`** | `ToolRuntime` | `"tools"` | 工具注册表与三段执行管线（`tools/pre-execute` → `tools/execute` → `tools/post-execute`），生成工具 Schema 并统一派发执行；定义 `ToolExposure` / `ToolExecutionMode` / `ToolAnnotations` | 无 | `cordis`、`mizar-llm` |
 
 ---
@@ -83,7 +83,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | Crate | 插件结构体 | 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-tool-search`** | `ToolSearchPlugin` | `"tool-search"` | `tool_search` | `["tools"]` | **BM25 工具发现**：对 `Codemode` / `Deferred` 暴露等级的工具建索引（名称权重 4.0、命名空间 2.0），命中后按会话（或全局）激活，使其出现在下一次模型调用的声明中。存在可搜索工具时自动激活，`default_limit` 默认 8 | `cordis`、`mizar-tools` |
-| **`mizar-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎（固定核心工具，受 Gate 2 自保护不可禁用）**：默认常驻激活，把多个工具调用折叠成一次脚本执行，中间结果不进上下文。自动在 `Direct` 工具描述追加 `Codemode: tools.<name>(args)` 引导并在系统提示词注入 `Promise.allSettled` 批处理规则；提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s，支持跨异步嵌套工具调用取消传播）与内联预算（默认 3 000 字符，`DEFAULT_CODEMODE_INLINE_BUDGET`）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`mizar-tool-search`、`mizar-tools` |
+| **`mizar-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎（固定核心工具，受 Gate 2 自保护不可禁用）**：默认常驻激活，把多个工具调用折叠成一次脚本执行，中间结果不进上下文。自动在 `Direct` 工具描述追加 `Codemode: tools.<name>(args)` 引导；提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s，支持跨异步嵌套工具调用取消传播）与内联预算（默认 3 000 字符，`DEFAULT_CODEMODE_INLINE_BUDGET`）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`mizar-tool-search`、`mizar-tools` |
 
 ### 4.4 MCP 接入
 
@@ -193,7 +193,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `defaultProvider` / `defaultModel` | string | 默认提供方与模型 |
 | `reasoningEffort`（别名 `defaultThinkingLevel`） | string | 思考强度 `off`..`max` |
 | `maxSteps` | number | 单轮工具步数上限，省略则不限 |
-| `persona` | string | 覆盖内置人设 |
+| `personality` | string | 覆写内置性格与沟通语气段（设为 `""` 可关闭，不影响身份定位与工程原则） |
 | `toolsPreset` | `all` / `minimal` / `read-only` | 编码工具预设，对应 `--minimal` / `--read-only` |
 | `tools` | string[] | 工具白名单（支持 `*` 通配） |
 | `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |

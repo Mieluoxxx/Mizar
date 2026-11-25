@@ -84,3 +84,13 @@
 - **可观测结果**：
   - 三种协议均能正确流式接收文本、推理与工具调用；MCP 工具可被发现、调用且暴露策略（hidden/codemode/deferred）生效。
   - 脚本异常与超时会迅速干净地返回错误给模型，不会拖垮或卡死宿主进程。
+
+## S8. 系统提示词分层组装与 `personality` 独立覆写（Agent）
+
+- **前置条件**：工作区根目录存在 `AGENTS.md`，分别准备默认 `settings.json`、自定义 `"personality"` 与空字符串 `"personality": ""` 三组配置。
+- **操作步骤**：
+  1. 在三组配置下分别通过 `mizar exec` 运行真实请求，观测发出给模型的 system prompt 组装结果（如配合 `--trace-out` 或可控上游端点）。
+  2. 对比默认与覆写配置下各段落存在性与前后相对顺序。
+- **可观测结果**：
+  - 默认配置下依次呈现 `identity` → `engineering`（第一性原理、奥卡姆剃刀、并行/`codemode`）→ `personality` → `coding_tools` → `runtime_protocol`，且项目 `AGENTS.md`（`<project_instructions>`）位于全局静态前缀之后的尾部。
+  - 覆写 `"personality"` 或设为空串 `""` 时，仅性格段落变更或消失，`identity`、`engineering` 与 `runtime_protocol` 完整保留且前缀顺序不变。

@@ -94,7 +94,7 @@ pub enum AgentToolsMode {
 pub struct AgentSpineConfig {
     /// 文件工具允许访问的根目录。
     pub workspace: PathBuf,
-    pub persona: Option<String>,
+    pub personality: Option<String>,
     pub agent: AgentLoopConfig,
     pub tools_mode: AgentToolsMode,
     /// 可选：全局工具白名单（支持 `*` 通配）。
@@ -131,7 +131,7 @@ impl AgentSpineConfig {
 
         Self {
             workspace: workspace.into(),
-            persona: None,
+            personality: None,
             agent: AgentLoopConfig::default(),
             tools_mode: default_mode,
             include_tools: None,
@@ -156,7 +156,7 @@ impl AgentSpineConfig {
         let ws = workspace.into();
         Self {
             workspace: ws.clone(),
-            persona: Some(mizar_system_prompt::DEFAULT_PERSONA.to_string()),
+            personality: None,
             agent: AgentLoopConfig::default(),
             tools_mode: AgentToolsMode::Coding {
                 coding: CodingToolsConfig::new(&ws),
@@ -261,7 +261,9 @@ impl Plugin for AgentSpinePlugin {
             ctx.try_plugin(
                 SystemPrompt::plugin(),
                 SystemPromptConfig {
-                    persona: config.persona,
+                    identity: None,
+                    engineering_principles: None,
+                    personality: config.personality,
                     runtime_protocol: Some(DEFAULT_RUNTIME_PROTOCOL.to_string()),
                 },
             )?;

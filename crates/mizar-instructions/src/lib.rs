@@ -2,7 +2,7 @@
 //!
 //! - 全局目录：`~/.mizar/`（支持 `MIZAR_HOME` 覆盖）与 `~/.agents/`（支持 `MIZAR_AGENTS_HOME` 覆盖）
 //! - 项目祖先链：从 `project_root`（向上查找 `.git`）到 `workspace`，按 `AGENTS.md` / `CLAUDE.md` 与 `.local.md` 顺序加载
-//! - 静态注入：仅在启动期读取一次并通过 `SystemPrompt::section` 注入（`order = 30`），随插件卸载自动清理
+//! - 静态注入：仅在启动期读取一次并通过 `SystemPrompt::section` 注入（`order = 80`），随插件卸载自动清理
 
 pub mod config;
 pub mod digest;
@@ -128,7 +128,7 @@ impl Service for AgentInstructions {
                     c.effect("instructions.system-prompt", move || {
                         Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
                             AGENT_INSTRUCTIONS_SECTION_ID,
-                            30,
+                            80,
                             move || {
                                 let svc = weak.upgrade()?;
                                 if !svc.is_enabled() {
