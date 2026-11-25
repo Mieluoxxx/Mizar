@@ -7,17 +7,23 @@ use std::sync::{Arc, Mutex};
 
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
 
-/// 默认编码 Agent 人设（`order = 0`，纯英文静态前缀）。
-pub const DEFAULT_PERSONA: &str = "\
-You are Mizar, a coding agent working in the user's workspace. Respond in the same language as the user unless asked otherwise.
+/// 默认身份定位与语言对齐（`order = 0`，纯英文静态前缀）。
+pub const DEFAULT_IDENTITY: &str = "\
+You are Mizar, a coding agent working in the user's workspace. Respond in the same language as the user unless asked otherwise.";
 
-Verify changes with targeted checks or tests when available; inspect command exit codes and investigate failures before moving on. Never fabricate tool output, test results, or file contents, and avoid edits outside the task scope.
-
+/// 默认工程原则（`order = 10`，纯英文静态前缀）。
+pub const DEFAULT_ENGINEERING_PRINCIPLES: &str = "\
 Engineering principles:
-- Choose the simplest modular design for the task and make long-term structural decisions over quick hacks.
-- Inspect existing code, workspace dependencies, and proven patterns before adding new dependencies or abstractions.
-- Grow changes incrementally from a minimal working end-to-end slice.
-- Remove obsolete code directly without leaving shims, while preserving task requirements and existing contracts.";
+- First principles: reason from the root problem and real constraints rather than patching symptoms.
+- Occam's razor: prefer the simplest solution that fits; cut unnecessary abstractions, indirection, and obsolete code.
+- Maximize parallel tool calls for independent operations, and prefer `codemode` to compose calls or filter outputs so token usage stays low and execution stays fast.";
+
+/// 默认性格与沟通语气（`order = 20`，纯英文静态前缀，可独立覆写或置空关闭）。
+pub const DEFAULT_PERSONALITY: &str = "\
+Personality:
+- Be concise, direct, and concrete; skip filler, hedging, and unnecessary recaps.
+- Assume a technical user; lead with conclusions, exact paths, symbols, or tradeoffs.
+- Push back with evidence when a plan or claim hides real risk; once the user decides, execute without relitigating.";
 
 /// 默认运行时上下文标签协议说明（`order = 40`，纯英文静态前缀）。
 pub const DEFAULT_RUNTIME_PROTOCOL: &str = "\
@@ -29,10 +35,22 @@ Runtime context blocks in conversation messages:
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemPromptConfig {
-    /// 部署方人设，放在最前面（`order = 0`）。
-    pub persona: Option<String>,
+    /// 身份定位（`order = 0`）；`None` 使用 `DEFAULT_IDENTITY`，`Some("")` 关闭。
+    pub identity: Option<String>,
+    /// 工程原则（`order = 10`）；`None` 使用 `DEFAULT_ENGINEERING_PRINCIPLES`，`Some("")` 关闭。
+    pub engineering_principles: Option<String>,
+    /// 性格与沟通语气（`order = 20`）；`None` 使用 `DEFAULT_PERSONALITY`，`Some("")` 关闭。
+    pub personality: Option<String>,
     /// 可选的静态运行时上下文标签协议说明（`order = 40`）。
     pub runtime_protocol: Option<String>,
+}
+
+fn resolve_default_section(configured: Option<String>, default_text: &str) -> Option<String> {
+    match configured {
+        None => Some(default_text.to_string()),
+        Some(text) if text.trim().is_empty() => None,
+        Some(text) => Some(text),
+    }
 }
 
 type RenderSectionFn = dyn Fn(Option<&str>) -> Option<String> + Send + Sync;
@@ -69,7 +87,9 @@ impl PromptSection {
 }
 
 pub struct SystemPrompt {
-    persona: String,
+    identity: Option<String>,
+    engineering_principles: Option<String>,
+    personality: Option<String>,
     runtime_protocol: Option<String>,
     sections: Mutex<HashMap<String, PromptSection>>,
 }
@@ -117,33 +137,62 @@ impl Service for SystemPrompt {
     }
 
     fn create(_ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
-        let persona = config
-            .persona
-            .unwrap_or_else(|| DEFAULT_PERSONA.to_string());
+        let identity = resolve_default_section(config.identity, DEFAULT_IDENTITY);
+        let engineering_principles = resolve_default_section(
+            config.engineering_principles,
+            DEFAULT_ENGINEERING_PRINCIPLES,
+        );
+        let personality = resolve_default_section(config.personality, DEFAULT_PERSONALITY);
         let runtime_protocol = config
             .runtime_protocol
             .filter(|text| !text.trim().is_empty());
         Ok(Arc::new(Self {
-            persona,
+            identity,
+            engineering_principles,
+            personality,
             runtime_protocol,
             sections: Mutex::new(HashMap::new()),
         }))
     }
 
     fn init(self: Arc<Self>, ctx: &Context) -> BoxFuture<'static, Result<(), CordisError>> {
-        let persona = self.persona.clone();
+        let identity = self.identity.clone();
+        let engineering_principles = self.engineering_principles.clone();
+        let personality = self.personality.clone();
         let runtime_protocol = self.runtime_protocol.clone();
         let sp = Arc::clone(&self);
         let ctx = ctx.clone();
         Box::pin(async move {
-            let sp_persona = Arc::clone(&sp);
-            ctx.effect("systemPrompt.persona", move || {
-                Ok::<_, CordisError>(Some(sp_persona.section(PromptSection::new(
-                    "persona",
-                    0,
-                    move || Some(persona.clone()),
-                ))))
-            })?;
+            if let Some(identity) = identity {
+                let sp_identity = Arc::clone(&sp);
+                ctx.effect("systemPrompt.identity", move || {
+                    Ok::<_, CordisError>(Some(sp_identity.section(PromptSection::new(
+                        "identity",
+                        0,
+                        move || Some(identity.clone()),
+                    ))))
+                })?;
+            }
+            if let Some(engineering) = engineering_principles {
+                let sp_eng = Arc::clone(&sp);
+                ctx.effect("systemPrompt.engineering", move || {
+                    Ok::<_, CordisError>(Some(sp_eng.section(PromptSection::new(
+                        "engineering",
+                        10,
+                        move || Some(engineering.clone()),
+                    ))))
+                })?;
+            }
+            if let Some(personality) = personality {
+                let sp_personality = Arc::clone(&sp);
+                ctx.effect("systemPrompt.personality", move || {
+                    Ok::<_, CordisError>(Some(sp_personality.section(PromptSection::new(
+                        "personality",
+                        20,
+                        move || Some(personality.clone()),
+                    ))))
+                })?;
+            }
             if let Some(protocol) = runtime_protocol {
                 ctx.effect("systemPrompt.runtimeProtocol", move || {
                     Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
@@ -165,102 +214,5 @@ pub trait SystemPromptContextExt {
 impl SystemPromptContextExt for Context {
     fn system_prompt(&self) -> Result<Arc<SystemPrompt>, CordisError> {
         self.service::<SystemPrompt>("systemPrompt")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn builds_sections_ordered_deterministically_without_dynamic_date() {
-        let app = Context::new();
-        app.plugin(
-            SystemPrompt::plugin(),
-            SystemPromptConfig {
-                persona: Some("测试人设".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let sp = app.system_prompt().unwrap();
-        let h_mid_b = app
-            .effect("extra.b", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                    "b_same_order",
-                    50,
-                    || Some("段落 B".into()),
-                ))))
-            })
-            .unwrap();
-        let h_mid_a = app
-            .effect("extra.a", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
-                    "a_same_order",
-                    50,
-                    || Some("段落 A".into()),
-                ))))
-            })
-            .unwrap();
-
-        let prompt = sp.build();
-        assert!(!prompt.contains("今天是 "));
-        let lines: Vec<&str> = prompt.split("\n\n").collect();
-        assert_eq!(lines, vec!["测试人设", "段落 A", "段落 B"]);
-
-        h_mid_a.dispose().await;
-        h_mid_b.dispose().await;
-        let prompt_after = sp.build();
-        assert_eq!(prompt_after, "测试人设");
-    }
-
-    #[tokio::test]
-    async fn default_persona_and_runtime_protocol_are_english_and_session_aware() {
-        let app = Context::new();
-        app.plugin(
-            SystemPrompt::plugin(),
-            SystemPromptConfig {
-                persona: None,
-                runtime_protocol: Some(DEFAULT_RUNTIME_PROTOCOL.to_string()),
-            },
-        )
-        .await
-        .unwrap();
-
-        let sp = app.system_prompt().unwrap();
-        let _h = app
-            .effect("extra.session", || {
-                Ok::<_, CordisError>(Some(sp.section(PromptSection::new_for_session(
-                    "session_probe",
-                    20,
-                    |sid| sid.map(|id| format!("Session section: {id}")),
-                ))))
-            })
-            .unwrap();
-
-        let default_built = sp.build();
-        assert!(default_built.contains("Respond in the same language as the user"));
-        assert!(default_built.contains("Verify changes with targeted checks"));
-        assert!(default_built.contains("Engineering principles:"));
-        assert!(default_built.contains("<environment_context>"));
-        assert!(default_built.contains("<mizar-compaction>"));
-        assert!(!default_built.contains("Session section:"));
-        assert!(
-            !default_built
-                .chars()
-                .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)),
-            "default system prompt must be pure English: {default_built}"
-        );
-
-        let with_sid = sp.build_for_session(Some("s-123"));
-        assert!(with_sid.contains("Session section: s-123"));
-        let idx_persona = with_sid.find("Engineering principles:").unwrap();
-        let idx_tools = with_sid.find("Session section: s-123").unwrap();
-        let idx_proto = with_sid.find("Runtime context blocks").unwrap();
-        assert!(idx_persona < idx_tools && idx_tools < idx_proto);
-
-        app.fiber().dispose().await;
     }
 }

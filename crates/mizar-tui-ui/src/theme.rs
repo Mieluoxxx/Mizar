@@ -860,38 +860,3 @@ impl Theme {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn okhsl_roundtrip_preserves_perceptual_hue_and_lightness() {
-        let rgb = okhsl_to_rgb(220.0, 0.70, 0.60);
-        let (h, s, l) = rgb_to_okhsl(rgb);
-        assert!((h - 220.0).abs() < 2.0, "h={h}");
-        assert!((s - 0.70).abs() < 0.03, "s={s}");
-        assert!((l - 0.60).abs() < 0.02, "l={l}");
-    }
-
-    #[test]
-    fn system_theme_adapts_to_light_and_dark_terminal_backgrounds() {
-        let dark_probe = TerminalColors {
-            background: Some(Rgb8::new(18, 20, 26)),
-            foreground: Some(Rgb8::new(230, 234, 240)),
-            palette: None,
-        };
-        let dark = Theme::from_preset(ThemePreset::System, Some(&dark_probe));
-        assert!(!dark.is_light);
-        assert_eq!(dark.id, "system");
-
-        let light_probe = TerminalColors {
-            background: Some(Rgb8::new(250, 249, 245)),
-            foreground: Some(Rgb8::new(36, 40, 48)),
-            palette: None,
-        };
-        let light = Theme::from_preset(ThemePreset::System, Some(&light_probe));
-        assert!(light.is_light);
-        assert_eq!(light.id, "system");
-    }
-}

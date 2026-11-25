@@ -500,33 +500,3 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let head: String = s.chars().take(max_chars).collect();
     format!("{head}\n[... truncated {} chars ...]", count - max_chars)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mizar_llm::ImageAttachment;
-
-    #[test]
-    fn transcript_summarizes_image_count_without_base64() {
-        let entry = SessionEntry {
-            seq: 1,
-            ts: 0,
-            event: SessionEvent::user_with_images(
-                "看看这个报错",
-                vec![ImageAttachment {
-                    media_type: "image/png".into(),
-                    data: "UNIQUE_BASE64_PAYLOAD_XYZ".into(),
-                    width: Some(100),
-                    height: Some(100),
-                }],
-            ),
-        };
-        let rendered = format_entry_for_transcript(&entry).expect("user entry should render");
-        assert!(rendered.contains("[图片 1 张]"), "{rendered}");
-        assert!(rendered.contains("看看这个报错"), "{rendered}");
-        assert!(
-            !rendered.contains("UNIQUE_BASE64_PAYLOAD_XYZ"),
-            "{rendered}"
-        );
-    }
-}

@@ -22,5 +22,3 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "time"] }
 tokio-util = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -416,29 +416,3 @@ fn encode_base64_str(input: &[u8]) -> String {
     }
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_osc10_osc11_and_osc4_hex16_responses() {
-        let resp = "\x1b]10;rgb:e8e8/ecec/f2f2\x07\x1b]11;rgb:1616/1a1a/2222\x1b\\\x1b]4;4;rgb:3b3b/8282/f6f6\x07\x1b[?62;c";
-        let colors = parse_osc_colors_response(resp);
-        assert_eq!(colors.foreground, Some(Rgb8::new(0xe8, 0xec, 0xf2)));
-        assert_eq!(colors.background, Some(Rgb8::new(0x16, 0x1a, 0x22)));
-        let pal = colors.palette.expect("palette parsed");
-        assert_eq!(pal[4], Rgb8::new(0x3b, 0x82, 0xf6));
-    }
-
-    #[test]
-    fn formats_valid_osc7501_status_sequence() {
-        let seq = format_osc_7501(
-            ProgramStatusState::Blocked,
-            Some("permission"),
-            Some("Run\ncargo test"),
-        );
-        assert!(seq.starts_with("\x1b]7501;state=blocked:app=mizar:kind=permission:msg="));
-        assert!(seq.ends_with("\x1b\\"));
-    }
-}

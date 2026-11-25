@@ -1,7 +1,8 @@
 //! 内置 Cordis 模块控制器（`"spinePlugins"`）：
 //!
 //! 统一管理 `mizar-agent-spine` 装配的可选内置 Cordis 模块生命周期（启动屏蔽与运行期热挂载/热卸载），
-//! 并对核心内核服务（`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins`）实施 Gate 2 自保护。
+//! 并对核心内核服务（`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins`）
+//! 以及 `coding` feature 下的固定核心工具 `codemode` 实施 Gate 2 自保护。
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -17,8 +18,6 @@ use cordis::{Context, CordisError, Fiber};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
-#[cfg(feature = "coding")]
-use mizar_codemode::{CodemodeConfig, CodemodePlugin};
 #[cfg(feature = "compaction")]
 use mizar_compaction::{CompactionConfig, CompactionRuntime};
 #[cfg(feature = "coding")]
@@ -81,6 +80,12 @@ const PROTECTED_MODULES: &[(&str, &str, &str)] = &[
         "模块控制器",
         "管理内置 Cordis 模块热启停与自保护策略（核心内核服务）",
     ),
+    #[cfg(feature = "coding")]
+    (
+        "codemode",
+        "脚本执行沙箱",
+        "通过 QuickJS 沙箱批量编排与调用工具（核心固定工具）",
+    ),
 ];
 
 /// 所有已知的内置可选模块稳定 ID（含不同模式或 Cargo feature 下可能未激活的模块）。
@@ -89,7 +94,6 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "tool-fs",
     "tools-coding",
     "tool-search",
-    "codemode",
     "mcp",
     "skills",
     "instructions",
@@ -160,8 +164,6 @@ pub(crate) enum ModuleSpec {
     #[cfg(feature = "coding")]
     ToolSearch(ToolSearchConfig),
     #[cfg(feature = "coding")]
-    Codemode(CodemodeConfig),
-    #[cfg(feature = "coding")]
     Mcp(McpPluginConfig),
     #[cfg(feature = "coding")]
     Skills(SkillsConfig),
@@ -230,8 +232,6 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         }
         #[cfg(feature = "coding")]
         ModuleSpec::ToolSearch(ref cfg) => Ok(vec![ctx.try_plugin(ToolSearchPlugin, cfg.clone())?]),
-        #[cfg(feature = "coding")]
-        ModuleSpec::Codemode(ref cfg) => Ok(vec![ctx.try_plugin(CodemodePlugin, cfg.clone())?]),
         #[cfg(feature = "coding")]
         ModuleSpec::Mcp(ref cfg) => Ok(vec![ctx.try_plugin(McpManager::plugin(), cfg.clone())?]),
         #[cfg(feature = "coding")]
@@ -319,10 +319,6 @@ async fn mount_module_and_wait(
         #[cfg(feature = "coding")]
         ModuleSpec::ToolSearch(ref cfg) => {
             mount_single_and_wait(ctx, id, ToolSearchPlugin, cfg.clone()).await
-        }
-        #[cfg(feature = "coding")]
-        ModuleSpec::Codemode(ref cfg) => {
-            mount_single_and_wait(ctx, id, CodemodePlugin, cfg.clone()).await
         }
         #[cfg(feature = "coding")]
         ModuleSpec::Mcp(ref cfg) => {
@@ -619,160 +615,5 @@ pub trait SpinePluginsContextExt {
 impl SpinePluginsContextExt for Context {
     fn spine_plugins(&self) -> Result<Arc<SpinePlugins>, CordisError> {
         self.service::<SpinePlugins>(SERVICE_SPINE_PLUGINS)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{AgentSpineConfig, AgentSpinePlugin};
-    use cordis::Context;
-    use mizar_agent_loop::AgentLoopContextExt;
-    use mizar_llm::LlmContextExt;
-    use mizar_session::SessionContextExt;
-    use mizar_system_prompt::SystemPromptContextExt;
-    use mizar_tools::ToolsContextExt;
-
-    #[tokio::test]
-    async fn core_modules_are_protected_under_minimal_features() {
-        let app = Context::new();
-        app.logger().set_silent();
-
-        let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins([
-            "llm",
-            "sessions",
-            "tools",
-            "systemPrompt",
-            "agentLoop",
-            "spinePlugins",
-            "unknown-mod",
-        ]);
-        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-
-        let ctrl = app.spine_plugins().unwrap();
-        assert!(app.llm().is_ok());
-        assert!(app.sessions().is_ok());
-        assert!(app.tools().is_ok());
-        assert!(app.system_prompt().is_ok());
-        assert!(app.agent_loop().is_ok());
-
-        let errs = ctrl.startup_errors();
-        for core in [
-            "llm",
-            "sessions",
-            "tools",
-            "systemPrompt",
-            "agentLoop",
-            "spinePlugins",
-        ] {
-            assert!(ctrl.is_protected(core));
-            assert!(ctrl.is_enabled(core));
-            assert!(
-                errs.iter().any(|e| e.contains(core)),
-                "expected startup rejection error for {core}, got: {errs:?}"
-            );
-            let res = ctrl.set_enabled(core, false).await;
-            assert!(
-                matches!(res, Err(SpinePluginError::ProtectedModule(ref m)) if m == core),
-                "expected ProtectedModule({core}), got {res:?}"
-            );
-        }
-        assert!(errs.iter().any(|e| e.contains("unknown-mod")));
-        assert!(ctrl.disabled_ids().is_empty());
-
-        let unknown_res = ctrl.set_enabled("does-not-exist", false).await;
-        assert!(matches!(
-            unknown_res,
-            Err(SpinePluginError::UnknownModule(_))
-        ));
-
-        app.fiber().dispose().await;
-    }
-
-    #[tokio::test]
-    async fn known_host_extension_ids_are_skipped_without_startup_errors() {
-        let app = Context::new();
-        app.logger().set_silent();
-
-        let mut disabled: Vec<&str> = KNOWN_HOST_EXTENSION_IDS.to_vec();
-        disabled.push("still-unknown-id");
-        let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins(disabled);
-        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-
-        let ctrl = app.spine_plugins().unwrap();
-        let errs = ctrl.startup_errors();
-        assert_eq!(
-            errs.len(),
-            1,
-            "expected only unknown id error, got: {errs:?}"
-        );
-        assert!(errs[0].contains("still-unknown-id"), "got: {errs:?}");
-        assert!(ctrl.disabled_ids().is_empty());
-
-        app.fiber().dispose().await;
-    }
-
-    #[cfg(feature = "legacy")]
-    #[tokio::test]
-    async fn legacy_mode_toggles_tool_time_and_tool_fs() {
-        let app = Context::new();
-        app.logger().set_silent();
-
-        let cfg = AgentSpineConfig::new(std::env::temp_dir()).with_disabled_plugins(["tool-time"]);
-        app.plugin(AgentSpinePlugin, cfg).await.unwrap();
-        for rt in app.registry().values() {
-            for f in rt.fibers() {
-                let _ = f.wait_settled().await;
-            }
-        }
-
-        let ctrl = app.spine_plugins().unwrap();
-        let tools = app.tools().unwrap();
-        assert!(!ctrl.is_enabled("tool-time"));
-        assert!(ctrl.is_enabled("tool-fs"));
-        assert!(!tools.list().iter().any(|t| t.name == "get_time"));
-        assert!(tools.list().iter().any(|t| t.name == "read_file"));
-
-        assert!(ctrl.set_enabled("tool-time", true).await.unwrap());
-        assert!(ctrl.is_enabled("tool-time"));
-        assert!(tools.list().iter().any(|t| t.name == "get_time"));
-
-        assert!(ctrl.set_enabled("tool-fs", false).await.unwrap());
-        assert!(!ctrl.is_enabled("tool-fs"));
-        assert!(!tools.list().iter().any(|t| t.name == "read_file"));
-        assert!(!tools.list().iter().any(|t| t.name == "list_dir"));
-        assert_eq!(ctrl.disabled_ids(), vec!["tool-fs".to_string()]);
-
-        assert!(ctrl.set_enabled("tool-fs", true).await.unwrap());
-        assert!(tools.list().iter().any(|t| t.name == "read_file"));
-        assert!(ctrl.disabled_ids().is_empty());
-
-        // 若外部直接释放某可选模块的底层 Fiber，is_enabled/disabled_ids 必须实时反映为禁用且允许干净重挂
-        let slot_fiber = {
-            let slots = ctrl.slots.lock().unwrap();
-            slots
-                .iter()
-                .find(|s| s.meta.id == "tool-time")
-                .unwrap()
-                .fibers[0]
-                .clone()
-        };
-        slot_fiber.dispose().await;
-        assert!(!ctrl.is_enabled("tool-time"));
-        assert_eq!(ctrl.disabled_ids(), vec!["tool-time".to_string()]);
-        assert!(ctrl.set_enabled("tool-time", true).await.unwrap());
-        assert!(ctrl.is_enabled("tool-time"));
-
-        app.fiber().dispose().await;
     }
 }

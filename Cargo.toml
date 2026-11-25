@@ -4,7 +4,7 @@ members = ["crates/*"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 license = "MIT"
 
@@ -19,7 +19,6 @@ globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 libc = "0.2"
-loom = "0.7"
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
 rquickjs = { version = "0.14", features = ["futures", "parallel"] }
@@ -70,7 +69,6 @@ mizar-tui = { path = "crates/mizar-tui" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mizar_loom)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -81,9 +79,6 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 debug = false
-
-[profile.test]
-inherits = "dev"
 
 [profile.release]
 lto = "thin"

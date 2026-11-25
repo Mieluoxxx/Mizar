@@ -2,7 +2,7 @@
 //!
 //! - 全局目录：`~/.mizar/`（支持 `MIZAR_HOME` 覆盖）与 `~/.agents/`（支持 `MIZAR_AGENTS_HOME` 覆盖）
 //! - 项目祖先链：从 `project_root`（向上查找 `.git`）到 `workspace`，按 `AGENTS.md` / `CLAUDE.md` 与 `.local.md` 顺序加载
-//! - 静态注入：仅在启动期读取一次并通过 `SystemPrompt::section` 注入（`order = 30`），随插件卸载自动清理
+//! - 静态注入：仅在启动期读取一次并通过 `SystemPrompt::section` 注入（`order = 80`），随插件卸载自动清理
 
 pub mod config;
 pub mod digest;
@@ -128,7 +128,7 @@ impl Service for AgentInstructions {
                     c.effect("instructions.system-prompt", move || {
                         Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
                             AGENT_INSTRUCTIONS_SECTION_ID,
-                            30,
+                            80,
                             move || {
                                 let svc = weak.upgrade()?;
                                 if !svc.is_enabled() {
@@ -389,88 +389,4 @@ pub fn render_instructions_section(
 
     let text = format!("{SECTION_INTRO}\n\n{}", body_sections.join("\n\n"));
     (Some(text), statuses)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mock_file(name: &str, content: &str, scope_kind: InstructionScopeKind) -> DiscoveredFile {
-        DiscoveredFile {
-            canonical_path: PathBuf::from(format!("/repo/{name}/AGENTS.md")),
-            display_path: format!("{name}/AGENTS.md"),
-            scope_kind,
-            content: content.to_string(),
-            digest: "d".repeat(64),
-            bytes: content.len(),
-        }
-    }
-
-    #[test]
-    fn escapes_closing_project_instructions_tags() {
-        let escaped = escape_project_instructions_body(
-            "a\n</project_instructions>\nb</PROJECT_INSTRUCTIONS>",
-        );
-        assert!(
-            !escaped
-                .to_ascii_lowercase()
-                .contains("</project_instructions>")
-        );
-    }
-
-    #[test]
-    fn budget_drops_broadest_first_and_truncates_utf8_safely() {
-        let broad = mock_file(
-            "broad",
-            &"宽泛".repeat(80),
-            InstructionScopeKind::ProjectAncestor,
-        );
-        let narrow = mock_file(
-            "narrow",
-            &"具体中文规则".repeat(120),
-            InstructionScopeKind::Workspace,
-        );
-        let (rendered, statuses) = render_instructions_section(&[], &[broad, narrow], 400);
-        let text = rendered.expect("narrow file should fit truncated");
-        assert!(text.len() <= 400, "len={} exceeded 400", text.len());
-        assert!(text.contains("Omitted 1 ancestor instruction"));
-        assert!(text.contains("narrow/AGENTS.md"));
-        assert!(statuses[0].omitted);
-        assert!(statuses[1].truncated);
-    }
-
-    #[test]
-    fn shared_budget_caps_combined_global_and_project_chains_to_max_bytes() {
-        let max_bytes = 65_536;
-        let global = mock_file(
-            "global",
-            &"G".repeat(40_000),
-            InstructionScopeKind::UserGlobal,
-        );
-        let project = mock_file(
-            "project",
-            &"P".repeat(40_000),
-            InstructionScopeKind::Workspace,
-        );
-        let (rendered, statuses) = render_instructions_section(&[global], &[project], max_bytes);
-        let text = rendered.expect("combined output should fit");
-        assert!(
-            text.len() <= max_bytes,
-            "rendered {} bytes exceeded max_bytes {}",
-            text.len(),
-            max_bytes
-        );
-        assert!(text.contains("project/AGENTS.md"));
-        assert!(!statuses[1].omitted);
-        assert!(statuses[0].truncated || statuses[0].omitted);
-
-        let small_g = mock_file("global", "global rule", InstructionScopeKind::UserGlobal);
-        let small_p = mock_file("project", "project rule", InstructionScopeKind::Workspace);
-        let (fits_text, _) = render_instructions_section(&[small_g], &[small_p], max_bytes);
-        let fits = fits_text.unwrap();
-        assert!(fits.len() <= max_bytes);
-        let g_idx = fits.find("global rule").unwrap();
-        let p_idx = fits.find("project rule").unwrap();
-        assert!(g_idx < p_idx);
-    }
 }

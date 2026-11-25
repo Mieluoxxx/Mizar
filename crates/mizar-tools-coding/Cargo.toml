@@ -23,5 +23,3 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "t
 tokio-util = { workspace = true }
 unicode-normalization = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }

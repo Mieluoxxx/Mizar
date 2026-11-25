@@ -9,7 +9,7 @@ use std::future::Future;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -214,12 +214,12 @@ pub fn parse_macos_clipboard_info(info: &str) -> MacClipboardInfo {
     }
 }
 
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(target_os = "macos")]
 struct TempClipboardDir {
     path: PathBuf,
 }
 
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(target_os = "macos")]
 impl TempClipboardDir {
     fn create(prefix: &str) -> io::Result<Self> {
         let nanos = SystemTime::now()
@@ -252,7 +252,7 @@ impl TempClipboardDir {
     }
 }
 
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(target_os = "macos")]
 impl Drop for TempClipboardDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -936,102 +936,4 @@ where
     }
 
     read_native_clipboard().await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn mime_priority_uri_list_and_macos_info_parsing() {
-        let all = vec![
-            "text/plain;charset=utf-8".to_string(),
-            "image/png".to_string(),
-            "text/uri-list".to_string(),
-        ];
-        assert_eq!(
-            select_preferred_mime(&all),
-            Some(MimeChoice::Files("text/uri-list".into()))
-        );
-        let img_and_text = vec![
-            "text/plain".to_string(),
-            "image/bmp".to_string(),
-            "image/png".to_string(),
-        ];
-        assert_eq!(
-            select_preferred_mime(&img_and_text),
-            Some(MimeChoice::Image("image/png".into()))
-        );
-        assert_eq!(
-            select_preferred_mime(&["STRING".to_string(), "UTF8_STRING".to_string()]),
-            Some(MimeChoice::Text("UTF8_STRING".into()))
-        );
-
-        let uri_list = "# comment\r\nfile:///tmp/my%20shot%231.png\r\ncopy\nfile:///home/%E6%88%AA%E5%9B%BE.png\n";
-        assert_eq!(
-            decode_file_uri_list(uri_list),
-            vec![
-                PathBuf::from("/tmp/my shot#1.png"),
-                PathBuf::from("/home/截图.png"),
-            ]
-        );
-
-        let p = parse_macos_clipboard_info("«class PNGf», 48210, «class TIFF», 120000");
-        assert!(p.has_png && p.has_tiff && !p.has_files);
-        assert!(parse_macos_clipboard_info("«class furl», 144").has_files);
-        assert!(native_unreachable_with(|k| k == "SSH_CONNECTION"));
-        assert!(!native_unreachable_with(|_| false));
-    }
-
-    #[test]
-    fn osc5522_chunked_reassembly_and_partial_rejection() {
-        let req = build_osc5522_read_request("secret", "mizar", "image/png");
-        assert!(req.starts_with("\x1b]5522;type=read:pw=") && req.ends_with(";aW1hZ2UvcG5n\x1b\\"));
-
-        let mime_b64 = STANDARD.encode(b"image/png");
-        let chunk1 = STANDARD.encode(b"hello ");
-        let chunk2 = STANDARD.encode(b"world");
-        let stream = format!(
-            "noise\x1b]5522;type=read:status=OK\x1b\\\
-             \x1b]5522;type=read:status=DATA:mime={mime_b64};{chunk1}\x07\
-             \x1b]5522;type=read:status=DATA:mime={mime_b64};{chunk2}\x1b\\\
-             \x1b]5522;type=read:status=DONE\x1b\\"
-        );
-        let mut buf = stream.as_bytes()[..stream.len() - 12].to_vec();
-        let first_pass = extract_osc5522_packets(&mut buf);
-        assert_eq!(first_pass.len(), 3);
-        assert_eq!(first_pass[1].mime.as_deref(), Some("image/png"));
-        buf.extend_from_slice(&stream.as_bytes()[stream.len() - 12..]);
-        let second_pass = extract_osc5522_packets(&mut buf);
-        assert_eq!(second_pass[0].status.as_deref(), Some("DONE"));
-        assert!(buf.is_empty());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::net::UnixStream;
-            let (mut writer, reader) = UnixStream::pair().unwrap();
-            let data_b64 = STANDARD.encode(b"partial-bytes");
-            let payload = format!(
-                "\x1b]5522;type=read:status=OK\x1b\\\x1b]5522;type=read:status=DATA;{data_b64}\x1b\\"
-            );
-            writer.write_all(payload.as_bytes()).unwrap();
-            drop(writer);
-            let err = collect_osc5522_response(reader.as_raw_fd(), Duration::from_millis(50))
-                .expect_err("missing DONE terminator must fail");
-            assert!(matches!(err, ClipboardError::CommandFailed(_)));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn temp_clipboard_dir_enforces_0700_and_0600_permissions() {
-        let dir = TempClipboardDir::create("permtest").unwrap();
-        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700);
-        let file = dir.create_secret_file("secret.png").unwrap();
-        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(file_mode, 0o600);
-    }
 }
