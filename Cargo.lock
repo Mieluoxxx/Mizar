@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-codemode"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "mizar-tools",
  "mizar-types",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "chrono",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "futures",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-mcp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dirs",
  "mizar-llm",
@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-session"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "mizar-types",
  "rusqlite",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tools"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dirs",
  "globset",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tui-ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossterm",
  "futures",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-types"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dirs",
  "futures",
