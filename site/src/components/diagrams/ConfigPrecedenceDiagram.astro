@@ -13,7 +13,7 @@ const isEn = locale === 'en';
 ---
 
 <DiagramFrame
-  fig="FIG 01"
+  fig="FIG 05"
   title={isEn ? 'Four-Tier Config Precedence & Dual-Track Merge' : '四级配置叠加优先级与双轨合并规则'}
   caption={caption}
   locale={locale}
@@ -237,7 +237,7 @@ const isEn = locale === 'en';
       <text x="443" y="420" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Model Routing & Credential Resolution' : '模型路由与凭据解析顺序'}</text>
       <text x="443" y="448" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-10)">{isEn ? '1. Explicit API_KEY or keyless models.json → direct route' : '1. 显式 API_KEY 或无 models.json 密钥 → 构造直连路由'}</text>
       <text x="443" y="467" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-9)">{isEn ? '2. models.json resolves $VAR / ${VAR} / !command' : '2. models.json 支持 $VAR / ${VAR} / !command 动态读取'}</text>
-      <text x="443" y="486" font-size={isEn ? 9.5 : 10.5} fill="var(--grey-8)">{isEn ? '3. None configured → fallback to offline demo (mock-v1)' : '3. 均未配置 → 自动回退离线演示模式 (mock-v1)'}</text>
+      <text x="443" y="486" font-size={isEn ? 9 : 10} fill="var(--grey-8)">{isEn ? '3. Pass --provider mock for keyless demo (else error)' : '3. 未配置凭据时需 --provider mock 启动离线演示'}</text>
     </g>
   </svg>
 </DiagramFrame>

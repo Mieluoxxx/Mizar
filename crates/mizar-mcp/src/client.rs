@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use cordis::Logger;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -77,10 +78,11 @@ impl McpClient {
         server_name: &str,
         config: &McpServerConfig,
         workspace: &Path,
+        logger: Logger,
         cancel: &CancellationToken,
     ) -> Result<Self, McpError> {
         let timeout = Duration::from_millis(config.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-        let transport = McpTransport::connect(server_name, config, workspace).await?;
+        let transport = McpTransport::connect(server_name, config, workspace, logger).await?;
 
         let init_res = transport
             .request(

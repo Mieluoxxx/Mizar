@@ -1,6 +1,5 @@
 //! 对话流虚拟化渲染、Inline scrollback 行构建与流式 Markdown 增量前缀缓存。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,195 +31,6 @@ use crate::timeline_rail::{
     RAIL_MIN_TERMINAL_WIDTH, RAIL_MIN_TURNS, RAIL_WIDTH, TimelineTurn, build_timeline_snapshot,
     compute_rail_geometry, render_timeline_rail,
 };
-
-const REASONING_CACHE_CAP: usize = 8;
-
-#[derive(Clone)]
-struct ReasoningCacheEntry {
-    width: usize,
-    theme_id: &'static str,
-    emphasis_enabled: bool,
-    round_caps: bool,
-    source: String,
-    lines: Arc<[RenderedLine]>,
-}
-
-struct ReasoningPrefixCache {
-    width: usize,
-    theme_id: &'static str,
-    emphasis_enabled: bool,
-    round_caps: bool,
-    prefix_text: String,
-    lines: Vec<RenderedLine>,
-}
-
-#[derive(Default)]
-struct ReasoningRenderCache {
-    entries: Vec<ReasoningCacheEntry>,
-    streaming_prefix: Option<ReasoningPrefixCache>,
-}
-
-#[derive(Default)]
-struct LazyResizeHeights {
-    session_id: String,
-    heights: HashMap<usize, (ItemRenderKey, usize)>,
-}
-
-thread_local! {
-    static REASONING_RENDER_CACHE: RefCell<ReasoningRenderCache> =
-        RefCell::new(ReasoningRenderCache::default());
-    static LAZY_RESIZE_HEIGHTS: RefCell<LazyResizeHeights> =
-        RefCell::new(LazyResizeHeights::default());
-}
-
-fn same_content_ignoring_width(a: &ItemRenderKey, b: &ItemRenderKey) -> bool {
-    a.theme_id == b.theme_id
-        && a.emphasis_enabled == b.emphasis_enabled
-        && a.round_caps == b.round_caps
-        && a.expanded == b.expanded
-        && a.status_code == b.status_code
-        && a.reasoning_len == b.reasoning_len
-        && a.text_len == b.text_len
-        && a.preview_len == b.preview_len
-}
-
-fn decorate_reasoning_lines(raw_lines: Vec<RenderedLine>, theme: &Theme) -> Vec<RenderedLine> {
-    let mut out = Vec::with_capacity(raw_lines.len());
-    for rl in raw_lines {
-        let mut spans = vec![Span::styled("┆ ", Style::default().fg(theme.text_dim))];
-        for s in rl.line.spans {
-            spans.push(Span::styled(
-                s.content,
-                s.style.fg(theme.text_dim).add_modifier(Modifier::ITALIC),
-            ));
-        }
-        out.push(RenderedLine {
-            line: Line::from(spans),
-            soft_wrapped: rl.soft_wrapped,
-        });
-    }
-    out
-}
-
-fn render_reasoning_lines_cached(
-    vis_reasoning: &str,
-    quote_w: usize,
-    theme: &Theme,
-    emphasis: &EmphasisConfig,
-) -> Arc<[RenderedLine]> {
-    if vis_reasoning.is_empty() {
-        return Arc::from([]);
-    }
-
-    let hit = REASONING_RENDER_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        if let Some(pos) = cache.entries.iter().position(|e| {
-            e.width == quote_w
-                && e.theme_id == theme.id
-                && e.emphasis_enabled == emphasis.enabled
-                && e.round_caps == emphasis.round_caps
-                && e.source.len() == vis_reasoning.len()
-                && e.source == vis_reasoning
-        }) {
-            let entry = cache.entries.remove(pos);
-            let lines = Arc::clone(&entry.lines);
-            cache.entries.push(entry);
-            Some(lines)
-        } else {
-            None
-        }
-    });
-    if let Some(lines) = hit {
-        return lines;
-    }
-
-    let built_vec: Vec<RenderedLine> = if vis_reasoning.len() > 1500
-        && let Some(split_idx) = find_streaming_markdown_split(vis_reasoning)
-    {
-        let new_prefix = &vis_reasoning[..split_idx];
-        let tail = &vis_reasoning[split_idx + 1..];
-        let mut out = REASONING_RENDER_CACHE.with(|cell| {
-            let mut cache = cell.borrow_mut();
-            if let Some(cached) = cache.streaming_prefix.as_mut()
-                && cached.width == quote_w
-                && cached.theme_id == theme.id
-                && cached.emphasis_enabled == emphasis.enabled
-                && cached.round_caps == emphasis.round_caps
-            {
-                if new_prefix == cached.prefix_text {
-                    return Some(cached.lines.clone());
-                }
-                if new_prefix.len() > cached.prefix_text.len()
-                    && new_prefix.starts_with(&cached.prefix_text)
-                    && new_prefix.as_bytes().get(cached.prefix_text.len()) == Some(&b'\n')
-                {
-                    let delta_prefix = &new_prefix[cached.prefix_text.len() + 1..];
-                    let delta_lines = decorate_reasoning_lines(
-                        render_markdown_rich(delta_prefix, quote_w, theme, emphasis),
-                        theme,
-                    );
-                    cached.lines.extend(delta_lines);
-                    cached.prefix_text = new_prefix.to_string();
-                    return Some(cached.lines.clone());
-                }
-            }
-            None
-        });
-        if out.is_none() {
-            let prefix_lines = decorate_reasoning_lines(
-                render_markdown_rich(new_prefix, quote_w, theme, emphasis),
-                theme,
-            );
-            REASONING_RENDER_CACHE.with(|cell| {
-                cell.borrow_mut().streaming_prefix = Some(ReasoningPrefixCache {
-                    width: quote_w,
-                    theme_id: theme.id,
-                    emphasis_enabled: emphasis.enabled,
-                    round_caps: emphasis.round_caps,
-                    prefix_text: new_prefix.to_string(),
-                    lines: prefix_lines.clone(),
-                });
-            });
-            out = Some(prefix_lines);
-        }
-        let mut combined = out.unwrap_or_default();
-        combined.extend(decorate_reasoning_lines(
-            render_markdown_rich(tail, quote_w, theme, emphasis),
-            theme,
-        ));
-        combined
-    } else {
-        decorate_reasoning_lines(
-            render_markdown_rich(vis_reasoning, quote_w, theme, emphasis),
-            theme,
-        )
-    };
-
-    let shared: Arc<[RenderedLine]> = Arc::from(built_vec);
-    REASONING_RENDER_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        if let Some(pos) = cache.entries.iter().position(|e| {
-            e.width == quote_w
-                && e.theme_id == theme.id
-                && e.emphasis_enabled == emphasis.enabled
-                && e.round_caps == emphasis.round_caps
-                && vis_reasoning.starts_with(&e.source)
-        }) {
-            cache.entries.remove(pos);
-        } else if cache.entries.len() >= REASONING_CACHE_CAP {
-            cache.entries.remove(0);
-        }
-        cache.entries.push(ReasoningCacheEntry {
-            width: quote_w,
-            theme_id: theme.id,
-            emphasis_enabled: emphasis.enabled,
-            round_caps: emphasis.round_caps,
-            source: vis_reasoning.to_string(),
-            lines: Arc::clone(&shared),
-        });
-    });
-    shared
-}
 
 /// 将单条已稳定完成的对话项渲染为可推送至 Inline 原生 scrollback 的行序列。
 pub fn build_item_lines_for_scrollback(
@@ -487,10 +297,6 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
             (Vec::new(), None, 0)
         };
 
-    if app.tool_extras.len() > 64 {
-        app.enforce_tool_extras_budget();
-    }
-
     // Pass 1：利用轻量高度缓存 + 局部失效只对必要条目求行数并收集时间轴转折点
     let mut turns: Vec<TimelineTurn> = Vec::with_capacity(user_turn_count);
     let mut spans = std::mem::take(&mut app.item_cache.span_scratch);
@@ -502,19 +308,8 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
 
     let mut cur_line = welcome_total_lines;
     let auto_scroll = app.auto_scroll;
-    let fixed_scroll_bottom = app
-        .scroll_from_top
-        .saturating_add(content_area.height as usize + 32);
-    let scroll_top_hint = app.scroll_from_top;
-    let eager_tail_start = total_items.saturating_sub((content_area.height as usize).max(24));
-
-    LAZY_RESIZE_HEIGHTS.with(|cell| {
-        let mut lazy = cell.borrow_mut();
-        if lazy.session_id != app.session_id || app.item_cache.is_empty() {
-            lazy.session_id.clone_from(&app.session_id);
-            lazy.heights.clear();
-        }
-    });
+    let fixed_scroll_bottom =
+        (app.scroll_from_top as usize).saturating_add(content_area.height as usize + 32);
 
     {
         let items = &app.items;
@@ -646,64 +441,31 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
             };
 
             let line_count = if let Some(h) = cache.get_height(idx, &key) {
-                LAZY_RESIZE_HEIGHTS.with(|cell| {
-                    let mut lazy = cell.borrow_mut();
-                    let up_to_date = lazy
-                        .heights
-                        .get(&idx)
-                        .is_some_and(|(k, lh)| k == &key && *lh == h);
-                    if !up_to_date {
-                        lazy.heights.insert(idx, (key.clone(), h));
-                    }
-                });
                 h
             } else {
-                // Resize 期间离屏条目保留旧高度占位，仅视口附近条目立即重排
-                let stale_offscreen_h = LAZY_RESIZE_HEIGHTS.with(|cell| {
-                    let lazy = cell.borrow();
-                    let (old_key, old_h) = lazy.heights.get(&idx)?;
-                    if old_key.width == key.width || !same_content_ignoring_width(old_key, &key) {
-                        return None;
-                    }
-                    let is_offscreen = if auto_scroll {
-                        idx < eager_tail_start
-                    } else {
-                        start_line + *old_h <= scroll_top_hint.saturating_sub(16)
-                            || start_line >= fixed_scroll_bottom
-                    };
-                    is_offscreen.then_some(*old_h)
-                });
-                if let Some(old_h) = stale_offscreen_h {
-                    old_h
+                let built = Arc::new(build_transcript_item_lines(
+                    items,
+                    start_item,
+                    idx,
+                    tool_extras,
+                    reveal,
+                    cache,
+                    theme,
+                    &emphasis,
+                    is_busy,
+                    show_thinking,
+                    verbose_expanded,
+                    spinner_tick,
+                    width_usize,
+                ));
+                let len = built.len();
+                let far_below_fixed_viewport = !auto_scroll && start_line >= fixed_scroll_bottom;
+                if far_below_fixed_viewport {
+                    cache.record_height_only(idx, key.clone(), len);
                 } else {
-                    let built = Arc::new(build_transcript_item_lines(
-                        items,
-                        start_item,
-                        idx,
-                        tool_extras,
-                        reveal,
-                        cache,
-                        theme,
-                        &emphasis,
-                        is_busy,
-                        show_thinking,
-                        verbose_expanded,
-                        spinner_tick,
-                        width_usize,
-                    ));
-                    let len = built.len();
-                    LAZY_RESIZE_HEIGHTS.with(|cell| {
-                        cell.borrow_mut().heights.insert(idx, (key.clone(), len));
-                    });
-                    let far_below_fixed_viewport =
-                        !auto_scroll && start_line >= fixed_scroll_bottom;
-                    if far_below_fixed_viewport {
-                        cache.record_height_only(idx, key.clone(), len);
-                    } else {
-                        cache.insert_lines(idx, key.clone(), built);
-                    }
-                    len
+                    cache.insert_lines(idx, key.clone(), built);
                 }
+                len
             };
 
             spans.push((start_line, line_count, key));
@@ -712,15 +474,16 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
     }
 
     let total_lines = cur_line;
+    let total_lines_u16 = total_lines.min(u16::MAX as usize) as u16;
     let scroll_top = if app.items.is_empty() && app.auto_scroll {
         app.last_viewport_height = content_area.height;
-        app.last_total_lines = total_lines;
+        app.last_total_lines = total_lines_u16;
         app.scroll_from_top = 0;
         0
     } else {
-        app.effective_scroll(content_area.height, total_lines)
+        app.effective_scroll(content_area.height, total_lines_u16) as usize
     };
-    let max_scroll = total_lines.saturating_sub(content_area.height as usize);
+    let max_scroll = total_lines_u16.saturating_sub(content_area.height) as usize;
     if app.features.timeline_rail {
         app.timeline_snap = build_timeline_snapshot(turns, scroll_top, max_scroll);
     }
@@ -829,12 +592,6 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
                     spinner_tick,
                     width_usize,
                 ));
-                let built_len = built.len();
-                LAZY_RESIZE_HEIGHTS.with(|cell| {
-                    cell.borrow_mut()
-                        .heights
-                        .insert(item_idx, (key.clone(), built_len));
-                });
                 cache.insert_lines(item_idx, key.clone(), Arc::clone(&built));
                 built
             };
@@ -1151,10 +908,19 @@ fn build_assistant_lines_with_cache(
         if show_thinking {
             if !vis_reasoning.is_empty() {
                 let quote_w = width.saturating_sub(2).max(2);
-                let r_lines =
-                    render_reasoning_lines_cached(vis_reasoning, quote_w, theme, emphasis);
-                if !r_lines.is_empty() {
-                    out.extend(r_lines.iter().cloned());
+                let r_lines = render_markdown_rich(vis_reasoning, quote_w, theme, emphasis);
+                for rl in r_lines {
+                    let mut spans = vec![Span::styled("┆ ", Style::default().fg(theme.text_dim))];
+                    for s in rl.line.spans {
+                        spans.push(Span::styled(
+                            s.content,
+                            s.style.fg(theme.text_dim).add_modifier(Modifier::ITALIC),
+                        ));
+                    }
+                    out.push(RenderedLine {
+                        line: Line::from(spans),
+                        soft_wrapped: rl.soft_wrapped,
+                    });
                     emitted_reasoning = true;
                 }
             }
@@ -1279,22 +1045,5 @@ mod tests {
             assert_eq!(cached_cmp, full_cmp);
         }
         assert!(cache.streaming_prefix.is_some());
-    }
-
-    #[test]
-    fn vis_reasoning_cache_reuses_arc_slice_across_text_streaming_ticks() {
-        let theme = Theme::mist_dark();
-        let emphasis = EmphasisConfig::default();
-        let reasoning =
-            "Step 1: analyze requirements.\n\nStep 2: check `render_transcript` CJK 渲染性能。";
-
-        let first = render_reasoning_lines_cached(reasoning, 76, &theme, &emphasis);
-        let second = render_reasoning_lines_cached(reasoning, 76, &theme, &emphasis);
-        assert!(!first.is_empty());
-        assert!(Arc::ptr_eq(&first, &second));
-
-        // 宽度变化应未命中并重排，不返回同一份 Arc
-        let narrower = render_reasoning_lines_cached(reasoning, 32, &theme, &emphasis);
-        assert!(!Arc::ptr_eq(&first, &narrower));
     }
 }

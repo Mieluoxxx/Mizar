@@ -66,20 +66,7 @@ pub fn format_osc_7501(
     kind: Option<&str>,
     message: Option<&str>,
 ) -> String {
-    format_osc_7501_with_pid(state, kind, message, None)
-}
-
-/// 生成符合 OSC 7501（Program Status Protocol）的控制序列；传入 `pid` 时在 `app=mizar` 后追加 `pid=<pid>`。
-pub fn format_osc_7501_with_pid(
-    state: ProgramStatusState,
-    kind: Option<&str>,
-    message: Option<&str>,
-    pid: Option<u32>,
-) -> String {
     let mut parts = vec![format!("state={}", state.as_str()), "app=mizar".to_string()];
-    if let Some(pid) = pid {
-        parts.push(format!("pid={pid}"));
-    }
     if state == ProgramStatusState::Blocked
         && let Some(k) = kind
     {
@@ -107,7 +94,7 @@ pub fn emit_program_status(state: ProgramStatusState, kind: Option<&str>, messag
     ) {
         return;
     }
-    let seq = format_osc_7501_with_pid(state, kind, message, Some(std::process::id()));
+    let seq = format_osc_7501(state, kind, message);
     let mut out = io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
@@ -191,33 +178,37 @@ pub fn probe_terminal_colors(timeout: Duration) -> TerminalColors {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 256];
 
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    const POLLIN_EVENT: i16 = 0x0001;
+    unsafe extern "C" {
+        fn poll(
+            fds: *mut PollFd,
+            nfds: std::os::raw::c_uint,
+            timeout: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+        fn read(fd: std::os::raw::c_int, buf: *mut std::os::raw::c_void, count: usize) -> isize;
+    }
+
     while Instant::now() < deadline {
         let rem_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
-            .min(i32::MAX as u128) as libc::c_int;
-        let mut pfd = libc::pollfd {
+            .min(i32::MAX as u128) as i32;
+        let mut pfd = PollFd {
             fd,
-            events: libc::POLLIN,
+            events: POLLIN_EVENT,
             revents: 0,
         };
-        let ready = unsafe { libc::poll(&mut pfd, 1 as libc::nfds_t, rem_ms) };
-        if ready < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
+        let ready = unsafe { poll(&mut pfd, 1, rem_ms) };
+        if ready <= 0 {
             break;
         }
-        if ready == 0 {
-            break;
-        }
-        let n = loop {
-            let res = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-            if res < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break res;
-        };
+        let n = unsafe { read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
         if n <= 0 {
             break;
         }
@@ -449,22 +440,5 @@ mod tests {
         );
         assert!(seq.starts_with("\x1b]7501;state=blocked:app=mizar:kind=permission:msg="));
         assert!(seq.ends_with("\x1b\\"));
-    }
-
-    #[test]
-    fn formats_osc7501_status_sequence_with_pid() {
-        let seq = format_osc_7501_with_pid(
-            ProgramStatusState::Blocked,
-            Some("permission"),
-            Some("Run cargo test"),
-            Some(48210),
-        );
-        assert!(
-            seq.starts_with("\x1b]7501;state=blocked:app=mizar:pid=48210:kind=permission:msg=")
-        );
-        assert!(seq.ends_with("\x1b\\"));
-
-        let working = format_osc_7501_with_pid(ProgramStatusState::Working, None, None, Some(99));
-        assert_eq!(working, "\x1b]7501;state=working:app=mizar:pid=99\x1b\\");
     }
 }

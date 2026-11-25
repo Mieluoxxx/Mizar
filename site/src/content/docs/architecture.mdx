@@ -1,0 +1,73 @@
+---
+title: 33-Crate Cordis 架构与开发指南
+description: Cordis 微内核机制、33 个 Crate 分层拓扑、4 个纯核心编译隔离红线、工具三段管线与 Cargo feature 门控。
+group: ops-internals
+order: 11
+---
+
+Mizar 由 `cordis` 微内核驱动，将全部能力拆分为 **33 个职责正交的 Virtual Workspace Crate**（Rust `1.98.0`、Edition 2024），通过 `inject` / `provide` 服务容器与 5 种事件分发模式（`emit`、`parallel`、`serial`、`bail`、`waterfall`）装配为确定性 Agent 运行时。
+
+<DiagramEmbed
+  id="cordis-architecture"
+  caption="图 06：Cordis 33-Crate 分层架构与编译隔离红线——左侧为 29 个异步宿主/插件 Crate，右侧为受严格依赖防火墙保护的 4 个纯核心 Crate。"
+/>
+
+## 33 个 Crate 分层拓扑
+
+| 层级 | Crate 清单（数量） | 职责与核心约束 |
+| :--- | :--- | :--- |
+| **L1 宿主、跨端运行时与装配层**（3） | `mizar-tui`、`mizar-client`、`mizar-agent-spine` | 唯一可执行入口 `mizar`、跨端宿主运行时（**Merak 直嵌边界**：`mizar-client` 严禁引入 `ratatui` / `crossterm` / `mizar-tui-ui`），以及装配 13 个可选模块的 `"spinePlugins"` 控制器 |
+| **L2 编排、观测与存储层**（4） | `mizar-agent-loop`、`mizar-trajectory`、`mizar-session-sqlite`、`mizar-session-title` | `"agentLoop"` 主循环、轨迹事件收集与 `RepeatToolGuard`、SQLite WAL 单写者与 FTS5 索引、后台异步标题总结 |
+| **L3 工具、压缩与情景回溯插件层**（10） | `mizar-tools-coding`、`mizar-tool-search`、`mizar-codemode`、`mizar-mcp`、`mizar-skills`、`mizar-tool-fs`、`mizar-tool-time`、`mizar-instructions`、`mizar-compaction`、`mizar-recall` | 可按配置热启停的功能插件。其中 `mizar-instructions` 仅注入 `"systemPrompt"` 不注册工具；`mizar-recall` 注册单静态 `recall` 工具 |
+| **L4 核心基础服务与 LLM 协议栈**（4 + 7 = 11） | 核心服务：`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools`；传输与协议：`mizar-llm-http`、`mizar-llm-retry`、`mizar-llm-router`、`mizar-llm-completions`、`mizar-llm-responses`、`mizar-llm-messages`、`mizar-llm-mock` | 抽象层零 HTTP 栈；所有 `reqwest` TLS/SSE 传输统一收口在 `mizar-llm-http`，四协议适配器均注入 `"llm"` |
+| **L5 微内核底座**（1） | `cordis` | 上下文树 `Context`、`Fiber` 生命周期状态机、`ctx.effect` 倒序清理、服务注入与事件通道 |
+| **纯核心孤岛**（4） | `mizar-client-core`、`mizar-tui-ui`、`mizar-trajectory-core`、`mizar-llm-types` | 零重型异步/IO 依赖，毫秒级增量编译与纯函数单测 |
+
+<Callout type="danger" title="不可破坏的两道编译隔离红线">
+  1. <strong>四大纯核心红线</strong>：<code>mizar-client-core</code>、<code>mizar-tui-ui</code>、<code>mizar-trajectory-core</code>、<code>mizar-llm-types</code> <strong>严禁引入</strong> <code>tokio</code>、<code>cordis</code>、<code>reqwest</code>、<code>rquickjs</code>、<code>rusqlite</code>。<br />
+  2. <strong>跨端宿主红线（Merak Desktop）</strong>：<code>mizar-client</code> 与 <code>mizar-client-core</code> <strong>严禁引入</strong> <code>ratatui</code>、<code>crossterm</code> 或 <code>mizar-tui-ui</code>，保证核心宿主逻辑零终端渲染绑定。
+</Callout>
+
+## Cordis 插件与三段工具管线规则
+
+```rust title="插件骨架示例（Cordis Service 依赖与副作用托管）"
+impl Plugin for ExamplePlugin {
+    type Config = ();
+    fn name(&self) -> Option<&str> { Some("example-plugin") }   // kebab-case
+    fn inject(&self) -> Inject { Inject::from(["tools"]) }       // camelCase 服务名
+
+    fn apply(&self, ctx: Context, _cfg: ()) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
+        Box::pin(async move {
+            let tools = ctx.tools()?;
+            ctx.effect("example-register", move || {
+                // 在容器挂载工具或钩子，返回反向清理闭包；Fiber 卸载时 LIFO 自动清理
+                Ok(())
+            })?;
+            Ok(None)
+        })
+    }
+}
+```
+
+- **全仓 10+1 服务名（始终使用 `<Name>ContextExt` 扩展方法读取）**：`llm`、`tools`、`sessions`、`systemPrompt`、`agentLoop`、`skills`、`mcp`、`trajectory`、`compaction`、`spinePlugins`（以及路由服务 `llmRouter`）。
+- **漏写 `inject` 坑点**：若插件未在 `inject()` 声明所需服务却在 `apply()` 中调用读取，系统**不会 panic**，而是返回 `MissingInject` 并把该 Fiber 置入 `FAILED` 状态——导致工具静默消失，排查成本远高于 panic。
+- **三段 Tool Waterfall 管线**：
+  `tools/pre-execute`（挂载 `Compaction` 写前文件护栏与 `ApprovalGate` 审批闸门） → `tools/execute`（执行具体工具并通过 `with_file_mutation_queue` 对同路径写操作排队） → `tools/post-execute`（挂载 `RepeatToolGuard` 异常计数及结果记录）。
+
+## Cargo Feature 裁剪与工程约定
+
+- **`mizar-agent-spine` Features**：支持按 `legacy`、`coding`、`compaction`、`sqlite`、`session-title`、`trajectory`、`router` 组合裁剪。传入 `--no-default-features` 可验证仅加载纯净核心容器的最小编译通过性；所有可选模块导入必须配齐 `#[cfg(feature = "...")]`。
+- **代码组织与文案语言**：禁止 `mod.rs`（统一 `foo.rs` + `foo/bar.rs`）；公共错误统一采用 `thiserror` 与 `cordis::BoxError`（不引入 `anyhow`）；`//!` 注释与运行时面向终端用户的报错用**中文**，而工具给模型看的 `description` 与参数说明**必须保持英文**。
+
+## 开发者本地验证套件
+
+CI 严格执行工作区全量校验，合入前务必依次跑通以下命令（`clippy` 任何 warning 即失败）：
+
+```sh title="全量工作区验证命令" kind="terminal"
+cargo check -p mizar-tui-ui                                              # 纯 UI 改动的毫秒级反馈回路
+cargo check --workspace                                                  # 修改跨 crate 事件/结构体后必跑
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+COLORTERM=truecolor cargo test --locked --workspace --no-fail-fast       # 必须携带 COLORTERM 通过真彩主题测试
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+```

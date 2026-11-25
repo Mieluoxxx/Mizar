@@ -1,110 +1,118 @@
 ---
 title: Introduction & Quick Start
-description: Launch Mizar in your terminal in 30 seconds—try the keyless demo, connect directly to an LLM via environment variables, or build from source—and learn the core workflow for your first minute.
-group: quickstart
+description: Install Mizar, configure model credentials or keyless mock mode, and run your first interactive or headless session.
+group: getting-started
 order: 1
 ---
 
-import CodeTabs from '../../../components/mdx/CodeTabs.astro';
-import Callout from '../../../components/mdx/Callout.astro';
-import Steps from '../../../components/mdx/Steps.astro';
-import CardGroup from '../../../components/mdx/CardGroup.astro';
-import DocCard from '../../../components/mdx/DocCard.astro';
+Mizar is a Rust terminal AI coding agent built on the **33-crate Cordis microkernel** (`mizar` binary). It pairs a streaming inference loop (`stream → tools → append-only session persistence`) with strict KV-cache prefix stability, offering both an interactive dual-viewport TUI workbench and a deterministic headless `exec` runner.
 
-export const introTabs = [
-    {
-      label: 'Prebuilt Binary',
-      lang: 'bash',
-      code: `# Install on macOS (Apple Silicon / Intel) or Linux (x86_64 / arm64) to ~/.local/bin/mizar
-curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
-
-# Verify and launch
-mizar --version
-mizar`,
-    },
-    {
-      label: 'Keyless Demo Mode',
-      lang: 'bash',
-      code: `# Enters offline demo mode automatically when no API key or models.json is configured
-cargo run -p mizar-tui --bin mizar`,
-    },
-    {
-      label: 'Connect via Env Vars',
-      lang: 'bash',
-      code: `# Set any supported provider variable to connect directly without a config file
-export DEEPSEEK_API_KEY="sk-..."
-cargo run -p mizar-tui --bin mizar -- -C /path/to/your-project
-
-# Also supports OPENAI_API_KEY / ANTHROPIC_API_KEY, or a custom gateway:
-# API_KEY="sk-..." BASE_URL="https://api.example.com/v1" MODEL="deepseek-chat" mizar`,
-    },
-    {
-      label: 'Build & Install mizar',
-      lang: 'bash',
-      code: `# Build the release binary (requires Rust 1.98.0+) and install it to your PATH
-cargo build -p mizar-tui --release --bin mizar
-install -m 755 target/release/mizar ~/.local/bin/mizar
-
-# Run directly inside any repository afterward
-mizar`,
-    },
-  ];
-
-Mizar is a terminal-native AI coding workbench built for heavy command-line workflows. It offers a dual-mode viewport—switching between a full-screen dashboard and an Inline mode that preserves terminal scrollback—along with built-in local shell execution, hierarchical project rule discovery, MCP server integration, and a lightweight JS orchestration sandbox.
-
-Whether you want to explore the interface first or connect DeepSeek, OpenAI, or Anthropic and start editing code right away, one command gets you up and running.
-
-## First Launch in 30 Seconds
-
-Pick any of the paths below depending on whether you already have an API key or the Rust 1.98 toolchain installed:
-
-<CodeTabs tabs={introTabs} />
-
-<Callout type="info" title="Seeing mock-v1 at the top of the screen?">
-
-When no usable key is found in environment variables or `models.json`, Mizar safely falls back to its built-in offline demo mode so you can still try UI navigation, local `!` commands, and panel layouts without spending quota. To connect a real model, head to [Models & Credentials](/en/providers/).
-
+<Callout type="info" title="Architecture Alignment">
+  This handbook documents the **33-crate Cordis microkernel branch**: always-on QuickJS `codemode`, a single static `recall` tool, a 4-section static English system prompt, startup-static `AGENTS.md` loading, cache-aware tail pruning, Compaction B-5 guards, and `--trace-out` structured trajectory export.
 </Callout>
 
-## What to Do in Your First Minute
+## Installation
 
-Once inside the workbench, you don't need to memorize every [shortcut](/en/tui/keybinds/) at once—start with these three high-impact actions:
+Mizar builds on pinned Rust `1.98.0` (Edition 2024). Install the prebuilt single binary, build from source, or self-update cleanly:
+
+<CodeTabs
+  tabs={[
+    {
+      label: 'Prebuilt Binary',
+      lang: 'sh',
+      code: `curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
+mizar --version`,
+    },
+    {
+      label: 'From Source',
+      lang: 'sh',
+      code: `git clone https://github.com/Mieluoxxx/Mizar.git
+cd Mizar
+cargo install --locked --path crates/mizar-tui`,
+    },
+    {
+      label: 'Self-Update',
+      lang: 'sh',
+      code: `mizar update --check      # Check latest release only
+mizar update              # Upgrade to latest stable release
+mizar update -v 0.1.6 -f  # Force-install a specific tag`,
+    },
+  ]}
+/>
+
+In air-gapped environments, set `MIZAR_OFFLINE=1` or `MIZAR_SKIP_VERSION_CHECK=1` to skip startup version checks, or point `MIZAR_RELEASE_BASE_URL` at an internal mirror.
+
+## Three-Minute Quick Start
 
 <Steps>
   <li>
-    <p><strong>Feed exact source files to the model with <code>@</code></strong>: Typing <code>@</code> in the input box opens a <code>.gitignore</code>-aware file completion menu. You can even write <code>@src/main.rs#L1-40 What edge cases does this argument parser have?</code> to skip manual copy-pasting.</p>
+    <strong>Choose credentials or offline mock</strong>: Use <code>--provider mock</code> without any API key to verify tool loops locally, or export a provider key / configure <code>~/.mizar/models.json</code>.
   </li>
   <li>
-    <p><strong>Run terminal commands directly with <code>!</code> and <code>!!</code></strong>: Commands starting with <code>!!git status</code> are purely local quick checks—they never enter conversation context and cost zero tokens. Switch to a single bang like <code>!cargo test</code>, and command output or errors become context for the next turn so the AI can fix them for you.</p>
+    <strong>Launch interactive or headless mode</strong>: Run <code>mizar</code> to open the terminal workbench, or pass <code>exec</code> / <code>-p</code> for single-turn automation.
   </li>
   <li>
-    <p><strong>Control views and settings with <a href="/en/tui/commands/">slash commands</a> and <a href="/en/tui/keybinds/">hotkeys</a></strong>: Press <kbd>Ctrl</kbd>+<kbd>B</kbd> to toggle the right-hand status panel showing current context usage and active files; press <kbd>F3</kbd> to switch seamlessly between Fullscreen focus mode and Inline scrollback mode; run <code>/settings</code> for live UI, compaction, and module toggles, or <code>/model</code> / <code>/effort</code> anytime to adjust the model and reasoning effort.</p>
+    <strong>Inspect edits and telemetry</strong>: Press <code>Ctrl+T</code> interactively to open the <code>/trace</code> 3-lane profiler, or pass <code>--trace-out trace.json</code> in headless mode to export <code>TrajectoryExport</code>.
   </li>
 </Steps>
 
-## Next Steps
+<CodeTabs
+  tabs={[
+    {
+      label: 'Keyless Offline Demo',
+      lang: 'sh',
+      code: `mizar --provider mock --model mock-v1`,
+    },
+    {
+      label: 'DeepSeek / OpenAI',
+      lang: 'sh',
+      code: `export DEEPSEEK_API_KEY="sk-..."
+mizar -C /path/to/repo`,
+    },
+    {
+      label: 'Custom Gateway',
+      lang: 'sh',
+      code: `export PROTOCOL=responses
+export BASE_URL="https://api.example.com/v1"
+export API_KEY="sk-..."
+export MODEL="gpt-5"
+mizar exec "Explain workspace layout in Cargo.toml"`,
+    },
+  ]}
+/>
 
-Once you're comfortable with the core workbench, dive into the topics most relevant to your workflow:
+## Execution Modes
+
+| Entrypoint | Use Case | Interaction | Persistence |
+| :--- | :--- | :--- | :--- |
+| `mizar [OPTIONS]` | Daily coding, multi-turn refactors, reviews | Fullscreen / Inline viewports, `!` / `!!` local Bash, `--approve` prompts | Persists to `~/.mizar/sessions.sqlite` by default (`--no-persist` disables) |
+| `mizar exec [OPTIONS] [<prompt>]` | CI pipelines, eval harnesses, batch scripts | Headless single-turn run; prints text or JSON summary to `stdout` | Supports `--isolated`, `--timeout`, `--trace-out`, and explicit exit codes |
+
+<Callout type="tip" title="Strict Route Errors When Unconfigured">
+  If no credentials exist in environment variables or <code>~/.mizar/models.json</code> and you do not pass <code>--provider mock</code>, Mizar fails immediately with <code>NoRouteConfigured</code> instead of issuing unauthenticated network requests.
+</Callout>
+
+## Next Steps
 
 <CardGroup>
   <DocCard
-    title="Configuration & Precedence"
-    description="Understand override and append rules between ~/.mizar and project .mizar, and customize default tools and budgets."
-    slug="config"
+    title="Workbench"
+    description="Master Fullscreen vs Inline viewports, the side panel, !/!! local Bash, keybindings, and all 24 slash commands."
+    slug="workbench"
   />
   <DocCard
-    title="Models & Credentials"
-    description="Configure DeepSeek, OpenAI, Anthropic, and your system keychain to manage API keys safely."
-    slug="providers"
+    title="Tools & Always-On Codemode"
+    description="Explore 5-tier ToolExposure, parallel coding queues, QuickJS codemode, tool_search, MCP, and SKILL.md."
+    slug="tools"
   />
   <DocCard
-    title="Terminal Workbench (TUI & CLI)"
-    description="Master the Fullscreen/Inline viewports, ! / !! local shell, @ references, and keyboard shortcuts."
-    slug="tui"
+    title="CLI & Env Vars"
+    description="Full flag matrix for mizar, mizar exec, and mizar update, JSON schema, exit codes, and env vars."
+    slug="reference/cli"
   />
   <DocCard
-    title="Project Rules (AGENTS.md)"
-    description="Let Mizar automatically load repository conventions and subdirectory context without overflowing the context window."
-    slug="instructions"
+    title="Config & Compat Reference"
+    description="Complete settings.json, mcp.json, models.json schemas, and all 16 CompatConfig switches."
+    slug="reference/config"
   />
 </CardGroup>

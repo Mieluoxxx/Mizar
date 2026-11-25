@@ -1,19 +1,14 @@
-//! 终端交互式 TUI 客户端宿主：桥接纯前端工作台 `mizar-tui-ui`、`mizar-client` 与 `MizarRuntime` 后端。
+//! 终端交互式 TUI 客户端宿主：桥接纯前端工作台 `mizar-tui-ui`、`mizar-client` 与 Cordis / AgentLoop / Trajectory 后端。
 
 pub mod clipboard;
 pub mod exec;
-pub mod rpc_host;
 pub mod runner;
-pub mod serve;
 pub mod update;
 
 pub use mizar_client::events::{
-    ActiveTask, ActiveTaskKind, LoopClientMsg, RunController, steer_session,
-    subscribe_session_events, subscribe_session_events_into, to_ui_status, to_ui_step_outcome,
-    to_ui_turn_end_reason,
-};
-pub use mizar_client::logging::{
-    TracingBridgeGuard, install_silent_tracing, install_tracing_handler,
+    ActiveTask, ActiveTaskKind, LoopClientMsg, PendingPrompt, RunController, WaitServicesError,
+    subscribe_session_events, subscribe_session_events_into, to_ui_log_record, to_ui_status,
+    to_ui_step_outcome, to_ui_turn_end_reason, wait_for_services,
 };
 pub use mizar_client::session_view::{
     SelectionSources, collect_session_picker_items, find_model_in_provider,
@@ -27,7 +22,7 @@ pub use mizar_client::settings::{
 pub use mizar_client::{images, mentions};
 
 pub mod emphasis {
-    pub use crate::runner::{install_tui_emphasis, mount_reply_guidance_section};
+    pub use crate::runner::{TuiEmphasisPlugin, mount_reply_guidance_section};
     pub use mizar_tui_ui::emphasis::*;
 }
 
@@ -44,11 +39,8 @@ pub use mizar_tui_ui::{
     app, editor, markdown, overlay, reveal, selection, side_panel, terminal, theme, timeline_rail,
     trajectory_scene, ui,
 };
-pub use rpc_host::{RpcHostError, run_rpc_host_cli};
 pub use runner::{
-    ResumeTarget, TuiConfig, TuiExitSummary, build_session_info_report,
+    ResumeTarget, TuiConfig, TuiEmphasisPlugin, TuiExitSummary, build_session_info_report,
     build_session_info_report_at, build_settings_entries, format_resume_command,
-    install_tui_emphasis, mount_reply_guidance_section, resume_session_into_app, run_tui,
-    run_tui_with_summary,
+    mount_reply_guidance_section, resume_session_into_app, run_tui, run_tui_with_summary,
 };
-pub use serve::{ServeConfig, ServeError, ServeHandle, run_serve_cli, start_serve};

@@ -1,0 +1,73 @@
+---
+title: 33-Crate Cordis Architecture & Development
+description: Cordis microkernel, 33-crate layered topology, 4 pure core boundaries, 3-stage tool waterfall, Cargo features, and test gates.
+group: ops-internals
+order: 11
+---
+
+Mizar decomposes its entire agent stack into **33 crates** in a virtual Cargo workspace (pinned Rust `1.98.0`, Edition 2024) orchestrated by the `cordis` microkernel via `inject` / `provide` service containers and five event dispatch modes (`emit`, `parallel`, `serial`, `bail`, `waterfall`).
+
+<DiagramEmbed
+  id="cordis-architecture"
+  caption="FIG 06: Cordis 33-crate layered architecture — 29 runtime/plugin crates on the left and 4 firewall-protected pure core crates on the right."
+/>
+
+## 33-Crate Layered Topology
+
+| Layer | Crates (Count) | Responsibility & Constraints |
+| :--- | :--- | :--- |
+| **L1 Host, Cross-End Client & Spine** (3) | `mizar-tui`, `mizar-client`, `mizar-agent-spine` | Single binary `mizar`, cross-end host runtime (**Merak boundary**: `mizar-client` forbids `ratatui`, `crossterm`, `mizar-tui-ui`), and `"spinePlugins"` assembling 13 optional modules |
+| **L2 Agent Loop, Trace, Storage & Title** (4) | `mizar-agent-loop`, `mizar-trajectory`, `mizar-session-sqlite`, `mizar-session-title` | `"agentLoop"` core loop, trajectory spans + `RepeatToolGuard`, SQLite WAL Single-Writer + FTS5, and async session titles |
+| **L3 Tool, Compaction & Context Plugins** (10) | `mizar-tools-coding`, `mizar-tool-search`, `mizar-codemode`, `mizar-mcp`, `mizar-skills`, `mizar-tool-fs`, `mizar-tool-time`, `mizar-instructions`, `mizar-compaction`, `mizar-recall` | Hot-toggleable optional Cordis plugins. `mizar-instructions` injects only `"systemPrompt"`; `mizar-recall` exposes the single static `recall` tool |
+| **L4 Core Services & LLM Protocol Stack** (4 + 7 = 11) | Core services: `mizar-llm`, `mizar-session`, `mizar-system-prompt`, `mizar-tools`; HTTP & adapters: `mizar-llm-http`, `mizar-llm-retry`, `mizar-llm-router`, `mizar-llm-completions`, `mizar-llm-responses`, `mizar-llm-messages`, `mizar-llm-mock` | Zero HTTP inside core traits; all `reqwest` TLS/SSE traffic isolated inside `mizar-llm-http`; adapters inject `"llm"` |
+| **L5 Microkernel** (1) | `cordis` | `Context` tree, `Fiber` FSM, `ctx.effect` LIFO cleanup invariant, dependency injection, and event dispatch |
+| **Pure Core Island** (4) | `mizar-client-core`, `mizar-tui-ui`, `mizar-trajectory-core`, `mizar-llm-types` | Zero async runtime or heavy IO dependencies; instant `cargo check` and pure unit tests |
+
+<Callout type="danger" title="Two Non-Negotiable Compile-Time Firewalls">
+  1. <strong>Pure Core Boundary</strong>: <code>mizar-client-core</code>, <code>mizar-tui-ui</code>, <code>mizar-trajectory-core</code>, and <code>mizar-llm-types</code> <strong>must never depend on</strong> <code>tokio</code>, <code>cordis</code>, <code>reqwest</code>, <code>rquickjs</code>, or <code>rusqlite</code>.<br />
+  2. <strong>Cross-End Merak Boundary</strong>: <code>mizar-client</code> and <code>mizar-client-core</code> <strong>must never depend on</strong> <code>ratatui</code>, <code>crossterm</code>, or <code>mizar-tui-ui</code>.
+</Callout>
+
+## Cordis Plugins & 3-Stage Tool Waterfall
+
+```rust title="Cordis Plugin Pattern (inject + LIFO ctx.effect)"
+impl Plugin for ExamplePlugin {
+    type Config = ();
+    fn name(&self) -> Option<&str> { Some("example-plugin") }   // kebab-case
+    fn inject(&self) -> Inject { Inject::from(["tools"]) }       // camelCase service ID
+
+    fn apply(&self, ctx: Context, _cfg: ()) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
+        Box::pin(async move {
+            let tools = ctx.tools()?;
+            ctx.effect("example-register", move || {
+                // Register tool/hook on container; LIFO cleanup runs automatically on Fiber unload
+                Ok(())
+            })?;
+            Ok(None)
+        })
+    }
+}
+```
+
+- **Registered Service Names (always access via `<Name>ContextExt`)**: `llm`, `tools`, `sessions`, `systemPrompt`, `agentLoop`, `skills`, `mcp`, `trajectory`, `compaction`, `spinePlugins` (plus `llmRouter`).
+- **Missing `inject` Pitfall**: Reading a service in `apply` without listing it in `inject()` does **not** panic — Cordis returns `MissingInject` and moves the Fiber to `FAILED`, causing tools to silently disappear.
+- **3-Stage Tool Waterfall**:
+  `tools/pre-execute` (`Compaction` `FileGuardTracker`, `ApprovalGatePlugin`) → `tools/execute` (dispatches tool; same-path `write`/`edit` serialized by `with_file_mutation_queue`) → `tools/post-execute` (`RepeatToolGuardPlugin` & telemetry).
+
+## Cargo Features & Contributor Conventions
+
+- **`mizar-agent-spine` Feature Gates**: `legacy`, `coding`, `compaction`, `sqlite`, `session-title`, `trajectory`, and `router`. Optional imports must be gated with `#[cfg(feature = "...")]`, verified via `--no-default-features`.
+- **Module & Language Conventions**: No `mod.rs` files (`foo.rs` + `foo/bar.rs`); public errors use `thiserror` and `cordis::BoxError` (never `anyhow`); `//!` crate/inline comments and human runtime errors use Chinese, while LLM-facing tool descriptions and parameter schemas **stay strictly English**.
+
+## Local Verification Gate
+
+All four CI gates (plus fast feedback checks) must pass cleanly — Clippy treats any warning as failure:
+
+```sh title="Workspace Verification Commands" kind="terminal"
+cargo check -p mizar-tui-ui                                              # Sub-second UI feedback loop
+cargo check --workspace                                                  # Required after cross-crate changes
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
+COLORTERM=truecolor cargo test --locked --workspace --no-fail-fast       # COLORTERM required for truecolor theme tests
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+```

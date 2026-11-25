@@ -13,8 +13,8 @@ const isEn = locale === 'en';
 ---
 
 <DiagramFrame
-  fig="FIG 06"
-  title={isEn ? 'SQLite WAL Session Forking & /trace 3-Lane Profiler' : 'SQLite WAL 会话分叉与 /trace 三泳道解剖'}
+  fig="FIG 03"
+  title={isEn ? 'SQLite WAL Session Forking, Compaction & Trajectory Export' : 'SQLite WAL 会话分叉、压缩剪枝与轨迹观测'}
   caption={caption}
   locale={locale}
 >
@@ -51,8 +51,8 @@ const isEn = locale === 'en';
 
       {/* 持久化架构横条 */}
       <rect x="33" y="56" width="366" height="46" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
-      <text x="45" y="75" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-session::sqlite (WAL · busy_timeout=5s)</text>
-      <text x="45" y="92" font-size={isEn ? 9 : 9.5} fill="var(--grey-9)">{isEn ? 'Single-Writer thread (128/tx off Tokio) · query_only read' : 'Single-Writer 线程 (128条/事务隔离Tokio) · query_only 读'}</text>
+      <text x="45" y="75" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-session-sqlite (WAL · FTS5 · busy_timeout=5s)</text>
+      <text x="45" y="92" font-size={isEn ? 8.8 : 9.2} fill="var(--grey-9)">{isEn ? 'Single-Writer (128/tx) · SQLITE_BUSY transient surface' : 'Single-Writer 线程 (128/tx) · SQLITE_BUSY 瞬时上报'}</text>
 
       {/* 主干时间线 */}
       <line x1="50" y1="120" x2="50" y2="404" stroke="var(--border-strong)" stroke-width="1.6" />
@@ -93,9 +93,9 @@ const isEn = locale === 'en';
       <rect x="66" y="214" width="164" height="68" fill="var(--grey-3)" stroke="var(--status-degraded)" stroke-width="1.2" />
       <rect x="66" y="214" width="164" height="68" fill="url(#sess-hatch-comp)" />
       <rect x="72" y="220" width="152" height="56" fill="var(--grey-2)" opacity="0.95" />
-      <text x="80" y="236" font-size="9.5" font-weight="700" fill="var(--callout-caution-ink)">{isEn ? '#3 COMPACTION Point' : '#3 COMPACTION 检查点'}</text>
-      <text x="80" y="252" font-size={isEn ? 8 : 8.5} fill="var(--grey-10)">{isEn ? 'Folds older into [Summary]' : '折叠早期为 [历史摘要]'}</text>
-      <text x="80" y="267" font-size={isEn ? 8 : 8.5} fill="var(--grey-8)">{isEn ? 'first_kept_seq (raw kept)' : 'first_kept_seq (原记录留存)'}</text>
+      <text x="80" y="236" font-size="9.2" font-weight="700" fill="var(--callout-caution-ink)">{isEn ? '#3 B-5 COMPACT + PRUNE' : '#3 B-5 压缩 & 尾部剪枝'}</text>
+      <text x="80" y="252" font-size={isEn ? 7.8 : 8.3} fill="var(--grey-10)">{isEn ? '8k warm tail · supersedeReads' : '8k 热尾保护 · superseded read'}</text>
+      <text x="80" y="267" font-size={isEn ? 7.8 : 8.3} fill="var(--grey-8)">{isEn ? 'Static recall · FileGuardTracker' : '单静态 recall · FileGuard 防误写'}</text>
 
       {/* #4 USER (Turn 2) */}
       <rect x="46" y="312" width="8" height="8" fill="var(--link)" />
@@ -201,7 +201,7 @@ const isEn = locale === 'en';
       <text x="453" y="403" font-size="10" font-weight="700" fill="var(--grey-11)">{isEn ? '④ Step Inspector & /export' : '④ Inspector 单步检查器 & /export'}</text>
       <text x="453" y="421" font-size="9.5" fill="var(--grey-10)">{isEn ? 'TTFT: 280ms · Total: 1,380ms · ↑12.4k ↓840 tokens' : 'TTFT: 280ms · 耗时: 1,380ms · ↑12.4k ↓840 tokens'}</text>
       <text x="453" y="438" font-size="9" fill="var(--grey-9)">{isEn ? 'Full tool args / result preview / RepeatGuard alerts' : '展示完整工具参数 / 返回预览 / RepeatToolGuard 告警'}</text>
-      <text x="453" y="454" font-size="9" fill="var(--link)">/export [path] → &#123;export_dir&#125;/&#123;session_id&#125;.jsonl</text>
+      <text x="453" y="454" font-size="8.8" fill="var(--link)">/export → .jsonl · exec --trace-out → TrajectoryExport</text>
 
       <rect x="427" y="18" width="4" height="4" fill="var(--link)" />
       <rect x="817" y="478" width="4" height="4" fill="var(--link)" />

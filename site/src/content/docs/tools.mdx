@@ -1,73 +1,66 @@
 ---
-title: 内置工具
-description: 了解 Mizar 默认提供的 6 个本地编程工具、大输出截断保护与 ToolExposure 五级暴露层级。
-group: capabilities
-order: 11
+title: 工具体系、常驻 Codemode、MCP 与技能
+description: ToolExposure 五级暴露模型、编码工具并发写锁、常驻 QuickJS codemode 沙箱、tool_search、MCP 与 SKILL.md。
+group: core-concepts
+order: 3
 ---
 
-import Callout from '../../components/mdx/Callout.astro';
-import DiagramEmbed from '../../components/DiagramEmbed.astro';
-
-向 Mizar 发送一条典型需求，它会自动串联多个内置工具完成排查、改动与验证，无需你手工复制代码或运行脚本：
-
-```text title="示例对话"
-你：帮我查一下 settings.json 为什么在只读容器里无法写入，顺手补一条单测。
-
-Mizar：
-1. find  → 定位配置加载与存储相关源文件
-2. grep  → 检索 sessionDb / mkdir 相关出错点
-3. read  → 分片精读错误上下文与现有测试风格
-4. edit  → 在目标文件做精确局部替换
-5. bash  → 运行 cargo test 验证修复通过
-```
-
-## 6 个内置工具的能力与防护
-
-所有内置工具都围绕「尽量保留关键信息、绝不一次性撑爆模型窗口」来设计：
-
-### `read` · 带行号分片读文件
-
-按起止行号（`offset` 与 `limit`）流式读取文件，输出带 1-indexed `<line>\t<text>` 行号以便精确定位编辑。超过 **2,000 行**、**50 KiB** 或单行超过 **2,000 字符**时自动安全截断，并在输出末尾提示续读行号。读取某个深层子目录的文件时，还会顺带发现该子目录自带的 `AGENTS.md` 规则。
-
-### `grep` 与 `find` · 目录扫描与正则检索
-
-优先复用 `PATH` 或 `~/.mizar/bin/` 中的 `rg` / `fd`，未安装时无缝回退同源内置 Rust（`ignore` + `regex`/`globset`）引擎，自动遵守 `.gitignore`、跳过常见构建噪声目录。`grep` 支持 `content` / `files_with_matches` / `count` 输出模式，默认最多返回 **100 条**匹配（单文件上限 **20 条**）并裁切单行超过 **500 字符**的极长 minified 文本；`find` 按修改时间倒序默认返回最多 **200 条**路径。
-
-### `edit` 与 `write` · 串行安全与原子多段编辑
-
-`write` 用于创建或覆写完整文件；`edit` 支持通过 `edits[]` 在单次调用内提交多处不重叠替换与 `replaceAll`，匹配原文件文本并自动保留 BOM 与 CRLF/LF。**对同一文件路径的连续修改会自动进入排队串行执行**，不会因为并发调用互相覆盖。
-
-### `bash` · 并发 Shell 与大输出落盘
-
-执行构建、测试或脚本命令时，会在独立进程组中拉起 POSIX Shell（支持并发批次与 `timeout` 参数，默认 `120s`、上限 `600s`；按 `Esc` 中断会连同整个子进程组一并清理）。当输出较大时：
-
-- `bash` 采用双向截断（最多 **400 行** / **20 KiB** / 单行 **768 字节**）保留最新上下文；
-- 输出超过 **64 KiB** 时同时把**完整原始日志**写进系统临时目录下的 `mizar/mizar-bash-*.log`，返回路径供你或模型用 `read` 随时回看全量细节。
-
-<Callout type="note" title="默认无路径硬隔离">
-
-为保证开发顺畅，`read` / `edit` / `bash` 默认均可访问工作区之外的文件或命令。如在陌生仓库运行，务必前往 [权限与安全](/security/) 配置工具裁剪、工作区路径约束与审批闸门。
-
-</Callout>
-
-## 为什么接入海量工具不会撑爆上下文？
-
-如果你接了上百个外部 MCP 工具，全部把 JSON Schema 塞进模型上下文不仅极其昂贵，还会显著降低工具选择准确率。Mizar 为每个工具分配了清晰的 `ToolExposure` 可见性层级，在“随时可用”与“保持精简上下文”之间自动取得平衡：
+Mizar 的全部可执行能力通过 `mizar-tools` 服务向模型统一暴露，并经过三段 Cordis 管线（`tools/pre-execute` → `tools/execute` → `tools/post-execute`）调度。为了在复杂项目中同时保障**上下文经济性**、**前缀稳定性**与**并发安全**，所有工具都受 `ToolExposure` 五级可见性控制。
 
 <DiagramEmbed
   id="tool-exposure"
-  title="工具可见性与上下文预算闭环"
-  caption="内置核心工具直接对模型可见；MCP 工具默认退入沙箱按需调用；发现与编排元工具允许模型主动按需检出。"
+  caption="图 02：ToolExposure 五级可见性矩阵、常驻 QuickJS codemode 沙箱调度与按需触发的 MCP BM25 检索闭环。"
 />
 
-从使用者的视角看，模型与工具共有五种 `ToolExposure` 暴露状态：
+## ToolExposure 五级暴露模型
 
-1. **直接声明（`Direct`）**：如 `read`、`edit`、`bash` 与静态常驻情景回溯 `recall`（支持 `search` / `read`），模型从第一轮起就能直接发起调用并保持系统提示词/工具表冻结以复用 Prompt Cache。
-2. **仅向模型声明 / 防嵌套（`ModelOnly`）**：如按需搜工具的 `tool_search`、执行 JS 编排的 `codemode` 与常驻后台分身 `subagent`（`spawn` / `send` / `status` / `stop`），模型可以直接触发它们，但沙箱脚本内部或子代理内部禁止递归套娃。
-3. **仅在沙箱内部调用（`Codemode`）**：所有 MCP 服务器工具默认属于这一层——完全不占对话首轮上下文，需要时模型在 [Codemode 沙箱](/codemode/) 里一键批量调通。
-4. **按需搜出 / 延迟加载（`Deferred`）**：例如标记为 `deferred` 的大型外部 MCP 工具平时静默隐藏，在经 `tool_search` 或沙箱 `searchTools()` 命中后才进入直接可用视野。
-5. **彻底隐藏（`Hidden`）**：被 `excludeTools` 或配置为 `hidden` 的工具对模型和沙箱均不可见。
+| 等级 | 直接声明给模型 | 可在 `codemode` 内调用 | 默认适用工具 | 设计意图 |
+| :--- | :--- | :--- | :--- | :--- |
+| `Direct` | ✓ 是 | ✓ 是 | `read`、`write`、`edit`、`bash`、`grep`、`find`、`recall`、`skill` | 核心高频工具，Schema 冻结在首轮请求中 |
+| `ModelOnly` | ✓ 是 | ✗ 禁止嵌套 | `codemode`、`tool_search` | 编排/元工具，禁止在 JS 沙箱内部递归套娃 |
+| `Codemode` | ✗ 懒加载 | ✓ 是（列于目录） | 所有外部 MCP 工具（默认） | 避免数十个 MCP Schema 撑爆上下文 |
+| `Deferred` | ✗ 懒加载 | ✓ 是（隐藏目录） | 大规模 MCP 工具显式标记为按需检索 | 仅通过 `tool_search` / `searchTools()` 发现并会话级激活 |
+| `Hidden` | ✗ 否 | ✗ 否 | 命中 `excludeTools` / `Disabled` 的工具 | 对模型和沙箱同时完全不可见 |
 
-## 工具裁剪与权限控制
+工具屏蔽与白名单遵循固定优先级：**`excludeTools` / `Hidden` > `includeTools`（`--tools` / `tools`） > 运行时覆盖 > 工具默认属性**。
 
-不同任务不需要开放全部能力。你可以通过 `settings.json` 的 `toolsPreset`（`all` / `minimal` / `read-only`）、`tools` 白名单（内部对应 `includeTools`）与 `excludeTools` 黑名单，或 CLI 启动参数 `--minimal`、`--read-only`、`-t` / `-xt` 随时收窄可用工具，也可以输入 [`/tools`](/tui/commands/) 查看当前生效层级。完整权限预设矩阵、跨层级并集规则与 `--approve` 审批闸门请见 [权限与安全](/security/)。
+## 内置编码工具集（`mizar-tools-coding`）
+
+除默认包含 6 个工具的 `All` 预设外，还可通过 `--minimal` / `toolsPreset: "minimal"`（仅留 `read`/`bash`/`edit`/`write`）或 `--read-only` / `toolsPreset: "read-only"`（仅留 `read`/`grep`/`find`）快速裁剪：
+
+| 工具 | 并行策略 | 关键参数与输出约束 |
+| :--- | :--- | :--- |
+| `read` | 完全并行 | 输出 1-indexed `<line>\t<text>`；上限 `2000` 行 / `50 KB` / 单行 `2000` 字符；支持 `offset` 与 `limit`，并支持读取图片为多模态内容 |
+| `edit` | 按路径串行队列，跨文件并行 | 支持顶层 `oldText`/`newText` 或原子批量 `edits[]` 数组，支持 `replaceAll`；保留文件 BOM 与 CRLF/LF |
+| `write` | 按路径串行队列，跨文件并行 | 全文件写入前受 `mizar-compaction` 的 `FileGuardTracker` 检查（压缩后修改已存在文件须先重读或改用 `edit`） |
+| `bash` | 完全并行 | 默认超时 `120s`（最大 `600s`），追加 `~/.mizar/bin` 到 `PATH`；`truncate_head_tail` 双向截断（**`400` 行 / `20 KB` / 单行 `768 B`**）；超过 `64 KB` 时完整流式输出自动落盘临时文件并返回路径 |
+| `grep` | 完全并行 | 基于 `ignore` 遵循 `.gitignore`，单行截断 `500` 字符 |
+| `find` | 完全并行 | 基于 `fd` / `.gitignore` 感知遍历，默认上限 `1000` 条或 `50 KB` |
+
+<Callout type="tip" title="工具参数校验错误直接回传模型">
+  当模型输出的 tool call arguments 不是合法 JSON 或缺少必需字段时，<code>parse_tool_arguments</code> 不再将其静默吞成空对象 <code>{}</code>，而是把结构化校验错误作为工具结果直接返回模型，让模型在同一轮次自我纠正参数重试。
+</Callout>
+
+同路径的 `write` 与 `edit` 会进入 `with_file_mutation_queue` 串行排队以消除竞态覆盖，而针对不同文件的 `read` / `write` / `edit` / `bash` 调用在启用并发时可同时执行。
+
+## 常驻 `codemode`（QuickJS 沙箱）
+
+`codemode`（`mizar-codemode`）在本分支中**默认常驻激活**，不存在动态开关状态机，从而保持工具 Schema 从第一轮起即完全冻结：
+
+- **大道至简的多工具折叠**：模型可在一次 tool call 中提交异步 JS 代码，通过 `tools.<name>(args)` 并发或串行调用任意 `Direct`、`Codemode` 与 `Deferred` 工具（如 `await Promise.allSettled([...])`），并在 QuickJS 堆内存中过滤、聚合结果，最终只返回紧凑文本或 JSON（默认内联预算 `inlineBudget = 3000` 字符，超出部分截断并落盘临时文件）。
+- **提示词联动引导**：`mizar-system-prompt` 与各 `Direct` 工具的描述（如 `Codemode: tools.read(args)`）会引导模型把多次独立只读探测、多步流水线或大规模文本过滤整合进一次 `codemode` 脚本，大幅减少 LLM 往返轮数与上下文膨胀。
+- **沙箱资源边界**：内嵌 `rquickjs` 运行时限定 **`256 MiB` 内存、`1 MiB` 栈深、并发工作数 `workers = 2`、默认超时 `120_000 ms`**（`codemode.timeoutMs` 可调），取消信号可穿透嵌套的异步工具调用。
+- **沙箱内建辅助函数**：除 `tools.*` 外，脚本环境中可直接调用 `searchTools()`、`describeTool()`、`store()` 与 `load()` 跨步共享中间结构化数据。
+- **专属控制项**：如希望屏蔽直接编码工具、强迫所有操作全部走 JS 编排，可设 `codemode.onlyMode: true`；如要彻底禁用 `codemode`，将其加入 `disabledPlugins: ["codemode"]` 或 `excludeTools: ["codemode"]`。
+
+## 按需激活的 `tool_search`
+
+`mizar-tool-search` 使用 BM25 算法（工具名权重 `4.0`，命名空间权重 `2.0`，默认返回 `defaultLimit = 8` 条）检索 `Codemode` 与 `Deferred` 工具：
+
+- **0-MCP 零开销省略**：当工作区未配置任何外部 MCP 工具（不存在任何 `Codemode` / `Deferred` 候选）时，`tool_search` 不会注入模型工具声明列表，彻底避免占用无效前缀 Token。
+- **仅存在 MCP 工具时启用**：只要检测到非空的 `Codemode` / `Deferred` 工具池且 `toolSearch.autoEnable !== false`，`tool_search` 自动现身；模型检索命中后调用激活接口，对应 MCP 工具的完整 Schema 会在**下一轮 LLM 请求**正式加入声明。
+
+## 外部 MCP 与渐进式技能（`SKILL.md`）
+
+- **MCP 客户端（`mizar-mcp`）**：读取 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json`（后者可仅覆写 `exposure` / `toolExposure` / `enabled` 等字段），同时支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP / SSE**（`url` / `headers`，复用 `mizar-llm-http` 连接池与自定义 TLS 根证书）。所有外部 MCP 工具默认暴露为 `Codemode`，命名规则为 `mcp__<server>__<tool>`；此外一并注册 `list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource`。
+- **渐进式技能（`mizar-skills`）**：启动时按优先级扫描工作区 `.agents/skills` → `skills.customDirs` → 全局 `~/.agents/skills` → 内置目录 `skills.bundledDir`（也可由 `MIZAR_BUNDLED_SKILL_DIR` 指定），解析 `SKILL.md` YAML frontmatter。当没有发现任何可用技能时，`skill` 工具同样从声明列表中静默省略；当通过 `write` / `edit` 修改技能目录文件时会自动触发热刷新。

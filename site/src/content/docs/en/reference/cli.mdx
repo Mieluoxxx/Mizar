@@ -1,0 +1,145 @@
+---
+title: CLI Flags, Exec Contract & Environment Variables
+description: Complete CLI flags for mizar, mizar exec, and mizar update, JSON output schema, exit codes, and environment variables.
+group: reference
+order: 7
+---
+
+The `mizar` binary (compiled from `mizar-tui`) exposes three entrypoints sharing the same config resolution, routing logic, and Cordis plugin spine.
+
+## Three CLI Entrypoints
+
+| Command Form | Purpose | Prompt Input |
+| :--- | :--- | :--- |
+| `mizar [OPTIONS]` | Launch interactive TUI workbench; passing `-p` / `--prompt` / `--prompt-file` enters headless exec | Interactive input or `-p` / `--prompt-file` |
+| `mizar exec [OPTIONS] [<prompt>]` | Headless single-turn execution for CI, benchmarks, and shell scripts | Positional `<prompt>`, `-p`, `--prompt-file`, or piped `stdin` |
+| `mizar update [FLAGS]` | Verify SHA-256 and update binary from GitHub Releases | `-v/--version <ver>`, `-f/--force`, `--check`, `-h/--help` |
+
+## Complete CLI Flags (`mizar` and `mizar exec`)
+
+| Flag | Value / Default | Scope | Description |
+| :--- | :--- | :--- | :--- |
+| `-C`, `--workspace <dir>` | Path (default `.`) | Global | Override workspace root directory (fallback: `WORKSPACE` env var) |
+| `-p`, `--prompt <text>` | String | Global / `exec` | Provide a single prompt and run headlessly |
+| `--prompt-file <path>` | File path | Global / `exec` | Read prompt from file and run headlessly (conflicts with `--prompt`/`<prompt>`) |
+| `--provider <name>` | Provider ID | Global | Override provider (`openai`, `openai-responses`, `anthropic`, `deepseek`, `mock`, or `models.json` key) |
+| `--model <id>` | Model ID | Global | Override active model ID |
+| `--protocol`, `--api-format <kind>` | `completions` \| `responses` \| `messages` | Global | Select protocol adapter (accepts `openai-completions`, `openai-responses`, `anthropic-messages`) |
+| `--base-url <url>` | URL string | Global | Override API endpoint URL |
+| `--reasoning-effort <level>` | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | Global | Override reasoning effort |
+| `--max-steps <n>` | Positive integer (unlimited) | Global | Maximum tool steps allowed per turn; triggers `code=max_steps` on overflow |
+| `--max-tokens <n>` | Positive integer | Global | Override max output tokens per LLM response |
+| `--timeout <secs>` | Seconds | `exec` | Whole-turn execution timeout; exits with code `124` on expiry |
+| `--output-format <fmt>` | `text` (default) \| `json` | `exec` | Format written to `stdout` on completion |
+| `--json` | Boolean flag | `exec` | Shorthand alias for `--output-format json` |
+| `--trace-out <path>` | File path | `exec` | Atomically write structured `TrajectoryExport` JSON on exit (overrides `MIZAR_TRACE_OUT`) |
+| `--isolated` | Boolean flag | Global | Skip loading global and workspace disk configs; run cleanly in memory |
+| `--minimal` | Boolean flag | Global | Select `MinimalCoding` preset (`read`, `bash`, `edit`, `write` only) |
+| `--read-only` | Boolean flag | Global | Select `ReadOnly` preset (`read`, `grep`, `find` only) |
+| `-t`, `--tools <csv>` | Comma-separated names | Global | Explicitly enable/constrain active tools |
+| `-xt`, `--exclude-tools <csv>` | Comma-separated globs | Global | Add tool exclusions (`Hidden` in both schemas and `codemode`) |
+| `--inline` | Boolean flag | TUI | Start directly in Inline scrollback viewport |
+| `--approve` | Boolean flag | TUI | Require interactive approval for non-read-only tools (`ui.approvalMode: "ask"`) |
+| `-c`, `--continue` | Boolean flag | TUI / `exec` | Resume the most recent session for the current workspace |
+| `-r`, `--resume [id]` | Optional session ID | TUI / `exec` | Open session picker in TUI when `id` is omitted, or resume matching ID |
+| `--no-persist` | Boolean flag | Global | Disable SQLite persistence (in-memory session only) |
+| `--no-instructions` | Boolean flag | Global | Skip startup `AGENTS.md` / `CLAUDE.md` discovery and injection |
+| `--theme <name>` | Theme name (`auto`) | TUI | Initial theme: `auto` \| `mist-dark` \| `mist-light` \| `sakura-dark` \| `system` \| `ansi16` |
+| `-h`, `--help` | — | Global | Print CLI help text |
+| `-V`, `--version` | — | Global | Print binary version and exit |
+
+## `mizar exec` Automation Contract
+
+### JSON Output Schema (`--json` / `--output-format json`)
+
+When a turn finishes with `TurnEndReason::Completed`, `stdout` emits one compact JSON object:
+
+```json title="stdout (--output-format json)"
+{
+  "session_id": "019...",
+  "resumed": false,
+  "reason": "completed",
+  "steps": 4,
+  "duration_ms": 3820,
+  "llm_ms": 2910,
+  "ttft_ms": 340,
+  "tool_ms": 880,
+  "tool_calls": 6,
+  "session_turns": 1,
+  "session_steps": 4,
+  "text": "Finished analyzing Cargo.toml..."
+}
+```
+
+### Exit Codes
+
+| Exit Code | Meaning | `stderr` Diagnostic Pattern |
+| :--- | :--- | :--- |
+| `0` | Completed turn cleanly | — |
+| `1` | Generic error, max steps, truncation, or cancellation | Contains `code=max_steps`, `code=max_tokens`, `code=cancelled`, or secret-redacted error text |
+| `124` | `--timeout` deadline exceeded | `execution timed out after <secs>s (code=timeout)` |
+| `130` / `143` | Interrupted by signal (`SIGINT` / `SIGTERM`) | `execution interrupted by signal (code=cancelled)` |
+
+<Callout type="note" title="Secret Redaction & Trace Resolution">
+  Diagnostics printed to <code>stderr</code> or triggered by <code>--trace-out</code> write errors are automatically scrubbed against loaded API keys. When both <code>--trace-out</code> and <code>MIZAR_TRACE_OUT</code> are set, the CLI flag wins.
+</Callout>
+
+## Environment Variables Reference
+
+### 1. LLM Routing & Credentials
+
+| Variable | Description |
+| :--- | :--- |
+| `API_KEY` | Highest-precedence generic credential overriding provider-specific env keys |
+| `OPENAI_API_KEY` | Default key for `openai` / `openai-responses` |
+| `ANTHROPIC_API_KEY` | Default key for `anthropic` |
+| `DEEPSEEK_API_KEY` | Default key for `deepseek` |
+| `OPENROUTER_API_KEY` | OpenRouter credential env var available to router overrides |
+| `PROTOCOL` | Override wire protocol (`completions` / `responses` / `messages`) |
+| `BASE_URL` | Override API base URL |
+| `MODEL` | Override active model ID |
+
+### 2. Paths & Runtime Diagnostics
+
+| Variable | Default / Behavior |
+| :--- | :--- |
+| `WORKSPACE` | Override workspace root (lower priority than `-C/--workspace`) |
+| `MIZAR_HOME` | Global config directory, default `~/.mizar` (`settings.json`, `models.json`, `mcp.json`, `sessions.sqlite`) |
+| `MIZAR_AGENTS_HOME` | Global agent directory, default `~/.agents` (`AGENTS.md`, `skills`) |
+| `MIZAR_SESSION_DB` | Override SQLite file path; set to `none` or `off` to disable persistence |
+| `MIZAR_BUNDLED_SKILL_DIR` | Override bundled skills directory (lower priority than `skills.bundledDir`) |
+| `MIZAR_TRACE_OUT` | Default output path for `mizar exec` `TrajectoryExport` JSON |
+| `CORDIS_LOG` | Control Cordis microkernel log verbosity (e.g. `debug` / `warn`) |
+
+### 3. Corporate Proxies & Custom TLS CA Roots
+
+`mizar-llm-http` and `mizar-mcp` check standard ecosystem CA bundle env vars in order — **any one suffices**:
+
+| Variable | Description |
+| :--- | :--- |
+| `SSL_CERT_FILE` | OpenSSL / standard PEM CA root bundle file |
+| `CURL_CA_BUNDLE` | curl-compatible CA bundle file |
+| `REQUESTS_CA_BUNDLE` | Python requests-compatible CA bundle file |
+| `NODE_EXTRA_CA_CERTS` | Node.js extra trusted root certificates file |
+
+### 4. Self-Update & Offline Controls
+
+| Variable | Description |
+| :--- | :--- |
+| `MIZAR_OFFLINE` | When `1`/`true`/`yes`/`on`, disables all startup update checks and outbound checks |
+| `MIZAR_SKIP_VERSION_CHECK` | When `1`/`true`/`yes`/`on`, skips startup async release check |
+| `MIZAR_RELEASE_BASE_URL` | Override `mizar update` download base URL (default `https://github.com/Mieluoxxx/Mizar`) |
+
+### 5. Terminal, TUI Emphasis & Editor Integration
+
+| Variable | Description |
+| :--- | :--- |
+| `COLORTERM` | Set to `truecolor` or `24bit` for full Oklab 24-bit rendering |
+| `TERM` / `COLORFGBG` | Used for capability probing and `auto` dark/light detection |
+| `SHELL` | Fallback shell for `bash` tool when `/bin/bash`, `/usr/bin/bash`, and `/bin/sh` are absent |
+| `VISUAL` / `EDITOR` | External editor binary |
+| `MIZAR_TUI_EMPHASIS` | Set `0`/`false`/`off` to disable `pi-emphasis` visual rendering |
+| `MIZAR_TUI_ROUND_CAPS` / `PI_EMPHASIS_ROUND_CAPS` | Set `0`/`false`/`off` to turn off rounded pill caps |
+| `MIZAR_TUI_PILL_ICONS` / `PI_EMPHASIS_PILL_ICONS` | Set `0`/`false`/`off` to hide Nerd Font pill icons |
+| `MIZAR_TUI_EMPHASIS_GUIDANCE` / `PI_EMPHASIS_GUIDANCE` | Set `0`/`false`/`off` to omit emphasis prompt guidance |
+| `MIZAR_TUI_PROGRAM_STATUS` | Controls terminal window/progress status reporting |

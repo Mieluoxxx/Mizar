@@ -1,112 +1,45 @@
 ---
-title: Troubleshooting
-description: Diagnose common issues by symptom—demo-mode fallback, unused MCP tools, strict JSON syntax errors, read-only database failures, and mouse text selection.
-group: rules-security
-order: 17
+title: Troubleshooting & Runtime Diagnostics
+description: Diagnose routing errors, TLS roots, gateway compat 400s, SQLITE_BUSY, MCP disconnects, codemode timeouts, and terminal glitches.
+group: ops-internals
+order: 10
 ---
 
-import Callout from '../../../components/mdx/Callout.astro';
+When investigating failures, start with `CORDIS_LOG=debug mizar exec "ping"` to inspect runtime traces, or match your symptom below.
 
-Locate the exact symptom you're seeing in the terminal and apply the corresponding fix.
+## 1. Routing, Credentials & TLS Networks
 
-## 1. Header shows `mock-v1` and responses are canned demo templates
+| Symptom | Cause | Fix |
+| :--- | :--- | :--- |
+| `no LLM provider or route configured` | No env credentials, no `models.json`, and no `--provider mock` | Export `API_KEY` + `BASE_URL` + `MODEL`, or run `mizar --provider mock --model mock-v1` |
+| `unknown provider "<name>"` | `--provider` matches neither built-ins nor `models.json` keys | Verify `models.json` provider key, or add `--protocol` and `--base-url` |
+| Corporate HTTPS proxy TLS verification error | Private CA root missing from Rust `reqwest` client trust store | Export `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, or `NODE_EXTRA_CA_CERTS` pointing to your `.pem` bundle |
+| Slow startup in air-gapped networks | Background GitHub release check timing out (6s) | Set `export MIZAR_OFFLINE=1` or `export MIZAR_SKIP_VERSION_CHECK=1` |
 
-### Cause
+## 2. Gateway 400s, Truncation & Loops
 
-When Mizar starts without any valid provider configuration in environment variables (`API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`) or `models.json`, it automatically enters the built-in offline demo mode (`mock` / `mock-v1`).
+When routing through OneAPI, LiteLLM, vLLM, Ollama, or custom OpenAI-compatible proxies:
 
-### Resolution
+- **Gateway rejects `developer` role**: Set `"supportsDeveloperRole": false` inside `compat`.
+- **Gateway rejects `stream_options` / `include_usage`**: Set `"supportsUsageInStreaming": false`.
+- **Gateway rejects `max_completion_tokens` or `max_output_tokens`**: Set `"maxTokensField": "max_tokens"` and `"supportsMaxOutputTokens": false`.
+- **Reasoning endpoint rejects `temperature` / `reasoning_effort`**: Disable via `"supportsTemperature": false` or `"supportsReasoningEffort": false`.
+- **`exec` exits `1` with `code=max_tokens`**: Response hit output token ceiling; raise `--max-tokens` or `models[].maxTokens`.
+- **`repeat-tool-guard` alerts fire repeatedly**: Press `Ctrl+T` to inspect `/trace` Hotspots & Inspector for repeated validation errors or missing paths.
 
-The fastest way to verify connectivity is to pass an environment variable directly on launch:
+## 3. SQLite Persistence & Concurrency
 
-```bash title="Direct connection via temporary environment variable"
-DEEPSEEK_API_KEY="sk-your-key" mizar
-```
+- **`SQLITE_BUSY` transient warnings**: Multiple concurrent `mizar` processes contended on `~/.mizar/sessions.sqlite` past the 5s `busy_timeout`. Isolate runs with `MIZAR_SESSION_DB=/tmp/dev-a.sqlite`, or pass `--no-persist` / `MIZAR_SESSION_DB=none`.
+- **Unpaired `tool_call` from a past crash**: `/tree` forking and `-r <id>` resume automatically synthesize healing results on replay.
 
-To persist one or more providers long-term, configure `providers` in `~/.mizar/models.json` following [Models & Credentials](/en/providers/), or run [`/model`](/en/tui/commands/) to check whether `mock` is currently selected as your default model.
+## 4. MCP, `codemode` & Instructions
 
-## 2. `mcp.json` is configured, but the model doesn't know those tools exist
+- **Configured MCP tools do not appear in top-level declarations**: External MCP tools default to `Codemode` to save tokens. The model invokes them directly via `codemode` (`tools.mcp__<server>__<tool>(...)`) or activates them via `tool_search`. Set `"exposure": "direct"` in `mcp.json` only for always-needed tools, and inspect live server state with `/mcp`.
+- **`codemode` 120s timeout**: Long builds/test suites inside a JS script should invoke standalone `bash` (up to `600s`) or raise `codemode.timeoutMs` in `settings.json`. To turn off `codemode`, add `"codemode"` to `disabledPlugins`.
+- **Subdirectory `AGENTS.md` edit not visible mid-session**: `mizar-instructions` loads statically at startup for KV-cache stability. Restart the session and run `/instructions` to verify loaded files and `maxBytes` eviction order.
 
-### Cause
+## 5. Terminal Colors, Clipboard & Selection
 
-This usually comes down to one of two things:
-
-1. **Background handshake failure**: Mizar connects to MCP servers asynchronously so a broken or slow server never freezes TUI startup, recording failures in the background instead;
-2. **Tools live in `codemode` by default or were hidden by overrides**: By default, MCP tools aren't injected into the model's direct tool list. If `"autoEnableCodemode": false` is set in `mcp.json` without marking individual servers or tools `"direct"`, the model sees neither direct tools nor `codemode`.
-
-### Resolution
-
-Run these two [slash commands](/en/tui/commands/) inside the TUI input box:
-
-```text title="Inspect tool and MCP status inside the TUI"
-/mcp
-/tools
-```
-
-- Check `/mcp` output to see whether the server shows `Connected` or an error message (for instance, an unset `${VAR}` leaving a URL or token empty);
-- While testing, temporarily set `"exposure": "direct"` on the server in `.mizar/mcp.json` so tool calls appear directly in the model's tool list.
-
-## 3. Startup fails immediately after editing config (or settings seem ignored)
-
-### Cause
-
-Mizar enforces **strict JSON parsing** for `settings.json`, `models.json`, and `mcp.json` under `~/.mizar/` and `<workspace>/.mizar/`:
-
-- `//` or `/* */` comments fail to parse;
-- Trailing commas at the end of objects or arrays fail to parse;
-- Using `snake_case` keys (such as `default_model` instead of `defaultModel`) causes fields to be ignored;
-- Exporting `API_KEY` or `MODEL` in your shell overrides values in `settings.json` and `models.json`.
-
-### Resolution
-
-Validate all three JSON files at once to pinpoint syntax errors and line numbers:
-
-```bash title="Validate syntax across all JSON config files"
-for f in ~/.mizar/*.json .mizar/*.json; do
-  [ -f "$f" ] && python3 -m json.tool "$f" >/dev/null && echo "OK: $f"
-done
-```
-
-If leftover shell variables might be overriding your configuration files, inspect your current environment:
-
-```bash title="Check for overriding environment variables"
-env | rg '^(MIZAR_|API_KEY|PROTOCOL|BASE_URL|MODEL|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY)'
-```
-
-## 4. Startup fails to create session DB in read-only containers, CI, or read-only mounts
-
-### Cause
-
-By default, Mizar writes conversation history and branch trees to `~/.mizar/sessions.sqlite` (using SQLite WAL mode). If `$HOME` is unwritable or mounted read-only inside a container, creating the database or `-wal` / `-shm` sidecar files fails.
-
-### Resolution
-
-Disable disk persistence or point `MIZAR_HOME` / `MIZAR_SESSION_DB` to a writable temp directory:
-
-```bash title="Run Mizar in-memory with no disk writes"
-# Option A: Disable persistence via CLI flag
-mizar --no-persist
-
-# Option B: Disable globally via env var ("off" also works)
-MIZAR_SESSION_DB=none mizar
-
-# Option C: Redirect config and session storage to /tmp
-MIZAR_HOME=/tmp/mizar-home mizar
-```
-
-## 5. Dragging with the mouse in the terminal scrolls instead of selecting text
-
-### Cause
-
-In Fullscreen mode, Mizar captures terminal mouse events so you can scroll long outputs, click tabs, and navigate trace panels with the wheel. That temporarily intercepts standard left-click text selection.
-
-### Resolution
-
-Two zero-config options work out of the box:
-
-- **Toggle mouse capture**: Press <kbd>F2</kbd> (or run [`/mouse`](/en/tui/commands/)) anytime to temporarily hand mouse control back to the terminal. The status bar indicates native mouse selection mode so you can drag-select and copy normally; press <kbd>F2</kbd> again to re-enable panel scrolling.
-- **Terminal bypass [shortcut](/en/tui/keybinds/)**: In most modern terminals (macOS Terminal, iTerm2, Ghostty, WezTerm, Alacritty), holding <kbd>Option</kbd> (or <kbd>Alt</kbd> / <kbd>Shift</kbd>) while dragging forces native text selection without toggling modes.
-
-<Callout type="tip" title="Don't forget lossless dual-mode viewports">
-  If you frequently copy terminal scrollback or interleave Mizar with host shell commands, press <kbd>F3</kbd> (or launch with <code>mizar --inline</code>) to switch to the Inline viewport that preserves native terminal scrollback.
-</Callout>
+- **Degraded colors in terminal/CI**: Ensure `COLORTERM=truecolor` is exported or switch via `/theme ansi16`; hide Nerd Font icons with `MIZAR_TUI_PILL_ICONS=0`.
+- **Cannot drag-select text across Fullscreen UI**: Press **`F2`** (`/mouse`) to pause in-app mouse capture for native selection, or run `--inline` (`/view inline`) to flush turns to native terminal scrollback.
+- **Red JSON config banner on startup**: Mizar requires strict JSON — strip `//` comments and trailing commas from `settings.json`, `models.json`, and `mcp.json`.

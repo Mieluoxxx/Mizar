@@ -1,0 +1,199 @@
+---
+title: settings.json、模块控制与 mcp.json
+description: 配置层级合并优先级、settings.json 全量字段、disabledPlugins 与 10 个宿主扩展 ID，以及 mcp.json Schema。
+group: reference
+order: 8
+---
+
+Mizar 采用严格 JSON（`serde_json`）读取配置文件：会自动剥离 UTF-8 BOM，但**禁止 JSONC 注释与尾随逗号**。发现语法错误时会在启动顶部通告栏报告具体文件路径与行号。
+
+<DiagramEmbed
+  id="config-precedence"
+  caption="图 05：四级配置优先级叠加规则——标量字段后者覆写，集合类字段去重追加合并。"
+/>
+
+## 配置文件位置与合并规则
+
+Mizar 按由低到高顺序加载两层磁盘配置（`--isolated` 时全部跳过），再叠加环境变量与 CLI 参数：
+
+1. **全局配置**：`~/.mizar/settings.json`（可通过 `MIZAR_HOME` 重定向）
+2. **项目配置**：`<workspace>/.mizar/settings.json`
+3. **运行期写回**：在 TUI 中通过 `/settings` 开关模块、主题、思考强度或审批模式时，会原子更新对应字段回配置文件。
+
+合并原则为双轨制：
+- **标量与嵌套对象**（如 `defaultModel`、`compaction.triggerRatio`、`ui.theme`）：项目层深度逐字段覆写全局层。
+- **集合白名单/黑名单字段**：`excludeTools`、`skills.customDirs` 与 `disabledPlugins` **按并集去重追加**，项目配置不会意外清空全局安全禁止规则。
+
+## `settings.json` 全量字段参考
+
+所有字段名均采用 **camelCase**：
+
+### 顶层核心字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `defaultProvider` | `string` | `null` | 默认提供方 ID（对应内置名或 `models.json` 键名） |
+| `defaultModel` | `string` | `null` | 默认模型 ID |
+| `reasoningEffort` | `string` | `null` | 默认思考强度（兼容别名 `defaultThinkingLevel`）：`off`..`max` |
+| `maxSteps` | `number` | `null`（不限） | 单轮内最大工具步数上限 |
+| `persona` | `string` | 内置静态英文 | 覆盖系统提示词首段的身份描述文本 |
+| `toolsPreset` | `string` | `"all"` | 工具集预设：`"all"` \| `"minimal"` \| `"read-only"` |
+| `tools` | `string[]` | `null` | 显式启用的工具名称列表（与 `--tools` 语义一致） |
+| `excludeTools` | `string[]` | `[]` | 屏蔽的工具通配符列表（命中即置为 `Hidden`，跨层并集叠加） |
+| `disabledPlugins` | `string[]` | `[]` | 声明式禁用的内置 Cordis 模块或宿主扩展 ID（跨层排序去重并集） |
+| `restrictToWorkspace` | `boolean` | `false` | 限制内置文件工具只能访问当前工作区及规范化子路径（**不限制 `bash`**） |
+| `sessionDb` | `string` | `~/.mizar/sessions.sqlite` | 会话数据库路径；设为 `"none"` 或 `"off"` 禁用磁盘持久化 |
+
+### `codemode` — 常驻 QuickJS 沙箱编排
+
+`codemode` 在本分支**默认常驻激活**（已移除旧版 `autoEnable` 开关），如需关闭请将其加入 `disabledPlugins: ["codemode"]` 或 `excludeTools: ["codemode"]`：
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `codemode.onlyMode` | `boolean` | `false` | 为 `true` 时隐藏 `Direct` 编码工具声明，强制模型全部经由 `codemode` JS 调用工具 |
+| `codemode.inlineBudget` | `number` | `3000` | 在工具描述中内联摘要的最大字符预算 |
+| `codemode.timeoutMs` | `number` | `120000` | 单段 QuickJS 沙箱脚本的执行超时毫秒数 |
+
+### `toolSearch` — MCP 工具 BM25 懒发现
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `toolSearch.autoEnable` | `boolean` | `true` | 当存在 `Codemode` / `Deferred` 暴露等级的外部 MCP 工具时自动启用 `tool_search` |
+| `toolSearch.defaultLimit` | `number` | `8` | 每次 BM25 检索返回的默认最大工具条目数 |
+
+### `skills` — 渐进式技能发现
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `skills.enabled` | `boolean` | `true` | 是否扫描与启用 `SKILL.md` 技能目录 |
+| `skills.customDirs` | `string[]` | `[]` | 额外自定义技能扫描目录列表（跨层并集去重） |
+| `skills.bundledDir` | `string` | `null` | 显式覆盖内置技能包根目录 |
+| `skills.catalogDescriptionMaxLength` | `number` | `500` | 合成技能目录中每项描述截断上限 |
+
+### `instructions` — 启动期静态指令加载
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `instructions.enabled` | `boolean` | `true` | 是否启用启动期指令扫描与系统提示词注入 |
+| `instructions.candidates` | `string[]` | `["AGENTS.md", "CLAUDE.md"]` | 候选指令文件名列表 |
+| `instructions.localCandidates` | `string[]` | `["AGENTS.local.md", "CLAUDE.local.md"]` | 本地覆盖指令文件名列表 |
+| `instructions.projectRootMarkers` | `string[]` | `[".git"]` | 向上回溯止步标记 |
+| `instructions.maxBytes` | `number` | `65536` | 全量指令拼装总字节预算（超出优先淘汰最远祖先目录） |
+| `instructions.maxSourceBytes` | `number` | `1048576` | 单个指令源文件允许读取的最大字节数（1 MiB） |
+
+### `compaction` — 缓存感知尾部剪枝与 B-5 检查点压缩
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `compaction.enabled` | `boolean` | `true` | 压缩与写前护栏模块开关 |
+| `compaction.autoCompact` | `boolean` | `true` | 当估算输入接近阈值时是否自动触发检查点压缩 |
+| `compaction.maxContextTokens` | `number` | `null` | 人为限制计算 `effective_window` 的上限（为 `null` 时取模型自身 `contextWindow`） |
+| `compaction.triggerRatio` | `number` | `0.80` | 自动压缩触发比例（`0.0..1.0`） |
+| `compaction.keepRecentTokens` | `number` | `20000` | 触发检查点压缩时至少原样保留的最近上下文 Token 数量 |
+| `compaction.supersedeReads` | `boolean` | `true` | 尾部剪枝时裁掉已被同文件后续完整重读覆盖的旧 `read` 输出（保护 8k 热尾） |
+| `compaction.dropUseless` | `boolean` | `true` | 尾部剪枝时裁掉零命中搜索等确认无用输出（始终保护 `skill` 与 8k 热尾） |
+
+### `recall` — 单一静态情景回溯工具
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `recall.enabled` | `boolean` | `true` | 是否启用静态 `recall` 工具 |
+| `recall.defaultSearchLimit` | `number` | `8` | `recall(query=...)` 默认返回摘要条目上限（硬上限 `20`） |
+| `recall.readCharLimit` | `number` | `6000` | `recall(seq=...)` 分页单次返回正文字符上限（硬上限 `8192`） |
+
+### `sessionTitle` 与 `ui`
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `sessionTitle.enabled` | `boolean` | `true` | 后台异步自动总结会话标题开关 |
+| `sessionTitle.model` | `string` | `null` | 为摘要指定独立低成本小模型（缺省复用主会话路由） |
+| `sessionTitle.thinkingLevel` | `string` | `"low"` | 标题摘要思考强度（缺省或无法识别时回退 `"low"`） |
+| `ui.theme` | `string` | `"auto"` | 默认 TUI 主题 |
+| `ui.screenMode` | `string` | `"fullscreen"` | 启动视口模式：`"fullscreen"` \| `"inline"` |
+| `ui.showThinking` | `boolean` | `false` | 默认是否展开模型思考块与完整工具参数 |
+| `ui.verboseExpanded` | `boolean` | `false` | 是否默认以详细展开模式渲染卡片 |
+| `ui.sidePanelOpen` | `boolean` | `false` | 终端够宽时是否默认展开右侧分栏面板 |
+| `ui.mouseCapture` | `boolean` | `true`（Fullscreen） | 是否拦截终端鼠标事件（Inline 下默认为 `false`） |
+| `ui.approvalMode` | `string` | `"auto"` | 工具审批默认策略：`"auto"` \| `"ask"` |
+
+```json title="~/.mizar/settings.json（典型开发者配置示例）" kind="file"
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-chat",
+  "restrictToWorkspace": true,
+  "codemode": {
+    "timeoutMs": 120000
+  },
+  "compaction": {
+    "triggerRatio": 0.80,
+    "keepRecentTokens": 20000,
+    "supersedeReads": true,
+    "dropUseless": true
+  },
+  "ui": {
+    "theme": "auto",
+    "approvalMode": "ask"
+  }
+}
+```
+
+## `disabledPlugins` 全量模块 ID
+
+### 1. 内置可选 Cordis 模块（13 个）
+
+加入 `disabledPlugins` 后会在装配或运行期停止对应 Fiber（可在 TUI `/settings` 实时热启停）：
+
+`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`
+
+### 2. 官方宿主 / TUI 扩展 ID（10 个 `KNOWN_HOST_EXTENSION_IDS`）
+
+由 `mizar-client` 与 `mizar-tui` 读取控制宿主及工作台特性开关（加入 `"tui"` 将级联禁用所有 `tui-*` 特性并拒绝进入终端交互模式）：
+
+`file-mentions`、`local-bash`、`approval-gate`、`tui`、`tui-emphasis`、`tui-side-panel`、`tui-timeline-rail`、`tui-trajectory-view`、`tui-selection`、`tui-clipboard`
+
+### 3. 受 Gate 2 自保护的核心服务（6 个，严禁禁用）
+
+以下六个基础容器服务任何配置都不可关闭，传入 `disabledPlugins` 时会被控制器强制拒绝：
+
+`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins`
+
+## `mcp.json` Schema 参考
+
+加载 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json`。如果项目级同名条目省略 `command` 与 `url`，则作为局部补丁仅覆写全局同名 Server 的 `enabled`、`exposure`、`toolExposure` 等控制字段。
+
+| 字段 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `mcpServers.<name>.command` | `string` | `null` | Stdio 传输启动的可执行命令（与 `url` 二选一） |
+| `mcpServers.<name>.args` | `string[]` | `[]` | Stdio 启动参数数组 |
+| `mcpServers.<name>.env` | `Record<string, string>` | `{}` | 注入子进程的环境变量 |
+| `mcpServers.<name>.cwd` | `string` | `null` | Stdio 子进程工作目录 |
+| `mcpServers.<name>.url` | `string` | `null` | Streamable HTTP / SSE 服务端完整 URL |
+| `mcpServers.<name>.headers` | `Record<string, string>` | `{}` | HTTP 请求附带请求头（如 `Authorization`） |
+| `mcpServers.<name>.enabled` | `boolean` | `true` | 是否连接并加载该 Server |
+| `mcpServers.<name>.exposure` | `"codemode"` \| `"deferred"` \| `"direct"` \| `"hidden"` | `"codemode"` | 该 Server 所有工具的默认暴露等级 |
+| `mcpServers.<name>.toolExposure` | `Record<string, Exposure>` | `{}` | 按精确工具名或通配符（最长匹配优先）局部覆写单个工具暴露等级 |
+| `mcpServers.<name>.description` | `string` | `null` | 展示备注信息 |
+| `mcpServers.<name>.timeoutMs` | `number` | `null` | 单次工具 RPC 调用超时毫秒数 |
+
+```json title=".mizar/mcp.json（Stdio 与 HTTP 双示例）" kind="file"
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..." },
+      "exposure": "codemode",
+      "toolExposure": {
+        "delete_*": "hidden",
+        "search_code": "direct"
+      }
+    },
+    "docs": {
+      "url": "https://docs.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" },
+      "exposure": "deferred",
+      "timeoutMs": 30000
+    }
+  }
+}
+```

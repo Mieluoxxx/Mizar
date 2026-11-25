@@ -1,0 +1,51 @@
+---
+title: Sessions, Compaction & Trajectory Tracing
+description: SQLite WAL single-writer persistence, SQLITE_BUSY transient reporting, /tree forking, B-5 compaction, cache-aware tail pruning, single static recall, and --trace-out.
+group: core-concepts
+order: 4
+---
+
+Mizar logs every prompt, model message, and tool call/result as an append-only event stream (`SessionEvent`), powering crash recovery, `/tree` branching, B-5 compaction, static episode recall, and trajectory profiling.
+
+<DiagramEmbed
+  id="session-trace"
+  caption="FIG 03: SQLite WAL session persistence and /tree forking (left) alongside Ctrl+T /trace and --trace-out profiling (right)."
+/>
+
+## SQLite WAL Persistence & Reliability
+
+- **Single-Writer Isolation (`mizar-session-sqlite`)**: Persists by default to `~/.mizar/sessions.sqlite` (override with `MIZAR_SESSION_DB` or `settings.json` `sessionDb`; disable via `none` / `off` or `--no-persist`). Runs SQLite WAL (`busy_timeout = 5s`) on a dedicated Single-Writer background thread batching up to `128` events per transaction off the Tokio executor, while readers use `query_only`.
+- **`SQLITE_BUSY` Transient Reporting**: If heavy multi-process lock contention exhausts retries, the writer surfaces explicit `pending_transient_error` warnings upward instead of silently dropping events.
+- **Resume & Orphan Healing**: Use `-c` / `--continue` to resume the latest session in the current workspace or `-r` / `--resume [id]`. If a crash left an unpaired `tool_call`, replay and `/tree` automatically heal the dangling call before sending history to strict gateways.
+
+## `/tree` Forking & Auto Titles
+
+- **`/tree` Branching**: `fork(id, up_to_seq)` atomically copies prefix events into a new session linked via `parent_id` and `fork_seq`, allowing safe experimentation without touching the mainline branch.
+- **Async Session Titles (`mizar-session-title`)**: Summarizes turns in `MMDD｜TYPE｜Topic` format (`FIX`, `FEA`, `DOC`, etc.) on Turn 1 and every `20` turns. Manual `/rename <title>` sets `TitleSource::Manual` and locks against auto-overwrites; `/rename` with no args triggers immediate LLM regeneration.
+
+## Context Compaction (B-5) & Cache-Aware Tail Pruning
+
+Long sessions stay accurate without thrashing provider Prompt Cache via a **two-stage pipeline**:
+
+1. **Cache-Aware Tail Pruning (`mizar-compaction/src/pruning.rs`)**: Runs deterministically before each step:
+   - **`compaction.supersedeReads` (default `true`)**: Prunes older `read` outputs that have since been superseded by a full re-read of the same path.
+   - **`compaction.dropUseless` (default `true`)**: Prunes empty searches or superseded noise (`skill` payloads are always protected).
+   - **8k Warm Tail & 90-Min Idle Flush**: Never touches the newest **`8,000`-token warm suffix** unless cold-cache idle exceeds `90` minutes, and records prunes by appending `SessionEvent::ToolResultPrune` so prior cached prefix bytes remain **100% identical**.
+2. **Checkpoint Compaction (`mizar-compaction` B-5)**:
+   - Triggers automatically at `effective_window * triggerRatio` (default `0.80`; override ceiling with `compaction.maxContextTokens`, keeping at least `keepRecentTokens = 20000` raw tokens) or manually via `/compact [focus]`.
+   - **B-5 Guarantees**: Anchors sizing on real `TokenUsage::prompt_tokens()`, unifies `effective_window` math, provides unknown-model fallbacks, forces `ReasoningEffort::Off` during summarization, handles L3 overflow / implicit truncation recovery, and enforces **`FileGuardTracker`** on `tools/pre-execute` (blocking blind whole-file `write` on compacted files until re-read or `edit`).
+
+## Single Static `recall` Tool
+
+Instead of two split tools dynamically toggled after compaction, `mizar-recall` registers **one static `recall` tool** at `ToolExposure::Direct` from Turn 0:
+
+- **Dual Query/Read Interface**: Pass `query` to search across compaction checkpoints and session lineage via SQLite Unicode 1..=3 n-gram **FTS5** (`defaultSearchLimit = 8`, max `20`; falls back to in-memory scan if unpersisted), or pass `seq` (with `end_seq`, `session_id`, `offset`, `limit`, `to_file`) to paginate verbatim log entries (`6,000` chars default cap).
+- **Cross-Branch Scope Validation**: Annotates `is_current_session` on results and supports `to_file: true` to spill large verbatim segments to a temporary file.
+
+## `/trace` Profiler & `--trace-out` Export
+
+- **Interactive 3-Lane Profiler (`Ctrl+T` / `/trace`)**:
+  - **WaveBand** overview bar (click any pulse to jump).
+  - **Timeline** with 3 parallel lanes: **L0 Input/Alerts** (`USER`, `CTX`, `RepeatToolGuard`), **L1 LLM Turns** (`TTFT` + `Decode`), and **L2 Tool Execution** (including nested `codemode` spans), switchable across `Duration`, `Seq`, and `Actual` axes.
+  - **Hotspots** & **Inspector** for tool latency breakdowns, token usage, and full arguments/results.
+- **Headless Structured Export (`--trace-out <path>` / `MIZAR_TRACE_OUT`)**: On completion, timeout, or error, `mizar exec` atomically writes a structured `TrajectoryExport` JSON file (with secret-sanitized diagnostics; CLI flag takes precedence over env var). Interactively, `/export [path]` writes JSONL trajectory logs.

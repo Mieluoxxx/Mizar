@@ -1,19 +1,21 @@
 //! 只读会话投影、模型选择优先级解析与会话报告生成（零终端依赖）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
-use mizar_core::spine::{MizarRuntime, strip_summary_wrapper};
-use mizar_llm::{ContentBlock, ModelCostRates, ModelInfo, ProviderInfo, TokenUsage};
-use mizar_session::{
-    Session, SessionEvent, SessionListQuery, SessionStore, SessionTraceEvent, TraceSeverity,
+use cordis::Context;
+use mizar_agent_spine::strip_summary_wrapper;
+use mizar_client_core::{
+    ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem, SessionSelection,
+    SessionTreeEntry, SessionViewData, abbreviate_home_path, format_tokens, short_id,
+    truncate_display,
 };
-use mizar_types::client::{
-    CacheMissAudit, ContextBreakdownSnapshot, NoticeLevel, SessionPickerItem, SessionReplayItem,
-    SessionSelection, SessionTreeEntry, SessionViewData, UsageAuditSample, abbreviate_home_path,
-    compute_cache_miss_audit, format_tokens, short_id, truncate_display,
+use mizar_llm::{ContentBlock, ModelInfo, ProviderInfo, TokenUsage};
+use mizar_session::{
+    Session, SessionEvent, SessionListQuery, SessionPersistenceContextExt, SessionStore,
+    SessionTraceEvent, TraceSeverity,
 };
 
 /// 选择解析的输入：各来源的值与「是否显式指定」标记。
@@ -113,7 +115,6 @@ pub fn latest_workspace_selection(
         .list_headers(&SessionListQuery {
             cwd: Some(workspace.display().to_string()),
             limit: Some(1),
-            exclude_subagents: true,
         })
         .ok()?
         .into_iter()
@@ -243,120 +244,23 @@ fn join_mid_dot(parts: &[String]) -> String {
     out
 }
 
-fn lookup_model_rates(
-    providers: &[ProviderInfo],
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> Option<ModelCostRates> {
-    let mod_id = model.filter(|s| !s.is_empty())?;
-    if let Some(prov_id) = provider.filter(|s| !s.is_empty()) {
-        return providers
-            .iter()
-            .find(|p| p.id == prov_id)
-            .and_then(|p| find_model_in_provider(p, mod_id))
-            .and_then(|m| m.cost.clone());
-    }
-    providers
-        .iter()
-        .find_map(|p| find_model_in_provider(p, mod_id))
-        .and_then(|m| m.cost.clone())
-}
-
-fn collect_usage_audit_samples(
-    entries: &[mizar_session::SessionEntry],
-    providers: &[ProviderInfo],
-) -> (Vec<UsageAuditSample>, Option<ModelCostRates>) {
-    let mut samples = Vec::new();
-    let mut active_provider: Option<String> = None;
-    let mut active_model: Option<String> = None;
-    let mut last_rates: Option<ModelCostRates> = None;
-
-    for entry in entries {
-        match &entry.event {
-            SessionEvent::Selection {
-                provider, model, ..
-            } => {
-                if provider.is_some() {
-                    active_provider = provider.clone();
-                }
-                if model.is_some() {
-                    active_model = model.clone();
-                }
-                if let Some(r) = lookup_model_rates(
-                    providers,
-                    active_provider.as_deref(),
-                    active_model.as_deref(),
-                ) {
-                    last_rates = Some(r);
-                }
-            }
-            SessionEvent::Compaction { .. } => {
-                samples.push(UsageAuditSample::Compaction);
-            }
-            SessionEvent::Assistant {
-                replay,
-                usage: Some(u),
-                ..
-            } => {
-                let rates = replay
-                    .as_ref()
-                    .and_then(|env| {
-                        lookup_model_rates(providers, Some(&env.provider), Some(&env.model))
-                    })
-                    .or_else(|| {
-                        lookup_model_rates(
-                            providers,
-                            active_provider.as_deref(),
-                            active_model.as_deref(),
-                        )
-                    });
-                if let Some(ref r) = rates {
-                    last_rates = Some(r.clone());
-                }
-                samples.push(UsageAuditSample::Assistant { usage: *u, rates });
-            }
-            SessionEvent::Usage {
-                kind,
-                provider,
-                model,
-                usage,
-                ..
-            } if kind == "cache_warm" => {
-                let rates = lookup_model_rates(providers, Some(provider), Some(model));
-                if let Some(ref r) = rates {
-                    last_rates = Some(r.clone());
-                }
-                samples.push(UsageAuditSample::CacheWarm {
-                    usage: *usage,
-                    rates,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    (samples, last_rates)
-}
-
 /// 构造 `/session` 命令的只读会话身份与账目报告。
 pub fn build_session_info_report(
-    runtime: &MizarRuntime,
+    ctx: &Context,
     session: &Session,
     session_db_path: Option<&Path>,
     context_window: u64,
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
 ) -> String {
-    let providers = runtime.llm.provider_infos();
-    build_session_info_report_at_with_cache(
+    build_session_info_report_at(
         session,
-        runtime.persistence.is_some(),
+        ctx.session_persistence().is_some(),
         session_db_path,
         context_window,
         last_prompt_tokens,
         context_breakdown,
         now_millis(),
-        &providers,
     )
 }
 
@@ -370,30 +274,6 @@ pub fn build_session_info_report_at(
     context_breakdown: &ContextBreakdownSnapshot,
     now_ms: u128,
 ) -> String {
-    build_session_info_report_at_with_cache(
-        session,
-        persisted,
-        session_db_path,
-        context_window,
-        last_prompt_tokens,
-        context_breakdown,
-        now_ms,
-        &[],
-    )
-}
-
-/// 附带路由计价表的完整 `/session` 报告构造函数。
-#[allow(clippy::too_many_arguments)]
-pub fn build_session_info_report_at_with_cache(
-    session: &Session,
-    persisted: bool,
-    session_db_path: Option<&Path>,
-    context_window: u64,
-    last_prompt_tokens: Option<u64>,
-    context_breakdown: &ContextBreakdownSnapshot,
-    now_ms: u128,
-    providers: &[ProviderInfo],
-) -> String {
     let header = session.header();
 
     let mut total_events = 0u64;
@@ -404,17 +284,16 @@ pub fn build_session_info_report_at_with_cache(
     let mut tool_error_count = 0u64;
     let mut bash_count = 0u64;
     let mut bash_local_count = 0u64;
+    let mut pruned_seqs = HashSet::<u64>::new();
     let mut injection_counts = HashMap::<String, u64>::new();
     let mut compaction_count = 0u64;
     let mut latest_compaction: Option<(u64, Option<u64>, Option<u64>)> = None;
     let mut total_usage = TokenUsage::default();
     let mut latest_context_tokens: Option<u64> = None;
-    let mut audit = CacheMissAudit::default();
+    let mut saw_prune_after_last_context = false;
 
     session.with_all_entries(|entries| {
         total_events = entries.len() as u64;
-        let (samples, fallback_rates) = collect_usage_audit_samples(entries, providers);
-        audit = compute_cache_miss_audit(&samples, fallback_rates.as_ref());
         for entry in entries {
             if entry.is_surface() {
                 surface_events += 1;
@@ -431,6 +310,7 @@ pub fn build_session_info_report_at_with_cache(
                         let prompt = u.prompt_tokens();
                         if prompt > 0 {
                             latest_context_tokens = Some(prompt);
+                            saw_prune_after_last_context = false;
                         }
                     }
                 }
@@ -450,7 +330,14 @@ pub fn build_session_info_report_at_with_cache(
                     latest_compaction = Some((*first_kept_seq, *tokens_before, *tokens_after));
                     if let Some(after) = tokens_after.filter(|&v| v > 0) {
                         latest_context_tokens = Some(after);
+                        saw_prune_after_last_context = false;
                     }
+                }
+                SessionEvent::ToolResultPrune { pruned } => {
+                    for item in pruned {
+                        pruned_seqs.insert(item.target_seq);
+                    }
+                    saw_prune_after_last_context = true;
                 }
                 SessionEvent::BashExecution {
                     exclude_from_context,
@@ -461,9 +348,7 @@ pub fn build_session_info_report_at_with_cache(
                         bash_local_count += 1;
                     }
                 }
-                SessionEvent::Trace { .. }
-                | SessionEvent::Selection { .. }
-                | SessionEvent::Usage { .. } => {}
+                SessionEvent::Trace { .. } | SessionEvent::Selection { .. } => {}
             }
         }
     });
@@ -539,6 +424,9 @@ pub fn build_session_info_report_at_with_cache(
             tool_parts.push(format!("bash {bash_count}"));
         }
     }
+    if !pruned_seqs.is_empty() {
+        tool_parts.push(format!("prune {}", pruned_seqs.len()));
+    }
     lines.push(format!("工具     {}", join_mid_dot(&tool_parts)));
 
     const KNOWN_INJECTION_SOURCES: [(&str, &str); 5] = [
@@ -613,7 +501,11 @@ pub fn build_session_info_report_at_with_cache(
     ));
 
     let window = context_window.max(1);
-    let effective_measured = latest_context_tokens.or(last_prompt_tokens);
+    let effective_measured = if saw_prune_after_last_context {
+        last_prompt_tokens.or(latest_context_tokens)
+    } else {
+        latest_context_tokens.or(last_prompt_tokens)
+    };
     let ctx_summary = if let Some(measured) = effective_measured {
         let pct = (measured as f64 / window as f64) * 100.0;
         format!(
@@ -639,34 +531,6 @@ pub fn build_session_info_report_at_with_cache(
     };
     lines.push(format!("上下文   {ctx_summary}"));
 
-    if audit.miss_events > 0 || audit.warm_events > 0 || cache_read > 0 || cache_write > 0 {
-        let mut audit_parts = vec![format!(
-            "Cache Re-billed: {} tokens",
-            format_tokens(audit.cache_rebilled_tokens)
-        )];
-        if audit.miss_events > 0 {
-            if audit.cache_rebilled_cost_usd > 0.0 {
-                audit_parts.push(format!(
-                    "{} 次意外失效 · 额外 ${:.4}",
-                    audit.miss_events, audit.cache_rebilled_cost_usd
-                ));
-            } else {
-                audit_parts.push(format!("{} 次意外失效", audit.miss_events));
-            }
-        }
-        if audit.warm_events > 0 {
-            if audit.total_warm_cost_usd > 0.0 {
-                audit_parts.push(format!(
-                    "续命 {} 次（${:.4}）",
-                    audit.warm_events, audit.total_warm_cost_usd
-                ));
-            } else {
-                audit_parts.push(format!("续命 {} 次", audit.warm_events));
-            }
-        }
-        lines.push(format!("缓存审计 {}", audit_parts.join(" · ")));
-    }
-
     lines.join("\n")
 }
 
@@ -676,14 +540,11 @@ pub fn project_session_view(
     finish_notice: impl Into<String>,
 ) -> SessionViewData {
     let header = session.header();
-    let entries = session.all_entries();
-    let (audit_samples, fallback_rates) = collect_usage_audit_samples(&entries, &[]);
-    let cache_miss_audit = compute_cache_miss_audit(&audit_samples, fallback_rates.as_ref());
     let mut total_usage = TokenUsage::default();
     let mut saw_usage = false;
     let mut last_prompt_tokens: Option<u64> = None;
     let mut items = Vec::new();
-    for entry in entries {
+    for entry in session.all_entries() {
         match entry.event {
             SessionEvent::User { text, images } => {
                 let display = if !images.is_empty() && !text.contains("[Image #") {
@@ -741,13 +602,11 @@ pub fn project_session_view(
                 tool_call_id,
                 content,
                 is_error,
-                meta,
                 ..
             } => items.push(SessionReplayItem::ToolResult {
                 tool_call_id,
                 content,
                 is_error,
-                meta,
             }),
             SessionEvent::BashExecution {
                 command,
@@ -779,7 +638,7 @@ pub fn project_session_view(
                 }
                 _ => {}
             },
-            SessionEvent::Selection { .. } | SessionEvent::Usage { .. } => {}
+            SessionEvent::ToolResultPrune { .. } | SessionEvent::Selection { .. } => {}
         }
     }
     if saw_usage {
@@ -793,7 +652,6 @@ pub fn project_session_view(
         selection: session.latest_selection().map(to_ui_selection),
         total_usage,
         last_prompt_tokens,
-        cache_miss_audit,
     }
 }
 
@@ -941,8 +799,8 @@ pub fn project_session_tree(session: &Session) -> Vec<SessionTreeEntry> {
                     can_fork: true,
                 })
             }
-            SessionEvent::Selection { .. }
-            | SessionEvent::Usage { .. }
+            SessionEvent::ToolResultPrune { .. }
+            | SessionEvent::Selection { .. }
             | SessionEvent::Trace { .. } => None,
         })
         .collect()
@@ -982,7 +840,6 @@ pub fn collect_session_picker_items(sessions: &SessionStore) -> Vec<SessionPicke
         .list_headers(&SessionListQuery {
             cwd: None,
             limit: Some(100),
-            exclude_subagents: true,
         })
         .unwrap_or_default()
         .into_iter()
@@ -1104,7 +961,6 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
-                    ..Default::default()
                 },
                 ModelInfo {
                     id: "mayoru-messages/claude-sonnet-5-5".to_string(),
@@ -1113,7 +969,6 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
-                    ..Default::default()
                 },
             ],
         }];
@@ -1145,8 +1000,11 @@ mod tests {
     #[tokio::test]
     async fn project_resume_view_maps_turn_notice_and_truncated_turn_end_to_notice_never_assistant()
     {
-        use mizar_core::spine::{AgentSpineConfig, AgentToolsMode};
+        use mizar_agent_spine::{AgentSpineConfig, AgentSpinePlugin, AgentToolsMode};
+        use mizar_session::SessionContextExt;
 
+        let ctx = Context::new();
+        ctx.logger().set_silent();
         let mut cfg = AgentSpineConfig::coding(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         if let AgentToolsMode::Coding {
             ref mut mcp,
@@ -1159,9 +1017,10 @@ mod tests {
             skills.include_default_roots = false;
             instructions.include_default_global = false;
         }
-        let runtime = MizarRuntime::build(cfg).await.unwrap();
+        ctx.plugin(AgentSpinePlugin, cfg);
+        crate::events::wait_for_services(&ctx).await.unwrap();
 
-        let session = runtime.sessions.create(None);
+        let session = ctx.sessions().unwrap().create(None);
         session.append(SessionEvent::user("hi"));
         session.append_trace(SessionTraceEvent::TurnNotice {
             turn: 1,
@@ -1171,14 +1030,10 @@ mod tests {
         session.append_trace(SessionTraceEvent::TurnEnd {
             turn: 1,
             reason: "max_steps".into(),
-            error: None,
-            summary: None,
         });
         session.append_trace(SessionTraceEvent::TurnEnd {
             turn: 2,
             reason: "truncated".into(),
-            error: None,
-            summary: None,
         });
 
         assert!(
@@ -1219,16 +1074,20 @@ mod tests {
             } if text.contains("max_tokens")
         )));
 
-        runtime.shutdown().await;
+        ctx.fiber().dispose().await;
     }
 
     #[tokio::test]
     async fn build_session_info_report_covers_full_identity_ledger_and_empty_omissions() {
+        use cordis::Service;
         use mizar_session::{
-            CompactionDigest, SessionCreateOptions, SessionEvent, SessionStore, SessionTraceEvent,
+            CompactionDigest, SessionContextExt, SessionCreateOptions, SessionEvent, SessionStore,
+            SessionTraceEvent,
         };
 
-        let store = SessionStore::new();
+        let ctx = Context::new();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let store = ctx.sessions().unwrap();
 
         let parent = store.create(None);
         parent.append(SessionEvent::user("parent"));
@@ -1307,155 +1166,7 @@ mod tests {
         );
         assert!(!fresh_report.contains("谱系") && !fresh_report.contains("压缩"));
         assert!(fresh_report.contains("存储     仅内存（未持久化）"));
-    }
 
-    #[tokio::test]
-    async fn build_session_info_report_renders_rebilled_audit() {
-        use mizar_llm::ModelCostRates;
-        use mizar_session::{SessionEvent, SessionStore};
-
-        let store = SessionStore::new();
-        let session = store.create(None);
-        session.record_selection(Some("anthropic".into()), Some("claude-sonnet".into()), None);
-        session.append(SessionEvent::Assistant {
-            blocks: vec![ContentBlock::Text { text: "s1".into() }],
-            replay: None,
-            usage: Some(TokenUsage {
-                input_tokens: 500,
-                cache_write_tokens: Some(80_000),
-                output_tokens: 100,
-                ..Default::default()
-            }),
-        });
-        session.append(SessionEvent::usage(
-            "cache_warm",
-            "anthropic",
-            "claude-sonnet",
-            TokenUsage {
-                cache_read_tokens: Some(80_000),
-                output_tokens: 1,
-                ..Default::default()
-            },
-            None,
-        ));
-        session.append(SessionEvent::Assistant {
-            blocks: vec![ContentBlock::Text { text: "s2".into() }],
-            replay: None,
-            usage: Some(TokenUsage {
-                input_tokens: 200,
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(80_000),
-                output_tokens: 120,
-                ..Default::default()
-            }),
-        });
-
-        let providers = vec![ProviderInfo {
-            id: "anthropic".into(),
-            name: "Anthropic".into(),
-            protocol: "anthropic-messages".into(),
-            models: vec![ModelInfo {
-                id: "claude-sonnet".into(),
-                name: "Claude Sonnet".into(),
-                cost: Some(ModelCostRates {
-                    input: 3.0,
-                    output: 15.0,
-                    cache_read: 0.3,
-                    cache_write: 3.75,
-                    tiers: Vec::new(),
-                }),
-                ..Default::default()
-            }],
-        }];
-        let breakdown = ContextBreakdownSnapshot::default();
-        let report = build_session_info_report_at_with_cache(
-            &session,
-            false,
-            None,
-            200_000,
-            Some(80_200),
-            &breakdown,
-            session.header().updated_at_ms + 1_000,
-            &providers,
-        );
-
-        assert!(!report.contains("缓存续命"), "{report}");
-        assert!(
-            report.contains("缓存审计 Cache Re-billed: 80.0k tokens · 1 次意外失效 · 额外 $0.2760 · 续命 1 次（$0.0240）"),
-            "{report}"
-        );
-
-        let view = project_session_view(&session, "ok");
-        assert_eq!(view.cache_miss_audit.cache_rebilled_tokens, 80_000);
-        assert_eq!(view.cache_miss_audit.miss_events, 1);
-        assert_eq!(view.cache_miss_audit.warm_events, 1);
-    }
-
-    #[tokio::test]
-    async fn latest_workspace_selection_skips_newer_subagent_child_session() {
-        use mizar_session::{SessionCreateOptions, SessionStore};
-
-        let store = SessionStore::new();
-        let ws = PathBuf::from("/tmp/mizar-ws-sel");
-
-        let parent = store.create_with(SessionCreateOptions {
-            id: Some("parent-main".into()),
-            cwd: Some(ws.display().to_string()),
-            ..Default::default()
-        });
-        parent.record_selection(
-            Some("anthropic".to_string()),
-            Some("claude-sonnet".to_string()),
-            None,
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let child = store.create_with(SessionCreateOptions {
-            id: Some("child-sub".into()),
-            cwd: Some(ws.display().to_string()),
-            parent_id: Some("parent-main".into()),
-            ..Default::default()
-        });
-        child.append(SessionEvent::user("child task"));
-
-        let sel = latest_workspace_selection(&store, &ws).expect("should find parent selection");
-        assert_eq!(sel.provider.as_deref(), Some("anthropic"));
-        assert_eq!(sel.model.as_deref(), Some("claude-sonnet"));
-    }
-
-    #[test]
-    fn project_session_view_forwards_tool_result_meta() {
-        use mizar_session::SessionStore;
-        use serde_json::json;
-
-        let store = SessionStore::new();
-        let session = store.create(None);
-        let meta = json!({
-            "kind": "diff",
-            "path": "src/lib.rs",
-            "added": 1,
-            "removed": 1,
-            "diff": "--- a\n+++ b\n-old\n+new",
-        });
-        session.append_tool_result_with_meta("c1", "edit", "ok", false, Some(meta.clone()));
-        session.append_tool_result_with_meta("c2", "read", "body", false, None);
-
-        let view = project_session_view(&session, "ok");
-        assert!(matches!(
-            &view.items[0],
-            SessionReplayItem::ToolResult {
-                tool_call_id,
-                meta: Some(m),
-                ..
-            } if tool_call_id == "c1" && m == &meta
-        ));
-        assert!(matches!(
-            &view.items[1],
-            SessionReplayItem::ToolResult {
-                tool_call_id,
-                meta: None,
-                ..
-            } if tool_call_id == "c2"
-        ));
+        ctx.fiber().dispose().await;
     }
 }

@@ -13,7 +13,7 @@ const isEn = locale === 'en';
 ---
 
 <DiagramFrame
-  fig="FIG 07"
+  fig="FIG 04"
   title={isEn ? 'Security 2×2 Matrix (Path Scope × Approval)' : '安全边界 2×2 正交矩阵（路径限制 × 工具审批）'}
   caption={caption}
   locale={locale}
@@ -101,7 +101,7 @@ const isEn = locale === 'en';
       <text x="518" y="104" font-size={isEn ? 9.8 : 10.5} font-weight="700" fill="var(--callout-caution-ink)">{isEn ? '! Partial Scope (Shell Gap)' : '! 半受限警惕区 (Shell 盲区)'}</text>
       <text x="807" y="104" font-size="9.5" font-weight="700" text-anchor="end" fill="var(--callout-caution-ink)">PARTIAL</text>
 
-      <text x="515" y="136" font-size={isEn ? 9 : 9.5} fill="var(--callout-tip-ink)">{isEn ? '✓ File tools (read/write/edit/grep/find) scoped' : '✓ 文件工具 (read/write/edit/grep/find) 锁死'}</text>
+      <text x="515" y="136" font-size={isEn ? 8.8 : 9.2} fill="var(--callout-tip-ink)">{isEn ? '✓ File tools scoped + 40-hop symlink guard' : '✓ 文件工具锁死 + 40跳符号链接防逃逸'}</text>
       <text x="515" y="157" font-size="9.5" font-weight="600" fill="var(--callout-danger-ink)">{isEn ? '⚠ bash commands bypass restrictToWorkspace' : '⚠ bash 内部命令不受 restrictToWorkspace 限制'}</text>
       <text x="515" y="178" font-size={isEn ? 9.5 : 10} fill="var(--grey-9)">{isEn ? '• Shell can reach outside via abs path or ../' : '• 命令仍可通过绝对路径或 ../ 触达区外'}</text>
       <rect x="515" y="194" width="288" height="30" fill="var(--grey-3)" stroke="var(--status-degraded)" stroke-width="0.9" />
@@ -132,7 +132,7 @@ const isEn = locale === 'en';
       <text x="518" y="270" font-size={isEn ? 10 : 10.5} font-weight="700" fill="var(--callout-tip-ink)">{isEn ? '✓ Recommended Dual Lock' : '✓ 生产推荐防线（双锁）'}</text>
       <text x="807" y="270" font-size="9.5" font-weight="700" text-anchor="end" fill="var(--callout-tip-ink)">RECOMMENDED</text>
 
-      <text x="515" y="302" font-size={isEn ? 9.5 : 10} font-weight="600" fill="var(--grey-11)">{isEn ? '✓ Defense-in-depth: scoped files + approvals' : '✓ 纵深防御：路径锁工作区 + 非只读全审批'}</text>
+      <text x="515" y="302" font-size={isEn ? 9 : 9.5} font-weight="600" fill="var(--grey-11)">{isEn ? '✓ Scoped files (symlink safe) + approvals' : '✓ 路径防逃逸（含软链）+ 非只读全审批'}</text>
       <text x="515" y="323" font-size={isEn ? 9.5 : 10} fill="var(--grey-10)">{isEn ? '✓ Blocks bash escapes & accidental overwrites' : '✓ 彻底拦截 bash 越界与意外覆写风险'}</text>
       <text x="515" y="344" font-size={isEn ? 9.5 : 10} fill="var(--grey-9)">{isEn ? '• Stack excludeTools: ["mcp__*__drop_*"]' : '• 可叠加 excludeTools: ["mcp__*__drop_*"]'}</text>
       <rect x="515" y="360" width="288" height="30" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1.1" />

@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mizar_client_core::{ClientEvent, LocalBashOutput};
 use mizar_session::{Session, SessionEvent};
-use mizar_tools::coding::bash::execute_bash_process;
-use mizar_types::client::{ClientEvent, LocalBashOutput};
+use mizar_tools_coding::bash::execute_bash_process;
 use tokio_util::sync::CancellationToken;
 
 static LOCAL_BASH_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -66,14 +66,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use mizar_session::SessionStore;
+    use cordis::{Context, Service};
+    use mizar_session::{SessionContextExt, SessionStore};
 
     use super::*;
 
     #[tokio::test]
     async fn execute_local_bash_for_session_persists_and_supports_cancel() {
-        let store = SessionStore::new();
-        let session = store.create(Some("local-bash".into()));
+        let ctx = Context::new();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let session = ctx.sessions().unwrap().create(Some("local-bash".into()));
         let cwd = std::env::temp_dir();
 
         let cid1 = next_local_bash_call_id();
@@ -146,5 +148,7 @@ mod tests {
                 ..
             }
         ));
+
+        ctx.fiber().dispose().await;
     }
 }

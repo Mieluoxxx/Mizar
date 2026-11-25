@@ -1,114 +1,50 @@
 ---
-title: 权限与安全
-description: 通过 toolsPreset、tools / excludeTools、restrictToWorkspace 与 --approve 审批闸门控制工具权限边界，并按场景选用三套加固配置。
-group: rules-security
-order: 16
+title: 安全边界、路径沙箱与交互审批
+description: 默认开箱姿态、restrictToWorkspace 符号链接 40 跳防逃逸、bash 非沙箱限制、--approve 审批闸门与纵深防御组合。
+group: core-concepts
+order: 6
 ---
 
-import Callout from '../../components/mdx/Callout.astro';
-import DiagramEmbed from '../../components/DiagramEmbed.astro';
+Mizar 的权限控制由两条互不正交的防线构成：**路径作用范围限制（`restrictToWorkspace`）** 与 **非只读工具执行前的人工审批闸门（`--approve` / `/approval ask`）**。
 
-<Callout type="warning" title="默认模式旨在不打断个人开发，不设文件系统隔离">
-  Mizar 默认（<code>restrictToWorkspace: false</code> 且不开启执行审批）下，所有内置工具都可以访问工作区之外的文件路径，并且 <code>bash</code> 会直接以你当前终端用户的权限运行任意 Shell 命令。审计陌生开源代码、连接敏感数据库或交由初级自动化脚本运行时，请务必启用下面介绍的两重防线与工具裁剪。
+<Callout type="warning" title="开箱默认全放行（本地效率优先）">
+  为顺畅进行本地仓库开发，Mizar 默认设置为 <code>restrictToWorkspace: false</code> 且 <code>ApprovalMode::Auto</code>——即模型可以直接读写跨目录路径并免弹窗执行 <code>bash</code>。处理陌生仓库、运行不可信脚本或执行批量危险操作前，请务必至少开启一条防线。
 </Callout>
-
-## 工具预设与通配裁剪
-
-在配置路径限制或人工审批之前，最彻底的收权方式是直接把不需要的工具从可用列表中移出。你可以通过 CLI 启动参数或在 `.mizar/settings.json` 中随时收缩工具清单：
-
-| 预设档位 | 启动命令 / 配置 | 可用工具范围 | 适用场景 |
-| :--- | :--- | :--- | :--- |
-| **完整工具** | 默认 / `"toolsPreset": "all"` | `read` `write` `edit` `bash` `grep` `find` | 日常全功能研发 |
-| **精简编码** | `--minimal` / `"minimal"` | `read` `edit` `write` `bash` | 依赖模型直接做变更与跑测试 |
-| **只读审计** | `--read-only` / `"read-only"` | `read` `grep` `find` | 架构排查、问答、代码审查 |
-
-想更精细地按名称增减工具，可用 `tools` 白名单（内部管线对应 `includeTools`，CLI 为 `--tools` / `-t`）或 `excludeTools` 黑名单（CLI 为 `--exclude-tools` / `-xt`），两者均支持 `*` 通配符：
-
-- **白名单覆写、黑名单跨层级并集追加**：`toolsPreset` 与 `tools` 采用后者覆写前者的优先级；而 `excludeTools` 会将全局 `~/.mizar/settings.json`、项目 `<workspace>/.mizar/settings.json` 与 CLI `-xt` / `--exclude-tools` **去重并集累加**，个人全局屏蔽的高危工具不会被某个仓库配置意外清空。
-- **叠加屏蔽高危 MCP 工具**：针对 `mcp__<server>__<tool>` 工具，除了在 `excludeTools` 中用通配符剔除（如 `"mcp__prod__*"` 或 `"mcp__*__drop_*"`），也可以在 `.mizar/mcp.json` 中用 `toolExposure` 将 `"drop_*": "hidden"`（详见 [MCP 服务器接入](/mcp/)）。
-
-例如在工作区禁用 `write` 并屏蔽生产环境的 MCP 工具：
-
-```json title=".mizar/settings.json"
-{
-  "tools": ["read", "edit", "grep", "find", "bash"],
-  "excludeTools": ["write", "mcp__prod__*"]
-}
-```
-
-在命令行上也可以用 `-t read,grep` 或 `-xt write,bash` 临时覆盖当前会话。
-
-## `restrictToWorkspace` 为什么防不住 `bash`？
-
-很多用户容易误以为在 `.mizar/settings.json` 里加上 `"restrictToWorkspace": true` 就等于把 Mizar 关进了操作系统沙箱——这是危险的误解。
-
-在 Mizar 的设计里，**「路径边界约束」与「动作执行审批」是两条完全正交的防线**：
 
 <DiagramEmbed
   id="security-matrix"
-  title="安全边界 2×2 正交矩阵"
-  caption="restrictToWorkspace 约束文件读写、搜索工具与 @ 引用路径；--approve / /approval ask 控制模型对所有非只读工具的每一次实际调用。"
+  caption="图 04：安全边界 2×2 正交矩阵——横轴控制文件工具路径范围，纵轴控制非只读工具执行前是否弹窗审批。"
 />
 
-具体来说，这两重控制分别管什么：
+## 轴一：工作区路径锁（`restrictToWorkspace`）
 
-- **`restrictToWorkspace: true`**：对 `read`、`write`、`edit`、`grep`、`find` 以及输入框 `@` 文件引用执行规范路径解析与符号链接检查（阻止通过 symlink 逃逸出工作区根目录），一旦目标落到工作区外即刻拒绝。**但它不会沙箱化 `bash` 工具**——因为一条普通构建命令（例如读取 `~/.cargo` 缓存或调用 `/usr/bin/env`）本身就需要访问工作区外路径。
-- **`--approve` / [`/approval ask`](/tui/commands/)**：只要模型准备调用**非只读工具**（包含 `write`、`edit`、`bash`，以及外部声明非只读的 MCP / `codemode` 调用），界面就会先挂起并弹出确认框。你可以按本次交互选择：
-  - <kbd>y</kbd> / <kbd>Enter</kbd>：仅放行这一次调用；
-  - <kbd>a</kbd>：本次会话内信任该工具，后续不再反复询问；
-  - <kbd>r</kbd>：拒绝执行并附带一句反馈原因给模型，让它换一种做法；
-  - <kbd>n</kbd> / <kbd>Esc</kbd>：直接拒绝并中止该工具调用。
+在 `settings.json` 中设置 `"restrictToWorkspace": true` 后，全部内置文件工具（`mizar-tools-coding` 的 `read`、`write`、`edit`、`grep`、`find` 以及 `mizar-tool-fs` 的 `read_file`、`list_dir`）的解析函数都会将目标路径严格钉死在当前工作区根目录之内：
 
-此外，你在输入框主动敲入的本地 Shell（`!cmd` 或 `!!cmd`）属于**用户本人直接触发的指令**，因此不会再反向弹审批框拦截你自己；同样也支持随时用 `/approval off`（或 `/approval auto`）切回自动放行。
+- **符号链接防逃逸保护（`resolve_canonical_target`）**：不仅检查字面路径前缀，还会自顶向下逐段解析真实符号链接目标，即便针对尚不存在的新建文件路径，也会沿着最近的已有祖先目录完成规范化（`canonicalize`）再拼接剩余子路径验证是否在工作区边界内。同时内置 **40 跳符号链接循环深度防护**，防止恶意软链形成死循环或绕出仓库目录。
+- **Shell 工具盲区警示**：`restrictToWorkspace` **仅对文件类内置工具生效，不会对 `bash` 启动的 OS 子进程注入 seccomp / sandbox-exec / chroot 隔离**。也就是说，如果同时允许模型调用 `bash`，模型仍可通过 `cat /etc/passwd` 或 `rm ../other-repo` 等命令越过工作区边界。
 
-## 三套典型场景的开箱配置
+## 轴二：交互式审批闸门（`--approve` / `/approval ask`）
 
-根据对当前目录代码的信任程度，直接选用以下三种策略：
+在终端宿主层中由 `mizar-client` 的 `ApprovalGatePlugin` 挂载在 `tools/pre-execute` 管线上：
 
-### 场景 1：只读审计陌生开源项目
+- **触发方式**：启动传入 `--approve`、配置 `ui.approvalMode: "ask"`，或在工作台内随时运行 `/approval ask` 开启（`/approval auto` 切回免审）。
+- **拦截对象**：放行只读工具（`read`、`grep`、`find`、`list_dir`、`get_time`、`recall`），拦截所有产生副作用或可变执行的非只读工具——包含 **`write`、`edit`、`bash`、`codemode` 以及外部非只读 MCP 工具**（注意：`codemode` 沙箱内部触发的嵌套写工具同样会过审批）。
+- **四选交互决策**：
+  1. **单次放行**：仅批准当前这次调用。
+  2. **本工具始终放行**：将当前工具名加入本次会话免审白名单。
+  3. **拒绝**：中断本次执行并返回拒绝错误。
+  4. **附带理由拒绝**：中断本次执行并将你填写的约束文本直接回馈给模型，引导模型改写方案后再试。
 
-只想让 Mizar 阅读、检索并分析代码漏洞，彻底杜绝任何落盘写入与命令执行，同时限制 `@` 与搜索不得离开仓库目录：
+<Callout type="note" title="用户手输入的 ! / !! 本地命令不经审批闸门">
+  在工作台输入框以 <code>!</code> 或 <code>!!</code> 开头的本地 Bash 命令属于用户本人显式输入执行，直接绕过 <code>ApprovalGatePlugin</code>，也不受模型工具白名单制约。
+</Callout>
 
-```bash title="零写入最严审计启动命令"
-mizar --read-only --approve --workspace /path/to/untrusted-repo
-```
+## 推荐的纵深防御配置组合
 
-配合项目内临时 `.mizar/settings.json` 锁死工作区边界（哪怕只读也不允许跨目录偷窥 `~/.ssh`）：
-
-```json title=".mizar/settings.json（审计模式）"
-{
-  "toolsPreset": "read-only",
-  "restrictToWorkspace": true,
-  "excludeTools": ["bash", "write", "edit"]
-}
-```
-
-### 场景 2：团队共享仓库受控研发
-
-允许模型改代码与跑单元测试，但要求所有会修改状态的操作先经你眼睛确认，且屏蔽生产级 MCP 工具：
-
-```json title=".mizar/settings.json（团队受控模式）"
-{
-  "restrictToWorkspace": true,
-  "excludeTools": ["mcp__prod__*"],
-  "codemode": {
-    "timeoutMs": 60000
-  }
-}
-```
-
-启动时固定带上审批开关：
-
-```bash title="开启交互审批"
-mizar --approve
-```
-
-### 场景 3：个人全权高速开发模式
-
-在自己完全可控的本地项目里写功能、重构与跑全套 CI 回归时，直接运行默认模式即可：
-
-```bash title="默认高速模式"
-mizar
-```
-
-此时你依然可以在运行中发现需要降权，随时在输入框输入 [`/approval ask`](/tui/commands/) 临时开启审批闸门，或者按 [快捷键](/tui/keybinds/) <kbd>Esc</kbd> 立刻中止正在运行的模型与 `bash` 子进程树。
+| 使用场景 | 推荐命令 / 配置 | 防御效果 |
+| :--- | :--- | :--- |
+| **未知开源仓库人工审计** | `mizar --approve -C /path/to/untrusted` + `restrictToWorkspace: true` | 软链/文件锁在仓库内，且一切 `bash` / `write` / `edit` / `codemode` 必须人工点头确认 |
+| **零写入只读 Code Review** | `mizar --read-only -C /path/to/repo` | 工具集直接裁剪为 `read` / `grep` / `find`（加 `recall`），无任何写工具与 `bash` |
+| **禁用 Shell 但允许改代码** | `"restrictToWorkspace": true, "excludeTools": ["bash"]` | 保留文件与沙箱读写并由 40 跳软链护栏锁区，彻底消除 Shell 越界通道 |
+| **高危 MCP 工具定向物理屏蔽** | `"excludeTools": ["mcp__prod__*", "*_drop_*"]` | 通配匹配即升为 `Hidden`，在声明列表与 `codemode` 沙箱中双端永久禁绝 |
+| **干净的一次性沙盒试验** | `mizar --isolated --no-persist -C /tmp/sandbox` | 忽略 `~/.mizar` 与项目盘上配置且不向 `sessions.sqlite` 落盘痕迹 |

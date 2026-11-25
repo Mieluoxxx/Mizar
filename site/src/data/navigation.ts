@@ -38,10 +38,10 @@ interface NavGroupDef {
 
 const NAV_GROUP_DEFS: NavGroupDef[] = [
   {
-    id: 'quickstart',
+    id: 'getting-started',
     title: {
       zh: '快速开始',
-      en: 'Quickstart',
+      en: 'Getting Started',
     },
     items: [
       {
@@ -49,293 +49,172 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
         fileSlug: 'intro',
         label: {
           zh: '简介与安装',
-          en: 'Intro',
+          en: 'Quick Start',
         },
         title: {
           zh: '简介与快速开始',
           en: 'Introduction & Quick Start',
         },
         description: {
-          zh: '安装 Mizar、选择免 Key 演示或直连大模型，完成终端里的第一次对话与代码改动。',
-          en: 'Install Mizar, run the keyless mock demo or connect a live LLM, and make your first terminal edit.',
+          zh: '安装 Mizar、配置模型凭据或离线演示，完成终端与无头模式的首次调用。',
+          en: 'Install Mizar, configure model credentials or keyless mock mode, and run your first interactive or headless session.',
+        },
+      },
+      {
+        slug: 'workbench',
+        fileSlug: 'workbench',
+        label: {
+          zh: '终端工作台',
+          en: 'Workbench',
+        },
+        title: {
+          zh: '终端工作台、快捷键与斜杠命令',
+          en: 'Workbench, Keybindings & Slash Commands',
+        },
+        description: {
+          zh: 'Fullscreen 与 Inline 双视口、右侧分栏、!/!! 本地 Bash、快捷键与全部 24 个斜杠命令。',
+          en: 'Fullscreen and Inline viewports, split side panel, !/!! local Bash, keybindings, and all 24 slash commands.',
         },
       },
     ],
   },
   {
-    id: 'configuration',
+    id: 'core-concepts',
     title: {
-      zh: '配置与模型',
-      en: 'Config & Models',
-    },
-    items: [
-      {
-        slug: 'config',
-        fileSlug: 'config',
-        label: {
-          zh: '配置文件',
-          en: 'Config',
-        },
-        title: {
-          zh: '配置与优先级',
-          en: 'Config & Precedence',
-        },
-        description: {
-          zh: '全局与项目级 settings.json 合并规则、/settings 实时配置、上下文压缩与模块原子开关。',
-          en: 'Global and project settings.json merge rules, live /settings modal, compaction, and module toggles.',
-        },
-      },
-      {
-        slug: 'providers',
-        fileSlug: 'providers',
-        label: {
-          zh: '模型与凭据',
-          en: 'Providers',
-        },
-        title: {
-          zh: '模型与凭据',
-          en: 'Models & Credentials',
-        },
-        description: {
-          zh: '配置 DeepSeek、OpenAI、Anthropic 与本地模型，使用环境变量和系统钥匙串管理密钥。',
-          en: 'Configure DeepSeek, OpenAI, Anthropic, and local models with env vars and keychain commands.',
-        },
-      },
-    ],
-  },
-  {
-    id: 'tui',
-    title: {
-      zh: 'TUI & CLI',
-      en: 'TUI & CLI',
-    },
-    items: [
-      {
-        slug: 'tui',
-        fileSlug: 'tui/index',
-        label: {
-          zh: 'TUI 界面',
-          en: 'TUI',
-        },
-        title: {
-          zh: '终端界面与双模视口',
-          en: 'TUI & Dual Viewports',
-        },
-        description: {
-          zh: 'Fullscreen 与 Inline 双视口切换、分栏诊断面板、鼠标划词放行与 Launchpad 快捷入口。',
-          en: 'Switch between Fullscreen and Inline viewports, inspect the split side panel, copy text, and use Launchpad shortcuts.',
-        },
-      },
-      {
-        slug: 'tui/bash-mode',
-        fileSlug: 'tui/bash-mode',
-        label: {
-          zh: '本地 Bash',
-          en: 'Bash Mode',
-        },
-        title: {
-          zh: '本地 Bash 模式 (! / !!)',
-          en: 'Local Bash Mode (! / !!)',
-        },
-        description: {
-          zh: '用 ! 把测试输出交给模型继续修，用 !! 零 Token 消耗查看状态，以及中断与输出落盘机制。',
-          en: 'Feed test output to the model with !, inspect state at zero token cost with !!, plus interrupts and spill files.',
-        },
-      },
-      {
-        slug: 'tui/commands',
-        fileSlug: 'tui/commands',
-        label: {
-          zh: '斜杠命令',
-          en: 'Commands',
-        },
-        title: {
-          zh: '斜杠命令',
-          en: 'Commands',
-        },
-        description: {
-          zh: '按模型视图、会话分叉、视口诊断与工具规则分组的斜杠命令参考。',
-          en: 'Grouped slash command reference across models, sessions, viewports, diagnostics, tools, and security.',
-        },
-      },
-      {
-        slug: 'tui/keybinds',
-        fileSlug: 'tui/keybinds',
-        label: {
-          zh: '快捷键',
-          en: 'Keybinds',
-        },
-        title: {
-          zh: '快捷键速查',
-          en: 'Keybinds',
-        },
-        description: {
-          zh: '全局、编辑器、侧边栏、补全弹窗与会话轨迹视图的快捷键速查表。',
-          en: 'Quick reference for global, editor, side panel, completion popup, and /trace keybindings.',
-        },
-      },
-      {
-        slug: 'tui/sessions',
-        fileSlug: 'tui/sessions',
-        label: {
-          zh: '会话与轨迹',
-          en: 'Sessions',
-        },
-        title: {
-          zh: '会话、分叉与性能轨迹',
-          en: 'Sessions, Forking & /trace',
-        },
-        description: {
-          zh: '恢复历史会话、/tree 分叉探索、/compact 上下文压缩与 FTS5 回溯，及 /trace 三泳道排查热点。',
-          en: 'Resume sessions, fork with /tree, compact context via /compact + FTS5 recall, and profile latency in /trace.',
-        },
-      },
-      {
-        slug: 'tui/cli',
-        fileSlug: 'tui/cli',
-        label: {
-          zh: 'CLI 参数',
-          en: 'CLI',
-        },
-        title: {
-          zh: 'CLI 参数',
-          en: 'CLI Flags',
-        },
-        description: {
-          zh: '按场景组合命令行启动参数，覆盖模型、工作区、视口、工具集、无头 exec、--trace-out 与 --trace-jsonl。',
-          en: 'Combine CLI startup flags across workspace, models, headless exec, --trace-out, --trace-jsonl, and approvals.',
-        },
-      },
-      {
-        slug: 'tui/themes',
-        fileSlug: 'tui/themes',
-        label: {
-          zh: '终端主题',
-          en: 'Themes',
-        },
-        title: {
-          zh: '终端主题',
-          en: 'Terminal Themes',
-        },
-        description: {
-          zh: 'auto / mist / sakura 等内置终端主题配置、真彩色支持与终端背景自适应探测。',
-          en: 'Built-in auto, mist, sakura, and other terminal themes with truecolor and background detection.',
-        },
-      },
-    ],
-  },
-  {
-    id: 'capabilities',
-    title: {
-      zh: '工具与扩展',
-      en: 'Tools & Extensions',
+      zh: '核心机制',
+      en: 'Core Concepts',
     },
     items: [
       {
         slug: 'tools',
         fileSlug: 'tools',
         label: {
-          zh: '内置工具',
-          en: 'Tools',
+          zh: '工具与扩展',
+          en: 'Tools & Extensions',
         },
         title: {
-          zh: '内置工具',
-          en: 'Built-in Tools',
+          zh: '工具体系、常驻 Codemode、MCP 与技能',
+          en: 'Tools, Always-On Codemode, MCP & Skills',
         },
         description: {
-          zh: '6 个内置编程工具、recall 情景回溯、常驻 subagent、输出截断与 ToolExposure 层级。',
-          en: 'The 6 coding tools, static recall, persistent subagent, truncation limits, and ToolExposure tiers.',
+          zh: '五级 ToolExposure 模型、编码工具并行写锁、常驻 QuickJS codemode、tool_search、MCP 与 SKILL.md。',
+          en: 'Five-level ToolExposure model, parallel coding tools, always-on QuickJS codemode, tool_search, MCP, and SKILL.md.',
         },
       },
       {
-        slug: 'mcp',
-        fileSlug: 'mcp',
+        slug: 'sessions',
+        fileSlug: 'sessions',
         label: {
-          zh: 'MCP 服务器',
-          en: 'MCP Servers',
+          zh: '会话与轨迹',
+          en: 'Sessions & Tracing',
         },
         title: {
-          zh: 'MCP 服务器接入',
-          en: 'MCP Server Integration',
+          zh: '会话持久化、压缩剪枝与轨迹分析',
+          en: 'Sessions, Compaction & Trajectory Tracing',
         },
         description: {
-          zh: '通过 mcp.json 接入本地 Stdio 与远程 HTTP 服务，并在项目内局部覆写暴露策略。',
-          en: 'Connect local Stdio and remote HTTP MCP servers via mcp.json with per-project exposure overrides.',
+          zh: 'SQLite WAL 持久化、/tree 分叉、B-5 压缩与缓存感知尾部剪枝、单 recall 回溯、/trace 与 --trace-out。',
+          en: 'SQLite WAL persistence, /tree forking, B-5 compaction, cache-aware tail pruning, single recall, /trace, and --trace-out.',
         },
       },
       {
-        slug: 'codemode',
-        fileSlug: 'codemode',
+        slug: 'context',
+        fileSlug: 'context',
         label: {
-          zh: 'Codemode 沙箱',
-          en: 'Codemode',
+          zh: '上下文与缓存',
+          en: 'Context & Caching',
         },
         title: {
-          zh: '按需发现与沙箱编排',
-          en: 'Tool Search & Codemode',
+          zh: 'KV Cache 前缀稳定、静态提示词与指令发现',
+          en: 'KV Cache Stability, Static Prompts & Instructions',
         },
         description: {
-          zh: '利用工具搜索与隔离 JS 沙箱，避免海量 MCP 工具撑爆上下文与 Token 费用。',
-          en: 'Use BM25 tool_search and the isolated QuickJS sandbox to avoid bloating context with large MCP catalogs.',
-        },
-      },
-    ],
-  },
-  {
-    id: 'rules-security',
-    title: {
-      zh: '规则、权限与排障',
-      en: 'Rules & Security',
-    },
-    items: [
-      {
-        slug: 'instructions',
-        fileSlug: 'instructions',
-        label: {
-          zh: '项目规则',
-          en: 'Rules',
-        },
-        title: {
-          zh: '项目规则 (AGENTS.md)',
-          en: 'Project Rules (AGENTS.md)',
-        },
-        description: {
-          zh: '沿目录树自动加载 AGENTS.md 与本地覆盖规则，了解 64 KiB 上下文预算的保近弃远策略。',
-          en: 'Auto-discover AGENTS.md and local overrides up the directory tree under a 64 KiB proximity-first budget.',
-        },
-      },
-      {
-        slug: 'skills',
-        fileSlug: 'skills',
-        label: {
-          zh: '技能 (Skills)',
-          en: 'Skills',
-        },
-        title: {
-          zh: '可复用技能 (Skills)',
-          en: 'Reusable Skills',
-        },
-        description: {
-          zh: '编写 SKILL.md 封装团队工作流，通过 /技能名 一键调用并在编辑后热更新。',
-          en: 'Package team workflows into SKILL.md files, invoke them with /skill-name, and hot-reload edits.',
+          zh: '四段静态英文提示词、Turn-0 严格顺序、启动期静态 AGENTS.md 加载、冻结工具表与协议层缓存保持。',
+          en: 'Static 4-section English system prompt, Turn-0 ordering, startup-static AGENTS.md, frozen tools, and wire cache alignment.',
         },
       },
       {
         slug: 'security',
         fileSlug: 'security',
         label: {
-          zh: '权限与安全',
-          en: 'Permissions',
+          zh: '安全与审批',
+          en: 'Security & Approvals',
         },
         title: {
-          zh: '权限与安全',
-          en: 'Permissions & Security',
+          zh: '安全边界、路径沙箱与交互审批',
+          en: 'Security Boundaries, Path Scope & Approval Gate',
         },
         description: {
-          zh: '工具预设、黑白名单并集、工作区限制与执行审批，及三套场景化加固配置。',
-          en: 'Tool presets, cumulative allow/exclude lists, workspace boundaries, --approve prompts, and three hardening profiles.',
+          zh: 'restrictToWorkspace 符号链接逃逸防护、bash 非沙箱说明、--approve 审批闸门与纵深防御组合。',
+          en: 'restrictToWorkspace symlink escape protection, bash shell caveats, --approve gate, and defense-in-depth recipes.',
         },
       },
+    ],
+  },
+  {
+    id: 'reference',
+    title: {
+      zh: '参考手册',
+      en: 'Reference',
+    },
+    items: [
+      {
+        slug: 'reference/cli',
+        fileSlug: 'reference/cli',
+        label: {
+          zh: 'CLI 与环境变量',
+          en: 'CLI & Env Vars',
+        },
+        title: {
+          zh: 'CLI 参数、Exec 输出契约与环境变量',
+          en: 'CLI Flags, Exec Contract & Environment Variables',
+        },
+        description: {
+          zh: 'mizar / mizar exec / mizar update 全量命令行参数、JSON 输出 Schema、退出码与全部环境变量。',
+          en: 'Complete CLI flags for mizar, mizar exec, and mizar update, JSON output schema, exit codes, and environment variables.',
+        },
+      },
+      {
+        slug: 'reference/config',
+        fileSlug: 'reference/config',
+        label: {
+          zh: '配置参考',
+          en: 'Config Reference',
+        },
+        title: {
+          zh: 'settings.json、模块控制与 mcp.json',
+          en: 'settings.json, Plugin Toggles & mcp.json',
+        },
+        description: {
+          zh: '配置层级合并规则、settings.json 全字段、disabledPlugins 与 10 个宿主扩展 ID、以及 mcp.json Schema。',
+          en: 'Config merge precedence, full settings.json schema, disabledPlugins, 10 host extension IDs, and mcp.json schema.',
+        },
+      },
+      {
+        slug: 'reference/models',
+        fileSlug: 'reference/models',
+        label: {
+          zh: '模型与兼容参数',
+          en: 'Models & Compat',
+        },
+        title: {
+          zh: 'models.json 路由协议与 16 项 compat 开关',
+          en: 'models.json Routing & 16 Compat Flags',
+        },
+        description: {
+          zh: '内置提供方解析顺序、models.json Schema、三协议适配器、全部 16 项 CompatConfig 参数与凭据模板。',
+          en: 'Built-in provider resolution, models.json schema, protocol adapters, all 16 CompatConfig flags, and provider recipes.',
+        },
+      },
+    ],
+  },
+  {
+    id: 'ops-internals',
+    title: {
+      zh: '排障与架构',
+      en: 'Ops & Internals',
+    },
+    items: [
       {
         slug: 'troubleshooting',
         fileSlug: 'troubleshooting',
@@ -344,69 +223,28 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Troubleshooting',
         },
         title: {
-          zh: '排障指南',
-          en: 'Troubleshooting',
+          zh: '常见故障排查与运行诊断',
+          en: 'Troubleshooting & Runtime Diagnostics',
         },
         description: {
-          zh: '按现象定位演示模式回退、MCP 不被调用、JSON 报错、只读环境与鼠标划词问题。',
-          en: 'Diagnose mock-mode fallbacks, skipped MCP tools, strict JSON errors, read-only workspaces, and mouse selection.',
-        },
-      },
-    ],
-  },
-  {
-    id: 'dev-arch',
-    title: {
-      zh: '架构与开发',
-      en: 'Development',
-    },
-    items: [
-      {
-        slug: 'dev',
-        fileSlug: 'dev/index',
-        label: {
-          zh: '架构分层',
-          en: 'Architecture',
-        },
-        title: {
-          zh: 'Workspace 分层与隔离边界',
-          en: 'Workspace Layers & Cores',
-        },
-        description: {
-          zh: '10 个 crate 的静态 DAG 职责分层，以及纯核心（mizar-types/mizar-tui-ui）与 Merak 零终端隔离边界。',
-          en: 'Responsibilities across 10 workspace crates, pure-core rules (mizar-types/mizar-tui-ui), and zero-TUI client bounds.',
+          zh: '路由失败、代理证书、兼容网关报错、SQLITE_BUSY、MCP 断连、Codemode 超时与终端渲染问题定位。',
+          en: 'Diagnose routing errors, TLS roots, gateway compat 400s, SQLITE_BUSY, MCP disconnects, codemode timeouts, and terminal glitches.',
         },
       },
       {
-        slug: 'dev/runtime',
-        fileSlug: 'dev/runtime',
+        slug: 'architecture',
+        fileSlug: 'architecture',
         label: {
-          zh: '运行时与钩子',
-          en: 'Runtime & Hooks',
+          zh: '架构与开发',
+          en: 'Architecture & Dev',
         },
         title: {
-          zh: 'MizarRuntime、强类型钩子与新增工具',
-          en: 'MizarRuntime, Typed Hooks & Tools',
+          zh: '33-Crate Cordis 微内核架构与开发指南',
+          en: '33-Crate Cordis Architecture & Development',
         },
         description: {
-          zh: 'MizarRuntime::build 静态装配、RAII HookGuard 清理、强类型钩子与事件总线，以及从零注册新工具。',
-          en: 'MizarRuntime::build static assembly, RAII HookGuard cleanup, typed hooks/event buses, and registering new tools.',
-        },
-      },
-      {
-        slug: 'dev/conventions',
-        fileSlug: 'dev/conventions',
-        label: {
-          zh: '开发规范',
-          en: 'Conventions',
-        },
-        title: {
-          zh: '工程规范、门控与测试',
-          en: 'Conventions, Gates & Tests',
-        },
-        description: {
-          zh: '仓库约定、文案双语规范、文件写队列、feature 门控验证与提交流程。',
-          en: 'Repo conventions, bilingual text rules, file mutation queues, feature-gate checks, and commit workflow.',
+          zh: 'Cordis 微内核、33 个 Crate 分层、4 个纯核心边界、三段工具管线、feature 门控与测试验证。',
+          en: 'Cordis microkernel, 33-crate layered topology, 4 pure core boundaries, tool waterfall, Cargo features, and test gates.',
         },
       },
     ],

@@ -1,9 +1,12 @@
 //! `UiEvent` 异步后端事件消费与状态归约（含流式增量、工具卡片与上下文压缩进度）。
 
+use serde_json::Value;
+
 use super::{
     ActivityState, AppState, ChatItem, NoticeLevel, ToolExtraMeta, ToolState, UiAgentStatus,
     UiEvent, UiLogLevel, UiStepOutcome, UiTurnEndReason, bash_inline_meta, bash_scope_label,
-    summarize_live_preview, summarize_tool_args, summarize_tool_result, turn_end_program_status,
+    extract_inline_meta, summarize_live_preview, summarize_tool_args, summarize_tool_result,
+    turn_end_program_status,
 };
 use crate::reveal::RevealSlot;
 use crate::terminal::{ProgramStatusState, emit_terminal_progress};
@@ -272,13 +275,23 @@ impl AppState {
                     ToolState::Done
                 };
                 let failed = is_error || blocked;
-                let preview = self.apply_tool_result_extras(
-                    &call_id,
-                    &name,
-                    &content,
-                    details.as_ref(),
-                    failed,
-                );
+                let diff_raw = if !failed && name == "edit" {
+                    details
+                        .as_ref()
+                        .and_then(|d| d.get("diff"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                } else {
+                    None
+                };
+                let inline_meta = extract_inline_meta(&name, &content, details.as_ref(), failed);
+                {
+                    let extra = self.tool_extras.entry(call_id.clone()).or_default();
+                    extra.full_content = content.clone();
+                    extra.diff_raw = diff_raw;
+                    extra.inline_meta = inline_meta;
+                }
+                let preview = summarize_tool_result(&name, &content, details.as_ref(), failed);
                 let idx = if let Some(pos) = self.items.iter().rposition(|item| match item {
                     ChatItem::ToolCall { id, .. } => id == &call_id,
                     _ => false,
@@ -350,15 +363,6 @@ impl AppState {
             }
             UiEvent::Notice { level, text } => {
                 self.push_notice(level, text);
-            }
-            UiEvent::SubagentState {
-                running_count,
-                notice,
-            } => {
-                self.running_subagents = running_count;
-                if let Some(text) = notice {
-                    self.push_notice(NoticeLevel::Info, text);
-                }
             }
             UiEvent::UserSkillsUpdated(names) => {
                 self.user_skill_names = names;
@@ -443,20 +447,14 @@ impl AppState {
                 self.refresh_context_breakdown();
             }
             UiEvent::ApprovalRequested {
-                request_id,
-                call_id,
                 tool_name,
                 args_preview,
                 responder,
             } => {
                 if let Some(tx) = responder.lock().unwrap().take() {
-                    let opened_now = self.overlay.open_approval(
-                        request_id,
-                        call_id,
-                        tool_name.clone(),
-                        args_preview,
-                        tx,
-                    );
+                    let opened_now =
+                        self.overlay
+                            .open_approval(tool_name.clone(), args_preview, tx);
                     if opened_now {
                         self.record_program_status(
                             ProgramStatusState::Blocked,
@@ -466,24 +464,11 @@ impl AppState {
                     }
                 }
             }
-            UiEvent::ApprovalResolved { request_id } => {
-                if self.overlay.dismiss_approval(&request_id) && !self.promote_next_approval() {
-                    self.record_program_status(
-                        if self.is_busy() {
-                            ProgramStatusState::Working
-                        } else {
-                            ProgramStatusState::Idle
-                        },
-                        None,
-                        None,
-                    );
-                }
-            }
-            UiEvent::SessionSwitched { .. } | UiEvent::QueueUpdated { .. } => {}
             UiEvent::CompactionStarted { trigger } => {
                 let label = match trigger.as_str() {
                     "manual" => "手动压缩中…",
                     "overflow" => "溢出恢复压缩中…",
+                    "cold-cache" => "冷缓存整理中…",
                     _ => "上下文压缩中…",
                 }
                 .to_string();
@@ -496,6 +481,7 @@ impl AppState {
             }
             UiEvent::CompactionProgress { stage, delta_chars } => {
                 let status = match stage.as_str() {
+                    "pruned" => "压缩中 · 已剪枝大输出".to_string(),
                     "prefill" => "压缩中 · prefill…".to_string(),
                     "transcript" => "压缩中 · 整理记录…".to_string(),
                     "summary" => format!("压缩中 · 摘要 {delta_chars} 字"),

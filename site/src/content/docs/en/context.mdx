@@ -1,0 +1,53 @@
+---
+title: KV Cache Stability, Static Prompts & Instructions
+description: Static 4-section English system prompt, Turn-0 message ordering, startup-static AGENTS.md loading, frozen tool schemas, and wire cache alignment.
+group: core-concepts
+order: 5
+---
+
+Most input token cost in multi-step coding agents comes from re-reading prefix context. Any per-second timestamp inside system instructions, mid-session tool list mutations, or dynamic per-step disk scans invalidates server-side KV / Prompt Cache prefixes. Mizar enforces prefix stability across prompts, tools, workspace instructions, and wire adapters.
+
+## Static 4-Section English System Prompt (`mizar-system-prompt`)
+
+Mizar builds a lean static English system prompt at startup and keeps it byte-identical across turns (`persona` in `settings.json` overrides Section 1):
+
+| Order | Section | Responsibility |
+| :--- | :--- | :--- |
+| 1 | `DEFAULT_PERSONA` | Core identity, concise engineering discipline, and factual verification rules |
+| 2 | `tools_guide` | Tool usage idioms and always-on `codemode` batching (`Promise.allSettled`) guidance |
+| 3 | `DEFAULT_RUNTIME_PROTOCOL` | Tool invocation, argument error recovery, and output formatting rules |
+| 4 | `emphasis` (optional) | Interactive TUI only (unless `MIZAR_TUI_EMPHASIS_GUIDANCE=0`); omitted in headless `exec` |
+
+<Callout type="info" title="Turn-0 Deterministic Ordering (EVENT_AGENT_PREPARE_TURN)">
+  Before dispatching Turn 0, <code>mizar-agent-loop</code> fires <code>EVENT_AGENT_PREPARE_TURN</code> so system instructions, static workspace context, and history maintain strict, reproducible ordering across fresh runs and resumed sessions.
+</Callout>
+
+## Startup-Static Workspace Instructions (`mizar-instructions`)
+
+`AGENTS.md` / `CLAUDE.md` discovery runs **once at startup** and injects a static read-only section into `SystemPrompt` via `ctx.effect` (`inject: ["systemPrompt"]`), replacing per-step subdirectory `stat` polling:
+
+- **Discovery Roots & Candidates**:
+  1. Global: `~/.mizar/` (`MIZAR_HOME`) and `~/.agents/` (`MIZAR_AGENTS_HOME`).
+  2. Workspace lineage: walks upward from current working directory to `projectRootMarkers` (`[".git"]`), loading `candidates` (`["AGENTS.md", "CLAUDE.md"]`) and local overrides `localCandidates` (`["AGENTS.local.md", "CLAUDE.local.md"]`).
+- **Deduplication & Budget Eviction**:
+  - Whitespace-normalized SHA-256 deduplicates identical files per group while keeping distinct files.
+  - Per-file cap `instructions.maxSourceBytes` (`1,048,576 B` = 1 MiB) and total budget `instructions.maxBytes` (`65,536 B`). When over budget, **broadest/furthest ancestors are evicted first** to preserve instructions closest to the active directory, with UTF-8 safe truncation.
+- **Zero Per-Step Disk I/O**: Prefix bytes never shift mid-session due to background file edits. Pass `--no-instructions` or set `instructions.enabled: false` to disable.
+
+## Frozen Tool Schema List
+
+To avoid mid-session cache invalidation from tool definition drift:
+
+- **Single static `recall`**: Always mounted in `Direct` from Turn 0 instead of appearing only after compaction.
+- **Always-on `codemode`**: Always declared by default rather than dynamically toggled.
+- **Zero-dependency omission**: `tool_search` is skipped when 0 MCP `Codemode`/`Deferred` tools exist; `skill` is skipped when 0 skills are loaded; no mutable `<mcp_servers>` status banner invalidates the prompt tail.
+
+## Wire-Level Prefix & Replay Alignment
+
+Each protocol adapter aligns its wire representation to upstream caching semantics (see [Models & Compat Reference](/en/reference/models/)):
+
+- **OpenAI Responses (`mizar-llm-responses`)**:
+  - Defaults to **`supportsDeveloperRole: true`** and **`useTopLevelInstructions: false`**, inlining system instructions as the first `developer` item inside `input` for contiguous cache hits.
+  - **Ordered `outputItems` replay**: Replays interleaved `reasoning`, `message`, and `function_call` blocks in original emission order, avoiding silent `IN_DROP` item drops.
+- **Anthropic Messages (`mizar-llm-messages`)**: Places `cache_control` breakpoints on system/tools/recent turn boundaries (configurable via `supportsCacheControlOnTools`).
+- **OpenAI Completions & DeepSeek (`mizar-llm-completions`)**: Preserves prefix bytes and sends session affinity headers (`sendSessionAffinityHeaders` / `sessionAffinityFormat`) and `prompt_cache_key` (`supportsPromptCacheKey`).

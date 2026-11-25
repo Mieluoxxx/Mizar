@@ -4,23 +4,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub use mizar_types::client::tool_format::{
+pub use mizar_client_core::tool_format::{
     abbreviate_home_path, abbreviate_home_with, bash_inline_meta, bash_scope_label,
     clean_bash_output_lines, count_diff_stats, extract_inline_meta, format_bash_display,
     format_diff_stat, format_expanded_tool_args, format_tokens, is_path_arg_tool,
     is_read_only_compact_tool, short_id, single_line_text, summarize_live_preview,
     summarize_tool_args, summarize_tool_result, truncate_display,
 };
-pub use mizar_types::client::{
+pub use mizar_client_core::{
     ActivityState, ApprovalMode, BashInputMode, LocalBashOutput, NoticeLevel, PromptQueue,
     QueuedPrompt, SessionReplayItem, SessionSelection, SessionViewData, ToolExtraMeta, ToolState,
     UiAgentStatus, UiLogLevel, UiLogRecord, UiStepOutcome, UiTurnEndReason,
 };
-use mizar_types::llm::{
+use mizar_llm_types::{
     ContentBlock, ImageAttachment, MAX_IMAGES_PER_MESSAGE, ModelInfo, ProviderInfo,
     ReasoningEffort, TokenUsage,
 };
-use mizar_types::trajectory::{TimelineMode, TrajectoryReport};
+use mizar_trajectory_core::{TimelineMode, TrajectoryReport};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::Value;
@@ -49,7 +49,7 @@ pub(crate) use cache::StreamingMarkdownPrefixCache;
 pub use cache::{CachedItemLines, ItemRenderKey, MAX_CACHED_RENDER_ITEMS, TranscriptRenderCache};
 
 /// 由后端异步事件与终端外部状态投递给 UI 主循环的消息。
-pub type UiEvent = mizar_types::client::ClientEvent;
+pub type UiEvent = mizar_client_core::ClientEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatItem {
@@ -175,10 +175,10 @@ pub struct AppState {
     pub always_allowed_tools: HashSet<String>,
 
     // 滚动与虚拟化状态
-    pub scroll_from_top: usize,
+    pub scroll_from_top: u16,
     pub auto_scroll: bool,
     pub last_viewport_height: u16,
-    pub last_total_lines: usize,
+    pub last_total_lines: u16,
 
     // 用量与性能仪表
     pub total_usage: TokenUsage,
@@ -237,8 +237,6 @@ pub struct AppState {
     pub last_step_outcome: Option<(usize, UiStepOutcome)>,
     /// 最近一次上报的终端 ProgramStatus，用于测试直接断言非 Completed 终态不产生 Done。
     pub last_program_status: Option<(ProgramStatusState, Option<String>)>,
-    /// 当前活跃会话正在后台运行的 Subagent 数量。
-    pub running_subagents: usize,
 }
 
 impl AppState {
@@ -324,7 +322,6 @@ impl AppState {
             last_turn_end_reason: None,
             last_step_outcome: None,
             last_program_status: None,
-            running_subagents: 0,
         }
     }
 
@@ -620,7 +617,6 @@ impl AppState {
         let idx = self.items.len() - 1;
         self.item_cache
             .invalidate_tool_neighborhood(&self.items, idx);
-        self.enforce_tool_extras_budget();
         self.scroll_to_bottom();
     }
 
@@ -770,67 +766,15 @@ impl AppState {
         next
     }
 
-    /// 限制 `tool_extras` 历史大字段（`full_content`/`diff_raw`/`full_args`）内存占用，保留最近 64 次调用完整明细。
-    pub fn enforce_tool_extras_budget(&mut self) {
-        const KEEP_RECENT_TOOL_EXTRAS: usize = 64;
-        const MAX_TOOL_EXTRAS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-
-        if self.tool_extras.len() <= KEEP_RECENT_TOOL_EXTRAS {
-            return;
-        }
-        let mut total_bytes: usize = self
-            .tool_extras
-            .values()
-            .map(|e| {
-                e.full_content.len()
-                    + e.diff_raw.as_ref().map_or(0, String::len)
-                    + e.full_args.len()
-            })
-            .sum();
-        if total_bytes <= MAX_TOOL_EXTRAS_TOTAL_BYTES {
-            return;
-        }
-
-        let tool_count = self
-            .items
-            .iter()
-            .filter(|it| matches!(it, ChatItem::ToolCall { .. }))
-            .count();
-        let trim_limit = tool_count.saturating_sub(KEEP_RECENT_TOOL_EXTRAS);
-        let mut seen_tools = 0usize;
-        for (idx, item) in self.items.iter().enumerate() {
-            if seen_tools >= trim_limit || total_bytes <= MAX_TOOL_EXTRAS_TOTAL_BYTES {
-                break;
-            }
-            if let ChatItem::ToolCall { id, .. } = item {
-                seen_tools += 1;
-                if let Some(ext) = self.tool_extras.get_mut(id) {
-                    let freed = ext.full_content.len()
-                        + ext.diff_raw.as_ref().map_or(0, String::len)
-                        + ext.full_args.len();
-                    if freed > 0 {
-                        ext.full_content = String::new();
-                        ext.diff_raw = None;
-                        ext.full_args = String::new();
-                        total_bytes = total_bytes.saturating_sub(freed);
-                        self.item_cache.invalidate_item(idx);
-                    }
-                }
-            }
-        }
+    fn page_step(&self) -> u16 {
+        self.last_viewport_height.saturating_sub(2).max(3)
     }
 
-    fn page_step(&self) -> usize {
-        (self.last_viewport_height as usize)
-            .saturating_sub(2)
-            .max(3)
-    }
-
-    pub fn scroll_up(&mut self, lines: usize) {
+    pub fn scroll_up(&mut self, lines: u16) {
         self.selection.clear();
         let max_scroll = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height as usize);
+            .saturating_sub(self.last_viewport_height);
         if max_scroll == 0 {
             self.auto_scroll = true;
             self.scroll_from_top = 0;
@@ -845,11 +789,11 @@ impl AppState {
         self.scroll_from_top = cur.saturating_sub(lines);
     }
 
-    pub fn scroll_down(&mut self, lines: usize) {
+    pub fn scroll_down(&mut self, lines: u16) {
         self.selection.clear();
         let max_scroll = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height as usize);
+            .saturating_sub(self.last_viewport_height);
         let next = self.scroll_from_top.saturating_add(lines);
         if next >= max_scroll {
             self.auto_scroll = true;
@@ -864,13 +808,13 @@ impl AppState {
         self.auto_scroll = true;
         self.scroll_from_top = self
             .last_total_lines
-            .saturating_sub(self.last_viewport_height as usize);
+            .saturating_sub(self.last_viewport_height);
     }
 
-    pub fn effective_scroll(&mut self, viewport_height: u16, total_lines: usize) -> usize {
+    pub fn effective_scroll(&mut self, viewport_height: u16, total_lines: u16) -> u16 {
         self.last_viewport_height = viewport_height;
         self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(viewport_height as usize);
+        let max_scroll = total_lines.saturating_sub(viewport_height);
         if self.auto_scroll {
             self.scroll_from_top = max_scroll;
         } else if max_scroll == 0 {
@@ -916,51 +860,11 @@ impl AppState {
         self.last_turn_end_reason = None;
         self.last_step_outcome = None;
         self.last_program_status = None;
-        self.running_subagents = 0;
         self.refresh_context_breakdown();
         self.push_notice(
             NoticeLevel::Info,
             format!("已开启新会话 ({})", short_id(&self.session_id)),
         );
-    }
-
-    /// 同步在线运行与历史回放的工具展示扩展态（`diff_raw`、`inline_meta`、`full_content`）并生成折叠预览。
-    pub(super) fn apply_tool_result_extras(
-        &mut self,
-        call_id: &str,
-        name: &str,
-        content: &str,
-        details: Option<&Value>,
-        failed: bool,
-    ) -> String {
-        let diff_raw = if !failed && name == "edit" {
-            details
-                .and_then(|d| d.get("diff"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        } else {
-            None
-        };
-        let inline_meta = if !failed
-            && name == "edit"
-            && let Some(d) = details
-            && let (Some(added), Some(removed)) = (
-                d.get("added").and_then(Value::as_u64),
-                d.get("removed").and_then(Value::as_u64),
-            ) {
-            format_diff_stat(added as usize, removed as usize)
-        } else if !name.is_empty() {
-            extract_inline_meta(name, content, details, failed)
-        } else {
-            None
-        };
-        {
-            let extra = self.tool_extras.entry(call_id.to_string()).or_default();
-            extra.full_content = content.to_string();
-            extra.diff_raw = diff_raw;
-            extra.inline_meta = inline_meta;
-        }
-        summarize_tool_result(name, content, details, failed)
     }
 
     /// 从投影后的纯会话视图重建界面对话流（供 `/tree` 分叉回溯与 `--resume` / `--continue` 使用）。
@@ -1043,39 +947,32 @@ impl AppState {
                     tool_call_id,
                     content,
                     is_error,
-                    meta,
                 } => {
-                    let matched_pos = self.items.iter().rposition(|it| match it {
+                    let mut matched_name = String::new();
+                    if let Some(ChatItem::ToolCall {
+                        name,
+                        status,
+                        output_preview,
+                        ..
+                    }) = self.items.iter_mut().rev().find(|it| match it {
                         ChatItem::ToolCall { id, .. } => id == &tool_call_id,
                         _ => false,
-                    });
-                    let matched_name = matched_pos
-                        .and_then(|pos| match &self.items[pos] {
-                            ChatItem::ToolCall { name, .. } => Some(name.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    let preview = self.apply_tool_result_extras(
-                        &tool_call_id,
-                        &matched_name,
-                        &content,
-                        meta.as_ref(),
-                        is_error,
-                    );
-                    if let Some(pos) = matched_pos
-                        && let ChatItem::ToolCall {
-                            status,
-                            output_preview,
-                            ..
-                        } = &mut self.items[pos]
-                    {
+                    }) {
+                        matched_name = name.clone();
                         *status = if is_error {
                             ToolState::Error
                         } else {
                             ToolState::Done
                         };
-                        *output_preview = preview;
+                        *output_preview =
+                            summarize_tool_result(&matched_name, &content, None, is_error);
                     }
+                    let inline_meta = (!matched_name.is_empty())
+                        .then(|| extract_inline_meta(&matched_name, &content, None, is_error))
+                        .flatten();
+                    let ext = self.tool_extras.entry(tool_call_id).or_default();
+                    ext.full_content = content;
+                    ext.inline_meta = inline_meta;
                 }
                 SessionReplayItem::BashExecution {
                     command,
@@ -1106,7 +1003,6 @@ impl AppState {
             }
         }
         self.push_notice(NoticeLevel::Info, view.finish_notice);
-        self.enforce_tool_extras_budget();
         self.refresh_context_breakdown();
         self.scroll_to_bottom();
     }
@@ -1233,15 +1129,6 @@ impl AppState {
 }
 
 fn summarize_context_notice_for_replay(source: &str, text: &str) -> String {
-    if source.starts_with("subagent:") || source.starts_with("subagent-watchdog:") {
-        let first_line = text
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("已返回结果");
-        return format!("[{source}] {}", truncate_display(first_line, 100));
-    }
     if source == "skill-catalog" {
         return "[skill-catalog] 已加载可用技能目录".to_string();
     }
@@ -1318,7 +1205,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use mizar_types::llm::{ModelInfo, ToolCall};
+    use mizar_llm_types::{ModelInfo, ToolCall};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1523,7 +1410,6 @@ mod tests {
                         ReasoningEffort::High,
                     ],
                     input: Vec::new(),
-                    ..Default::default()
                 },
                 ModelInfo {
                     id: "model-all".into(),
@@ -1532,7 +1418,6 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: Vec::new(),
-                    ..Default::default()
                 },
             ],
         }];
@@ -2195,7 +2080,6 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: vec!["text".into()],
-                    ..Default::default()
                 },
                 ModelInfo {
                     id: "vision".into(),
@@ -2204,7 +2088,6 @@ mod tests {
                     max_tokens: None,
                     reasoning_efforts: Vec::new(),
                     input: vec!["text".into(), "image".into()],
-                    ..Default::default()
                 },
             ],
         }];
@@ -2484,7 +2367,6 @@ mod tests {
             selection: None,
             total_usage: restored_usage,
             last_prompt_tokens: Some(12_000),
-            ..SessionViewData::default()
         });
 
         assert_eq!(app.total_usage, restored_usage);
@@ -2519,7 +2401,6 @@ mod tests {
                     max_tokens: Some(16_384),
                     reasoning_efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
                     input: Vec::new(),
-                    ..Default::default()
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
@@ -2528,7 +2409,6 @@ mod tests {
                     max_tokens: Some(4_096),
                     reasoning_efforts: vec![ReasoningEffort::Low],
                     input: Vec::new(),
-                    ..Default::default()
                 },
             ],
         }]
@@ -2721,15 +2601,11 @@ mod tests {
         let (tx1, mut rx1) = futures::channel::oneshot::channel();
         let (tx2, mut rx2) = futures::channel::oneshot::channel();
         app.apply_ui_event(UiEvent::ApprovalRequested {
-            request_id: "req-1".into(),
-            call_id: Some("call-1".into()),
             tool_name: "bash".into(),
             args_preview: "ls".into(),
             responder: Arc::new(std::sync::Mutex::new(Some(tx1))),
         });
         app.apply_ui_event(UiEvent::ApprovalRequested {
-            request_id: "req-2".into(),
-            call_id: Some("call-2".into()),
             tool_name: "write".into(),
             args_preview: "a.txt".into(),
             responder: Arc::new(std::sync::Mutex::new(Some(tx2))),
@@ -2756,36 +2632,6 @@ mod tests {
         assert_eq!(rx2.try_recv().unwrap(), Some(ApprovalDecision::Deny));
         assert!(!app.overlay.is_open());
 
-        // 异源（如 RPC）先一步裁决时，UiEvent::ApprovalResolved 应静默关闭对应弹窗并提升队列下一项
-        let (tx3, mut rx3) = futures::channel::oneshot::channel();
-        let (tx4, _rx4) = futures::channel::oneshot::channel();
-        app.apply_ui_event(UiEvent::ApprovalRequested {
-            request_id: "req-remote-1".into(),
-            call_id: None,
-            tool_name: "bash".into(),
-            args_preview: "pwd".into(),
-            responder: Arc::new(std::sync::Mutex::new(Some(tx3))),
-        });
-        app.apply_ui_event(UiEvent::ApprovalRequested {
-            request_id: "req-remote-2".into(),
-            call_id: None,
-            tool_name: "edit".into(),
-            args_preview: "b.rs".into(),
-            responder: Arc::new(std::sync::Mutex::new(Some(tx4))),
-        });
-        app.apply_ui_event(UiEvent::ApprovalResolved {
-            request_id: "req-remote-1".into(),
-        });
-        assert!(rx3.try_recv().is_err());
-        assert!(matches!(
-            app.overlay.active,
-            Some(OverlayKind::Approval(ref ap)) if ap.request_id == "req-remote-2"
-        ));
-        app.apply_ui_event(UiEvent::ApprovalResolved {
-            request_id: "req-remote-2".into(),
-        });
-        assert!(!app.overlay.is_open());
-
         app.effective_scroll(20, 100);
         app.scroll_up(15);
         assert!(!app.auto_scroll);
@@ -2794,19 +2640,6 @@ mod tests {
             !app.auto_scroll,
             "shrink while scrollable must preserve lock"
         );
-
-        // 超过 u16::MAX (65,535) 行的长会话滚动不得截断或卡死
-        app.scroll_to_bottom();
-        assert_eq!(app.effective_scroll(30, 100_000), 99_970);
-        app.scroll_up(500);
-        assert!(!app.auto_scroll);
-        assert_eq!(app.scroll_from_top, 99_470);
-        assert!(app.scroll_from_top > u16::MAX as usize);
-        app.scroll_down(200);
-        assert_eq!(app.scroll_from_top, 99_670);
-        app.scroll_to_bottom();
-        assert!(app.auto_scroll);
-        assert_eq!(app.scroll_from_top, 99_970);
 
         app.restore_session_view(SessionViewData {
             session_id: "s-restored".into(),
@@ -2822,7 +2655,6 @@ mod tests {
             selection: None,
             total_usage: TokenUsage::default(),
             last_prompt_tokens: None,
-            ..SessionViewData::default()
         });
         assert_eq!(app.touched_files.len(), 1);
         assert_eq!(app.touched_files[0].path, "src/lib.rs");
@@ -2926,152 +2758,5 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(!app.selection.is_active());
-    }
-
-    #[test]
-    fn subagent_state_updates_count_posts_notice_resets_and_summarizes_replay() {
-        let mut app = AppState::new(
-            PathBuf::from("/tmp"),
-            "sess-sub-ui",
-            Vec::new(),
-            None,
-            None,
-            None,
-        );
-        app.apply_ui_event(UiEvent::SubagentState {
-            running_count: 2,
-            notice: Some("后台子代理 scout 已启动 (read_only)".into()),
-        });
-        assert_eq!(app.running_subagents, 2);
-        assert!(matches!(
-            app.items.last(),
-            Some(ChatItem::Notice { level: NoticeLevel::Info, text })
-                if text == "后台子代理 scout 已启动 (read_only)"
-        ));
-
-        app.reset_for_new_session("sess-sub-ui-2", None);
-        assert_eq!(app.running_subagents, 0);
-
-        let replayed = summarize_context_notice_for_replay(
-            "subagent:scout",
-            "Subagent \"scout\" completed (mode=read_only, steps=3, elapsed=2s):\n\nvery long body line",
-        );
-        assert!(replayed.starts_with("[subagent:scout] Subagent \"scout\" completed"));
-        assert!(!replayed.contains("very long body line"));
-
-        let wd_replayed = summarize_context_notice_for_replay(
-            "subagent-watchdog:scout",
-            "Subagent watchdog notice (1/2): scout idle 46s\n\ndetail instructions",
-        );
-        assert!(wd_replayed.starts_with("[subagent-watchdog:scout] Subagent watchdog notice"));
-        assert!(!wd_replayed.contains("detail instructions"));
-    }
-
-    #[test]
-    fn restore_session_view_reconstructs_diff_raw_and_inline_meta_from_tool_result_meta() {
-        let mut app = AppState::new(
-            PathBuf::from("."),
-            "sess-replay-meta",
-            Vec::new(),
-            None,
-            None,
-            None,
-        );
-        let diff_text = "--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new\n+more";
-        app.restore_session_view(SessionViewData {
-            session_id: "sess-replay-meta".into(),
-            session_title: Some("Meta Replay".into()),
-            items: vec![
-                SessionReplayItem::Assistant {
-                    blocks: vec![
-                        ContentBlock::ToolCall {
-                            id: "c_edit".into(),
-                            name: "edit".into(),
-                            arguments: r#"{"path":"src/lib.rs"}"#.into(),
-                        },
-                        ContentBlock::ToolCall {
-                            id: "c_write".into(),
-                            name: "write".into(),
-                            arguments: r#"{"path":"out.txt"}"#.into(),
-                        },
-                        ContentBlock::ToolCall {
-                            id: "c_bash".into(),
-                            name: "bash".into(),
-                            arguments: r#"{"command":"false"}"#.into(),
-                        },
-                        ContentBlock::ToolCall {
-                            id: "c_read".into(),
-                            name: "read".into(),
-                            arguments: r#"{"path":"a.rs"}"#.into(),
-                        },
-                    ],
-                },
-                SessionReplayItem::ToolResult {
-                    tool_call_id: "c_edit".into(),
-                    content: "Successfully replaced 1 block(s)".into(),
-                    is_error: false,
-                    meta: Some(serde_json::json!({
-                        "kind": "diff",
-                        "path": "src/lib.rs",
-                        "added": 2,
-                        "removed": 1,
-                        "diff": diff_text,
-                    })),
-                },
-                SessionReplayItem::ToolResult {
-                    tool_call_id: "c_write".into(),
-                    content: "Successfully wrote 18 bytes".into(),
-                    is_error: false,
-                    meta: Some(serde_json::json!({
-                        "kind": "write",
-                        "path": "out.txt",
-                        "bytes": 18,
-                        "lines": 3,
-                    })),
-                },
-                SessionReplayItem::ToolResult {
-                    tool_call_id: "c_bash".into(),
-                    content: "Command exited with code 2".into(),
-                    is_error: true,
-                    meta: Some(serde_json::json!({
-                        "kind": "bash",
-                        "command": "false",
-                        "exit_code": 2,
-                        "duration_ms": 8,
-                        "timed_out": false,
-                        "cancelled": false,
-                        "full_output_path": null,
-                    })),
-                },
-                SessionReplayItem::ToolResult {
-                    tool_call_id: "c_read".into(),
-                    content: "1\thello".into(),
-                    is_error: false,
-                    meta: Some(serde_json::json!({
-                        "kind": "read",
-                        "path": "a.rs",
-                        "start_line": 1,
-                        "end_line": 20,
-                        "total_lines": 100,
-                        "truncated": true,
-                    })),
-                },
-            ],
-            finish_notice: "已恢复".into(),
-            ..SessionViewData::default()
-        });
-
-        let edit_ext = app.tool_extras.get("c_edit").unwrap();
-        assert_eq!(edit_ext.diff_raw.as_deref(), Some(diff_text));
-        assert_eq!(edit_ext.inline_meta.as_deref(), Some("+2 -1"));
-
-        let write_ext = app.tool_extras.get("c_write").unwrap();
-        assert_eq!(write_ext.inline_meta.as_deref(), Some("3 lines"));
-
-        let bash_ext = app.tool_extras.get("c_bash").unwrap();
-        assert_eq!(bash_ext.inline_meta.as_deref(), Some("exit 2"));
-
-        let read_ext = app.tool_extras.get("c_read").unwrap();
-        assert_eq!(read_ext.inline_meta.as_deref(), Some("L1-20/100"));
     }
 }

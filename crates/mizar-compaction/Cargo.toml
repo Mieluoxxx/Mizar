@@ -1,0 +1,27 @@
+[package]
+name = "mizar-compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mizar 四级渐进上下文压缩引擎（零模型剪枝、软硬分离检查点摘要、溢出兜底与压后工具守卫）"
+
+[lints]
+workspace = true
+
+[dependencies]
+cordis = { workspace = true }
+futures = { workspace = true }
+mizar-agent-loop = { workspace = true }
+mizar-llm = { workspace = true }
+mizar-session = { workspace = true }
+mizar-system-prompt = { workspace = true }
+mizar-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+mizar-tools-coding = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

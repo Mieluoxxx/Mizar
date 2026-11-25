@@ -1,0 +1,145 @@
+---
+title: CLI 参数、Exec 输出契约与环境变量
+description: mizar、mizar exec 与 mizar update 全量命令行参数、JSON 输出 Schema、退出码及系统环境变量参考。
+group: reference
+order: 7
+---
+
+`mizar` 二进制（由 `mizar-tui` 编译）提供三个入口形态，同一套配置加载、路由解析与 Cordis 插件装配逻辑驱动所有模式。
+
+## 三个命令行入口
+
+| 命令形态 | 作用 | 输入来源 |
+| :--- | :--- | :--- |
+| `mizar [OPTIONS]` | 启动交互式 TUI 工作台；若传入 `-p` / `--prompt` / `--prompt-file` 则自动转入无头单次执行 | 交互输入，或通过 `-p` / `--prompt-file` 指定单轮提示词 |
+| `mizar exec [OPTIONS] [<prompt>]` | 非交互无头单轮执行；适配 CI/CD、自动化评测与管道脚本 | 位置参数 `<prompt>`、`-p`、`--prompt-file`，缺省时自动从标准输入管道读取 |
+| `mizar update [FLAGS]` | 校验 SHA-256 并从 GitHub Releases 升级或切换二进制版本 | `-v/--version <ver>`、`-f/--force`、`--check`、`-h/--help` |
+
+## 命令行参数全表（`mizar` 与 `mizar exec`）
+
+| 短/长选项 | 参数值 / 默认值 | 适用范围 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `-C`, `--workspace <dir>` | 路径（默认 `.`） | 全局 | 指定工作区根目录（也可通过 `WORKSPACE` 设置） |
+| `-p`, `--prompt <text>` | 字符串 | 全局 / `exec` | 直接提供单轮提示词并进入无头执行 |
+| `--prompt-file <path>` | 文件路径 | 全局 / `exec` | 从文件读取提示词并进入无头执行（不可与 `--prompt` / `<prompt>` 冲突） |
+| `--provider <name>` | 提供方 ID | 全局 | 覆盖默认提供方（内置 `openai` / `openai-responses` / `anthropic` / `deepseek` / `mock` 或 `models.json` 自定义 key） |
+| `--model <id>` | 模型 ID | 全局 | 覆盖当前激活模型 ID |
+| `--protocol`, `--api-format <kind>` | `completions` \| `responses` \| `messages` | 全局 | 指定协议适配器（支持别名 `openai-completions`、`openai-responses`、`anthropic-messages`） |
+| `--base-url <url>` | URL 字符串 | 全局 | 覆盖 API 根地址 |
+| `--reasoning-effort <level>` | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | 全局 | 设置推理/思考强度 |
+| `--max-steps <n>` | 正整数（默认不限） | 全局 | 单轮对话内允许的最大工具步数上限；超限返回 `code=max_steps` |
+| `--max-tokens <n>` | 正整数 | 全局 | 覆盖单次模型响应的最大输出 Token 数 |
+| `--timeout <secs>` | 秒数 | `exec` | 无头执行整轮超时；超时终止并返回退出码 `124` |
+| `--output-format <fmt>` | `text`（默认）\| `json` | `exec` | 控制无头模式最终 `stdout` 输出格式 |
+| `--json` | 布尔标志 | `exec` | `--output-format json` 的简写别名 |
+| `--trace-out <path>` | 文件路径 | `exec` | 退出时将结构化 `TrajectoryExport` JSON 原子写入目标路径（优先于 `MIZAR_TRACE_OUT`） |
+| `--isolated` | 布尔标志 | 全局 | 忽略全局与项目级磁盘配置文件，以纯净内存态启动 |
+| `--minimal` | 布尔标志 | 全局 | 使用 `MinimalCoding` 预设（仅保留 `read` / `bash` / `edit` / `write`） |
+| `--read-only` | 布尔标志 | 全局 | 使用 `ReadOnly` 预设（仅保留 `read` / `grep` / `find`） |
+| `-t`, `--tools <csv>` | 逗号分隔工具名 | 全局 | 显式启用或约束允许的工具列表 |
+| `-xt`, `--exclude-tools <csv>` | 逗号分隔通配符 | 全局 | 叠加屏蔽工具列表（升为 `Hidden`，在常规声明和 `codemode` 中同步隐藏） |
+| `--inline` | 布尔标志 | TUI | 启动即进入 Inline 行内原生滚动模式 |
+| `--approve` | 布尔标志 | TUI | 强制开启非只读工具交互审批闸门（等效 `ui.approvalMode: "ask"`） |
+| `-c`, `--continue` | 布尔标志 | TUI / `exec` | 自动续接当前工作区最近一次保存的历史会话 |
+| `-r`, `--resume [id]` | 可选会话 ID | TUI / `exec` | 不带 ID 时打开交互式历史选择器（TUI），带 ID 时直接恢复对应会话 |
+| `--no-persist` | 布尔标志 | 全局 | 禁用 SQLite 持久化（仅在内存中维护本次会话） |
+| `--no-instructions` | 布尔标志 | 全局 | 跳过启动期 `AGENTS.md` / `CLAUDE.md` 指令发现与注入 |
+| `--theme <name>` | 主题名（默认 `auto`） | TUI | 设置初始主题：`auto` \| `mist-dark` \| `mist-light` \| `sakura-dark` \| `system` \| `ansi16` |
+| `-h`, `--help` | — | 全局 | 打印帮助信息 |
+| `-V`, `--version` | — | 全局 | 打印二进制版本号并退出 |
+
+## `mizar exec` 自动化输出契约
+
+### JSON 输出 Schema（`--json` / `--output-format json`）
+
+成功完成（`TurnEndReason::Completed`）时，`stdout` 输出单行合法 JSON：
+
+```json title="stdout (--output-format json)"
+{
+  "session_id": "019...",
+  "resumed": false,
+  "reason": "completed",
+  "steps": 4,
+  "duration_ms": 3820,
+  "llm_ms": 2910,
+  "ttft_ms": 340,
+  "tool_ms": 880,
+  "tool_calls": 6,
+  "session_turns": 1,
+  "session_steps": 4,
+  "text": "已完成 Cargo.toml 分析……"
+}
+```
+
+### 退出码规范
+
+| 退出码 | 语义 | 诊断文本特征（输出至 `stderr`） |
+| :--- | :--- | :--- |
+| `0` | 成功完成本轮推理与全部工具调用 | — |
+| `1` | 一般错误、步数超限、输出截断或取消 | 包含 `code=max_steps`、`code=max_tokens`、`code=cancelled` 或密钥脱敏后的错误详情 |
+| `124` | 达到 `--timeout` 设定秒数 | `execution timed out after <secs>s (code=timeout)` |
+| `130` / `143` | 收到系统信号中断（如 `SIGINT` / `SIGTERM`） | `execution interrupted by signal (code=cancelled)` |
+
+<Callout type="note" title="轨迹导出与密钥脱敏">
+  无论是 `stderr` 报错还是 `--trace-out` 写入失败提示，Mizar 均会经过密钥列表自动脱敏。如果命令行指定 `--trace-out` 且环境变量同时存在 `MIZAR_TRACE_OUT`，始终以命令行参数为准。
+</Callout>
+
+## 环境变量完整参考
+
+### 1. 模型路由与凭据
+
+| 变量名 | 说明 |
+| :--- | :--- |
+| `API_KEY` | 最高优先级通用密钥，显式覆盖各特定提供方环境变量 |
+| `OPENAI_API_KEY` | OpenAI / `openai-responses` 默认 API Key |
+| `ANTHROPIC_API_KEY` | Anthropic Messages 默认 API Key |
+| `DEEPSEEK_API_KEY` | DeepSeek Completions 默认 API Key |
+| `OPENROUTER_API_KEY` | OpenRouter 专用环境变量（供 `models.json` 或覆盖逻辑引用） |
+| `PROTOCOL` | 覆盖协议类型（`completions` / `responses` / `messages`） |
+| `BASE_URL` | 覆盖 API 端点 URL |
+| `MODEL` | 覆盖激活模型 ID |
+
+### 2. 路径与运行时诊断
+
+| 变量名 | 默认值 / 说明 |
+| :--- | :--- |
+| `WORKSPACE` | 覆盖工作区根目录（优先级低于 `-C/--workspace`） |
+| `MIZAR_HOME` | 全局配置目录，默认 `~/.mizar`（存放 `settings.json`、`models.json`、`mcp.json`、`sessions.sqlite`） |
+| `MIZAR_AGENTS_HOME` | 全局 Agent 扩展根目录，默认 `~/.agents`（存放全局 `AGENTS.md` 与 `skills`） |
+| `MIZAR_SESSION_DB` | 覆盖 SQLite 数据库路径；设为 `none` 或 `off` 时等价于 `--no-persist` |
+| `MIZAR_BUNDLED_SKILL_DIR` | 指定内置技能目录路径（优先级低于 `settings.json` 的 `skills.bundledDir`） |
+| `MIZAR_TRACE_OUT` | 无头执行退出时默认导出 `TrajectoryExport` JSON 的目标路径 |
+| `CORDIS_LOG` | 控制 Cordis 微内核日志输出级别（如 `debug` / `warn`） |
+
+### 3. 企业代理与自定义 TLS 根证书
+
+`mizar-llm-http` 与 `mizar-mcp` 启动异步 HTTP 客户端时按常见生态约定依次读取外部 PEM CA 证书包，**任设其一即可生效**：
+
+| 变量名 | 说明 |
+| :--- | :--- |
+| `SSL_CERT_FILE` | OpenSSL / 通用标准 CA 证书文件路径 |
+| `CURL_CA_BUNDLE` | curl 兼容 CA bundle 路径 |
+| `REQUESTS_CA_BUNDLE` | Python requests 兼容 CA bundle 路径 |
+| `NODE_EXTRA_CA_CERTS` | Node.js 额外信任根证书路径 |
+
+### 4. 自更新与离线模式
+
+| 变量名 | 说明 |
+| :--- | :--- |
+| `MIZAR_OFFLINE` | 设为 `1`/`true`/`yes`/`on` 时完全禁用启动版本检查及离线外联检查 |
+| `MIZAR_SKIP_VERSION_CHECK` | 设为 `1`/`true`/`yes`/`on` 时仅跳过启动异步更新检测 |
+| `MIZAR_RELEASE_BASE_URL` | 覆写 `mizar update` 下载源基准 URL（默认 `https://github.com/Mieluoxxx/Mizar`） |
+
+### 5. 终端能力、TUI 强调语法与外置编辑器
+
+| 变量名 | 说明 |
+| :--- | :--- |
+| `COLORTERM` | 设为 `truecolor` 或 `24bit` 时启用完整 Oklab 真彩色渲染 |
+| `TERM` / `COLORFGBG` | 用于探测终端功能及 `auto` 主题明暗背景判别 |
+| `SHELL` | 默认回退壳；`bash` 工具优先定位 `/bin/bash` → `/usr/bin/bash` → `/bin/sh`，找不到时回退 `$SHELL` |
+| `VISUAL` / `EDITOR` | 外置编辑器程序命令 |
+| `MIZAR_TUI_EMPHASIS` | 设为 `0`/`false`/`off` 全局禁用 `pi-emphasis` 渲染 |
+| `MIZAR_TUI_ROUND_CAPS` / `PI_EMPHASIS_ROUND_CAPS` | 设为 `0`/`false`/`off` 关闭胶囊状态圆角框线 |
+| `MIZAR_TUI_PILL_ICONS` / `PI_EMPHASIS_PILL_ICONS` | 设为 `0`/`false`/`off` 隐藏胶囊图标前缀 |
+| `MIZAR_TUI_EMPHASIS_GUIDANCE` / `PI_EMPHASIS_GUIDANCE` | 设为 `0`/`false`/`off` 禁止向系统提示词追加视觉状态语法说明 |
+| `MIZAR_TUI_PROGRAM_STATUS` | 控制终端窗口状态进度汇报开关 |

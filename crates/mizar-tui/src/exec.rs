@@ -1,7 +1,7 @@
 //! 非交互一次性任务执行器（`mizar exec` / `mizar -p` / `mizar --prompt-file`）。
 //!
 //! 职责：
-//! - 复用 `MizarRuntime` + `LlmRouter` + `install_retry` 装配 Agent，但不启动 TUI 与版本检查，也不注入 TUI `reply_guidance` 段落；
+//! - 复用 `AgentSpinePlugin` + `LlmRouter` + `LlmRetryPlugin` 装配 Agent，但不启动 TUI 与版本检查，也不注入 TUI `reply_guidance` 段落；
 //! - 支持 `--isolated` 隔离个人全局配置 / MCP / Skills / 指令与全局会话库；
 //! - 将诊断与警告严格路由至 `stderr` 并完成敏感凭据脱敏，退出码仅在正常收敛（`Stop` 且未截断/未超步/未取消）时为 `0`；
 //! - `stdout` 仅在退出码为 `0` 时输出最终回答全文，失败时 `stdout` 保持完全为空。
@@ -12,27 +12,27 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mizar_client::{
-    FileMentionsConfig, TracingBridgeGuard, env_log_level_override, install_file_mentions,
-    install_tracing_handler, ui_log_level_tag,
-};
-use mizar_core::agent_loop::{AgentError, RunOptions, StepOutcome, TurnEndReason};
-use mizar_core::spine::{
-    AgentSpineConfig, AgentToolsMode, CliLlmOverride, EnvLlmOverride, MizarRuntime,
+use cordis::{Context, LogLevel, Service};
+use mizar_agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
+use mizar_agent_spine::{
+    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
     load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
 };
-use mizar_core::trajectory::{
-    DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryConfig,
-    TrajectoryExport, prepare_trace_jsonl_file, write_trace_export_atomic,
-};
-use mizar_llm::retry::RetryConfig;
+use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
+use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
-use mizar_session::SessionListQuery;
-use mizar_tools::coding::CodingToolsPreset;
-use mizar_types::client::{ClientEvent, HostExtensionFlags, NoticeLevel, UiLogLevel};
+use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
+use mizar_llm_router::LlmRouter;
+use mizar_mcp::McpManager;
+use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
+use mizar_tools_coding::CodingToolsPreset;
+use mizar_trajectory::{
+    DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryExport,
+    TrajectoryRuntime, write_trace_export_atomic,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::runner::ResumeTarget;
+use crate::runner::{ResumeTarget, wait_for_services};
 
 /// 无头输出格式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,29 +74,11 @@ pub struct ExecConfig {
     pub resume_session: Option<ResumeTarget>,
     pub output_format: ExecOutputFormat,
     pub trace_out: Option<PathBuf>,
-    pub trace_jsonl: Option<PathBuf>,
 }
 
 /// 解析无头轨迹导出路径：CLI `--trace-out` 优先级高于环境变量 `MIZAR_TRACE_OUT`。
 pub fn resolve_trace_out_path(cli: Option<PathBuf>, env: Option<String>) -> Option<PathBuf> {
     cli.or_else(|| env.filter(|s| !s.trim().is_empty()).map(PathBuf::from))
-}
-
-/// 解析轨迹 JSONL 输出路径：CLI `--trace-jsonl` 优先级高于环境变量 `MIZAR_TRACE_JSONL`。
-pub fn resolve_trace_jsonl_path(cli: Option<PathBuf>, env: Option<String>) -> Option<PathBuf> {
-    cli.or_else(|| env.filter(|s| !s.trim().is_empty()).map(PathBuf::from))
-}
-
-/// 将显式请求的轨迹 JSONL 文件路径装配到 `AgentSpineConfig`，并确保 `trajectory` 不会被配置屏蔽。
-pub fn configure_spine_trace_jsonl(spine_cfg: &mut AgentSpineConfig, trace_jsonl: Option<&Path>) {
-    let Some(path) = trace_jsonl else {
-        return;
-    };
-    spine_cfg
-        .trajectory
-        .get_or_insert_with(TrajectoryConfig::default)
-        .export_file = Some(path.to_path_buf());
-    spine_cfg.disabled_plugins.retain(|id| id != "trajectory");
 }
 
 /// 解析来自命令行参数、文件或标准输入的任务文本；拒绝空白与冲突来源。
@@ -470,13 +452,15 @@ pub fn format_llm_error_diagnostic(err: &LlmError, secrets: &[String]) -> String
     }
 }
 
-fn configure_exec_logger(secrets: Arc<Mutex<Vec<String>>>) -> TracingBridgeGuard {
-    let threshold = env_log_level_override().unwrap_or(UiLogLevel::Warn);
-    install_tracing_handler(threshold, move |rec| {
-        let current_secrets = secrets.lock().unwrap().clone();
-        let clean = single_line(&sanitize_diagnostic_text(&rec.message, &current_secrets));
-        eprintln!("[{} {}] {}", ui_log_level_tag(rec.level), rec.name, clean);
-    })
+fn configure_exec_logger(app: &Context, secrets: Arc<Mutex<Vec<String>>>) {
+    app.logger().set_level(LogLevel::Warn);
+    app.logger().set_handler(move |rec| {
+        if matches!(rec.level, LogLevel::Warn | LogLevel::Error) {
+            let current_secrets = secrets.lock().unwrap().clone();
+            let clean = single_line(&sanitize_diagnostic_text(&rec.message, &current_secrets));
+            eprintln!("[{} {}] {}", rec.tag, rec.name, clean);
+        }
+    });
 }
 
 fn report_error_with_secrets(msg: &str, secrets: &Arc<Mutex<Vec<String>>>) {
@@ -485,26 +469,11 @@ fn report_error_with_secrets(msg: &str, secrets: &Arc<Mutex<Vec<String>>>) {
     eprintln!("error: {clean}");
 }
 
-/// 一次性无头 `exec` 模式下关闭 `subagent`（并行加速与上下文减负统一交由 `codemode` 承担）。
-pub(crate) fn disable_exec_subagent(spine_cfg: &mut AgentSpineConfig) {
-    spine_cfg.subagent = None;
-}
-
 /// 运行无头一次性任务，返回进程应使用的退出码。
 pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let exec_started = std::time::Instant::now();
     let env_override = EnvLlmOverride::from_env();
     let log_secrets = Arc::new(Mutex::new(env_override.collect_secrets()));
-    if let Some(path) = cfg.trace_jsonl.as_deref()
-        && let Err(err) = prepare_trace_jsonl_file(path)
-    {
-        let guard = log_secrets.lock().unwrap();
-        let clean = single_line(&sanitize_diagnostic_text(&err.to_string(), &guard));
-        eprintln!(
-            "[W trace] failed to prepare trajectory JSONL at \"{}\": {clean}",
-            path.display()
-        );
-    }
     let make_meta = |exit_code: i32,
                      termination_reason: &str,
                      error: Option<String>,
@@ -689,9 +658,13 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
-    configure_spine_trace_jsonl(&mut spine_cfg, cfg.trace_jsonl.as_deref());
-    // 一次性无头 exec 由 codemode 承担确定性并行与上下文减负，关闭异步交互分身插件
-    disable_exec_subagent(&mut spine_cfg);
+    if !spine_cfg
+        .disabled_plugins
+        .iter()
+        .any(|id| id == "session-title")
+    {
+        spine_cfg.disabled_plugins.push("session-title".to_string());
+    }
     if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.session_db.is_none()) {
         spine_cfg.session_db_path = None;
     }
@@ -732,6 +705,8 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let configured_max_steps = spine_cfg.agent.max_steps;
     let configured_max_tokens = spine_cfg.agent.max_tokens;
     let has_session_db = spine_cfg.session_db_path.is_some();
+    let active_provider = resolved_llm.active_provider.clone();
+    let active_model = resolved_llm.active_model.clone();
 
     if cfg.resume_session.is_some() && !has_session_db {
         let msg = "--continue/--resume requires session persistence database configuration (code=invalid_request)";
@@ -744,20 +719,45 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 1,
                 "invalid_request",
                 Some(msg.to_string()),
-                Some(resolved_llm.active_provider.clone()),
-                resolved_llm.active_model.clone(),
+                Some(active_provider.clone()),
+                active_model.clone(),
             ),
             &log_secrets,
         );
         return 1;
     }
 
-    let active_provider = resolved_llm.active_provider.clone();
-    let active_model = resolved_llm.active_model.clone();
-    let ext_flags = HostExtensionFlags::from_disabled_plugins(&spine_cfg.disabled_plugins);
-    let restrict_to_workspace = loaded_cfg.settings.restrict_to_workspace.unwrap_or(false);
+    let app = Context::new();
+    configure_exec_logger(&app, Arc::clone(&log_secrets));
 
-    let _exec_tracing_guard = configure_exec_logger(Arc::clone(&log_secrets));
+    let ext_flags = HostExtensionFlags::default();
+    let restrict_to_workspace = match &spine_cfg.tools_mode {
+        AgentToolsMode::Coding { coding, .. } => coding.restrict_to_workspace,
+        _ => false,
+    };
+
+    app.plugin(AgentSpinePlugin, spine_cfg);
+    app.plugin(LlmRetryPlugin, RetryConfig::default());
+    app.plugin(LlmRouter::plugin(), resolved_llm.router);
+    if ext_flags.file_mentions {
+        let mention_secrets = Arc::clone(&log_secrets);
+        let mention_ws = cfg.workspace.clone();
+        app.plugin(
+            FileMentionsPlugin,
+            FileMentionsConfig::with_callback(mention_ws, restrict_to_workspace, move |ev| {
+                if let ClientEvent::Notice { level, text } = ev {
+                    let tag = match level {
+                        NoticeLevel::Info => "I",
+                        NoticeLevel::Warn => "W",
+                        NoticeLevel::Error => "E",
+                    };
+                    let guard = mention_secrets.lock().unwrap();
+                    let clean = single_line(&sanitize_diagnostic_text(&text, &guard));
+                    eprintln!("[{tag} mentions] {clean}");
+                }
+            }),
+        );
+    }
 
     let cancel = CancellationToken::new();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -778,225 +778,217 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         biased;
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
-            let runtime = MizarRuntime::build(spine_cfg)
-                .await
-                .map_err(|e| e.to_string())?;
-            runtime.install_retry(RetryConfig::default());
-            runtime.install_router(resolved_llm.router);
-            if ext_flags.file_mentions {
-                let guard = install_file_mentions(
-                    &runtime,
-                    FileMentionsConfig::with_callback(
-                        cfg.workspace.clone(),
-                        restrict_to_workspace,
-                        move |ev| {
-                            if let ClientEvent::Notice { level, text } = ev {
-                                match level {
-                                    NoticeLevel::Error => {
-                                        tracing::error!(target: "mizar::mentions", "{text}")
-                                    }
-                                    NoticeLevel::Warn => {
-                                        tracing::warn!(target: "mizar::mentions", "{text}")
-                                    }
-                                    NoticeLevel::Info => {
-                                        tracing::info!(target: "mizar::mentions", "{text}")
-                                    }
-                                }
-                            }
-                        },
-                    ),
-                );
-                runtime.push_guard(guard);
+            wait_for_services(&app).await.map_err(|e| e.to_string())?;
+            if has_session_db && app.session_persistence().is_none() {
+                for _ in 0..25 {
+                    if app.session_persistence().is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
             }
-            if let Some(mcp) = runtime.mcp().await {
+            if let Some(mcp) = app.get::<McpManager>("mcp") {
                 mcp.wait_ready().await;
             }
-            Ok::<Arc<MizarRuntime>, String>(runtime)
+            Ok::<(), String>(())
         } => res,
     };
 
-    let runtime = match init_res {
-        Ok(rt) => rt,
-        Err(err_msg) => {
-            let outcome = resolve_cancel_or_error_exit(
-                &timed_out,
-                cfg.timeout_secs,
-                &signal_code,
-                &err_msg,
-                &log_secrets,
-            );
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
-                None,
-                None,
-                make_meta(
-                    outcome.exit_code,
-                    outcome.termination_reason,
-                    outcome.error,
-                    Some(active_provider.clone()),
-                    active_model.clone(),
-                ),
-                &log_secrets,
-            );
-            signal_handle.abort();
-            if let Some(handle) = timeout_handle {
-                handle.abort();
-            }
-            return outcome.exit_code;
-        }
-    };
-
-    let exit_code = if cfg.resume_session.is_some() && runtime.persistence.is_none() {
-        let msg =
-            "session persistence backend is unavailable for --continue/--resume (code=storage)";
-        eprintln!("error: {msg}");
+    if let Err(err_msg) = init_res {
+        let outcome = resolve_cancel_or_error_exit(
+            &timed_out,
+            cfg.timeout_secs,
+            &signal_code,
+            &err_msg,
+            &log_secrets,
+        );
         export_exec_trace_best_effort(
             cfg.trace_out.as_deref(),
-            Some(&runtime),
+            None,
             None,
             make_meta(
-                1,
-                "storage",
-                Some(msg.to_string()),
+                outcome.exit_code,
+                outcome.termination_reason,
+                outcome.error,
                 Some(active_provider.clone()),
                 active_model.clone(),
             ),
             &log_secrets,
         );
-        1
-    } else {
-        let sessions = &runtime.sessions;
-        let resolved_session = match &cfg.resume_session {
-            Some(ResumeTarget::Picker) => Err(
-                "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
-                    .to_string(),
-            ),
-            Some(ResumeTarget::Id(target_id)) => match sessions.get(target_id) {
-                Some(found) => Ok((found, true)),
-                None => Err(format!(
-                    "session \"{target_id}\" not found (code=invalid_request)"
-                )),
-            },
-            Some(ResumeTarget::LatestInWorkspace) => {
-                let ws_str = cfg.workspace.display().to_string();
-                let latest_id = sessions
-                    .list_headers(&SessionListQuery {
-                        cwd: Some(ws_str),
-                        limit: Some(1),
-                        exclude_subagents: true,
-                    })
-                    .ok()
-                    .and_then(|mut list| list.drain(..).next())
-                    .map(|h| h.id);
-                if let Some(id) = latest_id
-                    && let Some(found) = sessions.get(&id)
-                {
-                    Ok((found, true))
-                } else {
-                    Ok((sessions.create(None), false))
-                }
-            }
-            None => Ok((sessions.create(None), false)),
-        };
+        cleanup_exec(&app, signal_handle, timeout_handle).await;
+        return outcome.exit_code;
+    }
 
-        match resolved_session {
-            Err(msg) => {
+    let exit_code = match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
+        (Ok(sessions), Ok(agent_loop)) => {
+            if cfg.resume_session.is_some() && app.session_persistence().is_none() {
+                let msg = "session persistence backend is unavailable for --continue/--resume (code=storage)";
                 eprintln!("error: {msg}");
                 export_exec_trace_best_effort(
                     cfg.trace_out.as_deref(),
-                    Some(&runtime),
+                    Some(&app),
                     None,
                     make_meta(
                         1,
-                        "invalid_request",
-                        Some(msg),
+                        "storage",
+                        Some(msg.to_string()),
                         Some(active_provider.clone()),
                         active_model.clone(),
                     ),
                     &log_secrets,
                 );
                 1
-            }
-            Ok((session, resumed)) => {
-                let turn_started = std::time::Instant::now();
-                let opts = RunOptions {
-                    provider: Some(active_provider.clone()),
-                    model: active_model.clone(),
-                    max_steps: configured_max_steps,
-                    max_tokens: configured_max_tokens,
-                    reasoning_effort: effective_effort,
-                    ..Default::default()
-                };
-                let run_res = runtime
-                    .agent_loop
-                    .run_with_report(Arc::clone(&session), cfg.prompt, cancel.clone(), opts)
-                    .await;
-                let duration_ms = turn_started.elapsed().as_millis() as u64;
-
-                if has_session_db {
-                    let _ = sessions.flush_async(Some(session.id.clone())).await;
-                }
-
-                let json_meta = if cfg.output_format == ExecOutputFormat::Json {
-                    Some(build_exec_json_meta(
-                        &runtime,
-                        &session.id,
-                        resumed,
-                        duration_ms,
-                    ))
-                } else {
-                    None
-                };
-
-                let outcome = if timed_out.load(Ordering::SeqCst) {
-                    let secs = cfg.timeout_secs.unwrap_or(0);
-                    let msg = format!("execution timed out after {secs}s (code=timeout)");
-                    eprintln!("error: {msg}");
-                    TurnExitOutcome {
-                        exit_code: 124,
-                        termination_reason: "timeout",
-                        error: Some(msg),
-                    }
-                } else {
-                    let sig = signal_code.load(Ordering::SeqCst);
-                    if sig != 0 {
-                        let msg = "execution interrupted by signal (code=cancelled)".to_string();
-                        eprintln!("error: {msg}");
-                        TurnExitOutcome {
-                            exit_code: sig,
-                            termination_reason: "cancelled",
-                            error: Some(msg),
-                        }
-                    } else {
-                        classify_turn_result(
-                            run_res,
-                            configured_max_steps,
-                            cfg.output_format,
-                            json_meta.as_ref(),
-                            &log_secrets,
-                        )
-                    }
-                };
-
-                export_exec_trace_best_effort(
-                    cfg.trace_out.as_deref(),
-                    Some(&runtime),
-                    Some(&session.id),
-                    make_meta(
-                        outcome.exit_code,
-                        outcome.termination_reason,
-                        outcome.error,
-                        Some(active_provider.clone()),
-                        active_model.clone(),
+            } else {
+                let resolved_session = match &cfg.resume_session {
+                    Some(ResumeTarget::Picker) => Err(
+                        "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
+                            .to_string(),
                     ),
-                    &log_secrets,
-                );
-                outcome.exit_code
+                    Some(ResumeTarget::Id(target_id)) => match sessions.get(target_id) {
+                        Some(found) => Ok((found, true)),
+                        None => Err(format!(
+                            "session \"{target_id}\" not found (code=invalid_request)"
+                        )),
+                    },
+                    Some(ResumeTarget::LatestInWorkspace) => {
+                        let ws_str = cfg.workspace.display().to_string();
+                        let latest_id = sessions
+                            .list_headers(&SessionListQuery {
+                                cwd: Some(ws_str),
+                                limit: Some(1),
+                            })
+                            .ok()
+                            .and_then(|mut list| list.drain(..).next())
+                            .map(|h| h.id);
+                        if let Some(id) = latest_id
+                            && let Some(found) = sessions.get(&id)
+                        {
+                            Ok((found, true))
+                        } else {
+                            Ok((sessions.create(None), false))
+                        }
+                    }
+                    None => Ok((sessions.create(None), false)),
+                };
+
+                match resolved_session {
+                    Err(msg) => {
+                        eprintln!("error: {msg}");
+                        export_exec_trace_best_effort(
+                            cfg.trace_out.as_deref(),
+                            Some(&app),
+                            None,
+                            make_meta(
+                                1,
+                                "invalid_request",
+                                Some(msg),
+                                Some(active_provider.clone()),
+                                active_model.clone(),
+                            ),
+                            &log_secrets,
+                        );
+                        1
+                    }
+                    Ok((session, resumed)) => {
+                        let turn_started = std::time::Instant::now();
+                        let opts = RunOptions {
+                            provider: Some(active_provider.clone()),
+                            model: active_model.clone(),
+                            max_steps: configured_max_steps,
+                            max_tokens: configured_max_tokens,
+                            reasoning_effort: effective_effort,
+                            ..Default::default()
+                        };
+                        let run_res = agent_loop
+                            .run_with_report(Arc::clone(&session), cfg.prompt, cancel.clone(), opts)
+                            .await;
+                        let duration_ms = turn_started.elapsed().as_millis() as u64;
+
+                        if has_session_db {
+                            let _ = sessions.flush_async(Some(session.id.clone())).await;
+                        }
+
+                        let json_meta = if cfg.output_format == ExecOutputFormat::Json {
+                            Some(build_exec_json_meta(
+                                &app,
+                                &session.id,
+                                resumed,
+                                duration_ms,
+                            ))
+                        } else {
+                            None
+                        };
+
+                        let outcome = if timed_out.load(Ordering::SeqCst) {
+                            let secs = cfg.timeout_secs.unwrap_or(0);
+                            let msg = format!("execution timed out after {secs}s (code=timeout)");
+                            eprintln!("error: {msg}");
+                            TurnExitOutcome {
+                                exit_code: 124,
+                                termination_reason: "timeout",
+                                error: Some(msg),
+                            }
+                        } else {
+                            let sig = signal_code.load(Ordering::SeqCst);
+                            if sig != 0 {
+                                let msg =
+                                    "execution interrupted by signal (code=cancelled)".to_string();
+                                eprintln!("error: {msg}");
+                                TurnExitOutcome {
+                                    exit_code: sig,
+                                    termination_reason: "cancelled",
+                                    error: Some(msg),
+                                }
+                            } else {
+                                classify_turn_result(
+                                    run_res,
+                                    configured_max_steps,
+                                    cfg.output_format,
+                                    json_meta.as_ref(),
+                                    &log_secrets,
+                                )
+                            }
+                        };
+
+                        export_exec_trace_best_effort(
+                            cfg.trace_out.as_deref(),
+                            Some(&app),
+                            Some(&session.id),
+                            make_meta(
+                                outcome.exit_code,
+                                outcome.termination_reason,
+                                outcome.error,
+                                Some(active_provider.clone()),
+                                active_model.clone(),
+                            ),
+                            &log_secrets,
+                        );
+                        outcome.exit_code
+                    }
+                }
             }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            let err_msg = e.to_string();
+            report_error_with_secrets(&err_msg, &log_secrets);
+            export_exec_trace_best_effort(
+                cfg.trace_out.as_deref(),
+                Some(&app),
+                None,
+                make_meta(
+                    1,
+                    "error",
+                    Some(err_msg),
+                    Some(active_provider.clone()),
+                    active_model.clone(),
+                ),
+                &log_secrets,
+            );
+            1
         }
     };
 
-    cleanup_exec(&runtime, signal_handle, timeout_handle).await;
+    cleanup_exec(&app, signal_handle, timeout_handle).await;
     exit_code
 }
 
@@ -1013,14 +1005,13 @@ struct ExecJsonMeta {
 }
 
 fn build_exec_json_meta(
-    runtime: &MizarRuntime,
+    app: &Context,
     session_id: &str,
     resumed: bool,
     duration_ms: u64,
 ) -> ExecJsonMeta {
-    let report = runtime
-        .trajectory
-        .as_ref()
+    let report = app
+        .get::<TrajectoryRuntime>("trajectory")
         .and_then(|traj| traj.inspect(session_id, TimelineMode::Sequence));
     if let Some(rep) = report {
         let last_turn = rep.snapshot.turns.last();
@@ -1035,7 +1026,7 @@ fn build_exec_json_meta(
                     .records
                     .iter()
                     .filter(|r| {
-                        r.kind == mizar_core::trajectory::RecordKind::Tool && r.turn == Some(tnum)
+                        r.kind == mizar_trajectory::RecordKind::Tool && r.turn == Some(tnum)
                     })
                     .count()
             })
@@ -1074,7 +1065,7 @@ struct TurnExitOutcome {
 
 fn export_exec_trace_best_effort(
     trace_out: Option<&Path>,
-    runtime: Option<&MizarRuntime>,
+    app: Option<&Context>,
     session_id: Option<&str>,
     mut meta: TraceExportMeta,
     secrets: &Arc<Mutex<Vec<String>>>,
@@ -1088,9 +1079,9 @@ fn export_exec_trace_best_effort(
         meta.error = Some(single_line(&sanitize_diagnostic_text(err_msg, &guard)));
     }
 
-    let export = match (runtime, session_id) {
-        (Some(rt), Some(sid)) => {
-            if let Some(traj) = rt.trajectory.as_ref() {
+    let export = match (app, session_id) {
+        (Some(ctx), Some(sid)) => {
+            if let Some(traj) = ctx.get::<TrajectoryRuntime>("trajectory") {
                 traj.build_trace_export(
                     sid,
                     TimelineMode::Sequence,
@@ -1150,7 +1141,7 @@ fn resolve_cancel_or_error_exit(
 }
 
 fn classify_turn_result(
-    run_res: Result<mizar_core::agent_loop::TurnRunReport, AgentError>,
+    run_res: Result<mizar_agent_loop::TurnRunReport, AgentError>,
     configured_max_steps: Option<usize>,
     output_format: ExecOutputFormat,
     json_meta: Option<&ExecJsonMeta>,
@@ -1285,7 +1276,7 @@ fn classify_turn_result(
 }
 
 async fn cleanup_exec(
-    runtime: &MizarRuntime,
+    app: &Context,
     signal_handle: tokio::task::JoinHandle<()>,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
@@ -1293,7 +1284,7 @@ async fn cleanup_exec(
     if let Some(handle) = timeout_handle {
         handle.abort();
     }
-    let _ = tokio::time::timeout(Duration::from_secs(3), runtime.shutdown()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), app.fiber().dispose()).await;
 }
 
 fn spawn_signal_watcher(
@@ -1422,15 +1413,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_mode_disables_subagent_and_leaves_session_title_off() {
-        let mut spine = AgentSpineConfig::coding(PathBuf::from("/tmp"));
-        assert!(spine.session_title.is_none());
-        assert!(spine.subagent.is_some());
-        disable_exec_subagent(&mut spine);
-        assert!(spine.subagent.is_none());
-    }
-
-    #[test]
     fn exec_trace_out_prefers_cli_over_env_and_sanitizes_errors() {
         assert_eq!(
             resolve_trace_out_path(
@@ -1477,42 +1459,5 @@ mod tests {
         assert_eq!(parsed.exit_code, 1);
         assert_eq!(parsed.termination_reason, "error");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_trace_jsonl_and_configure_spine_overrides_disabled_trajectory() {
-        assert_eq!(
-            resolve_trace_jsonl_path(
-                Some(PathBuf::from("cli/trace.jsonl")),
-                Some("env/trace.jsonl".to_string())
-            ),
-            Some(PathBuf::from("cli/trace.jsonl"))
-        );
-        assert_eq!(
-            resolve_trace_jsonl_path(None, Some("env/trace.jsonl".to_string())),
-            Some(PathBuf::from("env/trace.jsonl"))
-        );
-        assert_eq!(
-            resolve_trace_jsonl_path(None, Some("   ".to_string())),
-            None
-        );
-        assert_eq!(resolve_trace_jsonl_path(None, None), None);
-
-        let mut spine = AgentSpineConfig::coding(PathBuf::from("/tmp"))
-            .with_disabled_plugins(["trajectory", "mcp"]);
-        spine.trajectory = None;
-
-        let target = PathBuf::from("logs/session-trace.jsonl");
-        configure_spine_trace_jsonl(&mut spine, Some(&target));
-
-        assert_eq!(
-            spine
-                .trajectory
-                .as_ref()
-                .and_then(|c| c.export_file.as_ref()),
-            Some(&target)
-        );
-        assert!(!spine.disabled_plugins.iter().any(|id| id == "trajectory"));
-        assert!(spine.disabled_plugins.iter().any(|id| id == "mcp"));
     }
 }
