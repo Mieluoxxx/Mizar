@@ -9,13 +9,6 @@ Mizar 是 Rust 编写的终端 AI 编程 Agent（微内核 `cordis` + 多 crate 
 - **Workspace 依赖**：新增依赖统一进根 `Cargo.toml` 的 `[workspace.dependencies]`，子 crate 写 `{ workspace = true }` 并带 `[lints] workspace = true`。
 - **文档与参考仓**：改 crate 结构 / `inject` / 服务名时同步更新 `docs/plugins.md`；`references/` 为 TS 原版参考，**禁止 `git add`**。
 
-## 代码约定
-
-- 不用 `mod.rs`（用 `src/foo.rs` + `src/foo/bar.rs`）。
-- 公共错误用 `thiserror` + `cordis::BoxError`，不用 `anyhow`；直接 `.lock().unwrap()` 可接受，勿引 `parking_lot` 或封装中毒处理。
-- **插件静默坑**：漏写 `inject()` 不 panic（插件进 `FAILED`、工具静默消失）；副作用必须包 `ctx.effect("id", ...)` 保证倒序清理。
-- **文案语言**：代码注释与给人的运行时错误用中文；给模型看的工具/参数 `description` **必须用英文**。
-
 ## 验证策略
 
 **禁止编写任何测试代码**：不建 `tests/`，不写 `#[cfg(test)]`，不加 `[dev-dependencies]`。
