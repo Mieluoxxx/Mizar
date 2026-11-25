@@ -437,7 +437,7 @@ mod disabled_plugins_tests {
             global.join("settings.json"),
             r#"{
                 "persona": "preserve-me",
-                "disabledPlugins": ["skills", " mcp ", "", "skills", "codemode"]
+                "disabledPlugins": ["skills", " mcp ", "", "skills", "tool-search"]
             }"#,
         )
         .unwrap();
@@ -454,11 +454,11 @@ mod disabled_plugins_tests {
         assert_eq!(
             loaded.settings.disabled_plugins,
             vec![
-                "codemode".to_string(),
                 "compaction".to_string(),
                 "mcp".to_string(),
                 "recall".to_string(),
                 "skills".to_string(),
+                "tool-search".to_string(),
             ]
         );
 
@@ -468,11 +468,11 @@ mod disabled_plugins_tests {
         assert_eq!(
             spine.disabled_plugins,
             vec![
-                "codemode".to_string(),
                 "compaction".to_string(),
                 "mcp".to_string(),
                 "recall".to_string(),
                 "skills".to_string(),
+                "tool-search".to_string(),
                 "trajectory".to_string(),
             ]
         );

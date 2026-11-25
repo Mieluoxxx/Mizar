@@ -48,7 +48,7 @@ pub use plugins::{
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin, Service};
 use mizar_agent_loop::{AgentLoop, AgentLoopConfig};
 #[cfg(feature = "coding")]
-use mizar_codemode::CodemodeConfig;
+use mizar_codemode::{CodemodeConfig, CodemodePlugin};
 use mizar_llm::LlmRuntime;
 #[cfg(feature = "coding")]
 use mizar_mcp::McpPluginConfig;
@@ -118,7 +118,7 @@ pub struct AgentSpineConfig {
     pub session_title: Option<SessionTitleConfig>,
     /// 可选：会话 SQLite 持久化数据库路径；为 `None` 时保持纯内存模式（适合测试）。
     pub session_db_path: Option<PathBuf>,
-    /// 启动阶段屏蔽的内置可选模块 ID 列表（如 `mcp`、`codemode` 等）。
+    /// 启动阶段屏蔽的内置可选模块 ID 列表（如 `mcp`、`skills` 等）。
     pub disabled_plugins: Vec<String>,
 }
 
@@ -346,15 +346,7 @@ impl Plugin for AgentSpinePlugin {
                         },
                         ModuleSpec::ToolSearch(tool_search),
                     ));
-                    specs.push((
-                        SpineModuleMeta {
-                            id: "codemode".to_string(),
-                            label: "脚本执行沙箱".to_string(),
-                            description: "通过 QuickJS 沙箱批量编排与调用工具 (codemode)"
-                                .to_string(),
-                        },
-                        ModuleSpec::Codemode(codemode),
-                    ));
+                    ctx.try_plugin(CodemodePlugin, codemode)?;
                     specs.push((
                         SpineModuleMeta {
                             id: "mcp".to_string(),

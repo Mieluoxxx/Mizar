@@ -103,6 +103,7 @@ async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
         "systemPrompt",
         "agentLoop",
         "spinePlugins",
+        "codemode",
         "nonexistent-module",
     ]);
     cfg.agent.provider = Some("mock".into());
@@ -135,6 +136,7 @@ async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
         "systemPrompt",
         "agentLoop",
         "spinePlugins",
+        "codemode",
     ] {
         assert!(
             ctrl.is_protected(protected_id) && ctrl.is_enabled(protected_id),
@@ -151,6 +153,18 @@ async fn protected_core_modules_cannot_be_disabled_at_startup_or_runtime() {
         );
         assert!(!ctrl.set_enabled(protected_id, true).await.unwrap());
     }
+    assert!(
+        app.tools()
+            .unwrap()
+            .list_all()
+            .iter()
+            .any(|t| t.name == "codemode"),
+        "protected core tool codemode must remain registered"
+    );
+    assert!(
+        !ctrl.optional_modules().iter().any(|m| m.id == "codemode"),
+        "codemode must not be exposed as an optional toggleable module"
+    );
     assert!(errs.iter().any(|e| e.contains("nonexistent-module")));
     assert!(matches!(
         ctrl.set_enabled("nonexistent-module", false).await,
@@ -187,7 +201,6 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         "compaction",
         "tools-coding",
         "tool-search",
-        "codemode",
         "mcp",
         "skills",
         "instructions",
@@ -245,8 +258,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
     let prompt = app.system_prompt().unwrap();
     let sessions = app.sessions().unwrap();
 
-    // 1. 启动阶段全部可选模块均已跳过，工具与可选服务均未挂载
-    assert_eq!(ctrl.disabled_ids().len(), 11);
+    // 1. 启动阶段全部可选模块均已跳过，固定核心工具 codemode 常驻且可选服务未挂载
+    assert_eq!(ctrl.disabled_ids().len(), 10);
     for svc in [
         "compaction",
         "sessionTitle",
@@ -269,7 +282,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
         startup_tool_names,
-        HashSet::from(["probe_echo".to_string()])
+        HashSet::from(["codemode".to_string(), "probe_echo".to_string()])
     );
     assert!(!prompt.build().contains("Available tools:"));
     assert!(!prompt.build().contains("当前工作目录："));
@@ -288,19 +301,12 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
         after_disable_coding,
-        HashSet::from(["probe_echo".to_string()])
+        HashSet::from(["codemode".to_string(), "probe_echo".to_string()])
     );
     assert!(!prompt.build().contains("Available tools:"));
 
-    // 3. 热挂载 tool-search / codemode / mcp / skills / instructions / recall
-    for id in [
-        "tool-search",
-        "codemode",
-        "mcp",
-        "skills",
-        "instructions",
-        "recall",
-    ] {
+    // 3. 热挂载 tool-search / mcp / skills / instructions / recall
+    for id in ["tool-search", "mcp", "skills", "instructions", "recall"] {
         assert!(ctrl.set_enabled(id, true).await.unwrap(), "enable {id}");
     }
     assert!(app.get::<McpManager>("mcp").is_some());
@@ -339,15 +345,8 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         SessionEvent::ContextNotice { text, .. } if text.contains("demo-skill")
     )));
 
-    // 4. 热卸载 tool-search / codemode / mcp / skills / instructions / recall
-    for id in [
-        "tool-search",
-        "codemode",
-        "mcp",
-        "skills",
-        "instructions",
-        "recall",
-    ] {
+    // 4. 热卸载 tool-search / mcp / skills / instructions / recall
+    for id in ["tool-search", "mcp", "skills", "instructions", "recall"] {
         assert!(ctrl.set_enabled(id, false).await.unwrap(), "disable {id}");
     }
     assert!(app.get::<McpManager>("mcp").is_none());
@@ -361,7 +360,7 @@ async fn optional_modules_startup_disable_hot_mount_and_hot_unload_cleanly() {
         tools.list_all().into_iter().map(|t| t.name).collect();
     assert_eq!(
         after_unload_names,
-        HashSet::from(["probe_echo".to_string()])
+        HashSet::from(["codemode".to_string(), "probe_echo".to_string()])
     );
 
     // 确认 skills 监听器已被卸载：新建会话不再收到对应 ContextNotice
