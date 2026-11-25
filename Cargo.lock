@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "cordis"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "futures",
  "thiserror 2.0.21",
@@ -1407,7 +1407,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-agent-loop"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "cordis",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-agent-spine"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "dirs",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-client"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-client-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "dirs",
  "futures",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-codemode"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-tool-search",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-compaction"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-instructions"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "dirs",
@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-completions"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-http"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "futures",
  "mizar-llm",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-messages"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-mock"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-responses"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-retry"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-router"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "futures",
@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-llm-types"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-mcp"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "dirs",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-recall"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-agent-loop",
@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-session"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-llm",
@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-session-sqlite"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-llm-types",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-session-title"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "cordis",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-skills"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "dirs",
@@ -1738,14 +1738,14 @@ dependencies = [
 
 [[package]]
 name = "mizar-system-prompt"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
 ]
 
 [[package]]
 name = "mizar-tool-fs"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-tools",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tool-search"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-tools",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tool-time"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "cordis",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tools"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-llm",
@@ -1789,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tools-coding"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "dirs",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-trajectory"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cordis",
  "mizar-agent-loop",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-trajectory-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "mizar-llm-types",
  "serde",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "mizar-tui-ui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "crossterm",
  "futures",
