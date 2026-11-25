@@ -86,7 +86,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -105,10 +104,8 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -307,6 +304,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordis"
+version = "0.2.3"
+dependencies = [
+ "futures",
+ "loom",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -467,12 +474,6 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
-
-[[package]]
-name = "data-encoding"
-version = "2.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "deltae"
@@ -1507,35 +1508,106 @@ dependencies = [
 ]
 
 [[package]]
-name = "mizar-client"
-version = "0.2.2"
+name = "mizar-agent-loop"
+version = "0.2.3"
 dependencies = [
- "base64 0.22.1",
  "chrono",
+ "cordis",
  "futures",
- "image",
- "libc",
- "mizar-core",
  "mizar-llm",
- "mizar-mcp",
  "mizar-session",
+ "mizar-system-prompt",
  "mizar-tools",
- "mizar-types",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "tracing",
- "uuid",
+]
+
+[[package]]
+name = "mizar-agent-spine"
+version = "0.2.3"
+dependencies = [
+ "axum",
+ "cordis",
+ "dirs",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-codemode",
+ "mizar-compaction",
+ "mizar-instructions",
+ "mizar-llm",
+ "mizar-llm-mock",
+ "mizar-llm-retry",
+ "mizar-llm-router",
+ "mizar-mcp",
+ "mizar-recall",
+ "mizar-session",
+ "mizar-session-sqlite",
+ "mizar-session-title",
+ "mizar-skills",
+ "mizar-system-prompt",
+ "mizar-tool-fs",
+ "mizar-tool-search",
+ "mizar-tool-time",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "mizar-trajectory",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-client"
+version = "0.2.3"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "cordis",
+ "futures",
+ "image",
+ "mizar-agent-loop",
+ "mizar-agent-spine",
+ "mizar-client-core",
+ "mizar-instructions",
+ "mizar-llm",
+ "mizar-mcp",
+ "mizar-session",
+ "mizar-session-title",
+ "mizar-skills",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "mizar-trajectory",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-client-core"
+version = "0.2.3"
+dependencies = [
+ "dirs",
+ "futures",
+ "ignore",
+ "mizar-llm-types",
+ "serde",
+ "serde_json",
+ "unicode-width",
 ]
 
 [[package]]
 name = "mizar-codemode"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
+ "cordis",
+ "mizar-tool-search",
  "mizar-tools",
- "mizar-types",
  "rquickjs",
  "serde",
  "serde_json",
@@ -1544,148 +1616,404 @@ dependencies = [
 ]
 
 [[package]]
-name = "mizar-core"
-version = "0.2.2"
+name = "mizar-compaction"
+version = "0.2.3"
 dependencies = [
- "axum",
- "chrono",
- "dirs",
+ "cordis",
  "futures",
- "loom",
- "mizar-codemode",
+ "mizar-agent-loop",
  "mizar-llm",
- "mizar-mcp",
  "mizar-session",
+ "mizar-system-prompt",
  "mizar-tools",
- "mizar-types",
+ "mizar-tools-coding",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "tracing",
+]
+
+[[package]]
+name = "mizar-instructions"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "dirs",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "mizar-llm"
-version = "0.2.2"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm-types",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm-completions"
+version = "0.2.3"
 dependencies = [
  "axum",
+ "cordis",
  "futures",
- "mizar-types",
+ "mizar-llm",
+ "mizar-llm-http",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "mizar-llm-http"
+version = "0.2.3"
+dependencies = [
+ "futures",
+ "mizar-llm",
+ "reqwest",
+ "serde_json",
+ "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm-messages"
+version = "0.2.3"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-mock"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-responses"
+version = "0.2.3"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-retry"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-llm-router"
+version = "0.2.3"
+dependencies = [
+ "axum",
+ "cordis",
+ "futures",
+ "mizar-llm",
+ "mizar-llm-completions",
+ "mizar-llm-http",
+ "mizar-llm-messages",
+ "mizar-llm-mock",
+ "mizar-llm-responses",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-llm-types"
+version = "0.2.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "mizar-mcp"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
+ "cordis",
  "dirs",
  "mizar-llm",
+ "mizar-llm-http",
+ "mizar-system-prompt",
  "mizar-tools",
- "mizar-types",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "tracing",
+]
+
+[[package]]
+name = "mizar-recall"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-session-sqlite",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "mizar-session"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
- "mizar-types",
- "rusqlite",
+ "cordis",
+ "mizar-llm",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "tokio-util",
- "tracing",
  "uuid",
+]
+
+[[package]]
+name = "mizar-session-sqlite"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "mizar-llm",
+ "mizar-llm-types",
+ "mizar-session",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-session-title"
+version = "0.2.3"
+dependencies = [
+ "chrono",
+ "cordis",
+ "futures",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-skills"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "dirs",
+ "futures",
+ "loom",
+ "mizar-agent-loop",
+ "mizar-llm",
+ "mizar-session",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "mizar-system-prompt"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-tool-fs"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "mizar-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-tool-search"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mizar-tool-time"
+version = "0.2.3"
+dependencies = [
+ "chrono",
+ "cordis",
+ "mizar-tools",
+ "serde_json",
 ]
 
 [[package]]
 name = "mizar-tools"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
- "dirs",
- "globset",
- "ignore",
- "libc",
+ "cordis",
  "loom",
- "mizar-types",
- "regex",
+ "mizar-llm",
  "serde",
  "serde_json",
- "similar",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "unicode-normalization",
  "uuid",
 ]
 
 [[package]]
-name = "mizar-tui"
-version = "0.2.2"
+name = "mizar-tools-coding"
+version = "0.2.3"
 dependencies = [
- "axum",
- "base64 0.22.1",
- "chrono",
- "crossterm",
- "futures",
- "image",
+ "cordis",
+ "dirs",
+ "globset",
+ "ignore",
  "libc",
- "mizar-client",
- "mizar-core",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "serde",
+ "serde_json",
+ "similar",
+ "tokio",
+ "tokio-util",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "mizar-trajectory"
+version = "0.2.3"
+dependencies = [
+ "cordis",
+ "mizar-agent-loop",
  "mizar-llm",
- "mizar-mcp",
  "mizar-session",
  "mizar-tools",
- "mizar-tui-ui",
- "mizar-types",
- "ratatui",
- "reqwest",
+ "mizar-trajectory-core",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "tracing",
+]
+
+[[package]]
+name = "mizar-trajectory-core"
+version = "0.2.3"
+dependencies = [
+ "mizar-llm-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mizar-tui"
+version = "0.2.3"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "cordis",
+ "crossterm",
+ "futures",
+ "image",
+ "mizar-agent-loop",
+ "mizar-agent-spine",
+ "mizar-client",
+ "mizar-client-core",
+ "mizar-instructions",
+ "mizar-llm",
+ "mizar-llm-mock",
+ "mizar-llm-retry",
+ "mizar-llm-router",
+ "mizar-mcp",
+ "mizar-session",
+ "mizar-session-title",
+ "mizar-skills",
+ "mizar-system-prompt",
+ "mizar-tools",
+ "mizar-tools-coding",
+ "mizar-trajectory",
+ "mizar-tui-ui",
+ "ratatui",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "mizar-tui-ui"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "crossterm",
  "futures",
- "libc",
- "mizar-types",
+ "mizar-client-core",
+ "mizar-llm-types",
+ "mizar-trajectory-core",
  "ratatui",
  "serde_json",
  "similar",
- "unicode-width",
-]
-
-[[package]]
-name = "mizar-types"
-version = "0.2.2"
-dependencies = [
- "dirs",
- "futures",
- "ignore",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
  "unicode-width",
 ]
 
@@ -2028,15 +2356,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,16 +2474,6 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
-dependencies = [
- "rand_chacha",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
@@ -2175,29 +2484,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_chacha"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
-dependencies = [
- "getrandom 0.3.4",
-]
 
 [[package]]
 name = "rand_core"
@@ -2653,17 +2943,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3111,18 +3390,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
- "tungstenite",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3237,22 +3504,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "sha1",
- "thiserror 2.0.21",
-]
 
 [[package]]
 name = "typenum"
@@ -3857,26 +4108,6 @@ dependencies = [
  "quote",
  "syn 3.0.9",
  "synstructure",
-]
-
-[[package]]
-name = "zerocopy"
-version = "0.8.64"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed43f3060383c64b000f3c630550aebdfa9d3b76d48de32390483dd2cc7e0865"
-dependencies = [
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.8.64"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cbd820fe3e35fb38c83b6dc7e6b1618bc46e0cd10073ae94e8d52dc468d8b9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]

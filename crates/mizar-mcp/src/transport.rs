@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mizar_types::llm::sse::SseParser;
+use cordis::Logger;
+use mizar_llm::sse::SseParser;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -40,9 +41,10 @@ impl McpTransport {
         server_name: &str,
         config: &McpServerConfig,
         workspace: &Path,
+        logger: Logger,
     ) -> Result<Self, McpError> {
         if let Some(cmd) = &config.command {
-            let stdio = StdioTransport::spawn(server_name, cmd, config, workspace).await?;
+            let stdio = StdioTransport::spawn(server_name, cmd, config, workspace, logger).await?;
             Ok(Self::Stdio(Arc::new(stdio)))
         } else if let Some(url) = &config.url {
             let http = HttpTransport::new(url, config)?;
@@ -149,6 +151,7 @@ impl StdioTransport {
         command: &str,
         config: &McpServerConfig,
         workspace: &Path,
+        logger: Logger,
     ) -> Result<Self, McpError> {
         let expanded_cmd = expand_env_vars(command);
         let mut cmd = Command::new(&expanded_cmd);
@@ -182,6 +185,7 @@ impl StdioTransport {
         let rpc = Arc::new(Mutex::new(StdioRpcState::open()));
 
         let rpc_reader = Arc::clone(&rpc);
+        let log_reader = logger.clone();
         let srv_name = server_name.to_string();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -196,10 +200,7 @@ impl StdioTransport {
                             continue;
                         }
                         let Ok(msg) = serde_json::from_str::<Value>(trimmed) else {
-                            tracing::debug!(
-                                target: "mizar::mcp",
-                                "mcp[{srv_name}] non-json line: {trimmed}"
-                            );
+                            log_reader.debug(format!("mcp[{srv_name}] non-json line: {trimmed}"));
                             continue;
                         };
                         if let Some(id) = msg.get("id").and_then(Value::as_i64)
@@ -212,10 +213,7 @@ impl StdioTransport {
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            target: "mizar::mcp",
-                            "mcp[{srv_name}] stdout read error: {err}"
-                        );
+                        log_reader.warn(format!("mcp[{srv_name}] stdout read error: {err}"));
                         break;
                     }
                 }
@@ -234,7 +232,7 @@ impl StdioTransport {
                     }
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
-                        tracing::debug!(target: "mizar::mcp", "mcp[{srv}] stderr: {trimmed}");
+                        logger.debug(format!("mcp[{srv}] stderr: {trimmed}"));
                     }
                     line.clear();
                 }
@@ -357,7 +355,7 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     fn new(url: &str, config: &McpServerConfig) -> Result<Self, McpError> {
-        let client = mizar_llm::http::default_http_client();
+        let client = mizar_llm_http::default_http_client();
         let mut headers = HashMap::new();
         for (k, v) in &config.headers {
             headers.insert(k.clone(), expand_env_vars(v));
@@ -477,7 +475,7 @@ impl HttpTransport {
             if content_type.contains("text/event-stream") {
                 let mut dec = SseParser::new();
                 let mut matched: Option<Result<Value, McpError>> = None;
-                let mut consume_events = |events: Vec<mizar_types::llm::sse::SseEvent>| -> bool {
+                let mut consume_events = |events: Vec<mizar_llm::sse::SseEvent>| -> bool {
                     for ev in events {
                         let data = ev.data.trim();
                         if data.is_empty() || data == "[DONE]" {

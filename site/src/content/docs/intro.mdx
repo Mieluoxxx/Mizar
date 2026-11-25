@@ -1,110 +1,118 @@
 ---
 title: 简介与快速开始
-description: 在终端启动 Mizar，30 秒内完成免 Key 试玩、环境变量直连大模型或源码编译安装，并掌握第一分钟的核心用法。
-group: quickstart
+description: 安装 Mizar、配置模型凭据或离线演示，完成终端工作台与无头模式的首次调用。
+group: getting-started
 order: 1
 ---
 
-import CodeTabs from '../../components/mdx/CodeTabs.astro';
-import Callout from '../../components/mdx/Callout.astro';
-import Steps from '../../components/mdx/Steps.astro';
-import CardGroup from '../../components/mdx/CardGroup.astro';
-import DocCard from '../../components/mdx/DocCard.astro';
+Mizar 是基于自研 **Cordis 微内核（33 个 Cargo Crate）** 构建的 Rust 终端 AI 编程 Agent，唯一可执行入口为 `mizar`。系统围绕「流式推理 → 并行/串行工具执行 → 只追加会话持久化 → KV Cache 前缀稳定」主循环设计，同时提供交互式双模 TUI 工作台与确定性无头 `exec` 模式。
 
-export const introTabs = [
-    {
-      label: '预编译二进制安装',
-      lang: 'bash',
-      code: `# macOS (Apple Silicon / Intel) 与 Linux (x86_64 / arm64) 一键安装（默认装到 ~/.local/bin/mizar）
-curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
-
-# 验证安装并启动
-mizar --version
-mizar`,
-    },
-    {
-      label: '免 Key 演示试玩',
-      lang: 'bash',
-      code: `# 在未设置 API Key 且未配置 models.json 时，自动进入离线演示模式
-cargo run -p mizar-tui --bin mizar`,
-    },
-    {
-      label: '环境变量一键连大模型',
-      lang: 'bash',
-      code: `# 任选一种官方兼容变量即可直连，无需先写配置文件
-export DEEPSEEK_API_KEY="sk-..."
-cargo run -p mizar-tui --bin mizar -- -C /path/to/your-project
-
-# 也支持 OPENAI_API_KEY / ANTHROPIC_API_KEY，或自定义网关：
-# API_KEY="sk-..." BASE_URL="https://api.example.com/v1" MODEL="deepseek-chat" mizar`,
-    },
-    {
-      label: '编译安装 mizar',
-      lang: 'bash',
-      code: `# 编译 release 二进制（需 Rust 1.98.0+）并安装到 PATH
-cargo build -p mizar-tui --release --bin mizar
-install -m 755 target/release/mizar ~/.local/bin/mizar
-
-# 之后在任意仓库目录直接运行
-mizar`,
-    },
-  ];
-
-Mizar 是一个面向终端的 AI 编程工作台，专为重度命令行工作流打造。它同时提供全屏看板与保留终端滚动历史的 Inline 双模视口，并内置本地 Shell 直执行、跨层项目规则发现、MCP 服务接入与轻量 JS 编排沙箱。
-
-无论你是想先体验交互界面，还是立刻接上 DeepSeek、OpenAI 或 Anthropic 开始改代码，一条命令即可进入工作状态。
-
-## 30 秒跑通第一次启动
-
-根据你手头是否有现成 API Key 或已安装 Rust 1.98 工具链，任选下面一种方式起步：
-
-<CodeTabs tabs={introTabs} />
-
-<Callout type="info" title="界面顶部显示 mock-v1？">
-
-当系统环境变量与 `models.json` 中都找不到任何可用密钥时，Mizar 会安全回退到内置离线演示模式，让你依然可以演练界面操作、本地 `!` 命令和面板布局，而不会消耗额度。接入真实模型请前往 [模型与凭据](/providers/)。
-
+<Callout type="info" title="架构对齐说明">
+  本手册对应当前 **33-Crate Cordis 微内核分支**：内置常驻 QuickJS `codemode`、单一静态 `recall` 工具、四段静态英文系统提示词、启动期静态 `AGENTS.md` 加载、缓存感知尾部剪枝、`Compaction B-5` 护栏，以及 `--trace-out` 结构化轨迹导出。
 </Callout>
 
-## 启动后第一分钟做什么
+## 安装
 
-进入工作台后，不必一次记住所有[快捷键](/tui/keybinds/)，先尝试这三件最立竿见影的事：
+Mizar 固定基于 Rust `1.98.0`（Edition 2024）构建，可通过官方安装脚本获取预编译单二进制，或从源码构建与升级：
+
+<CodeTabs
+  tabs={[
+    {
+      label: '预编译安装',
+      lang: 'sh',
+      code: `curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
+mizar --version`,
+    },
+    {
+      label: '源码构建',
+      lang: 'sh',
+      code: `git clone https://github.com/Mieluoxxx/Mizar.git
+cd Mizar
+cargo install --locked --path crates/mizar-tui`,
+    },
+    {
+      label: '自更新',
+      lang: 'sh',
+      code: `mizar update --check      # 仅检查最新版本
+mizar update              # 升级至最新正式版
+mizar update -v 0.1.6 -f  # 强制切换到指定版本`,
+    },
+  ]}
+/>
+
+如需隔离内网环境，可设置 `MIZAR_OFFLINE=1` 或 `MIZAR_SKIP_VERSION_CHECK=1` 跳过启动版本检查，或通过 `MIZAR_RELEASE_BASE_URL` 指向内部镜像仓库。
+
+## 三分钟跑通首次会话
 
 <Steps>
   <li>
-    <p><strong>用 <code>@</code> 把关键源码精确喂给模型</strong>：在输入框输入 <code>@</code> 会弹出受 <code>.gitignore</code> 保护的文件补全列表。你甚至可以直接写 <code>@src/main.rs#L1-40 这段参数解析有哪些边界情况？</code>，省去大段复制粘贴。</p>
+    <strong>选择凭据方式（免 Key 演示或直连模型）</strong>：无 API Key 时可用内置离线 Mock 快速验证工具链；直连模型只需导出对应环境变量或配置 <code>~/.mizar/models.json</code>。
   </li>
   <li>
-    <p><strong>用 <code>!</code> 和 <code>!!</code> 就在输入框里跑终端命令</strong>：以 <code>!!git status</code> 开头的命令纯属本地快速瞄一眼，不会写入对话上下文也不花一分钱 Token；换成单感叹号 <code>!cargo test</code>，命令报错会顺理成章成为下一轮对话背景，接着让 AI 帮你修即可。</p>
+    <strong>启动终端或无头命令</strong>：不带提示词参数直接运行 <code>mizar</code> 进入交互式全屏工作台；传入 <code>exec</code> 或 <code>-p</code> 则运行单轮无头任务并打印最终结果。
   </li>
   <li>
-    <p><strong>用<a href="/tui/commands/">斜杠命令</a>与<a href="/tui/keybinds/">热键</a>掌控视图与配置</strong>：按 <kbd>Ctrl</kbd>+<kbd>B</kbd> 打开右侧状态面板查看当前上下文占用与活跃文件；按 <kbd>F3</kbd> 在全屏专注模式与 Inline 滚动模式间无损切换；输入 <code>/settings</code> 实时调整界面、压缩策略与模块开关，或用 <code>/model</code> / <code>/effort</code> 切换模型与推理深度。</p>
+    <strong>审计变更与性能轨迹</strong>：交互模式按 <code>Ctrl+T</code> 打开 <code>/trace</code> 三泳道剖面；无头模式传 <code>--trace-out trace.json</code> 导出结构化 <code>TrajectoryExport</code>。
   </li>
 </Steps>
 
-## 继续深入
+<CodeTabs
+  tabs={[
+    {
+      label: '免 Key 离线演示',
+      lang: 'sh',
+      code: `mizar --provider mock --model mock-v1`,
+    },
+    {
+      label: 'DeepSeek / OpenAI',
+      lang: 'sh',
+      code: `export DEEPSEEK_API_KEY="sk-..."
+mizar -C /path/to/repo`,
+    },
+    {
+      label: '自定义兼容网关',
+      lang: 'sh',
+      code: `export PROTOCOL=responses
+export BASE_URL="https://api.example.com/v1"
+export API_KEY="sk-..."
+export MODEL="gpt-5"
+mizar exec "解释 Cargo.toml 中的工作区结构"`,
+    },
+  ]}
+/>
 
-把常用工作台跑顺之后，按你最关心的方向继续往下读：
+## 两种运行形态
+
+| 运行入口 | 适用场景 | 交互能力 | 上下文与持久化 |
+| :--- | :--- | :--- | :--- |
+| `mizar [OPTIONS]` | 日常研发、多轮重构、代码审查 | Fullscreen / Inline 双视口、`!` / `!!` 本地命令、`--approve` 审批弹窗 | 默认写入 `~/.mizar/sessions.sqlite`（可用 `--no-persist` 关闭） |
+| `mizar exec [OPTIONS] [<prompt>]` | CI 流水线、自动化评测、脚本批处理 | 无交互，退出前向 `stdout` 输出纯文本或 JSON 摘要 | 支持 `--isolated`、`--timeout`、`--trace-out` 与标准退出码 |
+
+<Callout type="tip" title="无显式路由时的报错行为">
+  启动时若既未在环境变量与 <code>~/.mizar/models.json</code> 配置任何提供方，也未指定 <code>--provider mock</code>，Mizar 会返回明确的 <code>NoRouteConfigured</code> 错误，而不会静默发送空密钥请求。
+</Callout>
+
+## 继续阅读
 
 <CardGroup>
   <DocCard
-    title="配置与优先级"
-    description="了解 ~/.mizar 与项目 .mizar 的覆盖与追加规则，定制默认工具与预算。"
-    slug="config"
+    title="终端工作台"
+    description="掌握 Fullscreen / Inline 双视口、右侧诊断栏、!/!! 本地 Bash 与全量快捷键及 24 个斜杠命令。"
+    slug="workbench"
   />
   <DocCard
-    title="模型与凭据"
-    description="配置 DeepSeek / OpenAI / Anthropic 与系统钥匙串，安全管理 API Key。"
-    slug="providers"
+    title="工具与常驻 Codemode"
+    description="理解五级 ToolExposure 模型、编码工具并发队列、QuickJS 沙箱编排与 MCP / SKILL.md 接入。"
+    slug="tools"
   />
   <DocCard
-    title="终端工作台 (TUI & CLI)"
-    description="掌握全屏/Inline 双视口、! / !! 本地 Shell、@ 引用与快捷键。"
-    slug="tui"
+    title="CLI 与环境变量参考"
+    description="查询全部启动参数、mizar exec JSON 输出契约、退出码与系统级环境变量。"
+    slug="reference/cli"
   />
   <DocCard
-    title="项目规则 (AGENTS.md)"
-    description="让 Mizar 自动读懂仓库规范与子目录上下文，而不撑爆模型窗口。"
-    slug="instructions"
+    title="配置与模型兼容开关"
+    description="查阅 settings.json、mcp.json、models.json Schema 以及全部 16 项 CompatConfig 参数。"
+    slug="reference/config"
   />
 </CardGroup>

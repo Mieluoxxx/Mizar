@@ -1,0 +1,26 @@
+[package]
+name = "mizar-session-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "基于嵌入式 SQLite (WAL + 单写者后台线程) 的 SessionPersistence 实现"
+
+[lints]
+workspace = true
+
+[features]
+default = ["bundled"]
+bundled = ["rusqlite/bundled"]
+
+[dependencies]
+cordis = { workspace = true }
+mizar-llm-types = { workspace = true }
+mizar-session = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+mizar-llm = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

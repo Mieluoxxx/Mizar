@@ -12,7 +12,7 @@ Run the relevant checks with the Rust toolchain pinned in `rust-toolchain.toml`.
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --no-fail-fast
-cargo check --locked -p mizar-core --no-default-features --all-targets
+cargo check --locked -p mizar-agent-spine --no-default-features --all-targets
 ```
 
 For changes to `site/`, use Node.js 24 and pnpm 12, as in the docs workflow:

@@ -1,19 +1,24 @@
-//! 提交时 `@` 文件/目录/图片引用展开、`pre_step_hook` 钩子与 `install_file_mentions`。
+//! 提交时 `@` 文件/目录/图片引用展开、`agent/pre-step` 钩子与 `FileMentionsPlugin`。
 //!
 //! 保留用户输入原文在 `SessionEvent::User` 中（气泡只渲染用户所写），
 //! 同时把解析得到的 `<attached-file ...>`、`<attached-directory ...>` 与图片附件
 //! 以 `SessionEvent::ContextNotice { source: "file-mentions", .. }` 注入本轮模型上下文。
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use mizar_core::agent_loop::{AgentLoop, AgentPreStepDecision, AgentPreStepInput, TurnInput};
-use mizar_core::spine::MizarRuntime;
-use mizar_llm::{ImageAttachment, LlmRuntime, MAX_IMAGES_PER_MESSAGE};
-use mizar_tools::coding::path_utils::resolve_read_path;
-use mizar_types::client::{ClientEvent, FILE_MENTIONS_SOURCE, NoticeLevel, extract_mentions};
-use mizar_types::{BoxFuture, HookGuard, HookOptions, Next};
+use cordis::{
+    BoxError, BoxFuture, Cleanup, Context, CordisError, DisposableHandle, Inject, Plugin,
+};
+use mizar_agent_loop::{AgentPreStepEvent, EVENT_AGENT_PRE_STEP};
+use mizar_client_core::{
+    ClientEvent, FILE_MENTIONS_SOURCE, NoticeLevel, PLUGIN_FILE_MENTIONS, extract_mentions,
+};
+use mizar_llm::{ImageAttachment, LlmContextExt, MAX_IMAGES_PER_MESSAGE};
+use mizar_session::SessionEvent;
+use mizar_tools_coding::path_utils::resolve_read_path;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -83,16 +88,44 @@ impl FileMentionsConfig {
     }
 }
 
-/// 将文件/目录/图片 `@` 引用展开钩子挂载到 `MizarRuntime` 上，返回 RAII `HookGuard`。
-pub fn install_file_mentions(runtime: &MizarRuntime, config: FileMentionsConfig) -> HookGuard {
-    let emit = Arc::clone(&config.emit);
-    register_mention_hook_with(
-        &runtime.agent_loop,
-        Some(Arc::clone(&runtime.llm)),
-        config.workspace,
-        config.restrict_to_workspace,
-        move |ev| emit(ev),
-    )
+/// 官方客户端文件/目录/图片 `@` 引用展开 Cordis 插件（依赖 `llm` 探测视觉能力）。
+#[derive(Default, Clone, Copy)]
+pub struct FileMentionsPlugin;
+
+impl Plugin for FileMentionsPlugin {
+    type Config = FileMentionsConfig;
+
+    fn name(&self) -> Option<&str> {
+        Some(PLUGIN_FILE_MENTIONS)
+    }
+
+    fn inject(&self) -> Inject {
+        Inject::from(["llm"])
+    }
+
+    fn apply(
+        &self,
+        ctx: Context,
+        config: Self::Config,
+    ) -> BoxFuture<'static, Result<Option<Cleanup>, BoxError>> {
+        Box::pin(async move {
+            let _ = ctx.llm()?;
+            let c = ctx.clone();
+            ctx.effect("mizar-client-file-mentions", move || {
+                let emit = Arc::clone(&config.emit);
+                let handle = register_mention_hook_with(
+                    &c,
+                    config.workspace,
+                    config.restrict_to_workspace,
+                    move |ev| emit(ev),
+                )?;
+                Ok::<_, CordisError>(Some(Cleanup::async_fn(move || async move {
+                    handle.dispose().await;
+                })))
+            })?;
+            Ok(None)
+        })
+    }
 }
 
 fn escape_xml_attr(s: &str) -> String {
@@ -340,12 +373,8 @@ pub async fn expand_text_mentions(
     out
 }
 
-fn model_supports_images(
-    llm: Option<&LlmRuntime>,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> bool {
-    let Some(llm) = llm else {
+fn model_supports_images(ctx: &Context, provider: Option<&str>, model: Option<&str>) -> bool {
+    let Ok(llm) = ctx.llm() else {
         return true;
     };
     for prov in llm.provider_infos() {
@@ -361,95 +390,114 @@ fn model_supports_images(
     true
 }
 
-/// 挂载 `pre_step_hook` 监听器：在每轮首次请求模型前，自动展开最新用户消息中的 `@` 引用。
+/// 挂载 `agent/pre-step` 监听器：在每轮首次请求模型前，自动展开最新用户消息中的 `@` 引用。
 pub fn register_mention_hook(
-    agent_loop: &Arc<AgentLoop>,
-    llm: Option<Arc<LlmRuntime>>,
+    ctx: &Context,
     workspace: PathBuf,
     restrict_to_workspace: bool,
     tx: mpsc::UnboundedSender<ClientEvent>,
-) -> HookGuard {
-    register_mention_hook_with(
-        agent_loop,
-        llm,
-        workspace,
-        restrict_to_workspace,
-        move |ev| {
-            let _ = tx.send(ev);
-        },
-    )
+) -> Result<DisposableHandle, CordisError> {
+    register_mention_hook_with(ctx, workspace, restrict_to_workspace, move |ev| {
+        let _ = tx.send(ev);
+    })
 }
 
-/// 挂载 `pre_step_hook` 监听器并通过自定义闭包投递 `ClientEvent`（便于上层包装成 `LoopClientMsg`）。
+/// 挂载 `agent/pre-step` 监听器并通过自定义闭包投递 `ClientEvent`（便于上层包装成 `LoopClientMsg`）。
 pub fn register_mention_hook_with<F>(
-    agent_loop: &Arc<AgentLoop>,
-    llm: Option<Arc<LlmRuntime>>,
+    ctx: &Context,
     workspace: PathBuf,
     restrict_to_workspace: bool,
     emit: F,
-) -> HookGuard
+) -> Result<DisposableHandle, CordisError>
 where
     F: Fn(ClientEvent) + Clone + Send + Sync + 'static,
 {
-    agent_loop.pre_step_hook().register_with(
-        HookOptions {
-            priority: -50,
-            ..Default::default()
-        },
-        move |mut input: AgentPreStepInput,
-              next: Next<AgentPreStepInput, BoxFuture<'static, AgentPreStepDecision>>| {
+    let processed_seq_by_session: Arc<Mutex<HashMap<String, u64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let ctx_hook = ctx.clone();
+
+    ctx.on_serial::<AgentPreStepEvent, (), _, _>(
+        EVENT_AGENT_PRE_STEP,
+        move |ev: AgentPreStepEvent| {
             let ws = workspace.clone();
             let emit = emit.clone();
-            let llm_hook = llm.clone();
-            Box::pin(async move {
-                if input.cancel.is_cancelled() {
-                    return AgentPreStepDecision::Reject {
-                        reason: "cancelled".to_string(),
-                    };
+            let processed = Arc::clone(&processed_seq_by_session);
+            let ctx_hook = ctx_hook.clone();
+            async move {
+                if ev.cancel.is_cancelled() {
+                    return None;
                 }
 
-                let mut user_texts = Vec::new();
-                let mut existing_images = 0usize;
-                for item in &input.inputs {
-                    if let TurnInput::User { text, images } = item {
-                        user_texts.push(text.as_str());
-                        existing_images += images.len();
-                    }
+                let sid = ev.session.id.clone();
+                let last_done_seq = processed.lock().unwrap().get(&sid).copied().unwrap_or(0);
+
+                let trailing_users: Vec<(u64, String, usize)> =
+                    ev.session.with_visible_entries(|entries| {
+                        let mut collected = Vec::new();
+                        for entry in entries.iter().rev() {
+                            if entry.seq <= last_done_seq {
+                                break;
+                            }
+                            match &entry.event {
+                                SessionEvent::User { text, images } => {
+                                    collected.push((entry.seq, text.clone(), images.len()))
+                                }
+                                SessionEvent::ContextNotice { source, .. }
+                                    if source != FILE_MENTIONS_SOURCE => {}
+                                SessionEvent::ContextNotice { .. }
+                                | SessionEvent::Assistant { .. }
+                                | SessionEvent::ToolResult { .. }
+                                | SessionEvent::Compaction { .. }
+                                | SessionEvent::ToolResultPrune { .. }
+                                | SessionEvent::BashExecution { .. }
+                                | SessionEvent::Selection { .. }
+                                | SessionEvent::Trace { .. } => break,
+                            }
+                        }
+                        collected.reverse();
+                        collected
+                    });
+
+                if trailing_users.is_empty() {
+                    return None;
                 }
 
-                if user_texts.is_empty() {
-                    return next.call(input).await;
-                }
+                let max_seq = trailing_users.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
+                let existing_images: usize = trailing_users.iter().map(|(_, _, n)| *n).sum();
+                let combined_text = trailing_users
+                    .iter()
+                    .map(|(_, t, _)| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
-                let combined_text = user_texts.join("\n");
                 let mut result =
-                    expand_text_mentions(&ws, restrict_to_workspace, &combined_text, &input.cancel)
+                    expand_text_mentions(&ws, restrict_to_workspace, &combined_text, &ev.cancel)
                         .await;
 
-                if input.cancel.is_cancelled() {
-                    return AgentPreStepDecision::Reject {
-                        reason: "cancelled".to_string(),
-                    };
+                if ev.cancel.is_cancelled() {
+                    return None;
                 }
 
                 if !result.images.is_empty()
                     && !model_supports_images(
-                        llm_hook.as_deref(),
-                        input.provider.as_deref(),
-                        input.model.as_deref(),
+                        &ctx_hook,
+                        ev.provider.as_deref(),
+                        ev.model.as_deref(),
                     )
                 {
-                    let model_name = input.model.as_deref().unwrap_or("当前模型");
-                    let reason = format!(
-                        "当前模型 {model_name} 不支持图片输入，已取消 `@` 图片发送（{}）",
-                        result.image_paths.join(", ")
-                    );
+                    let model_name = ev.model.as_deref().unwrap_or("当前模型");
                     emit(ClientEvent::Notice {
                         level: NoticeLevel::Error,
-                        text: reason.clone(),
+                        text: format!(
+                            "当前模型 {model_name} 不支持图片输入，已取消 `@` 图片发送（{}）",
+                            result.image_paths.join(", ")
+                        ),
                     });
-                    return AgentPreStepDecision::Reject { reason };
+                    ev.cancel.cancel();
+                    return None;
                 }
+
+                processed.lock().unwrap().insert(sid, max_seq);
 
                 if existing_images + result.images.len() > MAX_IMAGES_PER_MESSAGE {
                     let allowed = MAX_IMAGES_PER_MESSAGE.saturating_sub(existing_images);
@@ -473,11 +521,11 @@ where
                 }
 
                 if !notice_sections.is_empty() || !result.images.is_empty() {
-                    input.inputs.push(TurnInput::notice_with_images(
-                        FILE_MENTIONS_SOURCE,
-                        notice_sections.join("\n\n"),
-                        result.images,
-                    ));
+                    ev.session.append(SessionEvent::ContextNotice {
+                        source: FILE_MENTIONS_SOURCE.to_string(),
+                        text: notice_sections.join("\n\n"),
+                        images: result.images,
+                    });
                 }
 
                 if !result.attached.is_empty() {
@@ -499,8 +547,8 @@ where
                     });
                 }
 
-                next.call(input).await
-            })
+                None
+            }
         },
     )
 }
@@ -599,13 +647,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_check_does_not_latch_processed_seq() {
-        use mizar_core::agent_loop::AgentLoopConfig;
-        use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
+        use cordis::Service;
         use mizar_llm::{
             BoxChunkStream, GenerateOptions, LlmAdapter, LlmRuntime, ModelInfo, ProviderInfo,
         };
-        use mizar_session::SessionStore;
-        use mizar_tools::ToolRuntime;
+        use mizar_session::{SessionContextExt, SessionEvent, SessionStore};
         use tokio::sync::mpsc;
 
         struct TextOnlyAdapter;
@@ -623,7 +669,6 @@ mod tests {
                             max_tokens: None,
                             reasoning_efforts: Vec::new(),
                             input: vec!["text".into()],
-                            ..Default::default()
                         },
                         ModelInfo {
                             id: "vision-m".into(),
@@ -632,7 +677,6 @@ mod tests {
                             max_tokens: None,
                             reasoning_efforts: Vec::new(),
                             input: vec!["text".into(), "image".into()],
-                            ..Default::default()
                         },
                     ],
                 })
@@ -651,76 +695,58 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("shot.png"), tiny_png(100, 100)).unwrap();
 
-        let llm = LlmRuntime::new();
-        let sessions = SessionStore::new();
-        let tools = ToolRuntime::new();
-        let system_prompt = SystemPrompt::new(SystemPromptConfig::default());
-        let agent_loop = AgentLoop::new(
-            Arc::clone(&llm),
-            tools,
-            Arc::clone(&sessions),
-            system_prompt,
-            AgentLoopConfig::default(),
-        );
-        let _adapter_guard = llm
+        let ctx = cordis::Context::new();
+        ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
+        let _adapter_guard = ctx
+            .llm()
+            .unwrap()
             .register_adapter("text-only-p", Arc::new(TextOnlyAdapter))
             .unwrap();
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        let _hook =
-            register_mention_hook(&agent_loop, Some(Arc::clone(&llm)), tmp.clone(), true, tx);
-        let session = sessions.create(None);
+        let _hook = register_mention_hook(&ctx, tmp.clone(), true, tx).unwrap();
+        let session = ctx.sessions().unwrap().create(None);
+        session.append(SessionEvent::user("请看 @shot.png"));
 
-        // 1. 不支持图片的模型在 pre-step 阶段直接 Reject，不入账用户消息
+        // 1. 不支持图片的模型在 pre-step 阶段触发 cancel，不应推进 processed_seq
         let cancel1 = CancellationToken::new();
-        let ev1 = AgentPreStepInput {
+        let ev1 = AgentPreStepEvent {
             session: Arc::clone(&session),
             turn: 1,
             step: 1,
             provider: Some("text-only-p".into()),
             model: Some("text-only-m".into()),
             cancel: cancel1.clone(),
-            inputs: vec![TurnInput::user("请看 @shot.png")],
         };
-        let decision1 = agent_loop.run_pre_step(ev1).await;
-        assert!(matches!(decision1, AgentPreStepDecision::Reject { .. }));
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev1).await;
+        assert!(cancel1.is_cancelled());
 
-        // 2. 换用支持图片的模型重放同输入时顺利 Enter 并附加 file-mentions 通知
+        // 2. 换用支持图片的模型重放同 seq 时仍能继续识别 @shot.png 并写入 ContextNotice
         let cancel2 = CancellationToken::new();
-        let ev2 = AgentPreStepInput {
+        let ev2 = AgentPreStepEvent {
             session: Arc::clone(&session),
             turn: 1,
             step: 1,
             provider: Some("text-only-p".into()),
             model: Some("vision-m".into()),
             cancel: cancel2.clone(),
-            inputs: vec![TurnInput::user("请看 @shot.png")],
         };
-        let decision2 = agent_loop.run_pre_step(ev2).await;
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev2).await;
         assert!(!cancel2.is_cancelled());
-        match decision2 {
-            AgentPreStepDecision::Enter { inputs } => {
-                assert!(inputs.iter().any(|item| {
-                    matches!(
-                        item,
-                        TurnInput::Notice { source, images, .. }
-                        if source == FILE_MENTIONS_SOURCE && images.len() == 1
-                    )
-                }));
-            }
-            other => panic!("expected Enter, got {other:?}"),
-        }
+        assert!(session.log().iter().any(|e| {
+            matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
+        }));
 
+        ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
     async fn plugin_mounts_and_cleans_up_on_dispose() {
-        use mizar_core::agent_loop::AgentLoopConfig;
-        use mizar_core::system_prompt::{SystemPrompt, SystemPromptConfig};
+        use cordis::Service;
         use mizar_llm::LlmRuntime;
-        use mizar_session::SessionStore;
-        use mizar_tools::ToolRuntime;
+        use mizar_session::{SessionContextExt, SessionStore};
 
         let tmp = std::env::temp_dir().join(format!(
             "mizar_client_mention_plugin_{}",
@@ -730,77 +756,51 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("hello.txt"), "world").unwrap();
 
-        let llm = LlmRuntime::new();
-        let sessions = SessionStore::new();
-        let tools = ToolRuntime::new();
-        let system_prompt = SystemPrompt::new(SystemPromptConfig::default());
-        let agent_loop = AgentLoop::new(
-            Arc::clone(&llm),
-            tools,
-            Arc::clone(&sessions),
-            system_prompt,
-            AgentLoopConfig::default(),
-        );
+        let ctx = Context::new();
+        ctx.plugin(LlmRuntime::plugin(), ()).await.unwrap();
+        ctx.plugin(SessionStore::plugin(), ()).await.unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let cfg = FileMentionsConfig::new(tmp.clone(), true, tx);
-        let emit = Arc::clone(&cfg.emit);
-        let hook_guard = register_mention_hook_with(
-            &agent_loop,
-            Some(llm),
-            cfg.workspace,
-            cfg.restrict_to_workspace,
-            move |ev| emit(ev),
-        );
+        let plugin_fiber = ctx
+            .plugin(
+                FileMentionsPlugin,
+                FileMentionsConfig::new(tmp.clone(), true, tx),
+            )
+            .await
+            .unwrap();
 
-        let session = sessions.create(None);
+        let session = ctx.sessions().unwrap().create(None);
+        session.append(SessionEvent::user("看 @hello.txt"));
 
-        let ev = AgentPreStepInput {
+        let ev = AgentPreStepEvent {
             session: Arc::clone(&session),
             turn: 1,
             step: 1,
             provider: None,
             model: None,
             cancel: CancellationToken::new(),
-            inputs: vec![TurnInput::user("看 @hello.txt")],
         };
-        let decision1 = agent_loop.run_pre_step(ev).await;
-        match decision1 {
-            AgentPreStepDecision::Enter { inputs } => {
-                assert!(inputs.iter().any(|item| {
-                    matches!(
-                        item,
-                        TurnInput::Notice { source, .. } if source == FILE_MENTIONS_SOURCE
-                    )
-                }));
-            }
-            other => panic!("expected Enter, got {other:?}"),
-        }
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev).await;
+        assert!(session.log().iter().any(|e| {
+            matches!(&e.event, SessionEvent::ContextNotice { source, .. } if source == FILE_MENTIONS_SOURCE)
+        }));
         assert!(matches!(rx.try_recv(), Ok(ClientEvent::Flash(_))));
 
-        // 释放守卫后钩子应随之撤销，不再处理新消息
-        drop(hook_guard);
-        let ev2 = AgentPreStepInput {
+        // 卸载插件后钩子应随之撤销，不再处理新消息
+        plugin_fiber.dispose().await;
+        session.append(SessionEvent::user("再看 @hello.txt"));
+        let count_before = session.log().len();
+        let ev2 = AgentPreStepEvent {
             session: Arc::clone(&session),
             turn: 2,
             step: 1,
             provider: None,
             model: None,
             cancel: CancellationToken::new(),
-            inputs: vec![TurnInput::user("再看 @hello.txt")],
         };
-        let decision2 = agent_loop.run_pre_step(ev2).await;
-        match decision2 {
-            AgentPreStepDecision::Enter { inputs } => {
-                assert!(!inputs.iter().any(|item| {
-                    matches!(
-                        item,
-                        TurnInput::Notice { source, .. } if source == FILE_MENTIONS_SOURCE
-                    )
-                }));
-            }
-            other => panic!("expected Enter, got {other:?}"),
-        }
+        let _: Option<()> = ctx.events().serial(EVENT_AGENT_PRE_STEP, ev2).await;
+        assert_eq!(session.log().len(), count_before);
 
+        ctx.fiber().dispose().await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

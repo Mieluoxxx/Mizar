@@ -1,0 +1,93 @@
+---
+title: 终端工作台、快捷键与斜杠命令
+description: Fullscreen 与 Inline 双视口、右侧分栏、!/!! 本地 Bash、快捷键映射以及全部 24 个内置斜杠命令。
+group: getting-started
+order: 2
+---
+
+Mizar 的终端界面由纯前端状态机 `mizar-tui-ui` 与跨端宿主层 `mizar-client` 驱动，默认打开全屏交互工作台，同时支持把已完结轮次刷写回终端原生滚动区的行内模式。
+
+<DiagramEmbed
+  id="tui-modes"
+  caption="图 01：Fullscreen 默认双栏工作台（左）与 Inline 终端原生滚动视图（右），支持运行时 F3 / F2 热切换。"
+/>
+
+## 双模视口与分栏诊断
+
+- **Fullscreen（默认）**：占用 Alternate Screen，内置虚拟化 Markdown 渲染、词级 Diff、`TimelineRail`（终端宽度 `>= 60` 列且 `>= 2` 轮对话时自动出现，点击圆点直接跳转对应用户轮次）与右侧 `Ctrl+B` 分栏。
+- **Inline（`--inline` / `/view inline`）**：保留 7~14 行底部紧凑交互框，空闲时把已完成轮次推入终端原生 scrollback，支持终端自带 `Cmd+F` 搜索与原生划词，且默认关闭鼠标捕捉（`mouse_capture=false`）。
+- **右侧分栏面板（`Ctrl+B` / `/panel`）**：终端宽度 `>= 96` 列时显示，默认 42 列（最小 30 列，可用鼠标拖拽分隔线调宽），包含 `Ctx`（上下文占用与 TTFT / TPS）、`File`、`Tool`、`Stat` 等视图。
+- **鼠标划词放行（`F2` / `/mouse`）**：Fullscreen 下默认启用应用内拖拽复制；按 `F2` 临时暂停鼠标捕捉后，可直接用终端自身组合键（如 macOS `Option+Drag` / iTerm2 划词）复制跨区文本。
+
+## 输入增强与本地 Bash（`!` / `!!`）
+
+- **`@` 模糊文件引用**：输入 `@` 触发由 `WorkspaceFileCache`（尊重 `.gitignore`）支撑的实时文件补全；提交后由 `FileMentionsPlugin` 在步前注入 `ContextNotice` 提示上下文。
+- **多行输入与忙碌入队**：`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 插入换行；模型仍在生成时可直接提交后续指令进入 `PromptQueue` 排队。
+- **剪贴板粘贴（`Ctrl+V`）**：除文本外支持直接粘贴系统剪贴板图片（经 `mizar-client` 进行格式嗅探与自适应缩放后送入支持图像的多模态模型）。
+- **本地 Bash 前缀**：
+  - `! <command>`：在本地执行 shell 命令，**并将输出作为上下文送入下一轮对话**（适合跑完 `cargo test` 让模型接着修）。
+  - `!! <command>`：仅在本地执行并展示输出，**零 Token 消耗**——构建模型历史时会被 `derive_messages()` 自动跳过。
+
+## 全局快捷键
+
+| 按键 | 作用 | 备注 |
+| :--- | :--- | :--- |
+| `Enter` | 提交当前输入（忙碌时加入待发队列） | `/` 开头命令直接触发内置指令或技能 |
+| `Ctrl+Enter` | 立即插队提交（优先打断/插话队列） | — |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | 插入换行符 | 兼容多种终端模拟器的多行协议 |
+| `Tab` | 轮换思考强度 `reasoningEffort` | 按模型支持能力在 `off..max` 间步进 |
+| `Ctrl+C` | 生成中：中断当前轮；空闲时退出/清屏提示 | 按终端与状态机处理取消信号 |
+| `Ctrl+D` | 输入框为空时退出工作台 | 等价于 `/exit` |
+| `Ctrl+T` | 打开/关闭全屏三泳道轨迹分析 | 等价于 `/trace` |
+| `Ctrl+O` | 展开/折叠推理过程与完整工具参数 | 等价于 `/thinking` |
+| `Ctrl+B` | 展开/折叠右侧分栏面板 | 等价于 `/panel`（需终端宽 `>= 96` 列） |
+| `Ctrl+L` | 打开交互式模型与 Provider 选择器 | 等价于 `/model` |
+| `F2` | 切换鼠标捕捉（放行终端原生划词复制） | 等价于 `/mouse` |
+| `F3` | 热切换 Fullscreen / Inline 双模视口 | 等价于 `/view` |
+| `Ctrl+W` / `Ctrl+K` / `Ctrl+U` | 删词 / 删至行尾 / 清空行内输入 | 标准 readline 编辑键 |
+| `Ctrl+Z` / `Ctrl+Y` | 撤销 / 重做输入框编辑 | — |
+| `Ctrl+R` / `Ctrl+E` / `Ctrl+G` | 历史搜索 / 跳转或外置编辑器联动 | 受 `VISUAL` / `EDITOR` 环境变量影响 |
+| `Ctrl+V` | 粘贴剪贴板文本或图片 | 图片自动编码为视觉输入块 |
+| `Alt+Up` / `PageUp` / `PageDown` | 回溯历史或按页滚动对话流 | `Esc` 可关闭弹窗或取消当前操作 |
+| `?`（空输入框） | 打开快捷键与命令帮助面板 | 等价于 `/help` |
+
+## 内置斜杠命令全表（24 个）
+
+在输入框输入 `/` 即弹出实时模糊过滤面板；除下列 **24 个内置命令**外，已加载的技能也可通过 `/<skill-name>` 直接调用：
+
+| 命令 | 别名 | 参数 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `/help` | `/h` | 无 | 打开快捷键与命令帮助面板 |
+| `/resume` | — | `[id]` | 恢复历史会话（无参打开交互式会话选择器，有参直接按 ID 恢复） |
+| `/rename` | — | `[title]` | 重命名当前会话标题；留空时由模型重新生成标题 |
+| `/settings` | `/config` | 无 | 打开交互式配置面板（`Ctrl+B` 模块、开关实时生效并写回 `settings.json`） |
+| `/model` | — | `[spec]` | 打开模型/Provider 选择器（`Ctrl+L`）或直接切换 |
+| `/effort` | — | `[level]` | 调整推理强度：`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
+| `/compact` | — | `[focus]` | 手动压缩当前会话上下文，可附带重点保留说明 |
+| `/session` | — | 无 | 查看当前会话 ID、SQLite 存储路径、事件构成与压缩边界 |
+| `/theme` | — | `[name]` | 切换主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`） |
+| `/trace` | — | 无 | 打开全屏三泳道轨迹分析器（`Ctrl+T`） |
+| `/panel` | — | 无 | 展开/折叠右侧分栏面板（`Ctrl+B`） |
+| `/approval` | — | `[auto\|ask]` | 运行时切换非只读工具审批策略 |
+| `/thinking` | — | 无 | 切换是否展开思考块与详情（`Ctrl+O`） |
+| `/tools` | — | 无 | 查看当前已注册工具及其 `ToolExposure` 暴露状态 |
+| `/mcp` | — | 无 | 查看 `mcp.json` 中各个 MCP Server 的连接与工具状态 |
+| `/skills` | — | 无 | 打开交互式技能列表与选择器 |
+| `/instructions` | — | 无 | 查看启动期静态加载的 `AGENTS.md` / `CLAUDE.md` 路径与字节预算 |
+| `/tree` | — | 无 | 查看会话时间线并在任意历史序列点分叉出新会话 |
+| `/view` | — | `[fullscreen\|inline]` | 热切换双模视口（`F3`） |
+| `/mouse` | — | 无 | 切换鼠标捕捉与原生划词模式（`F2`） |
+| `/stats` | — | 无 | 查看当前会话 Token、吞吐率与耗时统计 |
+| `/export` | — | `[path]` | 将当前会话轨迹导出为 JSONL 文件 |
+| `/clear` | `/new` | 无 | 开启全新空会话 |
+| `/exit` | `/quit`, `/q` | 无 | 退出工作台并在 stderr 打印恢复命令（`mizar --resume <id>`） |
+
+## 主题与视觉强调（`pi-emphasis`）
+
+- **内置 6 套主题**：`auto`（根据终端 `COLORFGBG` 与明暗检测自动适配 `mist-dark` / `mist-light`）、`mist-dark`、`mist-light`、`sakura-dark`、`system`、`ansi16`。在无 TTY 或 CI 子进程环境下如需验证 24-bit 色彩，建议设置 `COLORTERM=truecolor`。
+- **`pi-emphasis` 视觉语法**：交互模式默认启用闭环视觉高亮，模型输出中的 `[[Done]]`、`[[Failed]]`、`[[Needs you]]` 等状态标签会被渲染为语义胶囊，而 SQLite 会话存储、剪贴板复制与 `/export` 导出仍保留纯净 Markdown。可通过环境变量按需关闭：
+  - `MIZAR_TUI_EMPHASIS=0`：全局关闭视觉强调渲染
+  - `MIZAR_TUI_ROUND_CAPS=0`（或 `PI_EMPHASIS_ROUND_CAPS=0`）：关闭圆角胶囊边界
+  - `MIZAR_TUI_PILL_ICONS=0`（或 `PI_EMPHASIS_PILL_ICONS=0`）：隐藏 Nerd Font 图标前缀
+  - `MIZAR_TUI_EMPHASIS_GUIDANCE=0`（或 `PI_EMPHASIS_GUIDANCE=0`）：禁止向系统提示词注入回复视觉规范段落
+  - `MIZAR_TUI_PROGRAM_STATUS=0`：关闭终端程序标题栏/进度状态汇报

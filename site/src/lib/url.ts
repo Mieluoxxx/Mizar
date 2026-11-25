@@ -120,12 +120,7 @@ export function getEditPageUrl(
   }
   const split = splitLocaleContentId(slug);
   const activeLocale = locale ?? split.locale;
-  const rel =
-    split.slug === 'tui'
-      ? 'tui/index'
-      : split.slug === 'dev'
-        ? 'dev/index'
-        : split.slug;
+  const rel = split.slug;
   const localePrefix = activeLocale === 'en' ? 'en/' : '';
   return `${repo}/blob/main/site/src/content/docs/${localePrefix}${rel}.mdx`;
 }

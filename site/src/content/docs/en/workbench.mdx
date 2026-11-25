@@ -1,0 +1,93 @@
+---
+title: Workbench, Keybindings & Slash Commands
+description: Fullscreen vs Inline viewports, split side panel, !/!! local Bash, keybindings, and all 24 built-in slash commands.
+group: getting-started
+order: 2
+---
+
+Mizar's terminal workbench pairs the pure UI state machine `mizar-tui-ui` with the cross-end host runtime `mizar-client`. It opens in a full-screen dual-pane workspace by default and can hot-swap into an inline mode that flushes completed turns back to native terminal scrollback.
+
+<DiagramEmbed
+  id="tui-modes"
+  caption="FIG 01: Fullscreen dual workbench (left) vs Inline native scrollback viewport (right) with runtime F3 / F2 switching."
+/>
+
+## Dual Viewports & Side Panel
+
+- **Fullscreen (default)**: Owns the alternate screen with virtualized Markdown, word-level diffs, a 2-column `TimelineRail` (appears when width `>= 60` cols and `>= 2` turns; click nodes to jump), and the `Ctrl+B` split side panel.
+- **Inline (`--inline` / `/view inline`)**: Keeps a compact 7–14 row composer at the bottom while flushing finished turns to native terminal scrollback (`Cmd+F`, native scrollbar, and drag selection work naturally with `mouse_capture=false`).
+- **Right Side Panel (`Ctrl+B` / `/panel`)**: Shown when terminal width `>= 96` cols (default 42 cols, min 30, draggable divider) with `Ctx` (context bar + TTFT/TPS), `File`, `Tool`, and `Stat` tabs.
+- **Native Selection Escape (`F2` / `/mouse`)**: Temporarily pauses in-app mouse capture in Fullscreen so your terminal emulator handles text selection directly.
+
+## Input Ergonomics & Local Bash (`!` / `!!`)
+
+- **`@` Fuzzy File Mentions**: Typing `@` triggers background `.gitignore`-aware suggestions from `WorkspaceFileCache`; submitted mentions are expanded by `FileMentionsPlugin` as `ContextNotice` items before the step runs.
+- **Multiline & Busy Queueing**: `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` inserts newlines; submitting while streaming pushes follow-ups into `PromptQueue`.
+- **Clipboard Images (`Ctrl+V`)**: Pastes text or sniffs/normalizes clipboard images via `mizar-client` for vision-capable models.
+- **Local Bash Prefixes**:
+  - `! <command>`: Runs locally **and feeds stdout/stderr into the next model turn** (ideal after fixing tests).
+  - `!! <command>`: Runs locally at **zero token cost** — skipped automatically by `derive_messages()`.
+
+## Global Keybindings
+
+| Key | Action | Notes |
+| :--- | :--- | :--- |
+| `Enter` | Submit input (or queue while streaming) | `/` prefix invokes built-in commands or skills |
+| `Ctrl+Enter` | Immediate priority / steer submission | — |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert newline | Broad terminal compatibility |
+| `Tab` | Cycle `reasoningEffort` (`off..max`) | Constrained by active model capabilities |
+| `Ctrl+C` | Cancel generation or interrupt / prompt exit | Follows active turn state |
+| `Ctrl+D` | Exit workbench when composer is empty | Equivalent to `/exit` |
+| `Ctrl+T` | Toggle `/trace` 3-lane trajectory profiler | Equivalent to `/trace` |
+| `Ctrl+O` | Expand/collapse thinking blocks & tool args | Equivalent to `/thinking` |
+| `Ctrl+B` | Toggle right split side panel | Equivalent to `/panel` (`>= 96` cols) |
+| `Ctrl+L` | Open model & provider picker | Equivalent to `/model` |
+| `F2` | Toggle mouse capture for native text copy | Equivalent to `/mouse` |
+| `F3` | Hot-swap Fullscreen / Inline viewport | Equivalent to `/view` |
+| `Ctrl+W` / `Ctrl+K` / `Ctrl+U` | Delete word / kill to end / clear line | Standard readline editing |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo composer input | — |
+| `Ctrl+R` / `Ctrl+E` / `Ctrl+G` | History search / jump / external editor | Honors `VISUAL` / `EDITOR` |
+| `Ctrl+V` | Paste clipboard text or image | Converts images to vision blocks |
+| `Alt+Up` / `PageUp` / `PageDown` | Recall prompt history / page transcript | `Esc` dismisses overlays or cancels |
+| `?` (empty input) | Open keybindings & command help modal | Equivalent to `/help` |
+
+## Built-in Slash Commands (All 24)
+
+Typing `/` opens interactive completion. Alongside these **24 built-in commands**, any loaded skill can be triggered via `/<skill-name>`:
+
+| Command | Aliases | Args | Description |
+| :--- | :--- | :--- | :--- |
+| `/help` | `/h` | — | Open keybindings & slash command reference modal |
+| `/resume` | — | `[id]` | Resume a previous session (interactive picker if `id` is omitted) |
+| `/rename` | — | `[title]` | Rename current session, or regenerate title via LLM when empty |
+| `/settings` | `/config` | — | Open live settings modal (`settings.json` + Cordis module toggles) |
+| `/model` | — | `[spec]` | Open interactive model/provider selector (`Ctrl+L`) or switch directly |
+| `/effort` | — | `[level]` | Set reasoning effort (`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`) |
+| `/compact` | — | `[focus]` | Manually compact conversation context with optional focus instructions |
+| `/session` | — | — | Inspect session ID, SQLite path, event breakdown, and compaction boundary |
+| `/theme` | — | `[name]` | Switch theme (`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`) |
+| `/trace` | — | — | Open full-screen 3-lane trajectory profiler (`Ctrl+T`) |
+| `/panel` | — | — | Toggle right split panel (`Ctrl+B`) |
+| `/approval` | — | `[auto\|ask]` | Switch mutating tool approval gate at runtime |
+| `/thinking` | — | — | Toggle thinking & verbose tool detail rendering (`Ctrl+O`) |
+| `/tools` | — | — | Inspect registered tools and active `ToolExposure` tiers |
+| `/mcp` | — | — | Inspect `mcp.json` server connection status and exposed tools |
+| `/skills` | — | — | Open interactive skill browser / picker |
+| `/instructions` | — | — | Inspect startup-loaded `AGENTS.md` / `CLAUDE.md` files and byte budget |
+| `/tree` | — | — | Browse timeline and fork a new session branch from any past `seq` |
+| `/view` | — | `[fullscreen\|inline]` | Hot-swap dual viewports (`F3`) |
+| `/mouse` | — | — | Toggle mouse capture (`F2`) |
+| `/stats` | — | — | Show token counts, throughput (TPS), and turn latency summary |
+| `/export` | — | `[path]` | Export session trajectory as JSONL |
+| `/clear` | `/new` | — | Start a fresh empty session |
+| `/exit` | `/quit`, `/q` | — | Exit TUI and print `mizar --resume <id>` to `stderr` |
+
+## Themes & `pi-emphasis` Visual Grammar
+
+- **6 Built-in Themes**: `auto` (adapts to terminal `COLORFGBG` dark/light detection), `mist-dark`, `mist-light`, `sakura-dark`, `system`, and `ansi16`. Ensure `COLORTERM=truecolor` in non-TTY test harnesses to enable 24-bit color.
+- **`pi-emphasis` Grammar**: Interactive TUI renders markers like `[[Done]]`, `[[Failed]]`, and `[[Needs you]]` as semantic status pills while preserving clean raw Markdown in SQLite storage, clipboard copy, and `/export`. Disable individual layers via environment variables:
+  - `MIZAR_TUI_EMPHASIS=0`: Disable emphasis rendering globally
+  - `MIZAR_TUI_ROUND_CAPS=0` (or `PI_EMPHASIS_ROUND_CAPS=0`): Disable rounded pill borders
+  - `MIZAR_TUI_PILL_ICONS=0` (or `PI_EMPHASIS_PILL_ICONS=0`): Hide Nerd Font pill icons
+  - `MIZAR_TUI_EMPHASIS_GUIDANCE=0` (or `PI_EMPHASIS_GUIDANCE=0`): Do not append emphasis reply guidance to system prompt
+  - `MIZAR_TUI_PROGRAM_STATUS=0`: Disable terminal title/progress reporting

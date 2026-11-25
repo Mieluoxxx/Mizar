@@ -1,0 +1,62 @@
+[package]
+name = "mizar-agent-spine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "核心套件插件，一次性装配 Agent 核心服务与按需特性插件（对应 NamiDSH packages/agent-spine）"
+
+[lints]
+workspace = true
+
+[features]
+default = ["legacy", "coding", "sqlite", "trajectory", "router", "compaction", "session-title"]
+legacy = ["dep:mizar-tool-fs", "dep:mizar-tool-time"]
+coding = [
+    "dep:mizar-tools-coding",
+    "dep:mizar-tool-search",
+    "dep:mizar-codemode",
+    "dep:mizar-mcp",
+    "dep:mizar-skills",
+    "dep:mizar-instructions",
+]
+compaction = ["dep:mizar-compaction", "dep:mizar-recall"]
+sqlite = ["dep:mizar-session-sqlite"]
+session-title = ["dep:mizar-session-title"]
+trajectory = ["dep:mizar-trajectory"]
+router = ["dep:mizar-llm-router"]
+
+[dependencies]
+cordis = { workspace = true }
+dirs = { workspace = true }
+mizar-agent-loop = { workspace = true }
+mizar-codemode = { workspace = true, optional = true }
+mizar-compaction = { workspace = true, optional = true }
+mizar-llm = { workspace = true }
+mizar-llm-router = { workspace = true, optional = true }
+mizar-mcp = { workspace = true, optional = true }
+mizar-recall = { workspace = true, optional = true }
+mizar-session = { workspace = true }
+mizar-session-sqlite = { workspace = true, optional = true }
+mizar-session-title = { workspace = true, optional = true }
+mizar-skills = { workspace = true, optional = true }
+mizar-instructions = { workspace = true, optional = true }
+mizar-system-prompt = { workspace = true }
+mizar-tool-fs = { workspace = true, optional = true }
+mizar-tool-search = { workspace = true, optional = true }
+mizar-tool-time = { workspace = true, optional = true }
+mizar-tools = { workspace = true }
+mizar-tools-coding = { workspace = true, optional = true }
+mizar-trajectory = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+mizar-llm-mock = { workspace = true }
+mizar-llm-retry = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true }

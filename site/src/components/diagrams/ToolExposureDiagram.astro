@@ -13,8 +13,8 @@ const isEn = locale === 'en';
 ---
 
 <DiagramFrame
-  fig="FIG 04"
-  title={isEn ? 'ToolExposure Levels & tool_search / codemode Loop' : 'ToolExposure 五级暴露与 tool_search / codemode 省上下文闭环'}
+  fig="FIG 02"
+  title={isEn ? 'ToolExposure Levels, Always-On codemode & MCP tool_search' : 'ToolExposure 五级暴露、常驻 codemode 与 MCP tool_search 闭环'}
   caption={caption}
   locale={locale}
 >
@@ -24,8 +24,8 @@ const isEn = locale === 'en';
     height="520"
     role="img"
     aria-label={isEn
-      ? 'Mizar ToolExposure five-level visibility model (Direct, ModelOnly, Codemode, Deferred, Hidden) with BM25 tool_search lazy activation and QuickJS codemode sandbox'
-      : 'Mizar ToolExposure 五级暴露模型（Direct、ModelOnly、Codemode、Deferred、Hidden）与 tool_search BM25 懒激活、codemode QuickJS 沙箱省上下文双闭环'}
+      ? 'Mizar ToolExposure five-level visibility model (Direct, ModelOnly, Codemode, Deferred, Hidden) with always-on QuickJS codemode and MCP BM25 tool_search lazy activation'
+      : 'Mizar ToolExposure 五级暴露模型（Direct、ModelOnly、Codemode、Deferred、Hidden）与常驻 QuickJS codemode、MCP tool_search BM25 懒激活双闭环'}
   >
     <defs>
       <pattern id="exp-hatch-sandbox" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -68,7 +68,7 @@ const isEn = locale === 'en';
       <text x="52" y="95" font-size="10.5" font-weight="700" fill="var(--grey-11)">Direct</text>
       <text x="122" y="95" font-size="9.5" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Direct' : '✓ 直接'}</text>
       <text x="184" y="95" font-size="9.5" fill="var(--grey-10)">{isEn ? '✓ Call' : '✓ 可调'}</text>
-      <text x="238" y="95" font-size="9.5" fill="var(--grey-10)">read / bash / edit / recall</text>
+      <text x="238" y="95" font-size="9" fill="var(--grey-10)">read · bash · edit · grep · recall</text>
 
       {/* Row 2: ModelOnly */}
       <rect x="31" y="114" width="376" height="36" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
@@ -76,7 +76,7 @@ const isEn = locale === 'en';
       <text x="52" y="136" font-size="10.5" font-weight="700" fill="var(--grey-11)">ModelOnly</text>
       <text x="122" y="136" font-size="9.5" font-weight="600" fill="var(--link)">{isEn ? '✓ Direct' : '✓ 直接'}</text>
       <text x="184" y="136" font-size="9.5" font-weight="600" fill="var(--callout-danger-ink)">{isEn ? '✕ Deny' : '✕ 禁嵌'}</text>
-      <text x="238" y="136" font-size="9.5" fill="var(--grey-10)">tool_search · codemode · subagent</text>
+      <text x="238" y="136" font-size="9" fill="var(--grey-10)">codemode (on) · tool_search (MCP)</text>
 
       {/* Row 3: Codemode */}
       <rect x="31" y="155" width="376" height="36" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1" />
@@ -141,8 +141,8 @@ const isEn = locale === 'en';
       <text x="355" y="417" font-size="9" text-anchor="middle" fill="var(--grey-8)">{isEn ? 'Session-scoped' : '仅限当前会话'}</text>
 
       <rect x="35" y="440" width="368" height="44" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
-      <text x="47" y="458" font-size="9.5" fill="var(--grey-10)">{isEn ? '• Auto-enabled when Codemode/Deferred tools exist' : '• 存在任意 Codemode/Deferred 工具时自动激活 tool_search'}</text>
-      <text x="47" y="474" font-size="9.5" fill="var(--grey-8)">{isEn ? '• Matched tools join schemas on the next LLM turn' : '• 命中工具在下一次 LLM 请求时自动加入声明列表'}</text>
+      <text x="47" y="458" font-size="9.2" fill="var(--grey-10)">{isEn ? '• Active only when MCP Codemode/Deferred exist (0-MCP skips)' : '• 仅存在 MCP Codemode/Deferred 时激活（0 MCP 自动省略）'}</text>
+      <text x="47" y="474" font-size="9.2" fill="var(--grey-8)">{isEn ? '• Matched tools join frozen schemas on next turn' : '• 命中工具在下轮加入声明；codemode 默认常驻，工具表不抖动'}</text>
 
       <rect x="19" y="494" width="4" height="4" fill="var(--status-degraded)" />
     </g>
@@ -192,9 +192,9 @@ const isEn = locale === 'en';
 
       <rect x="647" y="58" width="158" height="86" fill="var(--grey-3)" stroke="var(--border)" stroke-width="1" />
       <text x="726" y="78" font-size="10.5" font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Token Savings' : '省上下文效果'}</text>
-      <text x="726" y="99" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'Dozens of MCP tools' : '几十个 MCP 工具'}</text>
-      <text x="726" y="115" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? '→ 1 codemode schema' : '仅占 1 个 codemode'}</text>
-      <text x="726" y="131" font-size="9.5" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? '+ 1 tool_search' : '+ 1 个 tool_search'}</text>
+      <text x="726" y="99" font-size="9.5" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'Always-on codemode' : 'codemode 默认常驻'}</text>
+      <text x="726" y="115" font-size="9.2" text-anchor="middle" fill="var(--grey-9)">{isEn ? 'batches N calls → 1 turn' : 'N 次并发合并 1 轮返回'}</text>
+      <text x="726" y="131" font-size="9.2" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? '+ MCP lazy search' : '+ 外部 MCP 零前置占位'}</text>
 
       <rect x="817" y="18" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
     </g>
@@ -213,14 +213,14 @@ const isEn = locale === 'en';
       <rect x="447" y="205" width="372" height="293" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.5" />
       <rect x="447" y="205" width="372" height="28" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.5" />
       <rect x="447" y="205" width="372" height="28" fill="url(#exp-hatch-sandbox)" />
-      <rect x="459" y="209" width="218" height="20" fill="var(--grey-2)" stroke="var(--link)" stroke-width="0.9" />
-      <text x="468" y="223" font-size="10.5" font-weight="700" fill="var(--grey-11)">{isEn ? 'Loop B · codemode QuickJS' : '闭环 B · codemode QuickJS 沙箱'}</text>
+      <rect x="459" y="209" width="246" height="20" fill="var(--grey-2)" stroke="var(--link)" stroke-width="0.9" />
+      <text x="468" y="223" font-size="10.2" font-weight="700" fill="var(--grey-11)">{isEn ? 'Loop B · Always-on codemode JS' : '闭环 B · 常驻 codemode QuickJS 沙箱'}</text>
       <text x="807" y="223" font-size="9.5" font-weight="700" text-anchor="end" fill="var(--link)">rquickjs</text>
 
       {/* 脚本调度层 */}
       <rect x="461" y="244" width="344" height="58" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
       <text x="473" y="262" font-size="10" font-weight="700" fill="var(--grey-11)">{isEn ? 'Async JS Orchestrator (inlineBudget=3000)' : '异步 JS 编排体（inlineBudget=3000 字符）'}</text>
-      <text x="473" y="279" font-size="9.5" fill="var(--link)">await Promise.all([tools.mcp__a(), tools.read()])</text>
+      <text x="473" y="279" font-size="9" fill="var(--link)">await Promise.allSettled([tools.read(), tools.grep()])</text>
       <text x="473" y="294" font-size="9.5" fill="var(--grey-8)">{isEn ? 'Built-ins: searchTools / describeTool / store / load' : '内建 searchTools() / describeTool() / store() / load()'}</text>
 
       {/* 大数据留守隔离区 */}

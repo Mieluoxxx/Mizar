@@ -1,9 +1,6 @@
 //! 工具调用卡片渲染、组上下文计算、窄宽度路径省略与可展开性判定。
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -25,149 +22,6 @@ pub(super) struct ToolGroupCtx {
 }
 
 const EXPAND_HINT_INLINE: &str = " (Ctrl+O 展开)";
-const MAX_COLLAPSED_DIFF_SRC_LINES: usize = 8;
-const MAX_COLLAPSED_DIFF_LINE_BYTES: usize = 1024;
-const TOOL_CARD_CACHE_CAP: usize = 128;
-const TOOL_EXPANDABLE_CACHE_CAP: usize = 256;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ToolContentFingerprint {
-    args_len: usize,
-    preview_len: usize,
-    extra_full_len: usize,
-    extra_diff_len: usize,
-    extra_args_len: usize,
-    extra_meta_len: usize,
-    exclude_from_context: bool,
-    h1: u64,
-    h2: u64,
-}
-
-fn fnv1a_64_mix(mut state: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        state ^= b as u64;
-        state = state.wrapping_mul(0x100000001b3);
-    }
-    state ^ 0xff
-}
-
-fn fingerprint_tool_content(
-    name: &str,
-    args_summary: &str,
-    status: ToolState,
-    output_preview: &str,
-    extra: Option<&ToolExtraMeta>,
-) -> ToolContentFingerprint {
-    let mut d = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut d);
-    args_summary.hash(&mut d);
-    tool_base_status_code(status).hash(&mut d);
-    output_preview.hash(&mut d);
-    if let Some(ext) = extra {
-        ext.full_content.hash(&mut d);
-        ext.diff_raw.hash(&mut d);
-        ext.full_args.hash(&mut d);
-        ext.inline_meta.hash(&mut d);
-        ext.exclude_from_context.hash(&mut d);
-    }
-
-    let mut h2 = 0xcbf29ce484222325u64;
-    h2 = fnv1a_64_mix(h2, name.as_bytes());
-    h2 = fnv1a_64_mix(h2, args_summary.as_bytes());
-    h2 = fnv1a_64_mix(h2, &[tool_base_status_code(status)]);
-    h2 = fnv1a_64_mix(h2, output_preview.as_bytes());
-    if let Some(ext) = extra {
-        h2 = fnv1a_64_mix(h2, ext.full_content.as_bytes());
-        if let Some(diff) = ext.diff_raw.as_deref() {
-            h2 = fnv1a_64_mix(h2, diff.as_bytes());
-        }
-        h2 = fnv1a_64_mix(h2, ext.full_args.as_bytes());
-        if let Some(meta) = ext.inline_meta.as_deref() {
-            h2 = fnv1a_64_mix(h2, meta.as_bytes());
-        }
-    }
-
-    ToolContentFingerprint {
-        args_len: args_summary.len(),
-        preview_len: output_preview.len(),
-        extra_full_len: extra.map_or(0, |e| e.full_content.len()),
-        extra_diff_len: extra
-            .and_then(|e| e.diff_raw.as_ref())
-            .map_or(0, String::len),
-        extra_args_len: extra.map_or(0, |e| e.full_args.len()),
-        extra_meta_len: extra
-            .and_then(|e| e.inline_meta.as_ref())
-            .map_or(0, String::len),
-        exclude_from_context: extra.is_some_and(|e| e.exclude_from_context),
-        h1: d.finish(),
-        h2,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ToolCardCacheKey {
-    width: usize,
-    theme_id: &'static str,
-    expanded: bool,
-    is_group_end: bool,
-    show_expand_hint: bool,
-    spinner_idx: usize,
-    fp: ToolContentFingerprint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ToolExpandableCacheKey {
-    width: usize,
-    fp: ToolContentFingerprint,
-}
-
-struct BoundedCache<K, V> {
-    clock: u64,
-    cap: usize,
-    map: HashMap<K, (u64, V)>,
-}
-
-impl<K: Eq + Hash, V: Clone> BoundedCache<K, V> {
-    fn new(cap: usize) -> Self {
-        Self {
-            clock: 0,
-            cap,
-            map: HashMap::new(),
-        }
-    }
-
-    fn get(&mut self, key: &K) -> Option<V> {
-        self.clock = self.clock.wrapping_add(1);
-        let stamp = self.clock;
-        let entry = self.map.get_mut(key)?;
-        entry.0 = stamp;
-        Some(entry.1.clone())
-    }
-}
-
-impl<K: Eq + Hash + Clone, V: Clone> BoundedCache<K, V> {
-    fn insert_lru(&mut self, key: K, val: V) {
-        self.clock = self.clock.wrapping_add(1);
-        let stamp = self.clock;
-        self.map.insert(key, (stamp, val));
-        if self.map.len() > self.cap
-            && let Some(evict_k) = self
-                .map
-                .iter()
-                .min_by_key(|(_, (used, _))| *used)
-                .map(|(k, _)| k.clone())
-        {
-            self.map.remove(&evict_k);
-        }
-    }
-}
-
-thread_local! {
-    static TOOL_CARD_CACHE: RefCell<BoundedCache<ToolCardCacheKey, Arc<[RenderedLine]>>> =
-        RefCell::new(BoundedCache::new(TOOL_CARD_CACHE_CAP));
-    static TOOL_EXPANDABLE_CACHE: RefCell<BoundedCache<ToolExpandableCacheKey, bool>> =
-        RefCell::new(BoundedCache::new(TOOL_EXPANDABLE_CACHE_CAP));
-}
 
 pub(super) fn tool_extra_len(extra: Option<&ToolExtraMeta>) -> usize {
     extra.map_or(0, |e| {
@@ -489,52 +343,21 @@ fn resolve_inline_meta(
     None
 }
 
-fn truncate_diff_line_utf8(line: &str, max_bytes: usize) -> (&str, bool) {
-    if line.len() <= max_bytes {
-        return (line, false);
-    }
-    let cut = line.floor_char_boundary(max_bytes);
-    (&line[..cut], true)
-}
-
 fn compact_diff_preview(diff_raw: &str) -> (String, bool) {
-    let mut changed = Vec::with_capacity(MAX_COLLAPSED_DIFF_SRC_LINES);
+    let mut changed = Vec::new();
     let mut skipped_non_header = false;
     for line in diff_raw.lines() {
         if line.starts_with("--- ") || line.starts_with("+++ ") {
             continue;
         }
         if line.starts_with('+') || line.starts_with('-') {
-            if changed.len() >= MAX_COLLAPSED_DIFF_SRC_LINES {
-                skipped_non_header = true;
-                break;
-            }
-            let (clipped, line_truncated) =
-                truncate_diff_line_utf8(line, MAX_COLLAPSED_DIFF_LINE_BYTES);
-            if line_truncated {
-                skipped_non_header = true;
-            }
-            changed.push(clipped);
+            changed.push(line);
         } else if !line.trim().is_empty() {
             skipped_non_header = true;
         }
     }
     if changed.is_empty() {
-        let mut fallback = Vec::with_capacity(MAX_COLLAPSED_DIFF_SRC_LINES);
-        let mut fallback_truncated = false;
-        for line in diff_raw.lines() {
-            if fallback.len() >= MAX_COLLAPSED_DIFF_SRC_LINES {
-                fallback_truncated = true;
-                break;
-            }
-            let (clipped, line_truncated) =
-                truncate_diff_line_utf8(line, MAX_COLLAPSED_DIFF_LINE_BYTES);
-            if line_truncated {
-                fallback_truncated = true;
-            }
-            fallback.push(clipped);
-        }
-        (fallback.join("\n"), fallback_truncated)
+        (diff_raw.to_string(), false)
     } else {
         (changed.join("\n"), skipped_non_header)
     }
@@ -654,39 +477,11 @@ pub(super) fn is_tool_expandable(
     else {
         return false;
     };
-    let cache_key = ToolExpandableCacheKey {
-        width,
-        fp: fingerprint_tool_content(name, args_summary, *status, output_preview, extra),
-    };
-    if let Some(hit) = TOOL_EXPANDABLE_CACHE.with(|c| c.borrow_mut().get(&cache_key)) {
-        return hit;
-    }
-    let computed = compute_is_tool_expandable(
-        name,
-        args_summary,
-        *status,
-        output_preview,
-        extra,
-        width,
-        theme,
-    );
-    TOOL_EXPANDABLE_CACHE.with(|c| c.borrow_mut().insert_lru(cache_key, computed));
-    computed
-}
 
-fn compute_is_tool_expandable(
-    name: &str,
-    args_summary: &str,
-    status: ToolState,
-    output_preview: &str,
-    extra: Option<&ToolExtraMeta>,
-    width: usize,
-    theme: &Theme,
-) -> bool {
     let body_w = width.saturating_sub(4).max(4);
-    let inline_meta = resolve_inline_meta(name, status, output_preview, extra);
+    let inline_meta = resolve_inline_meta(name, *status, output_preview, extra);
     let abbr_args = abbreviate_home_path(args_summary);
-    let (glyph, _) = tool_status_glyph(status, 0, theme);
+    let (glyph, _) = tool_status_glyph(*status, 0, theme);
     let (_, _, args_budget) =
         collapsed_header_budget(glyph, name, &abbr_args, inline_meta.as_deref(), true, width);
     if !abbr_args.is_empty() && display_width(&abbr_args) > args_budget {
@@ -700,7 +495,7 @@ fn compute_is_tool_expandable(
 
     let full_text = extra
         .filter(|e| !e.full_content.is_empty())
-        .map_or(output_preview, |e| e.full_content.as_str());
+        .map_or(output_preview.as_str(), |e| e.full_content.as_str());
 
     if !matches!(status, ToolState::Error | ToolState::Blocked)
         && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
@@ -725,9 +520,9 @@ fn compute_is_tool_expandable(
         let preview_src = if output_preview.trim().is_empty() {
             full_text
         } else {
-            output_preview
+            output_preview.as_str()
         };
-        let shown = collapsed_preview_lines(name, status, preview_src);
+        let shown = collapsed_preview_lines(name, *status, preview_src);
         let full_count = if name == "bash" {
             clean_bash_output_lines(full_text, true).len()
         } else {
@@ -748,7 +543,7 @@ fn compute_is_tool_expandable(
         return !full_text.trim().is_empty();
     }
 
-    let shown = collapsed_preview_lines(name, status, output_preview);
+    let shown = collapsed_preview_lines(name, *status, output_preview);
     if name == "bash" {
         let full_lines = clean_bash_output_lines(full_text, false);
         let has_trunc_note = full_text
@@ -865,52 +660,6 @@ fn build_expanded_tool_header(spec: &ToolHeaderSpec<'_>) -> Vec<RenderedLine> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_tool_lines(
-    name: &str,
-    args_summary: &str,
-    status: ToolState,
-    output_preview: &str,
-    extra: Option<&ToolExtraMeta>,
-    expanded: bool,
-    group_ctx: ToolGroupCtx,
-    spinner_idx: usize,
-    width: usize,
-    theme: &Theme,
-) -> Vec<RenderedLine> {
-    let cache_key = ToolCardCacheKey {
-        width,
-        theme_id: theme.id,
-        expanded,
-        is_group_end: group_ctx.is_group_end,
-        show_expand_hint: group_ctx.show_expand_hint,
-        spinner_idx: if matches!(status, ToolState::Running) {
-            spinner_idx
-        } else {
-            0
-        },
-        fp: fingerprint_tool_content(name, args_summary, status, output_preview, extra),
-    };
-    if let Some(hit) = TOOL_CARD_CACHE.with(|c| c.borrow_mut().get(&cache_key)) {
-        return hit.to_vec();
-    }
-    let built = build_tool_lines_uncached(
-        name,
-        args_summary,
-        status,
-        output_preview,
-        extra,
-        expanded,
-        group_ctx,
-        spinner_idx,
-        width,
-        theme,
-    );
-    let shared: Arc<[RenderedLine]> = Arc::from(built.as_slice());
-    TOOL_CARD_CACHE.with(|c| c.borrow_mut().insert_lru(cache_key, shared));
-    built
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_tool_lines_uncached(
     name: &str,
     args_summary: &str,
     status: ToolState,
@@ -1253,91 +1002,5 @@ mod tests {
             let raw = format!(r#"{{"path":"{home_str}/workspace/demo.rs"}}"#);
             assert_eq!(summarize_tool_args(&raw), "~/workspace/demo.rs");
         }
-    }
-
-    #[test]
-    fn large_collapsed_edit_diff_truncates_before_word_diff_and_single_card_cache_isolates() {
-        let theme = Theme::mist_dark();
-        let long_old = format!("-{}", "alpha beta gamma ".repeat(1500));
-        let long_new = format!("+{}", "alpha delta gamma ".repeat(1500));
-        let mut lines = vec![
-            "--- a.rs".to_string(),
-            "+++ a.rs".to_string(),
-            long_old,
-            long_new,
-        ];
-        for i in 0..2000 {
-            lines.push(format!("-old_{i}"));
-            lines.push(format!("+new_{i}"));
-        }
-        let huge_diff = lines.join("\n");
-        let (preview, stripped) = compact_diff_preview(&huge_diff);
-        assert!(stripped);
-        assert!(preview.lines().count() <= MAX_COLLAPSED_DIFF_SRC_LINES);
-        assert!(
-            preview
-                .lines()
-                .all(|l| l.len() <= MAX_COLLAPSED_DIFF_LINE_BYTES)
-        );
-
-        let extra_huge = ToolExtraMeta {
-            diff_raw: Some(huge_diff),
-            ..Default::default()
-        };
-        let item = ChatItem::ToolCall {
-            id: "e1".into(),
-            name: "edit".into(),
-            args_summary: "a.rs".into(),
-            status: ToolState::Done,
-            output_preview: String::new(),
-        };
-        assert!(is_tool_expandable(&item, Some(&extra_huge), 100, &theme));
-
-        // 单卡缓存：同组内只有变更参数的卡重算，未变动的兄弟卡命中缓存
-        let sibling_key = ToolCardCacheKey {
-            width: 80,
-            theme_id: theme.id,
-            expanded: false,
-            is_group_end: false,
-            show_expand_hint: false,
-            spinner_idx: 0,
-            fp: fingerprint_tool_content("read", "sib.rs", ToolState::Done, "ok", None),
-        };
-        let _ = build_tool_lines(
-            "read",
-            "sib.rs",
-            ToolState::Done,
-            "ok",
-            None,
-            false,
-            ToolGroupCtx {
-                is_group_end: false,
-                show_expand_hint: false,
-            },
-            0,
-            80,
-            &theme,
-        );
-        let hit_before = TOOL_CARD_CACHE.with(|c| c.borrow_mut().get(&sibling_key));
-        assert!(hit_before.is_some());
-
-        // 另一张卡更新内容，不得清空 sibling_key 的单卡缓存
-        let _ = build_tool_lines(
-            "bash",
-            "ls",
-            ToolState::Running,
-            "step-2",
-            None,
-            false,
-            ToolGroupCtx {
-                is_group_end: true,
-                show_expand_hint: false,
-            },
-            1,
-            80,
-            &theme,
-        );
-        let hit_after = TOOL_CARD_CACHE.with(|c| c.borrow_mut().get(&sibling_key));
-        assert!(hit_after.is_some());
     }
 }

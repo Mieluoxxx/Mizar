@@ -1,0 +1,15 @@
+[package]
+name = "mizar-system-prompt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "系统提示词动态组装 ctx.systemPrompt（对应 NamiDSH packages/system-prompt）"
+
+[lints]
+workspace = true
+
+[dependencies]
+cordis = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1945,80 +1945,37 @@ fn is_kinsoku_no_line_end(ch: char) -> bool {
     )
 }
 
-type StyledSlice<'a> = (&'a str, Style);
-
-enum PieceList<'a> {
-    One(StyledSlice<'a>),
-    Many(Vec<StyledSlice<'a>>),
+enum RawToken {
+    Space {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    OpenPunct {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    ClosePunct {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    Atom {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
 }
 
-impl<'a> PieceList<'a> {
-    fn from_vec(mut v: Vec<StyledSlice<'a>>) -> Self {
-        if v.len() == 1 {
-            Self::One(v.pop().unwrap())
-        } else {
-            Self::Many(v)
-        }
-    }
-
-    fn extend_from(&mut self, other: Self) {
-        match (self, other) {
-            (this @ PieceList::One(_), PieceList::One(b)) => {
-                let PieceList::One(a) = std::mem::replace(this, PieceList::Many(Vec::new())) else {
-                    unreachable!();
-                };
-                *this = PieceList::Many(vec![a, b]);
-            }
-            (this @ PieceList::One(_), PieceList::Many(mut bs)) => {
-                let PieceList::One(a) = std::mem::replace(this, PieceList::Many(Vec::new())) else {
-                    unreachable!();
-                };
-                let mut v = Vec::with_capacity(1 + bs.len());
-                v.push(a);
-                v.append(&mut bs);
-                *this = PieceList::Many(v);
-            }
-            (PieceList::Many(av), PieceList::One(b)) => {
-                av.push(b);
-            }
-            (PieceList::Many(av), PieceList::Many(mut bv)) => {
-                av.append(&mut bv);
-            }
-        }
-    }
-
-    fn extend_into_vec(self, dst: &mut Vec<StyledSlice<'a>>) {
-        match self {
-            Self::One(p) => dst.push(p),
-            Self::Many(mut v) => dst.append(&mut v),
-        }
-    }
-
-    fn push_into_spans(self, cur_spans: &mut Vec<Span<'static>>) {
-        match self {
-            Self::One((t, st)) => push_styled_piece(cur_spans, t, st),
-            Self::Many(v) => {
-                for (t, st) in v {
-                    push_styled_piece(cur_spans, t, st);
-                }
-            }
-        }
-    }
+enum WrapItem {
+    BreakSpace {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
+    Atom {
+        pieces: Vec<(String, Style)>,
+        width: usize,
+    },
 }
 
-enum RawToken<'a> {
-    Space { pieces: PieceList<'a>, width: usize },
-    OpenPunct { pieces: PieceList<'a>, width: usize },
-    ClosePunct { pieces: PieceList<'a>, width: usize },
-    Atom { pieces: PieceList<'a>, width: usize },
-}
-
-enum WrapItem<'a> {
-    BreakSpace { pieces: PieceList<'a>, width: usize },
-    Atom { pieces: PieceList<'a>, width: usize },
-}
-
-fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Vec<RawToken<'a>> {
+fn tokenize_spans_for_wrap(spans: Vec<Span<'static>>, avail_w: usize) -> Vec<RawToken> {
     let mut raw = Vec::new();
     let mut seen_non_space = false;
     let mut idx = 0usize;
@@ -2033,13 +1990,10 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
             let mut w = 0usize;
             for sp in &spans[idx..=end_idx] {
                 w += display_width(&sp.content);
-                pieces.push((sp.content.as_ref(), sp.style));
+                pieces.push((sp.content.to_string(), sp.style));
             }
             seen_non_space = true;
-            raw.push(RawToken::Atom {
-                pieces: PieceList::from_vec(pieces),
-                width: w,
-            });
+            raw.push(RawToken::Atom { pieces, width: w });
             idx = end_idx + 1;
             continue;
         }
@@ -2057,7 +2011,7 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
             if w > 0 && w <= avail_w.min(28) {
                 seen_non_space = true;
                 raw.push(RawToken::Atom {
-                    pieces: PieceList::One((text, style)),
+                    pieces: vec![(text.to_string(), style)],
                     width: w,
                 });
                 idx += 1;
@@ -2079,15 +2033,15 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
                     w += char_width(nch);
                     chars.next();
                 }
-                let piece = (&text[start_b..end_b], style);
+                let piece = (text[start_b..end_b].to_string(), style);
                 if seen_non_space {
                     raw.push(RawToken::Space {
-                        pieces: PieceList::One(piece),
+                        pieces: vec![piece],
                         width: w,
                     });
                 } else {
                     raw.push(RawToken::Atom {
-                        pieces: PieceList::One(piece),
+                        pieces: vec![piece],
                         width: w,
                     });
                 }
@@ -2095,11 +2049,10 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
             }
 
             seen_non_space = true;
-            let end_b = start_b + ch.len_utf8();
             if is_kinsoku_no_line_end(ch) {
                 chars.next();
                 raw.push(RawToken::OpenPunct {
-                    pieces: PieceList::One((&text[start_b..end_b], style)),
+                    pieces: vec![(ch.to_string(), style)],
                     width: char_width(ch),
                 });
                 continue;
@@ -2107,7 +2060,7 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
             if is_kinsoku_no_line_start(ch) {
                 chars.next();
                 raw.push(RawToken::ClosePunct {
-                    pieces: PieceList::One((&text[start_b..end_b], style)),
+                    pieces: vec![(ch.to_string(), style)],
                     width: char_width(ch),
                 });
                 continue;
@@ -2115,26 +2068,26 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
             if is_cjk_char(ch) || char_width(ch) >= 2 {
                 chars.next();
                 raw.push(RawToken::Atom {
-                    pieces: PieceList::One((&text[start_b..end_b], style)),
+                    pieces: vec![(ch.to_string(), style)],
                     width: char_width(ch),
                 });
                 continue;
             }
 
             // 连续 ASCII 单词/标识符/路径块：在非 ASCII 字符、全角标点处结束
-            let mut word_end = end_b;
+            let mut end_b = start_b + ch.len_utf8();
             let mut w = char_width(ch);
             chars.next();
             while let Some(&(nb, nch)) = chars.peek() {
                 if nch == ' ' || !nch.is_ascii() || is_cjk_char(nch) || char_width(nch) >= 2 {
                     break;
                 }
-                word_end = nb + nch.len_utf8();
+                end_b = nb + nch.len_utf8();
                 w += char_width(nch);
                 chars.next();
             }
             raw.push(RawToken::Atom {
-                pieces: PieceList::One((&text[start_b..word_end], style)),
+                pieces: vec![(text[start_b..end_b].to_string(), style)],
                 width: w,
             });
         }
@@ -2145,16 +2098,16 @@ fn tokenize_spans_for_wrap<'a>(spans: &'a [Span<'static>], avail_w: usize) -> Ve
     raw
 }
 
-fn merge_kinsoku_items<'a>(raw: Vec<RawToken<'a>>, avail_w: usize) -> Vec<WrapItem<'a>> {
-    let mut items: Vec<WrapItem<'a>> = Vec::with_capacity(raw.len());
-    let mut pending_open: Vec<StyledSlice<'a>> = Vec::new();
+fn merge_kinsoku_items(raw: Vec<RawToken>, avail_w: usize) -> Vec<WrapItem> {
+    let mut items: Vec<WrapItem> = Vec::with_capacity(raw.len());
+    let mut pending_open: Vec<(String, Style)> = Vec::new();
     let mut pending_open_w = 0usize;
 
     let flush_pending_open =
-        |open: &mut Vec<StyledSlice<'a>>, open_w: &mut usize, items: &mut Vec<WrapItem<'a>>| {
+        |open: &mut Vec<(String, Style)>, open_w: &mut usize, items: &mut Vec<WrapItem>| {
             if !open.is_empty() {
                 items.push(WrapItem::Atom {
-                    pieces: PieceList::from_vec(std::mem::take(open)),
+                    pieces: std::mem::take(open),
                     width: std::mem::take(open_w),
                 });
             }
@@ -2167,12 +2120,12 @@ fn merge_kinsoku_items<'a>(raw: Vec<RawToken<'a>>, avail_w: usize) -> Vec<WrapIt
                 items.push(WrapItem::BreakSpace { pieces, width });
             }
             RawToken::OpenPunct { pieces, width } => {
-                pieces.extend_into_vec(&mut pending_open);
+                pending_open.extend(pieces);
                 pending_open_w += width;
             }
             RawToken::ClosePunct { pieces, width } => {
                 if !pending_open.is_empty() {
-                    pieces.extend_into_vec(&mut pending_open);
+                    pending_open.extend(pieces);
                     pending_open_w += width;
                     flush_pending_open(&mut pending_open, &mut pending_open_w, &mut items);
                 } else if let Some(WrapItem::Atom {
@@ -2181,19 +2134,19 @@ fn merge_kinsoku_items<'a>(raw: Vec<RawToken<'a>>, avail_w: usize) -> Vec<WrapIt
                 }) = items.last_mut()
                     && *prev_w + width <= avail_w
                 {
-                    prev_p.extend_from(pieces);
+                    prev_p.extend(pieces);
                     *prev_w += width;
                 } else {
                     items.push(WrapItem::Atom { pieces, width });
                 }
             }
-            RawToken::Atom { pieces, width } => {
+            RawToken::Atom { mut pieces, width } => {
                 if !pending_open.is_empty() {
                     let mut merged = std::mem::take(&mut pending_open);
                     let merged_w = std::mem::take(&mut pending_open_w) + width;
-                    pieces.extend_into_vec(&mut merged);
+                    merged.append(&mut pieces);
                     items.push(WrapItem::Atom {
-                        pieces: PieceList::from_vec(merged),
+                        pieces: merged,
                         width: merged_w,
                     });
                 } else {
@@ -2207,16 +2160,16 @@ fn merge_kinsoku_items<'a>(raw: Vec<RawToken<'a>>, avail_w: usize) -> Vec<WrapIt
     items
 }
 
-fn push_styled_piece(cur_spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+fn push_styled_piece(cur_spans: &mut Vec<Span<'static>>, text: String, style: Style) {
     if text.is_empty() {
         return;
     }
     if let Some(last) = cur_spans.last_mut()
         && last.style == style
     {
-        last.content.to_mut().push_str(text);
+        last.content.to_mut().push_str(&text);
     } else {
-        cur_spans.push(Span::styled(text.to_string(), style));
+        cur_spans.push(Span::styled(text, style));
     }
 }
 
@@ -2227,37 +2180,26 @@ fn is_preferred_atom_break(ch: char) -> bool {
     )
 }
 
-fn split_pieces_at_separators<'a>(pieces: PieceList<'a>) -> Vec<(Vec<StyledSlice<'a>>, usize)> {
-    let mut chunks: Vec<(Vec<StyledSlice<'a>>, usize)> = Vec::new();
-    let mut cur_pieces: Vec<StyledSlice<'a>> = Vec::new();
+fn split_pieces_at_separators(pieces: Vec<(String, Style)>) -> Vec<(Vec<(String, Style)>, usize)> {
+    let mut chunks: Vec<(Vec<(String, Style)>, usize)> = Vec::new();
+    let mut cur_pieces: Vec<(String, Style)> = Vec::new();
     let mut cur_w = 0usize;
 
-    let mut process_piece = |(text, style): StyledSlice<'a>| {
-        let mut seg_start = 0usize;
-        let mut chars = text.char_indices().peekable();
-        while let Some((idx, ch)) = chars.next() {
+    for (text, style) in pieces {
+        let mut buf = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             let cw = char_width(ch);
+            buf.push(ch);
             cur_w += cw;
-            let next_same_sep =
-                matches!(ch, ':' | '.') && chars.peek().is_some_and(|&(_, n)| n == ch);
+            let next_same_sep = matches!(ch, ':' | '.') && chars.peek() == Some(&ch);
             if is_preferred_atom_break(ch) && !next_same_sep {
-                let end = idx + ch.len_utf8();
-                cur_pieces.push((&text[seg_start..end], style));
+                cur_pieces.push((std::mem::take(&mut buf), style));
                 chunks.push((std::mem::take(&mut cur_pieces), std::mem::take(&mut cur_w)));
-                seg_start = end;
             }
         }
-        if seg_start < text.len() {
-            cur_pieces.push((&text[seg_start..], style));
-        }
-    };
-
-    match pieces {
-        PieceList::One(p) => process_piece(p),
-        PieceList::Many(v) => {
-            for p in v {
-                process_piece(p);
-            }
+        if !buf.is_empty() {
+            cur_pieces.push((buf, style));
         }
     }
     if !cur_pieces.is_empty() {
@@ -2273,27 +2215,10 @@ fn wrap_styled_spans_with_prefixes(
     max_width: usize,
 ) -> Vec<RenderedLine> {
     let width = max_width.max(2);
-    let first_prefix_w: usize = prefix_first.iter().map(|p| display_width(&p.content)).sum();
-    let spans_w: usize = spans.iter().map(|s| display_width(&s.content)).sum();
-    if first_prefix_w + spans_w <= width {
-        let mut cur_spans: Vec<Span<'static>> =
-            Vec::with_capacity(prefix_first.len() + spans.len());
-        for p in prefix_first {
-            cur_spans.push(p.clone());
-        }
-        for s in &spans {
-            push_styled_piece(&mut cur_spans, s.content.as_ref(), s.style);
-        }
-        return vec![RenderedLine {
-            line: Line::from(cur_spans),
-            soft_wrapped: false,
-        }];
-    }
-
     let cont_prefix_w: usize = prefix_cont.iter().map(|p| display_width(&p.content)).sum();
     let avail_w = width.saturating_sub(cont_prefix_w).max(1);
 
-    let raw = tokenize_spans_for_wrap(&spans, avail_w);
+    let raw = tokenize_spans_for_wrap(spans, avail_w);
     let items = merge_kinsoku_items(raw, avail_w);
 
     let mut lines: Vec<RenderedLine> = Vec::new();
@@ -2301,7 +2226,7 @@ fn wrap_styled_spans_with_prefixes(
     let mut cur_col = 0usize;
     let mut is_first_visual_line = true;
     let mut line_has_content = false;
-    let mut pending_space: Vec<StyledSlice<'_>> = Vec::new();
+    let mut pending_space: Vec<(String, Style)> = Vec::new();
     let mut pending_space_w = 0usize;
 
     let push_prefixes =
@@ -2333,7 +2258,7 @@ fn wrap_styled_spans_with_prefixes(
     for item in items {
         match item {
             WrapItem::BreakSpace { pieces, width: sw } => {
-                pieces.extend_into_vec(&mut pending_space);
+                pending_space.extend(pieces);
                 pending_space_w += sw;
             }
             WrapItem::Atom { pieces, width: aw } => {
@@ -2342,7 +2267,9 @@ fn wrap_styled_spans_with_prefixes(
                         push_styled_piece(&mut cur_spans, t, st);
                     }
                     cur_col += std::mem::take(&mut pending_space_w);
-                    pieces.push_into_spans(&mut cur_spans);
+                    for (t, st) in pieces {
+                        push_styled_piece(&mut cur_spans, t, st);
+                    }
                     cur_col += aw;
                     line_has_content = true;
                 } else if aw <= avail_w && (line_has_content || cur_col > 0) {
@@ -2355,7 +2282,9 @@ fn wrap_styled_spans_with_prefixes(
                         &mut is_first_visual_line,
                         &mut line_has_content,
                     );
-                    pieces.push_into_spans(&mut cur_spans);
+                    for (t, st) in pieces {
+                        push_styled_piece(&mut cur_spans, t, st);
+                    }
                     cur_col += aw;
                     line_has_content = true;
                 } else {
@@ -2405,12 +2334,15 @@ fn wrap_styled_spans_with_prefixes(
                             continue;
                         }
                         for (t, st) in sub_pieces {
-                            let mut seg_start = 0usize;
-                            for (idx, ch) in t.char_indices() {
+                            let mut chunk = String::new();
+                            for ch in t.chars() {
                                 let cw = char_width(ch);
                                 if cw > 0 && cur_col + cw > width && cur_col > 0 {
-                                    push_styled_piece(&mut cur_spans, &t[seg_start..idx], st);
-                                    seg_start = idx;
+                                    push_styled_piece(
+                                        &mut cur_spans,
+                                        std::mem::take(&mut chunk),
+                                        st,
+                                    );
                                     flush_line(
                                         &mut lines,
                                         &mut cur_spans,
@@ -2419,12 +2351,11 @@ fn wrap_styled_spans_with_prefixes(
                                         &mut line_has_content,
                                     );
                                 }
+                                chunk.push(ch);
                                 cur_col += cw;
                                 line_has_content = true;
                             }
-                            if seg_start < t.len() {
-                                push_styled_piece(&mut cur_spans, &t[seg_start..], st);
-                            }
+                            push_styled_piece(&mut cur_spans, chunk, st);
                         }
                     }
                 }
@@ -2503,16 +2434,6 @@ fn intra_line_word_diff_spans(
     if !indent.is_empty() {
         del_spans.push(Span::styled(indent.to_string(), base_del));
         add_spans.push(Span::styled(indent.to_string(), base_add));
-    }
-
-    if old_rest.len() + new_rest.len() > 4096 {
-        if !old_rest.is_empty() {
-            del_spans.push(Span::styled(old_rest.to_string(), base_del));
-        }
-        if !new_rest.is_empty() {
-            add_spans.push(Span::styled(new_rest.to_string(), base_add));
-        }
-        return (del_spans, add_spans);
     }
 
     let diff = TextDiff::from_words(old_rest, new_rest);

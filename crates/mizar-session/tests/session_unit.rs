@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use cordis::{BoxFuture, Context, Service};
+use mizar_llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 use mizar_session::{
-    EntryVisibility, LoadedSession, PersistenceError, PersistenceResult, SessionCreateOptions,
-    SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionOrigin,
-    SessionPersistence, SessionStore, SessionTitleUpdatedPayload, SessionTraceEvent, TitlePatch,
-    TitleSource, TitleSourcePatch, derive_session_title, repair_dangling_tool_calls,
+    EVENT_SESSION_TITLE_UPDATED, EntryVisibility, LoadedSession, PersistenceError,
+    PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionContextExt, SessionCreateOptions,
+    SessionEntry, SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery,
+    SessionPersistence, SessionPersistenceHandle, SessionStore, SessionTitleUpdatedPayload,
+    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, derive_session_title,
+    repair_dangling_tool_calls,
 };
-use mizar_types::hooks::BoxFuture;
-use mizar_types::llm::{ContentBlock, ImageAttachment, Message, TokenUsage};
 
 #[derive(Default)]
 struct InMemoryMockBackend {
@@ -162,7 +164,9 @@ impl SessionPersistence for InMemoryMockBackend {
 
 #[tokio::test]
 async fn separates_surface_from_log_only_and_compacts_cleanly() {
-    let store = SessionStore::new();
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
     let s = store.create_with(SessionCreateOptions {
         cwd: Some("/repo/demo".into()),
         ..Default::default()
@@ -174,8 +178,6 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
     s.append_trace(SessionTraceEvent::TurnEnd {
         turn: 1,
         reason: "completed".into(),
-        error: None,
-        summary: None,
     });
 
     s.append_trace(SessionTraceEvent::TurnStart { turn: 2 });
@@ -198,7 +200,6 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
         name: "read".into(),
         content: "file body".into(),
         is_error: false,
-        meta: None,
     });
     s.append(SessionEvent::assistant_text("完成"));
 
@@ -238,13 +239,22 @@ async fn separates_surface_from_log_only_and_compacts_cleanly() {
             }
         );
     }
+
+    app.fiber().dispose().await;
 }
 
 #[tokio::test]
 async fn hydrates_repairs_dangling_tools_and_forks_via_seam() {
     let backend = Arc::new(InMemoryMockBackend::default());
 
-    let store1 = SessionStore::with_persistence(backend.clone());
+    let app1 = Context::new();
+    app1.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend.clone())),
+    )
+    .unwrap();
+    app1.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store1 = app1.sessions().unwrap();
     let s1 = store1.create_with(SessionCreateOptions {
         id: Some("sess-1".into()),
         cwd: Some("/repo/app".into()),
@@ -261,11 +271,17 @@ async fn hydrates_repairs_dangling_tools_and_forks_via_seam() {
         replay: None,
         usage: None,
     });
-    let _ = store1.flush_async(None).await;
-    store1.clear();
+    app1.fiber().dispose().await;
 
     // 模拟全新进程重启后懒加载与断线自愈
-    let store2 = SessionStore::with_persistence(backend);
+    let app2 = Context::new();
+    app2.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend)),
+    )
+    .unwrap();
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store2 = app2.sessions().unwrap();
 
     assert!(store2.list().is_empty());
     let loaded = store2.get("sess-1").expect("should load from backend");
@@ -296,10 +312,11 @@ async fn hydrates_repairs_dangling_tools_and_forks_via_seam() {
         .list_headers(&SessionListQuery {
             cwd: Some("/repo/app".into()),
             limit: Some(10),
-            ..Default::default()
         })
         .unwrap();
     assert_eq!(list.len(), 2);
+
+    app2.fiber().dispose().await;
 }
 
 #[test]
@@ -327,7 +344,6 @@ fn repair_helper_noop_when_tool_already_resolved() {
                     name: "read".into(),
                     content: "ok".into(),
                     is_error: false,
-                    meta: None,
                 },
                 ts: 2,
             },
@@ -341,7 +357,9 @@ fn repair_helper_noop_when_tool_already_resolved() {
 
 #[tokio::test]
 async fn bash_execution_separates_context_and_log_only_across_derive_and_compaction() {
-    let store = SessionStore::new();
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
     let s = store.create(Some("sess-bash".into()));
 
     let ctx_ev = SessionEvent::BashExecution {
@@ -444,11 +462,15 @@ async fn bash_execution_separates_context_and_log_only_across_derive_and_compact
         }
         _ => true,
     }));
+
+    app.fiber().dispose().await;
 }
 
 #[tokio::test]
 async fn selection_is_log_only_deduped_and_survives_derive_messages() {
-    let store = SessionStore::new();
+    let app = Context::new();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
     let s = store.create(Some("sess-selection".into()));
 
     assert_eq!(s.latest_selection(), None);
@@ -457,14 +479,14 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert!(s.record_selection(
         Some("magpie".into()),
         Some("mayoru-responses/deepseek-flash".into()),
-        Some(mizar_types::llm::ReasoningEffort::High),
+        Some(mizar_llm::ReasoningEffort::High),
     ));
     assert_eq!(
         s.latest_selection(),
         Some(mizar_session::SessionSelection {
             provider: Some("magpie".into()),
             model: Some("mayoru-responses/deepseek-flash".into()),
-            reasoning_effort: Some(mizar_types::llm::ReasoningEffort::High),
+            reasoning_effort: Some(mizar_llm::ReasoningEffort::High),
         })
     );
 
@@ -472,7 +494,7 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert!(!s.record_selection(
         Some("magpie".into()),
         Some("mayoru-responses/deepseek-flash".into()),
-        Some(mizar_types::llm::ReasoningEffort::High),
+        Some(mizar_llm::ReasoningEffort::High),
     ));
     assert_eq!(s.all_entries().len(), 1);
 
@@ -480,12 +502,12 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
     assert!(s.record_selection(
         Some("magpie".into()),
         Some("mayoru-responses/deepseek-flash".into()),
-        Some(mizar_types::llm::ReasoningEffort::Max),
+        Some(mizar_llm::ReasoningEffort::Max),
     ));
     assert_eq!(s.all_entries().len(), 2);
     assert_eq!(
         s.latest_selection().unwrap().reasoning_effort,
-        Some(mizar_types::llm::ReasoningEffort::Max)
+        Some(mizar_llm::ReasoningEffort::Max)
     );
 
     // LogOnly：不进模型上下文、不出现在 surface 视图里
@@ -504,6 +526,8 @@ async fn selection_is_log_only_deduped_and_survives_derive_messages() {
 
     // 但仍在完整事件流里
     assert_eq!(s.all_entries().len(), 2);
+
+    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -516,7 +540,14 @@ async fn user_with_images_persists_through_backend_and_restores_via_derive_messa
         height: Some(480),
     };
 
-    let store1 = SessionStore::with_persistence(backend.clone());
+    let app1 = Context::new();
+    app1.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend.clone())),
+    )
+    .unwrap();
+    app1.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store1 = app1.sessions().unwrap();
     let s1 = store1.create_with(SessionCreateOptions {
         id: Some("sess-images".into()),
         ..Default::default()
@@ -526,9 +557,16 @@ async fn user_with_images_persists_through_backend_and_restores_via_derive_messa
         vec![img.clone()],
     ));
     s1.flush_async().await.unwrap();
-    store1.clear();
+    app1.fiber().dispose().await;
 
-    let store2 = SessionStore::with_persistence(backend);
+    let app2 = Context::new();
+    app2.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend)),
+    )
+    .unwrap();
+    app2.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store2 = app2.sessions().unwrap();
     let reloaded = store2
         .get("sess-images")
         .expect("reloaded session should exist");
@@ -543,6 +581,8 @@ async fn user_with_images_persists_through_backend_and_restores_via_derive_messa
         msgs[0],
         Message::user_with_images("请分析这张截图里的报错", vec![img])
     );
+
+    app2.fiber().dispose().await;
 }
 
 #[test]
@@ -584,17 +624,31 @@ fn derive_session_title_strips_noise_and_keeps_valid_tokens() {
 #[tokio::test]
 async fn set_title_clear_title_emit_event_and_fork_does_not_copy_parent_title() {
     let backend = Arc::new(InMemoryMockBackend::default());
-    let store = SessionStore::with_persistence(backend.clone());
+    let app = Context::new();
+    app.provide(
+        SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend.clone())),
+    )
+    .unwrap();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+
+    let store = app.sessions().unwrap();
 
     type RecordedTitleEvent = (String, Option<String>, Option<TitleSource>);
     let events: Arc<Mutex<Vec<RecordedTitleEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let events_sink = events.clone();
-    let _title_handle = store.on_title_updated(move |p: &SessionTitleUpdatedPayload| {
-        events_sink
-            .lock()
-            .unwrap()
-            .push((p.session.id.clone(), p.title.clone(), p.title_source));
-    });
+    let _title_handle = app
+        .on(
+            EVENT_SESSION_TITLE_UPDATED,
+            move |p: &SessionTitleUpdatedPayload| {
+                events_sink.lock().unwrap().push((
+                    p.session.id.clone(),
+                    p.title.clone(),
+                    p.title_source,
+                ));
+            },
+        )
+        .unwrap();
 
     let parent = store.create_with(SessionCreateOptions {
         id: Some("p-1".into()),
@@ -682,6 +736,8 @@ async fn set_title_clear_title_emit_event_and_fork_does_not_copy_parent_title() 
             ),
         ]
     );
+
+    app.fiber().dispose().await;
 }
 
 #[tokio::test]
@@ -792,7 +848,14 @@ async fn repair_skips_past_unparsed_tail_seq_and_inspect_readonly_does_not_mutat
         appended: Arc::clone(&appended),
     });
 
-    let store = SessionStore::with_persistence(backend);
+    let app = Context::new();
+    app.provide(
+        mizar_session::SERVICE_SESSION_PERSISTENCE,
+        Arc::new(SessionPersistenceHandle::new(backend)),
+    )
+    .unwrap();
+    app.plugin(SessionStore::plugin(), ()).await.unwrap();
+    let store = app.sessions().unwrap();
 
     // 1. 只读遍历 lineage / inspect_readonly 不应写入修复事件，也不应水合缓存
     let chain = store.lineage_session_ids("cold-parent");
@@ -822,637 +885,6 @@ async fn repair_skips_past_unparsed_tail_seq_and_inspect_readonly_does_not_mutat
         loaded_sess.compare_and_set_title_auto(Some("auto-one"), "stale-auto", true),
         Err(Some("manual-override".into()))
     );
-}
 
-#[tokio::test]
-async fn usage_event_is_log_only_excluded_from_derived_messages_and_roundtrips_json() {
-    let store = SessionStore::new();
-    let s = store.create(None);
-
-    s.append(SessionEvent::user("hi"));
-    let usage = TokenUsage {
-        input_tokens: 120,
-        output_tokens: 1,
-        cache_read_tokens: Some(4_000),
-        cache_write_tokens: Some(0),
-        total_tokens: Some(4_121),
-        reasoning_tokens: None,
-    };
-    let u_ev = SessionEvent::usage(
-        "cache_warm",
-        "anthropic",
-        "claude-sonnet-4-6",
-        usage,
-        Some("ttl=5m".into()),
-    );
-    assert_eq!(u_ev.visibility(), EntryVisibility::LogOnly);
-    assert_eq!(u_ev.kind_name(), "usage");
-    s.append(u_ev.clone());
-    s.append(SessionEvent::usage(
-        "session_title",
-        "openai",
-        "gpt-4o-mini",
-        usage,
-        None,
-    ));
-
-    // 只进入 all_entries，不进入表面 log()/visible_log()，也不进入 derive_messages()
-    assert_eq!(s.log().len(), 1);
-    assert_eq!(s.visible_log().len(), 1);
-    assert_eq!(s.all_entries().len(), 3);
-    assert_eq!(s.header().surface_count, 1);
-    assert_eq!(s.header().event_count, 3);
-    let msgs = s.derive_messages();
-    assert_eq!(msgs, vec![Message::user("hi")]);
-
-    let json = serde_json::to_string(&u_ev).unwrap();
-    assert!(json.contains("\"type\":\"usage\""));
-    assert!(json.contains("\"note\":\"ttl=5m\""));
-    let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
-    assert_eq!(decoded, u_ev);
-
-    let no_note = SessionEvent::usage("subagent", "openai", "gpt-5", usage, None);
-    let no_note_json = serde_json::to_string(&no_note).unwrap();
-    assert!(!no_note_json.contains("\"note\""));
-    assert_eq!(
-        serde_json::from_str::<SessionEvent>(&no_note_json).unwrap(),
-        no_note
-    );
-}
-
-#[tokio::test]
-async fn list_headers_exclude_subagents_filters_only_non_fork_children() {
-    let store = SessionStore::new();
-
-    let root = store.create_with(SessionCreateOptions {
-        id: Some("root".into()),
-        cwd: Some("/repo/ws".into()),
-        ..Default::default()
-    });
-    root.append(SessionEvent::user("hello"));
-    let forked = store
-        .fork(
-            "root",
-            1,
-            SessionCreateOptions {
-                id: Some("forked".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let child = store.create_with(SessionCreateOptions {
-        id: Some("child".into()),
-        cwd: Some("/repo/ws".into()),
-        parent_id: Some("root".into()),
-        ..Default::default()
-    });
-    assert!(child.header().is_subagent_child());
-    assert!(!root.header().is_subagent_child());
-    assert!(!forked.header().is_subagent_child());
-
-    let filtered = store
-        .list_headers(&SessionListQuery {
-            cwd: Some("/repo/ws".into()),
-            limit: Some(10),
-            exclude_subagents: true,
-        })
-        .unwrap();
-    let ids: Vec<&str> = filtered.iter().map(|h| h.id.as_str()).collect();
-    assert!(!ids.contains(&"child"), "{ids:?}");
-    assert!(ids.contains(&"root") && ids.contains(&"forked"), "{ids:?}");
-}
-
-#[tokio::test]
-async fn explicit_session_origin_overrides_fork_seq_inference_and_repairs_memory_dangling() {
-    let store = SessionStore::new();
-
-    let root = store.create_with(SessionCreateOptions {
-        id: Some("root-orig".into()),
-        cwd: Some("/repo/orig".into()),
-        ..Default::default()
-    });
-    root.append(SessionEvent::user("start"));
-    root.append(SessionEvent::Assistant {
-        blocks: vec![ContentBlock::ToolCall {
-            id: "call_mem_hang".into(),
-            name: "bash".into(),
-            arguments: "{}".into(),
-        }],
-        replay: None,
-        usage: None,
-    });
-
-    // fork 默认标记为 SessionOrigin::User
-    let user_fork = store
-        .fork(
-            "root-orig",
-            1,
-            SessionCreateOptions {
-                id: Some("user-fork".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(user_fork.header().origin, Some(SessionOrigin::User));
-    assert!(!user_fork.header().is_subagent_child());
-
-    // 显式标注 SessionOrigin::Subagent 且带 fork_seq 时，仍准确判定为子代理
-    let forked_subagent = store
-        .fork(
-            "root-orig",
-            1,
-            SessionCreateOptions {
-                id: Some("subagent-fork".into()),
-                origin: Some(SessionOrigin::Subagent),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        forked_subagent.header().origin,
-        Some(SessionOrigin::Subagent)
-    );
-    assert!(forked_subagent.header().is_subagent_child());
-
-    // 内存会话悬挂 ToolCall 修复且幂等
-    assert_eq!(root.repair_dangling_tool_calls(), 1);
-    assert_eq!(root.repair_dangling_tool_calls(), 0);
-    assert!(root.log().iter().any(|e| {
-        matches!(
-            &e.event,
-            SessionEvent::ToolResult {
-                tool_call_id,
-                is_error: true,
-                content,
-                ..
-            } if tool_call_id == "call_mem_hang" && content.contains("TOOL_OUTCOME_UNKNOWN")
-        )
-    }));
-
-    let filtered = store
-        .list_headers(&SessionListQuery {
-            cwd: Some("/repo/orig".into()),
-            limit: Some(10),
-            exclude_subagents: true,
-        })
-        .unwrap();
-    let ids: Vec<&str> = filtered.iter().map(|h| h.id.as_str()).collect();
-    assert!(!ids.contains(&"subagent-fork"), "{ids:?}");
-    assert!(ids.contains(&"root-orig") && ids.contains(&"user-fork"));
-}
-
-#[tokio::test]
-async fn lightweight_header_and_selection_queries_avoid_full_load_session() {
-    use mizar_session::SessionSelection;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct CountingHeaderBackend {
-        headers: HashMap<String, SessionHeader>,
-        selections: HashMap<String, SessionSelection>,
-        load_session_calls: AtomicUsize,
-        load_header_calls: AtomicUsize,
-        latest_selection_calls: AtomicUsize,
-    }
-
-    impl SessionPersistence for CountingHeaderBackend {
-        fn create_session(&self, _: &SessionHeader) -> PersistenceResult<()> {
-            Ok(())
-        }
-        fn update_header(&self, _: &str, _: SessionHeaderPatch) -> PersistenceResult<()> {
-            Ok(())
-        }
-        fn load_session(&self, _: &str) -> PersistenceResult<Option<LoadedSession>> {
-            self.load_session_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
-        }
-        fn load_header(&self, session_id: &str) -> PersistenceResult<Option<SessionHeader>> {
-            self.load_header_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.headers.get(session_id).cloned())
-        }
-        fn latest_selection(
-            &self,
-            session_id: &str,
-        ) -> PersistenceResult<Option<SessionSelection>> {
-            self.latest_selection_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.selections.get(session_id).cloned())
-        }
-        fn list_sessions(&self, _: &SessionListQuery) -> PersistenceResult<Vec<SessionHeader>> {
-            Ok(self.headers.values().cloned().collect())
-        }
-        fn append_events(&self, _: &str, _: &[SessionEntry]) -> PersistenceResult<()> {
-            Ok(())
-        }
-        fn flush(&self, _: Option<&str>) -> PersistenceResult<()> {
-            Ok(())
-        }
-        fn flush_async(&self, _: Option<String>) -> BoxFuture<'static, PersistenceResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn fork_session(
-            &self,
-            from_session_id: &str,
-            _: u64,
-            _: &SessionHeader,
-        ) -> PersistenceResult<LoadedSession> {
-            Err(PersistenceError::NotFound(from_session_id.to_string()))
-        }
-    }
-
-    let mut parent_h = SessionHeader::new("cold-parent", 10);
-    parent_h.cwd = Some("/ws/light".into());
-    let mut child_h = SessionHeader::new("cold-child", 20);
-    child_h.cwd = Some("/ws/light".into());
-    child_h.parent_id = Some("cold-parent".into());
-
-    let mut headers = HashMap::new();
-    headers.insert("cold-parent".into(), parent_h);
-    headers.insert("cold-child".into(), child_h);
-
-    let mut selections = HashMap::new();
-    selections.insert(
-        "cold-child".into(),
-        SessionSelection {
-            provider: Some("openai".into()),
-            model: Some("gpt-5".into()),
-            reasoning_effort: Some(mizar_types::llm::ReasoningEffort::High),
-        },
-    );
-
-    let backend = Arc::new(CountingHeaderBackend {
-        headers,
-        selections,
-        load_session_calls: AtomicUsize::new(0),
-        load_header_calls: AtomicUsize::new(0),
-        latest_selection_calls: AtomicUsize::new(0),
-    });
-
-    let store = SessionStore::with_persistence(backend.clone());
-
-    // 1. 持久化冷会话轻量读取不得触发 load_session
-    let h = store.inspect_header_async("cold-child").await.unwrap();
-    assert_eq!(h.cwd.as_deref(), Some("/ws/light"));
-    assert_eq!(
-        store.lineage_session_ids_async("cold-child").await,
-        vec!["cold-child", "cold-parent"]
-    );
-    let sel = store.peek_selection_async("cold-child").await.unwrap();
-    assert_eq!(sel.provider.as_deref(), Some("openai"));
-    assert_eq!(sel.model.as_deref(), Some("gpt-5"));
-    assert_eq!(
-        store
-            .peek_selection_light("cold-child")
-            .unwrap()
-            .model
-            .as_deref(),
-        Some("gpt-5")
-    );
-    assert_eq!(backend.load_session_calls.load(Ordering::SeqCst), 0);
-    assert!(backend.load_header_calls.load(Ordering::SeqCst) >= 3);
-    assert_eq!(backend.latest_selection_calls.load(Ordering::SeqCst), 2);
-
-    // 2. 内存会话同样走轻量通道而不触发持久化查询
-    let mem = store.create_with(SessionCreateOptions {
-        id: Some("mem-sess".into()),
-        cwd: Some("/ws/mem".into()),
-        ..Default::default()
-    });
-    mem.record_selection(
-        Some("anthropic".into()),
-        Some("claude-sonnet-4-5".into()),
-        Some(mizar_types::llm::ReasoningEffort::Medium),
-    );
-    assert_eq!(
-        store.inspect_header("mem-sess").unwrap().cwd.as_deref(),
-        Some("/ws/mem")
-    );
-    assert_eq!(
-        store
-            .peek_selection_light("mem-sess")
-            .unwrap()
-            .provider
-            .as_deref(),
-        Some("anthropic")
-    );
-    assert_eq!(
-        store
-            .peek_selection_async("mem-sess")
-            .await
-            .unwrap()
-            .model
-            .as_deref(),
-        Some("claude-sonnet-4-5")
-    );
-    assert_eq!(backend.load_session_calls.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn trace_end_events_preserve_legacy_json_and_serialize_optional_error() {
-    let legacy_step: SessionTraceEvent =
-        serde_json::from_str(r#"{"kind":"step-end","turn":1,"step":2,"outcome":"completed"}"#)
-            .unwrap();
-    assert_eq!(
-        legacy_step,
-        SessionTraceEvent::StepEnd {
-            turn: 1,
-            step: 2,
-            outcome: "completed".into(),
-            usage: None,
-            error: None,
-        }
-    );
-    let step_json = serde_json::to_string(&legacy_step).unwrap();
-    assert!(!step_json.contains(r#""error":"#));
-
-    let legacy_turn: SessionTraceEvent =
-        serde_json::from_str(r#"{"kind":"turn-end","turn":1,"reason":"error"}"#).unwrap();
-    assert_eq!(
-        legacy_turn,
-        SessionTraceEvent::TurnEnd {
-            turn: 1,
-            reason: "error".into(),
-            error: None,
-            summary: None,
-        }
-    );
-    let turn_json = serde_json::to_string(&legacy_turn).unwrap();
-    assert!(!turn_json.contains(r#""error":"#));
-    assert!(!turn_json.contains(r#""summary":"#));
-
-    let err_step = SessionTraceEvent::StepEnd {
-        turn: 1,
-        step: 1,
-        outcome: "error".into(),
-        usage: None,
-        error: Some("upstream timeout".into()),
-    };
-    let err_step_json = serde_json::to_string(&err_step).unwrap();
-    assert!(err_step_json.contains(r#""error":"upstream timeout""#));
-    assert_eq!(
-        serde_json::from_str::<SessionTraceEvent>(&err_step_json).unwrap(),
-        err_step
-    );
-}
-
-#[test]
-fn tool_result_prune_is_log_only_projects_in_derive_messages_and_preserves_fork_parity() {
-    let store = SessionStore::new();
-    let s = store.create_with(SessionCreateOptions {
-        id: Some("prune-mem".into()),
-        ..Default::default()
-    });
-    s.append(SessionEvent::user("check foo.rs"));
-    s.append(SessionEvent::Assistant {
-        blocks: vec![ContentBlock::ToolCall {
-            id: "c1".into(),
-            name: "read".into(),
-            arguments: r#"{"path":"foo.rs"}"#.into(),
-        }],
-        replay: None,
-        usage: None,
-    });
-    s.append(SessionEvent::ToolResult {
-        tool_call_id: "c1".into(),
-        name: "read".into(),
-        content: "ORIGINAL_LARGE_BODY".into(),
-        is_error: false,
-        meta: None,
-    });
-    s.append(SessionEvent::Assistant {
-        blocks: vec![ContentBlock::ToolCall {
-            id: "c2".into(),
-            name: "read".into(),
-            arguments: r#"{"path":"foo.rs"}"#.into(),
-        }],
-        replay: None,
-        usage: None,
-    });
-    s.append(SessionEvent::ToolResult {
-        tool_call_id: "c2".into(),
-        name: "read".into(),
-        content: "NEWER_COMPLETE_BODY".into(),
-        is_error: false,
-        meta: None,
-    });
-
-    // 剪枝标记落盘为 LogOnly，不修改原始 seq=3 的 ToolResult
-    s.append_trace(SessionTraceEvent::ToolResultPrune {
-        target_seq: 3,
-        notice: "[Superseded by a newer read of this file]".into(),
-    });
-    assert_eq!(s.log().len(), 5, "ToolResultPrune must stay LogOnly");
-    assert_eq!(s.all_entries().len(), 6);
-    assert!(matches!(
-        &s.log()[2].event,
-        SessionEvent::ToolResult { content, .. } if content == "ORIGINAL_LARGE_BODY"
-    ));
-
-    let live_msgs = s.derive_messages();
-    assert_eq!(
-        live_msgs[2],
-        Message::Tool {
-            content: "[Superseded by a newer read of this file]".into(),
-            tool_call_id: "c1".into(),
-            is_error: false,
-        }
-    );
-    assert_eq!(
-        live_msgs[4],
-        Message::Tool {
-            content: "NEWER_COMPLETE_BODY".into(),
-            tool_call_id: "c2".into(),
-            is_error: false,
-        }
-    );
-
-    // 剪枝前切点 fork 保留原文；剪枝后切点 fork 与 live derive_messages 字节一致
-    let pre_prune_fork = store
-        .fork(&s.id, 5, SessionCreateOptions::default())
-        .unwrap();
-    assert_eq!(
-        pre_prune_fork.derive_messages()[2],
-        Message::Tool {
-            content: "ORIGINAL_LARGE_BODY".into(),
-            tool_call_id: "c1".into(),
-            is_error: false,
-        }
-    );
-
-    let post_prune_fork = store
-        .fork(&s.id, 6, SessionCreateOptions::default())
-        .unwrap();
-    assert_eq!(post_prune_fork.derive_messages(), live_msgs);
-}
-
-#[test]
-fn m3_legacy_json_approval_visibility_and_derive_messages_parity() {
-    use mizar_session::{EntryVisibility, TurnEndSummary};
-    use serde_json::json;
-
-    // 1. 旧版 ToolResult JSON 缺少 meta 字段时应正常反序列化为 meta: None，且序列化时省略 None
-    let legacy_res: SessionEvent = serde_json::from_str(
-        r#"{"type":"tool-result","tool_call_id":"c1","name":"read","content":"hi","is_error":false}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        legacy_res,
-        SessionEvent::ToolResult {
-            tool_call_id: "c1".into(),
-            name: "read".into(),
-            content: "hi".into(),
-            is_error: false,
-            meta: None,
-        }
-    );
-    let legacy_res_json = serde_json::to_string(&legacy_res).unwrap();
-    assert!(!legacy_res_json.contains(r#""meta""#));
-
-    // 2. Approval 事件具备 LogOnly 可见性与 "approval" kind_name
-    let approval_ev = SessionEvent::Trace {
-        detail: SessionTraceEvent::Approval {
-            tool_call_id: "call_app".into(),
-            tool: "bash".into(),
-            decision: "allow_once".into(),
-            resolved_by: "tui".into(),
-        },
-    };
-    assert_eq!(approval_ev.visibility(), EntryVisibility::LogOnly);
-    assert_eq!(approval_ev.kind_name(), "approval");
-    let approval_json = serde_json::to_string(&approval_ev).unwrap();
-    assert_eq!(
-        serde_json::from_str::<SessionEvent>(&approval_json).unwrap(),
-        approval_ev
-    );
-
-    // 3. 含 ToolResult.meta、Approval 与 TurnEnd.summary 的会话与不含它们的镜像会话 derive_messages() 完全一致
-    let store = SessionStore::new();
-    let rich = store.create_with(SessionCreateOptions {
-        id: Some("rich".into()),
-        ..Default::default()
-    });
-    let plain = store.create_with(SessionCreateOptions {
-        id: Some("plain".into()),
-        ..Default::default()
-    });
-
-    for (sess, with_meta) in [(&rich, true), (&plain, false)] {
-        sess.append_trace(SessionTraceEvent::TurnStart { turn: 1 });
-        sess.append(SessionEvent::user("patch lib.rs"));
-        sess.append(SessionEvent::Assistant {
-            blocks: vec![ContentBlock::ToolCall {
-                id: "c1".into(),
-                name: "edit".into(),
-                arguments: r#"{"path":"src/lib.rs"}"#.into(),
-            }],
-            replay: None,
-            usage: Some(TokenUsage {
-                input_tokens: 100,
-                output_tokens: 20,
-                ..Default::default()
-            }),
-        });
-        if with_meta {
-            sess.append_approval("c1", "edit", "allow_once", "tui");
-            sess.append_tool_result_with_meta(
-                "c1",
-                "edit",
-                "ok",
-                false,
-                Some(json!({
-                    "kind": "diff",
-                    "path": "src/lib.rs",
-                    "added": 2,
-                    "removed": 1,
-                    "diff": "--- a\n+++ b\n-old\n+new\n+more"
-                })),
-            );
-        } else {
-            sess.append_tool_result_with_meta("c1", "edit", "ok", false, None);
-        }
-        sess.append(SessionEvent::assistant_text("done"));
-        sess.append_trace(SessionTraceEvent::TurnEnd {
-            turn: 1,
-            reason: "completed".into(),
-            error: None,
-            summary: with_meta.then(|| TurnEndSummary {
-                duration_ms: 250,
-                files_changed: vec!["src/lib.rs".into()],
-                commands_run: 0,
-                tool_errors: 0,
-                usage: Some(TokenUsage {
-                    input_tokens: 100,
-                    output_tokens: 20,
-                    total_tokens: Some(120),
-                    ..Default::default()
-                }),
-            }),
-        });
-    }
-
-    assert_eq!(rich.derive_messages(), plain.derive_messages());
-    assert_eq!(rich.log().len(), plain.log().len());
-    assert_eq!(rich.all_entries().len(), plain.all_entries().len() + 1);
-}
-
-#[test]
-fn list_events_paged_supports_bidirectional_cursors_bounds_and_ascending_order() {
-    let store = SessionStore::new();
-    let s = store.create_with(SessionCreateOptions {
-        id: Some("paged".into()),
-        ..Default::default()
-    });
-    for i in 1..=6 {
-        s.append(SessionEvent::user(format!("msg-{i}")));
-    }
-    let seqs = |items: &[mizar_session::SessionEntry]| -> Vec<u64> {
-        items.iter().map(|e| e.seq).collect()
-    };
-
-    // 无游标：取最新 limit 条，保持 seq 升序
-    let (tail, more) = s.list_events_paged(None, None, 3);
-    assert_eq!(seqs(&tail), vec![4, 5, 6]);
-    assert!(more);
-
-    let (all_tail, more) = s.list_events_paged(None, None, 6);
-    assert_eq!(seqs(&all_tail), vec![1, 2, 3, 4, 5, 6]);
-    assert!(!more);
-
-    // 向前翻页（before_seq）：返回严格小于游标的最新 limit 条，仍保持 seq 升序
-    let (prev, more) = s.list_events_paged(Some(4), None, 2);
-    assert_eq!(seqs(&prev), vec![2, 3]);
-    assert!(more);
-
-    let (oldest, more) = s.list_events_paged(Some(3), None, 2);
-    assert_eq!(seqs(&oldest), vec![1, 2]);
-    assert!(!more);
-
-    // 向后增量拉取（after_seq）：返回严格大于游标的最旧 limit 条
-    let (next, more) = s.list_events_paged(None, Some(2), 2);
-    assert_eq!(seqs(&next), vec![3, 4]);
-    assert!(more);
-
-    let (end_next, more) = s.list_events_paged(None, Some(4), 3);
-    assert_eq!(seqs(&end_next), vec![5, 6]);
-    assert!(!more);
-
-    // 双向区间游标（after_seq < seq < before_seq）
-    let (mid, more) = s.list_events_paged(Some(6), Some(1), 2);
-    assert_eq!(seqs(&mid), vec![2, 3]);
-    assert!(more);
-
-    let (mid_exact, more) = s.list_events_paged(Some(5), Some(2), 2);
-    assert_eq!(seqs(&mid_exact), vec![3, 4]);
-    assert!(!more);
-
-    // 边界：limit=0 与空结果集
-    let (zero, more) = s.list_events_paged(None, None, 0);
-    assert!(zero.is_empty());
-    assert!(more);
-
-    let (empty_before, more) = s.list_events_paged(Some(1), None, 5);
-    assert!(empty_before.is_empty());
-    assert!(!more);
-
-    let (empty_after, more) = s.list_events_paged(None, Some(6), 5);
-    assert!(empty_after.is_empty());
-    assert!(!more);
+    app.fiber().dispose().await;
 }

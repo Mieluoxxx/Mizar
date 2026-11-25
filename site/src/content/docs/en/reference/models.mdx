@@ -1,0 +1,152 @@
+---
+title: models.json Routing & 16 Compat Flags
+description: Built-in provider resolution order, models.json schema, protocol adapters, all 16 CompatConfig flags, and provider recipes.
+group: reference
+order: 9
+---
+
+`mizar-llm-router` maps `~/.mizar/models.json`, `<workspace>/.mizar/models.json`, environment variables, and CLI overrides onto four protocol adapters: `openai-completions`, `openai-responses`, `anthropic-messages`, and offline `mock`.
+
+## Built-In Providers & Credential Precedence
+
+Without any `models.json`, exporting a credential env var or passing CLI overrides immediately enables the four built-in providers:
+
+| Built-In `--provider` | Default Protocol | Default `baseUrl` | Default Model | Credential Resolution Order |
+| :--- | :--- | :--- | :--- | :--- |
+| `openai` | `openai-completions` | `https://api.openai.com/v1` | `gpt-4o` | `API_KEY` → `OPENAI_API_KEY` |
+| `openai-responses` | `openai-responses` | `https://api.openai.com/v1` | `gpt-5` | `API_KEY` → `OPENAI_API_KEY` |
+| `anthropic` | `anthropic-messages` | `https://api.anthropic.com` | `claude-sonnet-4-5` | `API_KEY` → `ANTHROPIC_API_KEY` |
+| `deepseek` | `openai-completions` | `https://api.deepseek.com/v1` | `deepseek-chat` | `API_KEY` → `DEEPSEEK_API_KEY` |
+| `mock` | `mock` | — | `mock-v1` | Keyless (offline tool testing) |
+
+When `--provider` is omitted, resolution checks: active `models.json` default provider → ad-hoc route from `--protocol` / `--base-url` / `API_KEY` → env sniffing (`OPENAI_API_KEY` → `ANTHROPIC_API_KEY` → `DEEPSEEK_API_KEY`); if nothing matches, Mizar returns `LlmRouteError::NoRouteConfigured`.
+
+## `models.json` Schema & Credential Syntax
+
+Root keys live under `providers` using **camelCase**:
+
+- **Dynamic `apiKey` values**:
+  1. `$VAR_NAME` or `${VAR_NAME}`: Reads from environment
+  2. `!shell command`: Executes command at startup (ideal for macOS Keychain `security find-generic-password`)
+  3. Literal string: Static key (or pair with `apiKeyEnv: "VAR_NAME"`)
+
+### Provider-Level Fields
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `api` / `protocol` | `string` | `openai-completions` (`completions`), `openai-responses` (`responses`, `openai-codex-responses`, `azure-openai-responses`), `anthropic-messages` (`anthropic`, `messages`) |
+| `displayName` / `name` | `string` | Display label in `/model` picker |
+| `baseUrl` | `string` | API base URL |
+| `apiKey` / `apiKeyEnv` | `string` | Literal key, `$VAR`, `!cmd`, or env var name |
+| `model` | `string` | Default model ID for this provider (falls back to `models[0].id`) |
+| `maxTokens` | `number` | Default max output tokens |
+| `anthropicVersion` | `string` | Override `anthropic-version` header |
+| `useBearerAuth` / `authHeader` | `boolean` | Force `Authorization: Bearer` header when true |
+| `thinkingBudgetTokens` | `number` | Anthropic extended thinking budget |
+| `headers` | `Record<string, string>` | Additional HTTP request headers |
+| `compat` | `CompatConfig` | Provider-wide compatibility flags (all 16 below) |
+| `models` | `RouterModelConfig[]` | Declared model catalog |
+| `modelOverrides` | `Record<string, ModelOverride>` | Per-model partial overrides merged atop `models` |
+
+### Model-Level Fields (`models[]` & `modelOverrides`)
+
+| Key | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `string` | Wire model identifier |
+| `name` | `string` | Display name |
+| `api` / `baseUrl` | `string` | Per-model protocol or endpoint override |
+| `reasoning` | `boolean` | Enable reasoning effort cycling |
+| `reasoningEfforts` | `string[]` | Supported effort whitelist (e.g. `["low","medium","high"]`) |
+| `thinkingLevelMap` | `Record<string, string\|null>` | Remap or disable `off..max` levels per model |
+| `input` | `string[]` | Input modalities, e.g. `["text", "image"]` |
+| `contextWindow` | `number` | Context window size used by `mizar-compaction` B-5 |
+| `maxTokens` | `number` | Per-turn output token cap |
+| `cost` | `object` | Pricing (`input`, `output`, `cacheRead`, `cacheWrite`, `tiers`) |
+| `promptCache` | `{ short?: number, long?: number }` | Cache retention policy metadata |
+| `samplingParams` / `samplingParamsByThinkingLevel` | `object` | Fixed or effort-keyed sampling params (`temperature`, `top_p`, etc.) |
+| `headers` / `compat` | `object` | Per-model headers or overrides for the 16 compat flags |
+
+## All 16 `CompatConfig` Flags
+
+Third-party gateways and local inference servers (vLLM, Ollama, LiteLLM, Azure, OneAPI, DeepSeek) vary in wire expectations. All **16 `CompatConfig` fields** can be tuned at either provider or model level:
+
+| # | Field (& Alias) | Type | Default / Protocol Behavior |
+| :--- | :--- | :--- | :--- |
+| 1 | `thinkingFormat` | `string` | Completions: reasoning wire format (`"none"` \| `"deepseek"` \| `"openai"` \| `"openrouter"` \| `"qwen"`) |
+| 2 | `maxTokensField` | `string` | Completions: send `"max_tokens"` vs `"max_completion_tokens"` |
+| 3 | `supportsUsageInStreaming` (alias `includeUsage`) | `boolean` | Completions: attach `stream_options: { include_usage: true }` |
+| 4 | `supportsMaxOutputTokens` | `boolean` | Emit `max_output_tokens` on payload |
+| 5 | `forceAdaptiveThinking` | `boolean` | Anthropic: force adaptive thinking parameter mode |
+| 6 | `sendSessionAffinityHeaders` | `boolean` | Send session affinity headers to pin upstream cache routing |
+| 7 | `sessionAffinityFormat` | `string` | Affinity header style: `"none"` \| `"openai"` \| `"openrouter"` |
+| 8 | `supportsLongCacheRetention` | `boolean` | Allow sending extended prompt-cache retention parameter |
+| 9 | `supportsPromptCacheKey` | `boolean` | Allow sending `prompt_cache_key` field |
+| 10 | `supportsTemperature` | `boolean` | Set `false` for reasoning endpoints that reject `temperature` with 400 |
+| 11 | `supportsCacheControlOnTools` | `boolean` | Anthropic Messages: attach `cache_control` breakpoint at end of tool list |
+| 12 | `supportsStore` | `boolean` | OpenAI Responses: control explicit `store` field emission |
+| 13 | `supportsDeveloperRole` | `boolean` | OpenAI Responses: defaults to **`true`** (inlines system prompt as `developer` item; set `false` for `system` fallback) |
+| 14 | `supportsReasoningEffort` | `boolean` | Emit `reasoning` / `reasoning_effort` payload fields |
+| 15 | `supportsStrictMode` | `boolean` | Tools / Responses: defaults to **`false`**; controls `strict: true` on tool JSON schemas |
+| 16 | `useTopLevelInstructions` | `boolean` | OpenAI Responses: defaults to **`false`** (keeps `developer` prefix in `input`); set `true` only if gateway requires top-level `instructions` |
+
+## Provider Configuration Recipes
+
+<CodeTabs
+  tabs={[
+    {
+      label: 'OpenAI Responses + DeepSeek',
+      lang: 'json',
+      code: `{
+  "providers": {
+    "openai-responses": {
+      "api": "openai-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "$OPENAI_API_KEY",
+      "model": "gpt-5",
+      "compat": {
+        "supportsDeveloperRole": true,
+        "useTopLevelInstructions": false,
+        "supportsStrictMode": false
+      }
+    },
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "$DEEPSEEK_API_KEY",
+      "model": "deepseek-chat",
+      "compat": {
+        "thinkingFormat": "deepseek"
+      }
+    }
+  }
+}`,
+    },
+    {
+      label: 'macOS Keychain + Local vLLM',
+      lang: 'json',
+      code: `{
+  "providers": {
+    "anthropic": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "!security find-generic-password -a $USER -s mizar-anthropic -w",
+      "models": [
+        { "id": "claude-sonnet-4-5", "contextWindow": 200000, "reasoning": true }
+      ]
+    },
+    "local-vllm": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "apiKey": "dummy",
+      "model": "qwen2.5-coder-32b",
+      "compat": {
+        "thinkingFormat": "qwen",
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens"
+      }
+    }
+  }
+}`,
+    },
+  ]}
+/>

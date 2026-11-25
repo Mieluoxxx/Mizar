@@ -1,0 +1,199 @@
+---
+title: settings.json, Plugin Toggles & mcp.json
+description: Config merge precedence, complete settings.json schema, disabledPlugins with 10 host extension IDs, and mcp.json schema.
+group: reference
+order: 8
+---
+
+Mizar parses config files with strict JSON (`serde_json`): UTF-8 BOM is stripped automatically, but **JSONC comments and trailing commas are rejected**. Syntax errors pinpoint file path and line number in the startup banner.
+
+<DiagramEmbed
+  id="config-precedence"
+  caption="FIG 05: Four-tier config precedence — scalar fields use last-write-wins while list exclusions union-append cleanly."
+/>
+
+## Locations & Merge Semantics
+
+Two on-disk scopes merge in ascending priority before env vars and CLI flags (both skipped under `--isolated`):
+
+1. **Global**: `~/.mizar/settings.json` (overridable via `MIZAR_HOME`)
+2. **Project**: `<workspace>/.mizar/settings.json`
+3. **Live Persistence**: Toggling settings or plugins via `/settings` atomically patches `settings.json`.
+
+Dual-track merge behavior:
+- **Scalars & nested objects** (`defaultModel`, `compaction.triggerRatio`, `ui.theme`): Project keys override global keys field by field.
+- **Set/list fields**: `excludeTools`, `skills.customDirs`, and `disabledPlugins` **union-append and deduplicate**, so project configs never silently erase global guardrails.
+
+## Complete `settings.json` Schema
+
+All JSON keys use **camelCase**:
+
+### Top-Level Fields
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `defaultProvider` | `string` | `null` | Default provider ID (built-in or `models.json` key) |
+| `defaultModel` | `string` | `null` | Default model ID |
+| `reasoningEffort` | `string` | `null` | Default effort (alias `defaultThinkingLevel`): `off`..`max` |
+| `maxSteps` | `number` | `null` (unlimited) | Max tool steps per turn |
+| `persona` | `string` | Built-in static English | Overrides Section 1 identity text in system prompt |
+| `toolsPreset` | `string` | `"all"` | Preset: `"all"` \| `"minimal"` \| `"read-only"` |
+| `tools` | `string[]` | `null` | Explicit tool allowlist (same as `--tools`) |
+| `excludeTools` | `string[]` | `[]` | Glob patterns forced to `Hidden` (union-merged across layers) |
+| `disabledPlugins` | `string[]` | `[]` | Cordis module or host extension IDs to disable (sorted/deduped union) |
+| `restrictToWorkspace` | `boolean` | `false` | Scope built-in file tools to canonical workspace tree (**does NOT restrict `bash`**) |
+| `sessionDb` | `string` | `~/.mizar/sessions.sqlite` | SQLite DB path; `"none"` or `"off"` disables disk writes |
+
+### `codemode` — Always-On QuickJS Sandbox
+
+In this branch `codemode` is **always active by default** (no `autoEnable` field). To disable it, add `"codemode"` to `disabledPlugins` or `excludeTools`:
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `codemode.onlyMode` | `boolean` | `false` | Hide `Direct` coding schemas from model so all tool calls go through `codemode` JS |
+| `codemode.inlineBudget` | `number` | `3000` | Max inline character budget for tool synopsis descriptions |
+| `codemode.timeoutMs` | `number` | `120000` | QuickJS execution timeout in milliseconds |
+
+### `toolSearch` — MCP BM25 Lazy Discovery
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `toolSearch.autoEnable` | `boolean` | `true` | Auto-enable `tool_search` when external `Codemode` / `Deferred` MCP tools exist |
+| `toolSearch.defaultLimit` | `number` | `8` | Default max hits returned per BM25 search |
+
+### `skills` — Progressive Skill Discovery
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `skills.enabled` | `boolean` | `true` | Enable `SKILL.md` scanning and the `skill` tool |
+| `skills.customDirs` | `string[]` | `[]` | Additional skill root directories (union-merged) |
+| `skills.bundledDir` | `string` | `null` | Override bundled skills directory path |
+| `skills.catalogDescriptionMaxLength` | `number` | `500` | Max chars per skill description in catalog |
+
+### `instructions` — Startup-Static Instructions
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `instructions.enabled` | `boolean` | `true` | Enable startup `AGENTS.md` / `CLAUDE.md` injection |
+| `instructions.candidates` | `string[]` | `["AGENTS.md", "CLAUDE.md"]` | Primary instruction filenames |
+| `instructions.localCandidates` | `string[]` | `["AGENTS.local.md", "CLAUDE.local.md"]` | Local override filenames |
+| `instructions.projectRootMarkers` | `string[]` | `[".git"]` | Ancestor walk boundary markers |
+| `instructions.maxBytes` | `number` | `65536` | Total byte cap across all loaded instruction files (evicts furthest ancestors first) |
+| `instructions.maxSourceBytes` | `number` | `1048576` | Max bytes read from any single instruction file (1 MiB) |
+
+### `compaction` — Cache-Aware Tail Pruning & B-5 Compaction
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `compaction.enabled` | `boolean` | `true` | Enable compaction runtime and `FileGuardTracker` |
+| `compaction.autoCompact` | `boolean` | `true` | Automatically summarize when usage crosses trigger threshold |
+| `compaction.maxContextTokens` | `number` | `null` | Optional ceiling capping computed `effective_window` |
+| `compaction.triggerRatio` | `number` | `0.80` | Fraction of `effective_window` that triggers auto-compaction |
+| `compaction.keepRecentTokens` | `number` | `20000` | Minimum recent context tokens preserved verbatim across compaction |
+| `compaction.supersedeReads` | `boolean` | `true` | Tail-prune older `read` outputs superseded by a full re-read (protects 8k warm suffix) |
+| `compaction.dropUseless` | `boolean` | `true` | Tail-prune zero-hit noise outputs (always protects `skill` and 8k warm suffix) |
+
+### `recall` — Single Static Episode Recall
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `recall.enabled` | `boolean` | `true` | Enable the static `recall` tool |
+| `recall.defaultSearchLimit` | `number` | `8` | Default hits returned by `recall(query=...)` (hard cap `20`) |
+| `recall.readCharLimit` | `number` | `6000` | Default character page limit for `recall(seq=...)` (hard cap `8192`) |
+
+### `sessionTitle` & `ui`
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `sessionTitle.enabled` | `boolean` | `true` | Enable async background session title generation |
+| `sessionTitle.model` | `string` | `null` | Dedicated model ID for title generation (defaults to active session route) |
+| `sessionTitle.thinkingLevel` | `string` | `"low"` | Thinking level used when generating titles (falls back to `"low"`) |
+| `ui.theme` | `string` | `"auto"` | Active TUI theme |
+| `ui.screenMode` | `string` | `"fullscreen"` | Launch viewport: `"fullscreen"` \| `"inline"` |
+| `ui.showThinking` | `boolean` | `false` | Expand reasoning blocks & full tool args by default |
+| `ui.verboseExpanded` | `boolean` | `false` | Render verbose tool cards by default |
+| `ui.sidePanelOpen` | `boolean` | `false` | Open split side panel on startup when terminal is wide enough |
+| `ui.mouseCapture` | `boolean` | `true` (Fullscreen) | Enable mouse capture (`false` by default in Inline mode) |
+| `ui.approvalMode` | `string` | `"auto"` | Default mutating tool gate: `"auto"` \| `"ask"` |
+
+```json title="~/.mizar/settings.json (Recommended Developer Baseline)" kind="file"
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-chat",
+  "restrictToWorkspace": true,
+  "codemode": {
+    "timeoutMs": 120000
+  },
+  "compaction": {
+    "triggerRatio": 0.80,
+    "keepRecentTokens": 20000,
+    "supersedeReads": true,
+    "dropUseless": true
+  },
+  "ui": {
+    "theme": "auto",
+    "approvalMode": "ask"
+  }
+}
+```
+
+## Complete `disabledPlugins` IDs
+
+### 1. Optional Built-In Cordis Modules (13 IDs)
+
+Can be toggled at startup via `settings.json` or live in `/settings`:
+
+`compaction`, `tool-time`, `tool-fs`, `tools-coding`, `tool-search`, `codemode`, `mcp`, `skills`, `instructions`, `recall`, `session-title`, `trajectory`, `repeat-guard`
+
+### 2. Official Host & TUI Extension IDs (10 `KNOWN_HOST_EXTENSION_IDS`)
+
+Controlled by `mizar-client` and `mizar-tui` (`"tui"` cascades to all `tui-*` UI features and refuses to enter terminal raw mode):
+
+`file-mentions`, `local-bash`, `approval-gate`, `tui`, `tui-emphasis`, `tui-side-panel`, `tui-timeline-rail`, `tui-trajectory-view`, `tui-selection`, `tui-clipboard`
+
+### 3. Protected Core Services (6 IDs — Cannot Be Disabled)
+
+Protected by Gate 2 inside `SpinePlugins`:
+
+`llm`, `sessions`, `tools`, `systemPrompt`, `agentLoop`, `spinePlugins`
+
+## Complete `mcp.json` Schema
+
+Loads `~/.mizar/mcp.json` and `<workspace>/.mizar/mcp.json`. Workspace entries that omit both `command` and `url` merge as partial overrides (`enabled`, `exposure`, `toolExposure`, etc.) on top of matching global entries.
+
+| Key | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `mcpServers.<name>.command` | `string` | `null` | Stdio executable path/name (mutually exclusive with `url`) |
+| `mcpServers.<name>.args` | `string[]` | `[]` | Stdio CLI arguments |
+| `mcpServers.<name>.env` | `Record<string, string>` | `{}` | Environment variables passed to stdio child |
+| `mcpServers.<name>.cwd` | `string` | `null` | Working directory for stdio child |
+| `mcpServers.<name>.url` | `string` | `null` | Streamable HTTP / SSE server endpoint URL |
+| `mcpServers.<name>.headers` | `Record<string, string>` | `{}` | Extra HTTP headers (e.g. `Authorization`) |
+| `mcpServers.<name>.enabled` | `boolean` | `true` | Connect and register tools from this server |
+| `mcpServers.<name>.exposure` | `"codemode"` \| `"deferred"` \| `"direct"` \| `"hidden"` | `"codemode"` | Server-wide default exposure tier |
+| `mcpServers.<name>.toolExposure` | `Record<string, Exposure>` | `{}` | Per-tool or glob override (longest specific match wins) |
+| `mcpServers.<name>.description` | `string` | `null` | Human-readable note |
+| `mcpServers.<name>.timeoutMs` | `number` | `null` | Per-call RPC timeout in milliseconds |
+
+```json title=".mizar/mcp.json (Stdio & HTTP Examples)" kind="file"
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..." },
+      "exposure": "codemode",
+      "toolExposure": {
+        "delete_*": "hidden",
+        "search_code": "direct"
+      }
+    },
+    "docs": {
+      "url": "https://docs.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" },
+      "exposure": "deferred",
+      "timeoutMs": 30000
+    }
+  }
+}
+```

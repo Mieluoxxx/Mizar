@@ -21,7 +21,7 @@
 
 ---
 
-**Mizar** is a Rust workspace (10-crate static `MizarRuntime` + `mizar-tui`) for heavy command-line coding workflows—featuring Fullscreen/Inline dual viewports, headless `mizar exec`, persistent background `subagent` workers, local `!` / `!!` shell execution, hierarchical `AGENTS.md` rules, MCP servers, and an isolated QuickJS orchestration sandbox.
+**Mizar** is a Rust workspace (`cordis` plugin microkernel + `mizar-tui`) for heavy command-line coding workflows—featuring Fullscreen/Inline dual viewports, local `!` / `!!` shell execution, hierarchical `AGENTS.md` rules, MCP servers, and an isolated QuickJS orchestration sandbox.
 
 ### Quick Start
 
@@ -53,7 +53,7 @@ cargo install --path crates/mizar-tui
 - **Local Bash (`!` / `!!`)**: Run `!cmd` to feed command output into the next model turn, or `!!cmd` to run locally with zero token cost.
 - **Rules & Skills**: Hierarchical `AGENTS.md` / `CLAUDE.md` discovery under a `64 KiB` budget plus hot-reloaded `SKILL.md` workflows.
 - **MCP & Codemode**: Connect Stdio/HTTP MCP servers via `mcp.json`, discover large tool catalogs on demand with `tool_search`, and batch-call tools inside an isolated QuickJS (`rquickjs`) sandbox.
-- **Providers, Compaction & Execution**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by WAL SQLite sessions (`/tree` branching, single-stage checkpoint `/compact` + static `recall` with FTS5, `/trace` profiler, headless `mizar exec --trace-out`, streaming `--trace-jsonl` trajectory logs, and persistent `subagent`).
+- **Providers & Persistence**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by WAL SQLite sessions (`/tree` branching, `/compact` + FTS5 recall, & `/trace` profiler).
 
 ### Documentation & Development
 
@@ -63,7 +63,7 @@ cargo install --path crates/mizar-tui
   pnpm --dir site install --frozen-lockfile
   pnpm --dir site dev
   ```
-- **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (10 workspace crates assembled via static `MizarRuntime` and typed `mizar-types::hooks`)
+- **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (30 workspace crates built on `cordis`)
 - **Contributing**: [`CONTRIBUTING.md`](CONTRIBUTING.md) · **Repository Rules**: [`AGENTS.md`](AGENTS.md)
 
 ### License

@@ -1,0 +1,152 @@
+---
+title: models.json 路由协议与 16 项 compat 开关
+description: 内置提供方与凭据解析顺序、models.json Schema、三协议适配器、全部 16 项 CompatConfig 参数及常用模板。
+group: reference
+order: 9
+---
+
+`mizar-llm-router` 将声明式路由配置 `~/.mizar/models.json`（及工作区 `.mizar/models.json`）与 CLI/环境变量统一映射为四类协议适配器：`openai-completions`、`openai-responses`、`anthropic-messages` 与离线 `mock`。
+
+## 内置提供方与凭据解析顺序
+
+未配置 `models.json` 时，只要导出对应环境变量或通过 CLI 指定参数即可直接运行四大内置提供方：
+
+| 内置 `--provider` ID | 默认协议 | 默认 `baseUrl` | 默认模型 | 对应凭据环境变量 |
+| :--- | :--- | :--- | :--- | :--- |
+| `openai` | `openai-completions` | `https://api.openai.com/v1` | `gpt-4o` | `API_KEY` → `OPENAI_API_KEY` |
+| `openai-responses` | `openai-responses` | `https://api.openai.com/v1` | `gpt-5` | `API_KEY` → `OPENAI_API_KEY` |
+| `anthropic` | `anthropic-messages` | `https://api.anthropic.com` | `claude-sonnet-4-5` | `API_KEY` → `ANTHROPIC_API_KEY` |
+| `deepseek` | `openai-completions` | `https://api.deepseek.com/v1` | `deepseek-chat` | `API_KEY` → `DEEPSEEK_API_KEY` |
+| `mock` | `mock` | — | `mock-v1` | 无需密钥（离线工具演练） |
+
+未传 `--provider` 时，路由探测顺序为：激活的 `models.json` 默认提供方 → 显式 `--protocol` / `--base-url` / `API_KEY` 构造的临时路由 → 环境变量嗅探（`OPENAI_API_KEY` → `ANTHROPIC_API_KEY` → `DEEPSEEK_API_KEY`）；若全部缺失则明确报 `LlmRouteError::NoRouteConfigured`。
+
+## `models.json` 结构与凭据语法
+
+根对象包含 `providers` 映射，每项对应一个提供方；单个字段均采用 **camelCase**：
+
+- **动态密钥解析（`apiKey`）**：支持三种形式：
+  1. `$VAR_NAME` 或 `${VAR_NAME}`：从环境变量读取
+  2. `!shell command`：启动时执行命令读取系统钥匙串输出（例如 macOS `security find-generic-password`）
+  3.  literal 字符串：直接填密钥（或单独配合 `apiKeyEnv: "ENV_NAME"`）
+
+### Provider 级字段
+
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `api` / `protocol` | `string` | `openai-completions`（`completions`）、`openai-responses`（`responses`、`openai-codex-responses`、`azure-openai-responses`）、`anthropic-messages`（`anthropic`、`messages`） |
+| `displayName` / `name` | `string` | UI 选择器展示名称 |
+| `baseUrl` | `string` | 接口基地址 |
+| `apiKey` / `apiKeyEnv` | `string` | 密钥字面量、`$VAR`、`!cmd` 或环境变量名 |
+| `model` | `string` | 该提供方默认模型 ID（缺省取 `models[0].id`） |
+| `maxTokens` | `number` | 默认输出 Token 上限 |
+| `anthropicVersion` | `string` | Anthropic `anthropic-version` 头覆写 |
+| `useBearerAuth` / `authHeader` | `boolean` | 在需要强制 `Authorization: Bearer` 鉴权头时设为 `true` |
+| `thinkingBudgetTokens` | `number` | Anthropic 推理思考预算 Token 数 |
+| `headers` | `Record<string, string>` | 附加自定义 HTTP 请求头 |
+| `compat` | `CompatConfig` | 提供方级兼容开关，见下表 16 项 |
+| `models` | `RouterModelConfig[]` | 模型目录定义列表 |
+| `modelOverrides` | `Record<string, ModelOverride>` | 按模型 ID 增量覆盖 `models` 中的字段与 `compat` |
+
+### Model 级字段（`models[]` 与 `modelOverrides`）
+
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `id` | `string` | 模型唯一标识（向网关发送的 `model` 字段） |
+| `name` | `string` | 展示名称 |
+| `api` / `baseUrl` | `string` | 单模型级覆盖提供方协议或端点 |
+| `reasoning` | `boolean` | 声明是否支持推理档位切换 |
+| `reasoningEfforts` | `string[]` | 允许的思考档位白名单（如 `["low","medium","high"]`） |
+| `thinkingLevelMap` | `Record<string, string\|null>` | 将统一 `off..max` 映射或置空为目标模型期望参数值 |
+| `input` | `string[]` | 支持模态，如 `["text", "image"]` |
+| `contextWindow` | `number` | 上下文总窗口大小（供 `mizar-compaction` B-5 计算阈值） |
+| `maxTokens` | `number` | 模型单次最大输出 Token 数 |
+| `cost` | `object` | 计费单价：`input`、`output`、`cacheRead`、`cacheWrite` 及分级 `tiers` |
+| `promptCache` | `{ short?: number, long?: number }` | 声明缓存保留策略 |
+| `samplingParams` / `samplingParamsByThinkingLevel` | `object` | 静态或分档位采样参数（如 `temperature`、`top_p`） |
+| `headers` / `compat` | `object` | 单模型覆盖自定义头或下方 16 项兼容开关 |
+
+## 全部 16 项 `CompatConfig` 兼容开关
+
+面对各家第三方兼容代理、网关或本地推理引擎（vLLM、Ollama、LiteLLM、Azure、DeepSeek 等）细微的参数差异，可在 `provider.compat` 或 `model.compat` 中精确微调 **全部 16 项兼容参数**：
+
+| # | 字段名（与别名） | 类型 | 默认 / 行为与适用协议 |
+| :--- | :--- | :--- | :--- |
+| 1 | `thinkingFormat` | `string` | Completions：控制思考/推理字段解析与发送格式，支持 `"none"` \| `"deepseek"` \| `"openai"` \| `"openrouter"` \| `"qwen"` |
+| 2 | `maxTokensField` | `string` | Completions：控制输出上限字段名为 `"max_tokens"` 或 `"max_completion_tokens"` |
+| 3 | `supportsUsageInStreaming`（别名 `includeUsage`） | `boolean` | Completions：控制流式请求是否发送 `stream_options: { include_usage: true }` |
+| 4 | `supportsMaxOutputTokens` | `boolean` | 控制是否在请求体携带 `max_output_tokens` |
+| 5 | `forceAdaptiveThinking` | `boolean` | Anthropic：强制按自适应思考模式提交参数 |
+| 6 | `sendSessionAffinityHeaders` | `boolean` | 是否在请求头发送会话亲和字段以提升服务端缓存路由命中 |
+| 7 | `sessionAffinityFormat` | `string` | 亲和头格式：`"none"` \| `"openai"` \| `"openrouter"` |
+| 8 | `supportsLongCacheRetention` | `boolean` | 声明是否允许发送长保留时间 Prompt Cache 策略参数 |
+| 9 | `supportsPromptCacheKey` | `boolean` | 声明网关是否接受 `prompt_cache_key` 请求字段 |
+| 10 | `supportsTemperature` | `boolean` | 当模型或网关禁止传 `temperature`（如部分推理模型报 400）时设为 `false` |
+| 11 | `supportsCacheControlOnTools` | `boolean` | Anthropic Messages：是否在工具声明末尾放置 `cache_control` 断点 |
+| 12 | `supportsStore` | `boolean` | OpenAI Responses：控制是否显式下发 `store` 字段 |
+| 13 | `supportsDeveloperRole` | `boolean` | OpenAI Responses：默认 **`true`**，将系统消息作为首位 `developer` role 内联进 `input`（不兼容 `developer` 的网关请设为 `false` 退回 `system`） |
+| 14 | `supportsReasoningEffort` | `boolean` | 控制是否下发 `reasoning` / `reasoning_effort` 参数 |
+| 15 | `supportsStrictMode` | `boolean` | OpenAI Responses / Tools：默认 **`false`**，是否在函数声明中发送 `strict: true` Schema 约束 |
+| 16 | `useTopLevelInstructions` | `boolean` | OpenAI Responses：默认 **`false`**（推荐内联 `developer` 以命中前缀缓存）；仅要求必须走顶层 `instructions` 字段的网关才设为 `true` |
+
+## 常用接入配置模板
+
+<CodeTabs
+  tabs={[
+    {
+      label: 'OpenAI Responses + DeepSeek',
+      lang: 'json',
+      code: `{
+  "providers": {
+    "openai-responses": {
+      "api": "openai-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "$OPENAI_API_KEY",
+      "model": "gpt-5",
+      "compat": {
+        "supportsDeveloperRole": true,
+        "useTopLevelInstructions": false,
+        "supportsStrictMode": false
+      }
+    },
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "$DEEPSEEK_API_KEY",
+      "model": "deepseek-chat",
+      "compat": {
+        "thinkingFormat": "deepseek"
+      }
+    }
+  }
+}`,
+    },
+    {
+      label: 'macOS 钥匙串 + 本地 vLLM',
+      lang: 'json',
+      code: `{
+  "providers": {
+    "anthropic": {
+      "api": "anthropic-messages",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKey": "!security find-generic-password -a $USER -s mizar-anthropic -w",
+      "models": [
+        { "id": "claude-sonnet-4-5", "contextWindow": 200000, "reasoning": true }
+      ]
+    },
+    "local-vllm": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "apiKey": "dummy",
+      "model": "qwen2.5-coder-32b",
+      "compat": {
+        "thinkingFormat": "qwen",
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens"
+      }
+    }
+  }
+}`,
+    },
+  ]}
+/>
