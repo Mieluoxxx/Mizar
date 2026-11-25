@@ -39,12 +39,13 @@ use mizar_tools::{ToolAnnotations, ToolDefinition, ToolOutput};
 use mizar_types::ApprovalMode;
 use mizar_types::BoxError;
 use mizar_types::rpc::{
-    AuthHelloResult, CapabilitiesListResult, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
-    ERR_PARSE_ERROR, ERR_SESSION_NOT_FOUND, ERR_UNAUTHORIZED, InteractionResolveResult, JsonRpcId,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, METHOD_AUTH_HELLO, QueuePopAllResult,
-    QueueRemoveResult, ResolvedBy, RpcApprovalDecision, RpcApprovalMode, RpcNotification,
-    RpcSubagentStatus, SessionConfigResult, SessionEventsResult, SessionForkResult,
-    SessionListResult, SessionRuntimeState, SessionSubscribeSnapshot, SessionTreeResult,
+    AuthHelloResult, BashRunResult, CapabilitiesListResult, ERR_INVALID_PARAMS,
+    ERR_METHOD_NOT_FOUND, ERR_PARSE_ERROR, ERR_SESSION_NOT_FOUND, ERR_UNAUTHORIZED,
+    InteractionResolveResult, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    METHOD_AUTH_HELLO, QueuePopAllResult, QueueRemoveResult, ResolvedBy, RpcApprovalDecision,
+    RpcApprovalMode, RpcNotification, RpcSubagentStatus, SessionCompactResult, SessionConfigResult,
+    SessionEventsResult, SessionForkResult, SessionListResult, SessionNewResult,
+    SessionRuntimeState, SessionSubscribeSnapshot, SessionSwitchResult, SessionTreeResult,
     StreamDeltaKind, SubmitMode, TurnCancelResult, TurnSubmitResult,
 };
 use serde_json::{Value, json};
@@ -1829,5 +1830,124 @@ async fn e2e_8_loopback_tcp_auth_gate_and_live_rpc_roundtrip() {
 
     server_no_tcp.shutdown().await;
     actor_no_tcp.shutdown().await;
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_9_session_new_switch_compact_bash_run_and_client_tracker() {
+    let ws = TempDirGuard::new("rpc_e2e_9");
+    let run_dir = ws.path().join("run");
+    let mut cfg = AgentSpineConfig::coding(ws.path());
+    cfg.session_db_path = None;
+    let rt = MizarRuntime::build(cfg).await.unwrap();
+    rt.register_mock_adapter().unwrap();
+    let sess = rt.sessions.create_with(Default::default());
+
+    let actor = SessionActor::spawn(
+        Arc::clone(&rt),
+        Arc::clone(&sess),
+        SessionActorConfig::new(ws.path())
+            .with_run_dir(&run_dir)
+            .with_provider_model(Some("mock".into()), Some("mock-v1".into()), None),
+    );
+    let meta = ProcessMeta::for_current_process(
+        &run_dir,
+        &sess.id,
+        ws.path().display().to_string(),
+        Some("mock".into()),
+        Some("mock-v1".into()),
+    );
+    let reg = ProcessRegistration::create(&run_dir, meta).unwrap();
+    let server = RpcServer::start(actor.clone(), reg, RpcServerConfig::default()).unwrap();
+    let tcp_addr = server.tcp_addr().unwrap();
+    let token = server.rpc_token().unwrap().to_string();
+
+    assert!(!server.ever_connected());
+    assert_eq!(server.active_clients(), 0);
+
+    // 未认证 / 错误 token 不应污染 ever_connected 与 active_clients
+    let mut unauthed = RpcTestClient::connect_tcp(tcp_addr).await;
+    let unauth_resp = unauthed
+        .call_raw(METHOD_AUTH_HELLO, Some(json!({ "token": "wrong-token" })))
+        .await;
+    let unauth_err = unauth_resp.error.expect("expected unauthorized error");
+    assert_eq!(unauth_err.code, ERR_UNAUTHORIZED);
+    drop(unauthed);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(!server.ever_connected());
+    assert_eq!(server.active_clients(), 0);
+
+    // 认证后客户端计数 + session.subscribe
+    let mut client = RpcTestClient::connect_tcp(tcp_addr).await;
+    assert!(client.auth_hello(&token).await.ok);
+    assert!(server.ever_connected());
+    assert_eq!(server.active_clients(), 1);
+
+    let snap: SessionSubscribeSnapshot = client
+        .call_ok("session.subscribe", Some(json!({ "session_id": sess.id })))
+        .await;
+    assert_eq!(snap.session.id, sess.id);
+
+    // bash.run 执行本地命令并触发 BashExecution CommittedEventDto
+    let bash_res: BashRunResult = client
+        .call_ok(
+            "bash.run",
+            Some(json!({
+                "session_id": sess.id,
+                "command": "echo MIZAR_E2E_BASH_OK",
+                "exclude_from_context": true
+            })),
+        )
+        .await;
+    assert_eq!(bash_res.exit_code, Some(0));
+    assert!(!bash_res.cancelled);
+    assert!(bash_res.exclude_from_context);
+    assert!(bash_res.output.contains("MIZAR_E2E_BASH_OK"));
+
+    let mut saw_bash_committed = false;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !saw_bash_committed {
+            let (_, notif) = client.next_notification().await;
+            if let RpcNotification::EventCommitted(ev) = notif
+                && ev.kind == "bash-execution"
+            {
+                saw_bash_committed = true;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for bash-execution committed notification");
+
+    // session.compact（当前 0 tokens -> 安全跳过并返回结构化消息）
+    let compact_res: SessionCompactResult = client
+        .call_ok("session.compact", Some(json!({ "session_id": sess.id })))
+        .await;
+    assert!(!compact_res.message.is_empty());
+
+    // session.new 创建新会话，再通过 session.switch 切回旧会话
+    let new_res: SessionNewResult = client
+        .call_ok("session.new", Some(json!({ "title": "Fresh Session" })))
+        .await;
+    assert_ne!(new_res.session.id, sess.id);
+    assert_eq!(new_res.session.title.as_deref(), Some("Fresh Session"));
+
+    let sw_res: SessionSwitchResult = client
+        .call_ok("session.switch", Some(json!({ "session_id": sess.id })))
+        .await;
+    assert_eq!(sw_res.session.id, sess.id);
+
+    // 断开客户端后 active_clients 归零，ever_connected 保持为 true
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.active_clients() > 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("active_clients should drop to 0 after disconnect");
+    assert!(server.ever_connected());
+
+    server.shutdown().await;
+    actor.shutdown().await;
     rt.shutdown().await;
 }

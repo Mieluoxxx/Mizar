@@ -19,6 +19,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use mizar_core::agent_loop::{
     AgentError, AgentEvent, DeliveryMode, RunOptions, TurnEndReason, TurnInput,
 };
+use mizar_core::compaction::{CompactionOutcome, ManualCompactOptions};
 use mizar_core::skills::SkillLookupOptions;
 use mizar_core::spine::{CompactionTrigger, MizarRuntime};
 use mizar_core::subagent::{SubagentMode, SubagentRunStatus, SubagentTaskSnapshot};
@@ -33,13 +34,14 @@ use mizar_types::client::{
     ApprovalDecision, ApprovalMode, ClientEvent, HostExtensionFlags, McpSummaryRow, SkillPickerItem,
 };
 use mizar_types::rpc::{
-    ActiveTurnDto, CapabilitiesListResult, CommittedEventDto, InteractionResolveParams,
-    InteractionResolveResult, JsonRpcError, QueuePopAllResult, QueueRemoveResult,
-    QueueUpdatedNotification, QueuedInputDto, ResolvedBy, RpcApprovalMode, RpcAttachmentDto,
-    RpcEventVisibility, RpcNotification, RpcSubagentMode, RpcSubagentStatus, RunningToolDto,
-    SessionConfigDto, SessionConfigParams, SessionConfigResult, SessionContextUsageDto,
-    SessionEventsParams, SessionEventsResult, SessionForkParams, SessionForkResult,
-    SessionListItemDto, SessionListParams, SessionListResult, SessionMetaDto, SessionRuntimeState,
+    ActiveTurnDto, BashRunParams, BashRunResult, CapabilitiesListResult, CommittedEventDto,
+    InteractionResolveParams, InteractionResolveResult, JsonRpcError, QueuePopAllResult,
+    QueueRemoveResult, QueueUpdatedNotification, QueuedInputDto, ResolvedBy, RpcApprovalMode,
+    RpcAttachmentDto, RpcEventVisibility, RpcNotification, RpcSubagentMode, RpcSubagentStatus,
+    RunningToolDto, SessionCompactParams, SessionCompactResult, SessionConfigDto,
+    SessionConfigParams, SessionConfigResult, SessionContextUsageDto, SessionEventsParams,
+    SessionEventsResult, SessionForkParams, SessionForkResult, SessionListItemDto,
+    SessionListParams, SessionListResult, SessionMetaDto, SessionRuntimeState,
     SessionSubscribeParams, SessionSubscribeSnapshot, SessionSwitchedNotification,
     SessionTreeResult, SlashCommandDto, StreamDeltaKind, StreamDeltaNotification,
     SubagentSnapshotDto, SubagentUpdatedNotification, SubmitMode, TurnCancelResult,
@@ -59,6 +61,7 @@ use crate::events::{
     ActiveTaskKind, RunController, to_ui_status, to_ui_step_outcome, to_ui_turn_end_reason,
 };
 use crate::images::{ImageProcessError, process_image_bytes};
+use crate::local_bash::{execute_local_bash_for_session, next_local_bash_call_id};
 use crate::mentions::{FileMentionsConfig, install_file_mentions};
 use crate::run_dir::{
     ProcessRegistration, SessionLockError, check_session_writable, scan_live_processes,
@@ -939,22 +942,7 @@ impl SessionActorHandle {
         params: TurnSubmitParams,
     ) -> Result<TurnSubmitResult, ActorError> {
         self.ensure_alive()?;
-        let active_session = self.inner.current_session();
-        if params.session_id != active_session.id {
-            if self
-                .inner
-                .runtime
-                .sessions
-                .get(&params.session_id)
-                .is_none()
-            {
-                return Err(ActorError::SessionNotFound(params.session_id));
-            }
-            return Err(ActorError::InvalidParams(format!(
-                "会话 `{}` 非当前活跃会话，仅支持向 `{}` 提交输入",
-                params.session_id, active_session.id
-            )));
-        }
+        let active_session = self.ensure_active_session(&params.session_id, "向其提交输入")?;
 
         let raw_attachments = params.attachments.clone().unwrap_or_default();
         if params.text.trim().is_empty() && raw_attachments.is_empty() {
@@ -1166,22 +1154,7 @@ impl SessionActorHandle {
         params: SessionConfigParams,
     ) -> Result<SessionConfigResult, ActorError> {
         self.ensure_alive()?;
-        let active_session = self.inner.current_session();
-        if params.session_id != active_session.id {
-            if self
-                .inner
-                .runtime
-                .sessions
-                .get(&params.session_id)
-                .is_none()
-            {
-                return Err(ActorError::SessionNotFound(params.session_id));
-            }
-            return Err(ActorError::InvalidParams(format!(
-                "会话 `{}` 非当前活跃会话，仅支持调整 `{}` 的运行配置",
-                params.session_id, active_session.id
-            )));
-        }
+        let active_session = self.ensure_active_session(&params.session_id, "调整其运行配置")?;
 
         let cfg = {
             let mut guard = self.inner.runtime_config.lock().unwrap();
@@ -1467,6 +1440,162 @@ impl SessionActorHandle {
         })
     }
 
+    /// 手动压缩当前活跃会话上下文（落盘 `SessionEvent::Compaction` 并广播 `event.committed`）。
+    pub async fn compact_session(
+        &self,
+        params: SessionCompactParams,
+    ) -> Result<SessionCompactResult, ActorError> {
+        self.ensure_alive()?;
+        let active_session = self.ensure_active_session(&params.session_id, "执行上下文压缩")?;
+        let Some(compaction) = self.inner.runtime.compaction.as_ref().map(Arc::clone) else {
+            return Ok(SessionCompactResult {
+                compacted: false,
+                message: "上下文压缩服务未启用".to_string(),
+            });
+        };
+        if !compaction.is_module_enabled() || !compaction.config().enabled {
+            return Ok(SessionCompactResult {
+                compacted: false,
+                message: "上下文压缩已在配置中禁用".to_string(),
+            });
+        }
+
+        let (run_id, cancel) = {
+            let mut ctrl = self.inner.run_controller.lock().unwrap();
+            if ctrl.active_task().is_some()
+                || self
+                    .inner
+                    .runtime
+                    .agent_loop
+                    .is_session_busy(&active_session.id)
+            {
+                return Err(ActorError::InvalidParams(
+                    "会话正在运行中，请等待或中止当前回合后再压缩".to_string(),
+                ));
+            }
+            ctrl.start(active_session.id.clone(), ActiveTaskKind::ManualCompaction)
+        };
+        let _guard = ActorTaskFinishGuard {
+            inner: Arc::clone(&self.inner),
+            run_id,
+            session_id: active_session.id.clone(),
+            kind: ActiveTaskKind::ManualCompaction,
+        };
+
+        let cfg = self.inner.runtime_config.lock().unwrap().clone();
+        let report = compaction
+            .compact_now(
+                active_session,
+                ManualCompactOptions {
+                    provider: cfg.provider,
+                    model: cfg.model,
+                    focus: params.focus,
+                },
+                cancel,
+            )
+            .await
+            .map_err(|err| ActorError::InvalidParams(err.to_string()))?;
+
+        let message = match report.outcome {
+            CompactionOutcome::Compacted => format!(
+                "已压缩上下文：{} → {} tokens",
+                report.tokens_before, report.tokens_after
+            ),
+            CompactionOutcome::Skipped => report
+                .skipped_reason
+                .unwrap_or_else(|| "当前上下文无需压缩".to_string()),
+            CompactionOutcome::Failed => report
+                .skipped_reason
+                .unwrap_or_else(|| "上下文压缩未完成".to_string()),
+        };
+        Ok(SessionCompactResult {
+            compacted: matches!(report.outcome, CompactionOutcome::Compacted),
+            message,
+        })
+    }
+
+    /// 在当前活跃会话与工作区执行本地 `!` / `!!` Shell 命令并落盘 `BashExecution` 事件。
+    pub async fn run_local_bash(&self, params: BashRunParams) -> Result<BashRunResult, ActorError> {
+        self.ensure_alive()?;
+        let active_session = self.ensure_active_session(&params.session_id, "执行本地命令")?;
+        let command = params.command.trim().to_string();
+        if command.is_empty() {
+            return Err(ActorError::InvalidParams("command 不能为空".to_string()));
+        }
+
+        // 仅当 `!` 需要注入上下文且当前正在运行模型回合时拒绝，避免并发改写上下文；
+        // `!!`（exclude_from_context = true）可随时在子令牌下独立运行。
+        let (slot_guard, cancel) = {
+            let mut ctrl = self.inner.run_controller.lock().unwrap();
+            let busy = ctrl.active_task().is_some()
+                || self
+                    .inner
+                    .runtime
+                    .agent_loop
+                    .is_session_busy(&active_session.id);
+            if busy {
+                if !params.exclude_from_context {
+                    return Err(ActorError::InvalidParams(
+                        "模型正在运行时请使用 `!!` 执行不注入上下文的本地命令".to_string(),
+                    ));
+                }
+                (None, self.inner.shutdown_cancel.child_token())
+            } else {
+                let (run_id, cancel) =
+                    ctrl.start(active_session.id.clone(), ActiveTaskKind::LocalBash);
+                (
+                    Some(ActorTaskFinishGuard {
+                        inner: Arc::clone(&self.inner),
+                        run_id,
+                        session_id: active_session.id.clone(),
+                        kind: ActiveTaskKind::LocalBash,
+                    }),
+                    cancel,
+                )
+            }
+        };
+        let _slot_guard = slot_guard;
+
+        let ev = execute_local_bash_for_session(
+            &active_session,
+            next_local_bash_call_id(),
+            command,
+            &self.inner.workspace,
+            params.exclude_from_context,
+            cancel,
+            |_| {},
+        )
+        .await;
+        self.inner.emit_client(ev.clone());
+
+        match ev {
+            ClientEvent::LocalBashFinished {
+                call_id,
+                command,
+                exclude_from_context,
+                output,
+            } => match output {
+                Ok(out) => Ok(BashRunResult {
+                    call_id,
+                    command,
+                    output: out.display,
+                    exit_code: out.exit_code,
+                    cancelled: out.cancelled,
+                    exclude_from_context,
+                }),
+                Err(err_msg) => Ok(BashRunResult {
+                    call_id,
+                    command,
+                    output: err_msg,
+                    exit_code: Some(1),
+                    cancelled: false,
+                    exclude_from_context,
+                }),
+            },
+            _ => unreachable!("execute_local_bash_for_session always yields LocalBashFinished"),
+        }
+    }
+
     /// 优雅关闭 `SessionActor`：终止唤醒循环、排空挂起审批、取消活跃运行并卸载钩子。
     pub async fn shutdown(&self) {
         if self.inner.is_shutdown.swap(true, Ordering::AcqRel) {
@@ -1501,12 +1630,35 @@ impl SessionActorHandle {
         let _reg = self.inner.registration.lock().unwrap().take();
     }
 
+    /// 导出任意会话元信息 DTO（供 `session.new` / `session.switch` 返回）。
+    pub fn session_meta(&self, session: &Session) -> SessionMetaDto {
+        session_to_meta_dto(session)
+    }
+
     fn ensure_alive(&self) -> Result<(), ActorError> {
         if self.inner.is_shutdown.load(Ordering::Acquire) {
             Err(ActorError::Shutdown)
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_active_session(
+        &self,
+        session_id: &str,
+        action_desc: &str,
+    ) -> Result<Arc<Session>, ActorError> {
+        let active_session = self.inner.current_session();
+        if session_id != active_session.id {
+            if self.inner.runtime.sessions.get(session_id).is_none() {
+                return Err(ActorError::SessionNotFound(session_id.to_string()));
+            }
+            return Err(ActorError::InvalidParams(format!(
+                "会话 `{session_id}` 非当前活跃会话，仅支持对 `{}` {action_desc}",
+                active_session.id
+            )));
+        }
+        Ok(active_session)
     }
 
     fn resolve_readable_session(&self, session_id: &str) -> Result<Arc<Session>, ActorError> {
@@ -1576,6 +1728,25 @@ impl SessionActorHandle {
                 new_session_id: new_id,
             },
         ));
+    }
+}
+
+struct ActorTaskFinishGuard {
+    inner: Arc<ActorInner>,
+    run_id: u64,
+    session_id: String,
+    kind: ActiveTaskKind,
+}
+
+impl Drop for ActorTaskFinishGuard {
+    fn drop(&mut self) {
+        let cur_sid = self.inner.current_session_id();
+        self.inner.run_controller.lock().unwrap().finish_if_current(
+            Some(self.run_id),
+            Some(&self.session_id),
+            &cur_sid,
+            self.kind,
+        );
     }
 }
 

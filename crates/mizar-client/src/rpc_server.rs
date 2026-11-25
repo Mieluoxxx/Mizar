@@ -14,19 +14,21 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mizar_types::rpc::{
-    AuthHelloParams, AuthHelloResult, CapabilitiesListParams, InteractionResolveParams,
-    JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, METHOD_AUTH_HELLO,
-    METHOD_CAPABILITIES_LIST, METHOD_INTERACTION_RESOLVE, METHOD_QUEUE_POP_ALL,
-    METHOD_QUEUE_REMOVE, METHOD_SESSION_CONFIG, METHOD_SESSION_EVENTS, METHOD_SESSION_FORK,
-    METHOD_SESSION_LIST, METHOD_SESSION_SUBSCRIBE, METHOD_SESSION_TREE, METHOD_TURN_CANCEL,
+    AuthHelloParams, AuthHelloResult, BashRunParams, CapabilitiesListParams,
+    InteractionResolveParams, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    METHOD_AUTH_HELLO, METHOD_BASH_RUN, METHOD_CAPABILITIES_LIST, METHOD_INTERACTION_RESOLVE,
+    METHOD_QUEUE_POP_ALL, METHOD_QUEUE_REMOVE, METHOD_SESSION_COMPACT, METHOD_SESSION_CONFIG,
+    METHOD_SESSION_EVENTS, METHOD_SESSION_FORK, METHOD_SESSION_LIST, METHOD_SESSION_NEW,
+    METHOD_SESSION_SUBSCRIBE, METHOD_SESSION_SWITCH, METHOD_SESSION_TREE, METHOD_TURN_CANCEL,
     METHOD_TURN_SUBMIT, QueuePopAllParams, QueueRemoveParams, ResolvedBy, RpcNotification,
-    SessionConfigParams, SessionEventsParams, SessionForkParams, SessionListParams,
-    SessionSubscribeParams, SessionTreeParams, StreamDeltaKind, StreamDeltaNotification,
-    TurnCancelParams, TurnSubmitParams,
+    SessionCompactParams, SessionConfigParams, SessionEventsParams, SessionForkParams,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionSubscribeParams,
+    SessionSwitchParams, SessionSwitchResult, SessionTreeParams, StreamDeltaKind,
+    StreamDeltaNotification, TurnCancelParams, TurnSubmitParams,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -92,9 +94,62 @@ pub struct RpcServerHandle {
     accept_task: Option<JoinHandle<()>>,
     tcp_accept_task: Option<JoinHandle<()>>,
     cleaned_up: Arc<AtomicBool>,
+    tracker: Arc<ClientTracker>,
+}
+
+#[derive(Debug, Default)]
+struct ClientTracker {
+    active: AtomicUsize,
+    ever_connected: AtomicBool,
+}
+
+#[cfg(unix)]
+struct ClientConnGuard {
+    tracker: Arc<ClientTracker>,
+    counted: bool,
+}
+
+#[cfg(unix)]
+impl ClientConnGuard {
+    fn new(tracker: Arc<ClientTracker>, pre_authenticated: bool) -> Self {
+        let mut guard = Self {
+            tracker,
+            counted: false,
+        };
+        if pre_authenticated {
+            guard.mark_authenticated();
+        }
+        guard
+    }
+
+    fn mark_authenticated(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            self.tracker.active.fetch_add(1, Ordering::AcqRel);
+            self.tracker.ever_connected.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ClientConnGuard {
+    fn drop(&mut self) {
+        if self.counted {
+            self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl RpcServerHandle {
+    /// 返回当前已认证的活跃客户端连接数（Unix Socket + 回环 TCP）。
+    pub fn active_clients(&self) -> usize {
+        self.tracker.active.load(Ordering::Acquire)
+    }
+
+    /// 返回自服务端启动以来是否至少完成过一次客户端接入认证。
+    pub fn ever_connected(&self) -> bool {
+        self.tracker.ever_connected.load(Ordering::Acquire)
+    }
     /// 返回服务端监听的 Unix Socket 文件路径（`<run_dir>/p-<pid>.sock`）。
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -200,10 +255,12 @@ impl RpcServer {
         handle.attach_registration(registration);
 
         let cancel = CancellationToken::new();
+        let tracker = Arc::new(ClientTracker::default());
         let accept_task = tokio::spawn(run_unix_accept_loop(
             listener,
             handle.clone(),
             config,
+            Arc::clone(&tracker),
             cancel.clone(),
         ));
         let tcp_accept_task = match (tcp_listener, rpc_token.as_deref()) {
@@ -212,6 +269,7 @@ impl RpcServer {
                 handle,
                 config,
                 Arc::<str>::from(token),
+                Arc::clone(&tracker),
                 cancel.clone(),
             ))),
             _ => None,
@@ -226,6 +284,7 @@ impl RpcServer {
             accept_task: Some(accept_task),
             tcp_accept_task,
             cleaned_up: Arc::new(AtomicBool::new(false)),
+            tracker,
         })
     }
 
@@ -307,6 +366,7 @@ async fn run_unix_accept_loop(
     listener: UnixListener,
     handle: SessionActorHandle,
     config: RpcServerConfig,
+    tracker: Arc<ClientTracker>,
     cancel: CancellationToken,
 ) {
     let mut clients = JoinSet::new();
@@ -320,7 +380,15 @@ async fn run_unix_accept_loop(
                     Ok((stream, _addr)) => {
                         let conn_handle = handle.clone();
                         let conn_cancel = cancel.child_token();
-                        clients.spawn(run_connection(stream, conn_handle, config, None, conn_cancel));
+                        let conn_tracker = Arc::clone(&tracker);
+                        clients.spawn(run_connection(
+                            stream,
+                            conn_handle,
+                            config,
+                            None,
+                            conn_tracker,
+                            conn_cancel,
+                        ));
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "RPC UnixListener accept 失败");
@@ -343,6 +411,7 @@ async fn run_tcp_accept_loop(
     handle: SessionActorHandle,
     config: RpcServerConfig,
     auth_token: Arc<str>,
+    tracker: Arc<ClientTracker>,
     cancel: CancellationToken,
 ) {
     let mut clients = JoinSet::new();
@@ -357,11 +426,13 @@ async fn run_tcp_accept_loop(
                         let _ = stream.set_nodelay(true);
                         let conn_handle = handle.clone();
                         let conn_cancel = cancel.child_token();
+                        let conn_tracker = Arc::clone(&tracker);
                         clients.spawn(run_connection(
                             stream,
                             conn_handle,
                             config,
                             Some(Arc::clone(&auth_token)),
+                            conn_tracker,
                             conn_cancel,
                         ));
                     }
@@ -386,11 +457,13 @@ struct SubscriptionActivation {
     notif_rx: broadcast::Receiver<RpcNotification>,
 }
 
+#[cfg(unix)]
 async fn run_connection<S>(
     stream: S,
     handle: SessionActorHandle,
     config: RpcServerConfig,
     auth_token: Option<Arc<str>>,
+    tracker: Arc<ClientTracker>,
     conn_cancel: CancellationToken,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -399,6 +472,7 @@ async fn run_connection<S>(
     let queue_cap = config.client_queue_capacity.max(1);
     let (outbound_tx, outbound_rx) = mpsc::channel::<String>(queue_cap);
     let (sub_cmd_tx, sub_cmd_rx) = mpsc::unbounded_channel::<SubscriptionActivation>();
+    let conn_guard = ClientConnGuard::new(tracker, auth_token.is_none());
 
     let writer_fut = run_writer_loop(write_half, outbound_rx, conn_cancel.clone());
     let notifier_fut =
@@ -409,6 +483,7 @@ async fn run_connection<S>(
         outbound_tx,
         sub_cmd_tx,
         auth_token,
+        conn_guard,
         conn_cancel.clone(),
     );
 
@@ -552,12 +627,14 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+#[cfg(unix)]
 async fn run_reader_loop<R>(
     read_half: R,
     handle: SessionActorHandle,
     outbound_tx: mpsc::Sender<String>,
     sub_cmd_tx: mpsc::UnboundedSender<SubscriptionActivation>,
     auth_token: Option<Arc<str>>,
+    mut conn_guard: ClientConnGuard,
     conn_cancel: CancellationToken,
 ) where
     R: AsyncRead + Unpin,
@@ -679,6 +756,7 @@ async fn run_reader_loop<R>(
                 break;
             }
             authenticated = true;
+            conn_guard.mark_authenticated();
             if let Some(id) = req.id {
                 let resp = ok_response(id, &AuthHelloResult { ok: true });
                 if !enqueue_response(&outbound_tx, &resp, &conn_cancel) {
@@ -828,6 +906,33 @@ async fn dispatch_non_subscribe_method(
         METHOD_CAPABILITIES_LIST => {
             let p: CapabilitiesListParams = parse_optional_params(params)?;
             to_value_result(handle.list_capabilities(p.session_id.as_deref()).await)
+        }
+        METHOD_SESSION_NEW => {
+            let p: SessionNewParams = parse_optional_params(params)?;
+            to_value_result(
+                handle
+                    .new_session(p.title)
+                    .await
+                    .map(|sess| SessionNewResult {
+                        session: handle.session_meta(&sess),
+                    }),
+            )
+        }
+        METHOD_SESSION_SWITCH => {
+            let p: SessionSwitchParams = parse_required_params(params)?;
+            to_value_result(handle.switch_session(&p.session_id).await.map(|sess| {
+                SessionSwitchResult {
+                    session: handle.session_meta(&sess),
+                }
+            }))
+        }
+        METHOD_SESSION_COMPACT => {
+            let p: SessionCompactParams = parse_required_params(params)?;
+            to_value_result(handle.compact_session(p).await)
+        }
+        METHOD_BASH_RUN => {
+            let p: BashRunParams = parse_required_params(params)?;
+            to_value_result(handle.run_local_bash(p).await)
         }
         other => Err(JsonRpcError::method_not_found(other)),
     }

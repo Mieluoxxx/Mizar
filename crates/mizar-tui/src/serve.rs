@@ -35,13 +35,15 @@ use mizar_llm::retry::RetryConfig;
 use mizar_session::{SessionCreateOptions, SessionListQuery, SessionOrigin};
 use mizar_types::BoxError;
 use mizar_types::rpc::{
-    CapabilitiesListParams, InteractionResolveParams, JsonRpcError, JsonRpcId, JsonRpcRequest,
-    JsonRpcResponse, METHOD_AUTH_HELLO, METHOD_CAPABILITIES_LIST, METHOD_INTERACTION_RESOLVE,
-    METHOD_QUEUE_POP_ALL, METHOD_QUEUE_REMOVE, METHOD_SESSION_CONFIG, METHOD_SESSION_EVENTS,
-    METHOD_SESSION_FORK, METHOD_SESSION_LIST, METHOD_SESSION_SUBSCRIBE, METHOD_SESSION_TREE,
+    BashRunParams, CapabilitiesListParams, InteractionResolveParams, JsonRpcError, JsonRpcId,
+    JsonRpcRequest, JsonRpcResponse, METHOD_AUTH_HELLO, METHOD_BASH_RUN, METHOD_CAPABILITIES_LIST,
+    METHOD_INTERACTION_RESOLVE, METHOD_QUEUE_POP_ALL, METHOD_QUEUE_REMOVE, METHOD_SESSION_COMPACT,
+    METHOD_SESSION_CONFIG, METHOD_SESSION_EVENTS, METHOD_SESSION_FORK, METHOD_SESSION_LIST,
+    METHOD_SESSION_NEW, METHOD_SESSION_SUBSCRIBE, METHOD_SESSION_SWITCH, METHOD_SESSION_TREE,
     METHOD_TURN_CANCEL, METHOD_TURN_SUBMIT, QueuePopAllParams, QueueRemoveParams, ResolvedBy,
-    RpcNotification, SessionConfigParams, SessionEventsParams, SessionForkParams,
-    SessionListItemDto, SessionListParams, SessionListResult, SessionSubscribeParams,
+    RpcNotification, SessionCompactParams, SessionConfigParams, SessionEventsParams,
+    SessionForkParams, SessionListItemDto, SessionListParams, SessionListResult, SessionNewParams,
+    SessionNewResult, SessionSubscribeParams, SessionSwitchParams, SessionSwitchResult,
     SessionTreeParams, StreamDeltaKind, StreamDeltaNotification, TurnCancelParams,
     TurnSubmitParams,
 };
@@ -949,11 +951,13 @@ async fn handle_ws_text_frame(
         .map(str::to_string);
 
     #[cfg(unix)]
-    if explicit_sid.is_none()
-        && matches!(
-            req.method.as_str(),
-            METHOD_INTERACTION_RESOLVE | METHOD_CAPABILITIES_LIST
-        )
+    if matches!(
+        req.method.as_str(),
+        METHOD_INTERACTION_RESOLVE
+            | METHOD_CAPABILITIES_LIST
+            | METHOD_SESSION_NEW
+            | METHOD_SESSION_SWITCH
+    ) && (explicit_sid.is_none() || req.method == METHOD_SESSION_SWITCH)
         && let Some(active_pid) = conn_state.subscribed_pid
         && let Some(proxy) = conn_state.proxies.get(&active_pid)
         && !proxy.writer_tx.is_closed()
@@ -970,7 +974,7 @@ async fn handle_ws_text_frame(
     let effective_sid = explicit_sid.clone().or_else(|| {
         if matches!(
             req.method.as_str(),
-            METHOD_INTERACTION_RESOLVE | METHOD_CAPABILITIES_LIST
+            METHOD_INTERACTION_RESOLVE | METHOD_CAPABILITIES_LIST | METHOD_SESSION_NEW
         ) {
             conn_state.bound_session_id.clone()
         } else {
@@ -1265,10 +1269,26 @@ async fn dispatch_via_headless_actor(
 
     let need_active = matches!(
         req.method.as_str(),
-        METHOD_TURN_SUBMIT | METHOD_SESSION_CONFIG
+        METHOD_TURN_SUBMIT
+            | METHOD_SESSION_CONFIG
+            | METHOD_SESSION_COMPACT
+            | METHOD_BASH_RUN
+            | METHOD_SESSION_NEW
+            | METHOD_SESSION_SWITCH
     );
     let actor = match state
-        .ensure_headless_actor_for(effective_sid.as_deref(), need_active, false)
+        .ensure_headless_actor_for(
+            if req.method == METHOD_SESSION_SWITCH {
+                conn_state
+                    .bound_session_id
+                    .as_deref()
+                    .or(effective_sid.as_deref())
+            } else {
+                effective_sid.as_deref()
+            },
+            need_active,
+            false,
+        )
         .await
     {
         Ok(actor) => actor,
@@ -1280,6 +1300,17 @@ async fn dispatch_via_headless_actor(
     }
 
     let outcome = dispatch_actor_method(&actor, &req.method, req.params).await;
+    if matches!(
+        req.method.as_str(),
+        METHOD_SESSION_NEW | METHOD_SESSION_SWITCH
+    ) && let Ok(ref val) = outcome
+        && let Some(new_sid) = val
+            .get("session")
+            .and_then(|s| s.get("id"))
+            .and_then(|v| v.as_str())
+    {
+        conn_state.bound_session_id = Some(new_sid.to_string());
+    }
     emit_rpc_outcome(outbound_tx, req.id, outcome).await
 }
 
@@ -1328,6 +1359,33 @@ async fn dispatch_actor_method(
         METHOD_CAPABILITIES_LIST => {
             let p: CapabilitiesListParams = parse_optional_params(params)?;
             to_value_result(handle.list_capabilities(p.session_id.as_deref()).await)
+        }
+        METHOD_SESSION_NEW => {
+            let p: SessionNewParams = parse_optional_params(params)?;
+            to_value_result(
+                handle
+                    .new_session(p.title)
+                    .await
+                    .map(|sess| SessionNewResult {
+                        session: handle.session_meta(&sess),
+                    }),
+            )
+        }
+        METHOD_SESSION_SWITCH => {
+            let p: SessionSwitchParams = parse_required_params(params)?;
+            to_value_result(handle.switch_session(&p.session_id).await.map(|sess| {
+                SessionSwitchResult {
+                    session: handle.session_meta(&sess),
+                }
+            }))
+        }
+        METHOD_SESSION_COMPACT => {
+            let p: SessionCompactParams = parse_required_params(params)?;
+            to_value_result(handle.compact_session(p).await)
+        }
+        METHOD_BASH_RUN => {
+            let p: BashRunParams = parse_required_params(params)?;
+            to_value_result(handle.run_local_bash(p).await)
         }
         other => Err(JsonRpcError::method_not_found(other)),
     }
@@ -1965,7 +2023,7 @@ pub async fn run_serve_cli(args: &[String]) -> Result<(), BoxError> {
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() {
+pub(crate) async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

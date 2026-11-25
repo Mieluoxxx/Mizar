@@ -52,7 +52,7 @@ pub use rpc_server::{
 pub use run_dir::{
     ProcessMeta, ProcessRegistration, SessionLockError, check_session_writable, ensure_run_dir,
     is_pid_alive, meta_path_for_pid, resolve_run_dir, resolve_run_dir_path, scan_live_processes,
-    set_socket_permissions_0600, socket_path_for_pid,
+    set_socket_permissions_0600, socket_path_for_pid, write_meta_atomic,
 };
 pub use session_view::{
     SelectionSources, build_session_info_report, build_session_info_report_at,

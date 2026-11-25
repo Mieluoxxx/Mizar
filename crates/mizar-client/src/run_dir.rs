@@ -325,7 +325,7 @@ impl Drop for ProcessRegistration {
     }
 }
 
-fn write_meta_atomic(meta_path: &Path, meta: &ProcessMeta) -> io::Result<()> {
+pub fn write_meta_atomic(meta_path: &Path, meta: &ProcessMeta) -> io::Result<()> {
     let parent = meta_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

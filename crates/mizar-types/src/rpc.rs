@@ -37,6 +37,10 @@ pub const METHOD_SESSION_EVENTS: &str = "session.events";
 pub const METHOD_SESSION_FORK: &str = "session.fork";
 pub const METHOD_SESSION_TREE: &str = "session.tree";
 pub const METHOD_CAPABILITIES_LIST: &str = "capabilities.list";
+pub const METHOD_SESSION_NEW: &str = "session.new";
+pub const METHOD_SESSION_SWITCH: &str = "session.switch";
+pub const METHOD_SESSION_COMPACT: &str = "session.compact";
+pub const METHOD_BASH_RUN: &str = "bash.run";
 
 pub const NOTIF_TURN_STATE: &str = "turn.state";
 pub const NOTIF_STREAM_DELTA: &str = "stream.delta";
@@ -917,6 +921,69 @@ pub struct AuthHelloResult {
     pub ok: bool,
 }
 
+/// `session.new` 请求参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNewParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// `session.new` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNewResult {
+    pub session: SessionMetaDto,
+}
+
+/// `session.switch` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSwitchParams {
+    pub session_id: String,
+}
+
+/// `session.switch` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSwitchResult {
+    pub session: SessionMetaDto,
+}
+
+/// `session.compact` 请求参数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompactParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+}
+
+/// `session.compact` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompactResult {
+    pub compacted: bool,
+    pub message: String,
+}
+
+/// `bash.run` 请求参数（本地 `!` / `!!` Shell 命令）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BashRunParams {
+    pub session_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub exclude_from_context: bool,
+}
+
+/// `bash.run` 响应结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BashRunResult {
+    pub call_id: String,
+    pub command: String,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub exclude_from_context: bool,
+}
+
 /// `capabilities.list` 请求参数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilitiesListParams {
@@ -1522,6 +1589,91 @@ mod tests {
             serde_json::from_str::<AuthHelloResult>(&serde_json::to_string(&auth_r).unwrap())
                 .unwrap(),
             auth_r
+        );
+
+        assert_eq!(METHOD_SESSION_NEW, "session.new");
+        assert_eq!(METHOD_SESSION_SWITCH, "session.switch");
+        assert_eq!(METHOD_SESSION_COMPACT, "session.compact");
+        assert_eq!(METHOD_BASH_RUN, "bash.run");
+
+        let new_p = SessionNewParams {
+            title: Some("Herdr Mizar".into()),
+        };
+        let new_r = SessionNewResult {
+            session: SessionMetaDto {
+                id: "s-new".into(),
+                cwd: Some("/tmp".into()),
+                title: Some("Herdr Mizar".into()),
+                parent_id: None,
+                fork_seq: None,
+            },
+        };
+        let sw_p = SessionSwitchParams {
+            session_id: "s-target".into(),
+        };
+        let sw_r = SessionSwitchResult {
+            session: new_r.session.clone(),
+        };
+        let cmp_p = SessionCompactParams {
+            session_id: "s-new".into(),
+            focus: Some("keep diffs".into()),
+        };
+        let cmp_r = SessionCompactResult {
+            compacted: true,
+            message: "Compacted 12k -> 3k tokens".into(),
+        };
+        let bash_p = BashRunParams {
+            session_id: "s-new".into(),
+            command: "git status".into(),
+            exclude_from_context: true,
+        };
+        let bash_r = BashRunResult {
+            call_id: "local-bash-1".into(),
+            command: "git status".into(),
+            output: "clean".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            exclude_from_context: true,
+        };
+        assert_eq!(
+            serde_json::from_str::<SessionNewParams>(&serde_json::to_string(&new_p).unwrap())
+                .unwrap(),
+            new_p
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionNewResult>(&serde_json::to_string(&new_r).unwrap())
+                .unwrap(),
+            new_r
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionSwitchParams>(&serde_json::to_string(&sw_p).unwrap())
+                .unwrap(),
+            sw_p
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionSwitchResult>(&serde_json::to_string(&sw_r).unwrap())
+                .unwrap(),
+            sw_r
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionCompactParams>(&serde_json::to_string(&cmp_p).unwrap())
+                .unwrap(),
+            cmp_p
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionCompactResult>(&serde_json::to_string(&cmp_r).unwrap())
+                .unwrap(),
+            cmp_r
+        );
+        assert_eq!(
+            serde_json::from_str::<BashRunParams>(&serde_json::to_string(&bash_p).unwrap())
+                .unwrap(),
+            bash_p
+        );
+        assert_eq!(
+            serde_json::from_str::<BashRunResult>(&serde_json::to_string(&bash_r).unwrap())
+                .unwrap(),
+            bash_r
         );
     }
 }
