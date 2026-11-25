@@ -243,7 +243,7 @@
 - [x] **M4（前端接入与按需远程化）**：
   - M4.1：为 `mizar-client` 增设 `127.0.0.1:0` 认证回环 TCP 旁路、`0600` `p-<pid>.json` `rpc_token`（`ProcessRegistration::without_secret()` 脱敏）及首帧常量时间 `auth.hello` 校验（失败返回 `-32003` 并断连）。
   - M4.2：落地 `mizar serve` 回环 HTTP/WebSocket 网关（仅允许回环地址绑定 + 严格 `Origin` 校验 `/403`、`/health`、脱敏 `/api/processes`、`/api/sessions`、`/ws` 代理活 `p-<pid>.sock` 或按需拉起静态 SQLite 会话 headless `SessionActor`，远程可叠加 Tailscale Serve）。
-  - M4.3：在 `~/workspace/herdr-mayonaka`（分支 `feat/mizar-mod`）建成原生 GPUI `mayonaka-mizar` 模块并接入 `layouts/mayonaka.json`、`mayonaka-tabs`（`⌘⌥M`）、`mayonaka-palette` 与 `mayonaka-pane` 状态标识（注：第四节决策 6 的 `gpt-6.2-sol` 线上实测仍待有真实凭据时交互验证）。
+  - M4.3：在 `~/workspace/herdr-mayonaka`（分支 `feat/mizar-mod`）建成原生 GPUI `mayonaka-mizar` 模块：从右侧 `panel-body` 移出为主工作区原生标签页与分栏卡片（移除 `layouts/mayonaka.json` 右栏 `mizar` 块，接入 `mayonaka-tabs` 的 `open-mizar-tab`/`split-mizar-right`、`mayonaka-new-menu`、`mayonaka-palette`、`mayonaka-pane` 状态与 `⌘⌥M`），经 `launcher.js` 按卡片自动拉起 `mizar rpc`（`0600` `--ready-file`、`--idle-exit-secs` 与关页清理），并提供 `pi-emphasis` 药丸、彩色 diff 卡片、可折叠工具/思考/Shell 卡片、内联审批、居中 Launchpad、`/` 与 `@` 补全、`!`/`!!` 本地命令及单行底部状态栏（注：第四节决策 6 的 `gpt-6.2-sol` 线上实测仍待有真实凭据时交互验证）。
 
 ---
 
@@ -282,7 +282,7 @@
 
 ### 2. 会话发现、单写者锁与 Socket 拓扑（平时零常驻进程）
 
-采用「**Per-Process Unix Socket + 可选 `mizar serve` 按需聚合**」，平时不留后台守护进程：
+采用「**Per-Process Unix Socket + `mizar rpc` 无头单会话 Host + 可选 `mizar serve` 按需聚合**」，平时不留后台守护进程（`herdr-mayonaka` 等原生工作区宿主可直接拉起 `mizar rpc --ready-file <0600> --idle-exit-secs <N> --parent-pid <pid>` 完成一对一绑定与随关清理）：
 
 - **运行目录**：`~/.mizar/run/`（目录权限 `0700`）。
 - **每活进程文件**：
@@ -350,6 +350,9 @@
 | `session.config` | `{ session_id, provider?, model?, reasoning_effort?, approval_mode? }` | 运行时结构化改配置，不再拼接 `/` 文本命令 |
 | `session.list` / `session.events` | `{ cwd?, query?, limit?, cursor? }` / `{ session_id, before_seq?, after_seq?, limit? }` | 会话列表（支持 `cwd`/标题过滤）与双向事件分页 |
 | `session.fork` / `session.tree` | `{ session_id, at_seq }` / `{ session_id }` | 复用 `mizar-session::fork` 与 `project_session_tree` |
+| `session.new` / `session.switch` | `{ title? }` / `{ session_id }` | 在当前 `SessionActor` 上新建并切换会话，或在单写者锁保护下切换到已有持久化会话 |
+| `session.compact` | `{ session_id, instruction? }` | 触发手动上下文压缩（对应 `/compact`） |
+| `bash.run` | `{ session_id, command, exclude_from_context? }` | 执行本地 `!` / `!!` Shell 命令并持久化 `BashExecution` |
 | `capabilities.list` | `{ session_id }` | 返回可用 `/` 命令、skills、MCP tools、providers/models 与上下文上限 |
 
 > **显式裁剪项**：不实现原草案中的 `session.search`（因决策 1 已移除 `session_recall_fts`，避免 20MB FTS5 回流）与 `blob.read`（见第 4 节）。
