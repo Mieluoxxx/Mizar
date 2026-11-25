@@ -18,8 +18,3 @@ tokio = { workspace = true, features = ["fs"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-
-[target.'cfg(mizar_loom)'.dev-dependencies]
-loom = { workspace = true }

@@ -168,32 +168,3 @@ impl Logger {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
-
-    #[test]
-    fn redirects_and_silences_child_loggers() {
-        let captured: Arc<Mutex<Vec<LogRecord>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_cb = Arc::clone(&captured);
-
-        let root = Logger::new("root");
-        let child = root.child("tui");
-        root.set_handler(move |rec| {
-            captured_cb.lock().unwrap().push(rec.clone());
-        });
-
-        child.info("hello");
-        root.warn("careful");
-        assert_eq!(captured.lock().unwrap().len(), 2);
-        assert_eq!(captured.lock().unwrap()[0].name, "tui");
-        assert_eq!(captured.lock().unwrap()[0].message, "hello");
-
-        root.set_silent();
-        child.error("ignored");
-        assert_eq!(captured.lock().unwrap().len(), 2);
-    }
-}

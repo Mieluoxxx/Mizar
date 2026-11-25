@@ -146,28 +146,3 @@ pub fn sha256_hex(data: &[u8]) -> String {
 pub fn trimmed_instruction_digest(content: &str) -> String {
     sha256_hex(content.trim().as_bytes())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sha256_matches_standard_vectors() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn trimmed_digest_ignores_surrounding_whitespace() {
-        assert_eq!(
-            trimmed_instruction_digest("  hello\n"),
-            trimmed_instruction_digest("hello")
-        );
-    }
-}

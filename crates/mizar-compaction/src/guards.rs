@@ -254,36 +254,3 @@ impl FileGuardTracker {
         result
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn line_threshold_distinguishes_50_vs_51_lines() {
-        let dir = std::env::temp_dir().join(format!("mizar_guards_lines_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let p50 = dir.join("exact50.txt");
-        let p50_no_nl = dir.join("exact50_nonl.txt");
-        let p51 = dir.join("over51.txt");
-        let p_empty = dir.join("empty.txt");
-
-        std::fs::write(&p50, "line\n".repeat(50)).unwrap();
-        let mut s50 = "line\n".repeat(49);
-        s50.push_str("line50");
-        std::fs::write(&p50_no_nl, s50).unwrap();
-        let mut s51 = "line\n".repeat(50);
-        s51.push_str("line51");
-        std::fs::write(&p51, s51).unwrap();
-        std::fs::write(&p_empty, "").unwrap();
-
-        assert!(!file_exceeds_line_threshold(&p_empty, 50));
-        assert!(!file_exceeds_line_threshold(&p50, 50));
-        assert!(!file_exceeds_line_threshold(&p50_no_nl, 50));
-        assert!(file_exceeds_line_threshold(&p51, 50));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}

@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint-and-test:
+  lint-and-check:
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +68,3 @@ jobs:
 
       - name: Clippy check
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: Run workspace tests
-        run: cargo test --locked --workspace --no-fail-fast

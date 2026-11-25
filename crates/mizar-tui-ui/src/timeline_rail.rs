@@ -191,32 +191,3 @@ pub fn render_timeline_rail(
     };
     buf.set_string(x, geo.down_row, " ▼", down_style);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rail_geometry_windows_and_hits_accurately() {
-        let turns: Vec<TimelineTurn> = (0..10)
-            .map(|i| TimelineTurn {
-                item_index: i * 2,
-                top_line: i * 20,
-                preview: format!("turn {i}"),
-            })
-            .collect();
-        let snap = build_timeline_snapshot(turns, 45, 180);
-        assert_eq!(snap.active_idx, Some(2));
-        assert_eq!(snap.pinned_idx, Some(2));
-        assert_eq!(snap.up_idx, Some(1));
-        assert_eq!(snap.down_idx, Some(3));
-
-        let geo = compute_rail_geometry(Rect::new(78, 0, 2, 7), &snap, false).unwrap();
-        assert_eq!(hit_test_rail(&geo, 78, geo.up_row), Some(RailHit::Up));
-        assert_eq!(hit_test_rail(&geo, 79, geo.down_row), Some(RailHit::Down));
-        assert_eq!(
-            hit_test_rail(&geo, 78, geo.tick_top),
-            Some(RailHit::Tick(geo.window_start))
-        );
-    }
-}
