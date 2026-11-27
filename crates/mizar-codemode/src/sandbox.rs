@@ -9,7 +9,10 @@ use mizar_tool_search::{Bm25Ranker, ToolSearchDocument, create_tool_search_docum
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head, write_temp_output,
 };
-use mizar_tools::{ToolCallContext, ToolExecution, ToolOutput, ToolRuntime, ToolRuntimeInfo};
+use mizar_tools::{
+    MAX_IMAGES_PER_MESSAGE, ToolCallContext, ToolExecution, ToolOutput, ToolRuntime,
+    ToolRuntimeInfo,
+};
 use rquickjs::context::EvalOptions;
 use rquickjs::prelude::{Async, Func};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise, Value as JsValue};
@@ -211,6 +214,7 @@ pub async fn execute_codemode_script(
     let store_state = Arc::new(Mutex::new(staging_store));
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let nested_calls = Arc::new(Mutex::new(Vec::<CodemodeNestedCall>::new()));
+    let attachments = Arc::new(Mutex::new(Vec::new()));
     let nested_seq = Arc::new(AtomicUsize::new(0));
     let exit_signal = Arc::new(Mutex::new(ScriptExitSignal::Running));
     let script_cancel = call_ctx.cancel.child_token();
@@ -242,6 +246,7 @@ pub async fn execute_codemode_script(
     let store_get = Arc::clone(&store_state);
     let store_set = Arc::clone(&store_state);
     let nested_host = Arc::clone(&nested_calls);
+    let attachments_host = Arc::clone(&attachments);
     let seq_host = Arc::clone(&nested_seq);
     let tools_host = Arc::clone(&tools_rt);
     let call_ctx_host = call_ctx.clone();
@@ -415,6 +420,7 @@ pub async fn execute_codemode_script(
                     let parent_ctx = call_ctx_host.clone();
                     let child_cancel = nested_cancel.clone();
                     let nested = Arc::clone(&nested_host);
+                    let attachments = Arc::clone(&attachments_host);
                     let seq = Arc::clone(&seq_host);
                     async move {
                         let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -462,14 +468,29 @@ pub async fn execute_codemode_script(
                             parent_ctx.emit_update(format_preview_calls(&list), None);
                         }
 
+                        let mut structured = res.structured_content;
+                        if !res.images.is_empty() {
+                            if let Some(value) = &mut structured {
+                                let payloads: Vec<_> = res.images.iter().map(|image| image.data.as_str()).collect();
+                                mizar_tools::omit_image_data(value, &payloads);
+                            } else {
+                                let metadata: Vec<_> = res.images.iter().map(|image| json!({
+                                    "media_type": image.media_type, "width": image.width, "height": image.height
+                                })).collect();
+                                structured = Some(json!({"text": res.content, "images": metadata}));
+                            }
+                            let mut kept = attachments.lock().unwrap();
+                            kept.extend(res.images.into_iter().map(|image| (n, image)));
+                            kept.sort_by_key(|(call, _)| *call);
+                            // 按调用顺序保留附件，多留一张让统一出口报告截断。
+                            kept.truncate(MAX_IMAGES_PER_MESSAGE + 1);
+                        }
                         if res.is_error {
                             Ok::<_, rquickjs::Error>(
                                 json!({ "ok": false, "error": res.content }).to_string(),
                             )
                         } else {
-                            let val = res
-                                .structured_content
-                                .unwrap_or(Value::String(res.content));
+                            let val = structured.unwrap_or(Value::String(res.content));
                             Ok::<_, rquickjs::Error>(
                                 json!({ "ok": true, "value": val }).to_string(),
                             )
@@ -624,6 +645,12 @@ pub async fn execute_codemode_script(
 
     Ok(ToolOutput {
         content: final_text,
+        images: attachments
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(_, image)| image)
+            .collect(),
         is_error,
         structured_content: structured,
         details: Some(details),

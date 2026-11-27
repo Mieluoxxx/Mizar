@@ -86,24 +86,21 @@ fn select_catalog(
 
 /// 生成供模型读取的 `codemode` 工具说明书：使用说明 + 全局变量 + 预算内的 TypeScript 工具声明目录。
 pub fn create_codemode_description(callable: &[ToolRuntimeInfo], inline_budget: usize) -> String {
-    let intro = "Run JavaScript that calls other tools. The input is raw JavaScript (not JSON, no code fence), run as an async function body in a QuickJS sandbox: top-level `await` and `return` work. No Node, file system, network, or timers.\n\
-- `await tools.<name>({ ...args })` resolves to `structuredContent` when present, otherwise text, and rejects with an Error on failure.\n\
+    let intro = "Run JavaScript that calls other tools. Pass async JavaScript source without a Markdown code fence in the `code` argument. It runs as a QuickJS async function body with top-level `await` and `return`. No Node, file system, network, or timers.\n\
+- `await tools.<name>({ ...args })` resolves to structured content or text and rejects on failure. Image results expose metadata to JavaScript and attach the images to the tool reply.\n\
 - Optional first line: `// @options: {\"timeoutMs\": 60000}`\n\n\
 Globals:\n\
 - `text(value)`, `console.log(...)`, and top-level `return` add output; `exit(msg?)` ends the script.\n\
 - `store(key, value)` and `load(key)` keep JSON values across codemode calls.\n\
 - `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.";
 
-    let non_deferred: Vec<&ToolRuntimeInfo> = callable
+    let local_direct: Vec<&ToolRuntimeInfo> = callable
         .iter()
         .filter(|t| {
-            !matches!(
-                t.exposure,
-                ToolExposure::Deferred | ToolExposure::Hidden | ToolExposure::ModelOnly
-            ) && t.name != CODEMODE_TOOL_NAME
+            t.exposure == ToolExposure::Direct && !mizar_tool_search::is_external_mcp_tool(t)
         })
         .collect();
-    if non_deferred.is_empty() {
+    if local_direct.is_empty() {
         return intro.to_string();
     }
 
@@ -114,7 +111,7 @@ Globals:\n\
     }
 
     let mut grouped: BTreeMap<String, NamespaceCatalogGroup> = BTreeMap::new();
-    for info in non_deferred {
+    for info in local_direct {
         let ns_key = info
             .namespace
             .as_ref()
@@ -204,37 +201,21 @@ pub fn prepare_codemode_loadout(
     hide_direct_in_only_mode: bool,
     inline_budget: usize,
 ) -> ToolLoadoutChanges {
-    let callable: Vec<ToolRuntimeInfo> = loadout
-        .callable
-        .iter()
-        .filter(|t| t.name != CODEMODE_TOOL_NAME)
-        .cloned()
-        .collect();
-    let callable_names: HashSet<&str> = callable.iter().map(|t| t.name.as_str()).collect();
-
     let mut descriptions = HashMap::new();
-    if !hide_direct_in_only_mode {
+    if hide_direct_in_only_mode {
+        descriptions.insert(
+            CODEMODE_TOOL_NAME.to_string(),
+            create_codemode_description(&loadout.callable, inline_budget),
+        );
+    } else {
+        let callable_names: HashSet<&str> =
+            loadout.callable.iter().map(|t| t.name.as_str()).collect();
         for tool in &loadout.declared {
             if callable_names.contains(tool.name.as_str()) {
                 descriptions.insert(tool.name.clone(), describe_script_call(tool));
             }
         }
     }
-
-    let listed: Vec<ToolRuntimeInfo> = if hide_direct_in_only_mode {
-        callable.clone()
-    } else {
-        callable
-            .iter()
-            .filter(|t| t.exposure != ToolExposure::Direct)
-            .cloned()
-            .collect()
-    };
-
-    descriptions.insert(
-        CODEMODE_TOOL_NAME.to_string(),
-        create_codemode_description(&listed, inline_budget),
-    );
 
     let hidden_declarations = if hide_direct_in_only_mode {
         loadout

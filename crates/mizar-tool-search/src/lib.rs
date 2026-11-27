@@ -223,7 +223,7 @@ impl Plugin for ToolSearchPlugin {
             if config.auto_enable {
                 let last_state = Arc::new(Mutex::new(AutoEnableState::Inactive));
                 sync_auto_enable(&tools, &last_state);
-                let tools_sub = tools;
+                let tools_sub = Arc::clone(&tools);
                 let last_sub = Arc::clone(&last_state);
                 let sub = ctx.on(EVENT_TOOLS_CHANGE, move |_: &()| {
                     sync_auto_enable(&tools_sub, &last_sub);
@@ -234,6 +234,9 @@ impl Plugin for ToolSearchPlugin {
             Ok(Some(Cleanup::async_fn(move || async move {
                 for h in handles {
                     h.dispose().await;
+                }
+                if config.auto_enable {
+                    tools.set_auto_default_active(TOOL_SEARCH_TOOL_NAME, None);
                 }
             })))
         })

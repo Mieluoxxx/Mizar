@@ -309,6 +309,7 @@ impl SessionTitleRuntime {
             messages: build_title_messages(&params.user_messages),
             tools: Vec::new(),
             model: params.model,
+            supports_images: None,
             provider: params.provider,
             system: None,
             max_tokens: Some(2048),

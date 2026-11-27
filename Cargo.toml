@@ -34,6 +34,7 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 cordis = { path = "crates/cordis" }
+mizar-image = { path = "crates/mizar-image" }
 mizar-llm-types = { path = "crates/mizar-llm-types" }
 mizar-llm = { path = "crates/mizar-llm" }
 mizar-llm-http = { path = "crates/mizar-llm-http" }

@@ -23,6 +23,7 @@ pub use sandbox::{CodemodeNestedCall, DEFAULT_CODEMODE_TIMEOUT_MS, execute_codem
 
 #[derive(Debug, Clone)]
 pub struct CodemodeConfig {
+    pub enabled: Option<bool>,
     /// 为 `true` 时类似 `pi` 的 `only` 模式：隐藏 `Direct` 工具的直接声明，改由脚本统一调度（默认 false）。
     pub only_mode: bool,
     pub inline_budget: usize,
@@ -33,6 +34,7 @@ pub struct CodemodeConfig {
 impl Default for CodemodeConfig {
     fn default() -> Self {
         Self {
+            enabled: None,
             only_mode: false,
             inline_budget: DEFAULT_CODEMODE_INLINE_BUDGET,
             max_workers: 2,
@@ -109,7 +111,12 @@ impl Plugin for CodemodePlugin {
                             }
                         },
                     )
-                    .with_exposure(ToolExposure::ModelOnly)
+                    .with_exposure(if config.enabled == Some(false) {
+                        ToolExposure::Hidden
+                    } else {
+                        ToolExposure::ModelOnly
+                    })
+                    .with_default_active(config.enabled.unwrap_or(only_mode))
                     .with_execution_mode(ToolExecutionMode::Sequential)
                     .with_annotations(ToolAnnotations {
                         read_only: false,

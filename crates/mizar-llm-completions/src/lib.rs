@@ -11,10 +11,11 @@ use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
-    clamp_openai_prompt_cache_key, classify_inband_error_value, classify_non_json_sse_frame,
-    detect_session_affinity_mode, push_session_affinity_headers, resolve_cache_retention,
+    ImageAttachment, LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo,
+    ProviderInfo, ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk,
+    TokenUsage, clamp_openai_prompt_cache_key, classify_inband_error_value,
+    classify_non_json_sse_frame, detect_session_affinity_mode, push_session_affinity_headers,
+    resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
@@ -135,24 +136,18 @@ pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
                 if !content.is_empty() {
                     parts.push(json!({ "type": "text", "text": content }));
                 }
-                for img in images {
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": img.data_url(),
-                        },
-                    }));
-                }
+                parts.extend(images.iter().map(image_block));
                 json!({ "role": "user", "content": parts })
             }
         }
         Message::Tool {
             content,
             tool_call_id,
+            images,
             ..
         } => json!({
             "role": "tool",
-            "content": content,
+            "content": if images.is_empty() { json!(content) } else { json!(format!("{content}\n(see attached image)")) },
             "tool_call_id": tool_call_id,
         }),
         Message::Assistant { blocks, replay } => {
@@ -207,6 +202,10 @@ pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
     }
 }
 
+fn image_block(img: &ImageAttachment) -> Value {
+    json!({"type": "image_url", "image_url": {"url": img.data_url()}})
+}
+
 fn effort_str(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Off => "none",
@@ -230,11 +229,32 @@ pub fn build_request_body(
     {
         messages.push(json!({ "role": "system", "content": sys }));
     }
-    for m in &options.messages {
-        if matches!(m, Message::Assistant { blocks, .. } if blocks.is_empty()) {
-            continue;
+    // 并行调用须先收齐所有工具回执，中途插入用户图片会破坏协议配对。
+    for batch in options
+        .messages
+        .chunk_by(|a, b| matches!((a, b), (Message::Tool { .. }, Message::Tool { .. })))
+    {
+        let mut attachments = Vec::new();
+        for msg in batch {
+            let message = options.message_for_model(msg);
+            if matches!(message.as_ref(), Message::Assistant { blocks, .. } if blocks.is_empty()) {
+                continue;
+            }
+            messages.push(to_wire(&message, &config.provider, model));
+            if let Message::Tool { images, .. } = message.as_ref()
+                && !images.is_empty()
+            {
+                if attachments.is_empty() {
+                    attachments.push(
+                        json!({"type": "text", "text": "Attached image(s) from tool result(s):"}),
+                    );
+                }
+                attachments.extend(images.iter().map(image_block));
+            }
         }
-        messages.push(to_wire(m, &config.provider, model));
+        if !attachments.is_empty() {
+            messages.push(json!({"role": "user", "content": attachments}));
+        }
     }
 
     let mut body = json!({
@@ -806,6 +826,10 @@ impl CompletionsAdapter {
 }
 
 impl LlmAdapter for CompletionsAdapter {
+    fn default_model(&self) -> Option<&str> {
+        Some(&self.config.model)
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.config.provider.clone(),

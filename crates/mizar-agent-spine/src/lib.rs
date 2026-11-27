@@ -48,7 +48,7 @@ pub use plugins::{
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Plugin, Service};
 use mizar_agent_loop::{AgentLoop, AgentLoopConfig};
 #[cfg(feature = "coding")]
-use mizar_codemode::{CodemodeConfig, CodemodePlugin};
+use mizar_codemode::CodemodeConfig;
 use mizar_llm::LlmRuntime;
 #[cfg(feature = "coding")]
 use mizar_mcp::McpPluginConfig;
@@ -78,7 +78,6 @@ pub enum AgentToolsMode {
     /// 保留原有最小只读套件（`get_time` + `list_dir` + `read_file`）。
     #[cfg(feature = "legacy")]
     Legacy,
-    /// 完整编程套件：`read` + `bash` + `edit` + `write` + `grep` + `find` + `skill` + `tool_search` + `codemode` + `mcp`。
     #[cfg(feature = "coding")]
     Coding {
         coding: CodingToolsConfig,
@@ -348,7 +347,14 @@ impl Plugin for AgentSpinePlugin {
                         },
                         ModuleSpec::ToolSearch(tool_search),
                     ));
-                    ctx.try_plugin(CodemodePlugin, codemode)?;
+                    specs.push((
+                        SpineModuleMeta {
+                            id: "codemode".to_string(),
+                            label: "脚本执行沙箱".to_string(),
+                            description: "按需通过 QuickJS 沙箱编排工具调用".to_string(),
+                        },
+                        ModuleSpec::Codemode(codemode),
+                    ));
                     specs.push((
                         SpineModuleMeta {
                             id: "mcp".to_string(),

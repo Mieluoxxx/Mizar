@@ -9,14 +9,13 @@ description = "前端无关的 Mizar 客户端宿主运行时（供 TUI 与 Mera
 workspace = true
 
 [dependencies]
-base64 = { workspace = true }
 chrono = { workspace = true }
 cordis = { workspace = true }
 futures = { workspace = true }
-image = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-agent-spine = { workspace = true }
 mizar-client-core = { workspace = true }
+mizar-image = { workspace = true }
 mizar-instructions = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-mcp = { workspace = true }

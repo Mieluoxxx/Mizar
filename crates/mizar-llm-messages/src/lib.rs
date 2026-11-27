@@ -15,10 +15,10 @@ use std::time::Duration;
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
-    LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo, ReasoningEffort,
-    ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, classify_inband_error_value,
-    classify_non_json_sse_frame, prefix_digest,
+    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, ImageAttachment,
+    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage,
+    classify_inband_error_value, classify_non_json_sse_frame, prefix_digest,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
@@ -69,6 +69,10 @@ impl Default for MessagesConfig {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
+}
+
+fn image_block(img: &ImageAttachment) -> Value {
+    json!({ "type": "image", "source": { "type": "base64", "media_type": img.media_type, "data": img.data } })
 }
 
 fn push_user_block(wire_messages: &mut Vec<Value>, block: Value) {
@@ -149,7 +153,7 @@ pub fn build_request_body(
     let mut wire_messages: Vec<Value> = Vec::new();
 
     for msg in &options.messages {
-        match msg {
+        match options.message_for_model(msg).as_ref() {
             Message::System { .. } => {}
             Message::User { content, images } => {
                 if images.is_empty() {
@@ -159,17 +163,7 @@ pub fn build_request_body(
                     );
                 } else {
                     for img in images {
-                        push_user_block(
-                            &mut wire_messages,
-                            json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.media_type,
-                                    "data": img.data,
-                                },
-                            }),
-                        );
+                        push_user_block(&mut wire_messages, image_block(img));
                     }
                     if !content.is_empty() {
                         push_user_block(
@@ -183,11 +177,24 @@ pub fn build_request_body(
                 content,
                 tool_call_id,
                 is_error,
+                images,
             } => {
+                let text = if content.is_empty() {
+                    "(no output)"
+                } else {
+                    content.as_str()
+                };
+                let output = if images.is_empty() {
+                    json!(text)
+                } else {
+                    let mut parts = vec![json!({"type": "text", "text": text})];
+                    parts.extend(images.iter().map(image_block));
+                    Value::Array(parts)
+                };
                 let mut block = json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
-                    "content": if content.is_empty() { "(no output)" } else { content.as_str() },
+                    "content": output,
                 });
                 if *is_error {
                     block["is_error"] = json!(true);
@@ -917,6 +924,10 @@ impl MessagesAdapter {
 }
 
 impl LlmAdapter for MessagesAdapter {
+    fn default_model(&self) -> Option<&str> {
+        Some(&self.config.model)
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.config.provider.clone(),

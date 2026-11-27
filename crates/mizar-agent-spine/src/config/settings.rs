@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CodemodeSettings {
+    pub enabled: Option<bool>,
     pub only_mode: Option<bool>,
     pub inline_budget: Option<usize>,
     pub timeout_ms: Option<u64>,
@@ -178,6 +179,9 @@ impl SettingsConfig {
         }
         if let Some(cm) = other.codemode {
             let dst = self.codemode.get_or_insert_with(Default::default);
+            if cm.enabled.is_some() {
+                dst.enabled = cm.enabled;
+            }
             if cm.only_mode.is_some() {
                 dst.only_mode = cm.only_mode;
             }

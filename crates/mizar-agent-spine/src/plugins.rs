@@ -1,8 +1,7 @@
 //! 内置 Cordis 模块控制器（`"spinePlugins"`）：
 //!
 //! 统一管理 `mizar-agent-spine` 装配的可选内置 Cordis 模块生命周期（启动屏蔽与运行期热挂载/热卸载），
-//! 并对核心内核服务（`llm`、`sessions`、`tools`、`systemPrompt`、`agentLoop`、`spinePlugins`）
-//! 以及 `coding` feature 下的固定核心工具 `codemode` 实施 Gate 2 自保护。
+//! 核心服务受保护，以免热卸载切断正在运行的会话。
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -18,6 +17,8 @@ use cordis::{Context, CordisError, Fiber};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
+#[cfg(feature = "coding")]
+use mizar_codemode::{CodemodeConfig, CodemodePlugin};
 #[cfg(feature = "compaction")]
 use mizar_compaction::{CompactionConfig, CompactionRuntime};
 #[cfg(feature = "coding")]
@@ -80,12 +81,6 @@ const PROTECTED_MODULES: &[(&str, &str, &str)] = &[
         "模块控制器",
         "管理内置 Cordis 模块热启停与自保护策略（核心内核服务）",
     ),
-    #[cfg(feature = "coding")]
-    (
-        "codemode",
-        "脚本执行沙箱",
-        "通过 QuickJS 沙箱批量编排与调用工具（核心固定工具）",
-    ),
 ];
 
 /// 所有已知的内置可选模块稳定 ID（含不同模式或 Cargo feature 下可能未激活的模块）。
@@ -94,6 +89,7 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "tool-fs",
     "tools-coding",
     "tool-search",
+    "codemode",
     "mcp",
     "skills",
     "instructions",
@@ -164,6 +160,8 @@ pub(crate) enum ModuleSpec {
     #[cfg(feature = "coding")]
     ToolSearch(ToolSearchConfig),
     #[cfg(feature = "coding")]
+    Codemode(CodemodeConfig),
+    #[cfg(feature = "coding")]
     Mcp(McpPluginConfig),
     #[cfg(feature = "coding")]
     Skills(SkillsConfig),
@@ -232,6 +230,8 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         }
         #[cfg(feature = "coding")]
         ModuleSpec::ToolSearch(ref cfg) => Ok(vec![ctx.try_plugin(ToolSearchPlugin, cfg.clone())?]),
+        #[cfg(feature = "coding")]
+        ModuleSpec::Codemode(ref cfg) => Ok(vec![ctx.try_plugin(CodemodePlugin, cfg.clone())?]),
         #[cfg(feature = "coding")]
         ModuleSpec::Mcp(ref cfg) => Ok(vec![ctx.try_plugin(McpManager::plugin(), cfg.clone())?]),
         #[cfg(feature = "coding")]
@@ -319,6 +319,10 @@ async fn mount_module_and_wait(
         #[cfg(feature = "coding")]
         ModuleSpec::ToolSearch(ref cfg) => {
             mount_single_and_wait(ctx, id, ToolSearchPlugin, cfg.clone()).await
+        }
+        #[cfg(feature = "coding")]
+        ModuleSpec::Codemode(ref cfg) => {
+            mount_single_and_wait(ctx, id, CodemodePlugin, cfg.clone()).await
         }
         #[cfg(feature = "coding")]
         ModuleSpec::Mcp(ref cfg) => {

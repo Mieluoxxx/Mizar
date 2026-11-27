@@ -705,6 +705,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         _ => false,
     };
 
+    let include_tools = spine_cfg.include_tools.clone();
     app.plugin(AgentSpinePlugin, spine_cfg);
     let retry_secrets = Arc::clone(&log_secrets);
     let _retry_subscription = app
@@ -760,7 +761,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
             wait_for_services(&app).await.map_err(|e| e.to_string())?;
-            if let Some(mcp) = app.get::<McpManager>("mcp") {
+            if let Some(mcp) = app.get::<McpManager>("mcp") && mcp.needs_initial_catalog(include_tools.as_deref()) {
                 mcp.wait_ready().await;
             }
             Ok::<(), String>(())

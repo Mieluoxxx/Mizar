@@ -1,6 +1,6 @@
 # Mizar 插件与模块清单
 
-本文档介绍 `crates/` 下共 **33 个 crate** 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
+本文档介绍 `crates/` 下各 crate 的分层作用，以及它们在 **Cordis 运行时（`inject` / `provide` 服务）** 与 **Cargo 包依赖** 两个维度上的依赖关系。
 
 目前仓库为纯 Virtual Workspace，唯一的终端入口为 `crates/mizar-tui/src/main.rs`（`mizar-tui`），通过 `mizar-agent-spine` 按需装配 Agent 能力，经跨端共享层（`mizar-client-core` / `mizar-client`）连接纯前端工作台 `mizar-tui-ui`（同时可供桌面端 Merak 直嵌复用）。**纯模型/纯 UI/纯客户端契约层**与**异步插件宿主层**已彻底解耦。
 
@@ -8,12 +8,13 @@
 
 ## 一、底层微内核与纯类型/核心层（无 `tokio` / 无 HTTP / 无重运行时）
 
-以下 5 个底层 crate 只保留数据结构、纯逻辑或微内核抽象，可独立进行毫秒级 `cargo check` 与单测：
+底层 crate 提供数据结构、纯逻辑或微内核抽象。
 
 | Crate | 类型 | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- |
 | **`cordis`** | 插件微内核框架 | 提供 `Context` 上下文树、`Fiber` 生命周期状态机、`effect` 记账与倒序清理、`Service` 抽象、`inject` 服务依赖注入与 5 种事件分发模式（`emit` / `parallel` / `serial` / `bail` / `waterfall`） | 无 |
 | **`mizar-llm-types`** | 纯 Schema / SSE Core | 定义统一消息、`ContentBlock`、`BlockAssembler`、错误分类与流式 `SseParser`（零 `tokio` / `cordis` / `reqwest`） | 无 |
+| **`mizar-image`** | 共享图片处理库 | 按文件头识别 PNG、JPEG、WebP、GIF。解码前校验 1 亿像素上限，再校正 EXIF 方向、提取动图首帧，按 2048 像素长边和 5 MB base64 预算生成 `ImageAttachment` | `mizar-llm-types` |
 | **`mizar-trajectory-core`** | 纯轨迹建模与检测 | 轨迹事件模型、折叠快照、三泳道时间轴建模与异常检测规则（零 `tokio` / `cordis` / 运行时插件依赖） | `mizar-llm-types` |
 | **`mizar-client-core`** | 纯客户端契约与算法层 | 跨 TUI 与 Merak Desktop 共享的纯数据结构与算法：`HostExtensionFlags`（10 个官方扩展开关与 `"tui"` 级联派生）、`PromptQueue`（ID 稳定的待发送队列）、`TpsLedger`（解码吞吐账本）、`WorkspaceFileCache`（`.gitignore` 感知后台索引）、`ClientEvent` 统一事件、`mentions` 解析、`reveal` 平滑吐字、`tool_format` 摘要与纯 DTO（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite` / `ratatui` / `crossterm`） | `mizar-llm-types` |
 | **`mizar-tui-ui`** | 纯终端工作台前端 | `AppState` 状态机、`TuiFeatures` 插件特性开关、`pi-emphasis` 视觉语法、虚拟化 Markdown/代码渲染、双栏侧栏、TimelineRail、Overlay、主题与轨迹全屏视图（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`） | `mizar-client-core`、`mizar-llm-types`、`mizar-trajectory-core` |
@@ -26,10 +27,10 @@
 
 | Crate | 插件 / 服务结构体 | 提供服务名 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-llm`** | `LlmRuntime` | `"llm"` | 抽象 LLM 服务：重导出 `mizar-llm-types`，提供 `llm/stream` 拦截通道并管理协议适配器注册（无内置 HTTP 栈） | 无 | `cordis`、`mizar-llm-types` |
-| **`mizar-session`** | `SessionStore` | `"sessions"` | 会话事件日志管理：以只追加日志保存对话、工具调用与回放状态，推导出发往模型的消息列表，并定义 `SessionPersistence` 持久化 trait 占位 `"sessionPersistence"` | 无 | `cordis`、`mizar-llm` |
+| **`mizar-llm`** | `LlmRuntime` | `"llm"` | 抽象 LLM 服务：重导出 `mizar-llm-types`，提供 `llm/stream` 拦截通道。按目标适配器的模型目录推断视觉能力，显式 `GenerateOptions.supports_images` 优先。目录缺项时允许图片 | 无 | `cordis`、`mizar-llm-types` |
+| **`mizar-session`** | `SessionStore` | `"sessions"` | 会话事件日志管理：以只追加日志保存对话、工具调用与回放状态。用户消息和工具回执可带图片，剪枝投影同时移除旧回执的文本和附件。定义 `SessionPersistence` 持久化 trait 占位 `"sessionPersistence"` | 无 | `cordis`、`mizar-llm` |
 | **`mizar-system-prompt`** | `SystemPrompt` | `"systemPrompt"` | 系统提示词动态组装：支持多插件按 `order` 贡献段落并自动拼接（内置 `identity (0)` / `engineering (10)` / `personality (20)` 与可选 `runtime_protocol (40)`） | 无 | `cordis` |
-| **`mizar-tools`** | `ToolRuntime` | `"tools"` | 工具注册表与三段执行管线（`tools/pre-execute` → `tools/execute` → `tools/post-execute`），生成工具 Schema 并统一派发执行；定义 `ToolExposure` / `ToolExecutionMode` / `ToolAnnotations` | 无 | `cordis`、`mizar-llm` |
+| **`mizar-tools`** | `ToolRuntime` | `"tools"` | 工具注册表与三段执行管线（`tools/pre-execute` → `tools/execute` → `tools/post-execute`），生成工具 Schema 并统一派发执行。每次工具回执最多保留 20 张图片，超限会在正文说明。定义 `ToolExposure` / `ToolExecutionMode` / `ToolAnnotations` | 无 | `cordis`、`mizar-llm` |
 
 ---
 
@@ -47,6 +48,8 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | **`mizar-llm-retry`** | 策略与流收集库 | — | 提供 `RetryConfig`、带抖动的退避、可取消等待和 `collect_with_retry`。主循环、压缩器和标题生成各自持有请求的重试预算 | — | `mizar-llm` |
 | **`mizar-llm-router`** | `LlmRouter` | `"llmRouter"`（服务） | **多提供方声明式路由与热重载插件**：将多路由配置（`~/.mizar/models.json`）映射到上述协议适配器，支持 `protocol` 选择、`api_key_env` 与 `$VAR` / `${VAR}` / `!command` 动态解析、`models` / `modelOverrides` 目录、请求头扩展钩子，并暴露 `apply_config` 原子热更新接口（**当前无内置文件监听**，需宿主在配置变更时主动调用） | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http`、`mizar-llm-completions`、`mizar-llm-responses`、`mizar-llm-messages`、`mizar-llm-mock` |
 
+视觉模型接收用户和工具图片。Anthropic 将工具的文本和图片放在 `tool_result.content` 数组，Responses 使用 `function_call_output.output` 数组。Chat Completions 先发出同一批的所有 `role: "tool"` 回执，再用一条 `role: "user"` 消息按顺序附图。纯文本工具回执沿用原来的字符串格式。目标模型仅支持文本时，三种协议都在序列化前将图片替换为 `[image omitted: current model does not support image input]`。
+
 ---
 
 ## 四、工具插件
@@ -57,13 +60,13 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | `ToolExposure` | 直接声明给模型 | 可被 `codemode` 脚本调用 | 列在 `codemode` 描述中 | 典型使用者 |
 | :--- | :--- | :--- | :--- | :--- |
-| `Direct` | ✓ 激活后 | ✓ | — | `read` / `bash` / `edit` / `write` / `grep` / `find` / `recall` / `skill` |
+| `Direct` | ✓ 激活后 | ✓ 激活后 | `onlyMode` 预算内的本地工具 | `read` / `bash` / `edit` / `write` / `grep` / `find` / `recall` / `skill` |
 | `ModelOnly` | ✓ 激活后 | ✗（自身是编排工具） | — | `tool_search`、`codemode` |
-| `Codemode` | ✗（需激活） | ✓ | ✓ | MCP 工具默认、`codemode` 内部依赖的工具 |
+| `Codemode` | 激活后可声明 | ✓ | 通过沙箱检索 | MCP 工具默认、`codemode` 内部依赖的工具 |
 | `Deferred` | ✗（需激活） | ✓ | ✗（靠 `tool_search` / `searchTools()` 发现） | MCP 工具可选项 |
 | `Hidden` | ✗ | ✗ | ✗ | 显式屏蔽（`exclude_tools`） |
 
-激活与排除的优先级依次为（`mizar-tools` 的 `is_default_active`）：**`global_active_overrides`** > **`include_tools` 通配白名单** > **`auto_default_active`**（`tool_search` 按需自动启用） > 工具的 `default_active`；任何情况下 `ToolExposure::Hidden` 与命中 `exclude_tools` 的工具都不可激活。显式激活过的工具会在下一次模型调用时重新参与声明，而 `Codemode` / `Deferred` 工具即使未激活也仍可被脚本或 `tool_search` 调用（`resolve_callable_infos`）。
+激活与排除的优先级依次为（`mizar-tools` 的 `is_default_active`）：**`global_active_overrides`** > **`include_tools` 通配白名单** > **`auto_default_active`**（MCP 按配置激活 `codemode`，`tool_search` 随可搜索工具激活） > 工具的 `default_active`；任何情况下 `ToolExposure::Hidden` 与命中 `exclude_tools` 的工具都不可激活。显式激活过的工具会在下一次模型调用时重新参与声明，而 `Codemode` / `Deferred` 工具即使未激活也仍可被脚本或 `tool_search` 调用（`resolve_callable_infos`）。
 
 ### 4.1 最小只读套件（Legacy 模式）
 
@@ -76,20 +79,22 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件结构体 | 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-tools-coding`** | `CodingToolsPlugin` | `"tools-coding"` | `read`、`write`、`edit`、`bash`、`grep`、`find` | `["tools"]` | 编码工具体系：`read` 支持行偏移与长度限制，`edit` 做词级 diff 替换，`grep` / `find` 走 `ignore` 库（尊重 `.gitignore`），`bash` 支持超时与输出截断。三档预设：`All`（6 个）、`MinimalCoding`（4 个：`read`/`bash`/`edit`/`write`）、`ReadOnly`（3 个：`read`/`grep`/`find`）；可选向 `SystemPrompt` 贡献「可用工具 + 工作目录」段落 | `cordis`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-tools-coding`** | `CodingToolsPlugin` | `"tools-coding"` | `read`、`bash`、`edit`、`write`、`grep`、`find` | `["tools"]`，可选 `systemPrompt` | 默认 `MinimalCoding` 声明前四项。`All` 或 `--tools` 可启用独立的 `grep` 和 `find`，`ReadOnly` 提供 `read`、`grep` 和 `find`。文本可按行分页读取，读图按文件头识别并检查 32 MiB 输入上限。`edit` 支持批量局部替换。`bash` 给模型展示首尾摘要（20 KiB、400 行、每行 768 字节），给脚本的 `structured_content.output` 最多 1 MiB，完整落盘输出可通过 `full_output_path` 读取 | `cordis`、`mizar-image`、`mizar-system-prompt`、`mizar-tools` |
 
 ### 4.3 工具发现与 JS 编排
 
 | Crate | 插件结构体 | 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-tool-search`** | `ToolSearchPlugin` | `"tool-search"` | `tool_search` | `["tools"]` | **BM25 工具发现**：对 `Codemode` / `Deferred` 暴露等级的工具建索引（名称权重 4.0、命名空间 2.0），命中后按会话（或全局）激活，使其出现在下一次模型调用的声明中。存在可搜索工具时自动激活，`default_limit` 默认 8 | `cordis`、`mizar-tools` |
-| **`mizar-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | **基于 QuickJS（`rquickjs`）沙箱的多工具 JS 编排引擎（固定核心工具，受 Gate 2 自保护不可禁用）**：默认常驻激活，把多个工具调用折叠成一次脚本执行，中间结果不进上下文。自动在 `Direct` 工具描述追加 `Codemode: tools.<name>(args)` 引导；提供 `searchTools()` 内建检索、并发信号量（`max_workers` 默认 2）、脚本超时（默认 120 s，支持跨异步嵌套工具调用取消传播）与内联预算（默认 3 000 字符，`DEFAULT_CODEMODE_INLINE_BUDGET`）；`only_mode` 可隐藏 `Direct` 工具的直接声明，全部改由脚本调度 | `cordis`、`mizar-tool-search`、`mizar-tools` |
+| **`mizar-codemode`** | `CodemodePlugin` | `"codemode"` | `codemode` | `["tools"]` | 可选 QuickJS 编排工具。默认休眠，`--tools codemode`、`codemode.enabled: true`、`onlyMode` 或 MCP 静态配置可激活。显式 `enabled: false` 禁用工具。混合模式使用固定声明，MCP 工具由 `searchTools()`、`describeTool()` 和 `describeNamespace()` 发现。`onlyMode` 隐藏直连声明，按命名空间轮询列出预算内的本地直连工具（默认 3000 token）。脚本接收图片元数据，宿主随外层结果附图。默认 2 个并发工作位，超时 120 秒，取消传递给嵌套调用 | `cordis`、`mizar-tool-search`、`mizar-tools` |
 
 ### 4.4 MCP 接入
 
 | Crate | 服务结构体 | 提供服务名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]` | **MCP 客户端**：从 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json` 加载配置（项目级省略 `command`/`url` 的同名条目作为增量补丁覆盖 `exposure` / `toolExposure` 等字段），支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP**（`url` / `headers`，复用 `mizar-llm-http` 连接池与自定义 CA 根，支持 `text/event-stream` 增量分块读取）两种传输；按 Server 与逐工具两级配置暴露等级（`McpExposure` 默认 `Codemode`，支持通配符匹配），后台异步连接不阻塞启动；`close_all` 通过 `McpManagerPhase` 状态机、`CancellationToken` 与传输层 `StdioRpcState` 安全退出并唤醒等待者；向 `SystemPrompt` 贡献 `<mcp_servers>` 段落 | `cordis`、`mizar-llm`、`mizar-llm-http`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-mcp`** | `McpManager` | `"mcp"` | `mcp__<server>__<tool>`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource` | `["tools"]`，可选 `systemPrompt` | 合并全局与项目 `mcp.json`，项目同名条目可覆盖 `exposure` 和 `toolExposure`。`autoEnableCodemode` 默认开启。启用的服务或其工具覆盖使用 `codemode` 暴露时，初始化立即激活沙箱。`<mcp_servers>` 按配置名排序，描述取自配置。stdio 和 Streamable HTTP 后台握手、工具发现和远端 instructions 不改变这段摘要。MCP `image` 块经解码、校验、压缩后作为附件返回，损坏图片返回文本说明。卸载撤销自动激活并关闭连接 | `cordis`、`mizar-image`、`mizar-llm`、`mizar-llm-http`、`mizar-system-prompt`、`mizar-tools` |
+
+混合模式下，后台握手完成前后，`codemode` 的声明和 `<mcp_servers>` 的字节相同。`tool_search` 有独立的自动激活条件，发现可搜索工具后仍可能加入声明。无头 `exec` 显式选择直连 MCP 工具时会等待远端工具清单，确保第一步即可调用。
 
 ### 4.5 技能系统
 
@@ -134,8 +139,8 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`）及 `coding` feature 下的固定核心工具 `codemode`，再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理 12 个内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins`（及 `coding` feature 下的 `codemode`）实施 Gate 2 自保护（严禁禁用），同时识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主/TUI 扩展 ID 以避免 `disabledPlugins` 误报未知模块警告。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并将配置加载与路由解析拆分为 `config.rs` + `config/{settings,route}.rs`（提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写） | 无（自身负责装配与控制） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` 及按 Cargo features 选配的后端 crate |
-| **`mizar-client`** | `FileMentionsPlugin`、`ApprovalGatePlugin` 与宿主运行时模块 | `"file-mentions"` / `"approval-gate"`（前端无关宿主运行时） | **跨端宿主运行时（零 `ratatui` / `crossterm` / `mizar-tui-ui`）**：供 `mizar-tui` 与未来桌面端 Merak 共用。内置两个标准 Cordis 插件——`FileMentionsPlugin`（`mentions`：在 `agent/pre-step` 展开 `@` 文件/目录/图片引用为 `ContextNotice`）与 `ApprovalGatePlugin`（`approval`：在 `tools/pre-execute` 拦截高危工具执行并等待决策）；并提供前端无关运行时子模块：`images`（图片嗅探/EXIF 校正/动图首帧与自适应压缩）、`session_view`（只读会话投影/模型选择优先级解析/会话信息报告）、`settings`（设置条目构建、热更新与 `SpinePlugins` 启停原子写回）、`local_bash`（`!` / `!!` 本地 Shell 执行与会话审计）、`events`（核心服务等待、事件订阅与 `LoopClientMsg` / `RunController` 代次控制）以及 `workspace`（`WorkspacePanelSnapshot` 工具/MCP/指令/Git/轨迹聚合） | `FileMentionsPlugin` 依赖 `["llm"]`；`ApprovalGatePlugin` 依赖 `["tools"]`；其余运行时工具按需访问 `agentLoop`、`sessions`、`spinePlugins`、`compaction`、`sessionTitle`、`instructions`、`mcp`、`skills`、`trajectory` | `cordis`、`mizar-agent-loop`、`mizar-agent-spine`、`mizar-client-core`、`mizar-instructions`、`mizar-llm`、`mizar-mcp`、`mizar-session`、`mizar-session-title`、`mizar-skills`、`mizar-tools`、`mizar-tools-coding`、`mizar-trajectory` |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins`实施 Gate 2 自保护（严禁禁用），同时识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主/TUI 扩展 ID 以避免 `disabledPlugins` 误报未知模块警告。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并将配置加载与路由解析拆分为 `config.rs` + `config/{settings,route}.rs`（提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写） | 无（自身负责装配与控制） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` 及按 Cargo features 选配的后端 crate |
+| **`mizar-client`** | `FileMentionsPlugin`、`ApprovalGatePlugin` 与宿主运行时模块 | `"file-mentions"` / `"approval-gate"`（前端无关宿主运行时） | **跨端宿主运行时（零 `ratatui` / `crossterm` / `mizar-tui-ui`）**：供 `mizar-tui` 与未来桌面端 Merak 共用。内置两个标准 Cordis 插件——`FileMentionsPlugin`（`mentions`：在 `agent/pre-step` 展开 `@` 文件/目录/图片引用为 `ContextNotice`）与 `ApprovalGatePlugin`（`approval`：在 `tools/pre-execute` 拦截高危工具执行并等待决策）；并提供前端无关运行时子模块：`images`（重导出 `mizar-image` 的共享管线）、`session_view`（只读会话投影/模型选择优先级解析/会话信息报告）、`settings`（设置条目构建、热更新与 `SpinePlugins` 启停原子写回）、`local_bash`（`!` / `!!` 本地 Shell 执行与会话审计）、`events`（核心服务等待、事件订阅与 `LoopClientMsg` / `RunController` 代次控制）以及 `workspace`（`WorkspacePanelSnapshot` 工具/MCP/指令/Git/轨迹聚合） | `FileMentionsPlugin` 依赖 `["llm"]`；`ApprovalGatePlugin` 依赖 `["tools"]`；其余运行时工具按需访问 `agentLoop`、`sessions`、`spinePlugins`、`compaction`、`sessionTitle`、`instructions`、`mcp`、`skills`、`trajectory` | `cordis`、`mizar-agent-loop`、`mizar-agent-spine`、`mizar-client-core`、`mizar-image`、`mizar-instructions`、`mizar-llm`、`mizar-mcp`、`mizar-session`、`mizar-session-title`、`mizar-skills`、`mizar-tools`、`mizar-tools-coding`、`mizar-trajectory` |
 | **`mizar-tui`** | 可执行文件 `mizar`（含 `TuiEmphasisPlugin`） | 终端与无头 CLI 入口 / `"tui-emphasis"` | **薄终端宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，同时提供交互式 TUI 与非交互无头单次执行（`mizar exec` / `-p` / `--prompt-file`）。TUI 模式（`runner.rs` + `runner/{terminal_io,actions}.rs`）将事件订阅、审批门禁、`@` 引用展开、图片处理、本地 Bash、会话投影与配置热写回全部委托给 `mizar-client` / `mizar-client-core`，自身专注终端 I/O、系统/OSC 5522 剪贴板（`clipboard`）、`mizar-tui-ui` 渲染桥接，以及按 `HostExtensionFlags` 控制 `TuiEmphasisPlugin`（`tui_reply_guidance` 系统提示词挂载）、`FileMentionsPlugin`、审批钩子与各前端特性开关（若 `disabledPlugins` 包含 `"tui"` 则直接拒绝启动而不进入终端 raw mode），支持欢迎画布、`!` / `!!` 本地 Bash 模式、可取消的 `/compact [focus]` 进度压缩、`/resume` 交互式会话选择器与 `/rename [title]` 改名/重生成，以及 `/settings`（`/config`）实时切换；无头 `exec` 模式复用同套装配，支持 `--provider` / `--model` / `--protocol`（`--api-format`）/ `--base-url` / `--reasoning-effort` / `--max-steps` / `--timeout` / `--isolated`，校验路由与凭据，标准错误报告重试；文本模式仅在成功时输出答案，`--json` 为每种终态输出结构化结果。CLI 同时支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r [id]`、`--no-persist`、`--no-instructions`、`--theme` 与 `mizar update` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测；`TuiEmphasisPlugin` 注入 `["systemPrompt"]`；按需访问 `spinePlugins`、`compaction`、`sessionTitle`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-client`、`mizar-client-core`、`mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
 ---
@@ -177,7 +182,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 ```
 
 **编译隔离边界**：
-- `mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite`（其中 `mizar-client-core` **亦禁止**依赖 `ratatui` / `crossterm`）；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `mizar-tui-ui` 与薄宿主 `mizar-tui`。
+- `mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`、`mizar-image` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite`（其中 `mizar-client-core` **亦禁止**依赖 `ratatui` / `crossterm`）；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `mizar-tui-ui` 与薄宿主 `mizar-tui`。
 - `mizar-client` 与 `mizar-client-core` **严禁引入 `ratatui`、`crossterm` 或 `mizar-tui-ui`**，确保未来 `Merak Desktop` 直嵌零终端依赖。
 
 ---
@@ -194,13 +199,13 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `reasoningEffort`（别名 `defaultThinkingLevel`） | string | 思考强度 `off`..`max` |
 | `maxSteps` | number | 单轮工具步数上限，省略则不限 |
 | `personality` | string | 覆写内置性格与沟通语气段（设为 `""` 可关闭，不影响身份定位与工程原则） |
-| `toolsPreset` | `all` / `minimal` / `read-only` | 编码工具预设，对应 `--minimal` / `--read-only` |
+| `toolsPreset` | `minimal` / `minimal-coding` / `all` / `read-only` / `readonly` | 默认 `minimal`，可用 `--minimal` 或 `--read-only` 覆盖项目配置 |
 | `tools` | string[] | 工具白名单（支持 `*` 通配） |
 | `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |
 | `disabledPlugins` | string[] | 声明式屏蔽内置可选 Cordis 模块 ID 或官方客户端/TUI 扩展 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期热启停并原子回写；受保护核心服务忽略并告警） |
 | `restrictToWorkspace` | bool | 将文件工具限制在工作区内（**默认 `false`**） |
 | `sessionDb` | string | SQLite 落盘路径；等价环境变量 `MIZAR_SESSION_DB`（`none` / `off` 关闭） |
-| `codemode` | object | `onlyMode` / `inlineBudget` / `timeoutMs` |
+| `codemode` | object | `enabled`（缺省按需激活）/ `onlyMode` / `inlineBudget`（token）/ `timeoutMs` |
 | `toolSearch` | object | `autoEnable` / `defaultLimit` |
 | `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
 | `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` |
@@ -228,6 +233,6 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 > **Merak Desktop 直嵌说明**：桌面端 Merak 内置 Mizar 时，只需在配置中设置 `disabledPlugins: ["tui"]`，即可一键级联禁用全部 `tui` 与 `tui-*` 终端扩展（含终端 `tui_reply_guidance` 系统提示词注入），同时完整保留 `file-mentions`、`local-bash`、`approval-gate` 以及后端 `AgentSpinePlugin` 全部核心能力。
 
-`models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/mizar-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，并额外支持每个 Server 的 `exposure` 与 `toolExposure`。
+`models.json` 为 `RouterConfig`（`providers` 映射），字段细节见 `crates/mizar-llm-router/src/config.rs` 顶部注释；`mcp.json` 使用标准 `mcpServers` 结构，支持顶层 `autoEnableCodemode` 以及每个 Server 的 `exposure` 与 `toolExposure`。
 
 > **注意**：`restrictToWorkspace` 默认关闭且 `TuiConfig::approval_mode` 默认为 `Auto`，即开箱状态下 `bash` / `write` / `edit` 可触达工作区外路径且无审批弹窗；需要沙箱感时请显式开启 `restrictToWorkspace` 并搭配 `--approve`（或通过 `/settings` / `/approval ask` 运行期开启审批）。

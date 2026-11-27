@@ -16,7 +16,7 @@ pub const DEFAULT_ENGINEERING_PRINCIPLES: &str = "\
 Engineering principles:
 - First principles: reason from the root problem and real constraints rather than patching symptoms.
 - Occam's razor: prefer the simplest solution that fits; cut unnecessary abstractions, indirection, and obsolete code.
-- Maximize parallel tool calls for independent operations, and prefer `codemode` to compose calls or filter outputs so token usage stays low and execution stays fast.";
+- Maximize parallel tool calls for independent operations to keep token usage low and execution fast.";
 
 /// 默认性格与沟通语气（`order = 20`，纯英文静态前缀，可独立覆写或置空关闭）。
 pub const DEFAULT_PERSONALITY: &str = "\

@@ -112,6 +112,12 @@ fn resolve_header_map(
 }
 
 impl LlmAdapter for RoutedAdapter {
+    fn default_model(&self) -> Option<&str> {
+        self.default_model
+            .as_deref()
+            .or_else(|| self.inner.default_model())
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.provider.clone(),

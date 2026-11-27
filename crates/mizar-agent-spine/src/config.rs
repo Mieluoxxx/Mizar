@@ -326,15 +326,19 @@ impl LoadedMizarConfig {
             }
             if let Some(preset_str) = &self.settings.tools_preset {
                 coding.preset = match preset_str.trim().to_ascii_lowercase().as_str() {
+                    "all" => CodingToolsPreset::All,
                     "minimal" | "minimal-coding" => CodingToolsPreset::MinimalCoding,
                     "read-only" | "readonly" => CodingToolsPreset::ReadOnly,
-                    _ => CodingToolsPreset::All,
+                    _ => coding.preset,
                 };
             }
             if let Some(restrict) = self.settings.restrict_to_workspace {
                 coding.restrict_to_workspace = restrict;
             }
             if let Some(cm) = &self.settings.codemode {
+                if cm.enabled.is_some() {
+                    codemode.enabled = cm.enabled;
+                }
                 if let Some(v) = cm.only_mode {
                     codemode.only_mode = v;
                 }

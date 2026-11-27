@@ -103,6 +103,7 @@ fn render_entry_verbatim(entry: &SessionEntry) -> Option<String> {
             name,
             content,
             is_error,
+            ..
         } => {
             let status = if *is_error { "error" } else { "ok" };
             Some(format!(

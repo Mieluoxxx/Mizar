@@ -25,9 +25,9 @@ pub use write::create_write_tool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodingToolsPreset {
     /// 全部 6 个内置编码工具：`read`、`write`、`edit`、`bash`、`grep`、`find`。
-    #[default]
     All,
     /// `pi` 极简默认 4 件套：`read`、`bash`、`edit`、`write`。
+    #[default]
     MinimalCoding,
     /// 纯只读套件：`read`、`grep`、`find`。
     ReadOnly,
@@ -48,7 +48,7 @@ impl CodingToolsConfig {
         Self {
             workspace: workspace.into(),
             restrict_to_workspace: false,
-            preset: CodingToolsPreset::All,
+            preset: CodingToolsPreset::default(),
             inject_system_prompt: true,
         }
     }
@@ -57,27 +57,18 @@ impl CodingToolsConfig {
 pub fn build_coding_tools(config: &CodingToolsConfig) -> Vec<ToolDefinition> {
     let cwd = config.workspace.clone();
     let restrict = config.restrict_to_workspace;
-    match config.preset {
-        CodingToolsPreset::All => vec![
-            create_read_tool(cwd.clone(), restrict),
+    let mut tools = vec![create_read_tool(cwd.clone(), restrict)];
+    if config.preset != CodingToolsPreset::ReadOnly {
+        tools.extend([
             create_bash_tool(cwd.clone()),
             create_edit_tool(cwd.clone(), restrict),
             create_write_tool(cwd.clone(), restrict),
-            create_grep_tool(cwd.clone(), restrict),
-            create_find_tool(cwd, restrict),
-        ],
-        CodingToolsPreset::MinimalCoding => vec![
-            create_read_tool(cwd.clone(), restrict),
-            create_bash_tool(cwd.clone()),
-            create_edit_tool(cwd.clone(), restrict),
-            create_write_tool(cwd, restrict),
-        ],
-        CodingToolsPreset::ReadOnly => vec![
-            create_read_tool(cwd.clone(), restrict),
-            create_grep_tool(cwd.clone(), restrict),
-            create_find_tool(cwd, restrict),
-        ],
+        ]);
     }
+    let search_active = config.preset != CodingToolsPreset::MinimalCoding;
+    tools.push(create_grep_tool(cwd.clone(), restrict).with_default_active(search_active));
+    tools.push(create_find_tool(cwd, restrict).with_default_active(search_active));
+    tools
 }
 
 /// 根据当前会话已声明工具构建 `tools_guide` 系统提示词段落（纯英文静态模板）。
@@ -108,24 +99,28 @@ pub fn build_tools_guide(declared: &[ToolRuntimeInfo]) -> Option<String> {
 
     let mut usage = Vec::new();
     if has("bash") {
-        let mut dedicated = Vec::new();
         if has("read") {
-            dedicated.push("`read` to inspect files");
-        }
-        if has("grep") {
-            dedicated.push("`grep` to search content");
-        }
-        if has("find") {
-            dedicated.push("`find` to locate files");
+            usage.push("- Use read to examine files instead of cat or sed.".into());
         }
         if has("edit") {
-            dedicated
-                .push("`edit` for targeted edits (batch disjoint edits to one file in `edits[]`)");
+            usage.push(
+                "- Use edit for targeted edits (batch disjoint edits to one file in edits[])."
+                    .into(),
+            );
         }
-        if !dedicated.is_empty() {
+        let searches: Vec<_> = ["grep", "find"]
+            .into_iter()
+            .filter(|name| has(name))
+            .collect();
+        if searches.is_empty() {
+            usage.push(
+                "- Use bash for shell commands and file operations such as ls, rg, and find."
+                    .into(),
+            );
+        } else {
             usage.push(format!(
-                "- Prefer dedicated tools over `bash`: use {}; never run `cat`, `head`, `tail`, `sed`, `grep`, or `find` via `bash`.",
-                dedicated.join(", ")
+                "- You may use {} for standalone searches, or bash directly for pipelines and compound commands.",
+                searches.join("/")
             ));
         }
     } else if has("edit") {

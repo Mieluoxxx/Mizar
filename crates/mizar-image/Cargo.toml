@@ -1,0 +1,15 @@
+[package]
+name = "mizar-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "供客户端与工具共用的图片校验、方向校正与压缩管线"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+image = { workspace = true }
+mizar-llm-types = { workspace = true }
+thiserror = { workspace = true }

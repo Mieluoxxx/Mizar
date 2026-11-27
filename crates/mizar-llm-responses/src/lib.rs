@@ -8,9 +8,9 @@ use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
-    ToolSchema, clamp_openai_prompt_cache_key, classify_inband_error_value,
+    ImageAttachment, LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo,
+    ProviderInfo, ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk,
+    TokenUsage, ToolSchema, clamp_openai_prompt_cache_key, classify_inband_error_value,
     classify_non_json_sse_frame, detect_session_affinity_mode, push_session_affinity_headers,
     resolve_cache_retention,
 };
@@ -83,11 +83,12 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
         Message::Tool {
             content,
             tool_call_id,
+            images,
             ..
         } => vec![json!({
             "type": "function_call_output",
             "call_id": tool_call_id,
-            "output": content,
+            "output": input_content(content, images, true),
         })],
         Message::Assistant { blocks, replay } => {
             let block_call_ids: HashSet<&str> = blocks
@@ -185,40 +186,31 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
             }
             items
         }
-        Message::User { content, images } => {
-            if images.is_empty() {
-                vec![json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": content,
-                })]
-            } else {
-                let mut parts = Vec::with_capacity(images.len() + 1);
-                if !content.is_empty() {
-                    parts.push(json!({
-                        "type": "input_text",
-                        "text": content,
-                    }));
-                }
-                for img in images {
-                    parts.push(json!({
-                        "type": "input_image",
-                        "image_url": img.data_url(),
-                    }));
-                }
-                vec![json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": parts,
-                })]
-            }
-        }
+        Message::User { content, images } => vec![json!({
+            "type": "message", "role": "user", "content": input_content(content, images, false),
+        })],
         Message::System { content } => vec![json!({
             "type": "message",
             "role": "developer",
             "content": content,
         })],
     }
+}
+
+fn input_content(text: &str, images: &[ImageAttachment], tool_result: bool) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if tool_result || !text.is_empty() {
+        parts.push(json!({"type": "input_text", "text": text}));
+    }
+    parts.extend(
+        images
+            .iter()
+            .map(|img| json!({"type": "input_image", "image_url": img.data_url()})),
+    );
+    Value::Array(parts)
 }
 
 fn has_encrypted_reasoning(item: &Value) -> bool {
@@ -601,7 +593,9 @@ pub fn build_request_body(
             .messages
             .iter()
             .filter(|m| !matches!(m, Message::System { .. }))
-            .flat_map(|m| to_wire_with_replay(m, &config.provider, model)),
+            .flat_map(|m| {
+                to_wire_with_replay(&options.message_for_model(m), &config.provider, model)
+            }),
     );
 
     let mut body = json!({
@@ -1787,6 +1781,10 @@ impl ResponsesAdapter {
 }
 
 impl LlmAdapter for ResponsesAdapter {
+    fn default_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.config.provider.clone(),

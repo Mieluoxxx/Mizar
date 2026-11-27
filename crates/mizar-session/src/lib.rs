@@ -232,6 +232,7 @@ pub fn repair_dangling_tool_calls(loaded: &mut LoadedSession) -> Vec<SessionEntr
                 name,
                 content: "[会话恢复：上次运行意外中断，工具结果未知 (TOOL_OUTCOME_UNKNOWN)]"
                     .to_string(),
+                images: Vec::new(),
                 is_error: true,
             },
             ts,
@@ -816,16 +817,17 @@ impl Session {
                     tool_call_id,
                     content,
                     is_error,
+                    images,
                     ..
                 } => {
-                    let effective_content = pruned_map
-                        .get(&entry.seq)
-                        .cloned()
-                        .unwrap_or_else(|| content.clone());
-                    messages.push(Message::Tool {
-                        content: effective_content,
-                        tool_call_id: tool_call_id.clone(),
-                        is_error: *is_error,
+                    messages.push(match pruned_map.get(&entry.seq) {
+                        Some(notice) => Message::tool(tool_call_id, notice, *is_error),
+                        None => Message::tool_with_images(
+                            tool_call_id,
+                            content,
+                            *is_error,
+                            images.clone(),
+                        ),
                     });
                 }
                 SessionEvent::Compaction {

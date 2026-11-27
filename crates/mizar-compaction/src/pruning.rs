@@ -21,7 +21,9 @@ use mizar_session::{PrunedToolResult, Session, SessionEntry, SessionEvent};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::budget::{estimate_entry_tokens_with_pruned, estimate_text_tokens};
+use crate::budget::{
+    estimate_entry_tokens_with_pruned, estimate_text_tokens, estimate_tool_output_tokens,
+};
 
 pub const SUPERSEDED_NOTICE: &str = "[Superseded by a newer read of this file]";
 pub const USELESS_NOTICE: &str = "[Uneventful result elided]";
@@ -279,10 +281,6 @@ fn collect_tool_calls<'a>(
     map
 }
 
-fn estimate_savings(content: &str, notice: &str) -> u64 {
-    estimate_text_tokens(content).saturating_sub(estimate_text_tokens(notice))
-}
-
 /// 纯规划函数：基于当前可见表面日志、`ToolResultPrune` 映射与提示词缓存边界计算本次应追加的剪枝标记。
 pub fn plan_tail_pruning(
     visible: &[SessionEntry],
@@ -307,6 +305,7 @@ pub fn plan_tail_pruning(
                 name,
                 content,
                 is_error,
+                images,
             } = &entry.event
             else {
                 continue;
@@ -355,7 +354,8 @@ pub fn plan_tail_pruning(
                     visible_idx: idx,
                     target_seq: entry.seq,
                     notice: SUPERSEDED_NOTICE,
-                    tokens_saved: estimate_savings(content, SUPERSEDED_NOTICE),
+                    tokens_saved: estimate_tool_output_tokens(content, images)
+                        .saturating_sub(estimate_text_tokens(SUPERSEDED_NOTICE)),
                 });
             }
         }
@@ -368,6 +368,7 @@ pub fn plan_tail_pruning(
                 name,
                 content,
                 is_error,
+                images,
             } = &entry.event
             else {
                 continue;
@@ -381,12 +382,13 @@ pub fn plan_tail_pruning(
             if is_protected_tool_result(name, call_args) {
                 continue;
             }
-            if is_useless_result(name, content, *is_error) {
+            if images.is_empty() && is_useless_result(name, content, *is_error) {
                 candidates.push(Candidate {
                     visible_idx: idx,
                     target_seq: entry.seq,
                     notice: USELESS_NOTICE,
-                    tokens_saved: estimate_savings(content, USELESS_NOTICE),
+                    tokens_saved: estimate_text_tokens(content)
+                        .saturating_sub(estimate_text_tokens(USELESS_NOTICE)),
                 });
             }
         }

@@ -18,7 +18,6 @@
 //! - `--output-format <fmt>` / `--json`：无头输出格式（`text` / `json`）
 //! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
 //! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
-//! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
 //! - `--tools <a,b,...>` / `-t`：工具白名单
 //! - `--exclude-tools <a,b,...>` / `-xt`：工具黑名单（支持 `*` 通配）
@@ -154,7 +153,7 @@ Options:
       --json                    Shorthand for --output-format json
       --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
       --isolated                Skip personal global config, MCP, skills, instructions, and DB
-      --minimal                 Enable minimal coding preset (read, bash, edit, write)
+      --minimal                 Use the default coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
   -t, --tools <a,b,...>         Tool allowlist (comma-separated, supports *)
  -xt, --exclude-tools <a,b,...> Tool denylist (comma-separated, supports *)

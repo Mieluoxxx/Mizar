@@ -9,8 +9,10 @@ description = "MCP 客户端与 ToolRuntime 接入插件（支持 stdio / Stream
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 cordis = { workspace = true }
 dirs = { workspace = true }
+mizar-image = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-llm-http = { workspace = true }
 mizar-system-prompt = { workspace = true }

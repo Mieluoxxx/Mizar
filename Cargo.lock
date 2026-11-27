@@ -1458,14 +1458,13 @@ dependencies = [
 name = "mizar-client"
 version = "0.2.4"
 dependencies = [
- "base64 0.22.1",
  "chrono",
  "cordis",
  "futures",
- "image",
  "mizar-agent-loop",
  "mizar-agent-spine",
  "mizar-client-core",
+ "mizar-image",
  "mizar-instructions",
  "mizar-llm",
  "mizar-mcp",
@@ -1524,6 +1523,16 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "mizar-image"
+version = "0.2.4"
+dependencies = [
+ "base64 0.22.1",
+ "image",
+ "mizar-llm-types",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1653,8 +1662,10 @@ dependencies = [
 name = "mizar-mcp"
 version = "0.2.4"
 dependencies = [
+ "base64 0.22.1",
  "cordis",
  "dirs",
+ "mizar-image",
  "mizar-llm",
  "mizar-llm-http",
  "mizar-system-prompt",
@@ -1798,6 +1809,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "mizar-image",
  "mizar-system-prompt",
  "mizar-tools",
  "serde",

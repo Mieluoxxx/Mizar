@@ -849,6 +849,7 @@ impl AgentLoop {
                 model: model.clone(),
                 provider: provider.clone(),
                 system: None,
+                supports_images: None,
                 max_tokens,
                 temperature,
                 reasoning_effort,
@@ -1063,6 +1064,7 @@ impl AgentLoop {
                             tool_call_id: pending.id.clone(),
                             name: pending.name.clone(),
                             content,
+                            images: Vec::new(),
                             is_error: true,
                         });
                     }
@@ -1160,6 +1162,7 @@ impl AgentLoop {
                         tool_call_id: call.id.clone(),
                         name: call.name.clone(),
                         content: result.content,
+                        images: result.images,
                         is_error: result.is_error,
                     });
                     for note in extra_contexts {

@@ -479,10 +479,13 @@ impl CompactionRuntime {
         let mut pruned_map = session.pruned_map();
         // 干净转录也应看到剪枝后的内容，避免把刚移除的输出又塞回摘要请求。
         for entry in &mut visible {
-            if let SessionEvent::ToolResult { content, .. } = &mut entry.event
+            if let SessionEvent::ToolResult {
+                content, images, ..
+            } = &mut entry.event
                 && let Some(notice) = pruned_map.remove(&entry.seq)
             {
                 *content = notice;
+                images.clear();
             }
         }
 

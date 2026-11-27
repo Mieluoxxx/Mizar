@@ -103,7 +103,9 @@ pub fn estimate_message_tokens(msg: &Message) -> u64 {
             }
             sum
         }
-        Message::Tool { content, .. } => base + 8 + estimate_text_tokens(content),
+        Message::Tool {
+            content, images, ..
+        } => base + 8 + estimate_tool_output_tokens(content, images),
     }
 }
 
@@ -130,7 +132,9 @@ pub fn estimate_entry_tokens(entry: &SessionEntry) -> u64 {
             }
             sum
         }
-        SessionEvent::ToolResult { content, .. } => base + 8 + estimate_text_tokens(content),
+        SessionEvent::ToolResult {
+            content, images, ..
+        } => base + 8 + estimate_tool_output_tokens(content, images),
         SessionEvent::Compaction {
             summary, digest, ..
         } => {
@@ -155,7 +159,11 @@ pub fn estimate_entry_tokens(entry: &SessionEntry) -> u64 {
     }
 }
 
-/// 估算单条会话事件在应用 `ToolResultPrune` 投影替换后的上下文 token 数。
+pub(crate) fn estimate_tool_output_tokens(content: &str, images: &[ImageAttachment]) -> u64 {
+    estimate_text_tokens(content) + images.iter().map(estimate_image_tokens).sum::<u64>()
+}
+
+/// 剪枝后模型只收到替换文本，因此旧附件不再占用预算。
 pub fn estimate_entry_tokens_with_pruned(
     entry: &SessionEntry,
     pruned_map: &HashMap<u64, String>,

@@ -260,6 +260,8 @@ pub enum Message {
     },
     Tool {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -329,10 +331,20 @@ impl Message {
         content: impl Into<String>,
         is_error: bool,
     ) -> Self {
+        Self::tool_with_images(tool_call_id, content, is_error, Vec::new())
+    }
+
+    pub fn tool_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+        images: Vec<ImageAttachment>,
+    ) -> Self {
         Self::Tool {
             tool_call_id: tool_call_id.into(),
             content: content.into(),
             is_error,
+            images,
         }
     }
 
@@ -350,10 +362,9 @@ impl Message {
         }
     }
 
-    /// 提取用户消息附带的图片列表。
     pub fn images(&self) -> &[ImageAttachment] {
         match self {
-            Self::User { images, .. } => images,
+            Self::User { images, .. } | Self::Tool { images, .. } => images,
             _ => &[],
         }
     }
