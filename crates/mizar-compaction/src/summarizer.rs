@@ -35,7 +35,7 @@ Write a concise, high-signal checkpoint summary with these exact sections:
 - Completed work, in-progress items, and the immediate next step.
 
 ## Recovery Handles
-- Important file paths, symbol names, or `[seq #N]` handles for `recall` if verbatim detail is later needed.";
+- Important file paths and symbol names.";
 
 pub struct SummarizeParams<'a> {
     pub llm: &'a LlmRuntime,

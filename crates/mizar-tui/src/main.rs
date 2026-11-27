@@ -17,7 +17,7 @@
 //! - `--max-steps <n>`：限制单轮最大工具循环步数
 //! - `--timeout <secs>`：限制无头单次任务总超时秒数
 //! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
-//! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
+//! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局会话存储
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
 //! - `--tools <a,b,...>` / `-t`：工具白名单
 //! - `--exclude-tools <a,b,...>` / `-xt`：工具黑名单（支持 `*` 通配）
@@ -25,7 +25,7 @@
 //! - `--approve`：开启高危工具交互式审批闸门（TUI 专用；无头模式不兼容并直接报错）
 //! - `--continue` / `-c`：恢复当前工作区最近一次持久化的历史会话（TUI）
 //! - `--resume [id]` / `-r [id]`：按会话 ID 恢复历史会话；省略 ID 时弹出交互式会话选择器（TUI）
-//! - `--no-persist`：禁用 SQLite 会话落盘（仅当前进程内存模式）
+//! - `--no-persist`：禁用 JSONL 会话落盘（仅当前进程内存模式）
 //! - `--no-instructions`：禁用自动发现与注入 `AGENTS.md` / `CLAUDE.md`
 //! - `--theme <preset>`：指定预设主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`）
 //! - `--help` / `-h`：打印命令行帮助信息并退出
@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use cordis::{Context, Service};
 use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
-    load_mizar_config, parse_context_window, resolve_default_session_db_path,
+    load_mizar_config, parse_context_window, resolve_default_sessions_dir,
 };
 use mizar_llm::ReasoningEffort;
 use mizar_llm_mock::MockPlugin;
@@ -158,7 +158,7 @@ Options:
       --output-format <fmt>     text (default), json or ndjson (one flushed event per line, result last)
       --json                    Shorthand for --output-format ndjson
       --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
-      --isolated                Skip personal global config, MCP, skills, instructions, and DB
+      --isolated                Skip personal global config, MCP, skills, instructions, and sessions
       --minimal                 Use the default coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
   -t, --tools <a,b,...>         Tool allowlist (comma-separated, supports *)
@@ -167,7 +167,7 @@ Options:
       --approve                 Prompt for approval on high-risk tools (TUI only)
   -c, --continue                Resume the latest persisted session in workspace
   -r, --resume [id]             Open picker in TUI, or resume persisted session by ID in exec
-      --no-persist              Disable SQLite session persistence
+      --no-persist              Disable JSONL session persistence
       --no-instructions         Disable AGENTS.md / CLAUDE.md discovery
       --theme <preset>          Theme preset (auto, mist-dark, mist-light, sakura-dark, system, ansi16)
   -h, --help                    Print help
@@ -630,7 +630,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut spine_cfg =
         AgentSpineConfig::coding(workspace.clone()).with_ensure_bin(interactive_bin_resolver(&app));
     if !cli.no_persist {
-        spine_cfg.session_db_path = resolve_default_session_db_path();
+        spine_cfg.sessions_dir = resolve_default_sessions_dir();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
     let cli_override = CliLlmOverride {
@@ -646,7 +646,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     cli_override.apply_context_window(&env, &mut spine_cfg);
     if cli.no_persist {
-        spine_cfg.session_db_path = None;
+        spine_cfg.sessions_dir = None;
     }
     if cli.no_instructions
         && let AgentToolsMode::Coding {
@@ -677,7 +677,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tui_cfg = TuiConfig::new(workspace);
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
-    tui_cfg.session_db_path = spine_cfg.session_db_path.clone();
+    tui_cfg.sessions_dir = spine_cfg.sessions_dir.clone();
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
     // 记录强度来源：settings.json 显式指定时才算「配置的默认」，否则留给会话记录覆盖
     tui_cfg.reasoning_effort_from_settings = loaded_cfg.settings.reasoning_effort.is_some();

@@ -150,7 +150,7 @@ pub struct TuiConfig {
     pub side_panel_open: Option<bool>,
     pub mouse_capture: Option<bool>,
     pub resume_session: Option<ResumeTarget>,
-    pub session_db_path: Option<PathBuf>,
+    pub sessions_dir: Option<PathBuf>,
     pub restrict_to_workspace: bool,
     pub check_for_updates: bool,
     pub disabled_plugins: Vec<String>,
@@ -176,7 +176,7 @@ impl TuiConfig {
             side_panel_open: None,
             mouse_capture: None,
             resume_session: None,
-            session_db_path: None,
+            sessions_dir: None,
             restrict_to_workspace: false,
             check_for_updates: false,
             disabled_plugins: Vec::new(),
@@ -255,7 +255,7 @@ pub fn build_session_info_report(
     mizar_client::session_view::build_session_info_report(
         ctx,
         session,
-        config.session_db_path.as_deref(),
+        config.sessions_dir.as_deref(),
         app.active_context_window(),
         app.last_prompt_tokens,
         &app.side_panel_data.context,
@@ -267,13 +267,13 @@ pub fn build_session_info_report_at(
     session: &Session,
     app: &AppState,
     persisted: bool,
-    session_db_path: Option<&Path>,
+    sessions_dir: Option<&Path>,
     now_ms: u128,
 ) -> String {
     mizar_client::session_view::build_session_info_report_at(
         session,
         persisted,
-        session_db_path,
+        sessions_dir,
         app.active_context_window(),
         app.last_prompt_tokens,
         &app.side_panel_data.context,
@@ -629,6 +629,9 @@ pub async fn run_tui_with_summary(
     for (level, msg) in &config.startup_notices {
         app.push_notice(*level, msg.clone());
     }
+    if config.sessions_dir.is_some() && ctx.session_persistence().is_none() {
+        app.push_notice(NoticeLevel::Error, "会话持久化初始化失败，当前会话未落盘");
+    }
 
     app.approval_mode = config.approval_mode;
     app.screen_mode = config.screen_mode;
@@ -709,6 +712,7 @@ pub async fn run_tui_with_summary(
         reveal_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let mut needs_redraw = true;
+        let mut last_reported_persistence_error: Option<String> = None;
 
         let ensure_bin = interactive_bin_resolver(&ctx);
         let mut bin_tasks = tokio::task::JoinSet::new();
@@ -867,6 +871,16 @@ pub async fn run_tui_with_summary(
                 )
                 .await;
 
+                if let Some(backend) = ctx.session_persistence()
+                    && let Some(err) = backend.last_error()
+                    && last_reported_persistence_error.as_deref() != Some(err.as_str())
+                {
+                    app.push_notice(NoticeLevel::Error, format!("会话持久化写入失败：{err}"));
+                    app.set_flash(format!("会话持久化写入失败：{err}"));
+                    last_reported_persistence_error = Some(err);
+                    needs_redraw = true;
+                }
+
                 if let Ok(mut guard) = approval_snap.write() {
                     if guard.mode != app.approval_mode {
                         guard.mode = app.approval_mode;
@@ -899,8 +913,26 @@ pub async fn run_tui_with_summary(
     }
     loop_res?;
 
+    let persisted = if let Some(backend) = ctx.session_persistence() {
+        let flush_res = backend.flush_async(None).await;
+        let err_msg = flush_res
+            .err()
+            .map(|e| e.to_string())
+            .or_else(|| backend.last_error());
+        if let Some(err) = err_msg {
+            return Err(format!("会话持久化落盘失败：{err}").into());
+        }
+        let header = active_session.header();
+        header.event_count > 0 || header.parent_id.is_some()
+    } else {
+        if config.sessions_dir.is_some() {
+            eprintln!("error: 会话持久化初始化失败，当前会话未落盘");
+        }
+        false
+    };
+
     Ok(TuiExitSummary {
         session_id: app.session_id.clone(),
-        persisted: ctx.session_persistence().is_some(),
+        persisted,
     })
 }

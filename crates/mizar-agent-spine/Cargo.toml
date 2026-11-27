@@ -9,7 +9,7 @@ description = "核心套件插件，一次性装配 Agent 核心服务与按需�
 workspace = true
 
 [features]
-default = ["legacy", "coding", "sqlite", "trajectory", "router", "compaction", "session-title"]
+default = ["legacy", "coding", "jsonl", "trajectory", "router", "compaction", "session-title"]
 legacy = ["dep:mizar-tool-fs", "dep:mizar-tool-time"]
 coding = [
     "dep:mizar-tools-coding",
@@ -19,8 +19,8 @@ coding = [
     "dep:mizar-skills",
     "dep:mizar-instructions",
 ]
-compaction = ["dep:mizar-compaction", "dep:mizar-recall"]
-sqlite = ["dep:mizar-session-sqlite"]
+compaction = ["dep:mizar-compaction"]
+jsonl = ["dep:mizar-session-jsonl"]
 session-title = ["dep:mizar-session-title"]
 trajectory = ["dep:mizar-trajectory"]
 router = ["dep:mizar-llm-router"]
@@ -34,9 +34,8 @@ mizar-compaction = { workspace = true, optional = true }
 mizar-llm = { workspace = true }
 mizar-llm-router = { workspace = true, optional = true }
 mizar-mcp = { workspace = true, optional = true }
-mizar-recall = { workspace = true, optional = true }
 mizar-session = { workspace = true }
-mizar-session-sqlite = { workspace = true, optional = true }
+mizar-session-jsonl = { workspace = true, optional = true }
 mizar-session-title = { workspace = true, optional = true }
 mizar-skills = { workspace = true, optional = true }
 mizar-instructions = { workspace = true, optional = true }

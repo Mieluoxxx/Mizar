@@ -106,7 +106,7 @@ pub fn to_ui_selection(sel: mizar_session::SessionSelection) -> SessionSelection
 /// 取当前工作区最近一个会话记录的选择。
 ///
 /// 只在 `settings.json` 未指定模型时使用，且语义为「跨会话沿用上次」而非「跨工作区」，
-/// 因此按 `cwd` 过滤（走 `idx_sessions_cwd_updated` 索引）。
+/// 因此按 `cwd` 桶定位过滤。
 pub fn latest_workspace_selection(
     sessions: &SessionStore,
     workspace: &Path,
@@ -248,7 +248,7 @@ fn join_mid_dot(parts: &[String]) -> String {
 pub fn build_session_info_report(
     ctx: &Context,
     session: &Session,
-    session_db_path: Option<&Path>,
+    sessions_dir: Option<&Path>,
     context_window: u64,
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
@@ -256,7 +256,7 @@ pub fn build_session_info_report(
     build_session_info_report_at(
         session,
         ctx.session_persistence().is_some(),
-        session_db_path,
+        sessions_dir,
         context_window,
         last_prompt_tokens,
         context_breakdown,
@@ -268,7 +268,7 @@ pub fn build_session_info_report(
 pub fn build_session_info_report_at(
     session: &Session,
     persisted: bool,
-    session_db_path: Option<&Path>,
+    sessions_dir: Option<&Path>,
     context_window: u64,
     last_prompt_tokens: Option<u64>,
     context_breakdown: &ContextBreakdownSnapshot,
@@ -389,14 +389,14 @@ pub fn build_session_info_report_at(
     lines.push(String::new());
 
     let storage = if persisted {
-        match session_db_path {
+        match sessions_dir {
             Some(path) => {
                 format!(
-                    "SQLite · {}",
+                    "JSONL · {}",
                     abbreviate_home_path(&path.display().to_string())
                 )
             }
-            None => "SQLite（已持久化）".to_string(),
+            None => "JSONL（已持久化）".to_string(),
         }
     } else {
         "仅内存（未持久化）".to_string()

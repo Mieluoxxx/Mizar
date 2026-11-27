@@ -16,8 +16,8 @@
 | **`mizar-llm-types`** | 纯 Schema / SSE Core | 定义统一消息、`ContentBlock`、`BlockAssembler`、错误分类与流式 `SseParser`（零 `tokio` / `cordis` / `reqwest`） | 无 |
 | **`mizar-image`** | 共享图片处理库 | 按文件头识别 PNG、JPEG、WebP、GIF。解码前校验 1 亿像素上限，再校正 EXIF 方向、提取动图首帧，按 2048 像素长边和 5 MB base64 预算生成 `ImageAttachment` | `mizar-llm-types` |
 | **`mizar-trajectory-core`** | 纯轨迹建模与检测 | 轨迹事件模型、折叠快照、三泳道时间轴建模与异常检测规则（零 `tokio` / `cordis` / 运行时插件依赖） | `mizar-llm-types` |
-| **`mizar-client-core`** | 纯客户端契约与算法层 | 跨 TUI 与 Merak Desktop 共享的纯数据结构与算法：`HostExtensionFlags`（10 个官方扩展开关与 `"tui"` 级联派生）、`PromptQueue`（ID 稳定的待发送队列）、`TpsLedger`（解码吞吐账本）、`WorkspaceFileCache`（`.gitignore` 感知后台索引）、`ClientEvent` 统一事件、`mentions` 解析、`reveal` 平滑吐字、`tool_format` 摘要与纯 DTO（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite` / `ratatui` / `crossterm`） | `mizar-llm-types` |
-| **`mizar-tui-ui`** | 纯终端工作台前端 | `AppState` 状态机、`TuiFeatures` 插件特性开关、`pi-emphasis` 视觉语法、虚拟化 Markdown/代码渲染、双栏侧栏、TimelineRail、Overlay、主题与轨迹全屏视图（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`） | `mizar-client-core`、`mizar-llm-types`、`mizar-trajectory-core` |
+| **`mizar-client-core`** | 纯客户端契约与算法层 | 跨 TUI 与 Merak Desktop 共享的纯数据结构与算法：`HostExtensionFlags`（10 个官方扩展开关与 `"tui"` 级联派生）、`PromptQueue`（ID 稳定的待发送队列）、`TpsLedger`（解码吞吐账本）、`WorkspaceFileCache`（`.gitignore` 感知后台索引）、`ClientEvent` 统一事件、`mentions` 解析、`reveal` 平滑吐字、`tool_format` 摘要与纯 DTO（零 `tokio` / `cordis` / `reqwest` / `rquickjs` / `ratatui` / `crossterm`） | `mizar-llm-types` |
+| **`mizar-tui-ui`** | 纯终端工作台前端 | `AppState` 状态机、`TuiFeatures` 插件特性开关、`pi-emphasis` 视觉语法、虚拟化 Markdown/代码渲染、双栏侧栏、TimelineRail、Overlay、主题与轨迹全屏视图（零 `tokio` / `cordis` / `reqwest` / `rquickjs`） | `mizar-client-core`、`mizar-llm-types`、`mizar-trajectory-core` |
 
 ---
 
@@ -54,13 +54,13 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 ## 四、工具插件
 
-以下插件中，4.1–4.4 及 4.7 的 `mizar-recall` 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.5 `mizar-skills`、4.6 `mizar-instructions` 与 4.7 `mizar-compaction` 是例外**：`mizar-skills` 不注册工具（仅读取声明表按需注入 `<available_skills>` 与展开 `/<name>` 手势），`mizar-instructions` 仅在启动期向 `"systemPrompt"` 注入静态工作区指令段落，`mizar-compaction` 提供 `"compaction"` 服务并通过步前与工具管线执行缓存感知尾部剪枝、上下文压缩与压后护栏。
+以下插件中，4.1–4.4 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.5 `mizar-skills`、4.6 `mizar-instructions` 与 4.7 `mizar-compaction` 是例外**：`mizar-skills` 不注册工具（仅读取声明表按需注入 `<available_skills>` 与展开 `/<name>` 手势），`mizar-instructions` 仅在启动期向 `"systemPrompt"` 注入静态工作区指令段落，`mizar-compaction` 提供 `"compaction"` 服务并通过步前与工具管线执行缓存感知尾部剪枝、上下文压缩与压后护栏。
 
 工具的可达性由 `mizar-tools` 的 **`ToolExposure`** 统一控制：
 
 | `ToolExposure` | 直接声明给模型 | 可被 `codemode` 脚本调用 | 列在 `codemode` 描述中 | 典型使用者 |
 | :--- | :--- | :--- | :--- | :--- |
-| `Direct` | ✓ 激活后 | ✓ 激活后 | `onlyMode` 预算内的本地工具 | `read` / `bash` / `edit` / `write` / `grep` / `find` / `recall` |
+| `Direct` | ✓ 激活后 | ✓ 激活后 | `onlyMode` 预算内的本地工具 | `read` / `bash` / `edit` / `write` / `grep` / `find` |
 | `ModelOnly` | ✓ 激活后 | ✗（自身是编排工具） | — | `tool_search`、`codemode` |
 | `Codemode` | 激活后可声明 | ✓ | 通过沙箱检索 | MCP 工具默认、`codemode` 内部依赖的工具 |
 | `Deferred` | ✗（需激活） | ✓ | ✗（靠 `tool_search` / `searchTools()` 发现） | MCP 工具可选项 |
@@ -112,12 +112,11 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-instructions`** | `AgentInstructions` | `"agentInstructions"` / `"agent-instructions"` | —（不注册工具） | `["systemPrompt"]` | **启动期静态 `AGENTS.md` / `CLAUDE.md` 发现与系统提示词注入**：启动期一次性扫描 `~/.mizar/`（`MIZAR_HOME`）与 `~/.agents/`（`MIZAR_AGENTS_HOME`）以及由 `.git` 项目根到工作区的祖先链；默认候选 `AGENTS.md` / `CLAUDE.md` 与 `.local.md` 变体。同组按去空白 SHA-256 摘要去重、不同内容并存；超预算时**优先淘汰最宽泛的祖先**以保住近目录指令，并在正文做 UTF-8 安全截断。默认 `max_bytes` 65 536、`max_source_bytes` 1 MiB；通过 `ctx.effect` 向 `SystemPrompt` 注入静态只读段落，运行期不做每步磁盘 `stat`，保持 KV Cache 前缀稳定 | `cordis`、`mizar-agent-loop`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
 
-### 4.7 上下文压缩与无损情景回溯
+### 4.7 上下文压缩
 
 | Crate | 服务 / 插件结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | 步前剪枝可折叠重复 `read` 和零命中搜索，保留 `SKILL.md` 读取及 SQLite 原文。热缓存期保护启用缓存的 OpenAI Responses、可思考的 Anthropic Messages，以及仍含 Responses 回放或签名思考块的历史。其余协议默认可剪最近 8,000 token，闲置 90 分钟可清仓。受保护会话达到阈值时先全量剪枝，重估仍达阈值才请求检查点摘要。窗口按 `--context-window`、`MIZAR_CONTEXT_WINDOW`、模型目录、`compaction.defaultContextWindow`、128,000 的顺序取值。预算预留输出并应用 `maxContextTokens` 上限，默认在可用窗口的 80% 触发。摘要沿用最近检查点、确定性摘要与完整工具批次。`compaction/end` 广播会话 ID、触发原因、结果及压缩前后 token 数。溢出恢复可使用净剪枝量。保留 `tools/pre-execute` 写前读护栏与 `/compact [focus]` 手动入口 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-llm-retry`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
-| **`mizar-recall`** | `RecallPlugin` | `"recall"` | `recall` | `["sessions", "tools"]` | **单一静态无损情景回溯工具**：以 `ToolExposure::Direct` 常驻挂载，冻结工具声明列表避免中途断缓存；同时支持 `query`（穿透压缩边界检索 SQLite FTS5 1..=3 n-gram 索引，无持久化时自动退回内存扫描）与 `seq`/`session_id` 原文分页读取、作用域校验、`is_current_session` 标记与 `to_file` 旁路导出 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools` |
+| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | 步前剪枝可折叠重复 `read` 和零命中搜索，保留 `SKILL.md` 读取与原始事件记录。热缓存期保护启用缓存的 OpenAI Responses、可思考的 Anthropic Messages，以及仍含 Responses 回放或签名思考块的历史。其余协议默认可剪最近 8,000 token，闲置 90 分钟可清仓。受保护会话达到阈值时先全量剪枝，重估仍达阈值才请求检查点摘要。窗口按 `--context-window`、`MIZAR_CONTEXT_WINDOW`、模型目录、`compaction.defaultContextWindow`、128,000 的顺序取值。预算预留输出并应用 `maxContextTokens` 上限，默认在可用窗口的 80% 触发。摘要沿用最近检查点、确定性摘要与完整工具批次。`compaction/end` 广播会话 ID、触发原因、结果及压缩前后 token 数。溢出恢复可使用净剪枝量。保留 `tools/pre-execute` 写前读护栏与 `/compact [focus]` 手动入口 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-llm-retry`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
 
 ---
 
@@ -125,7 +124,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件结构体 | 插件名 | 提供服务名 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-session-sqlite`** | `SqlitePersistencePlugin` | `"session-persistence-sqlite"` | `"sessionPersistence"` | 无 | **嵌入式 SQLite 持久化 + FTS5 情景索引**：WAL 模式 + `busy_timeout`，独占 **Single-Writer 后台线程**通过批量事务提交把写入隔离在 Tokio 调度器外；只读连接加 `query_only`；内建无内容 FTS5 1..=3 Unicode scalar n-gram 索引（`session_recall_docs` + `session_recall_fts`），供 `mizar-recall` 毫秒级穿透检索中英文与代码标识符；支持关闭 `bundled` feature 以链接系统 SQLite。默认路径 `~/.mizar/sessions.sqlite`（`MIZAR_SESSION_DB` 可覆盖，设为 `none`/`off` 关闭落盘） | `cordis`、`mizar-llm-types`、`mizar-session` |
+| **`mizar-session-jsonl`** | `JsonlPersistencePlugin` | `"session-persistence-jsonl"` | `"sessionPersistence"` | 无 | **宽容单会话 JSONL 持久化 + Blob 外置**：按 canonicalize 后的 `cwd` 分桶存储（`<sessions_dir>/<encoded-cwd>/<YYYYMMDDTHHMMSSZ>_<session_id>.jsonl`），无 `cwd` 归入 `_global`；启动期执行可写探针，初始化/写入失败显式暴露给宿主；**惰性落盘**（空会话不建空文件，首次非空追加或 `fork` 才写盘）；用户/上下文/工具图片 base64 经纯 Rust RFC 6234 SHA-256 摘要原子外置到同级 `blobs/<sha256>`（`blob:sha256:<hex>` 引用，缺失仅剔除丢失附件并告警）；Single-Writer 后台线程通过 `mpsc` 顺序追加与 `flush` 同步屏障保障有序落盘并暴露 `last_error`；宽容读取跳过空行/未知记录/崩溃截断尾行且严禁用整数版本号拒开。默认目录 `~/.mizar/sessions`（`MIZAR_SESSIONS_DIR` 可覆盖，设为 `none`/`off`/`memory` 关闭落盘） | `cordis`、`chrono`、`mizar-llm-types`、`mizar-session` |
 | **`mizar-session-title`** | `SessionTitleRuntime` | `"session-title"` | `"sessionTitle"` | `["llm", "sessions"]` | **后台异步会话标题自动生成**：订阅 `agent/turn-input`（仅提取 `SessionEvent::User` 消息），首轮输入及每隔 `refresh_interval_turns`（默认 20）轮异步生成 `MMDD｜TYPE｜Topic` 标题（`FEA/DES/FIX/OPT/REL/EXP/DOC/RES`）；自动跳过 `Offline Mock` 并尊重人工 `/rename` 所有权（`TitleSource::Manual`）与并发改名保护；失败静默不重试并保留 `derive_session_title` 兜底清洗标题；提供 `regenerate_now` 供 `/rename` 无参手动重生成 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-llm-retry`、`mizar-session` |
 
 ---
@@ -143,7 +142,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 入口 | 插件名 / 形态 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `sqlite` feature 与 `session_db_path` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins`实施 Gate 2 自保护（严禁禁用），同时识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主/TUI 扩展 ID 以避免 `disabledPlugins` 误报未知模块警告。支持 Cargo features（`legacy` / `coding` / `compaction` / `sqlite` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并将配置加载与路由解析拆分为 `config.rs` + `config/{settings,route}.rs`（提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写） | 无（自身负责装配与控制） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` 及按 Cargo features 选配的后端 crate |
+| **`mizar-agent-spine`** | `AgentSpinePlugin` / `SpinePlugins` | `"agent-spine"` / 提供服务 `"spinePlugins"` | **核心装配套件与模块控制器**：先挂载核心内核服务（含按 `jsonl` feature 与 `sessions_dir` 挂载的 `sessionPersistence`），再按顺序通过 `SpinePlugins`（`SpinePluginsContextExt`）管理内置可选模块（`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`session-title`、`trajectory`、`repeat-guard`）的 `Fiber` 生命周期与运行期热启停（`set_enabled`）；对 `llm` / `sessions` / `tools` / `systemPrompt` / `agentLoop` / `spinePlugins`实施 Gate 2 自保护（严禁禁用），同时识别 `KNOWN_HOST_EXTENSION_IDS` 10 个官方宿主/TUI 扩展 ID 以避免 `disabledPlugins` 误报未知模块警告。支持 Cargo features（`legacy` / `coding` / `compaction` / `jsonl` / `session-title` / `trajectory` / `router`）裁剪（`--no-default-features` 仅拉起核心服务），并将配置加载与路由解析拆分为 `config.rs` + `config/{settings,route}.rs`（提供 `load_mizar_config` / `patch_settings_file` / `persist_disabled_plugins` 原子读写） | 无（自身负责装配与控制） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` 及按 Cargo features 选配的后端 crate |
 | **`mizar-client`** | `FileMentionsPlugin`、`ApprovalGatePlugin` 与宿主运行时模块 | `"file-mentions"` / `"approval-gate"`（前端无关宿主运行时） | **跨端宿主运行时（零 `ratatui` / `crossterm` / `mizar-tui-ui`）**：供 `mizar-tui` 与未来桌面端 Merak 共用。内置两个标准 Cordis 插件——`FileMentionsPlugin`（`mentions`：在 `agent/pre-step` 展开 `@` 文件/目录/图片引用为 `ContextNotice`）与 `ApprovalGatePlugin`（`approval`：在 `tools/pre-execute` 拦截高危工具执行并等待决策）；并提供前端无关运行时子模块：`images`（重导出 `mizar-image` 的共享管线）、`session_view`（只读会话投影/模型选择优先级解析/会话信息报告）、`settings`（设置条目构建、热更新与 `SpinePlugins` 启停原子写回）、`local_bash`（`!` / `!!` 本地 Shell 执行与会话审计）、`events`（核心服务等待、事件订阅与 `LoopClientMsg` / `RunController` 代次控制）以及 `workspace`（`WorkspacePanelSnapshot` 工具/MCP/指令/Git/轨迹聚合） | `FileMentionsPlugin` 依赖 `["llm"]`；`ApprovalGatePlugin` 依赖 `["tools"]`；其余运行时工具按需访问 `agentLoop`、`sessions`、`spinePlugins`、`compaction`、`sessionTitle`、`instructions`、`mcp`、`skills`、`trajectory` | `cordis`、`mizar-agent-loop`、`mizar-agent-spine`、`mizar-client-core`、`mizar-image`、`mizar-instructions`、`mizar-llm`、`mizar-mcp`、`mizar-session`、`mizar-session-title`、`mizar-skills`、`mizar-tools`、`mizar-tools-coding`、`mizar-trajectory` |
 | **`mizar-tui`** | 可执行文件 `mizar`（含 `TuiEmphasisPlugin`） | 终端与无头 CLI 入口 / `"tui-emphasis"` | **薄终端宿主适配器**：解析 CLI 参数并装配 `AgentSpinePlugin`，同时提供交互式 TUI 与非交互无头单次执行（`mizar exec` / `-p` / `--prompt-file`）。TUI 模式（`runner.rs` + `runner/{terminal_io,actions}.rs`）将事件订阅、审批门禁、`@` 引用展开、图片处理、本地 Bash、会话投影与配置热写回全部委托给 `mizar-client` / `mizar-client-core`，自身专注终端 I/O、系统/OSC 5522 剪贴板（`clipboard`）、`mizar-tui-ui` 渲染桥接，以及按 `HostExtensionFlags` 控制 `TuiEmphasisPlugin`（`tui_reply_guidance` 系统提示词挂载）、`FileMentionsPlugin`、审批钩子与各前端特性开关（若 `disabledPlugins` 包含 `"tui"` 则直接拒绝启动而不进入终端 raw mode），支持欢迎画布、`!` / `!!` 本地 Bash 模式、可取消的 `/compact [focus]` 进度压缩、`/resume` 交互式会话选择器与 `/rename [title]` 改名/重生成，以及 `/settings`（`/config`）实时切换；无头 `exec` 模式复用同套装配，支持 `--provider` / `--model` / `--protocol`（`--api-format`）/ `--base-url` / `--reasoning-effort` / `--max-steps` / `--timeout` / `--isolated`，校验路由与凭据，标准错误报告重试；TUI 与无头模式都支持 `--context-window <tokens>`，TUI 的 `/session` 与侧栏使用生效窗口。文本模式仅在成功时向标准输出写答案。`exec --json`、`--output-format json` 和 `--output-format ndjson` 使用下述事件流。CLI 同时支持 `--workspace/-C`、`--minimal`、`--read-only`、`--tools/-t`、`--exclude-tools/-xt`、`--inline`、`--approve`、`--continue/-c`、`--resume/-r [id]`、`--no-persist`、`--no-instructions`、`--theme`、`mizar update` 与 `mizar install-tools` | `["agentLoop", "sessions", "llm"]`（启动前 `wait_for_services` 探测；`TuiEmphasisPlugin` 注入 `["systemPrompt"]`；按需访问 `spinePlugins`、`compaction`、`sessionTitle`、`skills`、`mcp`、`instructions`、`trajectory`、`llmRouter`、`tools`） | `mizar-client`、`mizar-client-core`、`mizar-tui-ui`、`mizar-agent-spine` 及宿主桥接 crate |
 
@@ -182,13 +181,13 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 ┌─ 编排与观测层 ─────────────────────────────────────────────────────────────┐
 │  mizar-agent-loop      mizar-trajectory ──► mizar-trajectory-core          │
 │  (agentLoop)         (trajectory + repeat-tool-guard)                      │
-│  mizar-session-sqlite (sessionPersistence) │ mizar-session-title (sessionTitle) │
+│  mizar-session-jsonl (sessionPersistence) │ mizar-session-title (sessionTitle) │
 └───────────────────────────────┬────────────────────────────────────────────┘
                                 v
 ┌─ 工具与上下文管理插件层 ───────────────────────────────────────────────────┐
 │  coding: mizar-tools-coding / mizar-tool-search / mizar-codemode           │
 │  legacy: mizar-tool-fs / mizar-tool-time                                   │
-│  extra : mizar-mcp / mizar-skills / mizar-recall                           │
+│  extra : mizar-mcp / mizar-skills                                          │
 │  ctx   : mizar-compaction（compaction）/ mizar-instructions（SystemPrompt）│
 └───────────────────────────────┬────────────────────────────────────────────┘
                                 v
@@ -202,7 +201,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 ```
 
 **编译隔离边界**：
-- `mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`、`mizar-image` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs` 或 `rusqlite`（其中 `mizar-client-core` **亦禁止**依赖 `ratatui` / `crossterm`）；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `mizar-tui-ui` 与薄宿主 `mizar-tui`。
+- `mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`、`mizar-image` 均不依赖 `tokio`、`cordis`、`reqwest`、`rquickjs`（其中 `mizar-client-core` **亦禁止**依赖 `ratatui` / `crossterm`）；修改 UI 状态、渲染或交互逻辑时，只需重编极轻量的 `mizar-tui-ui` 与薄宿主 `mizar-tui`。
 - `mizar-client` 与 `mizar-client-core` **严禁引入 `ratatui`、`crossterm` 或 `mizar-tui-ui`**，确保未来 `Merak Desktop` 直嵌零终端依赖。
 
 ---
@@ -224,13 +223,12 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `excludeTools` | string[] | 工具黑名单（支持 `*` 通配，多级目录累加） |
 | `disabledPlugins` | string[] | 声明式屏蔽内置可选 Cordis 模块 ID 或官方客户端/TUI 扩展 ID（全局 + 项目合并去重排序；支持 TUI `/settings` `[模块]` 运行期热启停并原子回写；受保护核心服务忽略并告警） |
 | `restrictToWorkspace` | bool | 将文件工具限制在工作区内（**默认 `false`**） |
-| `sessionDb` | string | SQLite 落盘路径；等价环境变量 `MIZAR_SESSION_DB`（`none` / `off` 关闭） |
+| `sessionsDir` | string | JSONL 会话持久化目录；等价环境变量 `MIZAR_SESSIONS_DIR`（`none` / `off` / `memory` 关闭） |
 | `codemode` | object | `enabled`（缺省按需激活）/ `onlyMode` / `inlineBudget`（token）/ `timeoutMs` |
 | `toolSearch` | object | `autoEnable` / `defaultLimit` |
 | `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
 | `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` |
 | `compaction` | object | `enabled` / `autoCompact` / `maxContextTokens`（可选软上限，默认 `null`）/ `triggerRatio`（默认 `0.80`）/ `keepRecentTokens`（默认 `20000`）/ `supersedeReads` / `dropUseless` |
-| `recall` | object | `enabled` / `defaultSearchLimit`（默认 `8`）/ `readCharLimit`（默认 `6000`） |
 | `sessionTitle` | object | `enabled`（默认 `true`）/ `model`（可选 `provider/model`，省略则跟随当前会话模型）/ `thinkingLevel`（默认 `"low"`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 

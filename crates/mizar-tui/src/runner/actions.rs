@@ -189,9 +189,10 @@ pub(super) fn spawn_agent_run(
     let tx = loop_tx.clone();
     tokio::spawn(async move {
         let res = agent_loop
-            .run_with_options(session, prompt, cancel, run_opts)
+            .run_with_options(Arc::clone(&session), prompt, cancel, run_opts)
             .await
             .map_err(|e| e.to_string());
+        let _ = session.flush_async().await;
         let _ = tx.send(LoopClientMsg::Task {
             run_id,
             session_id: task_session_id,
@@ -258,6 +259,7 @@ pub(super) fn spawn_local_bash_run(
             },
         )
         .await;
+        let _ = session.flush_async().await;
 
         let _ = tx.send(LoopClientMsg::Task {
             run_id,
@@ -482,7 +484,10 @@ pub(super) async fn handle_action(
             };
             let tx = loop_tx.clone();
             tokio::spawn(async move {
-                match compaction.compact_now(session, opts, cancel).await {
+                match compaction
+                    .compact_now(Arc::clone(&session), opts, cancel)
+                    .await
+                {
                     Ok(_) | Err(CompactionError::Llm(_)) => {
                         // Pipeline 内部已广播 `EVENT_COMPACTION_END`，避免重复投递
                     }
@@ -504,6 +509,7 @@ pub(super) async fn handle_action(
                         });
                     }
                 }
+                let _ = session.flush_async().await;
             });
         }
         AppAction::NewSession => {
@@ -511,6 +517,12 @@ pub(super) async fn handle_action(
             task_state.abort_for_session_switch();
             if app.is_running_activity() {
                 app.set_idle_state();
+            }
+            if let Err(err) = active_session.flush_async().await {
+                app.push_notice(
+                    NoticeLevel::Error,
+                    format!("切换会话前持久化落盘失败：{err}"),
+                );
             }
             if let Ok(sessions) = ctx.sessions() {
                 let next = sessions.create(None);
@@ -540,6 +552,12 @@ pub(super) async fn handle_action(
             task_state.abort_for_session_switch();
             if app.is_running_activity() {
                 app.set_idle_state();
+            }
+            if let Err(err) = active_session.flush_async().await {
+                app.push_notice(
+                    NoticeLevel::Error,
+                    format!("切换会话前持久化落盘失败：{err}"),
+                );
             }
             let _ =
                 resume_session_into_app(ctx, config, app, active_session, active_sid, &target_id)
@@ -1042,6 +1060,9 @@ pub(super) async fn handle_action(
             task_state.abort_for_session_switch();
             if app.is_running_activity() {
                 app.set_idle_state();
+            }
+            if let Err(err) = active_session.flush_async().await {
+                app.push_notice(NoticeLevel::Error, format!("分叉前持久化落盘失败：{err}"));
             }
             if let Ok(sessions) = ctx.sessions() {
                 match sessions.fork(&app.session_id, target_seq, SessionCreateOptions::default()) {

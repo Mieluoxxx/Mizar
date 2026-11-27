@@ -1,4 +1,4 @@
-//! 会话持久化抽象接口（Seam）：把领域层 `mizar-session` 与具体存储引擎（如 SQLite / JSONL）解耦。
+//! 会话持久化抽象接口（Seam）：把领域层 `mizar-session` 与具体存储引擎（如 JSONL）解耦。
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -7,8 +7,7 @@ use cordis::{BoxFuture, Context};
 use thiserror::Error;
 
 use crate::model::{
-    LoadedSession, RecallSearchHit, RecallSearchQuery, SessionEntry, SessionHeader,
-    SessionHeaderPatch, SessionListQuery,
+    LoadedSession, SessionEntry, SessionHeader, SessionHeaderPatch, SessionListQuery,
 };
 
 pub const SERVICE_SESSION_PERSISTENCE: &str = "sessionPersistence";
@@ -59,12 +58,9 @@ pub trait SessionPersistence: Send + Sync + 'static {
         new_header: &SessionHeader,
     ) -> PersistenceResult<LoadedSession>;
 
-    /// 可选的全文情景检索（如 SQLite FTS5 N-gram）；未实现时返回 `Ok(None)` 由上层退回内存扫描。
-    fn search_recall(
-        &self,
-        _query: &RecallSearchQuery,
-    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        Ok(None)
+    /// 返回异步写入线程最近一次未恢复的持久化错误，供宿主及时感知并提示用户。
+    fn last_error(&self) -> Option<String> {
+        None
     }
 }
 

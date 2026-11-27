@@ -18,10 +18,9 @@ use uuid::Uuid;
 
 pub use model::{
     CompactionDigest, EntryVisibility, LoadedSession, PinnedInput, PrunedToolResult,
-    RecallSearchHit, RecallSearchQuery, SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry,
-    SessionEvent, SessionHeader, SessionHeaderPatch, SessionListQuery, SessionSelection,
-    SessionTraceEvent, TitlePatch, TitleSource, TitleSourcePatch, TraceSeverity,
-    derive_session_title,
+    SESSION_FORMAT_VERSION, SessionCreateOptions, SessionEntry, SessionEvent, SessionHeader,
+    SessionHeaderPatch, SessionListQuery, SessionSelection, SessionTraceEvent, TitlePatch,
+    TitleSource, TitleSourcePatch, TraceSeverity, derive_session_title,
 };
 pub use persistence::{
     PersistenceError, PersistenceResult, SERVICE_SESSION_PERSISTENCE, SessionPersistence,
@@ -164,7 +163,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
             for pin in &digest.pinned_inputs {
                 out.push_str(&format!("[input seq #{}]", pin.seq));
                 if pin.truncated {
-                    out.push_str(" (truncated; use recall for full text)");
+                    out.push_str(" (truncated)");
                 }
                 out.push('\n');
                 out.push_str(&pin.text);
@@ -176,7 +175,7 @@ pub fn render_compaction_message(summary: &str, digest: &CompactionDigest) -> St
     out.push_str("<mizar-summary>\n");
     out.push_str(summary.trim());
     out.push_str("\n</mizar-summary>\n");
-    out.push_str("Note: Earlier messages were compacted. Full verbatim history remains available via `recall`. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
+    out.push_str("Note: Earlier messages were compacted. If anything in the summary conflicts with later messages or current workspace files, trust the later messages and current files.\n");
     out.push_str("</mizar-compaction>");
     out
 }
@@ -640,7 +639,7 @@ impl Session {
     }
 
     /// 折叠较早的表面历史为一条 `Compaction` 摘要，保留最近 `keep_recent_surface` 条表面事件。
-    /// 原始历史仍完整保存在日志与持久化数据库中，返回新建 `Compaction` 条目的 `seq`。
+    /// 原始历史仍完整保存在日志与持久化存储中，返回新建 `Compaction` 条目的 `seq`。
     pub fn compact(
         self: &Arc<Self>,
         summary: impl Into<String>,
@@ -1109,18 +1108,6 @@ impl SessionStore {
             cur = self.inspect_readonly(&id).and_then(|s| s.header.parent_id);
         }
         chain
-    }
-
-    /// 委托给持久化后端执行全文情景回溯（未启用或不支持索引时返回 `Ok(None)`）。
-    pub fn search_recall(
-        &self,
-        query: &RecallSearchQuery,
-    ) -> PersistenceResult<Option<Vec<RecallSearchHit>>> {
-        if let Some(backend) = self.ctx.session_persistence() {
-            backend.search_recall(query)
-        } else {
-            Ok(None)
-        }
     }
 
     /// 列出全部会话头信息（若挂载持久化后端则直接按索引查询，否则汇总内存会话），按最近活跃时间倒序。

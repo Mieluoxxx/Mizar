@@ -25,8 +25,6 @@ use mizar_compaction::{CompactionConfig, CompactionRuntime};
 use mizar_instructions::{AgentInstructions, InstructionsConfig};
 #[cfg(feature = "coding")]
 use mizar_mcp::{McpManager, McpPluginConfig};
-#[cfg(feature = "compaction")]
-use mizar_recall::{RecallConfig, RecallPlugin};
 #[cfg(feature = "session-title")]
 use mizar_session_title::{SessionTitleConfig, SessionTitleRuntime};
 #[cfg(feature = "coding")]
@@ -94,7 +92,6 @@ const KNOWN_OPTIONAL_IDS: &[&str] = &[
     "skills",
     "instructions",
     "compaction",
-    "recall",
     "session-title",
     "trajectory",
     "repeat-guard",
@@ -169,8 +166,6 @@ pub(crate) enum ModuleSpec {
     Instructions(InstructionsConfig),
     #[cfg(feature = "compaction")]
     Compaction(CompactionConfig),
-    #[cfg(feature = "compaction")]
-    Recall(RecallConfig),
     #[cfg(feature = "session-title")]
     SessionTitle(SessionTitleConfig),
     #[cfg(feature = "trajectory")]
@@ -255,8 +250,6 @@ fn mount_module_spawn(ctx: &Context, spec: &ModuleSpec) -> Result<Vec<Fiber>, Co
         ModuleSpec::Compaction(ref cfg) => Ok(vec![
             ctx.try_plugin(CompactionRuntime::plugin(), cfg.clone())?,
         ]),
-        #[cfg(feature = "compaction")]
-        ModuleSpec::Recall(ref cfg) => Ok(vec![ctx.try_plugin(RecallPlugin, cfg.clone())?]),
         #[cfg(feature = "session-title")]
         ModuleSpec::SessionTitle(ref cfg) => Ok(vec![
             ctx.try_plugin(SessionTitleRuntime::plugin(), cfg.clone())?,
@@ -363,10 +356,6 @@ async fn mount_module_and_wait(
         #[cfg(feature = "compaction")]
         ModuleSpec::Compaction(ref cfg) => {
             mount_single_and_wait(ctx, id, CompactionRuntime::plugin(), cfg.clone()).await
-        }
-        #[cfg(feature = "compaction")]
-        ModuleSpec::Recall(ref cfg) => {
-            mount_single_and_wait(ctx, id, RecallPlugin, cfg.clone()).await
         }
         #[cfg(feature = "session-title")]
         ModuleSpec::SessionTitle(ref cfg) => {

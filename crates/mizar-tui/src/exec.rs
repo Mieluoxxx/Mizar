@@ -15,7 +15,7 @@ use mizar_agent_loop::{
 };
 use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
-    load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
+    load_mizar_config, load_mizar_config_isolated, resolve_default_sessions_dir,
 };
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
@@ -558,7 +558,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     };
     let mut spine_cfg = AgentSpineConfig::coding(cfg.workspace.clone());
     if !cfg.isolated && !cfg.no_persist {
-        spine_cfg.session_db_path = resolve_default_session_db_path();
+        spine_cfg.sessions_dir = resolve_default_sessions_dir();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
     cli_override.apply_context_window(&env_override, &mut spine_cfg);
@@ -599,8 +599,8 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     {
         spine_cfg.disabled_plugins.push("session-title".to_string());
     }
-    if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.session_db.is_none()) {
-        spine_cfg.session_db_path = None;
+    if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.sessions_dir.is_none()) {
+        spine_cfg.sessions_dir = None;
     }
     if cfg.no_instructions
         && let AgentToolsMode::Coding {
@@ -638,12 +638,12 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     }
     let configured_max_steps = spine_cfg.agent.max_steps;
     let configured_max_tokens = spine_cfg.agent.max_tokens;
-    let has_session_db = spine_cfg.session_db_path.is_some();
+    let has_sessions_dir = spine_cfg.sessions_dir.is_some();
     let active_provider = resolved_llm.active_provider.clone();
     let active_model = resolved_llm.active_model.clone();
 
-    if cfg.resume_session.is_some() && !has_session_db {
-        let msg = "--continue/--resume requires session persistence database configuration (code=invalid_request)";
+    if cfg.resume_session.is_some() && !has_sessions_dir {
+        let msg = "--continue/--resume requires session persistence directory configuration (code=invalid_request)";
         return finish(
             TurnExitOutcome::failure("invalid_request", msg),
             None,
@@ -741,7 +741,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
             None,
             None,
         )
-    } else if has_session_db && app.session_persistence().is_none() {
+    } else if has_sessions_dir && app.session_persistence().is_none() {
         complete(
             interruption().unwrap_or_else(|| {
                 TurnExitOutcome::failure(
@@ -816,8 +816,13 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                             .await;
                         let duration_ms = turn_started.elapsed().as_millis() as u64;
 
-                        let flush_error = if has_session_db {
-                            sessions.flush_async(Some(session.id.clone())).await.err()
+                        let flush_error = if has_sessions_dir {
+                            sessions
+                                .flush_async(Some(session.id.clone()))
+                                .await
+                                .err()
+                                .map(|e| e.to_string())
+                                .or_else(|| app.session_persistence().and_then(|b| b.last_error()))
                         } else {
                             None
                         };

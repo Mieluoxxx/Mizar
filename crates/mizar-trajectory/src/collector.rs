@@ -1,6 +1,6 @@
 //! 轨迹采集服务 `ctx.trajectory`（`TrajectoryRuntime`）。
 //!
-//! 对已接入 `SessionStore` 的会话直接以 `Session` 作为唯一权威事实源（支持从 SQLite
+//! 对已接入 `SessionStore` 的会话直接以 `Session` 作为唯一权威事实源（支持从 JSONL
 //! 持久化历史重建完整轨迹报告与导出，不再在内存中双份缓存大文本载荷）；
 //! 当未挂载 `SessionStore`（如独立的工具级单元测试）时，仍保留轻量内存缓冲作为兜底。
 
@@ -556,7 +556,7 @@ impl TrajectoryRuntime {
             .unwrap_or_default()
     }
 
-    /// 对指定会话（内存激活或 SQLite 持久化历史）做一次完整轨迹折叠、时间轴投影与异常检测。
+    /// 对指定会话（内存激活或 JSONL 持久化历史）做一次完整轨迹折叠、时间轴投影与异常检测。
     pub fn inspect(&self, session_id: &str, mode: TimelineMode) -> Option<TrajectoryReport> {
         if let Some(session) = self.resolve_session(session_id) {
             self.sync_managed_session(&session);

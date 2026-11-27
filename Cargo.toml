@@ -22,7 +22,6 @@ libc = "0.2"
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "system-proxy"] }
 rquickjs = { version = "0.14", features = ["futures", "parallel"] }
-rusqlite = "0.43"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3"
@@ -45,7 +44,7 @@ mizar-llm-responses = { path = "crates/mizar-llm-responses" }
 mizar-llm-retry = { path = "crates/mizar-llm-retry" }
 mizar-llm-router = { path = "crates/mizar-llm-router" }
 mizar-session = { path = "crates/mizar-session" }
-mizar-session-sqlite = { path = "crates/mizar-session-sqlite" }
+mizar-session-jsonl = { path = "crates/mizar-session-jsonl" }
 mizar-session-title = { path = "crates/mizar-session-title" }
 mizar-tools = { path = "crates/mizar-tools" }
 mizar-tools-coding = { path = "crates/mizar-tools-coding" }
@@ -57,7 +56,6 @@ mizar-mcp = { path = "crates/mizar-mcp" }
 mizar-skills = { path = "crates/mizar-skills" }
 mizar-instructions = { path = "crates/mizar-instructions" }
 mizar-compaction = { path = "crates/mizar-compaction" }
-mizar-recall = { path = "crates/mizar-recall" }
 mizar-system-prompt = { path = "crates/mizar-system-prompt" }
 mizar-agent-loop = { path = "crates/mizar-agent-loop" }
 mizar-agent-spine = { path = "crates/mizar-agent-spine" }

@@ -14,7 +14,7 @@ You are a coding assistant running inside Mizar, a coding agent harness. Help us
 /// 默认运行时上下文标签协议说明（`order = 40`，纯英文静态前缀）。
 pub const DEFAULT_RUNTIME_PROTOCOL: &str = "\
 `<environment_context>` gives the workspace and date. Follow workspace instructions in `<project_instructions>`, updates in `<system-reminder>`, and loaded instructions in `<skill_content>`.
-`<mizar-compaction>` summarizes earlier turns. Prefer newer messages or current files on conflict. Use `recall` for verbatim history.";
+`<mizar-compaction>` summarizes earlier turns. Prefer newer messages or current files on conflict.";
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemPromptConfig {

@@ -105,7 +105,7 @@ impl ReplayEnvelope {
     }
 }
 
-/// 单条消息允许附带的图片上限（与 `dim` `MAX_IMAGES` 对齐，兼顾 SQLite 体积硬约束）。
+/// 单条消息允许附带的图片上限（与 `dim` `MAX_IMAGES` 对齐，兼顾存储体积约束）。
 pub const MAX_IMAGES_PER_MESSAGE: usize = 20;
 
 /// 用户消息附带的图片负载（base64 编码 + MIME 类型及可选尺寸）。

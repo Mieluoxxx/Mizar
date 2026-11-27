@@ -10,11 +10,11 @@ use std::path::PathBuf;
 
 pub use config::{
     CONFIG_DIR_NAME, CliLlmOverride, CodemodeSettings, CompactionSettings, EnvLlmOverride,
-    EnvProviderKind, InstructionsSettings, LoadedMizarConfig, RecallSettings, SessionTitleSettings,
-    SettingsConfig, SkillsSettings, ToolSearchSettings, UiSettings, load_mizar_config,
-    load_mizar_config_isolated, load_mizar_config_with_global, normalize_disabled_plugins,
+    EnvProviderKind, InstructionsSettings, LoadedMizarConfig, SessionTitleSettings, SettingsConfig,
+    SkillsSettings, ToolSearchSettings, UiSettings, load_mizar_config, load_mizar_config_isolated,
+    load_mizar_config_with_global, normalize_disabled_plugins,
     normalize_session_title_thinking_level, parse_context_window, patch_settings_file,
-    persist_disabled_plugins, resolve_default_session_db_path, resolve_global_config_dir,
+    persist_disabled_plugins, resolve_default_sessions_dir, resolve_global_config_dir,
     resolve_global_settings_path, resolve_project_config_dir,
 };
 #[cfg(feature = "router")]
@@ -31,8 +31,6 @@ pub use mizar_instructions::{
     AGENT_INSTRUCTIONS_SECTION_ID, AgentInstructions, InstructionScopeKind, InstructionScopeStatus,
     InstructionsConfig, InstructionsContextExt, SessionInstructionsReport,
 };
-#[cfg(feature = "compaction")]
-pub use mizar_recall::{RECALL_TOOL_NAME, RecallConfig, RecallPlugin};
 #[cfg(feature = "session-title")]
 pub use mizar_session_title::{
     DEFAULT_REFRESH_INTERVAL_TURNS, ParsedModelTitle, SERVICE_SESSION_TITLE, SessionTitleConfig,
@@ -53,8 +51,8 @@ use mizar_llm::LlmRuntime;
 #[cfg(feature = "coding")]
 use mizar_mcp::McpPluginConfig;
 use mizar_session::{SessionContextExt, SessionStore};
-#[cfg(feature = "sqlite")]
-use mizar_session_sqlite::{SqlitePersistenceConfig, SqlitePersistencePlugin};
+#[cfg(feature = "jsonl")]
+use mizar_session_jsonl::{JsonlPersistenceConfig, JsonlPersistencePlugin};
 #[cfg(feature = "coding")]
 use mizar_skills::SkillsConfig;
 use mizar_system_prompt::{DEFAULT_RUNTIME_PROTOCOL, SystemPrompt, SystemPromptConfig};
@@ -109,14 +107,11 @@ pub struct AgentSpineConfig {
     /// 是否启用上下文压缩、缓存感知尾部剪枝与压后写文件守卫服务（默认开启）。
     #[cfg(feature = "compaction")]
     pub compaction: Option<CompactionConfig>,
-    /// 是否启用单一静态情景回溯工具（`recall`，默认开启）。
-    #[cfg(feature = "compaction")]
-    pub recall: Option<RecallConfig>,
     /// 是否启用基于对话主题的会话标题自动生成服务（默认开启）。
     #[cfg(feature = "session-title")]
     pub session_title: Option<SessionTitleConfig>,
-    /// 可选：会话 SQLite 持久化数据库路径；为 `None` 时保持纯内存模式（适合测试）。
-    pub session_db_path: Option<PathBuf>,
+    /// 可选：JSONL 会话持久化目录；为 `None` 时保持纯内存模式（适合测试）。
+    pub sessions_dir: Option<PathBuf>,
     /// 启动阶段屏蔽的内置可选模块 ID 列表（如 `mcp`、`skills` 等）。
     pub disabled_plugins: Vec<String>,
 }
@@ -141,11 +136,9 @@ impl AgentSpineConfig {
             repeat_guard: Some(RepeatGuardConfig::default()),
             #[cfg(feature = "compaction")]
             compaction: Some(CompactionConfig::default()),
-            #[cfg(feature = "compaction")]
-            recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
             session_title: Some(SessionTitleConfig::default()),
-            session_db_path: None,
+            sessions_dir: None,
             disabled_plugins: Vec::new(),
         }
     }
@@ -173,17 +166,15 @@ impl AgentSpineConfig {
             repeat_guard: Some(RepeatGuardConfig::default()),
             #[cfg(feature = "compaction")]
             compaction: Some(CompactionConfig::default()),
-            #[cfg(feature = "compaction")]
-            recall: Some(RecallConfig::default()),
             #[cfg(feature = "session-title")]
             session_title: Some(SessionTitleConfig::default()),
-            session_db_path: None,
+            sessions_dir: None,
             disabled_plugins: Vec::new(),
         }
     }
 
-    pub fn with_session_db(mut self, path: impl Into<PathBuf>) -> Self {
-        self.session_db_path = Some(path.into());
+    pub fn with_sessions_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.sessions_dir = Some(path.into());
         self
     }
 
@@ -231,15 +222,15 @@ impl Plugin for AgentSpinePlugin {
         Box::pin(async move {
             let default_cwd = config.workspace.display().to_string();
             ctx.try_plugin(LlmRuntime::plugin(), ())?;
-            #[cfg(feature = "sqlite")]
-            if let Some(db_path) = config.session_db_path {
+            #[cfg(feature = "jsonl")]
+            if let Some(sessions_dir) = config.sessions_dir {
                 ctx.try_plugin(
-                    SqlitePersistencePlugin,
-                    SqlitePersistenceConfig::new(db_path),
+                    JsonlPersistencePlugin,
+                    JsonlPersistenceConfig::new(sessions_dir),
                 )?;
             }
-            #[cfg(not(feature = "sqlite"))]
-            let _ = config.session_db_path;
+            #[cfg(not(feature = "jsonl"))]
+            let _ = config.sessions_dir;
             ctx.try_plugin(SessionStore::plugin(), ())?;
             ctx.try_inject(["sessions"], move |c| {
                 let cwd = default_cwd.clone();
@@ -287,9 +278,9 @@ impl Plugin for AgentSpinePlugin {
             )]
             let mut specs: Vec<(SpineModuleMeta, ModuleSpec)> = Vec::new();
 
-            // 在 `instructions` / `skills` / `recall` 之前装配 `compaction`：
+            // 在 `instructions` / `skills` 之前装配 `compaction`：
             // 使同一次 `agent/pre-step` 中先完成压缩推进 `compacted_up_to_seq`，
-            // 随后指令、技能与回溯工具立即可见新压缩边界并当步完成重注/激活。
+            // 随后指令与技能立即可见新压缩边界并当步完成重注/激活。
             #[cfg(feature = "compaction")]
             if let Some(compaction_cfg) = config.compaction {
                 specs.push((
@@ -388,18 +379,6 @@ impl Plugin for AgentSpinePlugin {
                         ModuleSpec::Instructions(instructions),
                     ));
                 }
-            }
-
-            #[cfg(feature = "compaction")]
-            if let Some(recall_cfg) = config.recall {
-                specs.push((
-                    SpineModuleMeta {
-                        id: "recall".to_string(),
-                        label: "情景记忆回溯".to_string(),
-                        description: "静态常驻的历史会话搜索与原文读取工具 (recall)".to_string(),
-                    },
-                    ModuleSpec::Recall(recall_cfg),
-                ));
             }
 
             #[cfg(feature = "session-title")]
