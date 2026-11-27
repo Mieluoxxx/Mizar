@@ -15,10 +15,11 @@ use std::time::Duration;
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, ImageAttachment,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage,
+    BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
+    ImageAttachment, LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo,
+    ProviderInfo, ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage,
     classify_inband_error_value, classify_non_json_sse_frame, prefix_digest,
+    resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
@@ -45,6 +46,11 @@ pub struct MessagesConfig {
     /// 为 `true` 时发送自适应思考（`thinking.type = "adaptive"` + `output_config.effort`）。
     pub force_adaptive_thinking: bool,
     pub thinking_budget_tokens: Option<u32>,
+    pub supports_cache_control_on_tools: bool,
+    pub supports_long_cache_retention: bool,
+    pub supports_temperature: bool,
+    pub supports_reasoning_effort: bool,
+    pub default_cache_retention: Option<CacheRetention>,
     pub headers: Vec<(String, String)>,
     pub models: Vec<ModelInfo>,
     pub idle_timeout: Duration,
@@ -64,6 +70,11 @@ impl Default for MessagesConfig {
             use_bearer_auth: false,
             force_adaptive_thinking: false,
             thinking_budget_tokens: None,
+            supports_cache_control_on_tools: true,
+            supports_long_cache_retention: true,
+            supports_temperature: true,
+            supports_reasoning_effort: true,
+            default_cache_retention: None,
             headers: Vec::new(),
             models: Vec::new(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -138,7 +149,7 @@ pub fn build_request_body(
     }
     let system_text = sys_parts.join("\n\n");
 
-    let wire_tools: Vec<Value> = options
+    let mut wire_tools: Vec<Value> = options
         .tools
         .iter()
         .map(|t| {
@@ -285,8 +296,38 @@ pub fn build_request_body(
         "messages": &wire_messages,
     }));
 
+    // 必须在前后摘要算完之后再注入 cache_control，避免缓存策略差异破坏签名 thinking 回放匹配。
+    let retention =
+        resolve_cache_retention(options.cache_retention.or(config.default_cache_retention));
+    let cache_ctrl = (retention != CacheRetention::None).then(|| {
+        if retention == CacheRetention::Long && config.supports_long_cache_retention {
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        } else {
+            json!({ "type": "ephemeral" })
+        }
+    });
+    if let Some(ctrl) = &cache_ctrl {
+        if config.supports_cache_control_on_tools
+            && let Some(last_tool) = wire_tools.last_mut().and_then(Value::as_object_mut)
+        {
+            last_tool.insert("cache_control".to_string(), ctrl.clone());
+        }
+        if let Some(last_user) = wire_messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            && let Some(last_block) = last_user
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .and_then(|blocks| blocks.last_mut())
+                .and_then(Value::as_object_mut)
+        {
+            last_block.insert("cache_control".to_string(), ctrl.clone());
+        }
+    }
+
     let mut max_tokens = options.max_tokens.unwrap_or(config.default_max_tokens);
-    let adaptive_effort = if config.force_adaptive_thinking {
+    let adaptive_effort = if config.supports_reasoning_effort && config.force_adaptive_thinking {
         options.reasoning_effort.and_then(|effort| match effort {
             ReasoningEffort::Off => None,
             ReasoningEffort::Minimal | ReasoningEffort::Low => Some("low"),
@@ -298,7 +339,7 @@ pub fn build_request_body(
         None
     };
 
-    let thinking_budget_val = if adaptive_effort.is_none() {
+    let thinking_budget_val = if config.supports_reasoning_effort && adaptive_effort.is_none() {
         options
             .reasoning_effort
             .and_then(|e| thinking_budget(e, config.thinking_budget_tokens))
@@ -319,7 +360,15 @@ pub fn build_request_body(
         "messages": wire_messages,
     });
     if !system_text.is_empty() {
-        body["system"] = Value::String(system_text);
+        body["system"] = if let Some(ctrl) = &cache_ctrl {
+            json!([{
+                "type": "text",
+                "text": system_text,
+                "cache_control": ctrl,
+            }])
+        } else {
+            Value::String(system_text)
+        };
     }
     if !wire_tools.is_empty() {
         body["tools"] = Value::Array(wire_tools);
@@ -332,7 +381,9 @@ pub fn build_request_body(
             "type": "enabled",
             "budget_tokens": budget,
         });
-    } else if let Some(temp) = options.temperature {
+    } else if config.supports_temperature
+        && let Some(temp) = options.temperature
+    {
         body["temperature"] = json!(temp);
     }
 
@@ -924,6 +975,10 @@ impl MessagesAdapter {
 }
 
 impl LlmAdapter for MessagesAdapter {
+    fn default_cache_retention(&self) -> Option<CacheRetention> {
+        self.config.default_cache_retention
+    }
+
     fn default_model(&self) -> Option<&str> {
         Some(&self.config.model)
     }

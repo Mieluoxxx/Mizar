@@ -223,6 +223,7 @@ fn entry_to_trace_event(
             SessionTraceEvent::ToolOutcome {
                 tool_call_id,
                 blocked,
+                duration_ms: _,
             } => {
                 if *blocked {
                     blocked_ids.insert(tool_call_id.clone());

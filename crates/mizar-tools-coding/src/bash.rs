@@ -1,6 +1,8 @@
 //! 托管工具排在搜索路径末尾，以保留用户已有工具链的优先级。
 
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -8,7 +10,7 @@ use std::time::{Duration, Instant};
 use mizar_tools::truncate::{
     BASH_MAX_BYTES, BASH_MAX_LINE_BYTES, BASH_MAX_LINES, TruncatedBy, create_temp_output_file,
     format_size, slice_utf8_head, slice_utf8_tail, truncate_head_tail, truncate_line_bytes,
-    truncate_tail, write_temp_output,
+    truncate_tail, write_temp_bytes,
 };
 use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolOutput};
 use serde_json::{Value, json};
@@ -371,6 +373,7 @@ where
     let mut timed_out = false;
     let mut aborted = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
+    let mut wait_done = false;
 
     let deadline = timeout_secs.map(|s| tokio::time::Instant::now() + Duration::from_secs_f64(s));
     let timeout_fut = async {
@@ -385,7 +388,7 @@ where
     let drain_grace_fut = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(drain_grace_fut);
 
-    while !(out_eof && err_eof && exit_status.is_some()) {
+    while !(out_eof && err_eof && wait_done) {
         tokio::select! {
             _ = cancel.cancelled() => {
                 aborted = true;
@@ -401,14 +404,15 @@ where
                 kill_process_tree(&mut child);
                 break;
             }
-            _ = &mut drain_grace_fut, if exit_status.is_some() => {
+            _ = &mut drain_grace_fut, if wait_done => {
                 // 主 shell 已退出但孤儿后台进程仍持有 stdout/stderr fd，宽限期满后主动断开避免无限挂起。
                 drop(stdout.take());
                 drop(stderr.take());
                 break;
             }
-            wait_res = child.wait(), if exit_status.is_none() => {
-                exit_status = Some(wait_res.unwrap_or_default());
+            wait_res = child.wait(), if !wait_done => {
+                wait_done = true;
+                exit_status = wait_res.ok();
                 if out_eof && err_eof {
                     break;
                 }
@@ -453,15 +457,33 @@ where
         }
     }
 
-    if exit_status.is_none() {
+    if !wait_done {
         exit_status = tokio::time::timeout(Duration::from_secs(1), child.wait())
             .await
             .ok()
             .and_then(Result::ok);
     }
-    let exit_code = exit_status
-        .and_then(|s| s.code())
-        .or(Some(if aborted || timed_out { -1 } else { 0 }));
+    let (exit_code, killed_signal) = match exit_status {
+        Some(s) => {
+            if let Some(code) = s.code() {
+                (Some(code), None)
+            } else {
+                #[cfg(unix)]
+                {
+                    if let Some(sig) = s.signal() {
+                        (Some(128 + sig), Some(sig))
+                    } else {
+                        (Some(-1), None)
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    (Some(-1), None)
+                }
+            }
+        }
+        None => (Some(-1), None),
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
 
     if let Some(error) = collector.spill_error {
@@ -515,10 +537,10 @@ where
             BASH_MAX_LINE_BYTES,
         );
         let full_path = if truncation.truncated {
-            write_temp_output("mizar-bash-", &full_text)
+            let path = write_temp_bytes("mizar-bash-", &collector.in_mem)
                 .await
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| format!("Failed to save full bash output: {e}"))?;
+            Some(path.to_string_lossy().into_owned())
         } else {
             None
         };
@@ -569,6 +591,11 @@ where
     } else if timed_out {
         let secs = timeout_secs.unwrap_or(0.0);
         display.push_str(&format!("\n\nCommand timed out after {secs} seconds"));
+    } else if let Some(sig) = killed_signal {
+        let code = exit_code.unwrap_or(128 + sig);
+        display.push_str(&format!(
+            "\n\nCommand terminated by signal {sig} (exit code {code})"
+        ));
     } else if let Some(code) = exit_code
         && code != 0
     {

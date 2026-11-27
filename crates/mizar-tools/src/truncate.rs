@@ -382,11 +382,16 @@ pub async fn create_temp_output_file(prefix: &str) -> std::io::Result<(PathBuf, 
     Ok((path, file))
 }
 
-/// 把完整输出落盘到系统临时目录，供截断提示引用。
-pub async fn write_temp_output(prefix: &str, content: &str) -> std::io::Result<PathBuf> {
+/// 把原始字节落盘到系统临时目录，供截断提示引用并保持内容逐字节一致。
+pub async fn write_temp_bytes(prefix: &str, content: &[u8]) -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("mizar");
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join(format!("{prefix}{}.log", uuid::Uuid::new_v4()));
     tokio::fs::write(&path, content).await?;
     Ok(path)
+}
+
+/// 把完整输出落盘到系统临时目录，供截断提示引用。
+pub async fn write_temp_output(prefix: &str, content: &str) -> std::io::Result<PathBuf> {
+    write_temp_bytes(prefix, content.as_bytes()).await
 }

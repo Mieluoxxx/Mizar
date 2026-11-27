@@ -117,7 +117,7 @@
 | --- | --- |
 | 空配置启动，记录首个模型请求。依次改用 `toolsPreset: "all"`、`--tools read,bash,grep`、`--read-only` 和 `--tools codemode`。 | 默认声明的编码工具只有 `read`、`bash`、`edit`、`write`，声明和系统提示均无 `codemode`。引导允许用 bash 执行 `ls`、`rg`、`find`。`all` 增加两个独立搜索工具，显式名单只声明所选项，只读预设提供 `read`、`grep`、`find`。提供独立搜索工具时仍允许 shell 管道。显式选中沙箱后，模型可传 `code` 执行 JavaScript。 |
 | 配置一个默认 `codemode` 服务，另一个服务仅用 `toolExposure` 将某个工具设为 `codemode`。等待模型首个请求再让这两个服务完成握手，第二步用沙箱检索并调用新工具。分别设置 `codemode.enabled: false`、`disabledPlugins: ["codemode"]`、`autoEnableCodemode: false` 再启动。 | 无须等待握手，首个请求已声明 `codemode`。连接前后，该工具完整 JSON 声明和按配置名排序的 `<mcp_servers>` 段落逐字节相同。第二步可取得远端结果。三种显式关闭配置下，MCP 均未自动激活沙箱。单独开启 `onlyMode` 后，预算内本地工具出现在沙箱说明里。 |
-| 直接和通过 `codemode` 分别调用 `bash`，生成含首中尾标记的多行输出、超长单行及跨过 1 MiB 边界的 UTF-8 字符。脚本仅返回长度和边缘字符，另外读取 `full_output_path`。 | 模型直读保留首尾和省略提示，显示预算为 20 KiB、400 行、每行 768 字节。脚本能取到显示中省略的文字和原始末尾换行，最多 1,048,576 字节。边界上的半个字符被舍弃。落盘文件与完整命令输出逐字节一致。 |
+| 直接和通过 `codemode` 分别调用 `bash`，生成含首中尾标记的多行输出、超长单行、非 UTF-8 字节（≤ 64 KiB 但触发展示截断）、跨过 1 MiB 边界的 UTF-8 字符以及被信号终止的命令（如 `kill -9 $$`）；另让模型直调未在当前步声明的工具。 | 模型直读保留首尾和省略提示，显示预算为 20 KiB、400 行、每行 768 字节。脚本能取到显示中省略的文字和原始末尾换行，最多 1,048,576 字节，边界上的半个字符被舍弃。落盘文件（含 ≤ 64 KiB 截断场景）与完整命令输出逐字节一致；信号终止时 `exit_code` 为 `128 + sig`、`is_error` 为真且显示信号提示。未声明的直调工具直接返回错误而不执行，不影响 `codemode` 内部嵌套调用。 |
 | 让视觉模型在一批调用里读取无扩展名 PNG、文本文件并调用返回图片的 MCP 工具。分别使用 Messages、Responses 和 Chat Completions，并换成目录未登记的模型。 | Messages 的 `tool_result.content` 依次为文本块和 base64 图块，Responses 的 `function_call_output.output` 依次为 `input_text` 和 `input_image`。Completions 按调用顺序先写完所有 `tool` 字符串回执，有图的回执结尾为 `(see attached image)`。紧接的一条合成 `user` 按相同顺序携带全部图像。三种协议的纯文本回执均为字符串，未知模型也收到图片。 |
 | 读取旋转 JPEG、动图和长边超过 2048 像素的图片，再读超 32 MiB、超 1 亿像素和非图片二进制文件。让 MCP 返回损坏图片、超过 20 张不同图片，再由沙箱并行调用读图工具。 | 方向、首帧、原始和最终尺寸可核对。超限或非图片二进制返回错误。MCP 损坏块变为简短说明，多图只保留前 20 张并提示截断。沙箱读到文本或元数据，模型在外层回执中收到相应附件，脚本结果和工具说明中均无图片 base64。 |
 | 在视觉模型会话中同时产生用户图片和工具图片，再以三个协议分别切换到模型目录声明仅支持文本的模型并恢复会话。 | 出站用户和工具消息都出现 `[image omitted: current model does not support image input]`，原文本和工具调用 ID 保留，请求中没有图片块、data URL 或合成图片消息。原会话附件仍可供视觉模型回放。 |
@@ -130,12 +130,12 @@
 | 操作 | 可观测结果 |
 | --- | --- |
 | 在启用缓存的 Responses 路由上，用大窗口读取同一文件两次。记录第二次读取前后的请求。用同一会话切换协议并恢复，再分别以闲置 45 和 100 分钟的副本恢复。 | 热期的旧 `function_call_output` 字节与首次回执相同，切换协议后仍可见旧原文。45 分钟恢复保留回执，100 分钟恢复可见剪枝标记，JSONL 日志仍保存两份原文。 |
-| 在 `models.json` 给单模型指定 Responses 和长缓存，环境设置 `MIZAR_CACHE_RETENTION=none`。另用未带 Responses 回放的历史，移除路由长缓存设置后重复。 | 发出请求的协议和缓存策略与当前模型匹配。有长缓存的路由保住旧回执，关闭缓存且没有受保护回放的会话允许常规剪枝。 |
+| 在 `models.json` 给单模型指定 Responses 和长缓存，环境设置 `MIZAR_CACHE_RETENTION=none`；另对 Messages 路由开启思考签名与默认缓存，并分别配置 Responses `supportsDeveloperRole: false` 及关闭 `supportsCacheControlOnTools`、`supportsStore`、`supportsTemperature`、`supportsReasoningEffort`、`supportsPromptCacheKey`。 | 发出请求的协议、缓存策略（包含 Messages 在 `system` / 末尾 `tools` / 末尾 `user` 块的 `cache_control` 断点且不破坏思考签名回放）及兼容开关均与当前模型匹配：禁用项不出现在请求体中，`supportsDeveloperRole: false` 内联角色为 `system`。有长缓存的路由保住旧回执，关闭缓存且没有受保护回放的会话允许常规剪枝。 |
 | 在未知模型上设置 `compaction.defaultContextWindow`，再分别设置环境变量、`--context-window` 和模型目录窗口。用相同输入、候选回执与用量回放比较阈值。 | CLI 优先于 `MIZAR_CONTEXT_WINDOW`，两者都优先于目录。省略两者时使用目录或设置，均缺失时采用 128,000。`exec --context-window 0 --json` 只产生一条 `invalid_request`，退出 1。 |
 | Computer Use 在真实终端以 `MIZAR_CONTEXT_WINDOW=64000 mizar --context-window 32000` 启动 TUI，输入 `/session`。 | 会话报告的上下文总窗口为 `32k`。 |
 | 缩小窗口，让旧 `read` 首次可回收时已达阈值，候选距尾部超过 8,000 token。再增加一段无法剪枝的历史，使回收后仍超阈值。 | 前一种请求包含重读占位和最新原文，端点收到的摘要请求数为零。占位文本比原回执更长时，降压保留短回执原文。后一种出现检查点请求和 `compaction` 事件，`trigger` 为 `auto-threshold`，成功时 `outcome` 为 `compacted`，`result.compactions` 只计成功次数。 |
 | 让 `keepRecentTokens` 的初始切点落在多调用批次的第二个回执上。继续同一轮直到再次压缩，让前缀摘要返回空包装以触发转录兜底。 | 压缩后第一个保留批次的调用 ID 和每份回执逐一配对。下一次摘要请求包含最近的摘要，转录含 `<earlier-summary>`，同一轮原始用户指令仍在检查点中。 |
-| 先返回一次 503，再让模型批量读图片、普通文件和不存在的文件。给参数加上长 Unicode 文本和假凭据。分别使用 `--json`、`--output-format json` 与 `--output-format ndjson`，完成后再用 `--resume` 跑一轮。 | 首行是 `session`。各行的 `ts_ms` 与 `type` 可读，步骤、重试、调用和回执均可配对。预览脱敏且至多 512 字符。`images` 与出站附件数一致，`tool_errors` 与本轮错误回执数一致。各步六项 `usage` 逐项相加等于末行 `result.usage`，恢复后 `session_usage` 同时包括前一轮。 |
+| 先返回一次 503，再让模型同批并行调用慢速工具与快速只读工具（含图片、普通文件和不存在的文件）。给参数加上长 Unicode 文本和假凭据。分别使用 `--json`、`--output-format json` 与 `--output-format ndjson`，完成后再用 `--resume` 跑一轮。 | 首行是 `session`。各行的 `ts_ms` 与 `type` 可读，步骤、重试、调用和回执均可配对；并行批次中各 `tool_result.duration_ms` 与 `result.tool_ms` 反映单工具各自实际耗时而非整批墙钟。预览脱敏且至多 512 字符。`images` 与出站附件数一致，`tool_errors` 与本轮错误回执数一致。各步六项 `usage` 逐项相加等于末行 `result.usage`，恢复后 `session_usage` 同时包括前一轮。 |
 | 输出重定向到文件，再改为管道；两次都让端点在第二个模型请求挂起。进程运行中读取已有行，再向该进程发送 `SIGKILL`。 | 强杀前即可解析 `session`、已完成步骤和工具回执。强杀后这些完整行仍可读取，调用方可以从缺少 `result` 识别这次中断。 |
 
 ## S12. 搜索工具安装、镜像回退与按需补齐（Agent + Computer Use）

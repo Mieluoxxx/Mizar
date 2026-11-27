@@ -7,6 +7,7 @@
 
 pub mod mutation_queue;
 pub mod truncate;
+pub use truncate::write_temp_bytes;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

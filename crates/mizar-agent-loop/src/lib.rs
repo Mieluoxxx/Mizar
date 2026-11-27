@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cordis::{Context, CordisError, Inject, Service};
 use futures::future::join_all;
@@ -945,15 +945,15 @@ impl AgentLoop {
                 usage: None,
             };
 
-            let build_messages = || {
+            let build_messages = |prompt: &str| {
                 let mut messages = vec![Message::System {
-                    content: prompt_text.clone(),
+                    content: prompt.to_string(),
                 }];
                 messages.extend(session.derive_messages());
                 messages
             };
             let mut request = GenerateOptions {
-                messages: build_messages(),
+                messages: build_messages(&prompt_text),
                 tools: tool_list,
                 model: model.clone(),
                 provider: provider.clone(),
@@ -1053,8 +1053,9 @@ impl AgentLoop {
                         .lock()
                         .unwrap()
                         .remove(&session.id);
-                    // 压缩会改变可见历史并重置工具激活态，两者必须取自同一轮压缩之后。
-                    request.messages = build_messages();
+                    // 压缩会改变可见历史并重置工具激活态，系统提示与声明工具必须同步自同一轮压缩之后刷新。
+                    let refreshed_prompt = system_prompt.build_for_session(Some(&session.id));
+                    request.messages = build_messages(&refreshed_prompt);
                     request.tools = tools.list_declared(Some(&session.id));
                     Some((Duration::ZERO, "context_window_exceeded"))
                 } else if can_replay
@@ -1156,6 +1157,8 @@ impl AgentLoop {
                 });
             }
 
+            let declared_names: HashSet<&str> =
+                request.tools.iter().map(|t| t.name.as_str()).collect();
             let batches = partition_tool_batches(&tools, calls);
             for (batch_idx, batch) in batches.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -1185,7 +1188,7 @@ impl AgentLoop {
                     return Err(AgentError::Llm(LlmError::cancelled()));
                 }
 
-                let mut results: Vec<Option<ToolResult>> = vec![None; batch.len()];
+                let mut results: Vec<Option<(ToolResult, u64)>> = vec![None; batch.len()];
                 let mut futs = Vec::new();
                 let mut fut_indices = Vec::new();
                 for (idx, call) in batch.iter().enumerate() {
@@ -1203,11 +1206,19 @@ impl AgentLoop {
                             call: call.clone(),
                         },
                     );
+                    if !declared_names.contains(call.name.as_str()) {
+                        // 直调工具必须在当前请求实际公布的 allowlist 内，防止绕过按需暴露直接调用隐藏/未激活工具。
+                        results[idx] = Some((
+                            ToolResult::err(format!("工具未在当前会话允许列表中：{}", call.name)),
+                            0,
+                        ));
+                        continue;
+                    }
                     let args = match parse_tool_arguments(&call.name, &call.arguments) {
                         Ok(args) => args,
                         Err(msg) => {
                             // 畸形工具参数不再吞成 `{}`，直接返回校验错误供模型自我修正重试。
-                            results[idx] = Some(ToolResult::err(msg));
+                            results[idx] = Some((ToolResult::err(msg), 0));
                             continue;
                         }
                     };
@@ -1227,15 +1238,20 @@ impl AgentLoop {
                             },
                         );
                     });
+                    let runtime = Arc::clone(&tools);
+                    let exec =
+                        ToolExecution::new(call.name.clone(), args, Some(session.id.clone()))
+                            .with_call_id(call.id.clone());
+                    let call_cancel = cancel.clone();
                     fut_indices.push(idx);
-                    futs.push(
-                        tools.execute_with(
-                            ToolExecution::new(call.name.clone(), args, Some(session.id.clone()))
-                                .with_call_id(call.id.clone()),
-                            cancel.clone(),
-                            Some(on_update),
-                        ),
-                    );
+                    futs.push(async move {
+                        let started = Instant::now();
+                        let res = runtime
+                            .execute_with(exec, call_cancel, Some(on_update))
+                            .await;
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        (res, duration_ms)
+                    });
                 }
 
                 if futs.len() == 1 {
@@ -1246,12 +1262,12 @@ impl AgentLoop {
                         results[idx] = Some(res);
                     }
                 }
-                let results: Vec<ToolResult> = results
+                let results: Vec<(ToolResult, u64)> = results
                     .into_iter()
                     .map(|r| r.expect("tool result populated"))
                     .collect();
 
-                for (call, result) in batch.iter().zip(results) {
+                for (call, (result, duration_ms)) in batch.iter().zip(results) {
                     let extra_contexts = result.additional_contexts.clone();
                     self.ctx.emit(
                         EVENT_AGENT_TOOL_RESULT,
@@ -1265,12 +1281,11 @@ impl AgentLoop {
                             details: result.details,
                         },
                     );
-                    if result.blocked {
-                        session.append_trace(SessionTraceEvent::ToolOutcome {
-                            tool_call_id: call.id.clone(),
-                            blocked: true,
-                        });
-                    }
+                    session.append_trace(SessionTraceEvent::ToolOutcome {
+                        tool_call_id: call.id.clone(),
+                        blocked: result.blocked,
+                        duration_ms: Some(duration_ms),
+                    });
                     session.append(SessionEvent::ToolResult {
                         tool_call_id: call.id.clone(),
                         name: call.name.clone(),

@@ -1040,6 +1040,11 @@ impl SessionStore {
             .ok_or_else(|| PersistenceError::NotFound(from_session_id.to_string()))?;
 
         let new_id = opts.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        if new_id == from_session_id || self.contains_in_memory(&new_id) {
+            return Err(PersistenceError::InvalidArgument(format!(
+                "session \"{new_id}\" already exists"
+            )));
+        }
         let now = now_millis();
         let parent_header = parent.header();
         let mut new_header = SessionHeader::new(new_id.clone(), now);
