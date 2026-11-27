@@ -1,6 +1,6 @@
 ---
 title: 常见故障排查与运行诊断
-description: 快速定位路由失败、企业代理证书报错、网关 compat 400、SQLITE_BUSY、MCP 断连、Codemode 超时与终端异常。
+description: 快速定位路由失败、企业代理证书报错、网关 compat 400、JSONL 持久化错误、rg/fd 安装、MCP 断连、Codemode 超时与终端异常。
 group: ops-internals
 order: 10
 ---
@@ -27,14 +27,16 @@ order: 10
 - **`exec` 返回 `code=max_tokens`（退出码 `1`）**：单步回复撞到输出上限被硬截断；可通过 `--max-tokens` 或提高 `models.json` 中的 `maxTokens` 后重试。
 - **频繁触发 `repeat-tool-guard`**：说明模型陷入同一参数的死循环，打开 `Ctrl+T` 切换到 Hotspots / Inspector 检查是校验错误还是文件未找到；也可核对网关是否正确回传工具调用结果。
 
-## 3. SQLite 持久化与并发读写
+## 3. JSONL 持久化、Blob 与搜索工具安装
 
-- **多开终端看到 `SQLITE_BUSY` 瞬时告警**：多进程同时写同一个 `~/.mizar/sessions.sqlite` 超过了 5s `busy_timeout`。可各自通过 `MIZAR_SESSION_DB=/tmp/dev-a.sqlite` 隔离库文件，或在评测场景直接加 `--no-persist` / `MIZAR_SESSION_DB=none`。
+- **启动或退出报持久化错误（`code=storage` / TUI 红字告警）**：检查 `~/.mizar/sessions` 目录权限或磁盘空间；可用 `MIZAR_SESSIONS_DIR=/tmp/mizar-sessions` 或 `settings.json` `sessionsDir` 切换可写目录，或在只读评测环境传入 `--no-persist` / `MIZAR_SESSIONS_DIR=memory`。
+- **老会话恢复时提示部分图片 Blob 缺失**：`blobs/<sha256>` 文件被清理或损坏时，JSONL 读取器会自动剔除丢失的图片附件并记告警日志，文本历史与完好附件仍正常恢复。
 - **老会话崩溃遗留未配对 `tool_call` 导致网关拒绝重放**：运行 `/tree` 分叉或 `-r <id>` 恢复时会自动执行孤儿调用自愈补全，重新恢复即可正常继续。
+- **提示找不到 `rg` 或下载超时**：交互式 TUI 会自动下载并校验 `rg` / `fd`，也可运行 `mizar install-tools --force` 预装；无头 `exec` 模式仅查找本地已安装的 `rg` / `fd`。如直连 GitHub 较慢，默认会自动回退 `https://ghfast.top` 镜像，离线环境请设 `MIZAR_OFFLINE=1`。
 
 ## 4. MCP、`codemode` 与指令发现
 
-- **MCP 工具已在 `mcp.json` 配好但模型列表看不到**：外部 MCP 默认处于 `Codemode` 暴露等级（节省上下文）。模型可通过内置 `codemode` JS 直接调用 `tools.mcp__<server>__<tool>(...)`，或通过 `tool_search` 按需检索激活。若确需首页直出，可在对应服务器设置 `"exposure": "direct"`；同时可在 TUI 运行 `/mcp` 确认连接是否成功就绪。
+- **默认只看到 4 个工具，或者 MCP 工具没直接出现在首轮声明中**：`MinimalCoding` 默认仅声明 `read` / `bash` / `edit` / `write`；外部 MCP 默认处于 `Codemode` 暴露等级（启用 `codemode` exposure 的 MCP 服务会在初始化时按需激活 `codemode` 沙箱，其余场景下 `codemode` 默认休眠）。可通过 `--tools codemode`、`toolsPreset: "all"` 或在 `mcp.json` 对高频工具设 `"exposure": "direct"` 调整，并用 `/mcp` 与 `/tools` 查看实时状态。
 - **`codemode` 沙箱 120s 超时**：脚本内嵌套跑了耗时超过 2 分钟的测试或构建命令。长耗时任务应改调独立 `bash` 工具（上限 `600s`），或调大 `settings.json` 中 `codemode.timeoutMs`。如需彻底停用 `codemode`，将其写入 `disabledPlugins: ["codemode"]`。
 - **修改了子目录 `AGENTS.md` 没立刻生效**：`mizar-instructions` 采用启动期静态发现与一次性注入以稳住 KV Cache，修改后开启新进程即可加载；用 `/instructions` 可确认实际注入的文件列表及是否触发 `maxBytes` 祖先淘汰。
 

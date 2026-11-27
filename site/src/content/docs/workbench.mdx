@@ -15,6 +15,8 @@ Mizar 的终端界面由纯前端状态机 `mizar-tui-ui` 与跨端宿主层 `mi
 ## 双模视口与分栏诊断
 
 - **Fullscreen（默认）**：占用 Alternate Screen，内置虚拟化 Markdown 渲染、词级 Diff、`TimelineRail`（终端宽度 `>= 60` 列且 `>= 2` 轮对话时自动出现，点击圆点直接跳转对应用户轮次）与右侧 `Ctrl+B` 分栏。
+- **四态工具圆灯与 1 行折叠卡片**：每条工具调用均展示 4 态圆形状态灯——参数接收中显示灰色空心圈 `○`（`Drafting`），执行中就地转为黄色实心圆 `●`（`Running`），成功为绿色 `●`（`Done`），失败或被拦截为红色 `●`（`Error`/`Blocked`）。折叠状态下每张工具卡片严格占 **1 行标题**（零正文预览行），按 `Ctrl+O` 可展开完整参数、差异与回执输出；截断或按 `Esc` 取消时未派发草稿自动收为红灯。
+- **后台搜索工具自动补齐**：TUI 启动时会在后台并发按需安装 `rg` 与 `fd` 至 `~/.mizar/bin`（直连慢速或停滞自动切换 `ghfast.top` 镜像），`grep` 复用同一次安装过程，也可通过 `mizar install-tools` 提前安装。
 - **Inline（`--inline` / `/view inline`）**：保留 7~14 行底部紧凑交互框，空闲时把已完成轮次推入终端原生 scrollback，支持终端自带 `Cmd+F` 搜索与原生划词，且默认关闭鼠标捕捉（`mouse_capture=false`）。
 - **右侧分栏面板（`Ctrl+B` / `/panel`）**：终端宽度 `>= 96` 列时显示，默认 42 列（最小 30 列，可用鼠标拖拽分隔线调宽），包含 `Ctx`（上下文占用与 TTFT / TPS）、`File`、`Tool`、`Stat` 等视图。
 - **鼠标划词放行（`F2` / `/mouse`）**：Fullscreen 下默认启用应用内拖拽复制；按 `F2` 临时暂停鼠标捕捉后，可直接用终端自身组合键（如 macOS `Option+Drag` / iTerm2 划词）复制跨区文本。
@@ -64,7 +66,7 @@ Mizar 的终端界面由纯前端状态机 `mizar-tui-ui` 与跨端宿主层 `mi
 | `/model` | — | `[spec]` | 打开模型/Provider 选择器（`Ctrl+L`）或直接切换 |
 | `/effort` | — | `[level]` | 调整推理强度：`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `/compact` | — | `[focus]` | 手动压缩当前会话上下文，可附带重点保留说明 |
-| `/session` | — | 无 | 查看当前会话 ID、SQLite 存储路径、事件构成与压缩边界 |
+| `/session` | — | 无 | 查看当前会话 ID、JSONL 存储路径、生效上下文窗口、事件构成与压缩边界 |
 | `/theme` | — | `[name]` | 切换主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`） |
 | `/trace` | — | 无 | 打开全屏三泳道轨迹分析器（`Ctrl+T`） |
 | `/panel` | — | 无 | 展开/折叠右侧分栏面板（`Ctrl+B`） |
@@ -85,7 +87,7 @@ Mizar 的终端界面由纯前端状态机 `mizar-tui-ui` 与跨端宿主层 `mi
 ## 主题与视觉强调（`pi-emphasis`）
 
 - **内置 6 套主题**：`auto`（根据终端 `COLORFGBG` 与明暗检测自动适配 `mist-dark` / `mist-light`）、`mist-dark`、`mist-light`、`sakura-dark`、`system`、`ansi16`。在无 TTY 或 CI 子进程环境下如需验证 24-bit 色彩，建议设置 `COLORTERM=truecolor`。
-- **`pi-emphasis` 视觉语法**：交互模式默认启用闭环视觉高亮，模型输出中的 `[[Done]]`、`[[Failed]]`、`[[Needs you]]` 等状态标签会被渲染为语义胶囊，而 SQLite 会话存储、剪贴板复制与 `/export` 导出仍保留纯净 Markdown。可通过环境变量按需关闭：
+- **`pi-emphasis` 视觉语法**：交互模式默认启用闭环视觉高亮，模型输出中的 `[[Done]]`、`[[Failed]]`、`[[Needs you]]` 等状态标签会被渲染为语义胶囊，而 JSONL 会话存储、剪贴板复制与 `/export` 导出仍保留纯净 Markdown。可通过环境变量按需关闭：
   - `MIZAR_TUI_EMPHASIS=0`：全局关闭视觉强调渲染
   - `MIZAR_TUI_ROUND_CAPS=0`（或 `PI_EMPHASIS_ROUND_CAPS=0`）：关闭圆角胶囊边界
   - `MIZAR_TUI_PILL_ICONS=0`（或 `PI_EMPHASIS_PILL_ICONS=0`）：隐藏 Nerd Font 图标前缀

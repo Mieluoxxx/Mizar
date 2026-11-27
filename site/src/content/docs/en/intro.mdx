@@ -5,10 +5,10 @@ group: getting-started
 order: 1
 ---
 
-Mizar is a Rust terminal AI coding agent built on the **33-crate Cordis microkernel** (`mizar` binary). It pairs a streaming inference loop (`stream → tools → append-only session persistence`) with strict KV-cache prefix stability, offering both an interactive dual-viewport TUI workbench and a deterministic headless `exec` runner.
+Mizar is a Rust terminal AI coding agent built on the **33-crate Cordis microkernel** (`28` runtime/plugin + `5` pure core crates, `mizar` binary). It pairs a streaming inference loop (`stream → tools → append-only JSONL session persistence`) with strict KV-cache prefix stability, offering both an interactive dual-viewport TUI workbench and a deterministic headless `exec` runner.
 
 <Callout type="info" title="Architecture Alignment">
-  This handbook documents the **33-crate Cordis microkernel branch**: always-on QuickJS `codemode`, a single static `recall` tool, a 4-section static English system prompt, startup-static `AGENTS.md` loading, cache-aware tail pruning, Compaction B-5 guards, and `--trace-out` structured trajectory export.
+  This handbook matches the **33-crate Cordis architecture (v0.2.5)**: `MinimalCoding` 4-tool default (`read`/`bash`/`edit`/`write`), on-demand QuickJS `codemode`, `<available_skills>` `<location>` skill pointers, a lean static English system prompt, startup-static `AGENTS.md` loading, hot-cache-aware tail pruning & `Compaction B-5` guards, tolerant single-session JSONL + SHA-256 blobs, and `--trace-out` structured trajectory export.
 </Callout>
 
 ## Installation
@@ -31,11 +31,12 @@ cd Mizar
 cargo install --locked --path crates/mizar-tui`,
     },
     {
-      label: 'Self-Update',
+      label: 'Self-Update & Tools',
       lang: 'sh',
       code: `mizar update --check      # Check latest release only
 mizar update              # Upgrade to latest stable release
-mizar update -v 0.1.6 -f  # Force-install a specific tag`,
+mizar update -v 0.2.5 -f  # Force-install a specific tag
+mizar install-tools       # Install/verify managed rg & fd`,
     },
   ]}
 />
@@ -85,8 +86,8 @@ mizar exec "Explain workspace layout in Cargo.toml"`,
 
 | Entrypoint | Use Case | Interaction | Persistence |
 | :--- | :--- | :--- | :--- |
-| `mizar [OPTIONS]` | Daily coding, multi-turn refactors, reviews | Fullscreen / Inline viewports, `!` / `!!` local Bash, `--approve` prompts | Persists to `~/.mizar/sessions.sqlite` by default (`--no-persist` disables) |
-| `mizar exec [OPTIONS] [<prompt>]` | CI pipelines, eval harnesses, batch scripts | Headless single-turn run; prints text or JSON summary to `stdout` | Supports `--isolated`, `--timeout`, `--trace-out`, and explicit exit codes |
+| `mizar [OPTIONS]` | Daily coding, multi-turn refactors, reviews | Fullscreen / Inline viewports, `!` / `!!` local Bash, `--approve` prompts | Lazily persists per-`cwd` JSONL logs under `~/.mizar/sessions/` (`--no-persist` disables) |
+| `mizar exec [OPTIONS] [<prompt>]` | CI pipelines, eval harnesses, batch scripts | Headless single-turn run; outputs text or live-flushed NDJSON (`--json`) to `stdout` | Supports `--isolated`, `--timeout`, `--context-window`, `--trace-out`, and explicit exit codes |
 
 <Callout type="tip" title="Strict Route Errors When Unconfigured">
   If no credentials exist in environment variables or <code>~/.mizar/models.json</code> and you do not pass <code>--provider mock</code>, Mizar fails immediately with <code>NoRouteConfigured</code> instead of issuing unauthenticated network requests.
@@ -101,8 +102,8 @@ mizar exec "Explain workspace layout in Cargo.toml"`,
     slug="workbench"
   />
   <DocCard
-    title="Tools & Always-On Codemode"
-    description="Explore 5-tier ToolExposure, parallel coding queues, QuickJS codemode, tool_search, MCP, and SKILL.md."
+    title="Tools & On-Demand Codemode"
+    description="Explore 5-tier ToolExposure, MinimalCoding 4-tool default, on-demand QuickJS codemode, tool_search, MCP, and SKILL.md."
     slug="tools"
   />
   <DocCard

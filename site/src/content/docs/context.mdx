@@ -1,25 +1,26 @@
 ---
 title: KV Cache 前缀稳定、静态提示词与指令发现
-description: 四段静态英文系统提示词、Turn-0 消息严格顺序、启动期静态 AGENTS.md 加载、冻结工具表与协议层缓存对齐。
+description: 精简静态英文系统提示词、Turn-0 严格顺序、启动期静态 AGENTS.md 加载、按需工具表与协议层缓存断点保持。
 group: core-concepts
 order: 5
 ---
 
-大模型在多步编程循环中主要消耗在**重复读取前缀 Token**。一旦系统提示词里夹杂按秒跳变的时间戳、运行时中途增删工具 Schema、或者每步重新扫描修改指令文本，服务端 Prompt / KV Cache 就会全量失效重算。Mizar 从提示词、工具表、指令加载到协议线格式四层贯通「**静态冻结前缀**」设计。
+大模型在多步编程循环中主要消耗在**重复读取前缀 Token**。一旦系统提示词里夹杂按秒跳变的时间戳、运行时无故抖动工具 Schema、或者每步重新扫描修改指令文本，服务端 Prompt / KV Cache 就会全量失效重算。Mizar 从提示词、工具表、指令加载到协议线格式四层贯通「**静态前缀稳定**」设计。
 
-## 四段静态英文系统提示词（`mizar-system-prompt`）
+## 精简静态英文系统提示词（`mizar-system-prompt`）
 
-系统提示词采用精简静态英文骨架拼接，在启动后保持字节级只读不变（支持通过 `settings.json` 的 `persona` 覆写人格段落）：
+系统提示词按 `order` 拼接插件段落（纯英文静态骨架，默认**不含**工程哲学或虚构性格段，仅当 `settings.json` 配置了非空 `personality` 时插入）：
 
-| 顺序 | 段落来源 | 职责说明 |
+| `order` | 段落 ID | 职责说明 |
 | :--- | :--- | :--- |
-| 1 | `DEFAULT_PERSONA` | 核心身份、简洁精准工程行为规范与不编造验证结果的事实底线 |
-| 2 | `tools_guide` | 各活跃编码工具使用习惯及常驻 `codemode` 批处理引导（`Promise.allSettled` 折叠并发） |
-| 3 | `DEFAULT_RUNTIME_PROTOCOL` | 工具调用、错误处理与输出格式运行时协议 |
-| 4 | `emphasis`（可选） | 仅交互 TUI 且未关闭 `MIZAR_TUI_EMPHASIS_GUIDANCE` 时挂载，约定 `[[Done]]` 等胶囊语法；无头 `exec` 模式下从不注入 |
+| `0` | `identity` | `DEFAULT_IDENTITY`（`You are a coding assistant running inside Mizar...` 及随用户语言回复规则） |
+| `20` | `personality`（可选） | 仅采用 `settings.json` 中显式配置的非空 `personality`（省略、空串或纯空白均占 `0` 字节） |
+| `30` | `tools_guide` | 由 `mizar-tools-coding::build_tools_guide` 按当前会话声明组装 `<tools>` 与去重后的 `<rules>`（含独立并行原则与路径清晰规范） |
+| `40` | `runtime_protocol` | `DEFAULT_RUNTIME_PROTOCOL`：说明 `<environment_context>`、`<project_instructions>`、`<system-reminder>`、`<skill_content>` 与 `<mizar-compaction>` |
+| 末尾 | `emphasis`（可选） | 仅交互 TUI 且未关闭 `MIZAR_TUI_EMPHASIS_GUIDANCE` 时挂载，约定 `[[Done]]` 等胶囊语法；无头 `exec` 模式下从不注入 |
 
-<Callout type="info" title="Turn-0 严格消息顺序（EVENT_AGENT_PREPARE_TURN）">
-  在首轮发起模型请求前，<code>mizar-agent-loop</code> 通过 <code>EVENT_AGENT_PREPARE_TURN</code> 固定上下文片段（系统提示词、项目指令与历史消息）的装配次序，确保同一会话跨轮与断点恢复重放时的序列结构 100% 确定性一致。
+<Callout type="info" title="Turn-0 顺序、技能注入与压缩刷新">
+  发起 Turn 0 前，<code>mizar-agent-loop</code> 通过 <code>EVENT_AGENT_PREPARE_TURN</code> 固定上下文片段装配顺序；若会话声明了 <code>read</code> 或 <code>bash</code>，<code>mizar-skills</code> 会在其间按需注入含 <code>&lt;location&gt;</code> 的 <code>&lt;available_skills&gt;</code> 目录或展开 <code>/&lt;name&gt;</code> 的 <code>&lt;skill_content&gt;</code>。当压缩或上下文溢出重试改变可见历史后，<code>build_for_session(Some(&amp;session.id))</code> 与 <code>tools.list_declared(Some(&amp;session.id))</code> 会按会话同步刷新。
 </Callout>
 
 ## 启动期静态工作区指令发现（`mizar-instructions`）
@@ -34,20 +35,24 @@ order: 5
   - 单文件上限 `instructions.maxSourceBytes`（默认 `1 MiB` = `1,048,576 B`），所有指令总预算 `instructions.maxBytes`（默认 `65,536 B`）。当总字节数超限时，**优先淘汰距离当前工作区最远（最宽泛）的祖先文件**，竭力保住离当前代码最近的目录指令，并在正文按 UTF-8 字符边界安全截断。
 - **零运行时 I/O**：指令装配完毕后整个会话生命周期内不再扫描子目录，既消除了每步磁盘 `stat` 抖动，又保证系统提示词前半段永远稳固不变。传入 `--no-instructions` 或设置 `instructions.enabled: false` 可彻底关闭。
 
-## 冻结的工具声明表
+## 精简按需的工具声明表
 
-为消除多轮循环中途发生「Schema 变更导致整段 KV Cache 作废」：
+为消除无效前缀占位与中途声明抖动：
 
-- **`recall` 单一静态挂载**：从首轮起常驻在 `Direct` 列表中，不再等到压缩事件发生才动态切换挂载。
-- **`codemode` 默认常驻**：不再依赖外部 MCP 存在才延迟激活。
-- **零存在即彻底省略**：未配置 MCP Server 时跳过 `tool_search`，未加载任何技能时跳过 `skill`，且不再向系统提示词尾部动态拼装变化中的 MCP 状态文本。
+- **`MinimalCoding` 默认 4 件套**：默认仅声明 `read`、`bash`、`edit`、`write`，省去独立 `grep`/`find` 与沙箱 Schema 开销。
+- **`codemode` 按需稳定激活**：默认休眠；仅在 MCP 静态配置启用 `codemode`、`--tools codemode` 或配置 `codemode.enabled`/`onlyMode` 时于首轮即加入声明，且在后台 MCP 握手前后维持 `codemode` 声明与 `<mcp_servers>` 摘要字节完全一致。
+- **零冗余省略**：未配置 MCP Server 时跳过 `tool_search`；已移除独立 `skill` 工具（改由 `<available_skills>` `<location>` 按需读取 `SKILL.md`）。
 
-## 协议线级前缀保序与缓存对齐
+## 协议线级前缀保序、缓存断点与视觉降级
 
-三大底层协议适配器分别针对主流模型网关的 KV Cache 机制做了专用对齐（详见 [模型与兼容参数参考](/reference/models/)）：
+三大底层协议适配器分别针对主流模型网关的 KV Cache 与视觉能力做了专用对齐（详见 [模型与兼容参数参考](/reference/models/)）：
 
+- **Anthropic Messages（`mizar-llm-messages`）**：
+  - 先计算 `prefixDigest` 再注入 `cache_control` 断点（放在 `system`、最后一个 `tools` 条目［受 `supportsCacheControlOnTools` 控制］及最后一条 `user` 消息的末尾内容块；长缓存发送 `ttl: "1h"`），确保切换缓存保留策略不破坏签名 `thinking` / `redacted_thinking` 回放。
+  - 工具回执带图片时序列化为 `tool_result.content` 文本 + base64 图像块数组（纯文本保持字符串）。
 - **OpenAI Responses（`mizar-llm-responses`）**：
-  - 默认以 **`supportsDeveloperRole: true`**、**`useTopLevelInstructions: false`** 运行：将系统提示词作为 `input` 数组首位的 `developer` 消息内联，保证从系统指令到历史对话处于连续可缓存序列。
-  - **保序回放 `outputItems`**：保留单步响应中交错的多段 `reasoning`、`message` 与 `function_call` 原始顺序写回上下文，消除官方 Responses 接口因顺序打乱触发的 `IN_DROP` 静默丢弃问题。
-- **Anthropic Messages（`mizar-llm-messages`）**：自动分离 `system` 块并在系统/工具边界与近期回合放置 `cache_control` 缓存断点（可由 `supportsCacheControlOnTools` 控制工具段断点）。
-- **OpenAI Chat Completions & DeepSeek（`mizar-llm-completions`）**：固定提示词前缀配合会话亲和头（`sendSessionAffinityHeaders` / `sessionAffinityFormat`）及 `prompt_cache_key`（`supportsPromptCacheKey`），引导服务端路由固定打到命中既有 KV 缓存的推理节点。
+  - 默认 `supportsDeveloperRole: true`、`useTopLevelInstructions: false`（将系统提示词作为 `input[0]` 的 `developer` 消息内联，设为 `false` 时自动降级为 `"system"` 角色）；按 `compat` 开关门控 `store`、`temperature`、`reasoning` 与 `prompt_cache_key`，禁用项绝不出现在请求体中。
+  - 保序回放 `outputItems` 消除 `IN_DROP`；工具图片序列化为 `function_call_output.output` 的 `input_text` + `input_image` 数组。
+- **OpenAI Chat Completions & DeepSeek（`mizar-llm-completions`）**：
+  - 固定前缀配合会话亲和头与 `prompt_cache_key`；并行工具含图时，先按序写出同批全部 `role: "tool"` 回执（带图回执末尾追加 `(see attached image)`），再统一附加一条合成 `role: "user"` 消息按序携带全部图片。
+- **非视觉模型统一降级（`supportsImages`）**：当目标模型在目录中声明不支持图片（未知模型默认允许图片）时，三种协议都在序列化前通过 `message_for_model` 将用户与工具图片替换为 `[image omitted: current model does not support image input]`，不发送图片块或合成图片消息。

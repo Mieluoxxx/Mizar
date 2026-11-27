@@ -24,8 +24,8 @@ const isEn = locale === 'en';
     height="600"
     role="img"
     aria-label={isEn
-      ? 'Mizar 33-crate layered architecture and compile-time isolation boundary: 29 runtime/plugin crates on the left from host and mizar-client down to cordis microkernel, a strict dependency firewall in the center forbidding tokio/cordis/reqwest/rquickjs/rusqlite and terminal libs on mizar-client*, and 4 pure core crates on the right'
-      : 'Mizar 33 个 Crate 分层架构与编译隔离红线：左侧为宿主与跨端运行时、编排观测、工具/记忆插件、核心服务、HTTP 协议栈与底层 cordis 微内核共 29 个 crate；中间为禁止引入重型运行时的编译隔离红线；右侧为受保护的 4 个纯核心 crate'}
+      ? 'Mizar 33-crate layered architecture and compile-time isolation boundary: 28 runtime/plugin crates on the left from host and mizar-client down to cordis microkernel, a strict dependency firewall in the center forbidding tokio/cordis/reqwest/rquickjs/rusqlite and terminal libs on mizar-client*, and 5 pure core crates on the right'
+      : 'Mizar 33 个 Crate 分层架构与编译隔离红线：左侧为宿主与跨端运行时、编排观测、工具/压缩插件、核心服务、HTTP 协议栈与底层 cordis 微内核共 28 个 crate；中间为禁止引入重型运行时的编译隔离红线；右侧为受保护的 5 个纯核心 crate'}
   >
     <defs>
       <pattern id="cord-hatch-firewall" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -48,7 +48,7 @@ const isEn = locale === 'en';
       </marker>
     </defs>
 
-    {/* ================= 左侧：运行时与插件栈 (29 Crates) ================= */}
+    {/* ================= 左侧：运行时与插件栈 (28 Crates) ================= */}
 
     {/* 第 1 层：宿主、跨端运行时与装配层 (3) */}
     <g>
@@ -94,8 +94,8 @@ const isEn = locale === 'en';
       <text x="215" y="159" font-size="7.8" text-anchor="middle" fill="var(--grey-8)">Trace + RepeatGuard</text>
 
       <rect x="281" y="135" width="128" height="29" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
-      <text x="345" y="148" font-size="8.8" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-session-sqlite</text>
-      <text x="345" y="159" font-size="7.8" text-anchor="middle" fill="var(--grey-8)">WAL · FTS5 · BUSY</text>
+      <text x="345" y="148" font-size="8.8" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-session-jsonl</text>
+      <text x="345" y="159" font-size="7.5" text-anchor="middle" fill="var(--grey-8)">cwd-bucket · Blob · Lazy</text>
 
       <rect x="415" y="135" width="110" height="29" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
       <text x="470" y="148" font-size="8.8" font-weight="700" text-anchor="middle" fill="var(--grey-11)">mizar-session-title</text>
@@ -105,14 +105,14 @@ const isEn = locale === 'en';
     {/* L2 -> L3 */}
     <line x1="278" y1="172" x2="278" y2="184" stroke="var(--grey-9)" stroke-width="1.2" marker-end="url(#cord-arr-ink)" />
 
-    {/* 第 3 层：工具、上下文压缩与记忆插件层 (10) */}
+    {/* 第 3 层：工具、上下文压缩与指令插件层 (9) */}
     <g>
       <rect x="21" y="186" width="514" height="145" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.3" />
       <rect x="21" y="186" width="514" height="22" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.3" />
       <text x="33" y="201" font-size={isEn ? 9.5 : 10.5} font-weight="700" fill="var(--grey-11)">
         {isEn
-          ? 'L3 Tool, Compaction & Context Plugins (10 Crates · optional via spinePlugins)'
-          : 'L3 工具、压缩与情景回溯插件层 (10 Crates · 由 spinePlugins 热启停)'}
+          ? 'L3 Tool, Compaction & Instruction Plugins (9 Crates · optional via spinePlugins)'
+          : 'L3 工具、压缩与指令插件层 (9 Crates · 由 spinePlugins 热启停)'}
       </text>
 
       {/* Row 1 */}
@@ -123,7 +123,7 @@ const isEn = locale === 'en';
       <text x="223" y="230" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-tool-search</text>
 
       <rect x="289" y="214" width="126" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
-      <text x="352" y="230" font-size="9" font-weight="600" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'mizar-codemode (on)' : 'mizar-codemode (常驻)'}</text>
+      <text x="352" y="230" font-size="8.6" font-weight="600" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'mizar-codemode (on-demand)' : 'mizar-codemode (按需)'}</text>
 
       <rect x="422" y="214" width="101" height="24" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
       <text x="472" y="230" font-size="9.5" font-weight="600" text-anchor="middle" fill="var(--grey-11)">mizar-mcp</text>
@@ -141,15 +141,10 @@ const isEn = locale === 'en';
       <rect x="323" y="243" width="200" height="24" fill="var(--code-add-tint)" stroke="var(--status-ok)" stroke-width="1" />
       <text x="423" y="259" font-size="8.2" font-weight="600" text-anchor="middle" fill="var(--callout-tip-ink)">mizar-instructions (inject: systemPrompt)</text>
 
-      {/* Row 3: Compaction & Recall */}
-      <rect x="33" y="272" width="242" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
-      <text x="154" y="288" font-size="8.8" font-weight="600" text-anchor="middle" fill="var(--grey-11)">
-        {isEn ? 'mizar-compaction (B-5 + Tail Prune)' : 'mizar-compaction (B-5 压缩 & 尾部剪枝)'}
-      </text>
-
-      <rect x="282" y="272" width="241" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
-      <text x="402" y="288" font-size="8.8" font-weight="600" text-anchor="middle" fill="var(--grey-11)">
-        {isEn ? 'mizar-recall (Direct · single recall · FTS5)' : 'mizar-recall (Direct · 单 recall · FTS5)'}
+      {/* Row 3: Compaction */}
+      <rect x="33" y="272" width="490" height="24" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1" />
+      <text x="278" y="288" font-size="9" font-weight="600" text-anchor="middle" fill="var(--grey-11)">
+        {isEn ? 'mizar-compaction (B-5 Compaction · Hot-Cache Tail Prune · FileGuardTracker)' : 'mizar-compaction (B-5 压缩 · 热缓存尾部剪枝 · FileGuard 写前护栏)'}
       </text>
 
       {/* Waterfall 管线条 */}
@@ -271,70 +266,83 @@ const isEn = locale === 'en';
     {/* mizar-client -> mizar-client-core */}
     <line x1="535" y1="56" x2="635" y2="56" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
     {/* mizar-tui -> mizar-tui-ui */}
-    <path d="M 535 76 H 544 V 148 H 635" fill="none" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+    <path d="M 535 76 H 544 V 141 H 635" fill="none" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
     {/* mizar-trajectory -> mizar-trajectory-core */}
-    <path d="M 535 152 H 540 V 242 H 635" fill="none" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+    <path d="M 535 152 H 542 V 225 H 635" fill="none" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+    {/* L3 tools/mcp -> mizar-image */}
+    <path d="M 535 226 H 544 V 309 H 635" fill="none" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
     {/* mizar-llm -> mizar-llm-types */}
-    <line x1="535" y1="386" x2="635" y2="386" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
+    <path d="M 535 386 H 542 V 406 H 635" fill="none" stroke="var(--link)" stroke-width="1.5" marker-end="url(#cord-arr-link)" />
 
-    {/* ================= 右侧：受保护的 4 个纯核心 Crate ================= */}
+    {/* ================= 右侧：受保护的 5 个纯核心 Crate ================= */}
     <g>
       {/* 1. mizar-client-core */}
-      <rect x="639" y="20" width="180" height="80" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="20" width="180" height="74" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
       <rect x="639" y="20" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
       <rect x="639" y="20" width="180" height="22" fill="url(#cord-hatch-core)" />
       <rect x="646" y="23" width="114" height="16" fill="var(--grey-2)" />
       <text x="651" y="35" font-size="9.5" font-weight="700" fill="var(--grey-11)">mizar-client-core</text>
       <text x="812" y="35" font-size="8" font-weight="700" text-anchor="end" fill="var(--link)">CORE</text>
-      <text x="649" y="57" font-size="8.5" fill="var(--grey-10)">PromptQueue · TpsLedger</text>
-      <text x="649" y="73" font-size="8.5" fill="var(--grey-9)">HostExtFlags · ClientEvent</text>
-      <text x="649" y="90" font-size="8.5" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero ratatui / crossterm' : '✓ 零 ratatui / crossterm'}</text>
+      <text x="649" y="54" font-size="8.4" fill="var(--grey-10)">PromptQueue · TpsLedger</text>
+      <text x="649" y="69" font-size="8.4" fill="var(--grey-9)">HostExtFlags · ClientEvent</text>
+      <text x="649" y="84" font-size="8.3" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero ratatui / crossterm' : '✓ 零 ratatui / crossterm'}</text>
       <rect x="817" y="18" width="4" height="4" fill="var(--link)" />
 
       {/* 2. mizar-tui-ui */}
-      <rect x="639" y="112" width="180" height="86" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
-      <rect x="639" y="112" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
-      <rect x="639" y="112" width="180" height="22" fill="url(#cord-hatch-core)" />
-      <rect x="646" y="115" width="96" height="16" fill="var(--grey-2)" />
-      <text x="651" y="127" font-size="9.8" font-weight="700" fill="var(--grey-11)">mizar-tui-ui</text>
-      <text x="812" y="127" font-size="8" font-weight="700" text-anchor="end" fill="var(--link)">PURE UI</text>
-      <text x="649" y="150" font-size={isEn ? 8.5 : 9} fill="var(--grey-10)">{isEn ? 'AppState · Virtual Markdown' : 'AppState · 虚拟化 Markdown'}</text>
-      <text x="649" y="166" font-size={isEn ? 8.3 : 9} fill="var(--grey-9)">{isEn ? 'Split · Overlay · Oklab Theme' : '双栏 · Overlay · Oklab 主题'}</text>
-      <text x="649" y="185" font-size="8.5" font-weight="600" fill="var(--link)">{isEn ? 'cargo check -p sub-sec loop' : 'cargo check -p 秒级回路'}</text>
+      <rect x="639" y="104" width="180" height="74" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="104" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="104" width="180" height="22" fill="url(#cord-hatch-core)" />
+      <rect x="646" y="107" width="96" height="16" fill="var(--grey-2)" />
+      <text x="651" y="119" font-size="9.8" font-weight="700" fill="var(--grey-11)">mizar-tui-ui</text>
+      <text x="812" y="119" font-size="8" font-weight="700" text-anchor="end" fill="var(--link)">PURE UI</text>
+      <text x="649" y="138" font-size={isEn ? 8.4 : 8.8} fill="var(--grey-10)">{isEn ? 'AppState · Virtual Markdown' : 'AppState · 虚拟化 Markdown'}</text>
+      <text x="649" y="153" font-size={isEn ? 8.2 : 8.6} fill="var(--grey-9)">{isEn ? '4-State Dots · 1-Line Cards' : '4 态圆灯 · 1 行折叠卡片'}</text>
+      <text x="649" y="168" font-size="8.3" font-weight="600" fill="var(--link)">{isEn ? 'cargo check -p sub-sec loop' : 'cargo check -p 秒级回路'}</text>
 
       {/* 3. mizar-trajectory-core */}
-      <rect x="639" y="210" width="180" height="86" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
-      <rect x="639" y="210" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
-      <rect x="639" y="210" width="180" height="22" fill="url(#cord-hatch-core)" />
-      <rect x="646" y="213" width="142" height="16" fill="var(--grey-2)" />
-      <text x="651" y="225" font-size="9.5" font-weight="700" fill="var(--grey-11)">mizar-trajectory-core</text>
-      <text x="649" y="248" font-size={isEn ? 8.5 : 9} fill="var(--grey-10)">{isEn ? 'Fold Snapshot · 3-Lane Axes' : '轨迹折叠快照 · 三泳道轴'}</text>
-      <text x="649" y="264" font-size={isEn ? 8.5 : 9} fill="var(--grey-9)">{isEn ? 'Anomaly Rules · RepeatGuard' : '异常规则引擎 · RepeatGuard'}</text>
-      <text x="649" y="283" font-size="8.5" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero Async · Pure Tests' : '✓ 零异步 · 纯函数单测'}</text>
+      <rect x="639" y="188" width="180" height="74" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="188" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="188" width="180" height="22" fill="url(#cord-hatch-core)" />
+      <rect x="646" y="191" width="142" height="16" fill="var(--grey-2)" />
+      <text x="651" y="203" font-size="9.5" font-weight="700" fill="var(--grey-11)">mizar-trajectory-core</text>
+      <text x="649" y="222" font-size={isEn ? 8.4 : 8.8} fill="var(--grey-10)">{isEn ? 'Fold Snapshot · 3-Lane Axes' : '轨迹折叠快照 · 三泳道轴'}</text>
+      <text x="649" y="237" font-size={isEn ? 8.4 : 8.8} fill="var(--grey-9)">{isEn ? 'Anomaly Rules · RepeatGuard' : '异常规则引擎 · RepeatGuard'}</text>
+      <text x="649" y="252" font-size="8.3" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero Async · Pure Logic' : '✓ 零异步 · 纯函数逻辑'}</text>
 
-      {/* 4. mizar-llm-types */}
-      <rect x="639" y="346" width="180" height="88" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
-      <rect x="639" y="346" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
-      <rect x="639" y="346" width="180" height="22" fill="url(#cord-hatch-core)" />
-      <rect x="646" y="349" width="114" height="16" fill="var(--grey-2)" />
-      <text x="651" y="361" font-size="9.8" font-weight="700" fill="var(--grey-11)">mizar-llm-types</text>
-      <text x="649" y="384" font-size="9" fill="var(--grey-10)">Message · ContentBlock</text>
-      <text x="649" y="400" font-size="9" fill="var(--grey-9)">BlockAssembler · SseParser</text>
-      <text x="649" y="420" font-size="8.5" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero tokio / reqwest' : '✓ 零 tokio / reqwest'}</text>
+      {/* 4. mizar-image */}
+      <rect x="639" y="272" width="180" height="74" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="272" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="272" width="180" height="22" fill="url(#cord-hatch-core)" />
+      <rect x="646" y="275" width="90" height="16" fill="var(--grey-2)" />
+      <text x="651" y="287" font-size="9.6" font-weight="700" fill="var(--grey-11)">mizar-image</text>
+      <text x="812" y="287" font-size="8" font-weight="700" text-anchor="end" fill="var(--link)">IMAGE</text>
+      <text x="649" y="306" font-size="8.4" fill="var(--grey-10)">PNG · JPEG · WebP · GIF</text>
+      <text x="649" y="321" font-size="8.4" fill="var(--grey-9)">EXIF · ≤100MP · ≤2048px/5MB</text>
+      <text x="649" y="336" font-size="8.3" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero tokio / cordis' : '✓ 零 tokio / cordis'}</text>
+
+      {/* 5. mizar-llm-types */}
+      <rect x="639" y="366" width="180" height="80" fill="var(--grey-2)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="366" width="180" height="22" fill="var(--code-mark-tint)" stroke="var(--link)" stroke-width="1.4" />
+      <rect x="639" y="366" width="180" height="22" fill="url(#cord-hatch-core)" />
+      <rect x="646" y="369" width="114" height="16" fill="var(--grey-2)" />
+      <text x="651" y="381" font-size="9.8" font-weight="700" fill="var(--grey-11)">mizar-llm-types</text>
+      <text x="649" y="400" font-size="8.8" fill="var(--grey-10)">Message · ContentBlock</text>
+      <text x="649" y="415" font-size="8.8" fill="var(--grey-9)">BlockAssembler · SseParser</text>
+      <text x="649" y="432" font-size="8.4" font-weight="600" fill="var(--callout-tip-ink)">{isEn ? '✓ Zero tokio / reqwest' : '✓ 零 tokio / reqwest'}</text>
 
       {/* 纯核心之间的依赖线 */}
-      <line x1="729" y1="100" x2="729" y2="110" stroke="var(--link)" stroke-width="1.2" marker-end="url(#cord-arr-link)" />
-      <line x1="729" y1="198" x2="729" y2="208" stroke="var(--link)" stroke-width="1.2" marker-end="url(#cord-arr-link)" />
-      <line x1="729" y1="296" x2="729" y2="343" stroke="var(--link)" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#cord-arr-link)" />
-      <rect x="676" y="310" width="106" height="18" fill="var(--grey-1)" stroke="var(--link)" stroke-width="0.9" />
-      <text x="729" y="322" font-size="8.2" text-anchor="middle" fill="var(--link)">{isEn ? 'ui / core reuse' : '纯核心类型复用'}</text>
+      <line x1="729" y1="94" x2="729" y2="102" stroke="var(--link)" stroke-width="1.2" marker-end="url(#cord-arr-link)" />
+      <line x1="729" y1="178" x2="729" y2="186" stroke="var(--link)" stroke-width="1.2" marker-end="url(#cord-arr-link)" />
+      <line x1="729" y1="262" x2="729" y2="270" stroke="var(--link)" stroke-width="1.2" marker-end="url(#cord-arr-link)" />
+      <line x1="729" y1="346" x2="729" y2="363" stroke="var(--link)" stroke-width="1.2" stroke-dasharray="3 2" marker-end="url(#cord-arr-link)" />
 
       {/* 右下总结卡：33 Crates 统计与边界 */}
-      <rect x="639" y="468" width="180" height="99" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
-      <text x="729" y="490" font-size={isEn ? 10 : 10.5} font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Pure Cores (4 Crates)' : '纯核心孤岛 (4 Crates)'}</text>
-      <text x="651" y="511" font-size="9.5" fill="var(--grey-10)">{isEn ? '• 33 Workspace Crates' : '• 全仓 33 Crates Virtual'}</text>
-      <text x="651" y="529" font-size="9.5" fill="var(--grey-9)">• Rust 1.98 · Ed 2024</text>
-      <text x="651" y="547" font-size={isEn ? 9 : 9.5} fill="var(--grey-9)">{isEn ? '• Merak & Headless Ready' : '• Merak 跨端 & 无终端回归'}</text>
+      <rect x="639" y="462" width="180" height="105" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.2" />
+      <text x="729" y="483" font-size={isEn ? 10 : 10.5} font-weight="700" text-anchor="middle" fill="var(--grey-11)">{isEn ? 'Pure Cores (5 Crates)' : '纯核心孤岛 (5 Crates)'}</text>
+      <text x="651" y="503" font-size="9.2" fill="var(--grey-10)">{isEn ? '• 33 Workspace Crates' : '• 全仓 33 Crates Virtual'}</text>
+      <text x="651" y="520" font-size="9.2" fill="var(--grey-9)">{isEn ? '• 28 Runtime + 5 Pure Core' : '• 28 运行时 + 5 纯核心'}</text>
+      <text x="651" y="537" font-size="9.2" fill="var(--grey-9)">• Rust 1.98 · Ed 2024</text>
+      <text x="651" y="554" font-size={isEn ? 8.8 : 9.2} fill="var(--grey-9)">{isEn ? '• Merak & Headless Ready' : '• Merak 跨端 & 无终端回归'}</text>
 
       <rect x="817" y="565" width="4" height="4" fill="var(--grey-1)" stroke="var(--grey-7)" stroke-width="1" />
     </g>

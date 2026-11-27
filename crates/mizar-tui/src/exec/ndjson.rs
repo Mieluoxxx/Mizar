@@ -68,6 +68,7 @@ pub(super) struct ExecStream {
     llm_ms: u128,
     ttft_ms: Option<u128>,
     tool_starts: HashMap<String, u128>,
+    tool_durations: HashMap<String, u64>,
     tool_ms: u128,
     tool_calls: usize,
     tool_errors: usize,
@@ -95,10 +96,12 @@ impl ExecStream {
                 images,
                 ..
             } => {
+                let start = self.tool_starts.remove(tool_call_id);
                 let duration = self
-                    .tool_starts
+                    .tool_durations
                     .remove(tool_call_id)
-                    .map(|start| ts.saturating_sub(start));
+                    .map(u128::from)
+                    .or_else(|| start.map(|s| ts.saturating_sub(s)));
                 self.tool_ms += duration.unwrap_or(0);
                 self.tool_errors += usize::from(*is_error);
                 self.emit(json!({"type": "tool_result", "step": self.step, "call_id": tool_call_id,
@@ -157,6 +160,16 @@ impl ExecStream {
                 self.tool_starts.insert(call_id.clone(), ts);
                 let preview = arguments_preview(arguments, secrets);
                 json!({"type": "tool_call", "step": step, "call_id": call_id, "name": name, "arguments_preview": preview})
+            }
+            SessionTraceEvent::ToolOutcome {
+                tool_call_id,
+                duration_ms,
+                ..
+            } => {
+                if let Some(ms) = duration_ms {
+                    self.tool_durations.insert(tool_call_id.clone(), *ms);
+                }
+                return;
             }
             _ => return,
         };

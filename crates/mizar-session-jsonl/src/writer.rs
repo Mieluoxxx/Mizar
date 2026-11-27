@@ -255,10 +255,36 @@ impl WriterState {
             })
             .max();
 
+        if fresh_header.id == from_id
+            || self.pending.contains_key(&fresh_header.id)
+            || self.materialized.contains_key(&fresh_header.id)
+        {
+            return ForkOutcome::CallerErr(PersistenceError::InvalidArgument(format!(
+                "session \"{}\" already exists",
+                fresh_header.id
+            )));
+        }
+        match find_session_file(&self.sessions_dir, self.blobs.blobs_dir(), &fresh_header.id) {
+            Ok(Some(_)) => {
+                return ForkOutcome::CallerErr(PersistenceError::InvalidArgument(format!(
+                    "session \"{}\" already exists",
+                    fresh_header.id
+                )));
+            }
+            Ok(None) => {}
+            Err(err) => return ForkOutcome::StorageErr(err),
+        }
+
         let child_path = match session_file_path(&self.sessions_dir, &fresh_header) {
             Ok(p) => p,
             Err(err) => return ForkOutcome::CallerErr(err),
         };
+        if child_path.exists() {
+            return ForkOutcome::CallerErr(PersistenceError::InvalidArgument(format!(
+                "session \"{}\" already exists",
+                fresh_header.id
+            )));
+        }
         let (lines, seen_seqs) =
             match build_initial_session_lines(&fresh_header, &copied_entries, &self.blobs) {
                 Ok(res) => res,

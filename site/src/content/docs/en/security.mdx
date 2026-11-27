@@ -28,7 +28,7 @@ Enabling `"restrictToWorkspace": true` in `settings.json` confines all built-in 
 Implemented by `ApprovalGatePlugin` (`mizar-client`) on the `tools/pre-execute` waterfall:
 
 - **Activation**: Pass `--approve` on launch, set `ui.approvalMode: "ask"`, or toggle interactively via `/approval ask` (`/approval auto` restores auto-run).
-- **Gated Tools**: Read-only tools (`read`, `grep`, `find`, `list_dir`, `get_time`, `recall`) run without prompts. Every mutating or execution tool — **`write`, `edit`, `bash`, `codemode`, and mutating MCP tools** — requires approval (including nested mutating tool calls triggered inside `codemode`).
+- **Gated Tools**: Read-only tools (`read`, `grep`, `find`, `list_dir`, `get_time`) run without prompts. Every mutating or execution tool — **`write`, `edit`, `bash`, `codemode`, and mutating MCP tools** — requires approval (including nested mutating tool calls triggered inside `codemode`).
 - **Four Approval Actions**:
   1. **Allow once**: Approve this single invocation.
   2. **Always allow tool**: Whitelist this tool name for the current session.
@@ -44,7 +44,7 @@ Implemented by `ApprovalGatePlugin` (`mizar-client`) on the `tools/pre-execute` 
 | Scenario | Recommended Flags / Config | Effective Guarantee |
 | :--- | :--- | :--- |
 | **Untrusted repo audit & edits** | `mizar --approve -C /path/to/repo` + `restrictToWorkspace: true` | File tools locked inside repo (symlink-safe); every `bash`/`write`/`edit`/`codemode` requires consent |
-| **Read-only code review** | `mizar --read-only -C /path/to/repo` | Reduces coding tools to `read` / `grep` / `find` (+ `recall`) |
+| **Read-only code review** | `mizar --read-only -C /path/to/repo` | Reduces coding tools to `read` / `grep` / `find` |
 | **Code edits without shell access** | `"restrictToWorkspace": true, "excludeTools": ["bash"]` | Symlink-guarded file access with no OS command execution channel |
 | **Block dangerous MCP subsets** | `"excludeTools": ["mcp__prod__*", "*_drop_*"]` | Matched tools become `Hidden` in both LLM schemas and `codemode` |
-| **Ephemeral zero-trace run** | `mizar --isolated --no-persist -C /tmp/sandbox` | Ignores disk configs under `~/.mizar` and skips SQLite persistence |
+| **Ephemeral zero-trace run** | `mizar --isolated --no-persist -C /tmp/sandbox` | Ignores disk configs under `~/.mizar` and skips JSONL persistence under `~/.mizar/sessions` |

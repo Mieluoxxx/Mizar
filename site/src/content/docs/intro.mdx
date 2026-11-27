@@ -5,10 +5,10 @@ group: getting-started
 order: 1
 ---
 
-Mizar 是基于自研 **Cordis 微内核（33 个 Cargo Crate）** 构建的 Rust 终端 AI 编程 Agent，唯一可执行入口为 `mizar`。系统围绕「流式推理 → 并行/串行工具执行 → 只追加会话持久化 → KV Cache 前缀稳定」主循环设计，同时提供交互式双模 TUI 工作台与确定性无头 `exec` 模式。
+Mizar 是基于自研 **Cordis 微内核（33 个 Cargo Crate：28 个运行时/插件 + 5 个纯核心）** 构建的 Rust 终端 AI 编程 Agent，唯一可执行入口为 `mizar`。系统围绕「流式推理 → 并行/串行工具执行 → 只追加 JSONL 会话持久化 → KV Cache 前缀稳定」主循环设计，同时提供交互式双模 TUI 工作台与确定性无头 `exec` 模式。
 
 <Callout type="info" title="架构对齐说明">
-  本手册对应当前 **33-Crate Cordis 微内核分支**：内置常驻 QuickJS `codemode`、单一静态 `recall` 工具、四段静态英文系统提示词、启动期静态 `AGENTS.md` 加载、缓存感知尾部剪枝、`Compaction B-5` 护栏，以及 `--trace-out` 结构化轨迹导出。
+  本手册对应当前 **33-Crate Cordis 微内核架构（v0.2.5）**：默认 `MinimalCoding` 4 核心工具、按需激活 QuickJS `codemode`、`<available_skills>` `<location>` 按需读取技能、精简静态英文系统提示词、启动期静态 `AGENTS.md` 加载、热缓存感知尾部剪枝与 `Compaction B-5` 护栏、宽容单会话 JSONL + SHA-256 Blob 持久化，以及 `--trace-out` 结构化轨迹导出。
 </Callout>
 
 ## 安装
@@ -31,11 +31,12 @@ cd Mizar
 cargo install --locked --path crates/mizar-tui`,
     },
     {
-      label: '自更新',
+      label: '自更新与搜索工具',
       lang: 'sh',
       code: `mizar update --check      # 仅检查最新版本
 mizar update              # 升级至最新正式版
-mizar update -v 0.1.6 -f  # 强制切换到指定版本`,
+mizar update -v 0.2.5 -f  # 强制切换到指定版本
+mizar install-tools       # 预装或校验托管 rg 与 fd`,
     },
   ]}
 />
@@ -85,8 +86,8 @@ mizar exec "解释 Cargo.toml 中的工作区结构"`,
 
 | 运行入口 | 适用场景 | 交互能力 | 上下文与持久化 |
 | :--- | :--- | :--- | :--- |
-| `mizar [OPTIONS]` | 日常研发、多轮重构、代码审查 | Fullscreen / Inline 双视口、`!` / `!!` 本地命令、`--approve` 审批弹窗 | 默认写入 `~/.mizar/sessions.sqlite`（可用 `--no-persist` 关闭） |
-| `mizar exec [OPTIONS] [<prompt>]` | CI 流水线、自动化评测、脚本批处理 | 无交互，退出前向 `stdout` 输出纯文本或 JSON 摘要 | 支持 `--isolated`、`--timeout`、`--trace-out` 与标准退出码 |
+| `mizar [OPTIONS]` | 日常研发、多轮重构、代码审查 | Fullscreen / Inline 双视口、`!` / `!!` 本地命令、`--approve` 审批弹窗 | 默认按 `cwd` 分桶惰性写入 `~/.mizar/sessions/`（可用 `--no-persist` 关闭） |
+| `mizar exec [OPTIONS] [<prompt>]` | CI 流水线、自动化评测、脚本批处理 | 无交互，支持纯文本或实时刷新的 NDJSON 事件流（`--json`） | 支持 `--isolated`、`--timeout`、`--context-window`、`--trace-out` 与标准退出码 |
 
 <Callout type="tip" title="无显式路由时的报错行为">
   启动时若既未在环境变量与 <code>~/.mizar/models.json</code> 配置任何提供方，也未指定 <code>--provider mock</code>，Mizar 会返回明确的 <code>NoRouteConfigured</code> 错误，而不会静默发送空密钥请求。
@@ -101,8 +102,8 @@ mizar exec "解释 Cargo.toml 中的工作区结构"`,
     slug="workbench"
   />
   <DocCard
-    title="工具与常驻 Codemode"
-    description="理解五级 ToolExposure 模型、编码工具并发队列、QuickJS 沙箱编排与 MCP / SKILL.md 接入。"
+    title="工具与按需 Codemode"
+    description="理解五级 ToolExposure 模型、MinimalCoding 默认四件套、按需 QuickJS 沙箱编排与 MCP / SKILL.md 接入。"
     slug="tools"
   />
   <DocCard

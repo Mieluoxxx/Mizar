@@ -36,6 +36,10 @@ pub struct ResponsesConfig {
     pub supports_developer_role: bool,
     pub use_top_level_instructions: bool,
     pub supports_strict_mode: bool,
+    pub supports_store: bool,
+    pub supports_temperature: bool,
+    pub supports_reasoning_effort: bool,
+    pub supports_prompt_cache_key: bool,
     pub send_session_affinity_headers: Option<bool>,
     pub session_affinity_mode: Option<SessionAffinityMode>,
     pub supports_long_cache_retention: bool,
@@ -58,6 +62,10 @@ impl Default for ResponsesConfig {
             supports_developer_role: true,
             use_top_level_instructions: false,
             supports_strict_mode: false,
+            supports_store: true,
+            supports_temperature: true,
+            supports_reasoning_effort: true,
+            supports_prompt_cache_key: true,
             send_session_affinity_headers: None,
             session_affinity_mode: None,
             supports_long_cache_retention: true,
@@ -576,7 +584,7 @@ pub fn build_request_body(
     let instruction_role = if config.supports_developer_role {
         "developer"
     } else {
-        "user"
+        "system"
     };
 
     let mut input: Vec<Value> = Vec::new();
@@ -601,15 +609,18 @@ pub fn build_request_body(
     let mut body = json!({
         "model": model,
         "stream": true,
-        "store": false,
         "input": input,
     });
+    if config.supports_store {
+        body["store"] = json!(false);
+    }
     if !instructions.is_empty() && config.use_top_level_instructions {
         body["instructions"] = Value::String(instructions);
     }
     let retention =
         resolve_cache_retention(options.cache_retention.or(config.default_cache_retention));
-    if retention != CacheRetention::None
+    if config.supports_prompt_cache_key
+        && retention != CacheRetention::None
         && let Some(key) = options
             .session_id
             .as_deref()
@@ -625,10 +636,13 @@ pub fn build_request_body(
     {
         body["max_output_tokens"] = json!(max_tokens.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS));
     }
-    if let Some(temp) = options.temperature {
+    if config.supports_temperature
+        && let Some(temp) = options.temperature
+    {
         body["temperature"] = json!(temp);
     }
-    if let Some(requested_effort) = options.reasoning_effort
+    if config.supports_reasoning_effort
+        && let Some(requested_effort) = options.reasoning_effort
         && let Some(effort) = effort_str(requested_effort)
     {
         if requested_effort == ReasoningEffort::Off {

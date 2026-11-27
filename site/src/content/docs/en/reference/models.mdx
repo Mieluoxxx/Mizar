@@ -58,7 +58,7 @@ Root keys live under `providers` using **camelCase**:
 | `reasoning` | `boolean` | Enable reasoning effort cycling |
 | `reasoningEfforts` | `string[]` | Supported effort whitelist (e.g. `["low","medium","high"]`) |
 | `thinkingLevelMap` | `Record<string, string\|null>` | Remap or disable `off..max` levels per model |
-| `input` | `string[]` | Input modalities, e.g. `["text", "image"]` |
+| `input` | `string[]` | Input modalities, e.g. `["text", "image"]`; if catalog declares `["text"]` only (`supportsImages: false`), all protocols replace images pre-serialization with `[image omitted: current model does not support image input]` (unknown models allow images) |
 | `contextWindow` | `number` | Context window size used by `mizar-compaction` B-5 |
 | `maxTokens` | `number` | Per-turn output token cap |
 | `cost` | `object` | Pricing (`input`, `output`, `cacheRead`, `cacheWrite`, `tiers`) |
@@ -79,13 +79,13 @@ Third-party gateways and local inference servers (vLLM, Ollama, LiteLLM, Azure, 
 | 5 | `forceAdaptiveThinking` | `boolean` | Anthropic: force adaptive thinking parameter mode |
 | 6 | `sendSessionAffinityHeaders` | `boolean` | Send session affinity headers to pin upstream cache routing |
 | 7 | `sessionAffinityFormat` | `string` | Affinity header style: `"none"` \| `"openai"` \| `"openrouter"` |
-| 8 | `supportsLongCacheRetention` | `boolean` | Allow sending extended prompt-cache retention parameter |
-| 9 | `supportsPromptCacheKey` | `boolean` | Allow sending `prompt_cache_key` field |
-| 10 | `supportsTemperature` | `boolean` | Set `false` for reasoning endpoints that reject `temperature` with 400 |
-| 11 | `supportsCacheControlOnTools` | `boolean` | Anthropic Messages: attach `cache_control` breakpoint at end of tool list |
-| 12 | `supportsStore` | `boolean` | OpenAI Responses: control explicit `store` field emission |
-| 13 | `supportsDeveloperRole` | `boolean` | OpenAI Responses: defaults to **`true`** (inlines system prompt as `developer` item; set `false` for `system` fallback) |
-| 14 | `supportsReasoningEffort` | `boolean` | Emit `reasoning` / `reasoning_effort` payload fields |
+| 8 | `supportsLongCacheRetention` | `boolean` | Allow extended prompt-cache retention (`ttl: "1h"` on Anthropic / `prompt_cache_retention: "24h"` on Responses) |
+| 9 | `supportsPromptCacheKey` | `boolean` | Allow sending `prompt_cache_key` (omitted completely when `false`) |
+| 10 | `supportsTemperature` | `boolean` | Set `false` for reasoning endpoints that reject `temperature` (omitted completely when `false`) |
+| 11 | `supportsCacheControlOnTools` | `boolean` | Anthropic Messages: attach `cache_control` breakpoint on last tool (injected after `prefixDigest` so signed `thinking` replay remains intact) |
+| 12 | `supportsStore` | `boolean` | OpenAI Responses: control explicit `store: false` emission (omitted when `false`) |
+| 13 | `supportsDeveloperRole` | `boolean` | OpenAI Responses: defaults to **`true`** (inlines system prompt as `"developer"`; setting **`false`** cleanly falls back to `"system"`) |
+| 14 | `supportsReasoningEffort` | `boolean` | Emit `reasoning` / `reasoning_effort` (and Anthropic `thinking`) fields (omitted when `false`) |
 | 15 | `supportsStrictMode` | `boolean` | Tools / Responses: defaults to **`false`**; controls `strict: true` on tool JSON schemas |
 | 16 | `useTopLevelInstructions` | `boolean` | OpenAI Responses: defaults to **`false`** (keeps `developer` prefix in `input`); set `true` only if gateway requires top-level `instructions` |
 

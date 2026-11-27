@@ -15,6 +15,8 @@ Mizar's terminal workbench pairs the pure UI state machine `mizar-tui-ui` with t
 ## Dual Viewports & Side Panel
 
 - **Fullscreen (default)**: Owns the alternate screen with virtualized Markdown, word-level diffs, a 2-column `TimelineRail` (appears when width `>= 60` cols and `>= 2` turns; click nodes to jump), and the `Ctrl+B` split side panel.
+- **4-State Circular Tool Lights & Strict 1-Line Collapsed Cards**: Each tool call shows a 4-state circular indicator: muted hollow `○` while arguments stream (`Drafting`), solid yellow `●` while executing (`Running`), solid green `●` on success (`Done`), and solid red `●` on failure or denial (`Error`/`Blocked`). Collapsed cards always render strictly as **1 single header line** with zero preview lines; press `Ctrl+O` to inspect full arguments, diffs, and outputs. Unfinished drafts transition to red on truncation or `Esc` cancellation.
+- **Background `rg` / `fd` Installer**: Interactive TUI concurrently ensures `rg` and `fd` under `~/.mizar/bin` (with `ghfast.top` mirror fallback on slow/stalled transfers), sharing the single-flight install with `grep`; you can also pre-install via `mizar install-tools`.
 - **Inline (`--inline` / `/view inline`)**: Keeps a compact 7–14 row composer at the bottom while flushing finished turns to native terminal scrollback (`Cmd+F`, native scrollbar, and drag selection work naturally with `mouse_capture=false`).
 - **Right Side Panel (`Ctrl+B` / `/panel`)**: Shown when terminal width `>= 96` cols (default 42 cols, min 30, draggable divider) with `Ctx` (context bar + TTFT/TPS), `File`, `Tool`, and `Stat` tabs.
 - **Native Selection Escape (`F2` / `/mouse`)**: Temporarily pauses in-app mouse capture in Fullscreen so your terminal emulator handles text selection directly.
@@ -64,7 +66,7 @@ Typing `/` opens interactive completion. Alongside these **24 built-in commands*
 | `/model` | — | `[spec]` | Open interactive model/provider selector (`Ctrl+L`) or switch directly |
 | `/effort` | — | `[level]` | Set reasoning effort (`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`) |
 | `/compact` | — | `[focus]` | Manually compact conversation context with optional focus instructions |
-| `/session` | — | — | Inspect session ID, SQLite path, event breakdown, and compaction boundary |
+| `/session` | — | — | Inspect session ID, JSONL path, effective context window, event breakdown, and compaction boundary |
 | `/theme` | — | `[name]` | Switch theme (`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`) |
 | `/trace` | — | — | Open full-screen 3-lane trajectory profiler (`Ctrl+T`) |
 | `/panel` | — | — | Toggle right split panel (`Ctrl+B`) |
@@ -85,7 +87,7 @@ Typing `/` opens interactive completion. Alongside these **24 built-in commands*
 ## Themes & `pi-emphasis` Visual Grammar
 
 - **6 Built-in Themes**: `auto` (adapts to terminal `COLORFGBG` dark/light detection), `mist-dark`, `mist-light`, `sakura-dark`, `system`, and `ansi16`. Ensure `COLORTERM=truecolor` in non-TTY test harnesses to enable 24-bit color.
-- **`pi-emphasis` Grammar**: Interactive TUI renders markers like `[[Done]]`, `[[Failed]]`, and `[[Needs you]]` as semantic status pills while preserving clean raw Markdown in SQLite storage, clipboard copy, and `/export`. Disable individual layers via environment variables:
+- **`pi-emphasis` Grammar**: Interactive TUI renders markers like `[[Done]]`, `[[Failed]]`, and `[[Needs you]]` as semantic status pills while preserving clean raw Markdown in JSONL storage, clipboard copy, and `/export`. Disable individual layers via environment variables:
   - `MIZAR_TUI_EMPHASIS=0`: Disable emphasis rendering globally
   - `MIZAR_TUI_ROUND_CAPS=0` (or `PI_EMPHASIS_ROUND_CAPS=0`): Disable rounded pill borders
   - `MIZAR_TUI_PILL_ICONS=0` (or `PI_EMPHASIS_PILL_ICONS=0`): Hide Nerd Font pill icons

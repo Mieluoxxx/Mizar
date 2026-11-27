@@ -333,6 +333,10 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
                 supports_developer_role: compat_cfg.supports_developer_role.unwrap_or(true),
                 use_top_level_instructions: compat_cfg.use_top_level_instructions.unwrap_or(false),
                 supports_strict_mode: compat_cfg.supports_strict_mode.unwrap_or(false),
+                supports_store: compat_cfg.supports_store.unwrap_or(true),
+                supports_temperature: compat_cfg.supports_temperature.unwrap_or(true),
+                supports_reasoning_effort: compat_cfg.supports_reasoning_effort.unwrap_or(true),
+                supports_prompt_cache_key: compat_cfg.supports_prompt_cache_key.unwrap_or(true),
                 send_session_affinity_headers: compat_cfg.send_session_affinity_headers,
                 session_affinity_mode: compat_cfg.parsed_session_affinity_mode(),
                 supports_long_cache_retention: compat_cfg
@@ -364,6 +368,13 @@ fn build_protocol_adapter(spec: AdapterBuildSpec<'_>) -> Arc<dyn LlmAdapter> {
             use_bearer_auth: spec.use_bearer_auth,
             force_adaptive_thinking: compat_cfg.force_adaptive_thinking.unwrap_or(false),
             thinking_budget_tokens: spec.thinking_budget_tokens,
+            supports_cache_control_on_tools: compat_cfg
+                .supports_cache_control_on_tools
+                .unwrap_or(true),
+            supports_long_cache_retention: compat_cfg.supports_long_cache_retention.unwrap_or(true),
+            supports_temperature: compat_cfg.supports_temperature.unwrap_or(true),
+            supports_reasoning_effort: compat_cfg.supports_reasoning_effort.unwrap_or(true),
+            default_cache_retention,
             headers: Vec::new(),
             models: spec.models,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,

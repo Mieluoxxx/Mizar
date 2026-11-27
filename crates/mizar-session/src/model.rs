@@ -69,10 +69,12 @@ pub enum SessionTraceEvent {
         name: String,
         arguments: String,
     },
-    /// 记录工具执行是否被审批或守卫拦截（对应轨迹里 `ToolResult.blocked`）。
+    /// 记录工具执行是否被审批或守卫拦截，以及单次调用独立耗时（毫秒）。
     ToolOutcome {
         tool_call_id: String,
         blocked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     Anomaly {
         rule_id: String,

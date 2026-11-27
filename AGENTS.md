@@ -4,7 +4,7 @@ Mizar 是 Rust 编写的终端 AI 编程 Agent（微内核 `cordis` + 多 crate 
 
 ## 架构边界
 
-- **零异步/运行时边界**：`mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core` 禁止引入 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`。
+- **零异步/运行时边界**：`mizar-client-core`、`mizar-tui-ui`、`mizar-llm-types`、`mizar-trajectory-core`、`mizar-image` 禁止引入 `tokio` / `cordis` / `reqwest` / `rquickjs` / `rusqlite`。
 - **零终端依赖边界**：`mizar-client` 与 `mizar-client-core` 禁止引入 `ratatui` / `crossterm` / `mizar-tui-ui`（确保 Merak Desktop 可直嵌）。
 - **Workspace 依赖**：新增依赖统一进根 `Cargo.toml` 的 `[workspace.dependencies]`，子 crate 写 `{ workspace = true }` 并带 `[lints] workspace = true`。
 - **文档与参考仓**：改 crate 结构 / `inject` / 服务名时同步更新 `docs/plugins.md`；`references/` 为 TS 原版参考，**禁止 `git add`**。

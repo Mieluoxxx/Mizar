@@ -14,7 +14,7 @@ const isEn = locale === 'en';
 
 <DiagramFrame
   fig="FIG 03"
-  title={isEn ? 'SQLite WAL Session Forking, Compaction & Trajectory Export' : 'SQLite WAL 会话分叉、压缩剪枝与轨迹观测'}
+  title={isEn ? 'JSONL Session Forking, Compaction & Trajectory Export' : 'JSONL 会话分叉、压缩剪枝与轨迹观测'}
   caption={caption}
   locale={locale}
 >
@@ -24,8 +24,8 @@ const isEn = locale === 'en';
     height="500"
     role="img"
     aria-label={isEn
-      ? 'Mizar session and trace views: SQLite WAL persistence, compaction checkpoints and /tree forking on the left; Ctrl+T /trace WaveBand, three-lane Timeline, Hotspots and Inspector on the right'
-      : 'Mizar 会话与轨迹双视图：左侧 SQLite WAL 持久化、Compaction 摘要检查点与 /tree 分叉探索；右侧 Ctrl+T /trace 的 WaveBand、三泳道 Timeline、Hotspots 与 Inspector 解剖图'}
+      ? 'Mizar session and trace views: tolerant JSONL persistence with SHA-256 blobs, compaction checkpoints and /tree forking on the left; Ctrl+T /trace WaveBand, three-lane Timeline, Hotspots and Inspector on the right'
+      : 'Mizar 会话与轨迹双视图：左侧宽容 JSONL 持久化与 SHA-256 Blob 外置、Compaction 摘要检查点与 /tree 分叉探索；右侧 Ctrl+T /trace 的 WaveBand、三泳道 Timeline、Hotspots 与 Inspector 解剖图'}
   >
     <defs>
       <pattern id="sess-hatch-comp" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
@@ -42,17 +42,17 @@ const isEn = locale === 'en';
       </marker>
     </defs>
 
-    {/* 左半区：SQLite WAL 会话与 /tree 分叉 */}
+    {/* 左半区：JSONL 会话与 /tree 分叉 */}
     <g>
       <rect x="21" y="20" width="390" height="460" fill="var(--grey-2)" stroke="var(--border-strong)" stroke-width="1.35" />
       <rect x="21" y="20" width="390" height="26" fill="var(--grey-3)" stroke="var(--border-strong)" stroke-width="1.35" />
-      <text x="33" y="37" font-size={isEn ? 10.5 : 11} font-weight="700" fill="var(--grey-11)">{isEn ? 'SQLite WAL Append Log & /tree Fork' : 'SQLite WAL 只追加日志 & /tree 分叉'}</text>
+      <text x="33" y="37" font-size={isEn ? 10.5 : 11} font-weight="700" fill="var(--grey-11)">{isEn ? 'JSONL Append Log & /tree Fork' : 'JSONL 只追加日志 & /tree 分叉'}</text>
       <text x="399" y="37" font-size="9.5" text-anchor="end" fill="var(--link)">mizar-session</text>
 
       {/* 持久化架构横条 */}
       <rect x="33" y="56" width="366" height="46" fill="var(--grey-1)" stroke="var(--border-strong)" stroke-width="1" />
-      <text x="45" y="75" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-session-sqlite (WAL · FTS5 · busy_timeout=5s)</text>
-      <text x="45" y="92" font-size={isEn ? 8.8 : 9.2} fill="var(--grey-9)">{isEn ? 'Single-Writer (128/tx) · SQLITE_BUSY transient surface' : 'Single-Writer 线程 (128/tx) · SQLITE_BUSY 瞬时上报'}</text>
+      <text x="45" y="75" font-size="10" font-weight="700" fill="var(--grey-11)">mizar-session-jsonl (cwd-bucket · Blob · Lazy)</text>
+      <text x="45" y="92" font-size={isEn ? 8.3 : 8.8} fill="var(--grey-9)">{isEn ? 'Single-Writer · non-silent errors · 0 version reject' : 'Single-Writer 线程 · 错必上报 · 不以版本号拒开'}</text>
 
       {/* 主干时间线 */}
       <line x1="50" y1="120" x2="50" y2="404" stroke="var(--border-strong)" stroke-width="1.6" />
@@ -79,7 +79,7 @@ const isEn = locale === 'en';
       <text x="326" y="142" font-size={isEn ? 9.5 : 10} font-weight="700" text-anchor="middle" fill="var(--callout-tip-ink)">{isEn ? '/tree Fork Session' : '/tree 分叉新会话'}</text>
 
       <text x="264" y="169" font-size={isEn ? 8.8 : 9.2} font-weight="600" fill="var(--grey-11)">fork(id, up_to_seq=#2)</text>
-      <text x="264" y="186" font-size={isEn ? 8.8 : 9} fill="var(--grey-9)">{isEn ? '• Atomic prefix copy' : '• 同事务复制前缀日志'}</text>
+      <text x="264" y="186" font-size={isEn ? 8.3 : 8.6} fill="var(--grey-9)">{isEn ? '• Atomic create (no overwrite)' : '• 原子建新 (拒重名与覆盖)'}</text>
       <text x="264" y="202" font-size={isEn ? 8.8 : 9} fill="var(--grey-9)">• parent_id + fork_seq</text>
       <text x="264" y="218" font-size={isEn ? 8.5 : 9} fill="var(--grey-9)">{isEn ? '• Auto-heal orphan calls' : '• 悬挂工具调用自动自愈'}</text>
       <rect x="264" y="232" width="125" height="54" fill="var(--grey-2)" stroke="var(--status-ok)" stroke-width="1" />
@@ -94,8 +94,8 @@ const isEn = locale === 'en';
       <rect x="66" y="214" width="164" height="68" fill="url(#sess-hatch-comp)" />
       <rect x="72" y="220" width="152" height="56" fill="var(--grey-2)" opacity="0.95" />
       <text x="80" y="236" font-size="9.2" font-weight="700" fill="var(--callout-caution-ink)">{isEn ? '#3 B-5 COMPACT + PRUNE' : '#3 B-5 压缩 & 尾部剪枝'}</text>
-      <text x="80" y="252" font-size={isEn ? 7.8 : 8.3} fill="var(--grey-10)">{isEn ? '8k warm tail · supersedeReads' : '8k 热尾保护 · superseded read'}</text>
-      <text x="80" y="267" font-size={isEn ? 7.8 : 8.3} fill="var(--grey-8)">{isEn ? 'Static recall · FileGuardTracker' : '单静态 recall · FileGuard 防误写'}</text>
+      <text x="80" y="252" font-size={isEn ? 7.8 : 8.3} fill="var(--grey-10)">{isEn ? 'Hot-cache · 8k tail · supersede' : '热缓存保护 · 8k 尾 · 重读剪枝'}</text>
+      <text x="80" y="267" font-size={isEn ? 7.8 : 8.3} fill="var(--grey-8)">{isEn ? 'B-5 Guard · FileGuardTracker' : 'B-5 护栏 · FileGuard 防误写'}</text>
 
       {/* #4 USER (Turn 2) */}
       <rect x="46" y="312" width="8" height="8" fill="var(--link)" />
