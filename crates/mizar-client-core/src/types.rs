@@ -11,6 +11,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolState {
+    Drafting,
     Running,
     Done,
     Error,
@@ -476,6 +477,16 @@ pub enum ClientEvent {
     TextDelta {
         text: String,
         ts_ms: u128,
+    },
+    ToolCallDraft {
+        call_id: String,
+        name: String,
+        arguments_delta: String,
+        ts_ms: u128,
+    },
+    ToolCallDraftId {
+        previous_id: String,
+        call_id: String,
     },
     ToolCall(ToolCall),
     ToolUpdate {

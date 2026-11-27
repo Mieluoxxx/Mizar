@@ -951,6 +951,7 @@ impl AppState {
                         self.items.push(ChatItem::Assistant { reasoning, text });
                     }
                     for (id, name, arguments) in calls {
+                        self.reserve_tool_call_id(&id);
                         let args_summary = summarize_tool_args(&arguments);
                         self.record_touched_file(&name, &arguments);
                         self.tool_extras.insert(

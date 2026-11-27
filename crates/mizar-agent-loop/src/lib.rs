@@ -3,7 +3,7 @@
 //! Agent 循环本身也只是一个插件。它不知道模型是哪家、有哪些工具，只认四个服务名：
 //! `llm`、`tools`、`sessions`、`systemPrompt`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +33,8 @@ pub const EVENT_AGENT_CONTEXT_OVERFLOW: &str = "agent/context-overflow";
 pub const EVENT_AGENT_REQUEST: &str = "agent/request";
 pub const EVENT_AGENT_TEXT_DELTA: &str = "agent/text-delta";
 pub const EVENT_AGENT_REASONING_DELTA: &str = "agent/reasoning-delta";
+pub const EVENT_AGENT_TOOL_CALL_DRAFT: &str = "agent/tool-call-draft";
+pub const EVENT_AGENT_TOOL_CALL_DRAFT_ID: &str = "agent/tool-call-draft-id";
 pub const EVENT_AGENT_TOOL_CALL: &str = "agent/tool-call";
 pub const EVENT_AGENT_TOOL_UPDATE: &str = "agent/tool-update";
 pub const EVENT_AGENT_TOOL_RESULT: &str = "agent/tool-result";
@@ -192,6 +194,24 @@ pub struct AgentReasoningDeltaEvent {
     pub session: Arc<Session>,
     pub text: String,
     pub ts_ms: u128,
+}
+
+#[derive(Clone)]
+pub struct AgentToolCallDraftEvent {
+    pub session: Arc<Session>,
+    pub turn: usize,
+    pub step: usize,
+    pub call_id: String,
+    pub name: String,
+    pub arguments_delta: String,
+    pub ts_ms: u128,
+}
+
+#[derive(Clone)]
+pub struct AgentToolCallDraftIdEvent {
+    pub session: Arc<Session>,
+    pub previous_id: String,
+    pub call_id: String,
 }
 
 #[derive(Clone)]
@@ -450,9 +470,46 @@ struct AttemptProgress {
     has_visible_output: bool,
     has_tool_calls: bool,
     first_token_emitted: bool,
+    tool_drafts: BTreeMap<usize, ToolDraft>,
+}
+
+#[derive(Default)]
+struct ToolDraft {
+    call_id: String,
+    name: String,
+    pending_arguments: String,
+    sent_arguments: bool,
 }
 
 impl StepGuard {
+    fn emit_tool_draft(&self, call_id: &str, name: &str, arguments_delta: String, ts_ms: u128) {
+        self.ctx.emit(
+            EVENT_AGENT_TOOL_CALL_DRAFT,
+            AgentToolCallDraftEvent {
+                session: Arc::clone(&self.session),
+                turn: self.turn as usize,
+                step: self.step,
+                call_id: call_id.to_owned(),
+                name: name.to_owned(),
+                arguments_delta,
+                ts_ms,
+            },
+        );
+    }
+
+    fn align_tool_draft_id(&self, draft: &ToolDraft, call_id: &str) {
+        if !draft.name.is_empty() && draft.call_id != call_id {
+            self.ctx.emit(
+                EVENT_AGENT_TOOL_CALL_DRAFT_ID,
+                AgentToolCallDraftIdEvent {
+                    session: Arc::clone(&self.session),
+                    previous_id: draft.call_id.clone(),
+                    call_id: call_id.to_owned(),
+                },
+            );
+        }
+    }
+
     fn observe_chunk(&self, chunk: &StreamChunk, progress: &mut AttemptProgress) {
         match chunk {
             StreamChunk::TextDelta { text, .. } if !text.is_empty() => {
@@ -470,10 +527,13 @@ impl StepGuard {
                 ..
             } if !text.is_empty() => progress.saw_reasoning_delta = true,
             StreamChunk::BlockStart {
+                index,
                 kind: ContentBlockKind::ToolCall,
-                ..
+            } => {
+                progress.has_tool_calls = true;
+                progress.tool_drafts.entry(*index).or_default();
             }
-            | StreamChunk::ToolCallDelta { .. }
+            StreamChunk::ToolCallDelta { .. }
             | StreamChunk::BlockEnd {
                 block: ContentBlock::ToolCall { .. },
                 ..
@@ -514,6 +574,55 @@ impl StepGuard {
                     ts_ms,
                 },
             ),
+            StreamChunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                let draft = progress.tool_drafts.entry(*index).or_default();
+                if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+                    self.align_tool_draft_id(draft, id);
+                    draft.call_id = id.to_owned();
+                } else if draft.call_id.is_empty() {
+                    // 块索引会跨步复用，临时标识必须限定在本会话的当前步骤。
+                    draft.call_id = format!(
+                        "draft:{}:{}:{}:{index}",
+                        self.session.id, self.turn, self.step
+                    );
+                }
+                if let Some(name) = name {
+                    draft.name.push_str(name);
+                }
+                draft.pending_arguments.push_str(arguments_delta);
+                if !draft.name.is_empty() {
+                    draft.sent_arguments |= !draft.pending_arguments.is_empty();
+                    self.emit_tool_draft(
+                        &draft.call_id,
+                        &draft.name,
+                        std::mem::take(&mut draft.pending_arguments),
+                        ts_ms,
+                    );
+                }
+            }
+            StreamChunk::BlockEnd {
+                index,
+                block:
+                    ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+            } => {
+                let draft = progress.tool_drafts.entry(*index).or_default();
+                self.align_tool_draft_id(draft, id);
+                if !draft.sent_arguments && !name.is_empty() {
+                    self.emit_tool_draft(id, name, arguments.clone(), ts_ms);
+                    draft.sent_arguments = true;
+                }
+                draft.call_id.clone_from(id);
+                draft.name.clone_from(name);
+            }
             _ => {}
         }
     }
@@ -1005,6 +1114,10 @@ impl AgentLoop {
                         .lock()
                         .unwrap()
                         .remove(&session.id);
+                }
+                // 只有增量而没有闭块的协议会由组装器补全标识，调用顺序与块索引一致。
+                for (draft, call) in progress.tool_drafts.values().zip(&calls) {
+                    step_guard.align_tool_draft_id(draft, &call.id);
                 }
                 break 'attempt (assembler, text, calls);
             };
