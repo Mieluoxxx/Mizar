@@ -10,7 +10,9 @@ use mizar_agent_loop::{
     AgentContextOverflowEvent, AgentPreStepEvent, AgentStepEndEvent, EVENT_AGENT_CONTEXT_OVERFLOW,
     EVENT_AGENT_PRE_STEP, EVENT_AGENT_STEP_END, StepOutcome,
 };
-use mizar_llm::{LlmContextExt, LlmError, LlmErrorCode, Message};
+use mizar_llm::{
+    CacheRetention, LlmContextExt, LlmError, LlmErrorCode, Message, resolve_cache_retention,
+};
 use mizar_session::{Session, SessionContextExt, SessionEvent, SessionTraceEvent};
 use mizar_system_prompt::SystemPromptContextExt;
 use mizar_tools::{
@@ -99,64 +101,26 @@ impl CompactionRuntime {
         })
     }
 
-    /// 结合 `LlmRuntime::provider_infos()` 查表推导当前路由的协议与模型元数据；
-    /// 当明确指定 `model` 但未在模型表中命中时不借用其它模型，返回 `None` 以便回退 `default_window`。
-    fn resolve_provider_and_model(
-        &self,
-        provider: Option<&str>,
-        model: Option<&str>,
-    ) -> (Option<String>, Option<mizar_llm::ModelInfo>) {
-        let Ok(llm) = self.ctx.llm() else {
-            return (None, None);
-        };
-        let providers = llm.provider_infos();
-        let found = match provider {
-            Some(pid) => providers.iter().find(|p| p.id == pid).map(|p| {
-                let m = match model {
-                    Some(mid) => p.models.iter().find(|m| m.id == mid).cloned(),
-                    None => p.models.first().cloned(),
-                };
-                (p.protocol.clone(), m)
-            }),
-            None => match model {
-                Some(mid) => providers.iter().find_map(|p| {
-                    p.models
-                        .iter()
-                        .find(|m| m.id == mid)
-                        .map(|m| (p.protocol.clone(), Some(m.clone())))
-                }),
-                None => providers
-                    .first()
-                    .map(|p| (p.protocol.clone(), p.models.first().cloned())),
-            },
-        };
-        match found {
-            Some((proto, m)) => (Some(proto), m),
-            None => (None, None),
-        }
-    }
-
-    fn resolve_model_limits(
-        &self,
-        provider: Option<&str>,
-        model: Option<&str>,
-        default_window: u64,
-    ) -> (u64, Option<u32>) {
-        if let (_, Some(m)) = self.resolve_provider_and_model(provider, model) {
-            return (m.context_window.unwrap_or(default_window), m.max_tokens);
-        }
-        (default_window, None)
-    }
-
-    fn is_prefix_bound_thinking(
+    fn should_preserve_warm_prefix(
         &self,
         session: &Session,
         provider: Option<&str>,
         model: Option<&str>,
     ) -> bool {
-        if let (Some(proto), Some(m)) = self.resolve_provider_and_model(provider, model)
-            && proto == "anthropic-messages"
-            && !m.reasoning_efforts.is_empty()
+        if let Some(route) = self
+            .ctx
+            .llm()
+            .ok()
+            .and_then(|llm| llm.model_route(provider, model))
+            && match route.protocol.as_str() {
+                "anthropic-messages" => {
+                    route.model.is_some_and(|m| !m.reasoning_efforts.is_empty())
+                }
+                "openai-responses" => {
+                    resolve_cache_retention(route.default_cache_retention) != CacheRetention::None
+                }
+                _ => false,
+            }
         {
             return true;
         }
@@ -164,12 +128,10 @@ impl CompactionRuntime {
             entries.iter().any(|entry| {
                 matches!(
                     &entry.event,
-                    mizar_session::SessionEvent::Assistant { replay: Some(r), .. }
-                        if r.protocol == "anthropic-messages"
-                            && r.response.get("prefixDigest").is_some()
-                            && r.blocks.iter().any(|b| {
-                                b.get("signature").is_some() || b.get("redacted").is_some()
-                            })
+                    SessionEvent::Assistant { replay: Some(r), .. }
+                        if r.protocol == "openai-responses" || (r.protocol == "anthropic-messages"
+                            && r.blocks.iter().any(|b| b.get("signature").and_then(|v| v.as_str()).is_some()
+                                || b.get("redacted").and_then(|v| v.as_bool()) == Some(true)))
                 )
             })
         })
@@ -181,9 +143,17 @@ impl CompactionRuntime {
         model: Option<&str>,
         cfg: &CompactionConfig,
     ) -> ContextBudget {
-        let (window, max_out) =
-            self.resolve_model_limits(provider, model, cfg.default_context_window);
-        compute_budget(window, max_out, cfg)
+        let info = self
+            .ctx
+            .llm()
+            .ok()
+            .and_then(|llm| llm.model_route(provider, model))
+            .and_then(|route| route.model);
+        let window = cfg
+            .context_window_override
+            .or_else(|| info.as_ref().and_then(|m| m.context_window))
+            .unwrap_or(cfg.default_context_window);
+        compute_budget(window, info.and_then(|m| m.max_tokens), cfg)
     }
 
     fn current_prompt_and_tools(
@@ -269,34 +239,53 @@ impl CompactionRuntime {
         if !cfg.enabled {
             return;
         }
-        if (cfg.supersede_reads || cfg.drop_useless)
-            && let Ok(_lock) = self.try_lock_session(&ev.session.id)
-        {
-            let opts = TailPruneOptions {
-                supersede_reads: cfg.supersede_reads,
-                drop_useless: cfg.drop_useless,
-                warm_suffix_tokens: cfg.prune_warm_suffix_tokens,
-                idle_flush_ms: cfg.prune_idle_flush_ms,
-                is_prefix_bound_thinking: self.is_prefix_bound_thinking(
+        let Ok(lock) = self.try_lock_session(&ev.session.id) else {
+            return;
+        };
+        let pruning = cfg.supersede_reads || cfg.drop_useless;
+        let opts = TailPruneOptions {
+            supersede_reads: cfg.supersede_reads,
+            drop_useless: cfg.drop_useless,
+            warm_suffix_tokens: cfg.prune_warm_suffix_tokens,
+            idle_flush_ms: cfg.prune_idle_flush_ms,
+            preserve_warm_prefix: pruning
+                && self.should_preserve_warm_prefix(
                     &ev.session,
                     ev.provider.as_deref(),
                     ev.model.as_deref(),
                 ),
-                now_ms: None,
-            };
-            self.prune_tail(&ev.session, &opts, &ev.cancel);
+            now_ms: None,
+        };
+        let mut protected = false;
+        if pruning {
+            let report = self.prune_tail(&ev.session, &opts, &ev.cancel);
+            protected = opts.preserve_warm_prefix && !report.idle_flushed;
         }
-        if !cfg.auto_compact {
+        if !cfg.auto_compact || ev.cancel.is_cancelled() {
             return;
         }
         let budget = self.compute_session_budget(ev.provider.as_deref(), ev.model.as_deref(), &cfg);
         let (sys_prompt, _, tools_chars) = self.current_prompt_and_tools(&ev.session.id);
-        let estimated = estimate_session_context_tokens(&ev.session, &sys_prompt, tools_chars);
-
-        if estimated < budget.trigger_tokens {
+        let estimated = || estimate_session_context_tokens(&ev.session, &sys_prompt, tools_chars);
+        if estimated() < budget.trigger_tokens {
             return;
         }
-
+        if protected {
+            // 临近摘要时先牺牲缓存命中，避免为可确定回收的回执调用模型。
+            let full = TailPruneOptions {
+                preserve_warm_prefix: false,
+                warm_suffix_tokens: 0,
+                idle_flush_ms: 0,
+                ..opts
+            };
+            let report = self.prune_tail(&ev.session, &full, &ev.cancel);
+            if ev.cancel.is_cancelled()
+                || (report.pruned_count > 0 && estimated() < budget.trigger_tokens)
+            {
+                return;
+            }
+        }
+        drop(lock);
         let _ = self
             .run_compaction_pipeline(
                 Arc::clone(&ev.session),

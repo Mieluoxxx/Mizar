@@ -221,6 +221,9 @@ impl LoadedMizarConfig {
                 if let Some(v) = comp.auto_compact {
                     dst.auto_compact = v;
                 }
+                if let Some(v) = comp.default_context_window {
+                    dst.default_context_window = v;
+                }
                 if let Some(v) = comp.max_context_tokens {
                     dst.max_context_tokens = Some(v);
                 }

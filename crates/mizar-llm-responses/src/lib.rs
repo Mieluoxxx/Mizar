@@ -1781,6 +1781,10 @@ impl ResponsesAdapter {
 }
 
 impl LlmAdapter for ResponsesAdapter {
+    fn default_cache_retention(&self) -> Option<CacheRetention> {
+        self.config.default_cache_retention
+    }
+
     fn default_model(&self) -> Option<&str> {
         Some(&self.model)
     }

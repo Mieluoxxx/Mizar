@@ -185,6 +185,8 @@ pub struct AppState {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub providers: Vec<ProviderInfo>,
+    pub context_window_override: Option<u64>,
+    pub default_context_window: u64,
     pub user_skill_names: Vec<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub show_thinking: bool,
@@ -283,6 +285,8 @@ impl AppState {
             provider,
             model,
             providers,
+            context_window_override: None,
+            default_context_window: 128_000,
             user_skill_names: Vec::new(),
             reasoning_effort,
             show_thinking: true,
@@ -575,9 +579,13 @@ impl AppState {
     }
 
     pub fn active_context_window(&self) -> u64 {
-        self.active_model_info()
-            .and_then(|model| model.context_window)
-            .unwrap_or(128_000)
+        self.context_window_override
+            .or_else(|| {
+                self.active_model_info()
+                    .and_then(|model| model.context_window)
+            })
+            .unwrap_or(self.default_context_window)
+            .max(4_096)
     }
 
     pub fn available_efforts(&self) -> Vec<ReasoningEffort> {

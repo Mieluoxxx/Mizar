@@ -47,11 +47,20 @@ pub struct InstructionsSettings {
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
     pub auto_compact: Option<bool>,
+    #[serde(deserialize_with = "deserialize_context_window")]
+    pub default_context_window: Option<u64>,
     pub max_context_tokens: Option<u64>,
     pub trigger_ratio: Option<f64>,
     pub keep_recent_tokens: Option<u64>,
     pub supersede_reads: Option<bool>,
     pub drop_useless: Option<bool>,
+}
+
+fn deserialize_context_window<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    Option::<std::num::NonZeroU64>::deserialize(deserializer)
+        .map(|v| v.map(std::num::NonZeroU64::get))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -246,6 +255,9 @@ impl SettingsConfig {
             }
             if comp.auto_compact.is_some() {
                 dst.auto_compact = comp.auto_compact;
+            }
+            if comp.default_context_window.is_some() {
+                dst.default_context_window = comp.default_context_window;
             }
             if comp.max_context_tokens.is_some() {
                 dst.max_context_tokens = comp.max_context_tokens;

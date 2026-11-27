@@ -1,5 +1,7 @@
 //! 无头调用方依赖标准输出解析结果，诊断信息必须走标准错误。
 
+mod ndjson;
+
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -20,7 +22,7 @@ use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
 use mizar_llm_router::LlmRouter;
 use mizar_mcp::McpManager;
-use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
+use mizar_session::{Session, SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
 use mizar_tools_coding::CodingToolsPreset;
 use mizar_trajectory::{
     DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryExport,
@@ -29,6 +31,7 @@ use mizar_trajectory::{
 use tokio_util::sync::CancellationToken;
 
 use crate::runner::{ResumeTarget, wait_for_services};
+use ndjson::{ExecStream, now_ms, write_event};
 
 /// 无头输出格式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,6 +62,7 @@ pub struct ExecConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_steps: Option<usize>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u64>,
     pub timeout_secs: Option<u64>,
     pub isolated: bool,
     pub no_persist: bool,
@@ -126,11 +130,10 @@ fn validate_non_blank_prompt(text: String, source: &str) -> Result<String, Strin
 }
 
 fn single_line(text: &str) -> String {
-    let replaced = text.replace(['\r', '\n'], " ");
-    let mut out = String::with_capacity(replaced.len());
+    let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
-    for ch in replaced.chars() {
-        if ch.is_whitespace() {
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_control() {
             if !prev_space {
                 out.push(' ');
             }
@@ -150,10 +153,7 @@ pub fn sanitize_diagnostic_text(input: &str, secrets: &[String]) -> String {
     let mut deduped: Vec<&str> = secrets
         .iter()
         .map(|s| s.as_str())
-        .filter(|s| {
-            let trimmed = s.trim();
-            trimmed.len() >= 6 || (trimmed.starts_with("sk-") && trimmed.len() >= 4)
-        })
+        .filter(|s| !s.trim().is_empty())
         .collect();
     deduped.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     deduped.dedup();
@@ -161,10 +161,22 @@ pub fn sanitize_diagnostic_text(input: &str, secrets: &[String]) -> String {
         out = out.replace(secret, "[REDACTED]");
     }
 
-    out = redact_header_tokens(&out);
+    out = redact_named_secrets(&single_line(&out));
     out = redact_bearer_tokens(&out);
-    out = redact_query_secrets(&out);
     redact_prefixed_tokens(&out)
+}
+
+fn env_secrets() -> Vec<String> {
+    [
+        "API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENROUTER_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok())
+    .collect()
 }
 
 fn is_token_delimiter(b: u8) -> bool {
@@ -175,99 +187,78 @@ fn is_token_delimiter(b: u8) -> bool {
         )
 }
 
-fn redact_header_tokens(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let prefixes = ["authorization:", "x-api-key:", "api-key:"];
-    let mut result = String::with_capacity(input.len());
-    let mut cursor = 0usize;
-
-    while cursor < input.len() {
-        let mut next_match: Option<(usize, &str)> = None;
-        for &pat in &prefixes {
-            if let Some(rel) = lower[cursor..].find(pat) {
-                let pos = cursor + rel;
-                if next_match.is_none_or(|(best, _)| pos < best) {
-                    next_match = Some((pos, pat));
-                }
-            }
-        }
-        let Some((pos, pat)) = next_match else {
-            result.push_str(&input[cursor..]);
-            break;
-        };
-
-        let boundary_ok = pos == 0 || !input.as_bytes()[pos - 1].is_ascii_alphanumeric();
-        if !boundary_ok {
-            let advance = pos + pat.len();
-            result.push_str(&input[cursor..advance]);
-            cursor = advance;
-            continue;
-        }
-
-        let after_pat = pos + pat.len();
-        result.push_str(&input[cursor..after_pat]);
-        let mut val_start = after_pat;
-        while val_start < input.len() && input.as_bytes()[val_start] == b' ' {
-            result.push(' ');
-            val_start += 1;
-        }
-        if pat == "authorization:" && lower[val_start..].starts_with("bearer ") {
-            let b_len = "bearer ".len();
-            result.push_str(&input[val_start..val_start + b_len]);
-            val_start += b_len;
-            while val_start < input.len() && input.as_bytes()[val_start] == b' ' {
-                result.push(' ');
-                val_start += 1;
-            }
-        }
-        let mut val_end = val_start;
-        let bytes = input.as_bytes();
-        while val_end < bytes.len() && !is_token_delimiter(bytes[val_end]) {
-            val_end += 1;
-        }
-        if val_end > val_start {
-            let tok = &input[val_start..val_end];
-            if tok != "[REDACTED]" {
-                result.push_str("[REDACTED]");
-            } else {
-                result.push_str(tok);
-            }
-        }
-        cursor = val_end;
-    }
-
-    result
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    normalized.ends_with("apikey")
+        || normalized.ends_with("token")
+        || normalized.ends_with("secret")
+        || matches!(
+            normalized.as_str(),
+            "authorization" | "proxyauthorization" | "key" | "password"
+        )
 }
 
-fn looks_like_bearer_secret(tok: &str) -> bool {
-    if tok == "[REDACTED]" || tok.len() < 6 {
-        return false;
+fn redact_named_secrets(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'-' | b'_'))
+        {
+            i += 1;
+        }
+        if start == i {
+            i += 1;
+            continue;
+        }
+        let key = &input[start..i];
+        let rest = input[i..].trim_start_matches(['\"', '\'']).trim_start();
+        let Some(value) = rest.strip_prefix([':', '=']).map(str::trim_start) else {
+            continue;
+        };
+        if !is_secret_key(key) {
+            continue;
+        }
+        let mut pos = input.len() - value.len();
+        let quoted = matches!(bytes.get(pos), Some(b'\"' | b'\''));
+        if quoted {
+            pos += 1;
+        }
+        let mut end = pos;
+        if quoted {
+            let quote = bytes[pos - 1];
+            while end < bytes.len() && bytes[end] != quote {
+                if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                    end += 1;
+                }
+                end += 1;
+            }
+        } else {
+            // 认证方案和凭据之间可以有空格，不能只遮住方案名。
+            if key.to_ascii_lowercase().ends_with("authorization")
+                && let Some((scheme, token)) = value.split_once(' ')
+                && (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+            {
+                pos = input.len() - token.trim_start().len();
+                end = pos;
+            }
+            if input[pos..].starts_with("[REDACTED]") {
+                end += "[REDACTED]".len();
+            }
+            while end < bytes.len() && bytes[end] != b'&' && !is_token_delimiter(bytes[end]) {
+                end += 1;
+            }
+        }
+        out.push_str(&input[copied..pos]);
+        out.push_str("[REDACTED]");
+        copied = end;
+        i = end;
     }
-    let lower = tok.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "token"
-            | "auth"
-            | "authentication"
-            | "header"
-            | "headers"
-            | "scheme"
-            | "missing"
-            | "invalid"
-            | "expired"
-            | "format"
-            | "required"
-            | "provided"
-    ) {
-        return false;
-    }
-    tok.len() >= 12
-        || tok.starts_with("sk-")
-        || tok.starts_with("rk-")
-        || tok.starts_with("ghp_")
-        || tok
-            .bytes()
-            .any(|b| b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.')
+    out.push_str(&input[copied..]);
+    out
 }
 
 fn redact_bearer_tokens(input: &str) -> String {
@@ -296,7 +287,7 @@ fn redact_bearer_tokens(input: &str) -> String {
             tok_end += 1;
         }
         let tok = &input[tok_start..tok_end];
-        if looks_like_bearer_secret(tok) {
+        if !tok.is_empty() && !input[tok_start..].starts_with("[REDACTED]") {
             result.push_str("[REDACTED]");
         } else {
             result.push_str(tok);
@@ -304,55 +295,6 @@ fn redact_bearer_tokens(input: &str) -> String {
         cursor = tok_end;
     }
     result.push_str(&input[cursor..]);
-    result
-}
-
-fn redact_query_secrets(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let keys = [
-        "key=",
-        "api_key=",
-        "apikey=",
-        "token=",
-        "access_token=",
-        "secret=",
-    ];
-    let mut result = String::with_capacity(input.len());
-    let mut cursor = 0usize;
-
-    while cursor < input.len() {
-        let mut next_match: Option<(usize, &str)> = None;
-        for &pat in &keys {
-            if let Some(rel) = lower[cursor..].find(pat) {
-                let pos = cursor + rel;
-                if next_match.is_none_or(|(best, _)| pos < best) {
-                    next_match = Some((pos, pat));
-                }
-            }
-        }
-        let Some((pos, pat)) = next_match else {
-            result.push_str(&input[cursor..]);
-            break;
-        };
-        let is_query_param = pos > 0 && matches!(input.as_bytes()[pos - 1], b'?' | b'&');
-        let val_start = pos + pat.len();
-        if !is_query_param {
-            result.push_str(&input[cursor..val_start]);
-            cursor = val_start;
-            continue;
-        }
-        result.push_str(&input[cursor..val_start]);
-        let mut val_end = val_start;
-        let bytes = input.as_bytes();
-        while val_end < bytes.len() && bytes[val_end] != b'&' && !is_token_delimiter(bytes[val_end])
-        {
-            val_end += 1;
-        }
-        if val_end > val_start {
-            result.push_str("[REDACTED]");
-        }
-        cursor = val_end;
-    }
     result
 }
 
@@ -402,7 +344,7 @@ fn redact_prefixed_tokens(input: &str) -> String {
 /// 格式化单行诊断错误，保留 error code / HTTP status / provider message / retry_after_ms，
 /// 并兼容 Harbor `BaseInstalledAgent.ERROR_PATTERNS`（末尾匹配优先 `LastMatchWins`）。
 pub fn format_llm_error_diagnostic(err: &LlmError, secrets: &[String]) -> String {
-    let sanitized_msg = single_line(&sanitize_diagnostic_text(&err.message, secrets));
+    let sanitized_msg = sanitize_diagnostic_text(&err.message, secrets);
     let lower = sanitized_msg.to_ascii_lowercase();
 
     let mut meta = Vec::new();
@@ -452,9 +394,11 @@ fn configure_exec_logger(app: &Context, secrets: Arc<Mutex<Vec<String>>>) {
     app.logger().set_level(LogLevel::Warn);
     app.logger().set_handler(move |rec| {
         if matches!(rec.level, LogLevel::Warn | LogLevel::Error) {
-            let current_secrets = secrets.lock().unwrap().clone();
-            let clean = single_line(&sanitize_diagnostic_text(&rec.message, &current_secrets));
-            eprintln!("[{} {}] {}", rec.tag, rec.name, clean);
+            let line = format!("[{} {}] {}", rec.tag, rec.name, rec.message);
+            eprintln!(
+                "{}",
+                sanitize_diagnostic_text(&line, &secrets.lock().unwrap())
+            );
         }
     });
 }
@@ -462,26 +406,39 @@ fn configure_exec_logger(app: &Context, secrets: Arc<Mutex<Vec<String>>>) {
 /// 运行无头一次性任务，返回进程应使用的退出码。
 pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let exec_started = std::time::Instant::now();
-    let env_override = EnvLlmOverride::from_env();
-    let log_secrets = Arc::new(Mutex::new(env_override.collect_secrets()));
+    let log_secrets = Arc::new(Mutex::new(env_secrets()));
+    let stream = Arc::new(Mutex::new(ExecStream::default()));
     let finish = |mut outcome: TurnExitOutcome,
                   app: Option<&Context>,
-                  session: Option<(&str, bool, u64)>,
+                  session: Option<(&Session, bool, u64)>,
                   report: Option<&TurnRunReport>,
                   provider: Option<String>,
                   model: Option<String>| {
+        let json_meta = (cfg.output_format == ExecOutputFormat::Json
+            && outcome.termination_reason != "invalid_request")
+            .then(|| {
+                let mut stream = stream.lock().unwrap();
+                if let Some(err) = stream.write_error.take()
+                    && outcome.exit_code == 0
+                {
+                    outcome =
+                        TurnExitOutcome::failure("error", format!("failed to write stdout: {err}"));
+                }
+                let (session, resumed, duration) = match session {
+                    Some((s, resumed, duration)) => (Some(s), resumed, duration),
+                    None => (None, false, exec_started.elapsed().as_millis() as u64),
+                };
+                stream.result_fields(session, resumed, duration)
+            });
         if let Some(err) = &mut outcome.error {
-            *err = single_line(&sanitize_diagnostic_text(err, &log_secrets.lock().unwrap()));
+            *err = sanitize_diagnostic_text(err, &log_secrets.lock().unwrap());
             eprintln!("error: {err}");
         }
-        let json_meta = match (cfg.output_format, app, session) {
-            (ExecOutputFormat::Json, Some(ctx), Some((id, resumed, duration))) => {
-                Some(build_exec_json_meta(ctx, id, resumed, duration))
-            }
-            _ => None,
-        };
-        if let Err(err) = outcome.write_output(cfg.output_format, report, json_meta.as_ref()) {
-            let msg = format!("failed to write stdout: {err}");
+        if let Err(err) = outcome.write_output(cfg.output_format, report, json_meta) {
+            let msg = sanitize_diagnostic_text(
+                &format!("failed to write stdout: {err}"),
+                &log_secrets.lock().unwrap(),
+            );
             eprintln!("error: {msg}");
             if outcome.exit_code == 0 {
                 outcome = TurnExitOutcome::failure("error", msg);
@@ -491,7 +448,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         export_exec_trace_best_effort(
             cfg.trace_out.as_deref(),
             app,
-            session.map(|(id, _, _)| id),
+            session.map(|(session, _, _)| session.id.as_str()),
             TraceExportMeta {
                 exit_code: code,
                 termination_reason: outcome.termination_reason.to_owned(),
@@ -548,6 +505,16 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     } else {
         load_mizar_config(&cfg.workspace)
     };
+    {
+        let mut secrets = log_secrets.lock().unwrap();
+        secrets.extend(
+            loaded_cfg
+                .router
+                .providers
+                .values()
+                .filter_map(|r| r.api_key.clone()),
+        );
+    }
 
     if let Some(ui) = &loaded_cfg.settings.ui
         && let Some(ref mode) = ui.approval_mode
@@ -564,45 +531,41 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         );
     }
 
-    for parse_err in &loaded_cfg.errors {
-        let guard = log_secrets.lock().unwrap();
-        let clean = single_line(&sanitize_diagnostic_text(parse_err, &guard));
-        eprintln!("[W config] 配置解析失败：{clean}");
+    let invalid_config = |err: String| {
+        finish(
+            TurnExitOutcome::failure("invalid_request", err),
+            None,
+            None,
+            None,
+            cfg.provider.clone(),
+            cfg.model.clone(),
+        )
+    };
+    if !loaded_cfg.errors.is_empty() {
+        return invalid_config(loaded_cfg.errors.join(", "));
     }
-
     let cli_override = CliLlmOverride {
         provider: cfg.provider.clone(),
         model: cfg.model.clone(),
         protocol: cfg.protocol.clone(),
         base_url: cfg.base_url.clone(),
         reasoning_effort: cfg.reasoning_effort,
+        context_window: cfg.context_window,
     };
+    let env_override = match EnvLlmOverride::from_env(&cli_override) {
+        Ok(env) => env,
+        Err(err) => return invalid_config(err),
+    };
+    let mut spine_cfg = AgentSpineConfig::coding(cfg.workspace.clone());
+    if !cfg.isolated && !cfg.no_persist {
+        spine_cfg.session_db_path = resolve_default_session_db_path();
+    }
+    loaded_cfg.apply_to_spine(&mut spine_cfg);
+    cli_override.apply_context_window(&env_override, &mut spine_cfg);
     let resolved_llm = match loaded_cfg.resolve_llm_router_with_cli(env_override, cli_override) {
         Ok(resolved) => resolved,
-        Err(err) => {
-            let err_msg = err.to_string();
-            return finish(
-                TurnExitOutcome::failure("error", err_msg),
-                None,
-                None,
-                None,
-                cfg.provider.clone(),
-                cfg.model.clone(),
-            );
-        }
+        Err(err) => return invalid_config(err.to_string()),
     };
-
-    {
-        let mut s = log_secrets.lock().unwrap();
-        for route in resolved_llm.router.providers.values() {
-            if let Some(ref key) = route.api_key
-                && !key.trim().is_empty()
-                && !s.contains(key)
-            {
-                s.push(key.clone());
-            }
-        }
-    }
 
     match resolved_llm.validate_active_route() {
         Ok(maybe_secret) => {
@@ -619,7 +582,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 format_llm_error_diagnostic(&err, &guard)
             };
             return finish(
-                TurnExitOutcome::failure("error", diag),
+                TurnExitOutcome::failure("invalid_request", diag),
                 None,
                 None,
                 None,
@@ -629,11 +592,6 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         }
     }
 
-    let mut spine_cfg = AgentSpineConfig::coding(cfg.workspace.clone());
-    if !cfg.isolated && !cfg.no_persist {
-        spine_cfg.session_db_path = resolve_default_session_db_path();
-    }
-    loaded_cfg.apply_to_spine(&mut spine_cfg);
     if !spine_cfg
         .disabled_plugins
         .iter()
@@ -710,10 +668,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let retry_secrets = Arc::clone(&log_secrets);
     let _retry_subscription = app
         .on(EVENT_AGENT_RETRY, move |ev: &AgentRetryEvent| {
-            let reason = single_line(&sanitize_diagnostic_text(
-                &ev.reason,
-                &retry_secrets.lock().unwrap(),
-            ));
+            let reason = sanitize_diagnostic_text(&ev.reason, &retry_secrets.lock().unwrap());
             eprintln!(
                 "[W retry] step={} attempt={}/{} wait={}ms reason={reason}",
                 ev.step, ev.attempt, ev.max_attempts, ev.delay_ms
@@ -734,7 +689,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                         NoticeLevel::Error => "E",
                     };
                     let guard = mention_secrets.lock().unwrap();
-                    let clean = single_line(&sanitize_diagnostic_text(&text, &guard));
+                    let clean = sanitize_diagnostic_text(&text, &guard);
                     eprintln!("[{tag} mentions] {clean}");
                 }
             }),
@@ -768,16 +723,17 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         } => res,
     };
 
-    let complete = |outcome, session: Option<(&str, bool, u64)>, report: Option<&TurnRunReport>| {
-        finish(
-            outcome,
-            Some(&app),
-            session,
-            report,
-            Some(active_provider.clone()),
-            active_model.clone(),
-        )
-    };
+    let complete =
+        |outcome, session: Option<(&Session, bool, u64)>, report: Option<&TurnRunReport>| {
+            finish(
+                outcome,
+                Some(&app),
+                session,
+                report,
+                Some(active_provider.clone()),
+                active_model.clone(),
+            )
+        };
     let interruption = || interrupted_exit(&timed_out, cfg.timeout_secs, &signal_code);
     let exit_code = if let Err(err_msg) = init_res {
         complete(
@@ -837,6 +793,16 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                     }
                     Ok((session, resumed)) => {
                         let turn_started = std::time::Instant::now();
+                        if cfg.output_format == ExecOutputFormat::Json {
+                            ndjson::subscribe(&app, &session.id, &stream, &log_secrets);
+                            stream.lock().unwrap().emit(
+                                serde_json::json!({
+                                    "type": "session", "session_id": session.id, "resumed": resumed,
+                                    "provider": active_provider, "model": active_model,
+                                }),
+                                now_ms(),
+                            );
+                        }
                         let opts = RunOptions {
                             provider: Some(active_provider.clone()),
                             model: active_model.clone(),
@@ -863,16 +829,14 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                             if outcome.exit_code == 0 {
                                 outcome = TurnExitOutcome::failure("storage", msg);
                             } else {
-                                let clean = single_line(&sanitize_diagnostic_text(
-                                    &msg,
-                                    &log_secrets.lock().unwrap(),
-                                ));
+                                let clean =
+                                    sanitize_diagnostic_text(&msg, &log_secrets.lock().unwrap());
                                 eprintln!("[W storage] {clean}");
                             }
                         }
                         complete(
                             outcome,
-                            Some((&session.id, resumed, duration_ms)),
+                            Some((&session, resumed, duration_ms)),
                             run_res.as_ref().ok(),
                         )
                     }
@@ -888,71 +852,6 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
     cleanup_exec(&app, signal_handle, timeout_handle).await;
     exit_code
-}
-
-struct ExecJsonMeta {
-    session_id: String,
-    resumed: bool,
-    duration_ms: u64,
-    turn_llm_ms: u64,
-    turn_ttft_ms: Option<u64>,
-    turn_tool_calls: usize,
-    session_turns: u64,
-    session_steps: u64,
-    session_tool_ms: u64,
-}
-
-fn build_exec_json_meta(
-    app: &Context,
-    session_id: &str,
-    resumed: bool,
-    duration_ms: u64,
-) -> ExecJsonMeta {
-    let report = app
-        .get::<TrajectoryRuntime>("trajectory")
-        .and_then(|traj| traj.inspect(session_id, TimelineMode::Sequence));
-    if let Some(rep) = report {
-        let last_turn = rep.snapshot.turns.last();
-        let last_turn_num = last_turn.map(|t| t.turn);
-        let turn_llm_ms = last_turn
-            .map(|t| t.steps.iter().filter_map(|s| s.duration_ms).sum())
-            .unwrap_or(rep.snapshot.stats.llm_ms);
-        let turn_ttft_ms = last_turn.and_then(|t| t.steps.first().and_then(|s| s.ttft_ms));
-        let turn_tool_calls = last_turn_num
-            .map(|tnum| {
-                rep.snapshot
-                    .records
-                    .iter()
-                    .filter(|r| {
-                        r.kind == mizar_trajectory::RecordKind::Tool && r.turn == Some(tnum)
-                    })
-                    .count()
-            })
-            .unwrap_or(rep.snapshot.stats.tool_calls as usize);
-        ExecJsonMeta {
-            session_id: session_id.to_string(),
-            resumed,
-            duration_ms,
-            turn_llm_ms,
-            turn_ttft_ms,
-            turn_tool_calls,
-            session_turns: rep.snapshot.stats.turns,
-            session_steps: rep.snapshot.stats.steps,
-            session_tool_ms: rep.snapshot.stats.tool_ms,
-        }
-    } else {
-        ExecJsonMeta {
-            session_id: session_id.to_string(),
-            resumed,
-            duration_ms,
-            turn_llm_ms: 0,
-            turn_ttft_ms: None,
-            turn_tool_calls: 0,
-            session_turns: 0,
-            session_steps: 0,
-            session_tool_ms: 0,
-        }
-    }
 }
 
 struct TurnExitOutcome {
@@ -974,7 +873,7 @@ fn export_exec_trace_best_effort(
 
     if let Some(ref err_msg) = meta.error {
         let guard = secrets.lock().unwrap();
-        meta.error = Some(single_line(&sanitize_diagnostic_text(err_msg, &guard)));
+        meta.error = Some(sanitize_diagnostic_text(err_msg, &guard));
     }
 
     let export = match (app, session_id) {
@@ -995,11 +894,11 @@ fn export_exec_trace_best_effort(
 
     if let Err(err) = write_trace_export_atomic(path, &export) {
         let guard = secrets.lock().unwrap();
-        let clean = single_line(&sanitize_diagnostic_text(&err.to_string(), &guard));
-        eprintln!(
-            "[W trace] failed to write trajectory trace to \"{}\": {clean}",
+        let message = format!(
+            "failed to write trajectory trace to \"{}\": {err}",
             path.display()
         );
+        eprintln!("[W trace] {}", sanitize_diagnostic_text(&message, &guard));
     }
 }
 
@@ -1016,54 +915,43 @@ impl TurnExitOutcome {
         &self,
         format: ExecOutputFormat,
         report: Option<&TurnRunReport>,
-        meta: Option<&ExecJsonMeta>,
+        meta: Option<serde_json::Value>,
     ) -> io::Result<()> {
         let text = report
             .filter(|_| self.exit_code == 0)
             .map_or("", |r| r.text.as_str());
+        if format == ExecOutputFormat::Json {
+            let mut payload = meta.unwrap_or_else(|| serde_json::json!({}));
+            payload["type"] = "result".into();
+            payload["reason"] = self.termination_reason.into();
+            payload["exit_code"] = self.exit_code.into();
+            payload["text"] = text.into();
+            if let Some(error) = &self.error {
+                payload["error"] = error.as_str().into();
+            }
+            return write_event(payload, now_ms());
+        }
         let mut out = io::stdout().lock();
-        match format {
-            ExecOutputFormat::Text if !text.is_empty() => {
-                write!(out, "{text}")?;
-                if !text.ends_with('\n') {
-                    writeln!(out)?;
-                }
+        if !text.is_empty() {
+            write!(out, "{text}")?;
+            if !text.ends_with('\n') {
+                writeln!(out)?;
             }
-            ExecOutputFormat::Json => {
-                let mut payload = serde_json::json!({"reason": self.termination_reason, "exit_code": self.exit_code, "text": text});
-                if let Some(report) = report {
-                    payload["steps"] = report.steps.into();
-                }
-                if let Some(error) = &self.error {
-                    payload["error"] = error.as_str().into();
-                }
-                if let Some(meta) = meta {
-                    payload["session_id"] = meta.session_id.as_str().into();
-                    payload["resumed"] = meta.resumed.into();
-                    payload["duration_ms"] = meta.duration_ms.into();
-                    payload["llm_ms"] = meta.turn_llm_ms.into();
-                    payload["ttft_ms"] = meta.turn_ttft_ms.into();
-                    payload["tool_ms"] = meta.session_tool_ms.into();
-                    payload["tool_calls"] = meta.turn_tool_calls.into();
-                    payload["session_turns"] = meta.session_turns.into();
-                    payload["session_steps"] = meta.session_steps.into();
-                }
-                writeln!(out, "{payload}")?;
-            }
-            ExecOutputFormat::Text => {}
         }
         out.flush()
     }
 }
 
 pub fn report_exec_input_error(format: ExecOutputFormat, message: &str) {
-    let env_secrets = EnvLlmOverride::from_env().collect_secrets();
-    let msg = single_line(&sanitize_diagnostic_text(message, &env_secrets));
+    let msg = sanitize_diagnostic_text(message, &env_secrets());
     eprintln!("error: {msg}");
     if let Err(err) =
         TurnExitOutcome::failure("invalid_request", msg).write_output(format, None, None)
     {
-        eprintln!("error: failed to write stdout: {err}");
+        eprintln!(
+            "error: failed to write stdout: {}",
+            sanitize_diagnostic_text(&err.to_string(), &env_secrets())
+        );
     }
 }
 

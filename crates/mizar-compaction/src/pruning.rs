@@ -6,8 +6,8 @@
 //!    - `dropUseless`：零命中 / 无信息量工具结果 -> `[Uneventful result elided]`；
 //!    - 始终保护 `skill` 工具与 `skill://` / `SKILL.md` 读取。
 //! 2. **严格遵守 Prompt Cache 边界**：
-//!    - 热缓存期间仅裁剪后续可见消息估算 token 总和 `<= 8,000` 的尾部候选（前缀绑定思考模型直接置 `0`）；
-//!    - 仅当会话闲置超过 `90 分钟`（覆盖 1 小时 prompt cache TTL）时，才对最新压缩边界之后的全部可见候选清仓；
+//!    - 热缓存期改写旧回执会使前缀缓存失效，敏感协议需保护完整历史；
+//!    - 达到闲置时限或上下文承压时可清仓，避免为重复结果付出摘要开销；
 //!    - 已折叠至最新 `Compaction` 边界之前的条目永不触碰。
 //! 3. **Append-only 持久化**：只追加 `SessionEvent::ToolResultPrune`，绝不原地改写历史条目，保证 `--resume` 与 `fork` 前缀字节一致。
 
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mizar_llm::ContentBlock;
-use mizar_session::{PrunedToolResult, Session, SessionEntry, SessionEvent};
+use mizar_session::{PrunedToolResult, Session, SessionEntry, SessionEvent, SessionTraceEvent};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +36,7 @@ pub struct TailPruneOptions {
     pub drop_useless: bool,
     pub warm_suffix_tokens: u64,
     pub idle_flush_ms: u128,
-    pub is_prefix_bound_thinking: bool,
+    pub preserve_warm_prefix: bool,
     pub now_ms: Option<u128>,
 }
 
@@ -47,7 +47,7 @@ impl Default for TailPruneOptions {
             drop_useless: true,
             warm_suffix_tokens: DEFAULT_WARM_SUFFIX_TOKEN_LIMIT,
             idle_flush_ms: DEFAULT_IDLE_FLUSH_MS,
-            is_prefix_bound_thinking: false,
+            preserve_warm_prefix: false,
             now_ms: None,
         }
     }
@@ -103,6 +103,32 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn idle_flush_due(entries: &[SessionEntry], opts: &TailPruneOptions) -> bool {
+    // 新一轮用户输入和插件通知尚未发给模型，不能据此把已闲置的缓存重新算热。
+    let last = entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.event,
+                SessionEvent::Assistant { .. }
+                    | SessionEvent::ToolResult { .. }
+                    | SessionEvent::Compaction { .. }
+                    | SessionEvent::Trace {
+                        detail: SessionTraceEvent::StepEnd { .. }
+                            | SessionTraceEvent::StepStart { .. }
+                    }
+            )
+        })
+        .or_else(|| entries.last());
+    last.is_some_and(|entry| {
+        opts.now_ms
+            .unwrap_or_else(now_millis)
+            .saturating_sub(entry.ts)
+            >= opts.idle_flush_ms
+    })
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -293,6 +319,23 @@ pub fn plan_tail_pruning(
         return TailPrunePlan::default();
     }
 
+    let idle_flushed = idle_flush_due(
+        if all_entries.is_empty() {
+            visible
+        } else {
+            all_entries
+        },
+        opts,
+    );
+    let suffix_limit = if opts.preserve_warm_prefix {
+        0
+    } else {
+        opts.warm_suffix_tokens
+    };
+    if !idle_flushed && suffix_limit == 0 {
+        return TailPrunePlan::default();
+    }
+
     let tool_calls = collect_tool_calls(visible, all_entries);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut superseded_seqs: HashSet<u64> = HashSet::new();
@@ -394,24 +437,21 @@ pub fn plan_tail_pruning(
         }
     }
 
+    // 小回执的占位文本可能更长，清仓时写这种标记只会使实测用量锚点失效。
+    if opts.idle_flush_ms == 0 && opts.warm_suffix_tokens == 0 {
+        candidates.retain(|candidate| candidate.tokens_saved > 0);
+    }
     if candidates.is_empty() {
-        return TailPrunePlan::default();
+        return TailPrunePlan {
+            idle_flushed,
+            ..Default::default()
+        };
     }
     candidates.sort_by_key(|c| c.visible_idx);
-
-    let now_ms = opts.now_ms.unwrap_or_else(now_millis);
-    let last_visible_ts = visible.iter().map(|e| e.ts).max();
-    let idle_flushed =
-        last_visible_ts.is_some_and(|ts| now_ms.saturating_sub(ts) >= opts.idle_flush_ms);
 
     let selected: Vec<Candidate> = if idle_flushed {
         candidates
     } else {
-        let suffix_limit = if opts.is_prefix_bound_thinking {
-            0
-        } else {
-            opts.warm_suffix_tokens
-        };
         let mut suffix_tokens = 0u64;
         let mut next_cand = candidates.len();
         let mut kept_reversed = Vec::new();
@@ -473,7 +513,10 @@ pub(crate) fn prune_session_tail_cancellable(
     opts: &TailPruneOptions,
     cancel: Option<&CancellationToken>,
 ) -> TailPruneReport {
-    if cancel.is_some_and(CancellationToken::is_cancelled) {
+    if cancel.is_some_and(CancellationToken::is_cancelled)
+        || (opts.preserve_warm_prefix
+            && !session.with_all_entries(|entries| idle_flush_due(entries, opts)))
+    {
         return TailPruneReport::default();
     }
     let visible = session.visible_log();
@@ -481,7 +524,10 @@ pub(crate) fn prune_session_tail_cancellable(
     let pruned_map = session.pruned_map();
     let plan = plan_tail_pruning(&visible, &all_entries, &pruned_map, workspace, opts);
     if plan.items.is_empty() {
-        return TailPruneReport::default();
+        return TailPruneReport {
+            idle_flushed: plan.idle_flushed,
+            ..Default::default()
+        };
     }
     let chars_by_seq: HashMap<u64, usize> = visible
         .iter()

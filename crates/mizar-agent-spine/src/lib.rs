@@ -13,9 +13,9 @@ pub use config::{
     EnvProviderKind, InstructionsSettings, LoadedMizarConfig, RecallSettings, SessionTitleSettings,
     SettingsConfig, SkillsSettings, ToolSearchSettings, UiSettings, load_mizar_config,
     load_mizar_config_isolated, load_mizar_config_with_global, normalize_disabled_plugins,
-    normalize_session_title_thinking_level, patch_settings_file, persist_disabled_plugins,
-    resolve_default_session_db_path, resolve_global_config_dir, resolve_global_settings_path,
-    resolve_project_config_dir,
+    normalize_session_title_thinking_level, parse_context_window, patch_settings_file,
+    persist_disabled_plugins, resolve_default_session_db_path, resolve_global_config_dir,
+    resolve_global_settings_path, resolve_project_config_dir,
 };
 #[cfg(feature = "router")]
 pub use config::{LlmRouteError, ResolvedLlmRouter};

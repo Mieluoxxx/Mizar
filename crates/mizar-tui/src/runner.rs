@@ -8,7 +8,7 @@ use cordis::{
     BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, LogLevel, LogSink, Plugin,
 };
 use crossterm::event::EventStream;
-use mizar_agent_spine::SpinePluginsContextExt;
+use mizar_agent_spine::{CompactionContextExt, SpinePluginsContextExt};
 use mizar_client::approval::{ApprovalSnapshot, register_approval_hook_with};
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client::workspace::collect_user_skill_names;
@@ -521,6 +521,11 @@ pub async fn run_tui_with_summary(
         config.model.clone(),
         config.reasoning_effort,
     );
+    if let Ok(compaction) = ctx.compaction() {
+        let cfg = compaction.config();
+        app.context_window_override = cfg.context_window_override;
+        app.default_context_window = cfg.default_context_window;
+    }
     app.session_title = active_session.header().title;
     app.set_features(TuiFeatures::from(&ext_flags));
 

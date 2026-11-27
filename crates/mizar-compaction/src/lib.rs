@@ -2,7 +2,7 @@
 //!
 //! 整合核心工程实践：
 //! - **Cache-aware 尾部剪枝**：步前只剪被后续完整 `read` 覆盖的旧 `read` 与零命中搜索结果，
-//!   热缓存期仅裁剪尾部 `8,000` token（前缀绑定思考模型为 `0`），闲置 `>= 90 分钟` 允许清仓；
+//!   热缓存期保护前缀敏感协议，以免旧回执变化使后续缓存失效；
 //! - **单阶段检查点摘要**：步前按真实可用窗口 80% 触发（优先尾置指令复用主对话 KV Cache 前缀，
 //!   失败自动回退纯净转写），配合确定性 `<mizar-digest>` 硬事实与膨胀保护；
 //! - **溢出兜底恢复**：`agent/context-overflow` 捕获 `ContextWindowExceeded` 时以 `retain=0` 强制压缩并重试；
@@ -89,6 +89,7 @@ impl CompactionOutcome {
 pub struct CompactionConfig {
     pub enabled: bool,
     pub auto_compact: bool,
+    pub context_window_override: Option<u64>,
     pub default_context_window: u64,
     /// 可选上下文硬上限（默认 `None`，释放模型真实可用窗口；设为 `Some(cap)` 时按 `usable_tokens.min(cap)` 封顶）。
     pub max_context_tokens: Option<u64>,
@@ -109,6 +110,7 @@ impl Default for CompactionConfig {
         Self {
             enabled: true,
             auto_compact: true,
+            context_window_override: None,
             default_context_window: 128_000,
             max_context_tokens: None,
             trigger_ratio: 0.80,
