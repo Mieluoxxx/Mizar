@@ -3,6 +3,7 @@
 //! 子命令：
 //! - `mizar exec [<prompt>]`：非交互单次无头执行（无 explicit prompt 且 stdin 非 TTY 时读取 stdin 至 EOF）
 //! - `mizar update [--version <ver>] [--force] [--check]`：从 GitHub Releases 检查并更新 `mizar` 二进制
+//! - `mizar install-tools [--force] [rg|fd ...]` 可为离线环境预先备齐搜索工具。
 //!
 //! CLI 参数：
 //! - `--workspace <dir>` / `-C <dir>`：工作目录
@@ -59,6 +60,8 @@ use mizar_tui::exec::{
     ExecConfig, ExecOutputFormat, report_exec_input_error, resolve_exec_prompt,
     resolve_trace_out_path, run_exec_cli,
 };
+use mizar_tui::runner::interactive_bin_resolver;
+use mizar_tui::tools_manager::run_install_tools_cli;
 use mizar_tui::update::{current_version, is_version_check_disabled, run_update_cli};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -131,10 +134,12 @@ Usage:
   mizar [OPTIONS]
   mizar exec [OPTIONS] [<prompt>]
   mizar update [OPTIONS]
+  mizar install-tools [--force] [rg|fd ...]
 
 Commands:
   exec                          Run a single non-interactive task and exit
   update                        Check and install the latest release binary
+  install-tools                 Install or locate ripgrep and fd for Mizar
 
 Options:
   -C, --workspace <dir>         Workspace directory (defaults to current directory)
@@ -512,14 +517,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some((cmd, rest)) = raw_args.split_first()
-        && cmd == "update"
-    {
-        if let Err(err) = run_update_cli(rest).await {
-            eprintln!("error: {err}");
-            std::process::exit(1);
+    if let Some((cmd, rest)) = raw_args.split_first() {
+        let result = match cmd.as_str() {
+            "update" => Some(run_update_cli(rest).await),
+            "install-tools" => Some(run_install_tools_cli(rest).await),
+            _ => None,
+        };
+        if let Some(result) = result {
+            if let Err(err) = result {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     let mut cli = CliArgs::default();
@@ -617,7 +627,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     app.logger().set_silent();
 
     let loaded_cfg = load_mizar_config(&workspace);
-    let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());
+    let mut spine_cfg =
+        AgentSpineConfig::coding(workspace.clone()).with_ensure_bin(interactive_bin_resolver(&app));
     if !cli.no_persist {
         spine_cfg.session_db_path = resolve_default_session_db_path();
     }

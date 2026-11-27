@@ -297,4 +297,5 @@ pub fn create_read_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
         }
     }))
     .with_prompt_snippet("Read images or inspect text files with line numbers, offset and limit")
+    .with_prompt_guidelines(vec!["Use read to examine files instead of cat or sed.".into()])
 }

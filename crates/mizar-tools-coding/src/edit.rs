@@ -234,6 +234,7 @@ pub fn create_edit_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
     }))
     .with_prompt_snippet("Make precise file edits with exact text replacement, including multiple disjoint edits in one call")
     .with_prompt_guidelines(vec![
-        "Use edit for targeted changes to existing files instead of rewriting the whole file with write. Batch disjoint edits to one file in a single edits[] call.".into(),
+        "Use edit for targeted changes. Batch changes to one file in a single call.".into(),
+        "Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.".into(),
     ])
 }

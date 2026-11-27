@@ -85,15 +85,15 @@
   - 三种协议均能正确流式接收文本、推理与工具调用；MCP 工具可被发现、调用且暴露策略（hidden/codemode/deferred）生效。
   - 脚本异常与超时会迅速干净地返回错误给模型，不会拖垮或卡死宿主进程。
 
-## S8. 系统提示词分层组装与 `personality` 独立覆写（Agent）
+## S8. 随工具声明生成的系统提示词与可选 `personality`（Agent）
 
-- **前置条件**：工作区根目录存在 `AGENTS.md`，分别准备默认 `settings.json`、自定义 `"personality"` 与空字符串 `"personality": ""` 三组配置。
-- **操作步骤**：
-  1. 在三组配置下分别通过 `mizar exec` 运行真实请求，观测发出给模型的 system prompt 组装结果（如配合 `--trace-out` 或可控上游端点）。
-  2. 对比默认与覆写配置下各段落存在性与前后相对顺序。
-- **可观测结果**：
-  - 默认配置下依次呈现 `identity` → `engineering`（第一性原理、奥卡姆剃刀、独立调用并行）→ `personality` → `coding_tools` → `runtime_protocol`，且项目 `AGENTS.md`（`<project_instructions>`）位于全局静态前缀之后的尾部。
-  - 覆写 `"personality"` 或设为空串 `""` 时，仅性格段落变更或消失，`identity`、`engineering` 与 `runtime_protocol` 完整保留且前缀顺序不变。
+独立上下文的 Agent 在临时工作区放一份带标记的 `AGENTS.md`。用 `mizar exec --isolated` 连接可记录请求并回放工具调用的本地模型端点。逐步比对出站系统提示词与同一请求的工具声明。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 以默认设置发送请求。让模型读取文件，比较两步的系统提示。 | 身份以 `You are a coding assistant running inside Mizar` 开头，并要求跟随用户语言。默认提示中没有工程哲学、性格段或 `codemode`。`<tools>` 列出已声明工具，`<rules>` 含 bash 文件操作建议、read 和 write 的使用范围、edit 的批量编辑与精确唯一匹配要求。结尾依次为并行执行独立调用、简洁回复、写清路径。声明相同时，两步提示逐字节相同。 |
+| 在项目 `settings.json` 中分别省略 `personality`、设为空串、设为纯空白，再设为一段可识别的文字。 | 前三次系统提示逐字节相同。第四次的文字仅出现一次，介于身份与 `<tools>` 之间。四组均在 `</rules>` 之后说明 `<environment_context>`、`<project_instructions>`、`<skill_content>`、`<mizar-compaction>`，再出现项目文件的实际标记。 |
+| 用 `--tools read,bash,grep,find`、`--read-only`、`--tools codemode` 分别启动。 | 同时声明 shell 和独立搜索时，规则允许用 grep/find 单独搜索，也允许用 bash 写管道。只读预设仍含 read 指南。仅声明 codemode 时，`<rules>` 含其 `Promise.allSettled` 编排指南。每条规则只出现一次。 |
 
 ## S9. 流中断、单步重试、压缩恢复与无头退出（Agent + Computer Use）
 
@@ -139,3 +139,17 @@
 | 让 `keepRecentTokens` 的初始切点落在多调用批次的第二个回执上。继续同一轮直到再次压缩，让前缀摘要返回空包装以触发转录兜底。 | 压缩后第一个保留批次的调用 ID 和每份回执逐一配对。下一次摘要请求包含最近的摘要，转录含 `<earlier-summary>`，同一轮原始用户指令仍在检查点中。 |
 | 先返回一次 503，再让模型批量读图片、普通文件和不存在的文件。给参数加上长 Unicode 文本和假凭据。分别使用 `--json`、`--output-format json` 与 `--output-format ndjson`，完成后再用 `--resume` 跑一轮。 | 首行是 `session`。各行的 `ts_ms` 与 `type` 可读，步骤、重试、调用和回执均可配对。预览脱敏且至多 512 字符。`images` 与出站附件数一致，`tool_errors` 与本轮错误回执数一致。各步六项 `usage` 逐项相加等于末行 `result.usage`，恢复后 `session_usage` 同时包括前一轮。 |
 | 输出重定向到文件，再改为管道；两次都让端点在第二个模型请求挂起。进程运行中读取已有行，再向该进程发送 `SIGKILL`。 | 强杀前即可解析 `session`、已完成步骤和工具回执。强杀后这些完整行仍可读取，调用方可以从缺少 `result` 识别这次中断。 |
+
+## S12. 搜索工具安装、镜像回退与按需补齐（Agent + Computer Use）
+
+独立上下文的 Agent 使用本地构建的 `mizar`、临时工作区、专用 `MIZAR_HOME` 和可控制的 `PATH`。把 `MIZAR_GITHUB_BASE_URL`、`MIZAR_GITHUB_MIRROR` 指向两个记录请求时间的回环 HTTP 端点。让 `releases/latest` 返回带 `/releases/tag/<tag>` 的重定向。将本机可运行的 `rg`、`fd` 各放入带子目录的 `.tar.gz`。让本地模型端点回放 `grep` 或 `bash` 调用并记录回执。Computer Use 在真实终端操作交互案例，设置 `MIZAR_SKIP_VERSION_CHECK=1`。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 从系统 `PATH` 中移除 `rg`、`fd`、`fdfind`，保留 `tar`。运行 `mizar install-tools` 两次，再运行 `mizar install-tools --force rg`。用临时用户主目录，分别取消设置 `MIZAR_HOME` 和设为空串后重装。 | 首次两个包并发下载，CLI 打印直连来源、各自的路径及版本。第二次复用本地文件，端点无新请求。强制重装只请求 `rg`。显式指定的目录优先，省略或空串时安装在临时用户的 `~/.mizar/bin`。 |
+| 仅在系统 `PATH` 提供 `fdfind` 并运行 `mizar install-tools fd`。再用空缓存和无工具的 `PATH` 分别设置 `MIZAR_OFFLINE=1` 与 `PI_OFFLINE=yes` 运行安装。 | 第一组复用系统程序，随后在 `bash` 内执行 `fd --version` 成功。离线缺包时命令报告离线并退出非零。三组均无下载请求。 |
+| 让直连返回响应头，每 50 毫秒发一小块，保持速率低于 `MIZAR_BIN_SLOW_BPS=65536`。设 `MIZAR_BIN_WARMUP_MS=300`、`MIZAR_BIN_STALL_MS=1800`，运行 `mizar install-tools --force rg`。再改为预热 10 秒、停滞 250 毫秒，让服务发一个字节后暂停。 | 第一组预热后在数据持续到达时切源，第二组在停滞时限切源。镜像收到的路径为 `/{原始完整下载 URL}`，与 `ghfast.top` 的拼接格式一致。CLI 打印镜像来源和版本，落盘文件可执行。 |
+| 让直连 `latest` 返回 503，镜像返回合法重定向。另让直连包返回 502 或超过 10 秒才发响应头。然后设 `MIZAR_GITHUB_MIRROR=off`、`none` 或空串，重复失败请求。 | 版本查询和下载各自先试直连。版本查询通过镜像恢复后仍直连下载包。包请求失败时从镜像重新下载。关闭镜像时只有直连请求，失败原因可见。 |
+| 记录已装 `rg` 的 SHA-256。强制重装时让源分别返回 HTML 和损坏的压缩包。再让直连返回 502，镜像返回能解压但 `--version` 退出非零或标准输出为空的文件。 | 每次安装均退出非零。错误指出解压或 `--version` 失败。原文件的摘要和版本保持一致，`bin` 中没有遗留压缩包或暂存目录。 |
+| 从空缓存启动真实 TUI `mizar --tools grep`，让两个包发出响应头后暂缓传输。看到首屏后调用 `grep`，再让包在回退阈值前传完。换一份空缓存启动 TUI，让 `rg` 启动下载失败，恢复源后再调用 `grep`。 | 第一次可在下载期间提交命令。每种工具只有一个包请求，`grep` 返回目标文件的行号与内容。第二次在 `grep` 调用后重新请求 `rg` 并完成相同搜索。 |
+| 用 `mizar exec --tools grep,bash --json` 分别在空缓存和已有托管工具时搜索标记，并让 `bash` 运行 `command -v rg`、`fd --version`。再在系统 `PATH` 提供另一个 `rg` 后重复。 | 缺 `rg` 时工具回执提示运行 `mizar install-tools rg` 或安装 ripgrep。托管 `rg` 能搜到标记。两者都存在时，独立 `grep` 使用托管版本，shell 使用系统版本。shell 的 `PATH` 末尾有托管目录，可以直接调用 `fd`。无头模式下两个下载端点全程无请求。 |

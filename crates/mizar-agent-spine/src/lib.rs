@@ -64,7 +64,7 @@ use mizar_tool_fs::ToolFsConfig;
 use mizar_tool_search::ToolSearchConfig;
 use mizar_tools::{ToolRuntime, ToolsContextExt};
 #[cfg(feature = "coding")]
-use mizar_tools_coding::{CodingToolsConfig, CodingToolsPreset};
+use mizar_tools_coding::{CodingToolsConfig, CodingToolsPreset, EnsureBinFn};
 #[cfg(feature = "trajectory")]
 use mizar_trajectory::{RepeatGuardConfig, TrajectoryConfig};
 
@@ -203,6 +203,14 @@ impl AgentSpineConfig {
         }
         self
     }
+
+    #[cfg(feature = "coding")]
+    pub fn with_ensure_bin(mut self, ensure_bin: EnsureBinFn) -> Self {
+        if let AgentToolsMode::Coding { coding, .. } = &mut self.tools_mode {
+            coding.ensure_bin = Some(ensure_bin);
+        }
+        self
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -261,7 +269,6 @@ impl Plugin for AgentSpinePlugin {
                 SystemPrompt::plugin(),
                 SystemPromptConfig {
                     identity: None,
-                    engineering_principles: None,
                     personality: config.personality,
                     runtime_protocol: Some(DEFAULT_RUNTIME_PROTOCOL.to_string()),
                 },

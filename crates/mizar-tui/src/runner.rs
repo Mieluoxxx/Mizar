@@ -18,6 +18,7 @@ use mizar_session::{Session, SessionContextExt, SessionListQuery, SessionPersist
 use mizar_skills::EVENT_SKILLS_CHANGE;
 use mizar_system_prompt::{PromptSection, SystemPromptContextExt};
 use mizar_tools::EVENT_TOOLS_CHANGE;
+use mizar_tools_coding::EnsureBinFn;
 use mizar_tui_ui::TuiFeatures;
 use mizar_tui_ui::app::{
     AppAction, AppState, ApprovalMode, NoticeLevel, SessionSelection, UiEvent, UiTurnEndReason,
@@ -436,6 +437,25 @@ pub async fn run_tui(ctx: Context, config: TuiConfig) -> Result<(), Box<dyn std:
     run_tui_with_summary(ctx, config).await.map(|_| ())
 }
 
+pub fn interactive_bin_resolver(ctx: &Context) -> EnsureBinFn {
+    let logger = ctx.logger_named("install-tools");
+    Arc::new(move |name| {
+        let logger = logger.clone();
+        Box::pin(async move {
+            match crate::tools_manager::ensure_tool(name).await {
+                Ok(tool) => {
+                    logger.info(format!("{name} [{}] {}", tool.source, tool.path.display()));
+                    Some(tool.path)
+                }
+                Err(err) => {
+                    logger.warn(format!("{name}：{err}"));
+                    None
+                }
+            }
+        })
+    })
+}
+
 /// 在已装配 `AgentSpinePlugin` 与模型适配器的 `Context` 上启动 TUI，并在恢复终端后返回当前会话摘要。
 pub async fn run_tui_with_summary(
     ctx: Context,
@@ -690,6 +710,12 @@ pub async fn run_tui_with_summary(
 
         let mut needs_redraw = true;
 
+        let ensure_bin = interactive_bin_resolver(&ctx);
+        let mut bin_tasks = tokio::task::JoinSet::new();
+        for tool in ["fd", "rg"] {
+            bin_tasks.spawn(ensure_bin(tool));
+        }
+
         let update_check_task = if config.check_for_updates {
             let tx_update = ui_tx.clone();
             Some(tokio::spawn(async move {
@@ -857,6 +883,7 @@ pub async fn run_tui_with_summary(
         if let Some(task) = update_check_task {
             task.abort();
         }
+        bin_tasks.shutdown().await;
         run_loop_res
     }
     .await;

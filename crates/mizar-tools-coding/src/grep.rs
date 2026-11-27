@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::managed_bins::{EnsureBinFn, resolve_managed_bin};
 use crate::path_utils::resolve_to_cwd;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -76,7 +77,11 @@ fn format_rel_path(raw: &str, search_path: &Path, is_dir: bool) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-pub fn create_grep_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefinition {
+pub fn create_grep_tool(
+    cwd: PathBuf,
+    restrict_to_workspace: bool,
+    ensure_bin: Option<EnsureBinFn>,
+) -> ToolDefinition {
     ToolDefinition::async_rich_tool(
         "grep",
         format!(
@@ -100,6 +105,7 @@ pub fn create_grep_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
         }),
         move |args, call_ctx| {
             let cwd = cwd.clone();
+            let ensure_bin = ensure_bin.clone();
             async move {
                 let pattern = args
                     .get("pattern")
@@ -139,7 +145,15 @@ pub fn create_grep_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
                     .map_err(|_| format!("Path not found: {}", search_path.display()))?;
                 let is_dir = meta.is_dir();
 
-                let mut cmd = Command::new("rg");
+                let rg = match (resolve_managed_bin("rg"), ensure_bin) {
+                    (Some(path), _) => Some(path),
+                    (None, Some(ensure)) => tokio::select! {
+                        _ = call_ctx.cancel.cancelled() => return Err("Operation aborted".into()),
+                        path = ensure("rg") => path,
+                    },
+                    (None, None) => None,
+                }.ok_or("找不到可用的 rg，请运行 `mizar install-tools rg` 或安装 ripgrep 后重试")?;
+                let mut cmd = Command::new(&rg);
                 cmd.arg("--no-config")
                     .arg("--json")
                     .arg("--line-number")
@@ -173,13 +187,7 @@ pub fn create_grep_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
 
-                let mut child = cmd.spawn().map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        "ripgrep (rg) 未安装或不在 PATH 中".to_string()
-                    } else {
-                        format!("Failed to run ripgrep: {e}")
-                    }
-                })?;
+                let mut child = cmd.spawn().map_err(|e| format!("无法执行 {}：{e}，请运行 `mizar install-tools --force rg` 或安装 ripgrep", rg.display()))?;
 
                 let stdout = child.stdout.take().expect("stdout piped");
                 let mut stderr = child.stderr.take().expect("stderr piped");

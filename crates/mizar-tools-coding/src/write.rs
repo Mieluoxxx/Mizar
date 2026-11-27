@@ -84,4 +84,5 @@ pub fn create_write_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefin
         }
     }))
     .with_prompt_snippet("Create or overwrite files")
+    .with_prompt_guidelines(vec!["Use write only for new files or complete rewrites.".into()])
 }

@@ -3,6 +3,7 @@
 pub mod clipboard;
 pub mod exec;
 pub mod runner;
+pub mod tools_manager;
 pub mod update;
 
 pub use mizar_client::events::{

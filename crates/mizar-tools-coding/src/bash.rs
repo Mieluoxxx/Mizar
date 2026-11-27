@@ -1,4 +1,4 @@
-//! `bash` 工具：执行 shell 命令，支持并行批次、默认 `120s` 超时（上限 `600s`）、追加 `~/.mizar/bin` 到 `PATH` 末尾、防 OOM 流式落盘、O(1) 实时预览与 `20KB / 400 lines / 768B` 双向省略输出。
+//! 托管工具排在搜索路径末尾，以保留用户已有工具链的优先级。
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::managed_bins::mizar_bin_dir;
+
 pub const DEFAULT_BASH_TIMEOUT_SECS: f64 = 120.0;
 pub const MAX_BASH_TIMEOUT_SECS: f64 = 600.0;
 
@@ -27,10 +29,6 @@ const BASH_STRUCTURED_MAX_BYTES: usize = 1024 * 1024;
 const HEAD_CAPTURE_CAP: usize = 32 * 1024;
 const TAIL_CAPTURE_CAP: usize = 32 * 1024;
 const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(200);
-
-fn mizar_bin_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".mizar").join("bin"))
-}
 
 /// 固定优先使用 POSIX 兼容 shell，避免继承用户交互式 `fish`/`nu`/`csh` 导致语法失败。
 pub fn resolve_shell() -> String {

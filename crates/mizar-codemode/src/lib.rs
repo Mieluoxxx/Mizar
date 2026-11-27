@@ -127,7 +127,8 @@ impl Plugin for CodemodePlugin {
                     .with_prepare_loadout(move |loadout| {
                         Some(prepare_codemode_loadout(loadout, only_mode, inline_budget))
                     })
-                    .with_prompt_snippet("Execute sandboxed JavaScript to compose multiple tools in one turn"),
+                    .with_prompt_snippet("Execute sandboxed JavaScript to compose multiple tools in one turn")
+                    .with_prompt_guidelines(vec!["Use codemode to batch independent tool calls (Promise.allSettled), chain them, or filter large output, instead of many separate calls.".into()]),
                 )?))
             })?;
 
