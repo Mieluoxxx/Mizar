@@ -5,15 +5,16 @@ group: reference
 order: 7
 ---
 
-`mizar` 二进制（由 `mizar-tui` 编译）提供三个入口形态，同一套配置加载、路由解析与 Cordis 插件装配逻辑驱动所有模式。
+`mizar` 二进制（由 `mizar-tui` 编译）提供四个入口形态，同一套配置加载、路由解析与 Cordis 插件装配逻辑驱动核心与运行模式。
 
-## 三个命令行入口
+## 命令行入口
 
-| 命令形态 | 作用 | 输入来源 |
+| 命令形态 | 作用 | 输入来源 / 参数 |
 | :--- | :--- | :--- |
 | `mizar [OPTIONS]` | 启动交互式 TUI 工作台；若传入 `-p` / `--prompt` / `--prompt-file` 则自动转入无头单次执行 | 交互输入，或通过 `-p` / `--prompt-file` 指定单轮提示词 |
 | `mizar exec [OPTIONS] [<prompt>]` | 非交互无头单轮执行；适配 CI/CD、自动化评测与管道脚本 | 位置参数 `<prompt>`、`-p`、`--prompt-file`，缺省时自动从标准输入管道读取 |
 | `mizar update [FLAGS]` | 校验 SHA-256 并从 GitHub Releases 升级或切换二进制版本 | `-v/--version <ver>`、`-f/--force`、`--check`、`-h/--help` |
+| `mizar install-tools [--force] [rg\|fd ...]` | 安装或校验托管搜索工具 `rg` 与 `fd`（存入 `$MIZAR_HOME/bin`） | 默认同时处理 `rg` 与 `fd`；`--force` 强制重装，支持 `ghfast.top` 镜像回退 |
 
 ## 命令行参数全表（`mizar` 与 `mizar exec`）
 
@@ -29,12 +30,13 @@ order: 7
 | `--reasoning-effort <level>` | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | 全局 | 设置推理/思考强度 |
 | `--max-steps <n>` | 正整数（默认不限） | 全局 | 单轮对话内允许的最大工具步数上限；超限返回 `code=max_steps` |
 | `--max-tokens <n>` | 正整数 | 全局 | 覆盖单次模型响应的最大输出 Token 数 |
+| `--context-window <tokens>` | 正整数（`>= 1`） | 全局（TUI / `exec`） | 覆盖模型上下文总窗口大小（优先于 `MIZAR_CONTEXT_WINDOW` 与模型目录） |
 | `--timeout <secs>` | 秒数 | `exec` | 无头执行整轮超时；超时终止并返回退出码 `124` |
-| `--output-format <fmt>` | `text`（默认）\| `json` | `exec` | 控制无头模式最终 `stdout` 输出格式 |
-| `--json` | 布尔标志 | `exec` | `--output-format json` 的简写别名 |
+| `--output-format <fmt>` | `text`（默认）\| `json` \| `ndjson` | `exec` | 控制无头输出格式；`json` 与 `ndjson` 均逐行刷新 NDJSON 事件流，`result` 末行输出 |
+| `--json` | 布尔标志 | `exec` | `--output-format ndjson` 的简写别名 |
 | `--trace-out <path>` | 文件路径 | `exec` | 退出时将结构化 `TrajectoryExport` JSON 原子写入目标路径（优先于 `MIZAR_TRACE_OUT`） |
 | `--isolated` | 布尔标志 | 全局 | 忽略全局与项目级磁盘配置文件，以纯净内存态启动 |
-| `--minimal` | 布尔标志 | 全局 | 使用 `MinimalCoding` 预设（仅保留 `read` / `bash` / `edit` / `write`） |
+| `--minimal` | 布尔标志 | 全局 | 使用默认 `MinimalCoding` 预设（仅保留 `read` / `bash` / `edit` / `write`） |
 | `--read-only` | 布尔标志 | 全局 | 使用 `ReadOnly` 预设（仅保留 `read` / `grep` / `find`） |
 | `-t`, `--tools <csv>` | 逗号分隔工具名 | 全局 | 显式启用或约束允许的工具列表 |
 | `-xt`, `--exclude-tools <csv>` | 逗号分隔通配符 | 全局 | 叠加屏蔽工具列表（升为 `Hidden`，在常规声明和 `codemode` 中同步隐藏） |
@@ -42,7 +44,7 @@ order: 7
 | `--approve` | 布尔标志 | TUI | 强制开启非只读工具交互审批闸门（等效 `ui.approvalMode: "ask"`） |
 | `-c`, `--continue` | 布尔标志 | TUI / `exec` | 自动续接当前工作区最近一次保存的历史会话 |
 | `-r`, `--resume [id]` | 可选会话 ID | TUI / `exec` | 不带 ID 时打开交互式历史选择器（TUI），带 ID 时直接恢复对应会话 |
-| `--no-persist` | 布尔标志 | 全局 | 禁用 SQLite 持久化（仅在内存中维护本次会话） |
+| `--no-persist` | 布尔标志 | 全局 | 禁用 JSONL 会话落盘（仅在内存中维护本次会话） |
 | `--no-instructions` | 布尔标志 | 全局 | 跳过启动期 `AGENTS.md` / `CLAUDE.md` 指令发现与注入 |
 | `--theme <name>` | 主题名（默认 `auto`） | TUI | 设置初始主题：`auto` \| `mist-dark` \| `mist-light` \| `sakura-dark` \| `system` \| `ansi16` |
 | `-h`, `--help` | — | 全局 | 打印帮助信息 |
@@ -50,23 +52,31 @@ order: 7
 
 ## `mizar exec` 自动化输出契约
 
-### JSON 输出 Schema（`--json` / `--output-format json`）
+### NDJSON 流式事件 Schema（`--json` / `--output-format ndjson` / `--output-format json`）
 
-成功完成（`TurnEndReason::Completed`）时，`stdout` 输出单行合法 JSON：
+每行一条带 `type` 与 `ts_ms` 的 JSON 对象，每行写入后立即 `flush`：依次发出 `session`、`step_start`、`tool_call`（`arguments_preview` 脱敏且至多 `512` 字符）、`tool_result`（含各工具独立耗时 `duration_ms` 与 `images` 数）、`retry`（同时向 `stderr` 输出 `[W retry]`）、`compaction`、`step_end`（含单步六项 `usage`），并在持久化写入屏障后输出唯一的终态 `result`（参数校验失败仅输出单行 `reason="invalid_request"`）：
 
-```json title="stdout (--output-format json)"
+```json title="stdout (--json / --output-format ndjson 末行 result 示例)"
 {
+  "type": "result",
+  "ts_ms": 1764250000000,
   "session_id": "019...",
   "resumed": false,
   "reason": "completed",
+  "exit_code": 0,
   "steps": 4,
   "duration_ms": 3820,
   "llm_ms": 2910,
   "ttft_ms": 340,
   "tool_ms": 880,
   "tool_calls": 6,
+  "tool_errors": 0,
+  "retries": 0,
+  "compactions": 0,
   "session_turns": 1,
   "session_steps": 4,
+  "usage": { "input_tokens": 1200, "output_tokens": 350, "total_tokens": 1550, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0 },
+  "session_usage": { "input_tokens": 1200, "output_tokens": 350, "total_tokens": 1550, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0 },
   "text": "已完成 Cargo.toml 分析……"
 }
 ```
@@ -76,7 +86,7 @@ order: 7
 | 退出码 | 语义 | 诊断文本特征（输出至 `stderr`） |
 | :--- | :--- | :--- |
 | `0` | 成功完成本轮推理与全部工具调用 | — |
-| `1` | 一般错误、步数超限、输出截断或取消 | 包含 `code=max_steps`、`code=max_tokens`、`code=cancelled` 或密钥脱敏后的错误详情 |
+| `1` | 一般错误、存储失败、步数超限、输出截断或取消 | 包含 `code=storage`、`code=max_steps`、`code=max_tokens`、`code=cancelled`、`invalid_request` 或密钥脱敏后的错误详情 |
 | `124` | 达到 `--timeout` 设定秒数 | `execution timed out after <secs>s (code=timeout)` |
 | `130` / `143` | 收到系统信号中断（如 `SIGINT` / `SIGTERM`） | `execution interrupted by signal (code=cancelled)` |
 
@@ -104,9 +114,12 @@ order: 7
 | 变量名 | 默认值 / 说明 |
 | :--- | :--- |
 | `WORKSPACE` | 覆盖工作区根目录（优先级低于 `-C/--workspace`） |
-| `MIZAR_HOME` | 全局配置目录，默认 `~/.mizar`（存放 `settings.json`、`models.json`、`mcp.json`、`sessions.sqlite`） |
+| `MIZAR_HOME` | 全局配置目录，默认 `~/.mizar`（存放 `settings.json`、`models.json`、`mcp.json`、`sessions/`、`bin/`） |
 | `MIZAR_AGENTS_HOME` | 全局 Agent 扩展根目录，默认 `~/.agents`（存放全局 `AGENTS.md` 与 `skills`） |
-| `MIZAR_SESSION_DB` | 覆盖 SQLite 数据库路径；设为 `none` 或 `off` 时等价于 `--no-persist` |
+| `MIZAR_SESSIONS_DIR` | 覆盖 JSONL 会话持久化目录（默认 `~/.mizar/sessions`）；设为 `none`、`off`、`memory` 或空串时禁用落盘 |
+| `MIZAR_CONTEXT_WINDOW` | 覆盖模型上下文总窗口大小（优先级低于 `--context-window`，高于模型目录） |
+| `MIZAR_CACHE_RETENTION` / `PI_CACHE_RETENTION` | 覆盖默认缓存保留策略（`none` / `short` / `long`） |
+| `MIZAR_LLM_IDLE_TIMEOUT_SECS` | 覆盖 HTTP / SSE 流无进展空闲超时秒数 |
 | `MIZAR_BUNDLED_SKILL_DIR` | 指定内置技能目录路径（优先级低于 `settings.json` 的 `skills.bundledDir`） |
 | `MIZAR_TRACE_OUT` | 无头执行退出时默认导出 `TrajectoryExport` JSON 的目标路径 |
 | `CORDIS_LOG` | 控制 Cordis 微内核日志输出级别（如 `debug` / `warn`） |
@@ -122,13 +135,17 @@ order: 7
 | `REQUESTS_CA_BUNDLE` | Python requests 兼容 CA bundle 路径 |
 | `NODE_EXTRA_CA_CERTS` | Node.js 额外信任根证书路径 |
 
-### 4. 自更新与离线模式
+### 4. 自更新、离线模式与搜索工具安装
 
 | 变量名 | 说明 |
 | :--- | :--- |
-| `MIZAR_OFFLINE` | 设为 `1`/`true`/`yes`/`on` 时完全禁用启动版本检查及离线外联检查 |
+| `MIZAR_OFFLINE` / `PI_OFFLINE` | 设为 `1`/`true`/`yes`/`on` 时跳过启动版本检查及 `mizar install-tools` 离线下载 |
 | `MIZAR_SKIP_VERSION_CHECK` | 设为 `1`/`true`/`yes`/`on` 时仅跳过启动异步更新检测 |
 | `MIZAR_RELEASE_BASE_URL` | 覆写 `mizar update` 下载源基准 URL（默认 `https://github.com/Mieluoxxx/Mizar`） |
+| `MIZAR_GITHUB_BASE_URL` | 覆写 `mizar install-tools` / TUI 搜索工具下载基址（默认 `https://github.com`） |
+| `MIZAR_GITHUB_MIRROR` | 下载失败、慢速或停滞时的镜像前缀（默认 `https://ghfast.top`，请求 `{mirror}/{原始URL}`；设为 `off`/`none`/空串关闭） |
+| `MIZAR_BIN_WARMUP_MS` / `MIZAR_BIN_SLOW_BPS` | 预热等待毫秒数（默认 `5000`）与慢速切换阈值字节/秒（默认 `65536`） |
+| `MIZAR_BIN_STALL_MS` | 下载连续无新字节的停滞切换时限毫秒数（默认 `8000`） |
 
 ### 5. 终端能力、TUI 强调语法与外置编辑器
 

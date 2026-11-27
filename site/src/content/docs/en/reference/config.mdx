@@ -36,20 +36,21 @@ All JSON keys use **camelCase**:
 | `defaultModel` | `string` | `null` | Default model ID |
 | `reasoningEffort` | `string` | `null` | Default effort (alias `defaultThinkingLevel`): `off`..`max` |
 | `maxSteps` | `number` | `null` (unlimited) | Max tool steps per turn |
-| `persona` | `string` | Built-in static English | Overrides Section 1 identity text in system prompt |
-| `toolsPreset` | `string` | `"all"` | Preset: `"all"` \| `"minimal"` \| `"read-only"` |
+| `personality` | `string` | `null` | Optional communication style inserted after `identity` (omitted/blank = `0` bytes) |
+| `toolsPreset` | `string` | `"minimal"` | Preset: `"minimal"` \| `"minimal-coding"` \| `"all"` \| `"read-only"` \| `"readonly"` |
 | `tools` | `string[]` | `null` | Explicit tool allowlist (same as `--tools`) |
 | `excludeTools` | `string[]` | `[]` | Glob patterns forced to `Hidden` (union-merged across layers) |
 | `disabledPlugins` | `string[]` | `[]` | Cordis module or host extension IDs to disable (sorted/deduped union) |
 | `restrictToWorkspace` | `boolean` | `false` | Scope built-in file tools to canonical workspace tree (**does NOT restrict `bash`**) |
-| `sessionDb` | `string` | `~/.mizar/sessions.sqlite` | SQLite DB path; `"none"` or `"off"` disables disk writes |
+| `sessionsDir` | `string` | `~/.mizar/sessions` | JSONL sessions directory; `"none"`, `"off"`, or `"memory"` disables disk persistence |
 
-### `codemode` — Always-On QuickJS Sandbox
+### `codemode` — On-Demand QuickJS Sandbox
 
-In this branch `codemode` is **always active by default** (no `autoEnable` field). To disable it, add `"codemode"` to `disabledPlugins` or `excludeTools`:
+`codemode` stays dormant by default and activates on demand when `--tools codemode`, `codemode.enabled: true`, `codemode.onlyMode: true`, or an enabled MCP server / `toolExposure` uses `codemode`. Set `enabled: false`, or add `"codemode"` to `disabledPlugins` / `excludeTools`, to disable it completely:
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `codemode.enabled` | `boolean` | `null` (on-demand) | Explicit opt-in (`true`) or opt-out (`false`); defaults to `onlyMode` or static MCP config |
 | `codemode.onlyMode` | `boolean` | `false` | Hide `Direct` coding schemas from model so all tool calls go through `codemode` JS |
 | `codemode.inlineBudget` | `number` | `3000` | Max inline character budget for tool synopsis descriptions |
 | `codemode.timeoutMs` | `number` | `120000` | QuickJS execution timeout in milliseconds |
@@ -65,7 +66,7 @@ In this branch `codemode` is **always active by default** (no `autoEnable` field
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `skills.enabled` | `boolean` | `true` | Enable `SKILL.md` scanning and the `skill` tool |
+| `skills.enabled` | `boolean` | `true` | Enable `SKILL.md` scanning, `<available_skills>` injection (when `read`/`bash` declared), and `/<name>` expansion |
 | `skills.customDirs` | `string[]` | `[]` | Additional skill root directories (union-merged) |
 | `skills.bundledDir` | `string` | `null` | Override bundled skills directory path |
 | `skills.catalogDescriptionMaxLength` | `number` | `500` | Max chars per skill description in catalog |
@@ -81,25 +82,18 @@ In this branch `codemode` is **always active by default** (no `autoEnable` field
 | `instructions.maxBytes` | `number` | `65536` | Total byte cap across all loaded instruction files (evicts furthest ancestors first) |
 | `instructions.maxSourceBytes` | `number` | `1048576` | Max bytes read from any single instruction file (1 MiB) |
 
-### `compaction` — Cache-Aware Tail Pruning & B-5 Compaction
+### `compaction` — Hot-Cache-Aware Tail Pruning & B-5 Compaction
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `compaction.enabled` | `boolean` | `true` | Enable compaction runtime and `FileGuardTracker` |
 | `compaction.autoCompact` | `boolean` | `true` | Automatically summarize when usage crosses trigger threshold |
+| `compaction.defaultContextWindow` | `number` | `128000` | Default context window fallback when catalog, env var, and CLI override are unset |
 | `compaction.maxContextTokens` | `number` | `null` | Optional ceiling capping computed `effective_window` |
 | `compaction.triggerRatio` | `number` | `0.80` | Fraction of `effective_window` that triggers auto-compaction |
 | `compaction.keepRecentTokens` | `number` | `20000` | Minimum recent context tokens preserved verbatim across compaction |
-| `compaction.supersedeReads` | `boolean` | `true` | Tail-prune older `read` outputs superseded by a full re-read (protects 8k warm suffix) |
-| `compaction.dropUseless` | `boolean` | `true` | Tail-prune zero-hit noise outputs (always protects `skill` and 8k warm suffix) |
-
-### `recall` — Single Static Episode Recall
-
-| Key | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `recall.enabled` | `boolean` | `true` | Enable the static `recall` tool |
-| `recall.defaultSearchLimit` | `number` | `8` | Default hits returned by `recall(query=...)` (hard cap `20`) |
-| `recall.readCharLimit` | `number` | `6000` | Default character page limit for `recall(seq=...)` (hard cap `8192`) |
+| `compaction.supersedeReads` | `boolean` | `true` | Tail-prune older `read` outputs superseded by a full re-read (protects hot cache & 8k suffix) |
+| `compaction.dropUseless` | `boolean` | `true` | Tail-prune zero-hit noise outputs (always protects `SKILL.md` reads, hot cache, and 8k suffix) |
 
 ### `sessionTitle` & `ui`
 
@@ -139,11 +133,11 @@ In this branch `codemode` is **always active by default** (no `autoEnable` field
 
 ## Complete `disabledPlugins` IDs
 
-### 1. Optional Built-In Cordis Modules (13 IDs)
+### 1. Optional Built-In Cordis Modules (12 IDs)
 
 Can be toggled at startup via `settings.json` or live in `/settings`:
 
-`compaction`, `tool-time`, `tool-fs`, `tools-coding`, `tool-search`, `codemode`, `mcp`, `skills`, `instructions`, `recall`, `session-title`, `trajectory`, `repeat-guard`
+`compaction`, `tool-time`, `tool-fs`, `tools-coding`, `tool-search`, `codemode`, `mcp`, `skills`, `instructions`, `session-title`, `trajectory`, `repeat-guard`
 
 ### 2. Official Host & TUI Extension IDs (10 `KNOWN_HOST_EXTENSION_IDS`)
 
@@ -163,6 +157,7 @@ Loads `~/.mizar/mcp.json` and `<workspace>/.mizar/mcp.json`. Workspace entries t
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `autoEnableCodemode` | `boolean` | `true` | Top-level toggle: auto-activates `codemode` when any enabled server or override uses `codemode` |
 | `mcpServers.<name>.command` | `string` | `null` | Stdio executable path/name (mutually exclusive with `url`) |
 | `mcpServers.<name>.args` | `string[]` | `[]` | Stdio CLI arguments |
 | `mcpServers.<name>.env` | `Record<string, string>` | `{}` | Environment variables passed to stdio child |

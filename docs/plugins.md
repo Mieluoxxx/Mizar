@@ -42,8 +42,8 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`mizar-llm-http`** | 工具库（非插件） | — | 共享异步 `reqwest` 客户端、超时控制与 SSE 流驱动封装（隔离重型 TLS/HTTP 依赖图） | — | `mizar-llm` |
 | **`mizar-llm-completions`** | `CompletionsPlugin` | `"llm-completions"` | **OpenAI Chat Completions 兼容协议适配器**：支持 OpenAI、DeepSeek、OpenRouter、Qwen、vLLM 等端点及 `CompletionsCompat` 方言开关（思考格式、`max_tokens` 字段等） | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http` |
-| **`mizar-llm-responses`** | `ResponsesPlugin` | `"llm-responses"` | **OpenAI Responses 协议适配器**：对接 `/responses` 接口，默认将 `System` 作为 `developer` 内联 `input` 首位以命中 Prompt Cache（可选顶层 `instructions`），并保序回放 `outputItems` 及解析文本、思考摘要、函数调用与 `usage` 流式事件 | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http` |
-| **`mizar-llm-messages`** | `MessagesPlugin` | `"llm-messages"` | **Anthropic Messages 协议适配器**：对接 `/v1/messages`，自动处理 `system` 抽取、连续 `tool_result` 合并、`thinking` 签名与前缀摘要校验 | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http` |
+| **`mizar-llm-responses`** | `ResponsesPlugin` | `"llm-responses"` | **OpenAI Responses 协议适配器**：对接 `/responses` 接口，默认将 `System` 作为 `developer` 内联 `input` 首位以命中 Prompt Cache（`supportsDeveloperRole: false` 降级为 `system`，可选顶层 `instructions`），受 `supportsStore`/`supportsTemperature`/`supportsReasoningEffort`/`supportsPromptCacheKey` 门控字段，保序回放 `outputItems` 并解析文本、思考摘要、函数调用与 `usage` 流式事件 | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http` |
+| **`mizar-llm-messages`** | `MessagesPlugin` | `"llm-messages"` | **Anthropic Messages 协议适配器**：对接 `/v1/messages`，自动处理 `system` 抽取、连续 `tool_result` 合并、`thinking` 签名与前缀摘要校验，并在计算 `prefixDigest` 后注入 `system` / 末尾 `tools`（受 `supportsCacheControlOnTools` 门控）/ 末尾 `user` 块的 `cache_control` 断点以保住签名思考回放 | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http` |
 | **`mizar-llm-mock`** | `MockPlugin` | `"llm-mock"` | **离线假模型适配器**：无需 API Key，按关键词规则模拟 `get_time` / `list_dir` 工具调用与逐字流式输出，用于演示与无网测试 | `["llm"]` | `cordis`、`mizar-llm` |
 | **`mizar-llm-retry`** | 策略与流收集库 | — | 提供 `RetryConfig`、带抖动的退避、可取消等待和 `collect_with_retry`。主循环、压缩器和标题生成各自持有请求的重试预算 | — | `mizar-llm` |
 | **`mizar-llm-router`** | `LlmRouter` | `"llmRouter"`（服务） | **多提供方声明式路由与热重载插件**：将多路由配置（`~/.mizar/models.json`）映射到上述协议适配器，支持 `protocol` 选择、`api_key_env` 与 `$VAR` / `${VAR}` / `!command` 动态解析、`models` / `modelOverrides` 目录、请求头扩展钩子，并暴露 `apply_config` 原子热更新接口（**当前无内置文件监听**，需宿主在配置变更时主动调用） | `["llm"]` | `cordis`、`mizar-llm`、`mizar-llm-http`、`mizar-llm-completions`、`mizar-llm-responses`、`mizar-llm-messages`、`mizar-llm-mock` |
@@ -79,7 +79,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件结构体 | 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-tools-coding`** | `CodingToolsPlugin` | `"tools-coding"` | `read`、`bash`、`edit`、`write`、`grep`、`find` | `["tools"]`，可选 `systemPrompt` | 默认 `MinimalCoding` 声明前四项。`All` 或 `--tools` 可启用独立的 `grep` 和 `find`，`ReadOnly` 提供 `read`、`grep` 和 `find`。文本可按行分页读取，读图按文件头识别并检查 32 MiB 输入上限。`edit` 支持批量局部替换。按会话声明生成 `<tools>` 和 `<rules>`。`bash` 给模型展示首尾摘要（20 KiB、400 行、每行 768 字节），给脚本的 `structured_content.output` 最多 1 MiB，完整落盘输出可通过 `full_output_path` 读取 | `cordis`、`mizar-image`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-tools-coding`** | `CodingToolsPlugin` | `"tools-coding"` | `read`、`bash`、`edit`、`write`、`grep`、`find` | `["tools"]`，可选 `systemPrompt` | 默认 `MinimalCoding` 声明前四项。`All` 或 `--tools` 可启用独立的 `grep` 和 `find`，`ReadOnly` 提供 `read`、`grep` 和 `find`。文本可按行分页读取，读图按文件头识别并检查 32 MiB 输入上限。`edit` 支持批量局部替换。按会话声明生成 `<tools>` 和 `<rules>`。`bash` 给模型展示首尾摘要（20 KiB、400 行、每行 768 字节），给脚本的 `structured_content.output` 最多 1 MiB，不论 `<= 64 KiB` 或流式溢写均以原始字节落盘临时文件（`full_output_path`）且不吞写错误；被 Unix 信号终止时退出码记为 `128 + sig` 并提示信号编号 | `cordis`、`mizar-image`、`mizar-system-prompt`、`mizar-tools` |
 
 `<tools>` 按声明顺序列出工具与 `prompt_snippet`。`<rules>` 根据 `bash`、`grep`、`find` 的可用性给出搜索建议，再按原顺序收集各工具的 `prompt_guidelines` 并去重，最后提示并行执行独立调用、简洁回复和写清文件路径。
 
@@ -124,7 +124,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件结构体 | 插件名 | 提供服务名 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-session-jsonl`** | `JsonlPersistencePlugin` | `"session-persistence-jsonl"` | `"sessionPersistence"` | 无 | **宽容单会话 JSONL 持久化 + Blob 外置**：按 canonicalize 后的 `cwd` 分桶存储（`<sessions_dir>/<encoded-cwd>/<YYYYMMDDTHHMMSSZ>_<session_id>.jsonl`），无 `cwd` 归入 `_global`；启动期执行可写探针，初始化/写入失败显式暴露给宿主；**惰性落盘**（空会话不建空文件，首次非空追加或 `fork` 才写盘）；用户/上下文/工具图片 base64 经纯 Rust RFC 6234 SHA-256 摘要原子外置到同级 `blobs/<sha256>`（`blob:sha256:<hex>` 引用，缺失仅剔除丢失附件并告警）；Single-Writer 后台线程通过 `mpsc` 顺序追加与 `flush` 同步屏障保障有序落盘并暴露 `last_error`；宽容读取跳过空行/未知记录/崩溃截断尾行且严禁用整数版本号拒开。默认目录 `~/.mizar/sessions`（`MIZAR_SESSIONS_DIR` 可覆盖，设为 `none`/`off`/`memory` 关闭落盘） | `cordis`、`chrono`、`mizar-llm-types`、`mizar-session` |
+| **`mizar-session-jsonl`** | `JsonlPersistencePlugin` | `"session-persistence-jsonl"` | `"sessionPersistence"` | 无 | **宽容单会话 JSONL 持久化 + Blob 外置**：按 canonicalize 后的 `cwd` 分桶存储（`<sessions_dir>/<encoded-cwd>/<YYYYMMDDTHHMMSSZ>_<session_id>.jsonl`），无 `cwd` 归入 `_global`；启动期执行可写探针，初始化/写入失败显式暴露给宿主；**惰性落盘**（空会话不建空文件，首次非空追加或 `fork` 才写盘）；`fork` 拒绝重复会话 ID 或覆盖既有文件；用户/上下文/工具图片 base64 经纯 Rust RFC 6234 SHA-256 摘要原子外置到同级 `blobs/<sha256>`（`blob:sha256:<hex>` 引用，缺失仅剔除丢失附件并告警）；Single-Writer 后台线程通过 `mpsc` 顺序追加与 `flush` 同步屏障保障有序落盘并暴露 `last_error`；宽容读取跳过空行/未知记录/崩溃截断尾行且严禁用整数版本号拒开。默认目录 `~/.mizar/sessions`（`MIZAR_SESSIONS_DIR` 可覆盖，设为 `none`/`off`/`memory` 关闭落盘） | `cordis`、`chrono`、`mizar-llm-types`、`mizar-session` |
 | **`mizar-session-title`** | `SessionTitleRuntime` | `"session-title"` | `"sessionTitle"` | `["llm", "sessions"]` | **后台异步会话标题自动生成**：订阅 `agent/turn-input`（仅提取 `SessionEvent::User` 消息），首轮输入及每隔 `refresh_interval_turns`（默认 20）轮异步生成 `MMDD｜TYPE｜Topic` 标题（`FEA/DES/FIX/OPT/REL/EXP/DOC/RES`）；自动跳过 `Offline Mock` 并尊重人工 `/rename` 所有权（`TitleSource::Manual`）与并发改名保护；失败静默不重试并保留 `derive_session_title` 兜底清洗标题；提供 `regenerate_now` 供 `/rename` 无参手动重生成 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-llm-retry`、`mizar-session` |
 
 ---
@@ -133,7 +133,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 插件 / 服务结构体 | 插件名 / 提供服务 | 作用 | 运行时服务依赖（`inject`） | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-agent-loop`** | `AgentLoop` | `"AgentLoop"` / 提供 `"agentLoop"` | **Agent 主循环**：串联「记录用户输入 → 拼装提示词与历史 → 流式调模型 → 执行工具并写回会话 → 直到最终回答」，在同一步内重试首字前或仅有思考的瞬时断流，通过 `agent/retry` 通知客户端清理草稿；`max_steps` 默认 `None` 不限步数，靠模型收敛、重复守卫与 `CancellationToken` 终止 | `["llm", "tools", "sessions", "systemPrompt"]` | `cordis`、`mizar-llm`、`mizar-llm-retry`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-agent-loop`** | `AgentLoop` | `"AgentLoop"` / 提供 `"agentLoop"` | **Agent 主循环**：串联「记录用户输入 → 拼装提示词与历史 → 流式调模型 → 执行工具并写回会话 → 直到最终回答」，同一步内重试首字前或仅有思考的瞬时断流，通过 `agent/retry` 通知客户端清理草稿；overflow 压缩恢复后按 `session_id` 刷新系统提示词与声明工具；直调工具强制校验当前步公布白名单并独立统计各工具真实耗时（`duration_ms`）；`max_steps` 默认 `None` 不限步数，靠模型收敛、重复守卫与 `CancellationToken` 终止 | `["llm", "tools", "sessions", "systemPrompt"]` | `cordis`、`mizar-llm`、`mizar-llm-retry`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
 | **`mizar-trajectory`** | `TrajectoryRuntime` + `RepeatToolGuardPlugin` | `"trajectory"`（服务）/ `"repeat-tool-guard"` | **轨迹观测运行时**：基于 `mizar-trajectory-core` 模型与检测器提供 `"trajectory"` 服务，订阅会话与 `agent/*` 事件实时采集 `TraceEvent`（广播 `trajectory/anomaly`），支持结构化 `TrajectoryExport`（`mizar exec --trace-out` / `MIZAR_TRACE_OUT`）与可选 `{export_dir}/{session_id}.jsonl` 落盘；`RepeatToolGuardPlugin` 在 `tools/post-execute` waterfall 上捕捉连续重复调用并追加提醒或强制拦截 | 无（全部通过事件订阅接入） | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools`、`mizar-trajectory-core` |
 
 ---
@@ -158,7 +158,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `MIZAR_BIN_SLOW_BPS`、`MIZAR_BIN_WARMUP_MS` | 默认预热 5,000 毫秒。直连平均速率低于 65,536 字节/秒时，转到已启用的镜像。 |
 | `MIZAR_BIN_STALL_MS` | 连续收不到新字节的时限，默认为 8,000 毫秒。 |
 
-`mizar exec` 的 NDJSON 标准输出每行是一条带 `type` 和 `ts_ms` 的 JSON 对象，每行写完即刷新。会话和路由就绪时发送 `session`。`step_start` 和 `step_end` 标记模型调用，`step_end` 给出耗时、首 token 延迟和该步最终尝试的 `usage`。`tool_call` 携带单行脱敏参数预览，最多 512 个字符。`tool_result` 给出调用 ID、工具名、错误状态、耗时和图片张数。`retry` 记录尝试次数、等待毫秒数、原因及是否撤销草稿，标准错误同时写一行 `[W retry]`。`compaction` 报告触发原因、结果和前后 token 数。
+`mizar exec` 的 NDJSON 标准输出每行是一条带 `type` 和 `ts_ms` 的 JSON 对象，每行写完即刷新。会话和路由就绪时发送 `session`。`step_start` 和 `step_end` 标记模型调用，`step_end` 给出耗时、首 token 延迟和该步最终尝试的 `usage`。`tool_call` 携带单行脱敏参数预览，最多 512 个字符。`tool_result` 给出调用 ID、工具名、错误状态、单工具真实执行耗时（并行批次中各自独立计时，而非整批墙钟）和图片张数。`retry` 记录尝试次数、等待毫秒数、原因及是否撤销草稿，标准错误同时写一行 `[W retry]`。`compaction` 报告触发原因、结果和前后 token 数。
 
 启用持久化时，`result` 在会话写入完成或报告存储错误后输出。`reason`、`exit_code`、`text` 和错误时的 `error` 描述终态。本轮指标包括 `steps`、`duration_ms`、`llm_ms`、`ttft_ms`、`tool_ms`、`tool_calls`、`tool_errors`、`retries`、`compactions` 和 `usage`。`session_id`、`resumed`、`session_turns`、`session_steps` 和 `session_usage` 对应整个会话。用量分为 `input_tokens`、`output_tokens`、`total_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens`。`input_tokens` 是未命中缓存的输入，`total_tokens` 合计净输入、缓存读写和输出，推理用量是输出的细分。输入或配置校验失败时仅输出一行 `invalid_request` 终态。
 
@@ -228,7 +228,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 | `toolSearch` | object | `autoEnable` / `defaultLimit` |
 | `skills` | object | `enabled` / `customDirs` / `bundledDir` / `catalogDescriptionMaxLength` |
 | `instructions` | object | `enabled` / `candidates` / `localCandidates` / `projectRootMarkers` / `maxBytes` / `maxSourceBytes` |
-| `compaction` | object | `enabled` / `autoCompact` / `maxContextTokens`（可选软上限，默认 `null`）/ `triggerRatio`（默认 `0.80`）/ `keepRecentTokens`（默认 `20000`）/ `supersedeReads` / `dropUseless` |
+| `compaction` | object | `enabled` / `autoCompact` / `defaultContextWindow`（未知模型默认窗口 `128000`）/ `maxContextTokens`（可选软上限，默认 `null`）/ `triggerRatio`（默认 `0.80`）/ `keepRecentTokens`（默认 `20000`）/ `supersedeReads` / `dropUseless` |
 | `sessionTitle` | object | `enabled`（默认 `true`）/ `model`（可选 `provider/model`，省略则跟随当前会话模型）/ `thinkingLevel`（默认 `"low"`） |
 | `ui` | object | `theme` / `screenMode` / `showThinking` / `verboseExpanded` / `sidePanelOpen` / `mouseCapture` / `approvalMode`（可通过 TUI `/settings` 交互修改并自动保存） |
 

@@ -93,12 +93,12 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Tools & Extensions',
         },
         title: {
-          zh: '工具体系、常驻 Codemode、MCP 与技能',
-          en: 'Tools, Always-On Codemode, MCP & Skills',
+          zh: '工具体系、按需 Codemode、MCP 与技能',
+          en: 'Tools, On-Demand Codemode, MCP & Skills',
         },
         description: {
-          zh: '五级 ToolExposure 模型、编码工具并行写锁、常驻 QuickJS codemode、tool_search、MCP 与 SKILL.md。',
-          en: 'Five-level ToolExposure model, parallel coding tools, always-on QuickJS codemode, tool_search, MCP, and SKILL.md.',
+          zh: '五级 ToolExposure 模型、MinimalCoding 默认四件套、按需 QuickJS codemode、tool_search、MCP 与 SKILL.md 目录注入。',
+          en: 'Five-tier ToolExposure model, MinimalCoding default 4 tools, on-demand QuickJS codemode, tool_search, MCP, and SKILL.md <location> catalog.',
         },
       },
       {
@@ -113,8 +113,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Sessions, Compaction & Trajectory Tracing',
         },
         description: {
-          zh: 'SQLite WAL 持久化、/tree 分叉、B-5 压缩与缓存感知尾部剪枝、单 recall 回溯、/trace 与 --trace-out。',
-          en: 'SQLite WAL persistence, /tree forking, B-5 compaction, cache-aware tail pruning, single recall, /trace, and --trace-out.',
+          zh: '宽容 JSONL 单会话存储与 SHA-256 Blob 外置、/tree 分叉、热缓存感知剪枝与 B-5 压缩、/trace 与 --trace-out。',
+          en: 'Tolerant JSONL persistence + SHA-256 blobs, /tree forking, hot-cache-aware pruning & B-5 compaction, /trace, and --trace-out.',
         },
       },
       {
@@ -129,8 +129,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'KV Cache Stability, Static Prompts & Instructions',
         },
         description: {
-          zh: '四段静态英文提示词、Turn-0 严格顺序、启动期静态 AGENTS.md 加载、冻结工具表与协议层缓存保持。',
-          en: 'Static 4-section English system prompt, Turn-0 ordering, startup-static AGENTS.md, frozen tools, and wire cache alignment.',
+          zh: '精简静态英文系统提示词、Turn-0 严格顺序、启动期静态 AGENTS.md 加载、按需工具表与协议层缓存断点保持。',
+          en: 'Lean static English system prompt, Turn-0 ordering, startup-static AGENTS.md, on-demand tool schemas, and wire cache breakpoints.',
         },
       },
       {
@@ -227,8 +227,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: 'Troubleshooting & Runtime Diagnostics',
         },
         description: {
-          zh: '路由失败、代理证书、兼容网关报错、SQLITE_BUSY、MCP 断连、Codemode 超时与终端渲染问题定位。',
-          en: 'Diagnose routing errors, TLS roots, gateway compat 400s, SQLITE_BUSY, MCP disconnects, codemode timeouts, and terminal glitches.',
+          zh: '路由失败、代理证书、兼容网关报错、JSONL 持久化错误、MCP 断连、Codemode 超时与终端渲染问题定位。',
+          en: 'Diagnose routing errors, TLS roots, gateway compat 400s, JSONL persistence errors, MCP disconnects, codemode timeouts, and terminal glitches.',
         },
       },
       {
@@ -243,8 +243,8 @@ const NAV_GROUP_DEFS: NavGroupDef[] = [
           en: '33-Crate Cordis Architecture & Development',
         },
         description: {
-          zh: 'Cordis 微内核、33 个 Crate 分层、4 个纯核心边界、三段工具管线、feature 门控与测试验证。',
-          en: 'Cordis microkernel, 33-crate layered topology, 4 pure core boundaries, tool waterfall, Cargo features, and test gates.',
+          zh: 'Cordis 微内核、33 个 Crate 分层（28 运行时 + 5 纯核心）、三段工具管线、feature 门控与静态/用户故事验收。',
+          en: 'Cordis microkernel, 33-crate layered topology (28 runtime + 5 pure core), tool waterfall, Cargo features, and static/story gates.',
         },
       },
     ],

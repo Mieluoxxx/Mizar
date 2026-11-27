@@ -1,25 +1,26 @@
 ---
 title: KV Cache Stability, Static Prompts & Instructions
-description: Static 4-section English system prompt, Turn-0 message ordering, startup-static AGENTS.md loading, frozen tool schemas, and wire cache alignment.
+description: Lean static English system prompt, Turn-0 ordering, startup-static AGENTS.md, on-demand tool declarations, and wire cache breakpoints.
 group: core-concepts
 order: 5
 ---
 
-Most input token cost in multi-step coding agents comes from re-reading prefix context. Any per-second timestamp inside system instructions, mid-session tool list mutations, or dynamic per-step disk scans invalidates server-side KV / Prompt Cache prefixes. Mizar enforces prefix stability across prompts, tools, workspace instructions, and wire adapters.
+Most input token cost in multi-step coding agents comes from re-reading prefix context. Any per-second timestamp inside system instructions, unintended tool schema churn, or dynamic per-step disk scans invalidates server-side KV / Prompt Cache prefixes. Mizar enforces prefix stability across prompts, tool lists, workspace instructions, and wire adapters.
 
-## Static 4-Section English System Prompt (`mizar-system-prompt`)
+## Lean Static English System Prompt (`mizar-system-prompt`)
 
-Mizar builds a lean static English system prompt at startup and keeps it byte-identical across turns (`persona` in `settings.json` overrides Section 1):
+Sections assemble by numeric `order` using a lean static English template (no built-in philosophy or default personality block; only explicit non-empty `personality` in `settings.json` is inserted):
 
-| Order | Section | Responsibility |
+| `order` | Section ID | Responsibility |
 | :--- | :--- | :--- |
-| 1 | `DEFAULT_PERSONA` | Core identity, concise engineering discipline, and factual verification rules |
-| 2 | `tools_guide` | Tool usage idioms and always-on `codemode` batching (`Promise.allSettled`) guidance |
-| 3 | `DEFAULT_RUNTIME_PROTOCOL` | Tool invocation, argument error recovery, and output formatting rules |
-| 4 | `emphasis` (optional) | Interactive TUI only (unless `MIZAR_TUI_EMPHASIS_GUIDANCE=0`); omitted in headless `exec` |
+| `0` | `identity` | `DEFAULT_IDENTITY` (`You are a coding assistant running inside Mizar...` and language-matching rule) |
+| `20` | `personality` (optional) | Inserted only when `settings.json` sets a non-empty `personality` (omitted/blank = `0` bytes) |
+| `30` | `tools_guide` | `<tools>` and deduplicated `<rules>` assembled by `mizar-tools-coding::build_tools_guide` from declared session tools |
+| `40` | `runtime_protocol` | `DEFAULT_RUNTIME_PROTOCOL` describing `<environment_context>`, `<project_instructions>`, `<system-reminder>`, `<skill_content>`, and `<mizar-compaction>` |
+| tail | `emphasis` (optional) | Interactive TUI only (unless `MIZAR_TUI_EMPHASIS_GUIDANCE=0`); omitted in headless `exec` |
 
-<Callout type="info" title="Turn-0 Deterministic Ordering (EVENT_AGENT_PREPARE_TURN)">
-  Before dispatching Turn 0, <code>mizar-agent-loop</code> fires <code>EVENT_AGENT_PREPARE_TURN</code> so system instructions, static workspace context, and history maintain strict, reproducible ordering across fresh runs and resumed sessions.
+<Callout type="info" title="Turn-0 Ordering, Skill Catalog & Compaction Refresh">
+  Before Turn 0, <code>mizar-agent-loop</code> fires <code>EVENT_AGENT_PREPARE_TURN</code> to keep system instructions, workspace rules, and history deterministic. Whenever <code>read</code> or <code>bash</code> is declared, <code>mizar-skills</code> injects <code>&lt;available_skills&gt;</code> with <code>&lt;location&gt;</code> pointers or expands <code>/&lt;name&gt;</code> <code>&lt;skill_content&gt;</code>. After compaction or overflow recovery, both <code>system_prompt.build_for_session(Some(&amp;session.id))</code> and <code>tools.list_declared(Some(&amp;session.id))</code> refresh together.
 </Callout>
 
 ## Startup-Static Workspace Instructions (`mizar-instructions`)
@@ -34,20 +35,24 @@ Mizar builds a lean static English system prompt at startup and keeps it byte-id
   - Per-file cap `instructions.maxSourceBytes` (`1,048,576 B` = 1 MiB) and total budget `instructions.maxBytes` (`65,536 B`). When over budget, **broadest/furthest ancestors are evicted first** to preserve instructions closest to the active directory, with UTF-8 safe truncation.
 - **Zero Per-Step Disk I/O**: Prefix bytes never shift mid-session due to background file edits. Pass `--no-instructions` or set `instructions.enabled: false` to disable.
 
-## Frozen Tool Schema List
+## Lean On-Demand Tool Declarations
 
-To avoid mid-session cache invalidation from tool definition drift:
+To avoid unnecessary prefix bloat and schema churn:
 
-- **Single static `recall`**: Always mounted in `Direct` from Turn 0 instead of appearing only after compaction.
-- **Always-on `codemode`**: Always declared by default rather than dynamically toggled.
-- **Zero-dependency omission**: `tool_search` is skipped when 0 MCP `Codemode`/`Deferred` tools exist; `skill` is skipped when 0 skills are loaded; no mutable `<mcp_servers>` status banner invalidates the prompt tail.
+- **`MinimalCoding` 4-tool default**: Declares only `read`, `bash`, `edit`, and `write` by default.
+- **On-demand `codemode`**: Dormant unless enabled via MCP `codemode` config, `--tools codemode`, or `codemode.enabled`/`onlyMode`; in mixed mode, `codemode` declarations and `<mcp_servers>` summaries stay byte-identical before and after MCP handshake.
+- **Zero-dependency omission**: `tool_search` is skipped at 0 MCP tools; the standalone `skill` tool has been removed in favor of `<available_skills>` `<location>` pointers.
 
-## Wire-Level Prefix & Replay Alignment
+## Wire-Level Prefix, Breakpoints & Vision Alignment
 
-Each protocol adapter aligns its wire representation to upstream caching semantics (see [Models & Compat Reference](/en/reference/models/)):
+Each protocol adapter aligns wire formatting to upstream caching and multimodal semantics (see [Models & Compat Reference](/en/reference/models/)):
 
+- **Anthropic Messages (`mizar-llm-messages`)**:
+  - Computes `prefixDigest` **before** inserting `cache_control` breakpoints (`system`, last `tools` entry gated by `supportsCacheControlOnTools`, and last `user` block; `ttl: "1h"` for `Long` retention) so cache strategy switches never invalidate signed `thinking` / `redacted_thinking` replay.
+  - Encodes tool images as a `tool_result.content` array of text + base64 image blocks (plain string when text-only).
 - **OpenAI Responses (`mizar-llm-responses`)**:
-  - Defaults to **`supportsDeveloperRole: true`** and **`useTopLevelInstructions: false`**, inlining system instructions as the first `developer` item inside `input` for contiguous cache hits.
-  - **Ordered `outputItems` replay**: Replays interleaved `reasoning`, `message`, and `function_call` blocks in original emission order, avoiding silent `IN_DROP` item drops.
-- **Anthropic Messages (`mizar-llm-messages`)**: Places `cache_control` breakpoints on system/tools/recent turn boundaries (configurable via `supportsCacheControlOnTools`).
-- **OpenAI Completions & DeepSeek (`mizar-llm-completions`)**: Preserves prefix bytes and sends session affinity headers (`sendSessionAffinityHeaders` / `sessionAffinityFormat`) and `prompt_cache_key` (`supportsPromptCacheKey`).
+  - Defaults to `supportsDeveloperRole: true` and `useTopLevelInstructions: false` (inlining `input[0]` as `"developer"`, or falling back to `"system"` when `supportsDeveloperRole: false`); `supportsStore`, `supportsTemperature`, `supportsReasoningEffort`, and `supportsPromptCacheKey` omit disabled fields completely.
+  - Replays ordered `outputItems` to prevent `IN_DROP` and sends tool images as `function_call_output.output` arrays of `input_text` + `input_image`.
+- **OpenAI Completions & DeepSeek (`mizar-llm-completions`)**:
+  - Sends session affinity headers and `prompt_cache_key`; when a parallel tool batch returns images, emits all `role: "tool"` messages first (appending `(see attached image)`), followed by one synthetic `role: "user"` message carrying all images in order.
+- **Text-Only Model Degradation (`supportsImages`)**: When a catalog model declares `supportsImages: false` (unknown models allow images), all three adapters replace images pre-serialization via `message_for_model` with `[image omitted: current model does not support image input]`.

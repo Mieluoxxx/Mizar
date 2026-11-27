@@ -1,41 +1,41 @@
 ---
-title: Tools, Always-On Codemode, MCP & Skills
-description: Five-level ToolExposure model, parallel coding tools with per-path queues, always-on QuickJS codemode, tool_search, MCP, and SKILL.md.
+title: Tools, On-Demand Codemode, MCP & Skills
+description: Five-tier ToolExposure model, MinimalCoding default 4 tools, on-demand QuickJS codemode, tool_search, MCP, and SKILL.md <location> catalog.
 group: core-concepts
 order: 3
 ---
 
-Every capability in Mizar registers against `"tools"` (`mizar-tools`) and executes through a three-stage Cordis waterfall (`tools/pre-execute` → `tools/execute` → `tools/post-execute`). Tool visibility uses a five-tier `ToolExposure` model to protect context budget, keep KV-cache prefixes immutable, and serialize concurrent writes per file path.
+Every capability in Mizar registers against `"tools"` (`mizar-tools`) and executes through a three-stage Cordis waterfall (`tools/pre-execute` → `tools/execute` → `tools/post-execute`). Tool visibility uses a five-tier `ToolExposure` model to protect context budget, keep prefixes stable, and serialize concurrent writes per file path.
 
 <DiagramEmbed
   id="tool-exposure"
-  caption="FIG 02: Five-tier ToolExposure matrix, always-on QuickJS codemode orchestration, and MCP-only BM25 tool_search."
+  caption="FIG 02: Five-tier ToolExposure matrix, on-demand QuickJS codemode orchestration, and MCP-only BM25 tool_search."
 />
 
 ## Five-Tier `ToolExposure` Model
 
 | Tier | Exposed to LLM Schema | Callable via `codemode` | Typical Tools | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| `Direct` | ✓ Yes | ✓ Yes | `read`, `write`, `edit`, `bash`, `grep`, `find`, `recall`, `skill` | Core high-frequency tools frozen at Turn 0 |
-| `ModelOnly` | ✓ Yes | ✗ Disallowed | `codemode`, `tool_search` | Meta/orchestrator tools — no recursive nesting inside JS |
+| `Direct` | ✓ Yes | ✓ Yes | `read`, `bash`, `edit`, `write` (default `MinimalCoding`), plus `grep`, `find` when enabled | Core tools with session-scoped declaration stability |
+| `ModelOnly` | ✓ Yes | ✗ Disallowed | `codemode` (on-demand), `tool_search` (MCP) | Meta/orchestrator tools — no recursive nesting inside JS |
 | `Codemode` | ✗ Lazy | ✓ Yes (in directory) | External MCP tools (default) | Prevents large MCP schemas from bloating context |
 | `Deferred` | ✗ Lazy | ✓ Yes (hidden list) | Opt-in large MCP servers | Discovered via `tool_search` / `searchTools()` and activated per session |
 | `Hidden` | ✗ No | ✗ No | Matched by `excludeTools` | Completely invisible to both LLM and sandbox |
 
-Resolution precedence: **`excludeTools` / `Hidden` > `includeTools` (`--tools` / `tools`) > runtime overrides > default exposure**.
+Activation precedence (`is_default_active`): **`global_active_overrides` > `includeTools` (`--tools` / `tools`) > `auto_default_active` > tool default**, while `ToolExposure::Hidden` and `excludeTools` always block activation. Direct model tool calls are strictly validated against the current step's declared allowlist (`request.tools`), returning an error without executing if undeclared (without restricting nested `codemode` calls).
 
 ## Built-in Coding Tools (`mizar-tools-coding`)
 
-Switch presets quickly with `--minimal` / `toolsPreset: "minimal"` (`read`/`bash`/`edit`/`write`) or `--read-only` / `toolsPreset: "read-only"` (`read`/`grep`/`find`):
+The default preset is **`MinimalCoding`** (`read`, `bash`, `edit`, `write` — 4 tools only). Switch presets with `toolsPreset: "all"`, `--tools`, or `--read-only` / `toolsPreset: "read-only"` (`read`/`grep`/`find`):
 
 | Tool | Concurrency | Parameters & Output Caps |
 | :--- | :--- | :--- |
-| `read` | Parallel | Outputs 1-indexed `<line>\t<text>`; caps at `2000` lines / `50 KB` / `2000` chars per line; supports `offset`, `limit`, and images |
+| `read` | Parallel | Text outputs 1-indexed `<line>\t<text>` (`2000` lines / `50 KB` / `2000` chars per line, supports `offset` & `limit`); detects PNG/JPEG/WebP/GIF by magic header (`32 MiB` input cap) and processes via `mizar-image` (EXIF orientation, animated first frame, `≤ 100 MP`, `2048 px` max edge, `5 MB` base64 budget) |
 | `edit` | Serialized per path, parallel across files | Supports single `oldText`/`newText` or atomic `edits[]` arrays + `replaceAll`; preserves BOM and CRLF/LF |
 | `write` | Serialized per path, parallel across files | Guarded by `FileGuardTracker` in `mizar-compaction` (requires re-read or `edit` if stale after compaction) |
-| `bash` | Parallel | Default `120s` timeout (`600s` max), appends `~/.mizar/bin` to `PATH`; **`truncate_head_tail` cap (`400` lines / `20 KB` / `768 B` per line)**; outputs `> 64 KB` spill to temp file |
-| `grep` | Parallel | Uses `ignore` (respects `.gitignore`), caps lines at `500` chars |
-| `find` | Parallel | Uses `fd` / `.gitignore`-aware walk, caps at `1000` entries or `50 KB` |
+| `bash` | Parallel | Default `120s` timeout (`600s` max), appends `$MIZAR_HOME/bin` to tail of `PATH`; **`truncate_head_tail` cap (`400` lines / `20 KB` / `768 B` per line)**; `structured_content.output` up to `1 MiB` for `codemode`; both `<= 64 KiB` truncated outputs and `> 64 KiB` spills save **raw bytes** to temp files without swallowing errors; Unix signal exits report `128 + sig` |
+| `grep` | Parallel (dormant in `MinimalCoding`) | Enabled by `All`/`ReadOnly`/`--tools`; prefers `$MIZAR_HOME/bin/rg` then `PATH` (interactive TUI auto-installs; `exec` resolves local only), caps lines at `500` chars |
+| `find` | Parallel (dormant in `MinimalCoding`) | Enabled by `All`/`ReadOnly`/`--tools`; `.gitignore`-aware walk via `ignore`, caps at `1000` entries or `50 KB` (`fd` available in `bash` via `PATH`) |
 
 <Callout type="tip" title="Structured Argument Validation Feedback">
   Malformed JSON arguments on tool calls are no longer silently coerced into <code>{}</code>. <code>parse_tool_arguments</code> returns explicit schema validation errors straight back to the model so it can correct arguments and retry in-turn.
@@ -43,24 +43,24 @@ Switch presets quickly with `--minimal` / `toolsPreset: "minimal"` (`read`/`bash
 
 Same-path `write` and `edit` calls are serialized via `with_file_mutation_queue`, while calls targeting distinct files (alongside `read` and `bash`) execute in parallel.
 
-## Always-On `codemode` (QuickJS Sandbox)
+## On-Demand `codemode` (QuickJS Sandbox)
 
-In this branch, `codemode` (`mizar-codemode`) is **always enabled by default** — no state machine dynamically toggles it mid-session, keeping the declared tool schema immutable from Turn 0:
+`codemode` (`mizar-codemode`) is **dormant by default** so Turn 0 stays lean when no orchestration is needed. It activates on demand when `--tools codemode`, `codemode.enabled: true`, `codemode.onlyMode: true`, or an enabled MCP server / `toolExposure` uses `codemode` (`autoEnableCodemode: true` by default in `mcp.json`):
 
-- **Batch, Chain & Filter**: The model writes async JavaScript calling `tools.<name>(args)` over any `Direct`, `Codemode`, or `Deferred` tool (e.g. `await Promise.allSettled([...])`), filters large payloads inside QuickJS memory, and returns only a concise summary (default `inlineBudget = 3000` chars; oversized output spills to a temp file).
-- **Prompt Guidance**: `mizar-system-prompt` and `Direct` tool hints (`Codemode: tools.read(args)`) steer the model to collapse multi-file probes or multi-step checks into one script execution.
-- **Sandbox Limits**: Embedded `rquickjs` runtime enforces **`256 MiB` heap limit, `1 MiB` stack size, `workers = 2` concurrency semaphore, and `120,000 ms` default timeout** (`codemode.timeoutMs`), propagating cancellation tokens into nested tool calls.
-- **Sandbox Helpers**: Scripts can invoke `searchTools()`, `describeTool()`, `store()`, and `load()` without round-tripping to the model.
-- **Configuration & Opt-Out**: Set `codemode.onlyMode: true` to hide `Direct` coding schemas and route everything through JS; to disable `codemode` entirely, add `"codemode"` to `disabledPlugins` or `excludeTools`.
+- **Explicit Opt-Out**: `codemode.enabled: false`, `disabledPlugins: ["codemode"]`, or `excludeTools: ["codemode"]` prevents activation even when MCP `codemode` servers exist.
+- **Stable Mixed-Mode Prefix**: Static MCP config decides sandbox activation up front; in mixed mode, `codemode` schemas and `<mcp_servers>` summaries remain byte-identical before and after background stdio/HTTP handshakes (`searchTools()`, `describeTool()`, `describeNamespace()` discover remote tools).
+- **Batch, Chain, Filter & Vision**: Scripts invoke `tools.<name>(args)` over `Direct`, `Codemode`, or `Deferred` tools (e.g. `await Promise.allSettled([...])`) and return compact summaries (`inlineBudget = 3000` chars; excess spills to temp file). Image reads expose only metadata to JS while the host attaches images to the outer tool result.
+- **Sandbox Limits**: Embedded `rquickjs` runtime enforces **`256 MiB` heap limit, `1 MiB` stack size, `workers = 2` concurrency semaphore, and `120,000 ms` default timeout** (`codemode.timeoutMs`), propagating cancellation tokens into nested calls.
+- **Sandbox Helpers & `onlyMode`**: Scripts can use `searchTools()`, `describeTool()`, `describeNamespace()`, `store()`, and `load()`; `codemode.onlyMode: true` hides `Direct` declarations and lists round-robin local tools within `inlineBudget`.
 
 ## MCP-Only `tool_search`
 
 `mizar-tool-search` builds a BM25 index (`name` weight `4.0`, `namespace` weight `2.0`, `defaultLimit = 8`) over `Codemode` and `Deferred` tools:
 
 - **Zero Overhead with 0 MCP Servers**: When no external MCP `Codemode`/`Deferred` tools exist, `tool_search` is omitted completely from the tool list sent to the LLM.
-- **Lazy Schema Activation**: When external MCP tools are present and `toolSearch.autoEnable !== false`, calling `tool_search` promotes matched tools into active schemas starting on the **next LLM turn**.
+- **Lazy Schema Activation**: When searchable tools are present and `toolSearch.autoEnable !== false`, calling `tool_search` promotes matched tools into active schemas starting on the **next LLM turn**.
 
 ## External MCP & Progressive Skills (`SKILL.md`)
 
-- **MCP Client (`mizar-mcp`)**: Reads `~/.mizar/mcp.json` and `<workspace>/.mizar/mcp.json` (project entries omitting `command`/`url` act as partial patches overriding `exposure`, `toolExposure`, `enabled`, etc.). Supports **stdio** (`command`, `args`, `env`, `cwd`) and **Streamable HTTP / SSE** (`url`, `headers`, sharing `mizar-llm-http` TLS CA roots). Tools default to `Codemode` (`mcp__<server>__<tool>`), accompanied by `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource`.
-- **Progressive Skills (`mizar-skills`)**: Scans workspace `.agents/skills` → `skills.customDirs` → `~/.agents/skills` → `skills.bundledDir` (or `MIZAR_BUNDLED_SKILL_DIR`) for `SKILL.md` frontmatter. When zero skills exist, the `skill` tool is omitted from schemas; editing files inside skill dirs via `write` or `edit` triggers live cache refresh.
+- **MCP Client (`mizar-mcp`)**: Reads `~/.mizar/mcp.json` and `<workspace>/.mizar/mcp.json` (project entries omitting `command`/`url` act as partial patches overriding `exposure`, `toolExposure`, `enabled`, etc.). Supports **stdio** and **Streamable HTTP / SSE** (sharing `mizar-llm-http` TLS CA roots). Tools default to `Codemode` (`mcp__<server>__<tool>`), accompanied by `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource`. Returned MCP `image` blocks flow through `mizar-image` (max `20` images per result; corrupt blocks turn into text notices).
+- **Progressive Skills (`mizar-skills`, No `skill` Tool)**: The standalone `skill` tool has been removed. On startup, `mizar-skills` scans `.agents/skills` → `skills.customDirs` → `~/.agents/skills` → `skills.bundledDir` (or `MIZAR_BUNDLED_SKILL_DIR`) for `SKILL.md` frontmatter. Whenever `read` or `bash` is declared, `<available_skills>` is injected via `<system-reminder>` with `<name>`, `<description>`, and the absolute `<location>` path to `SKILL.md`, instructing the model to load it on demand via `read` (or `bash` if `read` is absent); if neither `read` nor `bash` is declared or zero skills exist, the catalog is omitted. Editing files inside skill dirs via `write`/`edit` triggers hot invalidation and replaces earlier catalogs; `/<skill-name>` user gestures expand `<skill_content>` directly.

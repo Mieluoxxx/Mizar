@@ -28,7 +28,7 @@ Mizar 的权限控制由两条互不正交的防线构成：**路径作用范围
 在终端宿主层中由 `mizar-client` 的 `ApprovalGatePlugin` 挂载在 `tools/pre-execute` 管线上：
 
 - **触发方式**：启动传入 `--approve`、配置 `ui.approvalMode: "ask"`，或在工作台内随时运行 `/approval ask` 开启（`/approval auto` 切回免审）。
-- **拦截对象**：放行只读工具（`read`、`grep`、`find`、`list_dir`、`get_time`、`recall`），拦截所有产生副作用或可变执行的非只读工具——包含 **`write`、`edit`、`bash`、`codemode` 以及外部非只读 MCP 工具**（注意：`codemode` 沙箱内部触发的嵌套写工具同样会过审批）。
+- **拦截对象**：放行只读工具（`read`、`grep`、`find`、`list_dir`、`get_time`），拦截所有产生副作用或可变执行的非只读工具——包含 **`write`、`edit`、`bash`、`codemode` 以及外部非只读 MCP 工具**（注意：`codemode` 沙箱内部触发的嵌套写工具同样会过审批）。
 - **四选交互决策**：
   1. **单次放行**：仅批准当前这次调用。
   2. **本工具始终放行**：将当前工具名加入本次会话免审白名单。
@@ -44,7 +44,7 @@ Mizar 的权限控制由两条互不正交的防线构成：**路径作用范围
 | 使用场景 | 推荐命令 / 配置 | 防御效果 |
 | :--- | :--- | :--- |
 | **未知开源仓库人工审计** | `mizar --approve -C /path/to/untrusted` + `restrictToWorkspace: true` | 软链/文件锁在仓库内，且一切 `bash` / `write` / `edit` / `codemode` 必须人工点头确认 |
-| **零写入只读 Code Review** | `mizar --read-only -C /path/to/repo` | 工具集直接裁剪为 `read` / `grep` / `find`（加 `recall`），无任何写工具与 `bash` |
+| **零写入只读 Code Review** | `mizar --read-only -C /path/to/repo` | 工具集直接裁剪为 `read` / `grep` / `find`，无任何写工具与 `bash` |
 | **禁用 Shell 但允许改代码** | `"restrictToWorkspace": true, "excludeTools": ["bash"]` | 保留文件与沙箱读写并由 40 跳软链护栏锁区，彻底消除 Shell 越界通道 |
 | **高危 MCP 工具定向物理屏蔽** | `"excludeTools": ["mcp__prod__*", "*_drop_*"]` | 通配匹配即升为 `Hidden`，在声明列表与 `codemode` 沙箱中双端永久禁绝 |
-| **干净的一次性沙盒试验** | `mizar --isolated --no-persist -C /tmp/sandbox` | 忽略 `~/.mizar` 与项目盘上配置且不向 `sessions.sqlite` 落盘痕迹 |
+| **干净的一次性沙盒试验** | `mizar --isolated --no-persist -C /tmp/sandbox` | 忽略 `~/.mizar` 与项目盘上配置且不向 `~/.mizar/sessions` 写入 JSONL 痕迹 |

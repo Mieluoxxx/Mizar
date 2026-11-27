@@ -5,15 +5,16 @@ group: reference
 order: 7
 ---
 
-The `mizar` binary (compiled from `mizar-tui`) exposes three entrypoints sharing the same config resolution, routing logic, and Cordis plugin spine.
+The `mizar` binary (compiled from `mizar-tui`) exposes four entrypoints sharing the same config resolution, routing logic, and Cordis plugin spine.
 
-## Three CLI Entrypoints
+## CLI Entrypoints
 
-| Command Form | Purpose | Prompt Input |
+| Command Form | Purpose | Prompt Input / Args |
 | :--- | :--- | :--- |
 | `mizar [OPTIONS]` | Launch interactive TUI workbench; passing `-p` / `--prompt` / `--prompt-file` enters headless exec | Interactive input or `-p` / `--prompt-file` |
 | `mizar exec [OPTIONS] [<prompt>]` | Headless single-turn execution for CI, benchmarks, and shell scripts | Positional `<prompt>`, `-p`, `--prompt-file`, or piped `stdin` |
 | `mizar update [FLAGS]` | Verify SHA-256 and update binary from GitHub Releases | `-v/--version <ver>`, `-f/--force`, `--check`, `-h/--help` |
+| `mizar install-tools [--force] [rg\|fd ...]` | Install or locate managed `rg` & `fd` binaries in `$MIZAR_HOME/bin` | Installs both by default; `--force` reinstalls, with `ghfast.top` mirror fallback |
 
 ## Complete CLI Flags (`mizar` and `mizar exec`)
 
@@ -29,12 +30,13 @@ The `mizar` binary (compiled from `mizar-tui`) exposes three entrypoints sharing
 | `--reasoning-effort <level>` | `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | Global | Override reasoning effort |
 | `--max-steps <n>` | Positive integer (unlimited) | Global | Maximum tool steps allowed per turn; triggers `code=max_steps` on overflow |
 | `--max-tokens <n>` | Positive integer | Global | Override max output tokens per LLM response |
+| `--context-window <tokens>` | Positive integer (`>= 1`) | Global (TUI / `exec`) | Override model context window (takes precedence over `MIZAR_CONTEXT_WINDOW` and catalog) |
 | `--timeout <secs>` | Seconds | `exec` | Whole-turn execution timeout; exits with code `124` on expiry |
-| `--output-format <fmt>` | `text` (default) \| `json` | `exec` | Format written to `stdout` on completion |
-| `--json` | Boolean flag | `exec` | Shorthand alias for `--output-format json` |
+| `--output-format <fmt>` | `text` (default) \| `json` \| `ndjson` | `exec` | Output format; `json` & `ndjson` emit line-flushed NDJSON events ending with `result` |
+| `--json` | Boolean flag | `exec` | Shorthand alias for `--output-format ndjson` |
 | `--trace-out <path>` | File path | `exec` | Atomically write structured `TrajectoryExport` JSON on exit (overrides `MIZAR_TRACE_OUT`) |
 | `--isolated` | Boolean flag | Global | Skip loading global and workspace disk configs; run cleanly in memory |
-| `--minimal` | Boolean flag | Global | Select `MinimalCoding` preset (`read`, `bash`, `edit`, `write` only) |
+| `--minimal` | Boolean flag | Global | Select default `MinimalCoding` preset (`read`, `bash`, `edit`, `write` only) |
 | `--read-only` | Boolean flag | Global | Select `ReadOnly` preset (`read`, `grep`, `find` only) |
 | `-t`, `--tools <csv>` | Comma-separated names | Global | Explicitly enable/constrain active tools |
 | `-xt`, `--exclude-tools <csv>` | Comma-separated globs | Global | Add tool exclusions (`Hidden` in both schemas and `codemode`) |
@@ -42,7 +44,7 @@ The `mizar` binary (compiled from `mizar-tui`) exposes three entrypoints sharing
 | `--approve` | Boolean flag | TUI | Require interactive approval for non-read-only tools (`ui.approvalMode: "ask"`) |
 | `-c`, `--continue` | Boolean flag | TUI / `exec` | Resume the most recent session for the current workspace |
 | `-r`, `--resume [id]` | Optional session ID | TUI / `exec` | Open session picker in TUI when `id` is omitted, or resume matching ID |
-| `--no-persist` | Boolean flag | Global | Disable SQLite persistence (in-memory session only) |
+| `--no-persist` | Boolean flag | Global | Disable JSONL session persistence (in-memory session only) |
 | `--no-instructions` | Boolean flag | Global | Skip startup `AGENTS.md` / `CLAUDE.md` discovery and injection |
 | `--theme <name>` | Theme name (`auto`) | TUI | Initial theme: `auto` \| `mist-dark` \| `mist-light` \| `sakura-dark` \| `system` \| `ansi16` |
 | `-h`, `--help` | — | Global | Print CLI help text |
@@ -50,23 +52,31 @@ The `mizar` binary (compiled from `mizar-tui`) exposes three entrypoints sharing
 
 ## `mizar exec` Automation Contract
 
-### JSON Output Schema (`--json` / `--output-format json`)
+### NDJSON Stream Schema (`--json` / `--output-format ndjson` / `--output-format json`)
 
-When a turn finishes with `TurnEndReason::Completed`, `stdout` emits one compact JSON object:
+Each line is a flushed JSON object carrying `type` and `ts_ms`: `session`, `step_start`, `tool_call` (redacted `arguments_preview` of at most `512` chars), `tool_result` (individual `duration_ms` and `images`), `retry` (plus `[W retry]` on `stderr`), `compaction`, `step_end` (6-field `usage`), ending with a single `result` after the persistence barrier (or a single `invalid_request` line on input/validation errors):
 
-```json title="stdout (--output-format json)"
+```json title="stdout (--json / --output-format ndjson final result example)"
 {
+  "type": "result",
+  "ts_ms": 1764250000000,
   "session_id": "019...",
   "resumed": false,
   "reason": "completed",
+  "exit_code": 0,
   "steps": 4,
   "duration_ms": 3820,
   "llm_ms": 2910,
   "ttft_ms": 340,
   "tool_ms": 880,
   "tool_calls": 6,
+  "tool_errors": 0,
+  "retries": 0,
+  "compactions": 0,
   "session_turns": 1,
   "session_steps": 4,
+  "usage": { "input_tokens": 1200, "output_tokens": 350, "total_tokens": 1550, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0 },
+  "session_usage": { "input_tokens": 1200, "output_tokens": 350, "total_tokens": 1550, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0 },
   "text": "Finished analyzing Cargo.toml..."
 }
 ```
@@ -76,7 +86,7 @@ When a turn finishes with `TurnEndReason::Completed`, `stdout` emits one compact
 | Exit Code | Meaning | `stderr` Diagnostic Pattern |
 | :--- | :--- | :--- |
 | `0` | Completed turn cleanly | — |
-| `1` | Generic error, max steps, truncation, or cancellation | Contains `code=max_steps`, `code=max_tokens`, `code=cancelled`, or secret-redacted error text |
+| `1` | Generic error, storage failure, max steps, truncation, or cancellation | Contains `code=storage`, `code=max_steps`, `code=max_tokens`, `code=cancelled`, `invalid_request`, or secret-redacted error text |
 | `124` | `--timeout` deadline exceeded | `execution timed out after <secs>s (code=timeout)` |
 | `130` / `143` | Interrupted by signal (`SIGINT` / `SIGTERM`) | `execution interrupted by signal (code=cancelled)` |
 
@@ -104,9 +114,12 @@ When a turn finishes with `TurnEndReason::Completed`, `stdout` emits one compact
 | Variable | Default / Behavior |
 | :--- | :--- |
 | `WORKSPACE` | Override workspace root (lower priority than `-C/--workspace`) |
-| `MIZAR_HOME` | Global config directory, default `~/.mizar` (`settings.json`, `models.json`, `mcp.json`, `sessions.sqlite`) |
+| `MIZAR_HOME` | Global config directory, default `~/.mizar` (`settings.json`, `models.json`, `mcp.json`, `sessions/`, `bin/`) |
 | `MIZAR_AGENTS_HOME` | Global agent directory, default `~/.agents` (`AGENTS.md`, `skills`) |
-| `MIZAR_SESSION_DB` | Override SQLite file path; set to `none` or `off` to disable persistence |
+| `MIZAR_SESSIONS_DIR` | Override JSONL sessions directory (default `~/.mizar/sessions`); set to `none`, `off`, `memory`, or empty to disable |
+| `MIZAR_CONTEXT_WINDOW` | Override context window size (lower priority than `--context-window`, higher than model catalog) |
+| `MIZAR_CACHE_RETENTION` / `PI_CACHE_RETENTION` | Override default cache retention policy (`none` / `short` / `long`) |
+| `MIZAR_LLM_IDLE_TIMEOUT_SECS` | Override HTTP / SSE idle progress timeout in seconds |
 | `MIZAR_BUNDLED_SKILL_DIR` | Override bundled skills directory (lower priority than `skills.bundledDir`) |
 | `MIZAR_TRACE_OUT` | Default output path for `mizar exec` `TrajectoryExport` JSON |
 | `CORDIS_LOG` | Control Cordis microkernel log verbosity (e.g. `debug` / `warn`) |
@@ -122,13 +135,17 @@ When a turn finishes with `TurnEndReason::Completed`, `stdout` emits one compact
 | `REQUESTS_CA_BUNDLE` | Python requests-compatible CA bundle file |
 | `NODE_EXTRA_CA_CERTS` | Node.js extra trusted root certificates file |
 
-### 4. Self-Update & Offline Controls
+### 4. Self-Update, Offline & Tool Installer Controls
 
 | Variable | Description |
 | :--- | :--- |
-| `MIZAR_OFFLINE` | When `1`/`true`/`yes`/`on`, disables all startup update checks and outbound checks |
+| `MIZAR_OFFLINE` / `PI_OFFLINE` | When `1`/`true`/`yes`/`on`, disables startup update checks and `mizar install-tools` downloads |
 | `MIZAR_SKIP_VERSION_CHECK` | When `1`/`true`/`yes`/`on`, skips startup async release check |
 | `MIZAR_RELEASE_BASE_URL` | Override `mizar update` download base URL (default `https://github.com/Mieluoxxx/Mizar`) |
+| `MIZAR_GITHUB_BASE_URL` | Override `mizar install-tools` / TUI download base URL (default `https://github.com`) |
+| `MIZAR_GITHUB_MIRROR` | Fallback mirror prefix (`{mirror}/{original_url}`, default `https://ghfast.top`; set `off`/`none`/empty to disable) |
+| `MIZAR_BIN_WARMUP_MS` / `MIZAR_BIN_SLOW_BPS` | Warmup window in ms (default `5000`) and slow-speed fallback threshold in bytes/s (default `65536`) |
+| `MIZAR_BIN_STALL_MS` | Continuous stall timeout in ms before switching to mirror (default `8000`) |
 
 ### 5. Terminal, TUI Emphasis & Editor Integration
 

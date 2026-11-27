@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting & Runtime Diagnostics
-description: Diagnose routing errors, TLS roots, gateway compat 400s, SQLITE_BUSY, MCP disconnects, codemode timeouts, and terminal glitches.
+description: Diagnose routing errors, TLS roots, gateway compat 400s, JSONL persistence errors, rg/fd install, MCP disconnects, codemode timeouts, and terminal glitches.
 group: ops-internals
 order: 10
 ---
@@ -27,14 +27,16 @@ When routing through OneAPI, LiteLLM, vLLM, Ollama, or custom OpenAI-compatible 
 - **`exec` exits `1` with `code=max_tokens`**: Response hit output token ceiling; raise `--max-tokens` or `models[].maxTokens`.
 - **`repeat-tool-guard` alerts fire repeatedly**: Press `Ctrl+T` to inspect `/trace` Hotspots & Inspector for repeated validation errors or missing paths.
 
-## 3. SQLite Persistence & Concurrency
+## 3. JSONL Persistence, Blobs & Tool Installation
 
-- **`SQLITE_BUSY` transient warnings**: Multiple concurrent `mizar` processes contended on `~/.mizar/sessions.sqlite` past the 5s `busy_timeout`. Isolate runs with `MIZAR_SESSION_DB=/tmp/dev-a.sqlite`, or pass `--no-persist` / `MIZAR_SESSION_DB=none`.
+- **Startup or exit persistence errors (`code=storage` / TUI error banner)**: Check permissions on `~/.mizar/sessions`, redirect via `MIZAR_SESSIONS_DIR` or `settings.json` `sessionsDir`, or run with `--no-persist` / `MIZAR_SESSIONS_DIR=memory` in ephemeral environments.
+- **Missing image blob warning on `--resume`**: If a file under `blobs/<sha256>` was deleted, the tolerant JSONL loader warns and strips only the missing attachment while recovering the rest of the session cleanly.
 - **Unpaired `tool_call` from a past crash**: `/tree` forking and `-r <id>` resume automatically synthesize healing results on replay.
+- **Missing `rg` or slow GitHub download**: Interactive TUI auto-installs `rg`/`fd` on demand (or run `mizar install-tools --force`); headless `exec` uses only locally available binaries. Slow/stalled downloads fall back to `https://ghfast.top` by default; set `MIZAR_OFFLINE=1` in air-gapped networks.
 
 ## 4. MCP, `codemode` & Instructions
 
-- **Configured MCP tools do not appear in top-level declarations**: External MCP tools default to `Codemode` to save tokens. The model invokes them directly via `codemode` (`tools.mcp__<server>__<tool>(...)`) or activates them via `tool_search`. Set `"exposure": "direct"` in `mcp.json` only for always-needed tools, and inspect live server state with `/mcp`.
+- **Only 4 tools appear by default, or MCP tools are hidden from top-level schemas**: `MinimalCoding` exposes `read`, `bash`, `edit`, and `write` by default, and `codemode` stays dormant unless activated via `--tools codemode`, `codemode.enabled`, or MCP `codemode` servers (`autoEnableCodemode: true`). Inspect live tool tiers with `/tools` and server states with `/mcp`, or set `"exposure": "direct"` selectively in `mcp.json`.
 - **`codemode` 120s timeout**: Long builds/test suites inside a JS script should invoke standalone `bash` (up to `600s`) or raise `codemode.timeoutMs` in `settings.json`. To turn off `codemode`, add `"codemode"` to `disabledPlugins`.
 - **Subdirectory `AGENTS.md` edit not visible mid-session**: `mizar-instructions` loads statically at startup for KV-cache stability. Restart the session and run `/instructions` to verify loaded files and `maxBytes` eviction order.
 

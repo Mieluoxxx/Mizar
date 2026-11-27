@@ -31,7 +31,7 @@ Install the prebuilt binary on macOS (Apple Silicon / Intel) or Linux (`x86_64` 
 curl -fsSL https://raw.githubusercontent.com/Mieluoxxx/Mizar/main/scripts/install.sh | sh
 ```
 
-Once installed, check or upgrade to the latest release anytime with `mizar update` (set `MIZAR_SKIP_VERSION_CHECK=1` to disable startup version checks). Note: the built-in `grep` tool requires `ripgrep` (`rg`) on `PATH`.
+Once installed, check or upgrade to the latest release anytime with `mizar update` (set `MIZAR_SKIP_VERSION_CHECK=1` to disable startup version checks). Note: the built-in `grep` tool uses `ripgrep` (`rg`) and `bash` can use `fd`—interactive TUI installs both on demand into `~/.mizar/bin`, or run `mizar install-tools`.
 
 Or build from source (requires **Rust 1.98.0+**, edition 2024, pinned in [`rust-toolchain.toml`](rust-toolchain.toml)):
 
@@ -51,9 +51,9 @@ cargo install --path crates/mizar-tui
 
 - **Dual-Mode TUI (`F3` / `--inline`)**: Switch seamlessly between a full-screen dashboard and an Inline viewport that preserves terminal scrollback, with `@file#L1-40` mentions, split diagnostics (`Ctrl+B`), and native copy toggle (`F2`).
 - **Local Bash (`!` / `!!`)**: Run `!cmd` to feed command output into the next model turn, or `!!cmd` to run locally with zero token cost.
-- **Rules & Skills**: Hierarchical `AGENTS.md` / `CLAUDE.md` discovery under a `64 KiB` budget plus hot-reloaded `SKILL.md` workflows.
-- **MCP & Codemode**: Connect Stdio/HTTP MCP servers via `mcp.json`, discover large tool catalogs on demand with `tool_search`, and batch-call tools inside an isolated QuickJS (`rquickjs`) sandbox.
-- **Providers & Persistence**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by WAL SQLite sessions (`/tree` branching, `/compact` + FTS5 recall, & `/trace` profiler).
+- **Rules & Skills**: Hierarchical `AGENTS.md` / `CLAUDE.md` discovery under a `64 KiB` budget plus hot-reloaded `SKILL.md` workflows (`<available_skills>` `<location>` pointers read on demand & `/<name>` gestures).
+- **MCP & Codemode**: Connect Stdio/HTTP MCP servers via `mcp.json`, discover large tool catalogs on demand with `tool_search`, and activate the isolated QuickJS (`rquickjs`) `codemode` sandbox on demand (auto-enabled for MCP `codemode` servers or via `--tools codemode` / `codemode.enabled`).
+- **Providers & Persistence**: OpenAI Completions/Responses, Anthropic Messages, and custom gateways configured via `~/.mizar/models.json` or live `/settings`, backed by tolerant append-only JSONL sessions with SHA-256 image blobs (`/tree` branching, B-5 `/compact`, & `/trace` profiler).
 
 ### Documentation & Development
 
@@ -63,7 +63,7 @@ cargo install --path crates/mizar-tui
   pnpm --dir site install --frozen-lockfile
   pnpm --dir site dev
   ```
-- **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (30 workspace crates built on `cordis`)
+- **Architecture & Crates**: [`docs/plugins.md`](docs/plugins.md) (33 workspace crates built on `cordis`)
 - **Contributing**: [`CONTRIBUTING.md`](CONTRIBUTING.md) · **Repository Rules**: [`AGENTS.md`](AGENTS.md)
 
 ### License

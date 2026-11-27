@@ -1,6 +1,6 @@
 ---
-title: 工具体系、常驻 Codemode、MCP 与技能
-description: ToolExposure 五级暴露模型、编码工具并发写锁、常驻 QuickJS codemode 沙箱、tool_search、MCP 与 SKILL.md。
+title: 工具体系、按需 Codemode、MCP 与技能
+description: ToolExposure 五级暴露模型、MinimalCoding 默认四件套、按需 QuickJS codemode 沙箱、tool_search、MCP 与 SKILL.md 目录注入。
 group: core-concepts
 order: 3
 ---
@@ -9,33 +9,33 @@ Mizar 的全部可执行能力通过 `mizar-tools` 服务向模型统一暴露�
 
 <DiagramEmbed
   id="tool-exposure"
-  caption="图 02：ToolExposure 五级可见性矩阵、常驻 QuickJS codemode 沙箱调度与按需触发的 MCP BM25 检索闭环。"
+  caption="图 02：ToolExposure 五级可见性矩阵、按需 QuickJS codemode 沙箱调度与按需触发的 MCP BM25 检索闭环。"
 />
 
 ## ToolExposure 五级暴露模型
 
 | 等级 | 直接声明给模型 | 可在 `codemode` 内调用 | 默认适用工具 | 设计意图 |
 | :--- | :--- | :--- | :--- | :--- |
-| `Direct` | ✓ 是 | ✓ 是 | `read`、`write`、`edit`、`bash`、`grep`、`find`、`recall`、`skill` | 核心高频工具，Schema 冻结在首轮请求中 |
-| `ModelOnly` | ✓ 是 | ✗ 禁止嵌套 | `codemode`、`tool_search` | 编排/元工具，禁止在 JS 沙箱内部递归套娃 |
+| `Direct` | ✓ 是 | ✓ 是 | `read`、`bash`、`edit`、`write`（默认 `MinimalCoding` 4 项），以及按预设/白名单启用的 `grep`、`find` | 核心高频工具，Schema 随当前会话宣告稳定 |
+| `ModelOnly` | ✓ 是 | ✗ 禁止嵌套 | `codemode`（按需激活）、`tool_search`（MCP 存在时） | 编排/元工具，禁止在 JS 沙箱内部递归套娃 |
 | `Codemode` | ✗ 懒加载 | ✓ 是（列于目录） | 所有外部 MCP 工具（默认） | 避免数十个 MCP Schema 撑爆上下文 |
 | `Deferred` | ✗ 懒加载 | ✓ 是（隐藏目录） | 大规模 MCP 工具显式标记为按需检索 | 仅通过 `tool_search` / `searchTools()` 发现并会话级激活 |
 | `Hidden` | ✗ 否 | ✗ 否 | 命中 `excludeTools` / `Disabled` 的工具 | 对模型和沙箱同时完全不可见 |
 
-工具屏蔽与白名单遵循固定优先级：**`excludeTools` / `Hidden` > `includeTools`（`--tools` / `tools`） > 运行时覆盖 > 工具默认属性**。
+工具激活与屏蔽遵循固定优先级（`is_default_active`）：**`global_active_overrides` > `includeTools`（`--tools` / `tools`） > `auto_default_active` > 工具默认属性**，且 `ToolExposure::Hidden` 与命中 `excludeTools` 在任何情况下均禁止激活。同时，**模型直调强制校验当步公布白名单**（`request.tools`），未在当前请求声明的工具会直接返回错误而不执行（不影响 `codemode` 沙箱内部对 `Codemode`/`Deferred` 工具的嵌套调用）。
 
 ## 内置编码工具集（`mizar-tools-coding`）
 
-除默认包含 6 个工具的 `All` 预设外，还可通过 `--minimal` / `toolsPreset: "minimal"`（仅留 `read`/`bash`/`edit`/`write`）或 `--read-only` / `toolsPreset: "read-only"`（仅留 `read`/`grep`/`find`）快速裁剪：
+默认采用 **`MinimalCoding` 四件套**（仅声明 `read`、`bash`、`edit`、`write`），可通过 `toolsPreset: "all"`、`--tools` 或 `--read-only` / `toolsPreset: "read-only"`（仅留 `read`/`grep`/`find`）切换：
 
 | 工具 | 并行策略 | 关键参数与输出约束 |
 | :--- | :--- | :--- |
-| `read` | 完全并行 | 输出 1-indexed `<line>\t<text>`；上限 `2000` 行 / `50 KB` / 单行 `2000` 字符；支持 `offset` 与 `limit`，并支持读取图片为多模态内容 |
+| `read` | 完全并行 | 文本输出 1-indexed `<line>\t<text>`（上限 `2000` 行 / `50 KB` / 单行 `2000` 字符，支持 `offset` 与 `limit`）；读图按文件头识别 PNG/JPEG/WebP/GIF（`32 MiB` 输入上限），经 `mizar-image` 校 EXIF 方向、提动图首帧、限制 `100 MP` 并按 `2048 px` / `5 MB` base64 预算返回附件 |
 | `edit` | 按路径串行队列，跨文件并行 | 支持顶层 `oldText`/`newText` 或原子批量 `edits[]` 数组，支持 `replaceAll`；保留文件 BOM 与 CRLF/LF |
 | `write` | 按路径串行队列，跨文件并行 | 全文件写入前受 `mizar-compaction` 的 `FileGuardTracker` 检查（压缩后修改已存在文件须先重读或改用 `edit`） |
-| `bash` | 完全并行 | 默认超时 `120s`（最大 `600s`），追加 `~/.mizar/bin` 到 `PATH`；`truncate_head_tail` 双向截断（**`400` 行 / `20 KB` / 单行 `768 B`**）；超过 `64 KB` 时完整流式输出自动落盘临时文件并返回路径 |
-| `grep` | 完全并行 | 基于 `ignore` 遵循 `.gitignore`，单行截断 `500` 字符 |
-| `find` | 完全并行 | 基于 `fd` / `.gitignore` 感知遍历，默认上限 `1000` 条或 `50 KB` |
+| `bash` | 完全并行 | 默认超时 `120s`（最大 `600s`），将 `$MIZAR_HOME/bin` 追加在子进程 `PATH` 末尾（保留系统工具优先级）；`truncate_head_tail` 双向截断（**`400` 行 / `20 KB` / 单行 `768 B`**）；给 `codemode` 脚本的 `structured_content.output` 最多 `1 MiB`；不论 `<= 64 KiB` 小输出截断还是 `> 64 KiB` 流式溢写，均以**原始字节**落盘临时文件且不吞写错误；被 Unix 信号终止时退出码记 `128 + sig` 并附加信号提示 |
+| `grep` | 完全并行（默认休眠） | `All`/`ReadOnly`/`--tools` 启用；优先用 `$MIZAR_HOME/bin/rg` 再查 `PATH`（TUI 缺失自动按需安装，`exec` 仅用本地），单行截断 `500` 字符 |
+| `find` | 完全并行（默认休眠） | `All`/`ReadOnly`/`--tools` 启用；基于 `ignore` 遍历 `.gitignore` 感知目录，默认上限 `1000` 条或 `50 KB`（`fd` 供 shell 命令使用） |
 
 <Callout type="tip" title="工具参数校验错误直接回传模型">
   当模型输出的 tool call arguments 不是合法 JSON 或缺少必需字段时，<code>parse_tool_arguments</code> 不再将其静默吞成空对象 <code>{}</code>，而是把结构化校验错误作为工具结果直接返回模型，让模型在同一轮次自我纠正参数重试。
@@ -43,24 +43,24 @@ Mizar 的全部可执行能力通过 `mizar-tools` 服务向模型统一暴露�
 
 同路径的 `write` 与 `edit` 会进入 `with_file_mutation_queue` 串行排队以消除竞态覆盖，而针对不同文件的 `read` / `write` / `edit` / `bash` 调用在启用并发时可同时执行。
 
-## 常驻 `codemode`（QuickJS 沙箱）
+## 按需激活的 `codemode`（QuickJS 沙箱）
 
-`codemode`（`mizar-codemode`）在本分支中**默认常驻激活**，不存在动态开关状态机，从而保持工具 Schema 从第一轮起即完全冻结：
+`codemode`（`mizar-codemode`）**默认处于休眠状态，不占用无 MCP/无脚本场景的首轮前缀**：仅当满足以下任一条件时才激活进入声明表——传入 `--tools codemode`、配置 `codemode.enabled: true` 或 `codemode.onlyMode: true`，或存在启用的 MCP 服务/工具覆盖使用 `codemode` 暴露（`mcp.json` 中 `autoEnableCodemode` 默认为 `true`）：
 
-- **大道至简的多工具折叠**：模型可在一次 tool call 中提交异步 JS 代码，通过 `tools.<name>(args)` 并发或串行调用任意 `Direct`、`Codemode` 与 `Deferred` 工具（如 `await Promise.allSettled([...])`），并在 QuickJS 堆内存中过滤、聚合结果，最终只返回紧凑文本或 JSON（默认内联预算 `inlineBudget = 3000` 字符，超出部分截断并落盘临时文件）。
-- **提示词联动引导**：`mizar-system-prompt` 与各 `Direct` 工具的描述（如 `Codemode: tools.read(args)`）会引导模型把多次独立只读探测、多步流水线或大规模文本过滤整合进一次 `codemode` 脚本，大幅减少 LLM 往返轮数与上下文膨胀。
-- **沙箱资源边界**：内嵌 `rquickjs` 运行时限定 **`256 MiB` 内存、`1 MiB` 栈深、并发工作数 `workers = 2`、默认超时 `120_000 ms`**（`codemode.timeoutMs` 可调），取消信号可穿透嵌套的异步工具调用。
-- **沙箱内建辅助函数**：除 `tools.*` 外，脚本环境中可直接调用 `searchTools()`、`describeTool()`、`store()` 与 `load()` 跨步共享中间结构化数据。
-- **专属控制项**：如希望屏蔽直接编码工具、强迫所有操作全部走 JS 编排，可设 `codemode.onlyMode: true`；如要彻底禁用 `codemode`，将其加入 `disabledPlugins: ["codemode"]` 或 `excludeTools: ["codemode"]`。
+- **显式禁用优先级**：配置 `codemode.enabled: false`、`disabledPlugins: ["codemode"]` 或 `excludeTools: ["codemode"]` 时禁止激活。
+- **混合模式前缀稳定**：由 MCP 静态配置决定沙箱是否激活；后台 stdio/HTTP 握手完成后，`codemode` 的工具声明与 `<mcp_servers>` 摘要字节均保持不变，远端工具通过沙箱内建 `searchTools()`、`describeTool()` 与 `describeNamespace()` 发现。
+- **多工具折叠与多模态**：模型可通过 `tools.<name>(args)` 并发或串行调用任意 `Direct`、`Codemode` 与 `Deferred` 工具（如 `await Promise.allSettled([...])`），并在 QuickJS 堆内存中过滤、聚合结果（`inlineBudget = 3000` 字符，超出落盘临时文件）。读取图片时脚本仅见轻量元数据，图片附件由宿主随外层工具回执送往视觉模型。
+- **沙箱资源边界**：内嵌 `rquickjs` 运行时限定 **`256 MiB` 内存、`1 MiB` 栈深、并发工作数 `workers = 2`、默认超时 `120_000 ms`**（`codemode.timeoutMs` 可调），取消信号可穿透嵌套调用。
+- **沙箱内建辅助函数**：除 `tools.*` 外，脚本可直接调用 `searchTools()`、`describeTool()`、`describeNamespace()`、`store()` 与 `load()` 跨步共享中间结构化数据；设 `codemode.onlyMode: true` 可隐藏本地直连声明，在 `inlineBudget` 内按命名空间轮询展示可调用本地工具。
 
 ## 按需激活的 `tool_search`
 
 `mizar-tool-search` 使用 BM25 算法（工具名权重 `4.0`，命名空间权重 `2.0`，默认返回 `defaultLimit = 8` 条）检索 `Codemode` 与 `Deferred` 工具：
 
 - **0-MCP 零开销省略**：当工作区未配置任何外部 MCP 工具（不存在任何 `Codemode` / `Deferred` 候选）时，`tool_search` 不会注入模型工具声明列表，彻底避免占用无效前缀 Token。
-- **仅存在 MCP 工具时启用**：只要检测到非空的 `Codemode` / `Deferred` 工具池且 `toolSearch.autoEnable !== false`，`tool_search` 自动现身；模型检索命中后调用激活接口，对应 MCP 工具的完整 Schema 会在**下一轮 LLM 请求**正式加入声明。
+- **仅存在可搜索工具时启用**：只要检测到非空的 `Codemode` / `Deferred` 工具池且 `toolSearch.autoEnable !== false`，`tool_search` 自动现身；模型检索命中后调用激活接口，对应工具的完整 Schema 会在**下一轮 LLM 请求**正式加入声明。
 
 ## 外部 MCP 与渐进式技能（`SKILL.md`）
 
-- **MCP 客户端（`mizar-mcp`）**：读取 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json`（后者可仅覆写 `exposure` / `toolExposure` / `enabled` 等字段），同时支持 **stdio**（`command` / `args` / `env` / `cwd`）与 **Streamable HTTP / SSE**（`url` / `headers`，复用 `mizar-llm-http` 连接池与自定义 TLS 根证书）。所有外部 MCP 工具默认暴露为 `Codemode`，命名规则为 `mcp__<server>__<tool>`；此外一并注册 `list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource`。
-- **渐进式技能（`mizar-skills`）**：启动时按优先级扫描工作区 `.agents/skills` → `skills.customDirs` → 全局 `~/.agents/skills` → 内置目录 `skills.bundledDir`（也可由 `MIZAR_BUNDLED_SKILL_DIR` 指定），解析 `SKILL.md` YAML frontmatter。当没有发现任何可用技能时，`skill` 工具同样从声明列表中静默省略；当通过 `write` / `edit` 修改技能目录文件时会自动触发热刷新。
+- **MCP 客户端（`mizar-mcp`）**：读取 `~/.mizar/mcp.json` 与 `<workspace>/.mizar/mcp.json`（后者可仅覆写 `exposure` / `toolExposure` / `enabled` 等字段），同时支持 **stdio** 与 **Streamable HTTP / SSE**（复用 `mizar-llm-http` 连接池与自定义 TLS 根证书）。所有外部 MCP 工具默认暴露为 `Codemode`，命名规则为 `mcp__<server>__<tool>`；此外一并注册 `list_mcp_resources`、`list_mcp_resource_templates` 与 `read_mcp_resource`。MCP 返回的 `image` 块复用 `mizar-image` 管线处理，单次工具回执最多保留 `20` 张图片（超限或损坏均给出明确文本说明）。
+- **渐进式技能（`mizar-skills`，无独立 `skill` 工具）**：已移除独立的 `skill` 工具，改由启动期按优先级扫描工作区 `.agents/skills` → `skills.customDirs` → 全局 `~/.agents/skills` → 内置目录 `skills.bundledDir`（或 `MIZAR_BUNDLED_SKILL_DIR`）解析 `SKILL.md` frontmatter。当会话声明了 `read` 或 `bash` 时，在 `<system-reminder>` 中注入包含 `<name>`、`<description>` 与指向 `SKILL.md` 绝对路径 `<location>` 的 `<available_skills>` 目录，引导模型按需使用 `read`（若无 `read` 则使用 `bash`）直接读取；既无 `read` 也无 `bash` 或无可用技能时不注入目录。通过 `write` / `edit` 修改技能目录文件时会自动触发热更新并用新目录替换旧列表；用户消息中的 `/<skill-name>` 手势则会直接展开 `<skill_content>`。

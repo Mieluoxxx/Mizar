@@ -36,20 +36,21 @@ Mizar 按由低到高顺序加载两层磁盘配置（`--isolated` 时全部跳�
 | `defaultModel` | `string` | `null` | 默认模型 ID |
 | `reasoningEffort` | `string` | `null` | 默认思考强度（兼容别名 `defaultThinkingLevel`）：`off`..`max` |
 | `maxSteps` | `number` | `null`（不限） | 单轮内最大工具步数上限 |
-| `persona` | `string` | 内置静态英文 | 覆盖系统提示词首段的身份描述文本 |
-| `toolsPreset` | `string` | `"all"` | 工具集预设：`"all"` \| `"minimal"` \| `"read-only"` |
+| `personality` | `string` | `null` | 在身份定位之后插入显式配置的沟通风格文本（省略、空串或纯空白均占 `0` 字节） |
+| `toolsPreset` | `string` | `"minimal"` | 工具集预设：`"minimal"` \| `"minimal-coding"` \| `"all"` \| `"read-only"` \| `"readonly"` |
 | `tools` | `string[]` | `null` | 显式启用的工具名称列表（与 `--tools` 语义一致） |
 | `excludeTools` | `string[]` | `[]` | 屏蔽的工具通配符列表（命中即置为 `Hidden`，跨层并集叠加） |
 | `disabledPlugins` | `string[]` | `[]` | 声明式禁用的内置 Cordis 模块或宿主扩展 ID（跨层排序去重并集） |
 | `restrictToWorkspace` | `boolean` | `false` | 限制内置文件工具只能访问当前工作区及规范化子路径（**不限制 `bash`**） |
-| `sessionDb` | `string` | `~/.mizar/sessions.sqlite` | 会话数据库路径；设为 `"none"` 或 `"off"` 禁用磁盘持久化 |
+| `sessionsDir` | `string` | `~/.mizar/sessions` | JSONL 会话持久化目录；设为 `"none"` / `"off"` / `"memory"` 禁用磁盘持久化 |
 
-### `codemode` — 常驻 QuickJS 沙箱编排
+### `codemode` — 按需 QuickJS 沙箱编排
 
-`codemode` 在本分支**默认常驻激活**（已移除旧版 `autoEnable` 开关），如需关闭请将其加入 `disabledPlugins: ["codemode"]` 或 `excludeTools: ["codemode"]`：
+`codemode` 默认休眠（当 `--tools codemode`、`codemode.enabled: true`、`onlyMode: true` 或启用的 MCP 服务使用 `codemode` 暴露时激活）；设为 `enabled: false`、加入 `disabledPlugins: ["codemode"]` 或 `excludeTools: ["codemode"]` 可彻底禁用：
 
 | 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
+| `codemode.enabled` | `boolean` | `null`（按需） | 显式开启（`true`）或关闭（`false`）；省略时由 `onlyMode` 与 MCP 静态配置按需决定 |
 | `codemode.onlyMode` | `boolean` | `false` | 为 `true` 时隐藏 `Direct` 编码工具声明，强制模型全部经由 `codemode` JS 调用工具 |
 | `codemode.inlineBudget` | `number` | `3000` | 在工具描述中内联摘要的最大字符预算 |
 | `codemode.timeoutMs` | `number` | `120000` | 单段 QuickJS 沙箱脚本的执行超时毫秒数 |
@@ -65,7 +66,7 @@ Mizar 按由低到高顺序加载两层磁盘配置（`--isolated` 时全部跳�
 
 | 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `skills.enabled` | `boolean` | `true` | 是否扫描与启用 `SKILL.md` 技能目录 |
+| `skills.enabled` | `boolean` | `true` | 是否扫描 `SKILL.md` 并在声明 `read`/`bash` 时注入 `<available_skills>` 目录及展开 `/<name>` |
 | `skills.customDirs` | `string[]` | `[]` | 额外自定义技能扫描目录列表（跨层并集去重） |
 | `skills.bundledDir` | `string` | `null` | 显式覆盖内置技能包根目录 |
 | `skills.catalogDescriptionMaxLength` | `number` | `500` | 合成技能目录中每项描述截断上限 |
@@ -81,25 +82,18 @@ Mizar 按由低到高顺序加载两层磁盘配置（`--isolated` 时全部跳�
 | `instructions.maxBytes` | `number` | `65536` | 全量指令拼装总字节预算（超出优先淘汰最远祖先目录） |
 | `instructions.maxSourceBytes` | `number` | `1048576` | 单个指令源文件允许读取的最大字节数（1 MiB） |
 
-### `compaction` — 缓存感知尾部剪枝与 B-5 检查点压缩
+### `compaction` — 热缓存感知尾部剪枝与 B-5 检查点压缩
 
 | 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `compaction.enabled` | `boolean` | `true` | 压缩与写前护栏模块开关 |
 | `compaction.autoCompact` | `boolean` | `true` | 当估算输入接近阈值时是否自动触发检查点压缩 |
-| `compaction.maxContextTokens` | `number` | `null` | 人为限制计算 `effective_window` 的上限（为 `null` 时取模型自身 `contextWindow`） |
+| `compaction.defaultContextWindow` | `number` | `128000` | 模型目录及 CLI/环境变量均缺失时的默认上下文窗口（`>= 1`） |
+| `compaction.maxContextTokens` | `number` | `null` | 人为限制计算 `effective_window` 的上限（为 `null` 时取生效窗口） |
 | `compaction.triggerRatio` | `number` | `0.80` | 自动压缩触发比例（`0.0..1.0`） |
 | `compaction.keepRecentTokens` | `number` | `20000` | 触发检查点压缩时至少原样保留的最近上下文 Token 数量 |
-| `compaction.supersedeReads` | `boolean` | `true` | 尾部剪枝时裁掉已被同文件后续完整重读覆盖的旧 `read` 输出（保护 8k 热尾） |
-| `compaction.dropUseless` | `boolean` | `true` | 尾部剪枝时裁掉零命中搜索等确认无用输出（始终保护 `skill` 与 8k 热尾） |
-
-### `recall` — 单一静态情景回溯工具
-
-| 字段 | 类型 | 默认值 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `recall.enabled` | `boolean` | `true` | 是否启用静态 `recall` 工具 |
-| `recall.defaultSearchLimit` | `number` | `8` | `recall(query=...)` 默认返回摘要条目上限（硬上限 `20`） |
-| `recall.readCharLimit` | `number` | `6000` | `recall(seq=...)` 分页单次返回正文字符上限（硬上限 `8192`） |
+| `compaction.supersedeReads` | `boolean` | `true` | 尾部剪枝时裁掉已被同文件后续完整重读覆盖的旧 `read` 输出（保护热缓存与 8k 热尾） |
+| `compaction.dropUseless` | `boolean` | `true` | 尾部剪枝时裁掉零命中搜索等确认无用输出（始终保护 `SKILL.md` 读取、热缓存与 8k 热尾） |
 
 ### `sessionTitle` 与 `ui`
 
@@ -139,11 +133,11 @@ Mizar 按由低到高顺序加载两层磁盘配置（`--isolated` 时全部跳�
 
 ## `disabledPlugins` 全量模块 ID
 
-### 1. 内置可选 Cordis 模块（13 个）
+### 1. 内置可选 Cordis 模块（12 个）
 
 加入 `disabledPlugins` 后会在装配或运行期停止对应 Fiber（可在 TUI `/settings` 实时热启停）：
 
-`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`recall`、`session-title`、`trajectory`、`repeat-guard`
+`compaction`、`tool-time`、`tool-fs`、`tools-coding`、`tool-search`、`codemode`、`mcp`、`skills`、`instructions`、`session-title`、`trajectory`、`repeat-guard`
 
 ### 2. 官方宿主 / TUI 扩展 ID（10 个 `KNOWN_HOST_EXTENSION_IDS`）
 
@@ -163,6 +157,7 @@ Mizar 按由低到高顺序加载两层磁盘配置（`--isolated` 时全部跳�
 
 | 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
+| `autoEnableCodemode` | `boolean` | `true` | 顶层字段：当存在启用的 `codemode` MCP 服务或工具覆盖时自动激活 `codemode` 沙箱 |
 | `mcpServers.<name>.command` | `string` | `null` | Stdio 传输启动的可执行命令（与 `url` 二选一） |
 | `mcpServers.<name>.args` | `string[]` | `[]` | Stdio 启动参数数组 |
 | `mcpServers.<name>.env` | `Record<string, string>` | `{}` | 注入子进程的环境变量 |
