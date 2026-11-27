@@ -54,13 +54,13 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 ## 四、工具插件
 
-以下插件中，4.1–4.5 及 4.7 的 `mizar-recall` 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.6 `mizar-instructions` 与 4.7 `mizar-compaction` 是例外**：前者不注册任何工具、仅在启动期向 `"systemPrompt"` 注入静态工作区指令段落，后者提供 `"compaction"` 服务并通过步前与工具管线执行缓存感知尾部剪枝、上下文压缩与压后护栏。
+以下插件中，4.1–4.4 及 4.7 的 `mizar-recall` 向 `"tools"` 运行时注册可执行工具并注入 `"tools"` 服务；**4.5 `mizar-skills`、4.6 `mizar-instructions` 与 4.7 `mizar-compaction` 是例外**：`mizar-skills` 不注册工具（仅读取声明表按需注入 `<available_skills>` 与展开 `/<name>` 手势），`mizar-instructions` 仅在启动期向 `"systemPrompt"` 注入静态工作区指令段落，`mizar-compaction` 提供 `"compaction"` 服务并通过步前与工具管线执行缓存感知尾部剪枝、上下文压缩与压后护栏。
 
 工具的可达性由 `mizar-tools` 的 **`ToolExposure`** 统一控制：
 
 | `ToolExposure` | 直接声明给模型 | 可被 `codemode` 脚本调用 | 列在 `codemode` 描述中 | 典型使用者 |
 | :--- | :--- | :--- | :--- | :--- |
-| `Direct` | ✓ 激活后 | ✓ 激活后 | `onlyMode` 预算内的本地工具 | `read` / `bash` / `edit` / `write` / `grep` / `find` / `recall` / `skill` |
+| `Direct` | ✓ 激活后 | ✓ 激活后 | `onlyMode` 预算内的本地工具 | `read` / `bash` / `edit` / `write` / `grep` / `find` / `recall` |
 | `ModelOnly` | ✓ 激活后 | ✗（自身是编排工具） | — | `tool_search`、`codemode` |
 | `Codemode` | 激活后可声明 | ✓ | 通过沙箱检索 | MCP 工具默认、`codemode` 内部依赖的工具 |
 | `Deferred` | ✗（需激活） | ✓ | ✗（靠 `tool_search` / `searchTools()` 发现） | MCP 工具可选项 |
@@ -104,7 +104,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 服务 / 插件结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-skills`** | `SkillRegistry` + `SkillsPlugin` | `"skills"` / `"skills-plugin"` | `skill` | `["tools", "skills"]` | **渐进式技能发现与按需加载**：扫描分层技能根（项目 `.agents/skills` → 自定义目录 → 用户 `~/.agents/skills` → 内置包），解析 `SKILL.md` frontmatter，按 rank 升序仲裁同名技能；通过合成消息注入技能目录并支持热失效——监听 `write` / `edit` 写入命中技能目录时自动刷新缓存，广播 `skills/change` | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools` |
+| **`mizar-skills`** | `SkillRegistry` + `SkillsPlugin` | `"skills"` / `"skills-plugin"` | —（不注册工具） | `["tools", "skills"]` | **渐进式技能发现与目录注入**：扫描分层技能根（项目 `.agents/skills` → 自定义目录 → 用户 `~/.agents/skills` → 内置包），解析 `SKILL.md` frontmatter，按 rank 升序仲裁同名技能；当会话声明了 `read` 或 `bash` 时通过合成消息注入含 `<location>`（`SKILL.md` 绝对路径）的 `<available_skills>` 目录并支持热失效——监听 `write` / `edit` 写入命中技能目录时自动刷新缓存，广播 `skills/change`；同时保留 `/<name>` 手势直接展开 `<skill_content>` | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools` |
 
 ### 4.6 工作区指令系统
 
@@ -116,7 +116,7 @@ HTTP 传输实现收敛在 `mizar-llm-http`，其余协议与路由插件运行�
 
 | Crate | 服务 / 插件结构体 | 提供服务名 / 插件名 | 注册工具 | `inject` | 作用 | 内部 Crate 依赖 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | 步前剪枝可折叠重复 `read` 和零命中搜索，保留 `skill` 读取及 SQLite 原文。热缓存期保护启用缓存的 OpenAI Responses、可思考的 Anthropic Messages，以及仍含 Responses 回放或签名思考块的历史。其余协议默认可剪最近 8,000 token，闲置 90 分钟可清仓。受保护会话达到阈值时先全量剪枝，重估仍达阈值才请求检查点摘要。窗口按 `--context-window`、`MIZAR_CONTEXT_WINDOW`、模型目录、`compaction.defaultContextWindow`、128,000 的顺序取值。预算预留输出并应用 `maxContextTokens` 上限，默认在可用窗口的 80% 触发。摘要沿用最近检查点、确定性摘要与完整工具批次。`compaction/end` 广播会话 ID、触发原因、结果及压缩前后 token 数。溢出恢复可使用净剪枝量。保留 `tools/pre-execute` 写前读护栏与 `/compact [focus]` 手动入口 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-llm-retry`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
+| **`mizar-compaction`** | `CompactionRuntime` | `"compaction"` / `"CompactionRuntime"` | —（不注册工具） | `["llm", "sessions", "tools", "systemPrompt"]` | 步前剪枝可折叠重复 `read` 和零命中搜索，保留 `SKILL.md` 读取及 SQLite 原文。热缓存期保护启用缓存的 OpenAI Responses、可思考的 Anthropic Messages，以及仍含 Responses 回放或签名思考块的历史。其余协议默认可剪最近 8,000 token，闲置 90 分钟可清仓。受保护会话达到阈值时先全量剪枝，重估仍达阈值才请求检查点摘要。窗口按 `--context-window`、`MIZAR_CONTEXT_WINDOW`、模型目录、`compaction.defaultContextWindow`、128,000 的顺序取值。预算预留输出并应用 `maxContextTokens` 上限，默认在可用窗口的 80% 触发。摘要沿用最近检查点、确定性摘要与完整工具批次。`compaction/end` 广播会话 ID、触发原因、结果及压缩前后 token 数。溢出恢复可使用净剪枝量。保留 `tools/pre-execute` 写前读护栏与 `/compact [focus]` 手动入口 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-llm-retry`、`mizar-session`、`mizar-system-prompt`、`mizar-tools` |
 | **`mizar-recall`** | `RecallPlugin` | `"recall"` | `recall` | `["sessions", "tools"]` | **单一静态无损情景回溯工具**：以 `ToolExposure::Direct` 常驻挂载，冻结工具声明列表避免中途断缓存；同时支持 `query`（穿透压缩边界检索 SQLite FTS5 1..=3 n-gram 索引，无持久化时自动退回内存扫描）与 `seq`/`session_id` 原文分页读取、作用域校验、`is_current_session` 标记与 `to_file` 旁路导出 | `cordis`、`mizar-agent-loop`、`mizar-llm`、`mizar-session`、`mizar-tools` |
 
 ---

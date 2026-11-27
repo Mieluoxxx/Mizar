@@ -4,7 +4,7 @@
 //! 1. **仅剪两类确定性死重**：
 //!    - `supersedeReads`：被同文件后续完整（或同区间）`read` 覆盖的旧 `read` 结果 -> `[Superseded by a newer read of this file]`；
 //!    - `dropUseless`：零命中 / 无信息量工具结果 -> `[Uneventful result elided]`；
-//!    - 始终保护 `skill` 工具与 `skill://` / `SKILL.md` 读取。
+//!    - 始终保护 `skill://` / `SKILL.md` 读取。
 //! 2. **严格遵守 Prompt Cache 边界**：
 //!    - 热缓存期改写旧回执会使前缀缓存失效，敏感协议需保护完整历史；
 //!    - 达到闲置时限或上下文承压时可清仓，避免为重复结果付出摘要开销；
@@ -207,9 +207,6 @@ fn is_skill_path(raw_path: &str) -> bool {
 }
 
 fn is_protected_tool_result(tool_name: &str, args: Option<&Value>) -> bool {
-    if tool_name == "skill" {
-        return true;
-    }
     if tool_name == "read"
         && let Some(args) = args
         && let Some(raw_path) = extract_read_raw_path(args)

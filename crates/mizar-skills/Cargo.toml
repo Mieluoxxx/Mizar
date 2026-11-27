@@ -3,7 +3,7 @@ name = "mizar-skills"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "渐进式技能发现、分层注册表、热失效与按需加载工具（参考 deepseek-harness packages/skill）"
+description = "渐进式技能发现、分层注册表、热失效与目录注入（参考 pi 与 deepseek-harness）"
 
 [lints]
 workspace = true

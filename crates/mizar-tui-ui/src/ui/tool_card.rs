@@ -314,7 +314,6 @@ fn resolve_inline_meta(
                     })
                 }
             }
-            "skill" => Some("loaded".to_string()),
             _ => {
                 if trimmed == "(empty file)" {
                     Some("empty".to_string())

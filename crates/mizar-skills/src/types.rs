@@ -197,7 +197,7 @@ fn render_resource_hint(summary: &SkillSummary) -> Vec<String> {
     }
 }
 
-/// 统一渲染 `skill` 工具与用户 `/<name>` 手势加载后的 `<skill_content>` 块。
+/// 统一渲染用户 `/<name>` 手势加载后的 `<skill_content>` 块。
 pub fn render_skill_content(def: &SkillDefinition) -> String {
     let mut lines = Vec::new();
     lines.push(format!(

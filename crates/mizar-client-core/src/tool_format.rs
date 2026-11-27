@@ -122,7 +122,6 @@ pub fn is_read_only_compact_tool(name: &str) -> bool {
             | "grep"
             | "find"
             | "tool_search"
-            | "skill"
             | "list_mcp_resources"
             | "list_mcp_resource_templates"
             | "read_mcp_resource"
@@ -513,7 +512,6 @@ pub fn extract_inline_meta(
             .and_then(|d| d.get("loaded"))
             .and_then(Value::as_array)
             .map(|arr| format!("{} loaded", arr.len())),
-        "skill" => Some("loaded".to_string()),
         "edit" => details
             .and_then(|d| d.get("diff"))
             .and_then(Value::as_str)
@@ -585,7 +583,7 @@ pub fn summarize_tool_result(
     }
 
     match name {
-        "skill" | "write" => String::new(),
+        "write" => String::new(),
         "edit" => {
             if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(Value::as_str) {
                 let lines: Vec<String> = diff
