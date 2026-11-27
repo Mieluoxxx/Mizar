@@ -59,7 +59,7 @@ pub struct TraceUsageSummary {
 }
 
 impl TraceUsageSummary {
-    fn add_usage(&mut self, usage: &TokenUsage) {
+    pub fn add_usage(&mut self, usage: &TokenUsage) {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.cache_read_tokens = self

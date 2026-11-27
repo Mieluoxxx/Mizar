@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Service};
 use futures::Stream;
 
-use crate::types::{GenerateOptions, ModelInfo, ProviderInfo, StreamChunk};
+use crate::types::{CacheRetention, GenerateOptions, ModelInfo, ProviderInfo, StreamChunk};
 use mizar_llm_types::LlmError;
 
 pub const EVENT_ADAPTERS_UPDATED: &str = "llm/adapters-updated";
@@ -13,12 +13,39 @@ pub const EVENT_LLM_STREAM: &str = "llm/stream";
 
 pub type BoxChunkStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send>>;
 
+pub struct ModelRouteInfo {
+    pub protocol: String,
+    pub model: Option<ModelInfo>,
+    pub default_cache_retention: Option<CacheRetention>,
+}
+
 /// 模型适配器：把统一的 `GenerateOptions` 翻译成具体模型协议的流式输出。
 pub trait LlmAdapter: Send + Sync + 'static {
     fn stream(&self, options: GenerateOptions) -> BoxChunkStream;
 
+    fn default_model(&self) -> Option<&str> {
+        None
+    }
+
     /// 返回当前路由的协议与静态模型目录信息（可选）。
     fn info(&self) -> Option<ProviderInfo> {
+        None
+    }
+
+    fn model_route(&self, model: Option<&str>) -> Option<ModelRouteInfo> {
+        let info = self.info()?;
+        let model = model.or_else(|| self.default_model());
+        Some(ModelRouteInfo {
+            protocol: info.protocol,
+            model: info
+                .models
+                .into_iter()
+                .find(|m| model.is_none_or(|id| id == m.id)),
+            default_cache_retention: self.default_cache_retention(),
+        })
+    }
+
+    fn default_cache_retention(&self) -> Option<CacheRetention> {
         None
     }
 
@@ -247,20 +274,44 @@ impl LlmRuntime {
         adapter.discover_models()
     }
 
-    /// 直接调用匹配的适配器流（绕过 `llm/stream` waterfall，供重试等中间件使用）。
-    pub fn stream_direct(&self, options: GenerateOptions) -> Result<BoxChunkStream, LlmError> {
+    pub fn model_route(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<ModelRouteInfo> {
+        self.resolve_adapter(provider)?.model_route(model)
+    }
+
+    fn resolve_stream_adapter(
+        &self,
+        options: &mut GenerateOptions,
+    ) -> Result<Arc<dyn LlmAdapter>, LlmError> {
         let adapter = self
             .resolve_adapter(options.provider.as_deref())
             .ok_or_else(LlmError::no_adapter)?;
+        if options.supports_images.is_none()
+            && let Some(model) = options.model.as_deref().or_else(|| adapter.default_model())
+            && let Some(info) = adapter.info()
+        {
+            options.supports_images = info
+                .models
+                .iter()
+                .find(|m| m.id == model)
+                .map(ModelInfo::supports_images);
+        }
+        Ok(adapter)
+    }
+
+    /// 中间件重试时绕过自身，沿用相同的模型能力判定。
+    pub fn stream_direct(&self, mut options: GenerateOptions) -> Result<BoxChunkStream, LlmError> {
+        let adapter = self.resolve_stream_adapter(&mut options)?;
         Ok(adapter.stream(options))
     }
 
     /// 流式调用。外层包了一道 `waterfall("llm/stream")`：
     /// 其他插件可以在这里加重试、日志或改写请求，无需修改核心代码。
-    pub fn stream(&self, options: GenerateOptions) -> Result<BoxChunkStream, LlmError> {
-        let adapter = self
-            .resolve_adapter(options.provider.as_deref())
-            .ok_or_else(LlmError::no_adapter)?;
+    pub fn stream(&self, mut options: GenerateOptions) -> Result<BoxChunkStream, LlmError> {
+        let adapter = self.resolve_stream_adapter(&mut options)?;
 
         Ok(self
             .ctx

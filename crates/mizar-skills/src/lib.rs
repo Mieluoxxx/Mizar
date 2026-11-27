@@ -1,4 +1,4 @@
-//! 渐进式技能发现、分层注册表、热失效与按需加载工具（参考 `deepseek-harness/packages/skill`）。
+//! 渐进式技能发现、分层注册表、热失效与目录注入（参考 `pi` 与 `deepseek-harness/packages/skill`）。
 
 pub mod filesystem;
 pub mod frontmatter;
@@ -13,7 +13,7 @@ pub use filesystem::{
 pub use frontmatter::{ParsedSkillFile, parse_skill_markdown};
 pub use plugin::{
     DEFAULT_CATALOG_DESCRIPTION_MAX_LENGTH, SKILL_CATALOG_SOURCE, SKILL_INVOCATION_SOURCE,
-    SKILL_TOOL_NAME, SkillsConfig, SkillsPlugin, extract_skill_gestures, list_workspace_skills,
+    SkillsConfig, SkillsPlugin, extract_skill_gestures, list_workspace_skills,
 };
 pub use registry::{
     EVENT_SKILLS_CHANGE, SkillProvider, SkillRegistry, SkillRegistryConfig, SkillsContextExt,

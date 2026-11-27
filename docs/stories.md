@@ -32,7 +32,7 @@
 
 ## S3. 会话持久化、恢复与分叉（Agent + Computer Use）
 
-- **前置条件**：使用真实 SQLite 会话存储。
+- **前置条件**：使用真实 JSONL 会话存储目录。
 - **操作步骤**：
   1. 运行一轮包含工具调用的对话后正常退出 `mizar`。
   2. 重启并通过 `--resume` 恢复该会话，检查历史消息与上下文统计，再继续提问。
@@ -45,34 +45,32 @@
 
 - **前置条件**：构造临时工作区与 mock/真实端点，同时在用户全局配置目录放入干扰配置（如全局 MCP/skills）。
 - **操作步骤**：
-  1. 分别通过位置参数、`-f <prompt_file>`、管道 `stdin` 调用 `mizar exec`，验证 `--json` 与多轮 `--resume` 输出。
+  1. 分别通过位置参数、`--prompt-file <path>`、管道 `stdin` 调用 `mizar exec`，验证 `--json` 与多轮 `--resume` 输出。
   2. 以隔离模式（忽略个人全局配置）运行 `mizar exec`。
   3. 传入错误 API Key / 含 Bearer Token 的自定义 Header 触发认证或网络错误。
 - **可观测结果**：
-  - 非 JSON 模式下 `stdout` 仅输出干净的最终结果；JSON 模式下输出结构化合法 JSON。
+  - 非 JSON 模式下 `stdout` 仅输出干净的最终结果；`--json` 逐行输出 NDJSON，末行的 `type` 为 `result`。
   - 隔离模式不加载全局 MCP/skills/指令；错误路径返回非零退出码，且日志/错误信息中 API Key 与 Bearer Token 被脱敏。
 
 ## S5. 编码工具链、安全边界与插件热开关（Agent）
 
-- **前置条件**：准备包含普通文件与指向工作区外部的 symlink 的测试目录。
+- **前置条件**：准备包含普通文件与指向工作区外部的 symlink 的临时目录。在项目设置中选用 `toolsPreset: "all"`，使独立 `grep` 工具参与本故事。
 - **操作步骤**：
   1. 让 Agent 端到端串联使用 `read`、`write`、`edit`、`grep`、`bash` 完成一次文件创建与精确修改。
   2. 开启 `restrictToWorkspace`，让工具尝试通过 `..` 或外部 symlink 读写工作区外文件。
-  3. 在设置中尝试禁用核心保护模块（如基础编码工具/核心装配）与可选模块，并重启/刷新观察生效情况。
+  3. 分别尝试禁用受保护的 `tools` 服务和可选的 `codemode` 模块，再启用 `codemode`，重启或刷新后检查各项状态。
 - **可观测结果**：
   - 正常文件读写与局部编辑成功且内容精确；工作区外路径与 symlink 逃逸被拒绝并返回明确错误。
   - 核心保护插件禁止被关闭，可选插件禁用后对应能力消失、重新启用后恢复可用。
 
-## S6. 长会话自动 Compaction 与 Recall 召回（Agent）
+## S6. 长会话自动 Compaction 压缩（Agent）
 
-- **前置条件**：工作区根目录存在 `AGENTS.md`（含特定项目约束）与可检索的历史日志。
+- **前置条件**：工作区根目录存在 `AGENTS.md`（含特定项目约束）。
 - **操作步骤**：
   1. 连续多轮读取大文件与工具输出，使上下文逼近模型窗口上限以触发自动 compaction（或手动执行压缩）。
-  2. 压缩完成后继续提问：先验证 `AGENTS.md` 中的约束是否依然被遵守，再要求查阅压缩前的某段原文细节。
-  3. 在另一工作区目录下尝试召回当前工作区的私有会话内容。
+  2. 压缩完成后继续提问，验证 `AGENTS.md` 中的约束以及压缩检查点保留的路径、符号与当前进展是否依然被准确继承。
 - **可观测结果**：
-  - 触发压缩后对话可无感继续，Token 占用显著回落，项目指令仍然生效。
-  - 能通过 recall 工具检索并还原压缩前关键细节，同时跨工作区越权读取被拒绝。
+  - 触发压缩后对话可无感继续，Token 占用显著回落，项目指令与压缩恢复句柄仍然生效，完整历史事件继续保存在持久化 JSONL 日志中。
 
 ## S7. 多协议 LLM 路由与 MCP / Codemode（Agent）
 
@@ -85,12 +83,107 @@
   - 三种协议均能正确流式接收文本、推理与工具调用；MCP 工具可被发现、调用且暴露策略（hidden/codemode/deferred）生效。
   - 脚本异常与超时会迅速干净地返回错误给模型，不会拖垮或卡死宿主进程。
 
-## S8. 系统提示词分层组装与 `personality` 独立覆写（Agent）
+## S8. 随工具声明生成的系统提示词与可选 `personality`（Agent）
 
-- **前置条件**：工作区根目录存在 `AGENTS.md`，分别准备默认 `settings.json`、自定义 `"personality"` 与空字符串 `"personality": ""` 三组配置。
-- **操作步骤**：
-  1. 在三组配置下分别通过 `mizar exec` 运行真实请求，观测发出给模型的 system prompt 组装结果（如配合 `--trace-out` 或可控上游端点）。
-  2. 对比默认与覆写配置下各段落存在性与前后相对顺序。
-- **可观测结果**：
-  - 默认配置下依次呈现 `identity` → `engineering`（第一性原理、奥卡姆剃刀、并行/`codemode`）→ `personality` → `coding_tools` → `runtime_protocol`，且项目 `AGENTS.md`（`<project_instructions>`）位于全局静态前缀之后的尾部。
-  - 覆写 `"personality"` 或设为空串 `""` 时，仅性格段落变更或消失，`identity`、`engineering` 与 `runtime_protocol` 完整保留且前缀顺序不变。
+独立上下文的 Agent 在临时工作区放一份带标记的 `AGENTS.md`。用 `mizar exec --isolated` 连接可记录请求并回放工具调用的本地模型端点。逐步比对出站系统提示词与同一请求的工具声明。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 以默认设置发送请求。让模型读取文件，比较两步的系统提示。 | 身份以 `You are a coding assistant running inside Mizar` 开头，并要求跟随用户语言。默认提示中没有工程哲学、性格段或 `codemode`。`<tools>` 列出已声明工具，`<rules>` 含 bash 文件操作建议、read 和 write 的使用范围、edit 的批量编辑与精确唯一匹配要求。结尾依次为并行执行独立调用、简洁回复、写清路径。声明相同时，两步提示逐字节相同。 |
+| 在项目 `settings.json` 中分别省略 `personality`、设为空串、设为纯空白，再设为一段可识别的文字。 | 前三次系统提示逐字节相同。第四次的文字仅出现一次，介于身份与 `<tools>` 之间。四组均在 `</rules>` 之后说明 `<environment_context>`、`<project_instructions>`、`<skill_content>`、`<mizar-compaction>`，再出现项目文件的实际标记。 |
+| 用 `--tools read,bash,grep,find`、`--read-only`、`--tools codemode` 分别启动。 | 同时声明 shell 和独立搜索时，规则允许用 grep/find 单独搜索，也允许用 bash 写管道。只读预设仍含 read 指南。仅声明 codemode 时，`<rules>` 含其 `Promise.allSettled` 编排指南。每条规则只出现一次。 |
+
+## S9. 流中断、单步重试、压缩恢复与无头退出（Agent + Computer Use）
+
+前置条件为隔离的临时工作区、可记录请求并顺序回放 HTTP/SSE 的本地端点，以及专用 JSONL 会话目录。Agent 用 `mizar exec --json --trace-out <path>` 核对请求、进程退出码、标准输出和标准错误。Computer Use 在真实终端观察同一组输入。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 将 `MIZAR_RETRY_MAX_RETRIES` 设为 3、`MIZAR_RETRY_MAX_MID_THINKING` 设为 1。在同一步依次返回首字前 503、仅含思考和用量的断流、正常回答。重复此场景，让第三次请求也在思考后断流。 | 首轮 3 次请求只计 1 个 Step，只有一次步开始和结束，最终用量只来自成功请求。耗尽时，轨迹的步骤明细与会话汇总都计入最后一次尝试的用量。第二轮抵达思考重试上限后终止。比对重试请求与会话日志，历史中只有原始用户输入和实际完成的回答。轨迹中的重试记录标记为 `LogOnly`，下次请求的消息体不含这些诊断。 |
+| 在 TUI 观察一段明显不同于最终回答的失败思考，等待退避，再观察新尝试的首个 delta。另在退避中按 Esc。 | 失败思考、渐显尾部和本步速率统计一起清空。状态栏显示旋转的“重试 X/Y (Zs)…”。新输出或步结束后恢复。聊天区没有重试通知，取消等待后不再请求。 |
+| 分别在首段正文、工具调用的首个分块后断流。另在已有部分正文时主动取消。 | 断流只发出一次请求，没有执行残缺工具，没有失败的助手消息落盘。主动取消时保留已有正文，恢复会话后可见。 |
+| 依次回放数值及日期 `Retry-After`、`retry-after-ms: 0`、`x-should-retry: false`、全零与混合的 `x-ratelimit-limit-*`。另在 200、正常结束但无正文的响应上分别加禁止重试和超长等待头。给 402/429 的错误文本加上 `context window`，另回放裸 413 与 HTML。 | 请求间隔满足服务端的等待值。超过 `max_retry_after` 立即结束。显式禁止、硬配额、过大载荷及畸形响应不触发退避。普通限流可重试，402/429 不会启动上下文压缩。 |
+| 保持连接但不回响应头，再分别只发送 SSE 注释、`ping` 或空 delta。Completions 返回 `finish_reason` 后保持连接并省略 `[DONE]`。 | 设置 `MIZAR_LLM_IDLE_TIMEOUT_SECS=10` 后，无进展请求在约 10 秒超时。Completions 在约 3 秒宽限期后正常结束。宽限期内收到的用量仍被采纳。 |
+| Responses 仅回 `[DONE]`。Messages 在缺 `stop_reason` 或工具块仍打开时回 `message_stop`。Completions 在 `tool_calls` 前发送截断或语法损坏的参数。再分别以 `max_output_tokens`、`max_tokens`、`length` 截断未完成的工具。 | 缺协议终态或未闭合调用表现为传输错误，语法损坏表现为畸形响应，均无工具副作用。正常的长度截断报告 `truncated`，即使同一响应中有已闭合的调用，也没有工具执行或回放。带内数字和字符串状态码以及网关明文错误遵守相同的回放边界。 |
+| 先手动压缩一段长对话，让前缀摘要返回空包装。另在有重复文件读取、可产生净剪枝的会话触发溢出，让干净转录先超窗、随后在长度上限截断。在没有可剪内容及主动取消时重复后一个场景。 | 空包装触发转录兜底，超窗后的字符预算逐次折半。半截摘要没有进入检查点。已有净缩减时主循环在原 Step 以新历史和工具声明重试。无净缩减或用户取消时不报告剪枝恢复。 |
+| 在开启自动标题的终端会话中，让主请求正常完成。标题请求先返回 503，再给出合法标题。换新会话，让标题请求收到超过 15 秒的 `Retry-After`。 | 第一轮最多重试一次并更新标题。第二轮保留原有标题，主回答正常显示，聊天区没有后台请求失败通知。 |
+| 分别让 `exec --json` 完成、截断、达到最大步数、被取消、超时及遇到上游错误。通过只读权限或路径冲突触发写失败，让正常回答在落盘时失败，并在写失败时再次发送 SIGINT/SIGTERM。 | 逐行读取标准输出，每一行都能单独解析为 JSON。末行是唯一的 `type: "result"`。正常完成退出 0，落盘失败是 `storage`、退出 1，标准输出没有成功回答。超时和信号分别保留 124、130、143。同时发生的存储错误可在标准错误中看到。每次重试在标准输出产生一条 `retry`，在标准错误产生一行脱敏的 `[W retry]`。 |
+
+## S10. 按需工具、MCP 缓存与多模态工具回执（Agent）
+
+独立上下文的 Agent 使用本地构建的 `mizar exec --json`。准备临时工作区、专用 JSONL 会话目录、可记录三种协议请求并回放工具调用的本地 HTTP 服务，以及能延迟握手并返回图片的 MCP 服务。逐行解析标准输出的 NDJSON，用 `call_id` 将 `tool_call` 与 `tool_result` 配对，检查 `images`、`is_error` 和末行 `type: "result"` 的用量。普通场景加 `--isolated`。恢复场景使用专用的 `MIZAR_HOME` 和会话目录，启动新进程并传 `--resume <id>`。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 空配置启动，记录首个模型请求。依次改用 `toolsPreset: "all"`、`--tools read,bash,grep`、`--read-only` 和 `--tools codemode`。 | 默认声明的编码工具只有 `read`、`bash`、`edit`、`write`，声明和系统提示均无 `codemode`。引导允许用 bash 执行 `ls`、`rg`、`find`。`all` 增加两个独立搜索工具，显式名单只声明所选项，只读预设提供 `read`、`grep`、`find`。提供独立搜索工具时仍允许 shell 管道。显式选中沙箱后，模型可传 `code` 执行 JavaScript。 |
+| 配置一个默认 `codemode` 服务，另一个服务仅用 `toolExposure` 将某个工具设为 `codemode`。等待模型首个请求再让这两个服务完成握手，第二步用沙箱检索并调用新工具。分别设置 `codemode.enabled: false`、`disabledPlugins: ["codemode"]`、`autoEnableCodemode: false` 再启动。 | 无须等待握手，首个请求已声明 `codemode`。连接前后，该工具完整 JSON 声明和按配置名排序的 `<mcp_servers>` 段落逐字节相同。第二步可取得远端结果。三种显式关闭配置下，MCP 均未自动激活沙箱。单独开启 `onlyMode` 后，预算内本地工具出现在沙箱说明里。 |
+| 直接和通过 `codemode` 分别调用 `bash`，生成含首中尾标记的多行输出、超长单行及跨过 1 MiB 边界的 UTF-8 字符。脚本仅返回长度和边缘字符，另外读取 `full_output_path`。 | 模型直读保留首尾和省略提示，显示预算为 20 KiB、400 行、每行 768 字节。脚本能取到显示中省略的文字和原始末尾换行，最多 1,048,576 字节。边界上的半个字符被舍弃。落盘文件与完整命令输出逐字节一致。 |
+| 让视觉模型在一批调用里读取无扩展名 PNG、文本文件并调用返回图片的 MCP 工具。分别使用 Messages、Responses 和 Chat Completions，并换成目录未登记的模型。 | Messages 的 `tool_result.content` 依次为文本块和 base64 图块，Responses 的 `function_call_output.output` 依次为 `input_text` 和 `input_image`。Completions 按调用顺序先写完所有 `tool` 字符串回执，有图的回执结尾为 `(see attached image)`。紧接的一条合成 `user` 按相同顺序携带全部图像。三种协议的纯文本回执均为字符串，未知模型也收到图片。 |
+| 读取旋转 JPEG、动图和长边超过 2048 像素的图片，再读超 32 MiB、超 1 亿像素和非图片二进制文件。让 MCP 返回损坏图片、超过 20 张不同图片，再由沙箱并行调用读图工具。 | 方向、首帧、原始和最终尺寸可核对。超限或非图片二进制返回错误。MCP 损坏块变为简短说明，多图只保留前 20 张并提示截断。沙箱读到文本或元数据，模型在外层回执中收到相应附件，脚本结果和工具说明中均无图片 base64。 |
+| 在视觉模型会话中同时产生用户图片和工具图片，再以三个协议分别切换到模型目录声明仅支持文本的模型并恢复会话。 | 出站用户和工具消息都出现 `[image omitted: current model does not support image input]`，原文本和工具调用 ID 保留，请求中没有图片块、data URL 或合成图片消息。原会话附件仍可供视觉模型回放。 |
+| 用 Completions 新建会话，开启 `supersedeReads`，读取图片、替换该路径的图片并重读。检查下一请求、重启后恢复，再用 `--trace-out` 观察一次靠剪枝恢复的溢出。另恢复旧版本生成的纯文本工具会话。 | 旧回执替换为 `[Superseded by a newer read of this file]`，发出的图片只有最新版本。JSONL 日志与 Blob 存储保留原图和追加的剪枝标记，恢复后的请求仍只有新图。即使替换文本比原描述长，轨迹中的上下文估算仍因移除图片而下降。旧记录无需迁移，回放的工具文字完整。 |
+
+## S11. 热缓存保护、压缩边界与无头流式观测（Agent + Computer Use）
+
+独立上下文的 Agent 使用本地构建的 `mizar`、临时工作区、专用 JSONL 会话目录与可暂停的本地 HTTP 回放端点。端点保存收到的 JSON 请求，能回放工具批次、可预测的六项用量、检查点摘要与单次 503。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 在启用缓存的 Responses 路由上，用大窗口读取同一文件两次。记录第二次读取前后的请求。用同一会话切换协议并恢复，再分别以闲置 45 和 100 分钟的副本恢复。 | 热期的旧 `function_call_output` 字节与首次回执相同，切换协议后仍可见旧原文。45 分钟恢复保留回执，100 分钟恢复可见剪枝标记，JSONL 日志仍保存两份原文。 |
+| 在 `models.json` 给单模型指定 Responses 和长缓存，环境设置 `MIZAR_CACHE_RETENTION=none`。另用未带 Responses 回放的历史，移除路由长缓存设置后重复。 | 发出请求的协议和缓存策略与当前模型匹配。有长缓存的路由保住旧回执，关闭缓存且没有受保护回放的会话允许常规剪枝。 |
+| 在未知模型上设置 `compaction.defaultContextWindow`，再分别设置环境变量、`--context-window` 和模型目录窗口。用相同输入、候选回执与用量回放比较阈值。 | CLI 优先于 `MIZAR_CONTEXT_WINDOW`，两者都优先于目录。省略两者时使用目录或设置，均缺失时采用 128,000。`exec --context-window 0 --json` 只产生一条 `invalid_request`，退出 1。 |
+| Computer Use 在真实终端以 `MIZAR_CONTEXT_WINDOW=64000 mizar --context-window 32000` 启动 TUI，输入 `/session`。 | 会话报告的上下文总窗口为 `32k`。 |
+| 缩小窗口，让旧 `read` 首次可回收时已达阈值，候选距尾部超过 8,000 token。再增加一段无法剪枝的历史，使回收后仍超阈值。 | 前一种请求包含重读占位和最新原文，端点收到的摘要请求数为零。占位文本比原回执更长时，降压保留短回执原文。后一种出现检查点请求和 `compaction` 事件，`trigger` 为 `auto-threshold`，成功时 `outcome` 为 `compacted`，`result.compactions` 只计成功次数。 |
+| 让 `keepRecentTokens` 的初始切点落在多调用批次的第二个回执上。继续同一轮直到再次压缩，让前缀摘要返回空包装以触发转录兜底。 | 压缩后第一个保留批次的调用 ID 和每份回执逐一配对。下一次摘要请求包含最近的摘要，转录含 `<earlier-summary>`，同一轮原始用户指令仍在检查点中。 |
+| 先返回一次 503，再让模型批量读图片、普通文件和不存在的文件。给参数加上长 Unicode 文本和假凭据。分别使用 `--json`、`--output-format json` 与 `--output-format ndjson`，完成后再用 `--resume` 跑一轮。 | 首行是 `session`。各行的 `ts_ms` 与 `type` 可读，步骤、重试、调用和回执均可配对。预览脱敏且至多 512 字符。`images` 与出站附件数一致，`tool_errors` 与本轮错误回执数一致。各步六项 `usage` 逐项相加等于末行 `result.usage`，恢复后 `session_usage` 同时包括前一轮。 |
+| 输出重定向到文件，再改为管道；两次都让端点在第二个模型请求挂起。进程运行中读取已有行，再向该进程发送 `SIGKILL`。 | 强杀前即可解析 `session`、已完成步骤和工具回执。强杀后这些完整行仍可读取，调用方可以从缺少 `result` 识别这次中断。 |
+
+## S12. 搜索工具安装、镜像回退与按需补齐（Agent + Computer Use）
+
+独立上下文的 Agent 使用本地构建的 `mizar`、临时工作区、专用 `MIZAR_HOME` 和可控制的 `PATH`。把 `MIZAR_GITHUB_BASE_URL`、`MIZAR_GITHUB_MIRROR` 指向两个记录请求时间的回环 HTTP 端点。让 `releases/latest` 返回带 `/releases/tag/<tag>` 的重定向。将本机可运行的 `rg`、`fd` 各放入带子目录的 `.tar.gz`。让本地模型端点回放 `grep` 或 `bash` 调用并记录回执。Computer Use 在真实终端操作交互案例，设置 `MIZAR_SKIP_VERSION_CHECK=1`。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 从系统 `PATH` 中移除 `rg`、`fd`、`fdfind`，保留 `tar`。运行 `mizar install-tools` 两次，再运行 `mizar install-tools --force rg`。用临时用户主目录，分别取消设置 `MIZAR_HOME` 和设为空串后重装。 | 首次两个包并发下载，CLI 打印直连来源、各自的路径及版本。第二次复用本地文件，端点无新请求。强制重装只请求 `rg`。显式指定的目录优先，省略或空串时安装在临时用户的 `~/.mizar/bin`。 |
+| 仅在系统 `PATH` 提供 `fdfind` 并运行 `mizar install-tools fd`。再用空缓存和无工具的 `PATH` 分别设置 `MIZAR_OFFLINE=1` 与 `PI_OFFLINE=yes` 运行安装。 | 第一组复用系统程序，随后在 `bash` 内执行 `fd --version` 成功。离线缺包时命令报告离线并退出非零。三组均无下载请求。 |
+| 让直连返回响应头，每 50 毫秒发一小块，保持速率低于 `MIZAR_BIN_SLOW_BPS=65536`。设 `MIZAR_BIN_WARMUP_MS=300`、`MIZAR_BIN_STALL_MS=1800`，运行 `mizar install-tools --force rg`。再改为预热 10 秒、停滞 250 毫秒，让服务发一个字节后暂停。 | 第一组预热后在数据持续到达时切源，第二组在停滞时限切源。镜像收到的路径为 `/{原始完整下载 URL}`，与 `ghfast.top` 的拼接格式一致。CLI 打印镜像来源和版本，落盘文件可执行。 |
+| 让直连 `latest` 返回 503，镜像返回合法重定向。另让直连包返回 502 或超过 10 秒才发响应头。然后设 `MIZAR_GITHUB_MIRROR=off`、`none` 或空串，重复失败请求。 | 版本查询和下载各自先试直连。版本查询通过镜像恢复后仍直连下载包。包请求失败时从镜像重新下载。关闭镜像时只有直连请求，失败原因可见。 |
+| 记录已装 `rg` 的 SHA-256。强制重装时让源分别返回 HTML 和损坏的压缩包。再让直连返回 502，镜像返回能解压但 `--version` 退出非零或标准输出为空的文件。 | 每次安装均退出非零。错误指出解压或 `--version` 失败。原文件的摘要和版本保持一致，`bin` 中没有遗留压缩包或暂存目录。 |
+| 从空缓存启动真实 TUI `mizar --tools grep`，让两个包发出响应头后暂缓传输。看到首屏后调用 `grep`，再让包在回退阈值前传完。换一份空缓存启动 TUI，让 `rg` 启动下载失败，恢复源后再调用 `grep`。 | 第一次可在下载期间提交命令。每种工具只有一个包请求，`grep` 返回目标文件的行号与内容。第二次在 `grep` 调用后重新请求 `rg` 并完成相同搜索。 |
+| 用 `mizar exec --tools grep,bash --json` 分别在空缓存和已有托管工具时搜索标记，并让 `bash` 运行 `command -v rg`、`fd --version`。再在系统 `PATH` 提供另一个 `rg` 后重复。 | 缺 `rg` 时工具回执提示运行 `mizar install-tools rg` 或安装 ripgrep。托管 `rg` 能搜到标记。两者都存在时，独立 `grep` 使用托管版本，shell 使用系统版本。shell 的 `PATH` 末尾有托管目录，可以直接调用 `fd`。无头模式下两个下载端点全程无请求。 |
+
+## S13. 工具卡片的四态圆灯与单行折叠（独立 Agent + Computer Use）
+
+独立 Agent 在临时工作区启动本地慢速 SSE 回放，准备一个可编辑的文件，以及能在输出首行后等待放行的命令。Computer Use 用 `cua-driver` 在真实终端启动本地构建的 `mizar`，保持工具卡片折叠，在每个停顿处观察同一张卡片。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 分片返回两次工具调用的参数，交错两个块的索引，让其中一次稍后才收到调用 ID。 | 每个调用各有一行标题。参数尚未闭合时左侧显示灰色空心圈 `○`，后续片段更新对应标题。收到真实 ID 后卡片数量与顺序不变。 |
+| 下一步复用前一步的调用 ID，改用可区分的命令和输出。完成后展开，再用 `--resume` 恢复会话并展开。 | 两次调用各有一张卡片，两次展开均能看到各自的命令和输出。 |
+| 完成参数并派发命令，等它输出一行后暂停。按 `Ctrl+O` 查看，再按一次折起。 | 原卡片的灯就地变为黄色实心圆 `●`。折叠时只有标题，展开时可见完整命令参数与已到达的输出。尚在排队的调用保持空心。 |
+| 放行一个成功命令、一个非零退出的命令和一次文件编辑，再在审批窗口拒绝一次工具调用。 | 成功与编辑完成时为绿色 `●`，失败与被拦截时为红色 `●`。每张折叠卡片正文均为零行，标题可显示行数、退出码或差异统计。相邻卡片之间没有预览行，组尾保留空行及可展开提示。 |
+| 按 `Ctrl+O` 展开工具组，核对多行脚本、错误正文和文件修改前后的差异。分别用单行输出和超过 160 行且带末行标记的输出重复，再按一次折起。 | 展开后能看到单行输出、长输出的末行标记、报错和差异。折起后回到同一组单行标题。 |
+| 分别在工具参数只有半段时回放长度截断、按 `Esc` 取消。 | 未派发的卡片从空心圈收敛为红色 `●`，终端显示截断或中断提示，命令没有执行。 |
+
+## S14. 技能目录 `<location>` 注入、按需读取与热更新（Agent）
+
+独立上下文的 Agent 使用临时工作区（含项目 `.agents/skills/<name>/SKILL.md`）与可记录请求的本地模型端点，运行 `mizar exec --isolated --json` 并切换 `--tools`。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 默认包含 `read` 启动会话，检查出站工具声明与 `<available_skills>`，并按 `<location>` 调用 `read` 加载技能。 | 工具声明中不含 `skill`。`<available_skills>` 内含 `<name>`、`<description>` 与指向 `SKILL.md` 的 `<location>`，指引使用 `read` 加载，并说明相对路径基于 `SKILL.md` 父目录解析。 |
+| 分别仅声明 `bash`（`--tools bash`）、既无 `read` 也无 `bash`（`--tools grep`），以及清空可用技能后以默认工具启动。 | 仅声明 `bash` 时指引使用 `bash` 读取技能文件；既无 `read` 也无 `bash` 或无可用技能时，均不注入 `<available_skills>`。 |
+| 运行中用 `write` 或 `edit` 修改技能目录中的 `SKILL.md`（或切换 `disable-model-invocation`），继续下一轮请求。 | 触发热更新并用新目录替换此前所有 `<available_skills>` 列表；无可用模型技能时提示当前无可用技能、勿沿用旧条目。 |
+| 用户消息携带 `/<skill-name>` 手势。 | 上下文直接展开对应 `<skill_content>`，无需再次读取技能文件。 |
+
+## S15. 宽容 JSONL 会话持久化、Blob 外置与错误显式透出（Agent + Computer Use）
+
+独立上下文的 Agent 使用临时工作区、可控的 `MIZAR_SESSIONS_DIR` / `settings.json`（`sessionsDir`）与多模态输入/工具回放端点；Computer Use 在真实终端验证 TUI `/session`、启动与运行期失败错误透出及空会话退出行为。
+
+| 操作 | 可观测结果 |
+| --- | --- |
+| 启动 TUI 不发送任何消息即退出（`--no-persist` 省略），以及设 `MIZAR_SESSIONS_DIR=memory` / `none` / `off` 跑一轮 `mizar exec`。 | 均未在磁盘生成空 `.jsonl` 文件；TUI 空会话退出后不输出无效的 `--resume` 命令。 |
+| 分别在两个工作区（含通过 symlink 指向同一真实路径的 cwd）及无 cwd 会话中运行对话，完成后检查 `/session` 与会话目录。 | 按 canonicalize 后的 `cwd` 归入对应 `<sessions_dir>/<encoded-cwd>/<YYYYMMDDTHHMMSSZ>_<session_id>.jsonl` 桶（无 cwd 归入 `_global`），经 symlink 访问归入同一桶；TUI `/session` 显示 `JSONL · <path>`。 |
+| 发送用户图片或让工具返回图片，检查 JSONL 文件与同级 `blobs/` 目录；手工删除其中某个 `blobs/<sha256>` 后 `--resume <id>` 恢复会话。 | JSONL 事件行中图片 `data` 存为 `"blob:sha256:<hex>"`，同级 `blobs/<sha256>` 保存去重后的原始 base64；删除 blob 后恢复不报错崩溃，仅剔除丢失的图片附件并记告警日志，其余文本与完好附件正常载入。 |
+| 向既有 `.jsonl` 文件首行写入更高整数 `formatVersion`（如 `999`）或 `0`、插入未知 `record` 行、未知 `event`（保留 `seq`）、`header-patch` 补丁及末尾不带换行的半截 JSON 尾行，再执行恢复与续写。 | 高版本与 `0` 版本均正常打开不被拒；未知事件和截断尾行安全跳过，已有历史与标题补丁准确还原；续写前自动补齐 `\n` 不粘行，新事件的 `seq` 严格大于跳过的 `max_persisted_seq`。 |
+| 将 `MIZAR_SESSIONS_DIR` 指向不可写路径启动 TUI；另在合法目录启动后将目标会话目录改为只读并继续运行及退出。 | 启动不可写时 TUI 立即显式注入 `NoticeLevel::Error`（「会话持久化初始化失败，当前会话未落盘」），`mizar exec` 以 `storage` 退出码 1 失败；运行期或退出 `flush` 失败（含 `last_error()` 非空）时 TUI 与 CLI 均显式报错退出，绝不静默丢数据。 |

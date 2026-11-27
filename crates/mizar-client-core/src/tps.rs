@@ -124,6 +124,14 @@ impl TpsLedger {
         self.open = Some(OpenStep::default());
     }
 
+    /// 退避与首字等待都不属于解码耗时，下一次尝试须从自己的首个 token 起算。
+    pub fn reset_open_step(&mut self, _ts_ms: u128) {
+        if let Some(open) = &mut self.open {
+            *open = OpenStep::default();
+            self.restore_completed_rate();
+        }
+    }
+
     /// 记录本步首个 token 的时间边界（同一步内重复到达只认第一次）。
     pub fn on_first_token(&mut self, ts_ms: u128) {
         if let Some(open) = &mut self.open {
@@ -186,6 +194,10 @@ impl TpsLedger {
     /// 此时读数回退到进入本轮前的值。
     pub fn on_turn_end(&mut self) -> Option<f64> {
         self.open = None;
+        self.restore_completed_rate()
+    }
+
+    fn restore_completed_rate(&mut self) -> Option<f64> {
         if self.sampled && self.decode_ms > 0 {
             let rate = self.decode_tokens / (self.decode_ms as f64 / 1000.0);
             self.rate = Some(rate);

@@ -86,7 +86,7 @@ Rules:
 3. Do NOT repeat CLI invocation noise, raw file paths, or UUIDs.
 4. Output ONLY a single line in exact format: TYPE｜Topic
    Example (Chinese): FEA｜自动会话标题生成
-   Example (English): FIX｜SQLite Schema v2 Migration";
+   Example (English): OPT｜JSONL Session Persistence";
 
     let user_prompt = format!(
         "User messages in chronological order:\n<user-messages>\n{conversation}\n</user-messages>\n\nOutput ONLY `TYPE｜Topic`."

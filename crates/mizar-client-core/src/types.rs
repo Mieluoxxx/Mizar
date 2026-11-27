@@ -11,6 +11,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolState {
+    Drafting,
     Running,
     Done,
     Error,
@@ -26,6 +27,7 @@ pub enum ActivityState {
     Agent {
         streaming_assistant_open: bool,
         compaction_status: Option<String>,
+        retry_status: Option<String>,
     },
     /// 用户触发 `!` / `!!` 本地 Bash 命令执行中。
     LocalBash,
@@ -450,6 +452,15 @@ pub enum ClientEvent {
     StepStart {
         ts_ms: u128,
     },
+    StepRetrying {
+        step: usize,
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        reason: String,
+        reset_draft: bool,
+        ts_ms: u128,
+    },
     StepEnd {
         step: usize,
         ts_ms: u128,
@@ -466,6 +477,16 @@ pub enum ClientEvent {
     TextDelta {
         text: String,
         ts_ms: u128,
+    },
+    ToolCallDraft {
+        call_id: String,
+        name: String,
+        arguments_delta: String,
+        ts_ms: u128,
+    },
+    ToolCallDraftId {
+        previous_id: String,
+        call_id: String,
     },
     ToolCall(ToolCall),
     ToolUpdate {

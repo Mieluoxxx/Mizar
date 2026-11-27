@@ -9,13 +9,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Inject, Logger, Service};
+use mizar_image::{MAX_IMAGE_INPUT_BYTES, base64_encoded_len, process_image_bytes};
+use mizar_system_prompt::{PromptSection, SystemPrompt};
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head, write_temp_output,
 };
 use mizar_tools::{
-    ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure, ToolNamespace, ToolOutput,
-    ToolsContextExt,
+    MAX_IMAGES_PER_MESSAGE, ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolExposure,
+    ToolNamespace, ToolOutput, ToolsContextExt,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
@@ -34,7 +37,7 @@ pub const READ_MCP_RESOURCE_TOOL: &str = "read_mcp_resource";
 const MAX_SERVER_DESCRIPTION_CHARS: usize = 250;
 const MAX_SERVERS_SECTION_CHARS: usize = 4096;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct McpPluginConfig {
     pub workspace: PathBuf,
     /// 可选覆盖全局配置目录（默认 `~/.mizar`，或 `MIZAR_HOME`）。
@@ -45,6 +48,7 @@ pub struct McpPluginConfig {
     pub load_config_files: bool,
     /// 代码内显式追加/覆盖的 MCP Server 配置。
     pub servers: HashMap<String, McpServerConfig>,
+    pub auto_enable_codemode: bool,
     /// 连接时是否异步后台连接（默认 true，不阻塞首屏启动；测试可设 false 并调用 `wait_ready`）。
     pub background_connect: bool,
 }
@@ -53,11 +57,54 @@ impl McpPluginConfig {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            load_config_files: true,
+            background_connect: true,
+            ..Self::default()
+        }
+    }
+
+    fn load_servers(&mut self) -> LoadedMcpConfig {
+        let mut loaded = if self.load_config_files {
+            let global = if self.skip_global_config {
+                None
+            } else {
+                self.global_config_dir
+                    .clone()
+                    .or_else(resolve_global_config_dir)
+            };
+            load_mcp_config_with_global(&self.workspace, global.as_deref())
+        } else {
+            LoadedMcpConfig {
+                auto_enable_codemode: true,
+                ..Default::default()
+            }
+        };
+        loaded.auto_enable_codemode &= self.auto_enable_codemode;
+        loaded
+            .entries
+            .retain(|entry| !self.servers.contains_key(&entry.name));
+        loaded
+            .entries
+            .extend(self.servers.drain().map(|(name, config)| LoadedMcpEntry {
+                name,
+                config,
+                source: "programmatic".into(),
+            }));
+        loaded.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        loaded
+    }
+}
+
+impl Default for McpPluginConfig {
+    fn default() -> Self {
+        Self {
+            workspace: PathBuf::new(),
             global_config_dir: None,
             skip_global_config: false,
-            load_config_files: true,
+            load_config_files: false,
             servers: HashMap::new(),
-            background_connect: true,
+            auto_enable_codemode: true,
+            background_connect: false,
         }
     }
 }
@@ -104,15 +151,6 @@ struct ConnectedServer {
     cleanups: Vec<Cleanup>,
 }
 
-fn mcp_server_summary(description: Option<&str>, instructions: Option<&str>) -> String {
-    let text = description
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| instructions.map(str::trim).filter(|s| !s.is_empty()))
-        .unwrap_or("");
-    text.lines().next().unwrap_or("").trim().to_string()
-}
-
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -126,7 +164,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 pub struct McpManager {
     ctx: Context,
-    config: McpPluginConfig,
+    config: LoadedMcpConfig,
+    workspace: PathBuf,
+    background_connect: bool,
     servers: AsyncMutex<HashMap<String, ConnectedServer>>,
     statuses: Mutex<HashMap<String, McpServerStatus>>,
     resource_cleanups: AsyncMutex<Vec<Cleanup>>,
@@ -155,6 +195,39 @@ impl McpManager {
         }
     }
 
+    pub fn needs_initial_catalog(&self, include: Option<&[String]>) -> bool {
+        let mut enabled = self
+            .config
+            .entries
+            .iter()
+            .filter(|s| s.config.enabled)
+            .peekable();
+        if enabled.peek().is_none() {
+            return false;
+        }
+        if let Some(patterns) = include {
+            return patterns.iter().any(|pattern| {
+                let prefix = pattern.split('*').next().unwrap_or(pattern);
+                pattern.starts_with("mcp__")
+                    || (pattern.contains('*') && "mcp__".starts_with(prefix))
+                    || [
+                        "tool_search",
+                        LIST_MCP_RESOURCES_TOOL,
+                        LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+                        READ_MCP_RESOURCE_TOOL,
+                    ]
+                    .iter()
+                    .any(|name| mizar_tools::wildcard_matches(pattern, name))
+            });
+        }
+        // 纯直连配置的首步需要真实声明；间接工具可在后台就绪后发现。
+        enabled.all(|s| {
+            s.config.exposure == McpExposure::Direct
+                && !s.config.uses_exposure(McpExposure::Codemode)
+                && !s.config.uses_exposure(McpExposure::Deferred)
+        })
+    }
+
     pub fn statuses(&self) -> Vec<McpServerStatus> {
         let mut list: Vec<McpServerStatus> =
             self.statuses.lock().unwrap().values().cloned().collect();
@@ -163,58 +236,29 @@ impl McpManager {
     }
 
     pub fn render_servers_section(&self) -> Option<String> {
-        let statuses = self.statuses();
-        let mut indirect: Vec<&McpServerStatus> = statuses
+        let indirect: Vec<_> = self
+            .config
+            .entries
             .iter()
             .filter(|s| {
-                if matches!(s.state, McpConnectionState::Disabled) {
-                    return false;
-                }
-                s.exposure == McpExposure::Codemode
-                    || s.exposure == McpExposure::Deferred
-                    || s.registered_tools.iter().any(|(_, exp)| {
-                        matches!(exp, ToolExposure::Codemode | ToolExposure::Deferred)
-                    })
+                s.config.uses_exposure(McpExposure::Codemode)
+                    || s.config.uses_exposure(McpExposure::Deferred)
             })
             .collect();
         if indirect.is_empty() {
             return None;
         }
-        indirect.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let mut has_codemode = false;
-        let mut has_deferred = false;
-        let mut heads = Vec::with_capacity(indirect.len());
-        for s in &indirect {
-            let uses_codemode = s.exposure == McpExposure::Codemode
-                || s.registered_tools
-                    .iter()
-                    .any(|(_, e)| *e == ToolExposure::Codemode);
-            if uses_codemode {
-                has_codemode = true;
-            } else {
-                has_deferred = true;
-            }
-            let reach = if uses_codemode {
-                "codemode"
-            } else {
-                "tool_search"
-            };
-            heads.push(format!("- {} ({reach})", mcp_namespace(&s.name)));
-        }
-
-        let mut intro = String::from("MCP servers whose tools are not declared to you.");
-        if has_codemode {
-            intro.push_str(" Call the tools of `codemode` servers from codemode scripts.");
-        }
-        if has_deferred {
-            intro.push_str(" Load the tools of `tool_search` servers with `tool_search`.");
-        }
+        let intro = "Configured MCP namespaces with indirect tools:";
+        let heads: Vec<_> = indirect
+            .iter()
+            .map(|s| format!("- {}", mcp_namespace(&s.name)))
+            .collect();
 
         let omitted = |count: usize| -> Option<String> {
             (count > 0).then(|| {
                 let suffix = if count == 1 { "" } else { "s" };
-                format!("- … {count} more server{suffix}; find their tools with searchTools()")
+                format!("- … {count} more server{suffix}")
             })
         };
         let size_for = |kept: usize| -> usize {
@@ -241,12 +285,19 @@ impl McpManager {
                 .min(MAX_SERVER_DESCRIPTION_CHARS)
         };
 
-        let mut parts = vec![intro];
+        let mut parts = vec![intro.to_string()];
         for (idx, s) in indirect.iter().take(kept).enumerate() {
             let summary = if per_server > 0 {
-                let first_line =
-                    mcp_server_summary(s.description.as_deref(), s.instructions.as_deref());
-                truncate_chars(&first_line, per_server)
+                let first_line = s
+                    .config
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or_default();
+                truncate_chars(first_line, per_server)
             } else {
                 String::new()
             };
@@ -268,43 +319,12 @@ impl McpManager {
             self.ready_notify.notify_waiters();
             return;
         }
-        let mut entries_map: HashMap<String, LoadedMcpEntry> = HashMap::new();
-
-        if self.config.load_config_files {
-            let global_dir = if self.config.skip_global_config {
-                None
-            } else {
-                self.config
-                    .global_config_dir
-                    .clone()
-                    .or_else(resolve_global_config_dir)
-            };
-            let loaded = load_mcp_config_with_global(&self.config.workspace, global_dir.as_deref());
-            for err in loaded.errors {
-                self.logger().warn(err);
-            }
-            for entry in loaded.entries {
-                entries_map.insert(entry.name.clone(), entry);
-            }
-        }
-        for (name, cfg) in &self.config.servers {
-            entries_map.insert(
-                name.clone(),
-                LoadedMcpEntry {
-                    name: name.clone(),
-                    config: cfg.clone(),
-                    source: "programmatic".to_string(),
-                },
-            );
-        }
-
-        let mut entries: Vec<LoadedMcpEntry> = entries_map.into_values().collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let entries = &self.config.entries;
 
         {
             let mut st = self.statuses.lock().unwrap();
             st.clear();
-            for entry in &entries {
+            for entry in entries {
                 let state = if entry.config.enabled {
                     McpConnectionState::Connecting
                 } else {
@@ -362,7 +382,7 @@ impl McpManager {
             McpClient::connect(
                 &entry.name,
                 &entry.config,
-                &self.config.workspace,
+                &self.workspace,
                 self.logger(),
                 &cancel,
             )
@@ -496,6 +516,9 @@ impl McpManager {
             *phase = McpManagerPhase::Closing;
         }
         self.connect_cancel.cancel();
+        if let Ok(tools) = self.ctx.tools() {
+            tools.set_auto_default_active("codemode", None);
+        }
         self.ready_notify.notify_waiters();
         let _connect_guard = self.connect_lock.lock().await;
 
@@ -587,7 +610,7 @@ fn make_mcp_tool_def(
                 let res = client
                     .call_tool(&remote_name, args, &call_ctx.cancel)
                     .await?;
-                format_mcp_tool_result(&res).await
+                format_mcp_tool_result(res).await
             }
         })
         .with_exposure(exposure)
@@ -601,18 +624,65 @@ fn make_mcp_tool_def(
     def
 }
 
-async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
+async fn format_mcp_tool_result(mut res: Value) -> Result<ToolOutput, BoxError> {
     let is_error = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
-    let structured = res.get("structuredContent").cloned();
     let mut parts = Vec::new();
+    let mut images = Vec::new();
+    let mut skipped_images = 0;
+    let mut structured = res.get_mut("structuredContent").map(Value::take);
 
-    if let Some(blocks) = res.get("content").and_then(Value::as_array) {
+    if let Some(blocks) = res.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(value) = &mut structured {
+            let payloads: Vec<_> = blocks
+                .iter()
+                .filter(|block| block["type"] == "image")
+                .filter_map(|block| block["data"].as_str())
+                .collect();
+            if !payloads.is_empty() {
+                mizar_tools::omit_image_data(value, &payloads);
+            }
+        }
         for block in blocks {
             let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
             match kind {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
                         parts.push(text.to_string());
+                    }
+                }
+                "image" => {
+                    if images.len() == MAX_IMAGES_PER_MESSAGE {
+                        skipped_images += 1;
+                        continue;
+                    }
+                    let Value::String(data) = block["data"].take() else {
+                        parts.push("[Image omitted: missing base64 data]".into());
+                        continue;
+                    };
+                    if data.len() > base64_encoded_len(MAX_IMAGE_INPUT_BYTES) {
+                        parts.push("[Image omitted: exceeds 32 MiB input limit]".into());
+                        continue;
+                    }
+                    let decoded = tokio::task::spawn_blocking(move || -> Result<_, BoxError> {
+                        let bytes = STANDARD.decode(data)?;
+                        if bytes.len() > MAX_IMAGE_INPUT_BYTES {
+                            return Err("exceeds 32 MiB input limit".into());
+                        }
+                        Ok(process_image_bytes(&bytes)?)
+                    })
+                    .await?;
+                    match decoded {
+                        Ok(image) => {
+                            parts.push(format!(
+                                "[Image {}: {}×{}, {}]",
+                                images.len() + 1,
+                                image.original_width,
+                                image.original_height,
+                                image.attachment.media_type
+                            ));
+                            images.push(image.attachment);
+                        }
+                        Err(error) => parts.push(format!("[Image omitted: {error}]")),
                     }
                 }
                 "resource" => {
@@ -641,7 +711,7 @@ async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
     };
 
     let trunc = truncate_head(&raw_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    let content = if trunc.truncated {
+    let mut content = if trunc.truncated {
         let spilled = write_temp_output("mizar-mcp-", &raw_text)
             .await
             .ok()
@@ -658,8 +728,19 @@ async fn format_mcp_tool_result(res: &Value) -> Result<ToolOutput, BoxError> {
         trunc.content
     };
 
+    if skipped_images > 0 {
+        content.push_str(&format!("\n[Image limit reached: kept the first {MAX_IMAGES_PER_MESSAGE}, skipped {skipped_images}.]"));
+    }
+    if !images.is_empty()
+        && let Some(Value::Object(fields)) = &mut structured
+    {
+        fields
+            .entry("text")
+            .or_insert_with(|| Value::String(content.clone()));
+    }
     Ok(ToolOutput {
         content,
+        images,
         is_error,
         structured_content: structured,
         details: None,
@@ -822,10 +903,16 @@ impl Service for McpManager {
         Inject::from(["tools"])
     }
 
-    fn create(ctx: &Context, config: Self::Config) -> Result<Arc<Self>, CordisError> {
+    fn create(ctx: &Context, mut config: Self::Config) -> Result<Arc<Self>, CordisError> {
+        let mut loaded = config.load_servers();
+        for error in loaded.errors.drain(..) {
+            ctx.logger_named("mcp").warn(error);
+        }
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
-            config,
+            config: loaded,
+            workspace: config.workspace,
+            background_connect: config.background_connect,
             servers: AsyncMutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             resource_cleanups: AsyncMutex::new(Vec::new()),
@@ -848,7 +935,35 @@ impl Service for McpManager {
                 })))
             })?;
 
-            if mgr_connect.config.background_connect {
+            let auto = self.config.auto_enable_codemode
+                && self
+                    .config
+                    .entries
+                    .iter()
+                    .any(|s| s.config.uses_exposure(McpExposure::Codemode));
+            ctx.tools()?
+                .set_auto_default_active("codemode", auto.then_some(true));
+            if let Some(summary) = self.render_servers_section() {
+                let section = format!("<mcp_servers>\n{summary}\n</mcp_servers>");
+                let fiber = ctx.try_inject(["systemPrompt"], move |c| {
+                    let section = section.clone();
+                    async move {
+                        let sp = c.service::<SystemPrompt>("systemPrompt")?;
+                        c.effect("mcp.servers-section", move || {
+                            Ok::<_, CordisError>(Some(sp.section(PromptSection::new(
+                                "mcp_servers",
+                                35,
+                                move || Some(section.clone()),
+                            ))))
+                        })?;
+                        Ok::<_, CordisError>(())
+                    }
+                })?;
+                if ctx.get::<SystemPrompt>("systemPrompt").is_some() {
+                    fiber.wait_settled().await?;
+                }
+            }
+            if mgr_connect.background_connect {
                 tokio::spawn(async move {
                     mgr_connect.connect_configured().await;
                 });

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use cordis::{BoxError, BoxFuture, Cleanup, Context, CordisError, Service};
 use mizar_llm::ToolSchema;
+pub use mizar_llm::{ImageAttachment, MAX_IMAGES_PER_MESSAGE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -40,9 +41,7 @@ pub enum ToolExposure {
     Direct,
     /// 激活时声明给模型，但禁止被 `codemode` 脚本嵌套调用（适用于 `codemode`、`tool_search` 等编排工具）。
     ModelOnly,
-    /// 已注册且可被 `codemode` 脚本调用；不直接声明给模型（除非被 `tool_search` 等激活）；会列在 `codemode` 描述中。
     Codemode,
-    /// 与 `Codemode` 类似，但不会自动列在 `codemode` 描述中，主要通过 `tool_search` / `searchTools()` 发现激活。
     Deferred,
     /// 已注册但彻底不可达，无法激活，也不被脚本或模型调用。
     Hidden,
@@ -147,6 +146,8 @@ fn is_false(v: &bool) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocked: bool,
@@ -164,6 +165,7 @@ impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: false,
             blocked: false,
             additional_contexts: Vec::new(),
@@ -174,29 +176,22 @@ impl ToolResult {
 
     pub fn err(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
             is_error: true,
-            blocked: false,
-            additional_contexts: Vec::new(),
-            structured_content: None,
-            details: None,
+            ..Self::ok(content)
         }
     }
 
     pub fn denied(content: impl Into<String>) -> Self {
         Self {
-            content: content.into(),
-            is_error: true,
             blocked: true,
-            additional_contexts: Vec::new(),
-            structured_content: None,
-            details: None,
+            ..Self::err(content)
         }
     }
 
     pub fn from_output(output: ToolOutput) -> Self {
         Self {
             content: output.content,
+            images: output.images,
             is_error: output.is_error,
             blocked: false,
             additional_contexts: Vec::new(),
@@ -236,9 +231,11 @@ impl ToolResult {
 }
 
 /// 工具执行返回的富输出结构。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
     pub is_error: bool,
     pub structured_content: Option<Value>,
     pub details: Option<Value>,
@@ -248,9 +245,7 @@ impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
-            is_error: false,
-            structured_content: None,
-            details: None,
+            ..Self::default()
         }
     }
 
@@ -258,9 +253,13 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
-            structured_content: None,
-            details: None,
+            ..Self::default()
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
+        self.images = images;
+        self
     }
 
     pub fn with_structured(mut self, value: Value) -> Self {
@@ -283,6 +282,27 @@ impl From<String> for ToolOutput {
 impl From<&str> for ToolOutput {
     fn from(content: &str) -> Self {
         Self::text(content)
+    }
+}
+
+// 插件可能把附件复制到任意 JSON 字段，保留旁边的元数据供脚本使用。
+pub fn omit_image_data(value: &mut Value, payloads: &[&str]) {
+    match value {
+        Value::String(text)
+            if text.starts_with("data:image/")
+                || payloads
+                    .iter()
+                    .any(|data| !data.is_empty() && text.contains(data)) =>
+        {
+            *value = Value::Null;
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| omit_image_data(item, payloads)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| omit_image_data(field, payloads)),
+        _ => {}
     }
 }
 
@@ -589,7 +609,7 @@ struct ToolState {
     tools: Vec<ToolDefinition>,
     /// 显式全局覆盖（例如手动覆盖默认激活或无会话上下文下动态启用）。
     global_active_overrides: HashMap<String, bool>,
-    /// 插件按需自动启用状态（如 `codemode` / `tool_search`），不绕过显式 `include_patterns`。
+    /// 由激活来源撤销，避免工具热重载时丢失仍生效的自动激活配置。
     auto_default_active: HashMap<String, bool>,
     /// 若设置了 `Some(patterns)`，默认只激活匹配这些模式且未关闭的工具。
     include_patterns: Option<Vec<String>>,
@@ -757,7 +777,6 @@ impl ToolRuntime {
                         st.tools.remove(idx);
                     }
                     st.global_active_overrides.remove(&tool_name);
-                    st.auto_default_active.remove(&tool_name);
                     for policy in st.session_policies.values_mut() {
                         match policy {
                             SessionToolPolicy::IncrementalAdded(list)
@@ -930,30 +949,25 @@ impl ToolRuntime {
     }
 
     pub fn list_declared_infos(&self, session_id: Option<&str>) -> Vec<ToolRuntimeInfo> {
-        let (active_defs, callable, registered) = {
+        let (hooks, loadout) = {
             let st = self.state.lock().unwrap();
             let active_defs = st.resolve_active_defs(session_id);
-            let callable = st.resolve_callable_infos(&active_defs);
-            let registered: Vec<ToolRuntimeInfo> =
-                st.tools.iter().map(ToolDefinition::info).collect();
-            (active_defs, callable, registered)
-        };
-
-        let declared_infos: Vec<ToolRuntimeInfo> =
-            active_defs.iter().map(ToolDefinition::info).collect();
-        let hooks: Vec<PrepareLoadoutFn> = active_defs
-            .iter()
-            .filter_map(|t| t.prepare_loadout.clone())
-            .collect();
-
-        if hooks.is_empty() {
-            return declared_infos;
-        }
-
-        let loadout = ToolLoadout {
-            declared: declared_infos.clone(),
-            callable,
-            registered,
+            let declared = active_defs.iter().map(ToolDefinition::info).collect();
+            let hooks: Vec<_> = active_defs
+                .iter()
+                .filter_map(|tool| tool.prepare_loadout.clone())
+                .collect();
+            if hooks.is_empty() {
+                return declared;
+            }
+            (
+                hooks,
+                ToolLoadout {
+                    declared,
+                    callable: st.resolve_callable_infos(&active_defs),
+                    registered: st.tools.iter().map(ToolDefinition::info).collect(),
+                },
+            )
         };
         let mut description_overrides: HashMap<String, String> = HashMap::new();
         let mut hidden: HashSet<String> = HashSet::new();
@@ -969,7 +983,8 @@ impl ToolRuntime {
             }
         }
 
-        declared_infos
+        loadout
+            .declared
             .into_iter()
             .filter(|info| !hidden.contains(&info.name))
             .map(|mut info| {
@@ -1103,7 +1118,7 @@ impl ToolRuntime {
                 .await
         };
 
-        let result = self
+        let mut result = self
             .ctx
             .waterfall(
                 EVENT_TOOLS_POST_EXECUTE,
@@ -1114,6 +1129,13 @@ impl ToolRuntime {
                 |input| -> BoxFuture<'static, ToolResult> { Box::pin(async move { input.result }) },
             )
             .await;
+
+        if result.images.len() > MAX_IMAGES_PER_MESSAGE {
+            result.images.truncate(MAX_IMAGES_PER_MESSAGE);
+            result.content.push_str(&format!(
+                "\n[Image limit reached: only the first {MAX_IMAGES_PER_MESSAGE} images were kept.]"
+            ));
+        }
 
         self.ctx.emit(
             EVENT_TOOLS_RESULT,

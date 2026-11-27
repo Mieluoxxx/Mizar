@@ -1,4 +1,4 @@
-//! 图片嗅探、头部宽高校验、EXIF 方向校正、动图首帧提取与自适应压缩管线。
+//! 客户端附件与工具回执共用同一套校验和压缩规则，以符合模型的图片输入限制。
 
 use std::io::Cursor;
 
@@ -13,18 +13,15 @@ use image::{
     AnimationDecoder, DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader,
     Limits, RgbImage,
 };
-use mizar_llm::ImageAttachment;
+use mizar_llm_types::ImageAttachment;
 use thiserror::Error;
 
-/// 输出图片长边像素上限。
 pub const MAX_IMAGE_EDGE: u32 = 2048;
-/// base64 编码后体积上限（5 MB，对齐主流视觉模型 API 硬约束）。
+/// 视觉模型按编码后的体积限制请求。
 pub const MAX_IMAGE_BASE64_BYTES: usize = 5_000_000;
-/// 允许解码的最大像素总数（1 亿像素），超限在读完文件头后立刻拒绝。
 pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
-/// PNG 超体积回退 JPEG 时采用的默认编码质量。
+pub const MAX_IMAGE_INPUT_BYTES: usize = 32 * 1024 * 1024;
 pub const JPEG_QUALITY: u8 = 85;
-/// 逐步降长边重试序列。
 const EDGE_STEP_DOWNS: &[u32] = &[1536, 1024, 768, 512, 384, 256, 128];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +34,6 @@ pub struct ProcessedImage {
 }
 
 impl ProcessedImage {
-    /// 生成 `[Image #N · ...]` 占位符后缀，无缩放/转码/动图降帧时返回 `None`。
     pub fn marker_suffix(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let (Some(w), Some(h)) = (self.attachment.width, self.attachment.height)
@@ -86,7 +82,7 @@ pub enum ImageProcessError {
     BudgetExceeded { base64_len: usize, limit: usize },
 }
 
-/// 检查前 16 字节魔数，仅放行 PNG / JPEG / WebP / GIF。
+/// 文件扩展名与服务端声明的格式均可能与实际内容不符。
 pub fn sniff_image_format(bytes: &[u8]) -> Option<ImageFormat> {
     let head = &bytes[..bytes.len().min(16)];
     if head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -275,15 +271,7 @@ fn encode_jpeg_bytes(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, ImagePr
     Ok(buf)
 }
 
-/// 对原始图片字节运行完整校验、方向纠正与自适应压缩流水线。
-///
-/// 顺序严格遵循：
-/// 1. 读前 16 字节魔数（仅 PNG / JPEG / WebP / GIF）
-/// 2. 仅读 header 取分辨率，超过 `MAX_IMAGE_PIXELS` 直接拒绝（不分配解码缓冲）
-/// 3. 解码（受 `Limits` 约束），动图仅取首帧
-/// 4. 若分辨率、方向、5MB 体积均合规且非动图，原样 base64 传出
-/// 5. 先应用 EXIF 方向，再按 `MAX_IMAGE_EDGE` 等比缩放
-/// 6. 优先尝试无损 PNG；超 5MB 转 JPEG q=85；仍超则逐档降长边重试
+/// 解码前校验像素数，避免小体积压缩文件触发过大的内存分配。
 pub fn process_image_bytes(bytes: &[u8]) -> Result<ProcessedImage, ImageProcessError> {
     process_image_bytes_with_budget(bytes, MAX_IMAGE_BASE64_BYTES)
 }
@@ -398,27 +386,25 @@ fn process_image_bytes_with_budget(
         return Ok(ProcessedImage {
             attachment: ImageAttachment::new("image/png", STANDARD.encode(&png_bytes))
                 .with_dimensions(target_w, target_h),
-            original_width: oriented_w,
-            original_height: oriented_h,
+            original_width: orig_w,
+            original_height: orig_h,
             original_media_type: orig_mime,
             animated_first_frame: animated,
         });
     }
 
-    // 超出预算则转为 JPEG q=85
     let jpg_bytes = encode_jpeg_bytes(&resized, JPEG_QUALITY)?;
     if base64_encoded_len(jpg_bytes.len()) <= max_base64_bytes {
         return Ok(ProcessedImage {
             attachment: ImageAttachment::new("image/jpeg", STANDARD.encode(&jpg_bytes))
                 .with_dimensions(target_w, target_h),
-            original_width: oriented_w,
-            original_height: oriented_h,
+            original_width: orig_w,
+            original_height: orig_h,
             original_media_type: orig_mime,
             animated_first_frame: animated,
         });
     }
 
-    // 仍超则逐档缩小长边重编 JPEG
     let current_longest = target_w.max(target_h);
     let mut last_b64_len = base64_encoded_len(jpg_bytes.len());
     for &cap in EDGE_STEP_DOWNS {
@@ -433,8 +419,8 @@ fn process_image_bytes_with_budget(
             return Ok(ProcessedImage {
                 attachment: ImageAttachment::new("image/jpeg", STANDARD.encode(&step_jpg))
                     .with_dimensions(sw, sh),
-                original_width: oriented_w,
-                original_height: oriented_h,
+                original_width: orig_w,
+                original_height: orig_h,
                 original_media_type: orig_mime,
                 animated_first_frame: animated,
             });

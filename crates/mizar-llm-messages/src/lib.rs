@@ -15,9 +15,10 @@ use std::time::Duration;
 use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, LlmAdapter,
-    LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo, ReasoningEffort,
-    ReplayEnvelope, SseEvent, StreamChunk, TokenUsage, prefix_digest,
+    BoxChunkStream, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, ImageAttachment,
+    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
+    ReasoningEffort, ReplayEnvelope, SseEvent, StreamChunk, TokenUsage,
+    classify_inband_error_value, classify_non_json_sse_frame, prefix_digest,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, ensure_v1_root,
@@ -68,6 +69,10 @@ impl Default for MessagesConfig {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
+}
+
+fn image_block(img: &ImageAttachment) -> Value {
+    json!({ "type": "image", "source": { "type": "base64", "media_type": img.media_type, "data": img.data } })
 }
 
 fn push_user_block(wire_messages: &mut Vec<Value>, block: Value) {
@@ -148,7 +153,7 @@ pub fn build_request_body(
     let mut wire_messages: Vec<Value> = Vec::new();
 
     for msg in &options.messages {
-        match msg {
+        match options.message_for_model(msg).as_ref() {
             Message::System { .. } => {}
             Message::User { content, images } => {
                 if images.is_empty() {
@@ -158,17 +163,7 @@ pub fn build_request_body(
                     );
                 } else {
                     for img in images {
-                        push_user_block(
-                            &mut wire_messages,
-                            json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.media_type,
-                                    "data": img.data,
-                                },
-                            }),
-                        );
+                        push_user_block(&mut wire_messages, image_block(img));
                     }
                     if !content.is_empty() {
                         push_user_block(
@@ -182,11 +177,24 @@ pub fn build_request_body(
                 content,
                 tool_call_id,
                 is_error,
+                images,
             } => {
+                let text = if content.is_empty() {
+                    "(no output)"
+                } else {
+                    content.as_str()
+                };
+                let output = if images.is_empty() {
+                    json!(text)
+                } else {
+                    let mut parts = vec![json!({"type": "text", "text": text})];
+                    parts.extend(images.iter().map(image_block));
+                    Value::Array(parts)
+                };
                 let mut block = json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
-                    "content": if content.is_empty() { "(no output)" } else { content.as_str() },
+                    "content": output,
                 });
                 if *is_error {
                     block["is_error"] = json!(true);
@@ -194,6 +202,9 @@ pub fn build_request_body(
                 push_user_block(&mut wire_messages, block);
             }
             Message::Assistant { blocks, replay } => {
+                if blocks.is_empty() {
+                    continue;
+                }
                 let prior_digest = prefix_digest(&json!({
                     "system": &system_text,
                     "tools": &wire_tools,
@@ -361,8 +372,8 @@ impl BlockKindState {
                 fallback_input,
                 partial_json,
             } => {
-                let arguments = if partial_json.trim().is_empty() {
-                    serde_json::to_string(fallback_input).unwrap_or_else(|_| "{}".to_string())
+                let arguments = if partial_json.is_empty() {
+                    fallback_input.to_string()
                 } else {
                     partial_json.clone()
                 };
@@ -419,8 +430,7 @@ pub struct MessagesSseDecoder {
     response_id: Option<String>,
     response_model: Option<String>,
     blocks: BTreeMap<usize, BlockEntry>,
-    usage: TokenUsage,
-    has_usage: bool,
+    usage: Option<TokenUsage>,
     stop_reason: Option<String>,
     event_phase: EventPhase,
     finish_phase: FinishPhase,
@@ -439,49 +449,38 @@ impl MessagesSseDecoder {
             response_id: None,
             response_model: None,
             blocks: BTreeMap::new(),
-            usage: TokenUsage::default(),
-            has_usage: false,
+            usage: None,
             stop_reason: None,
             event_phase: EventPhase::Streaming,
             finish_phase: FinishPhase::Pending,
         }
     }
 
-    fn update_usage(&mut self, u: &Value) {
-        self.has_usage = true;
-        if let Some(v) = u.get("input_tokens").and_then(Value::as_u64) {
-            self.usage.input_tokens = v;
-        }
-        if let Some(v) = u.get("output_tokens").and_then(Value::as_u64) {
-            self.usage.output_tokens = v;
-        }
-        if let Some(v) = u.get("cache_read_input_tokens").and_then(Value::as_u64)
-            && v > 0
-        {
-            self.usage.cache_read_tokens = Some(v);
-        }
-        if let Some(v) = u.get("cache_creation_input_tokens").and_then(Value::as_u64)
-            && v > 0
-        {
-            self.usage.cache_write_tokens = Some(v);
-        }
-        let total = self.usage.input_tokens
-            + self.usage.output_tokens
-            + self.usage.cache_read_tokens.unwrap_or(0)
-            + self.usage.cache_write_tokens.unwrap_or(0);
-        self.usage.total_tokens = Some(total);
+    fn update_usage(&mut self, u: &Value) -> Option<TokenUsage> {
+        let count = |key: &str| u.get(key).and_then(Value::as_u64);
+        let input = count("input_tokens");
+        let output = count("output_tokens");
+        let read = count("cache_read_input_tokens");
+        let write = count("cache_creation_input_tokens");
+        input.or(output).or(read).or(write)?;
+        let mut usage = self.usage.unwrap_or_default();
+        usage.input_tokens = input.unwrap_or(usage.input_tokens);
+        usage.output_tokens = output.unwrap_or(usage.output_tokens);
+        usage.cache_read_tokens = read.or(usage.cache_read_tokens).filter(|&n| n > 0);
+        usage.cache_write_tokens = write.or(usage.cache_write_tokens).filter(|&n| n > 0);
+        usage.total_tokens = Some(usage.grand_total());
+        (self.usage.replace(usage) != Some(usage)).then_some(usage)
     }
 
     fn map_finish_reason(&self) -> FinishReason {
         match self.stop_reason.as_deref() {
             Some("tool_use") => FinishReason::ToolCalls,
             Some("max_tokens") => FinishReason::MaxTokens,
-            Some("refusal") => FinishReason::Error {
-                code: LlmErrorCode::ContentRefused,
-                message: "model refused to answer under content safety review".to_string(),
-                status: None,
-                retry_after_ms: None,
-            },
+            Some("refusal") => LlmError::new(
+                LlmErrorCode::ContentRefused,
+                "model refused to answer under content safety review",
+            )
+            .into(),
             _ => {
                 if self
                     .blocks
@@ -494,6 +493,46 @@ impl MessagesSseDecoder {
                 }
             }
         }
+    }
+
+    fn validate_message_stop(&self) -> Result<(), LlmError> {
+        let reason = self.stop_reason.as_deref().ok_or_else(|| {
+            LlmError::transport("messages SSE stream ended before message_delta.stop_reason")
+        })?;
+        if reason == "max_tokens" {
+            return Ok(());
+        }
+        for entry in self.blocks.values() {
+            match entry {
+                BlockEntry::Open(BlockKindState::ToolUse { .. }) => {
+                    return Err(LlmError::transport("message_stop with unfinished tool_use"));
+                }
+                BlockEntry::Closed(BlockKindState::ToolUse {
+                    id,
+                    name,
+                    fallback_input,
+                    partial_json,
+                }) => {
+                    let valid_input = if partial_json.is_empty() {
+                        fallback_input.is_object()
+                    } else {
+                        matches!(serde_json::from_str(partial_json), Ok(Value::Object(_)))
+                    };
+                    if !valid_input {
+                        return Err(LlmError::malformed(
+                            "messages tool input must be a JSON object",
+                        ));
+                    }
+                    if id.is_empty() || name.is_empty() {
+                        return Err(LlmError::transport(
+                            "messages stream ended before tool id or name",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -510,9 +549,15 @@ impl SseStreamDecoder for MessagesSseDecoder {
         if data.is_empty() {
             return Ok(false);
         }
+        if data == "[DONE]" {
+            self.on_eof_without_done()?;
+            return Ok(true);
+        }
 
-        let payload: Value = serde_json::from_str(data)
-            .map_err(|e| LlmError::malformed(format!("invalid messages SSE json: {e}")))?;
+        let payload: Value = serde_json::from_str(data).map_err(|e| {
+            classify_non_json_sse_frame(data)
+                .unwrap_or_else(|| LlmError::malformed(format!("invalid messages SSE json: {e}")))
+        })?;
 
         let ev_type = payload
             .get("type")
@@ -520,18 +565,11 @@ impl SseStreamDecoder for MessagesSseDecoder {
             .or(event.event.as_deref())
             .unwrap_or("");
 
+        if ev_type == "error" || payload.get("error").is_some_and(|err| !err.is_null()) {
+            return Err(classify_inband_error_value(&payload));
+        }
         match ev_type {
             "ping" => {}
-            "error" => {
-                let err_obj = payload.get("error").unwrap_or(&payload);
-                let msg = err_obj
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("messages stream error");
-                let etype = err_obj.get("type").and_then(Value::as_str);
-                let ecode = err_obj.get("code").and_then(Value::as_str);
-                return Err(LlmError::classify_provider_error(None, etype, ecode, msg));
-            }
             "message_start" => {
                 if let Some(msg) = payload.get("message") {
                     if let Some(id) = msg.get("id").and_then(Value::as_str) {
@@ -540,8 +578,10 @@ impl SseStreamDecoder for MessagesSseDecoder {
                     if let Some(m) = msg.get("model").and_then(Value::as_str) {
                         self.response_model = Some(m.to_string());
                     }
-                    if let Some(u) = msg.get("usage") {
-                        self.update_usage(u);
+                    if let Some(usage) = msg.get("usage").and_then(|u| self.update_usage(u))
+                        && !emit(StreamChunk::Usage { usage })
+                    {
+                        return Ok(true);
                     }
                 }
             }
@@ -634,19 +674,21 @@ impl SseStreamDecoder for MessagesSseDecoder {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        let fallback_input = cb.get("input").cloned().unwrap_or_else(|| json!({}));
+                        let fallback_input = cb.get("input").cloned().unwrap_or_default();
                         if !emit(StreamChunk::BlockStart {
                             index,
                             kind: ContentBlockKind::ToolCall,
                         }) {
                             return Ok(true);
                         }
-                        if !emit(StreamChunk::ToolCallDelta {
-                            index,
-                            id: (!id.is_empty()).then_some(id.clone()),
-                            name: (!name.is_empty()).then_some(name.clone()),
-                            arguments_delta: String::new(),
-                        }) {
+                        if (!id.is_empty() || !name.is_empty())
+                            && !emit(StreamChunk::ToolCallDelta {
+                                index,
+                                id: (!id.is_empty()).then_some(id.clone()),
+                                name: (!name.is_empty()).then_some(name.clone()),
+                                arguments_delta: String::new(),
+                            })
+                        {
                             return Ok(true);
                         }
                         self.blocks.insert(
@@ -743,25 +785,35 @@ impl SseStreamDecoder for MessagesSseDecoder {
                     ) {
                         BlockEntry::Open(s) | BlockEntry::Closed(s) => s,
                     };
-                    let block = inner.to_content_block();
-                    *entry = BlockEntry::Closed(inner);
-                    if !emit(StreamChunk::BlockEnd { index, block }) {
+                    // 截断原因要到 message_delta 才能确定，提前交付工具会泄漏残缺参数。
+                    if !matches!(inner, BlockKindState::ToolUse { .. })
+                        && !emit(StreamChunk::BlockEnd {
+                            index,
+                            block: inner.to_content_block(),
+                        })
+                    {
                         return Ok(true);
                     }
+                    *entry = BlockEntry::Closed(inner);
                 }
             }
             "message_delta" => {
-                if let Some(sr) = payload
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
+                if self.stop_reason.as_deref() != Some("max_tokens")
+                    && let Some(sr) = payload
+                        .pointer("/delta/stop_reason")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
                 {
                     self.stop_reason = Some(sr.to_string());
                 }
-                if let Some(u) = payload.get("usage") {
-                    self.update_usage(u);
+                if let Some(usage) = payload.get("usage").and_then(|u| self.update_usage(u))
+                    && !emit(StreamChunk::Usage { usage })
+                {
+                    return Ok(true);
                 }
             }
             "message_stop" => {
+                self.validate_message_stop()?;
                 self.event_phase = EventPhase::Stopped;
                 return Ok(true);
             }
@@ -771,16 +823,36 @@ impl SseStreamDecoder for MessagesSseDecoder {
         Ok(false)
     }
 
+    fn on_eof_without_done(&self) -> Result<(), LlmError> {
+        if self.event_phase == EventPhase::Stopped {
+            Ok(())
+        } else {
+            Err(LlmError::transport(
+                "messages SSE stream ended before message_stop",
+            ))
+        }
+    }
+
     fn on_finish(&mut self, emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
+        self.on_eof_without_done()?;
         if self.finish_phase == FinishPhase::Emitted {
             return Ok(());
         }
         self.finish_phase = FinishPhase::Emitted;
 
-        if self.has_usage && !emit(StreamChunk::Usage { usage: self.usage }) {
-            return Ok(());
+        let reason = self.map_finish_reason();
+        if reason != FinishReason::MaxTokens {
+            for (&index, entry) in &self.blocks {
+                if let BlockEntry::Closed(tool @ BlockKindState::ToolUse { .. }) = entry
+                    && !emit(StreamChunk::BlockEnd {
+                        index,
+                        block: tool.to_content_block(),
+                    })
+                {
+                    return Ok(());
+                }
+            }
         }
-
         let replay_blocks: Vec<Value> = self
             .blocks
             .values()
@@ -800,7 +872,7 @@ impl SseStreamDecoder for MessagesSseDecoder {
         };
 
         let _ = emit(StreamChunk::Finish {
-            reason: self.map_finish_reason(),
+            reason,
             replay: Some(replay),
         });
         Ok(())
@@ -852,6 +924,10 @@ impl MessagesAdapter {
 }
 
 impl LlmAdapter for MessagesAdapter {
+    fn default_model(&self) -> Option<&str> {
+        Some(&self.config.model)
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.config.provider.clone(),

@@ -2,21 +2,60 @@
 
 use std::path::PathBuf;
 
+use mizar_image::{MAX_IMAGE_INPUT_BYTES, process_image_bytes, sniff_image_format};
 use mizar_tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, READ_MAX_LINE_CHARS, TruncatedBy, format_size,
     truncate_head, truncate_line,
 };
 use mizar_tools::{ToolAnnotations, ToolDefinition, ToolExecutionMode, ToolOutput};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::path_utils::resolve_read_path;
+
+async fn read_image(
+    reader: BufReader<tokio::fs::File>,
+    path: &str,
+    file_size: u64,
+) -> Result<ToolOutput, cordis::BoxError> {
+    let size_error = || format!("Image exceeds the 32 MiB input limit: {path}");
+    if file_size > MAX_IMAGE_INPUT_BYTES as u64 {
+        return Err(size_error().into());
+    }
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_IMAGE_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_IMAGE_INPUT_BYTES {
+        return Err(size_error().into());
+    }
+    let image = tokio::task::spawn_blocking(move || process_image_bytes(&bytes)).await??;
+    let mut text = format!(
+        "{path}: {}×{} ({})",
+        image.original_width, image.original_height, image.attachment.media_type
+    );
+    if let Some(changes) = image.marker_suffix() {
+        text.push_str(&format!(" · {changes}"));
+    }
+    let metadata = json!({
+        "path": path,
+        "media_type": image.attachment.media_type,
+        "width": image.attachment.width,
+        "height": image.attachment.height,
+        "original_width": image.original_width,
+        "original_height": image.original_height,
+    });
+    Ok(ToolOutput::text(text)
+        .with_structured(metadata)
+        .with_images(vec![image.attachment]))
+}
 
 pub fn create_read_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefinition {
     ToolDefinition::async_rich_tool(
         "read",
         format!(
-            "Read the contents of a text file with 1-indexed `<line>\\t<text>` line numbers. Output is truncated to {} lines, {}KB, or {} chars per line (whichever is reached first). Use offset and limit to paginate large files.",
+            "Read a PNG, JPEG, WebP or GIF image, or a text file with 1-indexed `<line>\\t<text>` line numbers. Text output is truncated to {} lines, {}KB, or {} chars per line (whichever is reached first). Use offset and limit to paginate text files.",
             DEFAULT_MAX_LINES,
             DEFAULT_MAX_BYTES / 1024,
             READ_MAX_LINE_CHARS
@@ -70,6 +109,9 @@ pub fn create_read_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
 
                 let file = tokio::fs::File::open(&target).await?;
                 let mut reader = BufReader::new(file);
+                if sniff_image_format(reader.fill_buf().await?).is_some() {
+                    return read_image(reader, raw_path, meta.len()).await;
+                }
                 let mut buf = Vec::new();
                 let mut total_lines = 0usize;
                 let mut selected_lines: Vec<String> = Vec::new();
@@ -241,6 +283,11 @@ pub fn create_read_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
         "type": "object",
         "properties": {
             "path": { "type": "string" },
+            "media_type": { "type": "string" },
+            "width": { "type": "integer" },
+            "height": { "type": "integer" },
+            "original_width": { "type": "integer" },
+            "original_height": { "type": "integer" },
             "start_line": { "type": "integer" },
             "end_line": { "type": "integer" },
             "total_lines": { "type": "integer" },
@@ -249,8 +296,6 @@ pub fn create_read_tool(cwd: PathBuf, restrict_to_workspace: bool) -> ToolDefini
             "next_offset": { "type": ["integer", "null"] }
         }
     }))
-    .with_prompt_snippet("Read file contents with line numbers, optional offset and limit")
-    .with_prompt_guidelines(vec![
-        "Use read to examine files instead of cat, head, or tail via bash.".into(),
-    ])
+    .with_prompt_snippet("Read images or inspect text files with line numbers, offset and limit")
+    .with_prompt_guidelines(vec!["Use read to examine files instead of cat or sed.".into()])
 }

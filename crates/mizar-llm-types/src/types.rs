@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::LlmErrorCode;
+use crate::error::{HttpErrorHints, LlmError, LlmErrorCode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
@@ -105,7 +105,7 @@ impl ReplayEnvelope {
     }
 }
 
-/// 单条消息允许附带的图片上限（与 `dim` `MAX_IMAGES` 对齐，兼顾 SQLite 体积硬约束）。
+/// 单条消息允许附带的图片上限（与 `dim` `MAX_IMAGES` 对齐，兼顾存储体积约束）。
 pub const MAX_IMAGES_PER_MESSAGE: usize = 20;
 
 /// 用户消息附带的图片负载（base64 编码 + MIME 类型及可选尺寸）。
@@ -260,6 +260,8 @@ pub enum Message {
     },
     Tool {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -329,10 +331,20 @@ impl Message {
         content: impl Into<String>,
         is_error: bool,
     ) -> Self {
+        Self::tool_with_images(tool_call_id, content, is_error, Vec::new())
+    }
+
+    pub fn tool_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+        images: Vec<ImageAttachment>,
+    ) -> Self {
         Self::Tool {
             tool_call_id: tool_call_id.into(),
             content: content.into(),
             is_error,
+            images,
         }
     }
 
@@ -350,10 +362,9 @@ impl Message {
         }
     }
 
-    /// 提取用户消息附带的图片列表。
     pub fn images(&self) -> &[ImageAttachment] {
         match self {
-            Self::User { images, .. } => images,
+            Self::User { images, .. } | Self::Tool { images, .. } => images,
             _ => &[],
         }
     }
@@ -452,11 +463,48 @@ pub enum FinishReason {
         status: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        should_retry: Option<bool>,
     },
+}
+
+impl FinishReason {
+    pub fn into_error(self) -> Option<LlmError> {
+        match self {
+            Self::Aborted => Some(LlmError::cancelled()),
+            Self::Error {
+                code,
+                message,
+                status,
+                retry_after_ms,
+                should_retry,
+            } => Some(LlmError {
+                code,
+                message,
+                status,
+                retry_after_ms,
+                should_retry,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl From<LlmError> for FinishReason {
+    fn from(err: LlmError) -> Self {
+        Self::Error {
+            code: err.code,
+            message: err.message,
+            status: err.status,
+            retry_after_ms: err.retry_after_ms,
+            should_retry: err.should_retry,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamChunk {
+    ResponseHints(HttpErrorHints),
     BlockStart {
         index: usize,
         kind: ContentBlockKind,

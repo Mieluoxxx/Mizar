@@ -1,30 +1,28 @@
-//! 非交互一次性任务执行器（`mizar exec` / `mizar -p` / `mizar --prompt-file`）。
-//!
-//! 职责：
-//! - 复用 `AgentSpinePlugin` + `LlmRouter` + `LlmRetryPlugin` 装配 Agent，但不启动 TUI 与版本检查，也不注入 TUI `reply_guidance` 段落；
-//! - 支持 `--isolated` 隔离个人全局配置 / MCP / Skills / 指令与全局会话库；
-//! - 将诊断与警告严格路由至 `stderr` 并完成敏感凭据脱敏，退出码仅在正常收敛（`Stop` 且未截断/未超步/未取消）时为 `0`；
-//! - `stdout` 仅在退出码为 `0` 时输出最终回答全文，失败时 `stdout` 保持完全为空。
+//! 无头调用方依赖标准输出解析结果，诊断信息必须走标准错误。
 
-use std::io::{IsTerminal, Read};
+mod ndjson;
+
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cordis::{Context, LogLevel, Service};
-use mizar_agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
+use mizar_agent_loop::{
+    AgentError, AgentLoop, AgentRetryEvent, EVENT_AGENT_RETRY, RunOptions, TurnEndReason,
+    TurnRunReport,
+};
 use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
-    load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
+    load_mizar_config, load_mizar_config_isolated, resolve_default_sessions_dir,
 };
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_mcp::McpManager;
-use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
+use mizar_session::{Session, SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
 use mizar_tools_coding::CodingToolsPreset;
 use mizar_trajectory::{
     DEFAULT_TOOL_RESULT_SUMMARY_MAX_CHARS, TimelineMode, TraceExportMeta, TrajectoryExport,
@@ -33,6 +31,7 @@ use mizar_trajectory::{
 use tokio_util::sync::CancellationToken;
 
 use crate::runner::{ResumeTarget, wait_for_services};
+use ndjson::{ExecStream, now_ms, write_event};
 
 /// 无头输出格式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +62,7 @@ pub struct ExecConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_steps: Option<usize>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u64>,
     pub timeout_secs: Option<u64>,
     pub isolated: bool,
     pub no_persist: bool,
@@ -130,11 +130,10 @@ fn validate_non_blank_prompt(text: String, source: &str) -> Result<String, Strin
 }
 
 fn single_line(text: &str) -> String {
-    let replaced = text.replace(['\r', '\n'], " ");
-    let mut out = String::with_capacity(replaced.len());
+    let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
-    for ch in replaced.chars() {
-        if ch.is_whitespace() {
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_control() {
             if !prev_space {
                 out.push(' ');
             }
@@ -154,10 +153,7 @@ pub fn sanitize_diagnostic_text(input: &str, secrets: &[String]) -> String {
     let mut deduped: Vec<&str> = secrets
         .iter()
         .map(|s| s.as_str())
-        .filter(|s| {
-            let trimmed = s.trim();
-            trimmed.len() >= 6 || (trimmed.starts_with("sk-") && trimmed.len() >= 4)
-        })
+        .filter(|s| !s.trim().is_empty())
         .collect();
     deduped.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     deduped.dedup();
@@ -165,10 +161,22 @@ pub fn sanitize_diagnostic_text(input: &str, secrets: &[String]) -> String {
         out = out.replace(secret, "[REDACTED]");
     }
 
-    out = redact_header_tokens(&out);
+    out = redact_named_secrets(&single_line(&out));
     out = redact_bearer_tokens(&out);
-    out = redact_query_secrets(&out);
     redact_prefixed_tokens(&out)
+}
+
+fn env_secrets() -> Vec<String> {
+    [
+        "API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENROUTER_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok())
+    .collect()
 }
 
 fn is_token_delimiter(b: u8) -> bool {
@@ -179,99 +187,78 @@ fn is_token_delimiter(b: u8) -> bool {
         )
 }
 
-fn redact_header_tokens(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let prefixes = ["authorization:", "x-api-key:", "api-key:"];
-    let mut result = String::with_capacity(input.len());
-    let mut cursor = 0usize;
-
-    while cursor < input.len() {
-        let mut next_match: Option<(usize, &str)> = None;
-        for &pat in &prefixes {
-            if let Some(rel) = lower[cursor..].find(pat) {
-                let pos = cursor + rel;
-                if next_match.is_none_or(|(best, _)| pos < best) {
-                    next_match = Some((pos, pat));
-                }
-            }
-        }
-        let Some((pos, pat)) = next_match else {
-            result.push_str(&input[cursor..]);
-            break;
-        };
-
-        let boundary_ok = pos == 0 || !input.as_bytes()[pos - 1].is_ascii_alphanumeric();
-        if !boundary_ok {
-            let advance = pos + pat.len();
-            result.push_str(&input[cursor..advance]);
-            cursor = advance;
-            continue;
-        }
-
-        let after_pat = pos + pat.len();
-        result.push_str(&input[cursor..after_pat]);
-        let mut val_start = after_pat;
-        while val_start < input.len() && input.as_bytes()[val_start] == b' ' {
-            result.push(' ');
-            val_start += 1;
-        }
-        if pat == "authorization:" && lower[val_start..].starts_with("bearer ") {
-            let b_len = "bearer ".len();
-            result.push_str(&input[val_start..val_start + b_len]);
-            val_start += b_len;
-            while val_start < input.len() && input.as_bytes()[val_start] == b' ' {
-                result.push(' ');
-                val_start += 1;
-            }
-        }
-        let mut val_end = val_start;
-        let bytes = input.as_bytes();
-        while val_end < bytes.len() && !is_token_delimiter(bytes[val_end]) {
-            val_end += 1;
-        }
-        if val_end > val_start {
-            let tok = &input[val_start..val_end];
-            if tok != "[REDACTED]" {
-                result.push_str("[REDACTED]");
-            } else {
-                result.push_str(tok);
-            }
-        }
-        cursor = val_end;
-    }
-
-    result
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    normalized.ends_with("apikey")
+        || normalized.ends_with("token")
+        || normalized.ends_with("secret")
+        || matches!(
+            normalized.as_str(),
+            "authorization" | "proxyauthorization" | "key" | "password"
+        )
 }
 
-fn looks_like_bearer_secret(tok: &str) -> bool {
-    if tok == "[REDACTED]" || tok.len() < 6 {
-        return false;
+fn redact_named_secrets(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'-' | b'_'))
+        {
+            i += 1;
+        }
+        if start == i {
+            i += 1;
+            continue;
+        }
+        let key = &input[start..i];
+        let rest = input[i..].trim_start_matches(['\"', '\'']).trim_start();
+        let Some(value) = rest.strip_prefix([':', '=']).map(str::trim_start) else {
+            continue;
+        };
+        if !is_secret_key(key) {
+            continue;
+        }
+        let mut pos = input.len() - value.len();
+        let quoted = matches!(bytes.get(pos), Some(b'\"' | b'\''));
+        if quoted {
+            pos += 1;
+        }
+        let mut end = pos;
+        if quoted {
+            let quote = bytes[pos - 1];
+            while end < bytes.len() && bytes[end] != quote {
+                if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                    end += 1;
+                }
+                end += 1;
+            }
+        } else {
+            // 认证方案和凭据之间可以有空格，不能只遮住方案名。
+            if key.to_ascii_lowercase().ends_with("authorization")
+                && let Some((scheme, token)) = value.split_once(' ')
+                && (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
+            {
+                pos = input.len() - token.trim_start().len();
+                end = pos;
+            }
+            if input[pos..].starts_with("[REDACTED]") {
+                end += "[REDACTED]".len();
+            }
+            while end < bytes.len() && bytes[end] != b'&' && !is_token_delimiter(bytes[end]) {
+                end += 1;
+            }
+        }
+        out.push_str(&input[copied..pos]);
+        out.push_str("[REDACTED]");
+        copied = end;
+        i = end;
     }
-    let lower = tok.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "token"
-            | "auth"
-            | "authentication"
-            | "header"
-            | "headers"
-            | "scheme"
-            | "missing"
-            | "invalid"
-            | "expired"
-            | "format"
-            | "required"
-            | "provided"
-    ) {
-        return false;
-    }
-    tok.len() >= 12
-        || tok.starts_with("sk-")
-        || tok.starts_with("rk-")
-        || tok.starts_with("ghp_")
-        || tok
-            .bytes()
-            .any(|b| b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.')
+    out.push_str(&input[copied..]);
+    out
 }
 
 fn redact_bearer_tokens(input: &str) -> String {
@@ -300,7 +287,7 @@ fn redact_bearer_tokens(input: &str) -> String {
             tok_end += 1;
         }
         let tok = &input[tok_start..tok_end];
-        if looks_like_bearer_secret(tok) {
+        if !tok.is_empty() && !input[tok_start..].starts_with("[REDACTED]") {
             result.push_str("[REDACTED]");
         } else {
             result.push_str(tok);
@@ -308,55 +295,6 @@ fn redact_bearer_tokens(input: &str) -> String {
         cursor = tok_end;
     }
     result.push_str(&input[cursor..]);
-    result
-}
-
-fn redact_query_secrets(input: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let keys = [
-        "key=",
-        "api_key=",
-        "apikey=",
-        "token=",
-        "access_token=",
-        "secret=",
-    ];
-    let mut result = String::with_capacity(input.len());
-    let mut cursor = 0usize;
-
-    while cursor < input.len() {
-        let mut next_match: Option<(usize, &str)> = None;
-        for &pat in &keys {
-            if let Some(rel) = lower[cursor..].find(pat) {
-                let pos = cursor + rel;
-                if next_match.is_none_or(|(best, _)| pos < best) {
-                    next_match = Some((pos, pat));
-                }
-            }
-        }
-        let Some((pos, pat)) = next_match else {
-            result.push_str(&input[cursor..]);
-            break;
-        };
-        let is_query_param = pos > 0 && matches!(input.as_bytes()[pos - 1], b'?' | b'&');
-        let val_start = pos + pat.len();
-        if !is_query_param {
-            result.push_str(&input[cursor..val_start]);
-            cursor = val_start;
-            continue;
-        }
-        result.push_str(&input[cursor..val_start]);
-        let mut val_end = val_start;
-        let bytes = input.as_bytes();
-        while val_end < bytes.len() && bytes[val_end] != b'&' && !is_token_delimiter(bytes[val_end])
-        {
-            val_end += 1;
-        }
-        if val_end > val_start {
-            result.push_str("[REDACTED]");
-        }
-        cursor = val_end;
-    }
     result
 }
 
@@ -406,7 +344,7 @@ fn redact_prefixed_tokens(input: &str) -> String {
 /// 格式化单行诊断错误，保留 error code / HTTP status / provider message / retry_after_ms，
 /// 并兼容 Harbor `BaseInstalledAgent.ERROR_PATTERNS`（末尾匹配优先 `LastMatchWins`）。
 pub fn format_llm_error_diagnostic(err: &LlmError, secrets: &[String]) -> String {
-    let sanitized_msg = single_line(&sanitize_diagnostic_text(&err.message, secrets));
+    let sanitized_msg = sanitize_diagnostic_text(&err.message, secrets);
     let lower = sanitized_msg.to_ascii_lowercase();
 
     let mut meta = Vec::new();
@@ -456,93 +394,109 @@ fn configure_exec_logger(app: &Context, secrets: Arc<Mutex<Vec<String>>>) {
     app.logger().set_level(LogLevel::Warn);
     app.logger().set_handler(move |rec| {
         if matches!(rec.level, LogLevel::Warn | LogLevel::Error) {
-            let current_secrets = secrets.lock().unwrap().clone();
-            let clean = single_line(&sanitize_diagnostic_text(&rec.message, &current_secrets));
-            eprintln!("[{} {}] {}", rec.tag, rec.name, clean);
+            let line = format!("[{} {}] {}", rec.tag, rec.name, rec.message);
+            eprintln!(
+                "{}",
+                sanitize_diagnostic_text(&line, &secrets.lock().unwrap())
+            );
         }
     });
-}
-
-fn report_error_with_secrets(msg: &str, secrets: &Arc<Mutex<Vec<String>>>) {
-    let guard = secrets.lock().unwrap();
-    let clean = single_line(&sanitize_diagnostic_text(msg, &guard));
-    eprintln!("error: {clean}");
 }
 
 /// 运行无头一次性任务，返回进程应使用的退出码。
 pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let exec_started = std::time::Instant::now();
-    let env_override = EnvLlmOverride::from_env();
-    let log_secrets = Arc::new(Mutex::new(env_override.collect_secrets()));
-    let make_meta = |exit_code: i32,
-                     termination_reason: &str,
-                     error: Option<String>,
-                     provider: Option<String>,
-                     model: Option<String>| TraceExportMeta {
-        exit_code,
-        termination_reason: termination_reason.to_string(),
-        error,
-        duration_ms: exec_started.elapsed().as_millis() as u64,
-        provider,
-        model,
-        isolated: cfg.isolated,
-        output_format: Some(cfg.output_format.as_str().to_string()),
+    let log_secrets = Arc::new(Mutex::new(env_secrets()));
+    let stream = Arc::new(Mutex::new(ExecStream::default()));
+    let finish = |mut outcome: TurnExitOutcome,
+                  app: Option<&Context>,
+                  session: Option<(&Session, bool, u64)>,
+                  report: Option<&TurnRunReport>,
+                  provider: Option<String>,
+                  model: Option<String>| {
+        let json_meta = (cfg.output_format == ExecOutputFormat::Json
+            && outcome.termination_reason != "invalid_request")
+            .then(|| {
+                let mut stream = stream.lock().unwrap();
+                if let Some(err) = stream.write_error.take()
+                    && outcome.exit_code == 0
+                {
+                    outcome =
+                        TurnExitOutcome::failure("error", format!("failed to write stdout: {err}"));
+                }
+                let (session, resumed, duration) = match session {
+                    Some((s, resumed, duration)) => (Some(s), resumed, duration),
+                    None => (None, false, exec_started.elapsed().as_millis() as u64),
+                };
+                stream.result_fields(session, resumed, duration)
+            });
+        if let Some(err) = &mut outcome.error {
+            *err = sanitize_diagnostic_text(err, &log_secrets.lock().unwrap());
+            eprintln!("error: {err}");
+        }
+        if let Err(err) = outcome.write_output(cfg.output_format, report, json_meta) {
+            let msg = sanitize_diagnostic_text(
+                &format!("failed to write stdout: {err}"),
+                &log_secrets.lock().unwrap(),
+            );
+            eprintln!("error: {msg}");
+            if outcome.exit_code == 0 {
+                outcome = TurnExitOutcome::failure("error", msg);
+            }
+        }
+        let code = outcome.exit_code;
+        export_exec_trace_best_effort(
+            cfg.trace_out.as_deref(),
+            app,
+            session.map(|(session, _, _)| session.id.as_str()),
+            TraceExportMeta {
+                exit_code: code,
+                termination_reason: outcome.termination_reason.to_owned(),
+                error: outcome.error,
+                duration_ms: exec_started.elapsed().as_millis() as u64,
+                provider,
+                model,
+                isolated: cfg.isolated,
+                output_format: Some(cfg.output_format.as_str().to_owned()),
+            },
+            &log_secrets,
+        );
+        code
     };
 
     if cfg.approve {
         let msg = "--approve is incompatible with non-interactive exec mode (code=invalid_request)";
-        eprintln!("error: {msg}");
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+        return finish(
+            TurnExitOutcome::failure("invalid_request", msg),
             None,
             None,
-            make_meta(
-                1,
-                "invalid_request",
-                Some(msg.to_string()),
-                cfg.provider.clone(),
-                cfg.model.clone(),
-            ),
-            &log_secrets,
+            None,
+            cfg.provider.clone(),
+            cfg.model.clone(),
         );
-        return 1;
     }
     if let Some(ref target) = cfg.resume_session {
         if matches!(target, ResumeTarget::Picker) {
             let msg = "--resume requires a session id in non-interactive exec mode (code=invalid_request)";
-            eprintln!("error: {msg}");
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("invalid_request", msg),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "invalid_request",
-                    Some(msg.to_string()),
-                    cfg.provider.clone(),
-                    cfg.model.clone(),
-                ),
-                &log_secrets,
+                None,
+                cfg.provider.clone(),
+                cfg.model.clone(),
             );
-            return 1;
         }
         if cfg.no_persist || cfg.isolated {
             let msg = "--continue/--resume is incompatible with --no-persist/--isolated (code=invalid_request)";
-            eprintln!("error: {msg}");
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("invalid_request", msg),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "invalid_request",
-                    Some(msg.to_string()),
-                    cfg.provider.clone(),
-                    cfg.model.clone(),
-                ),
-                &log_secrets,
+                None,
+                cfg.provider.clone(),
+                cfg.model.clone(),
             );
-            return 1;
         }
     }
 
@@ -551,75 +505,67 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     } else {
         load_mizar_config(&cfg.workspace)
     };
+    {
+        let mut secrets = log_secrets.lock().unwrap();
+        secrets.extend(
+            loaded_cfg
+                .router
+                .providers
+                .values()
+                .filter_map(|r| r.api_key.clone()),
+        );
+    }
 
     if let Some(ui) = &loaded_cfg.settings.ui
         && let Some(ref mode) = ui.approval_mode
         && mode.trim().eq_ignore_ascii_case("ask")
     {
         let msg = "ui.approvalMode=\"ask\" is incompatible with non-interactive exec mode (code=invalid_request)";
-        eprintln!("error: {msg}");
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+        return finish(
+            TurnExitOutcome::failure("invalid_request", msg),
             None,
             None,
-            make_meta(
-                1,
-                "invalid_request",
-                Some(msg.to_string()),
-                cfg.provider.clone(),
-                cfg.model.clone(),
-            ),
-            &log_secrets,
+            None,
+            cfg.provider.clone(),
+            cfg.model.clone(),
         );
-        return 1;
     }
 
-    for parse_err in &loaded_cfg.errors {
-        let guard = log_secrets.lock().unwrap();
-        let clean = single_line(&sanitize_diagnostic_text(parse_err, &guard));
-        eprintln!("[W config] 配置解析失败：{clean}");
+    let invalid_config = |err: String| {
+        finish(
+            TurnExitOutcome::failure("invalid_request", err),
+            None,
+            None,
+            None,
+            cfg.provider.clone(),
+            cfg.model.clone(),
+        )
+    };
+    if !loaded_cfg.errors.is_empty() {
+        return invalid_config(loaded_cfg.errors.join(", "));
     }
-
     let cli_override = CliLlmOverride {
         provider: cfg.provider.clone(),
         model: cfg.model.clone(),
         protocol: cfg.protocol.clone(),
         base_url: cfg.base_url.clone(),
         reasoning_effort: cfg.reasoning_effort,
+        context_window: cfg.context_window,
     };
+    let env_override = match EnvLlmOverride::from_env(&cli_override) {
+        Ok(env) => env,
+        Err(err) => return invalid_config(err),
+    };
+    let mut spine_cfg = AgentSpineConfig::coding(cfg.workspace.clone());
+    if !cfg.isolated && !cfg.no_persist {
+        spine_cfg.sessions_dir = resolve_default_sessions_dir();
+    }
+    loaded_cfg.apply_to_spine(&mut spine_cfg);
+    cli_override.apply_context_window(&env_override, &mut spine_cfg);
     let resolved_llm = match loaded_cfg.resolve_llm_router_with_cli(env_override, cli_override) {
         Ok(resolved) => resolved,
-        Err(err) => {
-            let err_msg = err.to_string();
-            report_error_with_secrets(&err_msg, &log_secrets);
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
-                None,
-                None,
-                make_meta(
-                    1,
-                    "error",
-                    Some(err_msg),
-                    cfg.provider.clone(),
-                    cfg.model.clone(),
-                ),
-                &log_secrets,
-            );
-            return 1;
-        }
+        Err(err) => return invalid_config(err.to_string()),
     };
-
-    {
-        let mut s = log_secrets.lock().unwrap();
-        for route in resolved_llm.router.providers.values() {
-            if let Some(ref key) = route.api_key
-                && !key.trim().is_empty()
-                && !s.contains(key)
-            {
-                s.push(key.clone());
-            }
-        }
-    }
 
     match resolved_llm.validate_active_route() {
         Ok(maybe_secret) => {
@@ -635,29 +581,17 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 let guard = log_secrets.lock().unwrap();
                 format_llm_error_diagnostic(&err, &guard)
             };
-            eprintln!("error: {diag}");
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("invalid_request", diag),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "error",
-                    Some(diag),
-                    Some(resolved_llm.active_provider.clone()),
-                    resolved_llm.active_model.clone(),
-                ),
-                &log_secrets,
+                None,
+                Some(resolved_llm.active_provider.clone()),
+                resolved_llm.active_model.clone(),
             );
-            return 1;
         }
     }
 
-    let mut spine_cfg = AgentSpineConfig::coding(cfg.workspace.clone());
-    if !cfg.isolated && !cfg.no_persist {
-        spine_cfg.session_db_path = resolve_default_session_db_path();
-    }
-    loaded_cfg.apply_to_spine(&mut spine_cfg);
     if !spine_cfg
         .disabled_plugins
         .iter()
@@ -665,8 +599,8 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     {
         spine_cfg.disabled_plugins.push("session-title".to_string());
     }
-    if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.session_db.is_none()) {
-        spine_cfg.session_db_path = None;
+    if cfg.no_persist || (cfg.isolated && loaded_cfg.settings.sessions_dir.is_none()) {
+        spine_cfg.sessions_dir = None;
     }
     if cfg.no_instructions
         && let AgentToolsMode::Coding {
@@ -704,27 +638,20 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     }
     let configured_max_steps = spine_cfg.agent.max_steps;
     let configured_max_tokens = spine_cfg.agent.max_tokens;
-    let has_session_db = spine_cfg.session_db_path.is_some();
+    let has_sessions_dir = spine_cfg.sessions_dir.is_some();
     let active_provider = resolved_llm.active_provider.clone();
     let active_model = resolved_llm.active_model.clone();
 
-    if cfg.resume_session.is_some() && !has_session_db {
-        let msg = "--continue/--resume requires session persistence database configuration (code=invalid_request)";
-        eprintln!("error: {msg}");
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+    if cfg.resume_session.is_some() && !has_sessions_dir {
+        let msg = "--continue/--resume requires session persistence directory configuration (code=invalid_request)";
+        return finish(
+            TurnExitOutcome::failure("invalid_request", msg),
             None,
             None,
-            make_meta(
-                1,
-                "invalid_request",
-                Some(msg.to_string()),
-                Some(active_provider.clone()),
-                active_model.clone(),
-            ),
-            &log_secrets,
+            None,
+            Some(active_provider.clone()),
+            active_model.clone(),
         );
-        return 1;
     }
 
     let app = Context::new();
@@ -736,8 +663,18 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         _ => false,
     };
 
+    let include_tools = spine_cfg.include_tools.clone();
     app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
+    let retry_secrets = Arc::clone(&log_secrets);
+    let _retry_subscription = app
+        .on(EVENT_AGENT_RETRY, move |ev: &AgentRetryEvent| {
+            let reason = sanitize_diagnostic_text(&ev.reason, &retry_secrets.lock().unwrap());
+            eprintln!(
+                "[W retry] step={} attempt={}/{} wait={}ms reason={reason}",
+                ev.step, ev.attempt, ev.max_attempts, ev.delay_ms
+            );
+        })
+        .expect("active exec context");
     app.plugin(LlmRouter::plugin(), resolved_llm.router);
     if ext_flags.file_mentions {
         let mention_secrets = Arc::clone(&log_secrets);
@@ -752,7 +689,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                         NoticeLevel::Error => "E",
                     };
                     let guard = mention_secrets.lock().unwrap();
-                    let clean = single_line(&sanitize_diagnostic_text(&text, &guard));
+                    let clean = sanitize_diagnostic_text(&text, &guard);
                     eprintln!("[{tag} mentions] {clean}");
                 }
             }),
@@ -779,66 +716,45 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
             wait_for_services(&app).await.map_err(|e| e.to_string())?;
-            if has_session_db && app.session_persistence().is_none() {
-                for _ in 0..25 {
-                    if app.session_persistence().is_some() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-            if let Some(mcp) = app.get::<McpManager>("mcp") {
+            if let Some(mcp) = app.get::<McpManager>("mcp") && mcp.needs_initial_catalog(include_tools.as_deref()) {
                 mcp.wait_ready().await;
             }
             Ok::<(), String>(())
         } => res,
     };
 
-    if let Err(err_msg) = init_res {
-        let outcome = resolve_cancel_or_error_exit(
-            &timed_out,
-            cfg.timeout_secs,
-            &signal_code,
-            &err_msg,
-            &log_secrets,
-        );
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
-            None,
-            None,
-            make_meta(
-                outcome.exit_code,
-                outcome.termination_reason,
-                outcome.error,
+    let complete =
+        |outcome, session: Option<(&Session, bool, u64)>, report: Option<&TurnRunReport>| {
+            finish(
+                outcome,
+                Some(&app),
+                session,
+                report,
                 Some(active_provider.clone()),
                 active_model.clone(),
-            ),
-            &log_secrets,
-        );
-        cleanup_exec(&app, signal_handle, timeout_handle).await;
-        return outcome.exit_code;
-    }
-
-    let exit_code = match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
-        (Ok(sessions), Ok(agent_loop)) => {
-            if cfg.resume_session.is_some() && app.session_persistence().is_none() {
-                let msg = "session persistence backend is unavailable for --continue/--resume (code=storage)";
-                eprintln!("error: {msg}");
-                export_exec_trace_best_effort(
-                    cfg.trace_out.as_deref(),
-                    Some(&app),
-                    None,
-                    make_meta(
-                        1,
-                        "storage",
-                        Some(msg.to_string()),
-                        Some(active_provider.clone()),
-                        active_model.clone(),
-                    ),
-                    &log_secrets,
-                );
-                1
-            } else {
+            )
+        };
+    let interruption = || interrupted_exit(&timed_out, cfg.timeout_secs, &signal_code);
+    let exit_code = if let Err(err_msg) = init_res {
+        complete(
+            interruption().unwrap_or_else(|| TurnExitOutcome::failure("error", err_msg)),
+            None,
+            None,
+        )
+    } else if has_sessions_dir && app.session_persistence().is_none() {
+        complete(
+            interruption().unwrap_or_else(|| {
+                TurnExitOutcome::failure(
+                    "storage",
+                    "session persistence backend is unavailable (code=storage)",
+                )
+            }),
+            None,
+            None,
+        )
+    } else {
+        match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
+            (Ok(sessions), Ok(agent_loop)) => {
                 let resolved_session = match &cfg.resume_session {
                     Some(ResumeTarget::Picker) => Err(
                         "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
@@ -873,24 +789,20 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
                 match resolved_session {
                     Err(msg) => {
-                        eprintln!("error: {msg}");
-                        export_exec_trace_best_effort(
-                            cfg.trace_out.as_deref(),
-                            Some(&app),
-                            None,
-                            make_meta(
-                                1,
-                                "invalid_request",
-                                Some(msg),
-                                Some(active_provider.clone()),
-                                active_model.clone(),
-                            ),
-                            &log_secrets,
-                        );
-                        1
+                        complete(TurnExitOutcome::failure("invalid_request", msg), None, None)
                     }
                     Ok((session, resumed)) => {
                         let turn_started = std::time::Instant::now();
+                        if cfg.output_format == ExecOutputFormat::Json {
+                            ndjson::subscribe(&app, &session.id, &stream, &log_secrets);
+                            stream.lock().unwrap().emit(
+                                serde_json::json!({
+                                    "type": "session", "session_id": session.id, "resumed": resumed,
+                                    "provider": active_provider, "model": active_model,
+                                }),
+                                now_ms(),
+                            );
+                        }
                         let opts = RunOptions {
                             provider: Some(active_provider.clone()),
                             model: active_model.clone(),
@@ -904,157 +816,47 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                             .await;
                         let duration_ms = turn_started.elapsed().as_millis() as u64;
 
-                        if has_session_db {
-                            let _ = sessions.flush_async(Some(session.id.clone())).await;
-                        }
-
-                        let json_meta = if cfg.output_format == ExecOutputFormat::Json {
-                            Some(build_exec_json_meta(
-                                &app,
-                                &session.id,
-                                resumed,
-                                duration_ms,
-                            ))
+                        let flush_error = if has_sessions_dir {
+                            sessions
+                                .flush_async(Some(session.id.clone()))
+                                .await
+                                .err()
+                                .map(|e| e.to_string())
+                                .or_else(|| app.session_persistence().and_then(|b| b.last_error()))
                         } else {
                             None
                         };
-
-                        let outcome = if timed_out.load(Ordering::SeqCst) {
-                            let secs = cfg.timeout_secs.unwrap_or(0);
-                            let msg = format!("execution timed out after {secs}s (code=timeout)");
-                            eprintln!("error: {msg}");
-                            TurnExitOutcome {
-                                exit_code: 124,
-                                termination_reason: "timeout",
-                                error: Some(msg),
-                            }
-                        } else {
-                            let sig = signal_code.load(Ordering::SeqCst);
-                            if sig != 0 {
-                                let msg =
-                                    "execution interrupted by signal (code=cancelled)".to_string();
-                                eprintln!("error: {msg}");
-                                TurnExitOutcome {
-                                    exit_code: sig,
-                                    termination_reason: "cancelled",
-                                    error: Some(msg),
-                                }
+                        let mut outcome = interruption().unwrap_or_else(|| {
+                            classify_turn_result(&run_res, configured_max_steps, &log_secrets)
+                        });
+                        if let Some(err) = flush_error {
+                            let msg = format!("failed to persist session: {err} (code=storage)");
+                            if outcome.exit_code == 0 {
+                                outcome = TurnExitOutcome::failure("storage", msg);
                             } else {
-                                classify_turn_result(
-                                    run_res,
-                                    configured_max_steps,
-                                    cfg.output_format,
-                                    json_meta.as_ref(),
-                                    &log_secrets,
-                                )
+                                let clean =
+                                    sanitize_diagnostic_text(&msg, &log_secrets.lock().unwrap());
+                                eprintln!("[W storage] {clean}");
                             }
-                        };
-
-                        export_exec_trace_best_effort(
-                            cfg.trace_out.as_deref(),
-                            Some(&app),
-                            Some(&session.id),
-                            make_meta(
-                                outcome.exit_code,
-                                outcome.termination_reason,
-                                outcome.error,
-                                Some(active_provider.clone()),
-                                active_model.clone(),
-                            ),
-                            &log_secrets,
-                        );
-                        outcome.exit_code
+                        }
+                        complete(
+                            outcome,
+                            Some((&session, resumed, duration_ms)),
+                            run_res.as_ref().ok(),
+                        )
                     }
                 }
             }
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            let err_msg = e.to_string();
-            report_error_with_secrets(&err_msg, &log_secrets);
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
-                Some(&app),
+            (Err(err), _) | (_, Err(err)) => complete(
+                TurnExitOutcome::failure("error", err.to_string()),
                 None,
-                make_meta(
-                    1,
-                    "error",
-                    Some(err_msg),
-                    Some(active_provider.clone()),
-                    active_model.clone(),
-                ),
-                &log_secrets,
-            );
-            1
+                None,
+            ),
         }
     };
 
     cleanup_exec(&app, signal_handle, timeout_handle).await;
     exit_code
-}
-
-struct ExecJsonMeta {
-    session_id: String,
-    resumed: bool,
-    duration_ms: u64,
-    turn_llm_ms: u64,
-    turn_ttft_ms: Option<u64>,
-    turn_tool_calls: usize,
-    session_turns: u64,
-    session_steps: u64,
-    session_tool_ms: u64,
-}
-
-fn build_exec_json_meta(
-    app: &Context,
-    session_id: &str,
-    resumed: bool,
-    duration_ms: u64,
-) -> ExecJsonMeta {
-    let report = app
-        .get::<TrajectoryRuntime>("trajectory")
-        .and_then(|traj| traj.inspect(session_id, TimelineMode::Sequence));
-    if let Some(rep) = report {
-        let last_turn = rep.snapshot.turns.last();
-        let last_turn_num = last_turn.map(|t| t.turn);
-        let turn_llm_ms = last_turn
-            .map(|t| t.steps.iter().filter_map(|s| s.duration_ms).sum())
-            .unwrap_or(rep.snapshot.stats.llm_ms);
-        let turn_ttft_ms = last_turn.and_then(|t| t.steps.first().and_then(|s| s.ttft_ms));
-        let turn_tool_calls = last_turn_num
-            .map(|tnum| {
-                rep.snapshot
-                    .records
-                    .iter()
-                    .filter(|r| {
-                        r.kind == mizar_trajectory::RecordKind::Tool && r.turn == Some(tnum)
-                    })
-                    .count()
-            })
-            .unwrap_or(rep.snapshot.stats.tool_calls as usize);
-        ExecJsonMeta {
-            session_id: session_id.to_string(),
-            resumed,
-            duration_ms,
-            turn_llm_ms,
-            turn_ttft_ms,
-            turn_tool_calls,
-            session_turns: rep.snapshot.stats.turns,
-            session_steps: rep.snapshot.stats.steps,
-            session_tool_ms: rep.snapshot.stats.tool_ms,
-        }
-    } else {
-        ExecJsonMeta {
-            session_id: session_id.to_string(),
-            resumed,
-            duration_ms,
-            turn_llm_ms: 0,
-            turn_ttft_ms: None,
-            turn_tool_calls: 0,
-            session_turns: 0,
-            session_steps: 0,
-            session_tool_ms: 0,
-        }
-    }
 }
 
 struct TurnExitOutcome {
@@ -1076,7 +878,7 @@ fn export_exec_trace_best_effort(
 
     if let Some(ref err_msg) = meta.error {
         let guard = secrets.lock().unwrap();
-        meta.error = Some(single_line(&sanitize_diagnostic_text(err_msg, &guard)));
+        meta.error = Some(sanitize_diagnostic_text(err_msg, &guard));
     }
 
     let export = match (app, session_id) {
@@ -1097,181 +899,125 @@ fn export_exec_trace_best_effort(
 
     if let Err(err) = write_trace_export_atomic(path, &export) {
         let guard = secrets.lock().unwrap();
-        let clean = single_line(&sanitize_diagnostic_text(&err.to_string(), &guard));
-        eprintln!(
-            "[W trace] failed to write trajectory trace to \"{}\": {clean}",
+        let message = format!(
+            "failed to write trajectory trace to \"{}\": {err}",
             path.display()
+        );
+        eprintln!("[W trace] {}", sanitize_diagnostic_text(&message, &guard));
+    }
+}
+
+impl TurnExitOutcome {
+    fn failure(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 1,
+            termination_reason: reason,
+            error: Some(message.into()),
+        }
+    }
+
+    fn write_output(
+        &self,
+        format: ExecOutputFormat,
+        report: Option<&TurnRunReport>,
+        meta: Option<serde_json::Value>,
+    ) -> io::Result<()> {
+        let text = report
+            .filter(|_| self.exit_code == 0)
+            .map_or("", |r| r.text.as_str());
+        if format == ExecOutputFormat::Json {
+            let mut payload = meta.unwrap_or_else(|| serde_json::json!({}));
+            payload["type"] = "result".into();
+            payload["reason"] = self.termination_reason.into();
+            payload["exit_code"] = self.exit_code.into();
+            payload["text"] = text.into();
+            if let Some(error) = &self.error {
+                payload["error"] = error.as_str().into();
+            }
+            return write_event(payload, now_ms());
+        }
+        let mut out = io::stdout().lock();
+        if !text.is_empty() {
+            write!(out, "{text}")?;
+            if !text.ends_with('\n') {
+                writeln!(out)?;
+            }
+        }
+        out.flush()
+    }
+}
+
+pub fn report_exec_input_error(format: ExecOutputFormat, message: &str) {
+    let msg = sanitize_diagnostic_text(message, &env_secrets());
+    eprintln!("error: {msg}");
+    if let Err(err) =
+        TurnExitOutcome::failure("invalid_request", msg).write_output(format, None, None)
+    {
+        eprintln!(
+            "error: failed to write stdout: {}",
+            sanitize_diagnostic_text(&err.to_string(), &env_secrets())
         );
     }
 }
 
-fn resolve_cancel_or_error_exit(
+fn interrupted_exit(
     timed_out: &AtomicBool,
     timeout_secs: Option<u64>,
     signal_code: &AtomicI32,
-    fallback_msg: &str,
-    secrets: &Arc<Mutex<Vec<String>>>,
-) -> TurnExitOutcome {
+) -> Option<TurnExitOutcome> {
     if timed_out.load(Ordering::SeqCst) {
         let secs = timeout_secs.unwrap_or(0);
-        let msg = format!("execution timed out after {secs}s (code=timeout)");
-        eprintln!("error: {msg}");
-        return TurnExitOutcome {
+        return Some(TurnExitOutcome {
             exit_code: 124,
             termination_reason: "timeout",
-            error: Some(msg),
-        };
+            error: Some(format!("execution timed out after {secs}s (code=timeout)")),
+        });
     }
     let sig = signal_code.load(Ordering::SeqCst);
-    if sig != 0 {
-        let msg = "execution interrupted by signal (code=cancelled)".to_string();
-        eprintln!("error: {msg}");
-        return TurnExitOutcome {
-            exit_code: sig,
-            termination_reason: "cancelled",
-            error: Some(msg),
-        };
-    }
-    report_error_with_secrets(fallback_msg, secrets);
-    TurnExitOutcome {
-        exit_code: 1,
-        termination_reason: "error",
-        error: Some(fallback_msg.to_string()),
-    }
+    (sig != 0).then(|| TurnExitOutcome {
+        exit_code: sig,
+        termination_reason: "cancelled",
+        error: Some("execution interrupted by signal (code=cancelled)".to_owned()),
+    })
 }
 
 fn classify_turn_result(
-    run_res: Result<mizar_agent_loop::TurnRunReport, AgentError>,
+    run_res: &Result<TurnRunReport, AgentError>,
     configured_max_steps: Option<usize>,
-    output_format: ExecOutputFormat,
-    json_meta: Option<&ExecJsonMeta>,
-    secrets: &Arc<Mutex<Vec<String>>>,
+    secrets: &Mutex<Vec<String>>,
 ) -> TurnExitOutcome {
     match run_res {
-        Ok(report) => {
-            if report.reason == TurnEndReason::Truncated
-                || matches!(report.last_step_outcome, Some(StepOutcome::MaxTokens))
-            {
-                let msg = "model output truncated: response exceeded model output token maximum (code=max_tokens)";
-                eprintln!("error: {msg}");
-                return TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "truncated",
-                    error: Some(msg.to_string()),
-                };
+        Ok(report) => match &report.reason {
+            TurnEndReason::Completed => TurnExitOutcome {
+                exit_code: 0,
+                termination_reason: "completed",
+                error: None,
+            },
+            TurnEndReason::MaxSteps => TurnExitOutcome::failure(
+                "max_steps",
+                format!(
+                    "max steps exceeded (steps={}, max_steps={}, code=max_steps)",
+                    report.steps,
+                    configured_max_steps.unwrap_or(report.steps)
+                ),
+            ),
+            TurnEndReason::Cancelled => {
+                TurnExitOutcome::failure("cancelled", "execution cancelled (code=cancelled)")
             }
-            match report.reason {
-                TurnEndReason::Completed => {
-                    match output_format {
-                        ExecOutputFormat::Text => {
-                            if !report.text.is_empty() {
-                                if report.text.ends_with('\n') {
-                                    print!("{}", report.text);
-                                } else {
-                                    println!("{}", report.text);
-                                }
-                            }
-                        }
-                        ExecOutputFormat::Json => {
-                            let payload = if let Some(meta) = json_meta {
-                                serde_json::json!({
-                                    "session_id": meta.session_id,
-                                    "resumed": meta.resumed,
-                                    "reason": "completed",
-                                    "steps": report.steps,
-                                    "duration_ms": meta.duration_ms,
-                                    "llm_ms": meta.turn_llm_ms,
-                                    "ttft_ms": meta.turn_ttft_ms,
-                                    "tool_ms": meta.session_tool_ms,
-                                    "tool_calls": meta.turn_tool_calls,
-                                    "session_turns": meta.session_turns,
-                                    "session_steps": meta.session_steps,
-                                    "text": report.text,
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "reason": "completed",
-                                    "steps": report.steps,
-                                    "text": report.text,
-                                })
-                            };
-                            println!("{payload}");
-                        }
-                    }
-                    TurnExitOutcome {
-                        exit_code: 0,
-                        termination_reason: "completed",
-                        error: None,
-                    }
-                }
-                TurnEndReason::MaxSteps => {
-                    let limit = configured_max_steps.unwrap_or(report.steps);
-                    let msg = format!(
-                        "max steps exceeded (steps={}, max_steps={limit}, code=max_steps)",
-                        report.steps
-                    );
-                    eprintln!("error: {msg}");
-                    TurnExitOutcome {
-                        exit_code: 1,
-                        termination_reason: "max_steps",
-                        error: Some(msg),
-                    }
-                }
-                TurnEndReason::Cancelled => {
-                    let msg = "execution cancelled (code=cancelled)";
-                    eprintln!("error: {msg}");
-                    TurnExitOutcome {
-                        exit_code: 1,
-                        termination_reason: "cancelled",
-                        error: Some(msg.to_string()),
-                    }
-                }
-                TurnEndReason::Error { message } => {
-                    report_error_with_secrets(&message, secrets);
-                    TurnExitOutcome {
-                        exit_code: 1,
-                        termination_reason: "error",
-                        error: Some(message),
-                    }
-                }
-                TurnEndReason::Truncated => TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "truncated",
-                    error: Some("model output truncated (code=max_tokens)".to_string()),
-                },
-            }
+            TurnEndReason::Error { message } => TurnExitOutcome::failure("error", message),
+            TurnEndReason::Truncated => TurnExitOutcome::failure(
+                "truncated",
+                "model output truncated: response exceeded model output token maximum (code=max_tokens)",
+            ),
+        },
+        Err(AgentError::Llm(err)) if err.code == LlmErrorCode::Cancelled => {
+            TurnExitOutcome::failure("cancelled", "execution cancelled (code=cancelled)")
         }
-        Err(AgentError::Llm(llm_err)) => {
-            if llm_err.code == LlmErrorCode::Cancelled {
-                let msg = "execution cancelled (code=cancelled)";
-                eprintln!("error: {msg}");
-                TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "cancelled",
-                    error: Some(msg.to_string()),
-                }
-            } else {
-                let diag = {
-                    let guard = secrets.lock().unwrap();
-                    format_llm_error_diagnostic(&llm_err, &guard)
-                };
-                eprintln!("error: {diag}");
-                TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "error",
-                    error: Some(diag),
-                }
-            }
-        }
-        Err(err) => {
-            let msg = err.to_string();
-            report_error_with_secrets(&msg, secrets);
-            TurnExitOutcome {
-                exit_code: 1,
-                termination_reason: "error",
-                error: Some(msg),
-            }
-        }
+        Err(AgentError::Llm(err)) => TurnExitOutcome::failure(
+            "error",
+            format_llm_error_diagnostic(err, &secrets.lock().unwrap()),
+        ),
+        Err(err) => TurnExitOutcome::failure("error", err.to_string()),
     }
 }
 

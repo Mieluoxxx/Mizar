@@ -153,11 +153,29 @@ pub enum AppAction {
     Quit,
 }
 
+#[derive(Default)]
+enum DraftTtft {
+    #[default]
+    Pending,
+    // 满 32 项时须记住被挤出的旧样本，撤销重试才不会缩短历史。
+    Sampled {
+        evicted_ms: Option<u64>,
+    },
+}
+
+#[derive(Default)]
+struct StepDraft {
+    // 通知可能把同一次尝试的草稿分成多段，重试时要保留夹在中间的通知。
+    first_item: Option<usize>,
+    ttft: DraftTtft,
+}
+
 pub struct AppState {
     pub workspace: PathBuf,
     pub session_id: String,
     pub session_title: Option<String>,
     pub items: Vec<ChatItem>,
+    draft: StepDraft,
     pub tool_extras: HashMap<String, ToolExtraMeta>,
     pub item_cache: TranscriptRenderCache,
 
@@ -167,6 +185,8 @@ pub struct AppState {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub providers: Vec<ProviderInfo>,
+    pub context_window_override: Option<u64>,
+    pub default_context_window: u64,
     pub user_skill_names: Vec<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub show_thinking: bool,
@@ -256,6 +276,7 @@ impl AppState {
             session_id: session_id.into(),
             session_title: None,
             items: Vec::new(),
+            draft: StepDraft::default(),
             tool_extras: HashMap::new(),
             item_cache: TranscriptRenderCache::default(),
             input: TextInput::new(),
@@ -264,6 +285,8 @@ impl AppState {
             provider,
             model,
             providers,
+            context_window_override: None,
+            default_context_window: 128_000,
             user_skill_names: Vec::new(),
             reasoning_effort,
             show_thinking: true,
@@ -393,6 +416,7 @@ impl AppState {
                 self.activity = ActivityState::Agent {
                     streaming_assistant_open: false,
                     compaction_status: None,
+                    retry_status: None,
                 };
             }
         } else if matches!(self.activity, ActivityState::Agent { .. }) {
@@ -555,9 +579,13 @@ impl AppState {
     }
 
     pub fn active_context_window(&self) -> u64 {
-        self.active_model_info()
-            .and_then(|model| model.context_window)
-            .unwrap_or(128_000)
+        self.context_window_override
+            .or_else(|| {
+                self.active_model_info()
+                    .and_then(|model| model.context_window)
+            })
+            .unwrap_or(self.default_context_window)
+            .max(4_096)
     }
 
     pub fn available_efforts(&self) -> Vec<ReasoningEffort> {
@@ -836,6 +864,7 @@ impl AppState {
         self.pending_settings_model_pick = None;
         self.overlay.resolve_all_approvals(ApprovalDecision::Deny);
         self.items.clear();
+        self.draft = StepDraft::default();
         self.tool_extras.clear();
         self.item_cache.clear();
         self.touched_files.clear();
@@ -922,6 +951,7 @@ impl AppState {
                         self.items.push(ChatItem::Assistant { reasoning, text });
                     }
                     for (id, name, arguments) in calls {
+                        self.reserve_tool_call_id(&id);
                         let args_summary = summarize_tool_args(&arguments);
                         self.record_touched_file(&name, &arguments);
                         self.tool_extras.insert(

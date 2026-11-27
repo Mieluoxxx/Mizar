@@ -3,17 +3,18 @@
 //! Agent 循环本身也只是一个插件。它不知道模型是哪家、有哪些工具，只认四个服务名：
 //! `llm`、`tools`、`sessions`、`systemPrompt`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cordis::{Context, CordisError, Inject, Service};
-use futures::StreamExt;
 use futures::future::join_all;
 use mizar_llm::{
-    BlockAssembler, FinishReason, GenerateOptions, ImageAttachment, LlmContextExt, LlmError,
-    LlmErrorCode, Message, ReasoningEffort, StreamChunk, TokenUsage, ToolCall,
+    BlockAssembler, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions, ImageAttachment,
+    LlmContextExt, LlmError, LlmErrorCode, Message, ReasoningEffort, StreamChunk, TokenUsage,
+    ToolCall,
 };
+use mizar_llm_retry::{RetryConfig, RetryDecision, collect_attempt, sleep_cancellable};
 use mizar_session::{Session, SessionEvent, SessionTraceEvent, TraceSeverity};
 use mizar_system_prompt::SystemPromptContextExt;
 use mizar_tools::{
@@ -32,9 +33,12 @@ pub const EVENT_AGENT_CONTEXT_OVERFLOW: &str = "agent/context-overflow";
 pub const EVENT_AGENT_REQUEST: &str = "agent/request";
 pub const EVENT_AGENT_TEXT_DELTA: &str = "agent/text-delta";
 pub const EVENT_AGENT_REASONING_DELTA: &str = "agent/reasoning-delta";
+pub const EVENT_AGENT_TOOL_CALL_DRAFT: &str = "agent/tool-call-draft";
+pub const EVENT_AGENT_TOOL_CALL_DRAFT_ID: &str = "agent/tool-call-draft-id";
 pub const EVENT_AGENT_TOOL_CALL: &str = "agent/tool-call";
 pub const EVENT_AGENT_TOOL_UPDATE: &str = "agent/tool-update";
 pub const EVENT_AGENT_TOOL_RESULT: &str = "agent/tool-result";
+pub const EVENT_AGENT_RETRY: &str = "agent/retry";
 pub const EVENT_AGENT_USAGE: &str = "agent/usage";
 pub const EVENT_AGENT_TURN_START: &str = "agent/turn-start";
 pub const EVENT_AGENT_TURN_INPUT: &str = "agent/turn-input";
@@ -193,6 +197,24 @@ pub struct AgentReasoningDeltaEvent {
 }
 
 #[derive(Clone)]
+pub struct AgentToolCallDraftEvent {
+    pub session: Arc<Session>,
+    pub turn: usize,
+    pub step: usize,
+    pub call_id: String,
+    pub name: String,
+    pub arguments_delta: String,
+    pub ts_ms: u128,
+}
+
+#[derive(Clone)]
+pub struct AgentToolCallDraftIdEvent {
+    pub session: Arc<Session>,
+    pub previous_id: String,
+    pub call_id: String,
+}
+
+#[derive(Clone)]
 pub struct AgentToolCallEvent {
     pub session: Arc<Session>,
     pub call: ToolCall,
@@ -216,6 +238,19 @@ pub struct AgentToolResultEvent {
     pub is_error: bool,
     pub blocked: bool,
     pub details: Option<Value>,
+}
+
+#[derive(Clone)]
+pub struct AgentRetryEvent {
+    pub session: Arc<Session>,
+    pub turn: u64,
+    pub step: usize,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay_ms: u64,
+    pub reason: String,
+    pub reset_draft: bool,
+    pub ts_ms: u128,
 }
 
 #[derive(Clone)]
@@ -278,7 +313,7 @@ pub struct AgentStepEndEvent {
     pub ts_ms: u128,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AgentLoopConfig {
     /// 用哪个适配器，默认第一个注册的。
     pub provider: Option<String>,
@@ -289,6 +324,21 @@ pub struct AgentLoopConfig {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub retry: RetryConfig,
+}
+
+impl Default for AgentLoopConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            max_steps: None,
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            retry: RetryConfig::from_env(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -414,7 +464,207 @@ struct StepGuard {
     usage: Option<TokenUsage>,
 }
 
+#[derive(Default)]
+struct AttemptProgress {
+    saw_reasoning_delta: bool,
+    has_visible_output: bool,
+    has_tool_calls: bool,
+    first_token_emitted: bool,
+    tool_drafts: BTreeMap<usize, ToolDraft>,
+}
+
+#[derive(Default)]
+struct ToolDraft {
+    call_id: String,
+    name: String,
+    pending_arguments: String,
+    sent_arguments: bool,
+}
+
 impl StepGuard {
+    fn emit_tool_draft(&self, call_id: &str, name: &str, arguments_delta: String, ts_ms: u128) {
+        self.ctx.emit(
+            EVENT_AGENT_TOOL_CALL_DRAFT,
+            AgentToolCallDraftEvent {
+                session: Arc::clone(&self.session),
+                turn: self.turn as usize,
+                step: self.step,
+                call_id: call_id.to_owned(),
+                name: name.to_owned(),
+                arguments_delta,
+                ts_ms,
+            },
+        );
+    }
+
+    fn align_tool_draft_id(&self, draft: &ToolDraft, call_id: &str) {
+        if !draft.name.is_empty() && draft.call_id != call_id {
+            self.ctx.emit(
+                EVENT_AGENT_TOOL_CALL_DRAFT_ID,
+                AgentToolCallDraftIdEvent {
+                    session: Arc::clone(&self.session),
+                    previous_id: draft.call_id.clone(),
+                    call_id: call_id.to_owned(),
+                },
+            );
+        }
+    }
+
+    fn observe_chunk(&self, chunk: &StreamChunk, progress: &mut AttemptProgress) {
+        match chunk {
+            StreamChunk::TextDelta { text, .. } if !text.is_empty() => {
+                progress.has_visible_output = true
+            }
+            StreamChunk::ReasoningDelta { text, .. } if !text.is_empty() => {
+                progress.saw_reasoning_delta = true
+            }
+            StreamChunk::BlockEnd {
+                block: ContentBlock::Text { text },
+                ..
+            } if !text.is_empty() => progress.has_visible_output = true,
+            StreamChunk::BlockEnd {
+                block: ContentBlock::Reasoning { text },
+                ..
+            } if !text.is_empty() => progress.saw_reasoning_delta = true,
+            StreamChunk::BlockStart {
+                index,
+                kind: ContentBlockKind::ToolCall,
+            } => {
+                progress.has_tool_calls = true;
+                progress.tool_drafts.entry(*index).or_default();
+            }
+            StreamChunk::ToolCallDelta { .. }
+            | StreamChunk::BlockEnd {
+                block: ContentBlock::ToolCall { .. },
+                ..
+            } => progress.has_tool_calls = true,
+            _ => return,
+        }
+        let ts_ms = now_millis();
+        if !progress.first_token_emitted {
+            progress.first_token_emitted = true;
+            self.session.append_trace(SessionTraceEvent::FirstToken {
+                turn: self.turn,
+                step: self.step,
+            });
+            self.ctx.emit(
+                EVENT_AGENT_STEP_FIRST_TOKEN,
+                AgentStepFirstTokenEvent {
+                    session: Arc::clone(&self.session),
+                    turn: self.turn,
+                    step: self.step,
+                    ts_ms,
+                },
+            );
+        }
+        match chunk {
+            StreamChunk::TextDelta { text, .. } => self.ctx.emit(
+                EVENT_AGENT_TEXT_DELTA,
+                AgentTextDeltaEvent {
+                    session: Arc::clone(&self.session),
+                    text: text.clone(),
+                    ts_ms,
+                },
+            ),
+            StreamChunk::ReasoningDelta { text, .. } => self.ctx.emit(
+                EVENT_AGENT_REASONING_DELTA,
+                AgentReasoningDeltaEvent {
+                    session: Arc::clone(&self.session),
+                    text: text.clone(),
+                    ts_ms,
+                },
+            ),
+            StreamChunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                let draft = progress.tool_drafts.entry(*index).or_default();
+                if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+                    self.align_tool_draft_id(draft, id);
+                    draft.call_id = id.to_owned();
+                } else if draft.call_id.is_empty() {
+                    // 块索引会跨步复用，临时标识必须限定在本会话的当前步骤。
+                    draft.call_id = format!(
+                        "draft:{}:{}:{}:{index}",
+                        self.session.id, self.turn, self.step
+                    );
+                }
+                if let Some(name) = name {
+                    draft.name.push_str(name);
+                }
+                draft.pending_arguments.push_str(arguments_delta);
+                if !draft.name.is_empty() {
+                    draft.sent_arguments |= !draft.pending_arguments.is_empty();
+                    self.emit_tool_draft(
+                        &draft.call_id,
+                        &draft.name,
+                        std::mem::take(&mut draft.pending_arguments),
+                        ts_ms,
+                    );
+                }
+            }
+            StreamChunk::BlockEnd {
+                index,
+                block:
+                    ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+            } => {
+                let draft = progress.tool_drafts.entry(*index).or_default();
+                self.align_tool_draft_id(draft, id);
+                if !draft.sent_arguments && !name.is_empty() {
+                    self.emit_tool_draft(id, name, arguments.clone(), ts_ms);
+                    draft.sent_arguments = true;
+                }
+                draft.call_id.clone_from(id);
+                draft.name.clone_from(name);
+            }
+            _ => {}
+        }
+    }
+
+    fn retry(
+        &self,
+        attempt: usize,
+        max_attempts: usize,
+        delay: Duration,
+        reason: &str,
+        reset_draft: bool,
+    ) {
+        let delay_ms = delay.as_millis() as u64;
+        self.ctx.logger_named("agent-loop").info(format_args!(
+            "step={} retry={attempt}/{max_attempts} wait={delay_ms}ms reason={reason}",
+            self.step
+        ));
+        self.session.append_trace(SessionTraceEvent::StepRetry {
+            turn: self.turn,
+            step: self.step,
+            attempt,
+            max_attempts,
+            delay_ms,
+            reason: reason.to_owned(),
+            reset_draft,
+        });
+        self.ctx.emit(
+            EVENT_AGENT_RETRY,
+            AgentRetryEvent {
+                session: Arc::clone(&self.session),
+                turn: self.turn,
+                step: self.step,
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason: reason.to_owned(),
+                reset_draft,
+                ts_ms: now_millis(),
+            },
+        );
+    }
+
     fn finish(&mut self, outcome: StepOutcome, usage: Option<TokenUsage>) {
         self.outcome = outcome;
         self.usage = usage;
@@ -423,6 +673,16 @@ impl StepGuard {
 
 impl Drop for StepGuard {
     fn drop(&mut self) {
+        // 用量是本次请求的累计快照，只有最终尝试才能计入本步。
+        if let Some(usage) = self.usage {
+            self.ctx.emit(
+                EVENT_AGENT_USAGE,
+                AgentUsageEvent {
+                    session: Arc::clone(&self.session),
+                    usage,
+                },
+            );
+        }
         self.session.append_trace(SessionTraceEvent::StepEnd {
             turn: self.turn,
             step: self.step,
@@ -444,8 +704,6 @@ impl Drop for StepGuard {
         );
     }
 }
-
-const MAX_EMPTY_RESPONSE_RETRIES: usize = 2;
 
 fn parse_tool_arguments(tool_name: &str, raw_arguments: &str) -> Result<Value, String> {
     if raw_arguments.trim().is_empty() {
@@ -608,9 +866,7 @@ impl AgentLoop {
         let mut step = 0usize;
         let mut steps_executed = 0usize;
         let mut last_step_outcome: Option<StepOutcome> = None;
-        let mut last_overflow_step: Option<usize> = None;
         let mut overflow_recoveries_this_turn = 0usize;
-        let mut empty_response_retries = 0usize;
         let mut consecutive_short_cutoffs = self
             .short_cutoffs_by_session
             .lock()
@@ -689,19 +945,20 @@ impl AgentLoop {
                 usage: None,
             };
 
-            let mut messages = vec![Message::System {
-                content: prompt_text,
-            }];
-            messages.extend(session.derive_messages());
-            let can_recover_overflow =
-                last_overflow_step != Some(step) && overflow_recoveries_this_turn < 3;
-
-            let mut stream = match llm.stream(GenerateOptions {
-                messages,
+            let build_messages = || {
+                let mut messages = vec![Message::System {
+                    content: prompt_text.clone(),
+                }];
+                messages.extend(session.derive_messages());
+                messages
+            };
+            let mut request = GenerateOptions {
+                messages: build_messages(),
                 tools: tool_list,
                 model: model.clone(),
                 provider: provider.clone(),
                 system: None,
+                supports_images: None,
                 max_tokens,
                 temperature,
                 reasoning_effort,
@@ -709,423 +966,166 @@ impl AgentLoop {
                 session_id: Some(session.id.clone()),
                 cache_retention: None,
                 cancel: cancel.clone(),
-            }) {
-                Ok(s) => s,
-                Err(err) => {
-                    if err.code == LlmErrorCode::ContextWindowExceeded
-                        && can_recover_overflow
-                        && !cancel.is_cancelled()
-                    {
-                        let recovered = self
-                            .ctx
-                            .serial::<AgentContextOverflowEvent, bool>(
-                                EVENT_AGENT_CONTEXT_OVERFLOW,
-                                AgentContextOverflowEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    provider: provider.clone(),
-                                    model: model.clone(),
-                                    reason: err.to_string(),
-                                    cancel: cancel.clone(),
-                                },
-                            )
-                            .await
-                            .unwrap_or(false);
-                        if recovered {
-                            last_overflow_step = Some(step);
-                            overflow_recoveries_this_turn += 1;
-                            consecutive_short_cutoffs = 0;
-                            self.short_cutoffs_by_session
-                                .lock()
-                                .unwrap()
-                                .remove(&session.id);
-                            step_guard.finish(
-                                StepOutcome::Error {
-                                    message: "context overflow recovered; retrying".to_string(),
-                                },
-                                None,
-                            );
-                            drop(step_guard);
-                            step = step.saturating_sub(1);
-                            continue;
-                        }
+            };
+            let retry = &self.config.retry;
+            let mut step_retries = 0;
+            let mut mid_thinking_retries = 0;
+            let mut recovered_overflow = false;
+            let (assembler, text, calls) = 'attempt: loop {
+                let mut assembler = BlockAssembler::new();
+                let mut progress = AttemptProgress::default();
+                let mut error = collect_attempt(&llm, request.clone(), &mut assembler, |chunk| {
+                    step_guard.observe_chunk(chunk, &mut progress);
+                })
+                .await
+                .err();
+                let text = assembler.text();
+                let calls = assembler.tool_calls();
+                let is_cutoff = error.is_none() && assembler.finish() == FinishReason::MaxTokens;
+                let short_cutoff =
+                    is_cutoff && calls.is_empty() && text.chars().take(200).count() < 200;
+                let implicit_overflow = short_cutoff
+                    && (assembler.blocks().is_empty() || consecutive_short_cutoffs > 0);
+                if error.is_none() && !is_cutoff && calls.is_empty() && text.trim().is_empty() {
+                    error = Some(
+                        LlmError::transport("model returned empty response")
+                            .with_http_hints(assembler.response_hints()),
+                    );
+                }
+                if let Some(err) = &mut error
+                    && err.code == LlmErrorCode::EmptyResponse
+                {
+                    err.code = LlmErrorCode::Transport;
+                }
+                let can_replay = !cancel.is_cancelled()
+                    && !progress.has_visible_output
+                    && !progress.has_tool_calls
+                    && step_retries < retry.max_retries
+                    && (!progress.saw_reasoning_delta
+                        || mid_thinking_retries < retry.max_mid_thinking_retries);
+                let overflow_hints = match &error {
+                    Some(err) if err.code == LlmErrorCode::ContextWindowExceeded => {
+                        Some((err.should_retry, err.retry_after_ms))
                     }
+                    None if implicit_overflow => {
+                        let hints = assembler.response_hints();
+                        Some((hints.should_retry, hints.retry_after_ms))
+                    }
+                    _ => None,
+                };
+                let overflow_delay = overflow_hints
+                    .filter(|(allowed, _)| *allowed != Some(false))
+                    .map(|(_, ms)| Duration::from_millis(ms.unwrap_or(0)))
+                    .filter(|delay| *delay <= retry.max_retry_after);
+                let next = if can_replay
+                    && !recovered_overflow
+                    && overflow_recoveries_this_turn < 3
+                    && let Some(delay) = overflow_delay
+                    // 压缩可能立即调用同一网关，等待应从收到溢出响应开始。
+                    && (delay.is_zero() || sleep_cancellable(delay, &cancel).await.is_ok())
+                    && self
+                        .ctx
+                        .serial::<AgentContextOverflowEvent, bool>(
+                            EVENT_AGENT_CONTEXT_OVERFLOW,
+                            AgentContextOverflowEvent {
+                                session: Arc::clone(&session),
+                                turn,
+                                step,
+                                provider: provider.clone(),
+                                model: model.clone(),
+                                reason: error.as_ref().map_or_else(
+                                    || {
+                                        "suspected context overflow after max_tokens cutoff"
+                                            .to_string()
+                                    },
+                                    ToString::to_string,
+                                ),
+                                cancel: cancel.clone(),
+                            },
+                        )
+                        .await
+                        .unwrap_or(false)
+                {
+                    recovered_overflow = true;
+                    overflow_recoveries_this_turn += 1;
+                    consecutive_short_cutoffs = 0;
+                    self.short_cutoffs_by_session
+                        .lock()
+                        .unwrap()
+                        .remove(&session.id);
+                    // 压缩会改变可见历史并重置工具激活态，两者必须取自同一轮压缩之后。
+                    request.messages = build_messages();
+                    request.tools = tools.list_declared(Some(&session.id));
+                    Some((Duration::ZERO, "context_window_exceeded"))
+                } else if can_replay
+                    && let Some(err) = &error
+                    && let RetryDecision::Wait(delay) = retry.decide(err, step_retries)
+                {
+                    Some((delay, err.code.as_str()))
+                } else {
+                    None
+                };
+                if let Some((delay, reason)) = next {
+                    step_retries += 1;
+                    if progress.saw_reasoning_delta {
+                        mid_thinking_retries += 1;
+                    }
+                    step_guard.retry(
+                        step_retries,
+                        retry.max_retries,
+                        delay,
+                        reason,
+                        progress.saw_reasoning_delta,
+                    );
+                    sleep_cancellable(delay, &cancel).await?;
+                    continue 'attempt;
+                }
+                if cancel.is_cancelled() {
+                    error = Some(LlmError::cancelled());
+                }
+                if let Some(err) = error {
                     if err.code == LlmErrorCode::Cancelled {
-                        step_guard.finish(StepOutcome::Cancelled, None);
+                        if cancel.is_cancelled() {
+                            flush_interrupted_assistant(&session, &assembler);
+                        }
+                        step_guard.finish(StepOutcome::Cancelled, assembler.usage());
                         turn_guard.set_reason(TurnEndReason::Cancelled);
                     } else {
-                        let msg = err.to_string();
+                        let message = err.to_string();
                         step_guard.finish(
                             StepOutcome::Error {
-                                message: msg.clone(),
+                                message: message.clone(),
                             },
-                            None,
+                            assembler.usage(),
                         );
-                        turn_guard.set_reason(TurnEndReason::Error { message: msg });
+                        turn_guard.set_reason(TurnEndReason::Error { message });
                     }
-                    return Err(AgentError::Llm(err));
+                    return Err(err.into());
                 }
-            };
-
-            let mut assembler = BlockAssembler::new();
-            let mut first_token_emitted = false;
-            let mut stream_err: Option<LlmError> = None;
-            let mut emit_first_token = || {
-                if !first_token_emitted {
-                    first_token_emitted = true;
-                    session.append_trace(SessionTraceEvent::FirstToken { turn, step });
-                    self.ctx.emit(
-                        EVENT_AGENT_STEP_FIRST_TOKEN,
-                        AgentStepFirstTokenEvent {
-                            session: Arc::clone(&session),
-                            turn,
-                            step,
-                            ts_ms: now_millis(),
-                        },
-                    );
-                }
-            };
-            while let Some(chunk_res) = stream.next().await {
-                let chunk = match chunk_res {
-                    Ok(c) => c,
-                    Err(err) => {
-                        if err.code == LlmErrorCode::Cancelled {
-                            flush_interrupted_assistant(&session, &assembler);
-                            step_guard.finish(StepOutcome::Cancelled, assembler.usage());
-                            turn_guard.set_reason(TurnEndReason::Cancelled);
-                            return Err(AgentError::Llm(err));
-                        }
-                        let can_retry_overflow = err.code == LlmErrorCode::ContextWindowExceeded
-                            && can_recover_overflow
-                            && !cancel.is_cancelled();
-                        let can_retry_empty = err.code == LlmErrorCode::EmptyResponse
-                            && !cancel.is_cancelled()
-                            && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES;
-                        if can_retry_overflow || can_retry_empty {
-                            stream_err = Some(err);
-                            break;
-                        }
-                        let msg = err.to_string();
-                        step_guard.finish(
-                            StepOutcome::Error {
-                                message: msg.clone(),
-                            },
-                            None,
-                        );
-                        turn_guard.set_reason(TurnEndReason::Error { message: msg });
-                        return Err(AgentError::Llm(err));
-                    }
-                };
-                match &chunk {
-                    StreamChunk::TextDelta { text, .. } if !text.is_empty() => {
-                        emit_first_token();
-                        self.ctx.emit(
-                            EVENT_AGENT_TEXT_DELTA,
-                            AgentTextDeltaEvent {
-                                session: Arc::clone(&session),
-                                text: text.clone(),
-                                ts_ms: now_millis(),
-                            },
-                        );
-                    }
-                    StreamChunk::ReasoningDelta { text, .. } if !text.is_empty() => {
-                        emit_first_token();
-                        self.ctx.emit(
-                            EVENT_AGENT_REASONING_DELTA,
-                            AgentReasoningDeltaEvent {
-                                session: Arc::clone(&session),
-                                text: text.clone(),
-                                ts_ms: now_millis(),
-                            },
-                        );
-                    }
-                    StreamChunk::ToolCallDelta {
-                        id,
-                        name,
-                        arguments_delta,
-                        ..
-                    } if !arguments_delta.is_empty()
-                        || id.as_deref().is_some_and(|s| !s.is_empty())
-                        || name.as_deref().is_some_and(|s| !s.is_empty()) =>
-                    {
-                        emit_first_token();
-                    }
-                    StreamChunk::BlockEnd {
-                        block: mizar_llm::ContentBlock::ToolCall { .. },
-                        ..
-                    } => {
-                        emit_first_token();
-                    }
-                    StreamChunk::Usage { usage } => {
-                        self.ctx.emit(
-                            EVENT_AGENT_USAGE,
-                            AgentUsageEvent {
-                                session: Arc::clone(&session),
-                                usage: *usage,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-                assembler.push(chunk);
-            }
-
-            if let Some(err) = stream_err {
-                if err.code == LlmErrorCode::EmptyResponse {
-                    empty_response_retries += 1;
-                    let outcome = StepOutcome::Error {
-                        message: "stream error recovered; retrying".to_string(),
-                    };
-                    last_step_outcome = Some(outcome.clone());
-                    step_guard.finish(outcome, None);
-                    drop(step_guard);
-                    step = step.saturating_sub(1);
-                    continue;
-                }
-                let recovered = self
-                    .ctx
-                    .serial::<AgentContextOverflowEvent, bool>(
-                        EVENT_AGENT_CONTEXT_OVERFLOW,
-                        AgentContextOverflowEvent {
-                            session: Arc::clone(&session),
-                            turn,
-                            step,
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            reason: err.to_string(),
-                            cancel: cancel.clone(),
-                        },
-                    )
-                    .await
-                    .unwrap_or(false);
-                if recovered {
-                    last_overflow_step = Some(step);
-                    overflow_recoveries_this_turn += 1;
+                if short_cutoff {
+                    consecutive_short_cutoffs += 1;
+                    self.short_cutoffs_by_session
+                        .lock()
+                        .unwrap()
+                        .insert(session.id.clone(), consecutive_short_cutoffs);
+                } else {
                     consecutive_short_cutoffs = 0;
                     self.short_cutoffs_by_session
                         .lock()
                         .unwrap()
                         .remove(&session.id);
-                    step_guard.finish(
-                        StepOutcome::Error {
-                            message: "context overflow recovered; retrying".to_string(),
-                        },
-                        None,
-                    );
-                    drop(step_guard);
-                    step = step.saturating_sub(1);
-                    continue;
                 }
-                let msg = err.to_string();
-                step_guard.finish(
-                    StepOutcome::Error {
-                        message: msg.clone(),
-                    },
-                    None,
-                );
-                turn_guard.set_reason(TurnEndReason::Error { message: msg });
-                return Err(AgentError::Llm(err));
-            }
-
-            let finish_reason = assembler.finish();
-            match &finish_reason {
-                FinishReason::Aborted => {
-                    flush_interrupted_assistant(&session, &assembler);
-                    step_guard.finish(StepOutcome::Cancelled, assembler.usage());
-                    turn_guard.set_reason(TurnEndReason::Cancelled);
-                    return Err(AgentError::Llm(LlmError::cancelled()));
+                // 只有增量而没有闭块的协议会由组装器补全标识，调用顺序与块索引一致。
+                for (draft, call) in progress.tool_drafts.values().zip(&calls) {
+                    step_guard.align_tool_draft_id(draft, &call.id);
                 }
-                FinishReason::Error {
-                    code,
-                    message,
-                    status,
-                    retry_after_ms,
-                } => {
-                    let err = LlmError {
-                        code: *code,
-                        message: message.clone(),
-                        status: *status,
-                        retry_after_ms: *retry_after_ms,
-                    };
-                    if err.code == LlmErrorCode::ContextWindowExceeded
-                        && can_recover_overflow
-                        && !cancel.is_cancelled()
-                    {
-                        let recovered = self
-                            .ctx
-                            .serial::<AgentContextOverflowEvent, bool>(
-                                EVENT_AGENT_CONTEXT_OVERFLOW,
-                                AgentContextOverflowEvent {
-                                    session: Arc::clone(&session),
-                                    turn,
-                                    step,
-                                    provider: provider.clone(),
-                                    model: model.clone(),
-                                    reason: err.to_string(),
-                                    cancel: cancel.clone(),
-                                },
-                            )
-                            .await
-                            .unwrap_or(false);
-                        if recovered {
-                            last_overflow_step = Some(step);
-                            overflow_recoveries_this_turn += 1;
-                            consecutive_short_cutoffs = 0;
-                            self.short_cutoffs_by_session
-                                .lock()
-                                .unwrap()
-                                .remove(&session.id);
-                            let outcome = StepOutcome::Error {
-                                message: "context overflow recovered; retrying".to_string(),
-                            };
-                            last_step_outcome = Some(outcome.clone());
-                            step_guard.finish(outcome, None);
-                            drop(step_guard);
-                            step = step.saturating_sub(1);
-                            continue;
-                        }
-                    }
-                    if !cancel.is_cancelled()
-                        && err.code == LlmErrorCode::EmptyResponse
-                        && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES
-                    {
-                        empty_response_retries += 1;
-                        let outcome = StepOutcome::Error {
-                            message: "empty response; retrying".to_string(),
-                        };
-                        last_step_outcome = Some(outcome.clone());
-                        step_guard.finish(outcome, None);
-                        drop(step_guard);
-                        step = step.saturating_sub(1);
-                        continue;
-                    }
-                    let msg = err.to_string();
-                    step_guard.finish(
-                        StepOutcome::Error {
-                            message: msg.clone(),
-                        },
-                        None,
-                    );
-                    turn_guard.set_reason(TurnEndReason::Error { message: msg });
-                    return Err(AgentError::Llm(err));
-                }
-                FinishReason::Stop | FinishReason::ToolCalls | FinishReason::MaxTokens => {}
-            }
-
-            let text = assembler.text();
-            let calls = assembler.tool_calls();
+                break 'attempt (assembler, text, calls);
+            };
             let usage = assembler.usage();
-            let blocks = assembler.blocks();
-            let replay = assembler.replay();
-
-            // 识别隐性小窗口截断：0 输出 `MaxTokens`（pi）或连续两次极短 `MaxTokens`（DS-Bot `cutOffs >= 2`）
-            let is_zero_len_cutoff = matches!(finish_reason, FinishReason::MaxTokens)
-                && calls.is_empty()
-                && blocks.is_empty();
-            let is_short_cutoff = matches!(finish_reason, FinishReason::MaxTokens)
-                && calls.is_empty()
-                && text.chars().count() < 200;
-            if is_short_cutoff {
-                consecutive_short_cutoffs += 1;
-                self.short_cutoffs_by_session
-                    .lock()
-                    .unwrap()
-                    .insert(session.id.clone(), consecutive_short_cutoffs);
-            } else {
-                consecutive_short_cutoffs = 0;
-                self.short_cutoffs_by_session
-                    .lock()
-                    .unwrap()
-                    .remove(&session.id);
-            }
-
-            if (is_zero_len_cutoff || consecutive_short_cutoffs >= 2)
-                && can_recover_overflow
-                && !cancel.is_cancelled()
-            {
-                let reason = if is_zero_len_cutoff {
-                    "zero-output max_tokens cutoff (suspected context window overflow)".to_string()
-                } else {
-                    format!(
-                        "consecutive short max_tokens cutoffs ({consecutive_short_cutoffs}, suspected implicit small context window)"
-                    )
-                };
-                let recovered = self
-                    .ctx
-                    .serial::<AgentContextOverflowEvent, bool>(
-                        EVENT_AGENT_CONTEXT_OVERFLOW,
-                        AgentContextOverflowEvent {
-                            session: Arc::clone(&session),
-                            turn,
-                            step,
-                            provider: provider.clone(),
-                            model: model.clone(),
-                            reason,
-                            cancel: cancel.clone(),
-                        },
-                    )
-                    .await
-                    .unwrap_or(false);
-                if recovered {
-                    last_overflow_step = Some(step);
-                    overflow_recoveries_this_turn += 1;
-                    consecutive_short_cutoffs = 0;
-                    self.short_cutoffs_by_session
-                        .lock()
-                        .unwrap()
-                        .remove(&session.id);
-                    let outcome = StepOutcome::Error {
-                        message: "implicit cutoff overflow recovered; retrying".to_string(),
-                    };
-                    last_step_outcome = Some(outcome.clone());
-                    step_guard.finish(outcome, usage);
-                    drop(step_guard);
-                    step = step.saturating_sub(1);
-                    continue;
-                }
-            }
-
-            let has_visible_text = blocks.iter().any(|b| match b {
-                mizar_llm::ContentBlock::Text { text } => !text.trim().is_empty(),
-                _ => false,
-            });
-            if calls.is_empty()
-                && !has_visible_text
-                && !matches!(finish_reason, FinishReason::MaxTokens)
-            {
-                if !cancel.is_cancelled() && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES {
-                    empty_response_retries += 1;
-                    let outcome = StepOutcome::Error {
-                        message: "empty response; retrying".to_string(),
-                    };
-                    last_step_outcome = Some(outcome.clone());
-                    step_guard.finish(outcome, usage);
-                    drop(step_guard);
-                    step = step.saturating_sub(1);
-                    continue;
-                }
-                let detail = if blocks.is_empty() {
-                    "model output must contain either output text or tool calls"
-                } else {
-                    "model output contained only reasoning without visible text or tool calls"
-                };
-                let err = LlmError::new(LlmErrorCode::EmptyResponse, detail);
-                let msg = err.to_string();
-                step_guard.finish(
-                    StepOutcome::Error {
-                        message: msg.clone(),
-                    },
-                    usage,
-                );
-                turn_guard.set_reason(TurnEndReason::Error { message: msg });
-                return Err(AgentError::Llm(err));
-            }
-
-            empty_response_retries = 0;
+            let finish_reason = assembler.finish();
             session.append(SessionEvent::Assistant {
-                blocks,
-                replay,
+                blocks: assembler.blocks(),
+                replay: assembler.replay(),
                 usage,
             });
 
@@ -1142,7 +1142,7 @@ impl AgentLoop {
             drop(step_guard);
 
             if calls.is_empty() {
-                let reason = if is_truncated || !has_visible_text {
+                let reason = if is_truncated {
                     TurnEndReason::Truncated
                 } else {
                     TurnEndReason::Completed
@@ -1177,6 +1177,7 @@ impl AgentLoop {
                             tool_call_id: pending.id.clone(),
                             name: pending.name.clone(),
                             content,
+                            images: Vec::new(),
                             is_error: true,
                         });
                     }
@@ -1274,6 +1275,7 @@ impl AgentLoop {
                         tool_call_id: call.id.clone(),
                         name: call.name.clone(),
                         content: result.content,
+                        images: result.images,
                         is_error: result.is_error,
                     });
                     for note in extra_contexts {

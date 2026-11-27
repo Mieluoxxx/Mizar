@@ -11,9 +11,10 @@ use cordis::{BoxError, BoxFuture, Cleanup, Context, Inject, Plugin};
 use futures::channel::mpsc;
 use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
-    LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
-    ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
-    clamp_openai_prompt_cache_key, detect_session_affinity_mode, push_session_affinity_headers,
+    ImageAttachment, LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo,
+    ProviderInfo, ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk,
+    TokenUsage, clamp_openai_prompt_cache_key, classify_inband_error_value,
+    classify_non_json_sse_frame, detect_session_affinity_mode, push_session_affinity_headers,
     resolve_cache_retention,
 };
 use mizar_llm_http::{
@@ -135,24 +136,18 @@ pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
                 if !content.is_empty() {
                     parts.push(json!({ "type": "text", "text": content }));
                 }
-                for img in images {
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": img.data_url(),
-                        },
-                    }));
-                }
+                parts.extend(images.iter().map(image_block));
                 json!({ "role": "user", "content": parts })
             }
         }
         Message::Tool {
             content,
             tool_call_id,
+            images,
             ..
         } => json!({
             "role": "tool",
-            "content": content,
+            "content": if images.is_empty() { json!(content) } else { json!(format!("{content}\n(see attached image)")) },
             "tool_call_id": tool_call_id,
         }),
         Message::Assistant { blocks, replay } => {
@@ -207,6 +202,10 @@ pub fn to_wire(message: &Message, provider: &str, model: &str) -> Value {
     }
 }
 
+fn image_block(img: &ImageAttachment) -> Value {
+    json!({"type": "image_url", "image_url": {"url": img.data_url()}})
+}
+
 fn effort_str(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Off => "none",
@@ -230,8 +229,32 @@ pub fn build_request_body(
     {
         messages.push(json!({ "role": "system", "content": sys }));
     }
-    for m in &options.messages {
-        messages.push(to_wire(m, &config.provider, model));
+    // 并行调用须先收齐所有工具回执，中途插入用户图片会破坏协议配对。
+    for batch in options
+        .messages
+        .chunk_by(|a, b| matches!((a, b), (Message::Tool { .. }, Message::Tool { .. })))
+    {
+        let mut attachments = Vec::new();
+        for msg in batch {
+            let message = options.message_for_model(msg);
+            if matches!(message.as_ref(), Message::Assistant { blocks, .. } if blocks.is_empty()) {
+                continue;
+            }
+            messages.push(to_wire(&message, &config.provider, model));
+            if let Message::Tool { images, .. } = message.as_ref()
+                && !images.is_empty()
+            {
+                if attachments.is_empty() {
+                    attachments.push(
+                        json!({"type": "text", "text": "Attached image(s) from tool result(s):"}),
+                    );
+                }
+                attachments.extend(images.iter().map(image_block));
+            }
+        }
+        if !attachments.is_empty() {
+            messages.push(json!({"role": "user", "content": attachments}));
+        }
     }
 
     let mut body = json!({
@@ -322,7 +345,6 @@ struct ChatCompletionChunk {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<WireUsage>,
-    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +364,35 @@ struct WirePromptDetails {
 #[derive(Debug, Deserialize)]
 struct WireCompletionDetails {
     reasoning_tokens: Option<u64>,
+}
+
+impl WireUsage {
+    fn token_usage(&self) -> Option<TokenUsage> {
+        let cached = self
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens);
+        let reasoning = self
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens);
+        self.prompt_tokens
+            .or(self.completion_tokens)
+            .or(self.total_tokens)
+            .or(cached)
+            .or(reasoning)?;
+        Some(TokenUsage {
+            input_tokens: self
+                .prompt_tokens
+                .unwrap_or(0)
+                .saturating_sub(cached.unwrap_or(0)),
+            output_tokens: self.completion_tokens.unwrap_or(0),
+            total_tokens: self.total_tokens,
+            cache_read_tokens: cached.filter(|&n| n > 0),
+            cache_write_tokens: None,
+            reasoning_tokens: reasoning,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,7 +417,7 @@ struct ChunkToolCallPart {
     function: Option<ChunkFunctionDelta>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ChunkFunctionDelta {
     name: Option<String>,
     arguments: Option<String>,
@@ -465,12 +516,11 @@ impl CompletionsSseDecoder {
         match self.finish_reason.as_deref() {
             Some("tool_calls") => FinishReason::ToolCalls,
             Some("length") => FinishReason::MaxTokens,
-            Some("content_filter") => FinishReason::Error {
-                code: LlmErrorCode::ContentRefused,
-                message: "model response blocked by content_filter".to_string(),
-                status: None,
-                retry_after_ms: None,
-            },
+            Some("content_filter") => LlmError::new(
+                LlmErrorCode::ContentRefused,
+                "model response blocked by content_filter",
+            )
+            .into(),
             _ => {
                 if self
                     .blocks
@@ -500,22 +550,24 @@ impl SseStreamDecoder for CompletionsSseDecoder {
             return Ok(false);
         }
         if data == "[DONE]" {
+            self.on_eof_without_done()?;
             self.event_phase = CompletionsEventPhase::Done;
             return Ok(true);
         }
 
-        let chunk: ChatCompletionChunk = serde_json::from_str(data)
-            .map_err(|e| LlmError::malformed(format!("invalid completions SSE json: {e}")))?;
-
-        if let Some(err_val) = chunk.error {
-            let msg = err_val
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("completions stream error");
-            let etype = err_val.get("type").and_then(Value::as_str);
-            let ecode = err_val.get("code").and_then(Value::as_str);
-            return Err(LlmError::classify_provider_error(None, etype, ecode, msg));
+        let payload: Value = serde_json::from_str(data).map_err(|e| {
+            classify_non_json_sse_frame(data).unwrap_or_else(|| {
+                LlmError::malformed(format!("invalid completions SSE json: {e}"))
+            })
+        })?;
+        if payload.get("error").is_some_and(|err| !err.is_null())
+            || payload.get("type").and_then(Value::as_str) == Some("error")
+            || event.event.as_deref() == Some("error")
+        {
+            return Err(classify_inband_error_value(&payload));
         }
+        let chunk: ChatCompletionChunk = serde_json::from_value(payload)
+            .map_err(|e| LlmError::malformed(format!("invalid completions SSE chunk: {e}")))?;
 
         if let Some(id) = chunk.id {
             self.response_id = Some(id);
@@ -524,32 +576,21 @@ impl SseStreamDecoder for CompletionsSseDecoder {
             self.response_model = Some(model);
         }
 
-        if let Some(u) = chunk.usage {
-            let prompt = u.prompt_tokens.unwrap_or(0);
-            let cached = u
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0);
-            let output = u.completion_tokens.unwrap_or(0);
-            let reasoning = u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.reasoning_tokens);
-            self.usage = Some(TokenUsage {
-                input_tokens: prompt.saturating_sub(cached),
-                output_tokens: output,
-                total_tokens: u.total_tokens,
-                cache_read_tokens: (cached > 0).then_some(cached),
-                cache_write_tokens: None,
-                reasoning_tokens: reasoning,
-            });
+        if let Some(usage) = chunk.usage.and_then(|u| u.token_usage())
+            && self.usage != Some(usage)
+        {
+            self.usage = Some(usage);
+            if !emit(StreamChunk::Usage { usage }) {
+                return Ok(true);
+            }
         }
 
         let Some(choice) = chunk.choices.into_iter().next() else {
             return Ok(false);
         };
-        if let Some(reason) = choice.finish_reason {
+        if self.finish_reason.as_deref() != Some("length")
+            && let Some(reason) = choice.finish_reason.filter(|s| !s.trim().is_empty())
+        {
             self.finish_reason = Some(reason);
         }
         let Some(delta) = choice.delta else {
@@ -602,6 +643,13 @@ impl SseStreamDecoder for CompletionsSseDecoder {
         }
 
         for part in delta.tool_calls {
+            let function = part.function.unwrap_or_default();
+            let id = part.id.filter(|s| !s.is_empty());
+            let name = function.name.filter(|s| !s.is_empty());
+            let args = function.arguments.unwrap_or_default();
+            if id.is_none() && name.is_none() && args.is_empty() {
+                continue;
+            }
             let idx = match self.tool_map.get(&part.index).copied() {
                 Some(i) => i,
                 None => {
@@ -612,38 +660,25 @@ impl SseStreamDecoder for CompletionsSseDecoder {
                     i
                 }
             };
-            let id_delta = part.id.clone();
-            let mut name_delta = None;
-            let mut args_delta = String::new();
             if let CompletionsBlockKind::ToolCall {
                 id: ref mut tool_id,
                 name: ref mut tool_name,
                 args: ref mut tool_args,
             } = self.blocks[idx].kind
             {
-                if let Some(id) = part.id
-                    && !id.is_empty()
-                {
-                    *tool_id = id;
+                if let Some(id) = &id {
+                    tool_id.clone_from(id);
                 }
-                if let Some(func) = part.function {
-                    if let Some(name) = func.name
-                        && !name.is_empty()
-                    {
-                        tool_name.push_str(&name);
-                        name_delta = Some(name);
-                    }
-                    if let Some(args) = func.arguments {
-                        tool_args.push_str(&args);
-                        args_delta = args;
-                    }
+                if let Some(name) = &name {
+                    tool_name.push_str(name);
                 }
+                tool_args.push_str(&args);
             }
             if !emit(StreamChunk::ToolCallDelta {
                 index: idx,
-                id: id_delta,
-                name: name_delta,
-                arguments_delta: args_delta,
+                id,
+                name,
+                arguments_delta: args,
             }) {
                 return Ok(true);
             }
@@ -652,12 +687,16 @@ impl SseStreamDecoder for CompletionsSseDecoder {
         Ok(false)
     }
 
+    fn has_terminal_finish(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
     fn on_eof_without_done(&self) -> Result<(), LlmError> {
-        if self.finish_reason.is_some() {
+        if self.has_terminal_finish() {
             Ok(())
         } else {
-            Err(LlmError::malformed(
-                "completions SSE stream truncated before [DONE] or finish_reason",
+            Err(LlmError::transport(
+                "completions SSE stream ended before finish_reason",
             ))
         }
     }
@@ -665,6 +704,32 @@ impl SseStreamDecoder for CompletionsSseDecoder {
     fn on_finish(&mut self, emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
         if self.finish_phase == CompletionsFinishPhase::Emitted {
             return Ok(());
+        }
+        self.on_eof_without_done()?;
+        let reason = self.map_finish_reason();
+        if !matches!(reason, FinishReason::MaxTokens | FinishReason::Error { .. }) {
+            for b in &self.blocks {
+                if let CompletionsBlockKind::ToolCall { name, id, args } = &b.kind {
+                    if id.is_empty() || name.is_empty() {
+                        return Err(LlmError::transport(
+                            "completions stream ended before tool id or name",
+                        ));
+                    }
+                    match serde_json::from_str(args) {
+                        Ok(Value::Object(_)) => {}
+                        Err(e) if e.is_eof() => {
+                            return Err(LlmError::transport(format!(
+                                "completions tool arguments truncated: {e}"
+                            )));
+                        }
+                        _ => {
+                            return Err(LlmError::malformed(
+                                "completions tool arguments must be a JSON object",
+                            ));
+                        }
+                    }
+                }
+            }
         }
         self.finish_phase = CompletionsFinishPhase::Emitted;
 
@@ -674,11 +739,16 @@ impl SseStreamDecoder for CompletionsSseDecoder {
                 CompletionsBlockKind::Reasoning(text) => {
                     ContentBlock::Reasoning { text: text.clone() }
                 }
-                CompletionsBlockKind::ToolCall { id, name, args } => ContentBlock::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: args.clone(),
-                },
+                CompletionsBlockKind::ToolCall { id, name, args } => {
+                    if matches!(reason, FinishReason::MaxTokens | FinishReason::Error { .. }) {
+                        continue;
+                    }
+                    ContentBlock::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: args.clone(),
+                    }
+                }
             };
             if !emit(StreamChunk::BlockEnd {
                 index: b.index,
@@ -686,12 +756,6 @@ impl SseStreamDecoder for CompletionsSseDecoder {
             }) {
                 return Ok(());
             }
-        }
-
-        if let Some(usage) = self.usage
-            && !emit(StreamChunk::Usage { usage })
-        {
-            return Ok(());
         }
 
         let replay = ReplayEnvelope {
@@ -705,7 +769,7 @@ impl SseStreamDecoder for CompletionsSseDecoder {
             blocks: Vec::new(),
         };
         let _ = emit(StreamChunk::Finish {
-            reason: self.map_finish_reason(),
+            reason,
             replay: Some(replay),
         });
         Ok(())
@@ -762,6 +826,14 @@ impl CompletionsAdapter {
 }
 
 impl LlmAdapter for CompletionsAdapter {
+    fn default_cache_retention(&self) -> Option<CacheRetention> {
+        self.config.default_cache_retention
+    }
+
+    fn default_model(&self) -> Option<&str> {
+        Some(&self.config.model)
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.config.provider.clone(),

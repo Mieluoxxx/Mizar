@@ -1,17 +1,95 @@
 //! `UiEvent` 异步后端事件消费与状态归约（含流式增量、工具卡片与上下文压缩进度）。
 
+use mizar_client_core::tool_format::{MAX_ARGS_SUMMARY_COLS, truncate_display};
 use serde_json::Value;
 
 use super::{
-    ActivityState, AppState, ChatItem, NoticeLevel, ToolExtraMeta, ToolState, UiAgentStatus,
-    UiEvent, UiLogLevel, UiStepOutcome, UiTurnEndReason, bash_inline_meta, bash_scope_label,
-    extract_inline_meta, summarize_live_preview, summarize_tool_args, summarize_tool_result,
-    turn_end_program_status,
+    ActivityState, AppState, ChatItem, DraftTtft, NoticeLevel, ToolExtraMeta, ToolState,
+    UiAgentStatus, UiEvent, UiLogLevel, UiStepOutcome, UiTurnEndReason, bash_inline_meta,
+    bash_scope_label, extract_inline_meta, summarize_live_preview, summarize_tool_args,
+    summarize_tool_result, turn_end_program_status,
 };
 use crate::reveal::RevealSlot;
 use crate::terminal::{ProgramStatusState, emit_terminal_progress};
 
 impl AppState {
+    fn tool_call_index(&self, call_id: &str) -> Option<usize> {
+        self.items
+            .iter()
+            .rposition(|item| matches!(item, ChatItem::ToolCall { id, .. } if id == call_id))
+    }
+
+    pub(super) fn reserve_tool_call_id(&mut self, call_id: &str) -> Option<usize> {
+        if !self.tool_extras.contains_key(call_id) {
+            return None;
+        }
+        let idx = self.tool_call_index(call_id)?;
+        if self.draft.first_item.is_some_and(|start| idx >= start) {
+            return Some(idx);
+        }
+        // 有些端点每步从同一个标识重新计数，历史卡片仍需保留自己的参数和回执。
+        if let ChatItem::ToolCall { id, .. } = &mut self.items[idx] {
+            *id = format!("history:{}:{idx}:{call_id}", self.session_id);
+            if let Some(extra) = self.tool_extras.remove(call_id) {
+                self.tool_extras.insert(id.clone(), extra);
+            }
+        }
+        None
+    }
+
+    fn apply_tool_arguments(
+        &mut self,
+        id: String,
+        name: String,
+        arguments: String,
+        status: ToolState,
+    ) {
+        let pos = self.reserve_tool_call_id(&id);
+        if pos.is_none() || status == ToolState::Running {
+            self.close_streaming_assistant();
+            self.reveal.snap_all();
+        }
+        let extra = self.tool_extras.entry(id.clone()).or_default();
+        let args_summary = if status == ToolState::Drafting {
+            extra.full_args.push_str(&arguments);
+            // 未闭合的参数也要有稳定的单行摘要，大段脚本只取标题可用的前缀。
+            truncate_display(&extra.full_args, MAX_ARGS_SUMMARY_COLS)
+        } else {
+            extra.full_args = arguments;
+            summarize_tool_args(&extra.full_args)
+        };
+        let card = ChatItem::ToolCall {
+            id,
+            name,
+            args_summary,
+            status,
+            output_preview: String::new(),
+        };
+        let idx = if let Some(idx) = pos {
+            self.items[idx] = card;
+            idx
+        } else {
+            self.items.push(card);
+            self.items.len() - 1
+        };
+        self.draft.first_item.get_or_insert(idx);
+        self.item_cache
+            .invalidate_tool_neighborhood(&self.items, idx);
+    }
+
+    fn fail_unfinished_tool_drafts(&mut self) {
+        if let Some(start) = self.draft.first_item {
+            for (idx, item) in self.items.iter_mut().enumerate().skip(start) {
+                if let ChatItem::ToolCall { status, .. } = item
+                    && *status == ToolState::Drafting
+                {
+                    *status = ToolState::Error;
+                    self.item_cache.invalidate_item(idx);
+                }
+            }
+        }
+    }
+
     pub(super) fn apply_local_bash_completion(
         &mut self,
         call_id: String,
@@ -23,10 +101,7 @@ impl AppState {
     ) -> usize {
         let failed = !matches!(status, ToolState::Done);
         let preview = summarize_tool_result("bash", &display, None, failed);
-        let idx = if let Some(pos) = self.items.iter().rposition(|item| match item {
-            ChatItem::ToolCall { id, .. } => id == &call_id,
-            _ => false,
-        }) {
+        let idx = if let Some(pos) = self.tool_call_index(&call_id) {
             if let ChatItem::ToolCall {
                 status: st,
                 output_preview,
@@ -82,6 +157,7 @@ impl AppState {
             } = &mut self.activity
             {
                 *streaming_assistant_open = true;
+                self.draft.first_item.get_or_insert(self.items.len() - 1);
             }
         }
         let idx = self.items.len() - 1;
@@ -89,16 +165,20 @@ impl AppState {
     }
 
     pub fn apply_ui_event(&mut self, event: UiEvent) {
+        if matches!(
+            event,
+            UiEvent::FirstToken { .. }
+                | UiEvent::ReasoningDelta { .. }
+                | UiEvent::TextDelta { .. }
+                | UiEvent::ToolCallDraft { .. }
+                | UiEvent::StepEnd { .. }
+        ) && let ActivityState::Agent { retry_status, .. } = &mut self.activity
+        {
+            *retry_status = None;
+        }
         match event {
             UiEvent::Status(status) => match status {
-                UiAgentStatus::Busy => {
-                    if !matches!(self.activity, ActivityState::Agent { .. }) {
-                        self.activity = ActivityState::Agent {
-                            streaming_assistant_open: false,
-                            compaction_status: None,
-                        };
-                    }
-                }
+                UiAgentStatus::Busy => self.set_busy_state(true),
                 UiAgentStatus::Idle => {
                     if matches!(self.activity, ActivityState::Agent { .. }) {
                         self.activity = ActivityState::Idle;
@@ -116,6 +196,7 @@ impl AppState {
                 self.activity = ActivityState::Agent {
                     streaming_assistant_open: false,
                     compaction_status: preserved_compaction,
+                    retry_status: None,
                 };
                 self.auto_scroll = true;
                 self.last_turn_end_reason = None;
@@ -125,6 +206,9 @@ impl AppState {
                 self.record_program_status(ProgramStatusState::Working, None, Some("Generating"));
             }
             UiEvent::TurnEnd { reason } => {
+                self.fail_unfinished_tool_drafts();
+                self.draft = Default::default();
+                self.last_step_start_ms = None;
                 self.activity = ActivityState::Idle;
                 self.reveal.snap_all();
                 emit_terminal_progress(false);
@@ -167,8 +251,54 @@ impl AppState {
                 self.refresh_context_breakdown();
             }
             UiEvent::StepStart { ts_ms } => {
+                self.fail_unfinished_tool_drafts();
+                self.draft = Default::default();
                 self.last_step_start_ms = Some(ts_ms);
                 self.tps.on_step_start();
+            }
+            UiEvent::StepRetrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reset_draft,
+                ts_ms,
+                ..
+            } => {
+                if reset_draft {
+                    self.fail_unfinished_tool_drafts();
+                }
+                let ActivityState::Agent {
+                    streaming_assistant_open,
+                    retry_status,
+                    ..
+                } = &mut self.activity
+                else {
+                    return;
+                };
+                let seconds = delay_ms.div_ceil(1_000);
+                *retry_status = Some(format!("重试 {attempt}/{max_attempts} ({seconds}s)…"));
+                if reset_draft {
+                    let draft = std::mem::take(&mut self.draft);
+                    if let Some(start) = draft.first_item {
+                        for idx in start..self.items.len() {
+                            self.item_cache.invalidate_item(idx);
+                            self.reveal.remove_item(idx);
+                        }
+                        self.items
+                            .extract_if(start.., |item| matches!(item, ChatItem::Assistant { .. }))
+                            .for_each(drop);
+                    }
+                    if let DraftTtft::Sampled { evicted_ms } = draft.ttft {
+                        self.ttft_history.pop();
+                        if let Some(oldest) = evicted_ms {
+                            self.ttft_history.insert(0, oldest);
+                        }
+                        self.last_ttft_ms = self.ttft_history.last().copied();
+                    }
+                    *streaming_assistant_open = false;
+                    self.tps.reset_open_step(ts_ms);
+                    self.refresh_context_breakdown();
+                }
             }
             UiEvent::StepEnd {
                 step,
@@ -176,17 +306,27 @@ impl AppState {
                 outcome,
                 usage,
             } => {
+                // 正常的工具步骤先结束生成，再分批派发；排队中的调用此时仍有效。
+                if outcome != UiStepOutcome::ToolCalls {
+                    self.fail_unfinished_tool_drafts();
+                    self.draft = Default::default();
+                }
+                self.last_step_start_ms = None;
+                self.close_streaming_assistant();
                 self.last_step_outcome = Some((step, outcome));
                 self.tps.on_step_end(ts_ms, usage);
             }
             UiEvent::FirstToken { ts_ms } => {
-                if let Some(start) = self.last_step_start_ms.take() {
+                if let Some(start) = self.last_step_start_ms
+                    && matches!(self.draft.ttft, DraftTtft::Pending)
+                {
                     let ttft = ts_ms.saturating_sub(start) as u64;
+                    let evicted_ms =
+                        (self.ttft_history.len() == 32).then(|| self.ttft_history.remove(0));
                     self.last_ttft_ms = Some(ttft);
                     self.ttft_history.push(ttft);
-                    if self.ttft_history.len() > 32 {
-                        self.ttft_history.remove(0);
-                    }
+                    self.draft.ttft = DraftTtft::Sampled { evicted_ms };
+                    self.refresh_context_breakdown();
                 }
                 self.tps.on_first_token(ts_ms);
             }
@@ -216,31 +356,37 @@ impl AppState {
                     .observe(RevealSlot::AssistantText(idx), len, busy);
                 self.tps.on_token_delta(&text, ts_ms);
             }
+            UiEvent::ToolCallDraft {
+                call_id,
+                name,
+                arguments_delta,
+                ..
+            } => {
+                self.apply_tool_arguments(call_id, name, arguments_delta, ToolState::Drafting);
+            }
+            UiEvent::ToolCallDraftId {
+                previous_id,
+                call_id,
+            } => {
+                self.reserve_tool_call_id(&call_id);
+                if let Some(pos) = self.tool_call_index(&previous_id)
+                    && let ChatItem::ToolCall {
+                        id,
+                        status: ToolState::Drafting,
+                        ..
+                    } = &mut self.items[pos]
+                {
+                    id.clone_from(&call_id);
+                    if let Some(extra) = self.tool_extras.remove(&previous_id) {
+                        self.tool_extras.insert(call_id, extra);
+                    }
+                    self.item_cache
+                        .invalidate_tool_neighborhood(&self.items, pos);
+                }
+            }
             UiEvent::ToolCall(call) => {
-                self.close_streaming_assistant();
-                self.reveal.snap_all();
-                let args_summary = summarize_tool_args(&call.arguments);
                 self.record_touched_file(&call.name, &call.arguments);
-                self.tool_extras.insert(
-                    call.id.clone(),
-                    ToolExtraMeta {
-                        full_content: String::new(),
-                        diff_raw: None,
-                        full_args: call.arguments,
-                        inline_meta: None,
-                        exclude_from_context: false,
-                    },
-                );
-                self.items.push(ChatItem::ToolCall {
-                    id: call.id,
-                    name: call.name,
-                    args_summary,
-                    status: ToolState::Running,
-                    output_preview: String::new(),
-                });
-                let idx = self.items.len() - 1;
-                self.item_cache
-                    .invalidate_tool_neighborhood(&self.items, idx);
+                self.apply_tool_arguments(call.id, call.name, call.arguments, ToolState::Running);
             }
             UiEvent::ToolUpdate {
                 call_id, preview, ..
@@ -248,10 +394,7 @@ impl AppState {
                 if let Some(ext) = self.tool_extras.get_mut(&call_id) {
                     ext.full_content = preview.clone();
                 }
-                if let Some(pos) = self.items.iter().rposition(|item| match item {
-                    ChatItem::ToolCall { id, .. } => id == &call_id,
-                    _ => false,
-                }) {
+                if let Some(pos) = self.tool_call_index(&call_id) {
                     if let ChatItem::ToolCall { output_preview, .. } = &mut self.items[pos] {
                         *output_preview = summarize_live_preview(&preview);
                     }
@@ -292,10 +435,7 @@ impl AppState {
                     extra.inline_meta = inline_meta;
                 }
                 let preview = summarize_tool_result(&name, &content, details.as_ref(), failed);
-                let idx = if let Some(pos) = self.items.iter().rposition(|item| match item {
-                    ChatItem::ToolCall { id, .. } => id == &call_id,
-                    _ => false,
-                }) {
+                let idx = if let Some(pos) = self.tool_call_index(&call_id) {
                     if let ChatItem::ToolCall {
                         status: st,
                         output_preview,

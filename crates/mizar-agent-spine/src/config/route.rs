@@ -18,6 +18,24 @@ pub struct CliLlmOverride {
     pub protocol: Option<String>,
     pub base_url: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub context_window: Option<u64>,
+}
+
+pub fn parse_context_window(source: &str, value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<std::num::NonZeroU64>()
+        .map(std::num::NonZeroU64::get)
+        .map_err(|_| format!("{source} 必须为正整数"))
+}
+
+#[cfg(feature = "compaction")]
+impl CliLlmOverride {
+    pub fn apply_context_window(&self, env: &EnvLlmOverride, spine: &mut crate::AgentSpineConfig) {
+        if let Some(cfg) = &mut spine.compaction {
+            cfg.context_window_override = self.context_window.or(env.context_window);
+        }
+    }
 }
 
 #[cfg(feature = "router")]
@@ -264,25 +282,31 @@ pub struct EnvLlmOverride {
     pub protocol: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub context_window: Option<u64>,
     pub openai_api_key: Option<String>,
     pub anthropic_api_key: Option<String>,
     pub deepseek_api_key: Option<String>,
     pub openrouter_api_key: Option<String>,
 }
 
-fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.trim().is_empty())
-}
-
 impl EnvLlmOverride {
-    pub fn from_env() -> Self {
-        Self::from_lookup(env_non_empty)
+    pub fn from_env(cli: &CliLlmOverride) -> Result<Self, String> {
+        Self::from_lookup(|key| match key {
+            "MIZAR_CONTEXT_WINDOW" if cli.context_window.is_some() => None,
+            "MIZAR_CONTEXT_WINDOW" => {
+                std::env::var_os(key).map(|v| v.to_string_lossy().into_owned())
+            }
+            _ => std::env::var(key).ok(),
+        })
     }
 
-    pub fn from_lookup<F>(mut lookup: F) -> Self
+    pub fn from_lookup<F>(mut lookup: F) -> Result<Self, String>
     where
         F: FnMut(&str) -> Option<String>,
     {
+        let context_window = lookup("MIZAR_CONTEXT_WINDOW")
+            .map(|v| parse_context_window("MIZAR_CONTEXT_WINDOW", &v))
+            .transpose()?;
         let mut clean = |k: &str| lookup(k).filter(|s| !s.trim().is_empty());
         let openai_api_key = clean("OPENAI_API_KEY");
         let anthropic_api_key = clean("ANTHROPIC_API_KEY");
@@ -297,39 +321,19 @@ impl EnvLlmOverride {
         } else {
             (None, None)
         };
-        Self {
+        Ok(Self {
             explicit_api_key: clean("API_KEY"),
             provider_api_key,
             provider_hint,
             protocol: clean("PROTOCOL"),
             base_url: clean("BASE_URL"),
             model: clean("MODEL"),
+            context_window,
             openai_api_key,
             anthropic_api_key,
             deepseek_api_key,
             openrouter_api_key,
-        }
-    }
-
-    /// 收集环境变量中可能出现的所有非空 API Key（供诊断/日志脱敏）。
-    pub fn collect_secrets(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for k in [
-            &self.explicit_api_key,
-            &self.provider_api_key,
-            &self.openai_api_key,
-            &self.anthropic_api_key,
-            &self.deepseek_api_key,
-            &self.openrouter_api_key,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !k.trim().is_empty() && !out.contains(k) {
-                out.push(k.clone());
-            }
-        }
-        out
+        })
     }
 }
 
@@ -396,11 +400,6 @@ impl ResolvedLlmRouter {
 
 #[cfg(feature = "router")]
 impl LoadedMizarConfig {
-    /// 结合环境变量覆盖与 `models.json` / `settings.json` 解析最终模型路由（TUI 兼容入口）。
-    pub fn resolve_llm_router(&self) -> Option<ResolvedLlmRouter> {
-        self.resolve_llm_router_with_env(EnvLlmOverride::from_env())
-    }
-
     /// 按严格优先序（`CLI > Env > LoadedConfig`）解析并校验 LLM 路由，用于无头 `exec` 模式。
     pub fn resolve_llm_router_with_cli(
         &self,

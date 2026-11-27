@@ -3,18 +3,24 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use futures::StreamExt;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::channel::mpsc;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
+use tokio::time::{Instant, Sleep, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use mizar_llm::{
-    BoxChunkStream, LlmError, LlmErrorCode, ModelInfo, SseEvent, SseParser, StreamChunk,
+    BoxChunkStream, FinishReason, HttpErrorHints, LlmError, LlmErrorCode, ModelInfo, SseEvent,
+    SseParser, StreamChunk,
 };
 
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const BODY_TIMEOUT: Duration = Duration::from_secs(15);
+const ERROR_BODY_LIMIT: usize = 64 * 1024;
+const MODELS_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const TERMINAL_GRACE: Duration = Duration::from_secs(3);
 
 fn format_reqwest_error(err: &reqwest::Error) -> String {
     let mut msg = err.to_string();
@@ -89,12 +95,27 @@ pub fn configure_custom_ca_roots(mut builder: reqwest::ClientBuilder) -> reqwest
 
 /// 构造带自定义根证书与连接调优的 HTTP 客户端。
 pub fn build_http_client() -> reqwest::Client {
-    let builder = configure_custom_ca_roots(
+    let builder = || {
         reqwest::Client::builder()
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-            .tcp_nodelay(true),
-    );
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt
+                    .previous()
+                    .first()
+                    .is_some_and(|url| url.origin() == attempt.url().origin())
+                {
+                    reqwest::redirect::Policy::limited(3).redirect(attempt)
+                } else {
+                    attempt.error("cross-origin HTTP redirect refused")
+                }
+            }))
+    };
+    // 自定义证书不可用时，回退客户端仍须限制重定向，以免凭据跨源。
+    configure_custom_ca_roots(builder())
+        .build()
+        .unwrap_or_else(|_| builder().build().expect("failed to initialize HTTP client"))
 }
 
 /// 获取进程级复用的共享 `reqwest::Client`（跨适配器、跨热重载复用连接池与 HTTP/2 连接）。
@@ -117,9 +138,14 @@ pub trait SseStreamDecoder: Send + 'static {
         emit: &mut dyn FnMut(StreamChunk) -> bool,
     ) -> Result<bool, LlmError>;
 
+    /// 代理可能在协议已给出结束原因后吞掉最后的结束标记。
+    fn has_terminal_finish(&self) -> bool {
+        false
+    }
+
     /// 底层响应流在 `on_event` 尚未返回 `Ok(true)` 时到达 EOF 的检查（默认拒绝静默截断）。
     fn on_eof_without_done(&self) -> Result<(), LlmError> {
-        Err(LlmError::malformed(
+        Err(LlmError::transport(
             "SSE stream ended unexpectedly before completion marker",
         ))
     }
@@ -152,184 +178,405 @@ fn build_header_map(headers: &[(String, String)]) -> Result<HeaderMap, LlmError>
     Ok(map)
 }
 
-fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
-    if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok())
-        && let Ok(secs) = val.trim().parse::<f64>()
-        && secs.is_finite()
-        && secs > 0.0
-    {
-        return Some((secs * 1000.0).round() as u64);
+fn nonnegative_number(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+}
+
+fn remaining_ms(timestamp_ms: i64) -> u64 {
+    timestamp_ms
+        .saturating_sub(Utc::now().timestamp_millis())
+        .max(0) as u64
+}
+
+fn http_date_delay_ms(value: &str) -> Option<u64> {
+    if let Ok(date) = DateTime::parse_from_rfc2822(value) {
+        return Some(remaining_ms(date.timestamp_millis()));
     }
-    if let Some(val) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok())
-        && let Ok(ms) = val.trim().parse::<f64>()
-        && ms.is_finite()
-        && ms > 0.0
-    {
-        return Some(ms.round() as u64);
+    ["%A, %d-%b-%y %T GMT", "%a %b %e %T %Y"]
+        .iter()
+        .find_map(|format| {
+            let date = NaiveDateTime::parse_from_str(value, format).ok()?;
+            Some(remaining_ms(date.and_utc().timestamp_millis()))
+        })
+}
+
+fn reset_delay_ms(value: &str, unit_ms: f64) -> Option<u64> {
+    if let Some(n) = nonnegative_number(value) {
+        // 网关混用相对时长和 Unix 时间戳，后者通常是十位秒或十三位毫秒。
+        if n >= 1_000_000_000_000.0 {
+            return Some(remaining_ms(n.ceil() as i64));
+        }
+        if n >= 1_000_000_000.0 {
+            return Some(remaining_ms((n * 1000.0).ceil() as i64));
+        }
+        return Some((n * unit_ms).ceil() as u64);
     }
-    None
+    if let Ok(date) = DateTime::parse_from_rfc3339(value) {
+        return Some(remaining_ms(date.timestamp_millis()));
+    }
+    let mut rest = value.strip_prefix('+').unwrap_or(value);
+    let mut millis = 0.0;
+    loop {
+        let unit_start = rest.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let (number, suffix) = rest.split_at(unit_start);
+        let n = nonnegative_number(number)?;
+        let (unit, factor) = [
+            ("ns", 0.000_001),
+            ("us", 0.001),
+            ("µs", 0.001),
+            ("μs", 0.001),
+            ("ms", 1.0),
+            ("s", 1000.0),
+            ("m", 60_000.0),
+            ("h", 3_600_000.0),
+        ]
+        .into_iter()
+        .find(|(unit, _)| suffix.starts_with(unit))?;
+        millis += n * factor;
+        rest = &suffix[unit.len()..];
+        if rest.is_empty() {
+            return Some(millis.ceil() as u64);
+        }
+    }
+}
+
+fn http_error_hints(headers: &HeaderMap) -> HttpErrorHints {
+    let header = |name: &str| {
+        std::str::from_utf8(headers.get(name)?.as_bytes())
+            .ok()
+            .map(str::trim)
+    };
+    let retry_after_ms = header("retry-after-ms")
+        .and_then(nonnegative_number)
+        .map(|ms| ms.ceil() as u64)
+        .or_else(|| {
+            let value = header("retry-after")?;
+            nonnegative_number(value)
+                .map(|s| (s * 1000.0).ceil() as u64)
+                .or_else(|| http_date_delay_ms(value))
+        })
+        .or_else(|| reset_delay_ms(header("x-ratelimit-reset-ms")?, 1.0))
+        .or_else(|| reset_delay_ms(header("x-ratelimit-reset")?, 1000.0));
+    let should_retry = headers
+        .get_all("x-should-retry")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|value| match value.trim() {
+            v if v == "0" || v.eq_ignore_ascii_case("false") => Some(false),
+            v if v == "1" || v.eq_ignore_ascii_case("true") => Some(true),
+            _ => None,
+        })
+        .min();
+    let mut limits = headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with("x-ratelimit-limit-"))
+        .peekable();
+    let ratelimit_limit_zero = limits.peek().is_some()
+        && limits.all(|(_, value)| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.split(',').all(|n| n.trim().parse::<u64>() == Ok(0)))
+        });
+    HttpErrorHints {
+        retry_after_ms,
+        should_retry,
+        ratelimit_limit_zero,
+    }
+}
+
+fn request_error(context: &str, error: reqwest::Error) -> LlmError {
+    let code = if error.is_timeout() {
+        LlmErrorCode::Timeout
+    } else if error.is_redirect() {
+        LlmErrorCode::InvalidRequest
+    } else {
+        LlmErrorCode::Transport
+    };
+    LlmError::new(code, format!("{context}: {}", format_reqwest_error(&error)))
+}
+
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    timeout: Sleep,
+    cancel: &CancellationToken,
+) -> Result<reqwest::Response, LlmError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(LlmError::cancelled()),
+        _ = timeout => Err(LlmError::timeout("timed out waiting for HTTP response headers")),
+        response = request.send() => response.map_err(|e| request_error("HTTP request failed", e)),
+    }
+}
+
+async fn read_bounded_body(
+    response: &mut reqwest::Response,
+    limit: usize,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, LlmError> {
+    let error_body = !response.status().is_success();
+    let too_large = || LlmError::malformed(format!("HTTP response body exceeds {limit} bytes"));
+    if !error_body
+        && response
+            .content_length()
+            .is_some_and(|len| len > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    let timeout = sleep_until(deadline);
+    tokio::pin!(timeout);
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(LlmError::cancelled()),
+            _ = &mut timeout => Err(LlmError::timeout("HTTP response body timed out")),
+            next = response.chunk() => next.map_err(|e| request_error("HTTP response body failed", e)),
+        };
+        let bytes = match next {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
+            // 错误体残缺时仍以已收到的状态码和响应头为准，避免把鉴权失败当作断流重试。
+            Err(_) if error_body => break,
+            Err(err) => return Err(err),
+        };
+        let remaining = limit - body.len();
+        if !error_body && bytes.len() > remaining {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+        if error_body && body.len() == limit {
+            break;
+        }
+    }
+    Ok(body)
+}
+
+async fn check_response(
+    mut response: reqwest::Response,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<reqwest::Response, LlmError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = read_bounded_body(&mut response, ERROR_BODY_LIMIT, deadline, cancel).await?;
+    Err(LlmError::classify_http_with_hints(
+        status.as_u16(),
+        http_error_hints(response.headers()),
+        &String::from_utf8_lossy(&body),
+    ))
+}
+
+fn markup_response() -> LlmError {
+    LlmError::malformed(
+        "received a markup document from the SSE endpoint (check the provider base URL)",
+    )
+}
+
+#[derive(Default)]
+struct SseBody {
+    parser: SseParser,
+    field: Vec<u8>,
+    saw_text: bool,
+    started: bool,
+}
+
+impl SseBody {
+    fn known_field(&self) -> bool {
+        matches!(self.field.as_slice(), b"data" | b"event" | b"id" | b"retry")
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<SseEvent>, LlmError> {
+        const BOM: &[u8] = b"\xef\xbb\xbf";
+        // 合法 SSE 可能以未知字段开头，只有在 EOF 仍无协议字段时才能判为普通文本。
+        while !self.started
+            && let Some((&byte, rest)) = bytes.split_first()
+        {
+            if !self.saw_text
+                && BOM.starts_with(&self.field)
+                && BOM.get(self.field.len()) == Some(&byte)
+            {
+                self.field.push(byte);
+                if self.field == BOM {
+                    self.field.clear();
+                }
+                bytes = rest;
+                continue;
+            }
+            if !self.saw_text && !byte.is_ascii_whitespace() {
+                if byte == b'<' {
+                    return Err(markup_response());
+                }
+                self.saw_text = true;
+            }
+            if (byte == b':' && self.field.is_empty())
+                || (matches!(byte, b':' | b'\r' | b'\n') && self.known_field())
+            {
+                self.started = true;
+                self.parser.push(&self.field, || {});
+                break;
+            }
+            if byte == b'\n' {
+                self.field.clear();
+            } else if self.field.len() <= b"event".len() {
+                // 多留一字节可将 event 与更长的未知字段区分开。
+                self.field.push(byte);
+            }
+            bytes = rest;
+        }
+        Ok(self.parser.push(bytes, || {}))
+    }
+
+    fn finish(&mut self, declared_sse: bool) -> Result<Vec<SseEvent>, LlmError> {
+        if !self.started {
+            if self.known_field() {
+                self.parser.push(&self.field, || {});
+            } else if self.saw_text && !declared_sse {
+                return Err(LlmError::malformed(
+                    "SSE endpoint returned text without SSE fields (check the provider base URL)",
+                ));
+            }
+        }
+        Ok(self.parser.finish(|| {}))
+    }
 }
 
 /// 共用 SSE 流式请求驱动：处理取消、HTTP 错误归类、空闲超时与帧解码。
-pub fn spawn_sse_stream<D: SseStreamDecoder>(
-    req_spec: SseRequest,
-    mut decoder: D,
-) -> BoxChunkStream {
+pub fn spawn_sse_stream<D: SseStreamDecoder>(req_spec: SseRequest, decoder: D) -> BoxChunkStream {
     let (tx, rx) = mpsc::unbounded();
-
     tokio::spawn(async move {
-        let header_map = match build_header_map(&req_spec.headers) {
-            Ok(h) => h,
-            Err(err) => {
-                let _ = tx.unbounded_send(Err(err));
-                return;
-            }
-        };
-
-        let req = req_spec
-            .client
-            .post(&req_spec.url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .headers(header_map)
-            .json(&req_spec.body);
-
-        let resp = tokio::select! {
-            res = req.send() => match res {
-                Ok(r) => r,
-                Err(e) => {
-                    let code = if e.is_timeout() {
-                        LlmErrorCode::Timeout
-                    } else {
-                        LlmErrorCode::Transport
-                    };
-                    let _ = tx.unbounded_send(Err(LlmError::new(
-                        code,
-                        format!("http error: {}", format_reqwest_error(&e)),
-                    )));
-                    return;
-                }
-            },
-            _ = req_spec.cancel.cancelled() => {
-                let _ = tx.unbounded_send(Err(LlmError::cancelled()));
-                return;
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let retry_after = parse_retry_after_ms(resp.headers());
-            let body = resp.text().await.unwrap_or_default();
-            let _ = tx.unbounded_send(Err(LlmError::classify_http(status, retry_after, &body)));
-            return;
-        }
-
-        let mut byte_stream = resp.bytes_stream();
-        let mut parser = SseParser::new();
-        let mut done = false;
-        let idle = req_spec.idle_timeout;
-
-        while !done {
-            let next_chunk = tokio::select! {
-                item = tokio::time::timeout(idle, byte_stream.next()) => match item {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        let _ = tx.unbounded_send(Err(LlmError::timeout(format!(
-                            "stream idle timeout after {}s",
-                            idle.as_secs()
-                        ))));
-                        return;
-                    }
-                },
-                _ = req_spec.cancel.cancelled() => {
-                    let _ = tx.unbounded_send(Err(LlmError::cancelled()));
-                    return;
-                }
-            };
-
-            let Some(chunk_res) = next_chunk else {
-                break;
-            };
-            let bytes = match chunk_res {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ =
-                        tx.unbounded_send(Err(LlmError::transport(format!("stream error: {e}"))));
-                    return;
-                }
-            };
-
-            let events = parser.push(&bytes, || {});
-            for ev in events {
-                let mut receiver_closed = false;
-                let mut emit = |chunk: StreamChunk| -> bool {
-                    if tx.unbounded_send(Ok(chunk)).is_err() {
-                        receiver_closed = true;
-                        false
-                    } else {
-                        true
-                    }
-                };
-                match decoder.on_event(ev, &mut emit) {
-                    Ok(is_done) => {
-                        if receiver_closed || is_done {
-                            done = true;
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = tx.unbounded_send(Err(err));
-                        return;
-                    }
-                }
-                if receiver_closed {
-                    return;
-                }
-            }
-        }
-
-        if !done {
-            let tail = parser.finish(|| {});
-            for ev in tail {
-                let mut receiver_closed = false;
-                let mut emit = |chunk: StreamChunk| -> bool {
-                    if tx.unbounded_send(Ok(chunk)).is_err() {
-                        receiver_closed = true;
-                        false
-                    } else {
-                        true
-                    }
-                };
-                match decoder.on_event(ev, &mut emit) {
-                    Ok(is_done) => {
-                        if receiver_closed {
-                            return;
-                        }
-                        if is_done {
-                            done = true;
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = tx.unbounded_send(Err(err));
-                        return;
-                    }
-                }
-            }
-        }
-
-        if !done && let Err(err) = decoder.on_eof_without_done() {
-            let _ = tx.unbounded_send(Err(err));
-            return;
-        }
-
-        let mut emit = |chunk: StreamChunk| tx.unbounded_send(Ok(chunk)).is_ok();
-        if let Err(err) = decoder.on_finish(&mut emit) {
+        if let Err(err) = drive_sse_stream(req_spec, decoder, &tx).await {
             let _ = tx.unbounded_send(Err(err));
         }
     });
-
     Box::pin(rx)
+}
+
+async fn drive_sse_stream(
+    req_spec: SseRequest,
+    decoder: impl SseStreamDecoder,
+    tx: &mpsc::UnboundedSender<Result<StreamChunk, LlmError>>,
+) -> Result<(), LlmError> {
+    let req = req_spec
+        .client
+        .post(&req_spec.url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream")
+        .headers(build_header_map(&req_spec.headers)?)
+        .json(&req_spec.body);
+    let idle = std::env::var("MIZAR_LLM_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|s| Duration::from_secs(s.clamp(10, 1800) as u64))
+        .unwrap_or(req_spec.idle_timeout);
+    let cancel = &req_spec.cancel;
+    let response = send_request(req, sleep(idle), cancel).await?;
+    let response = check_response(response, Instant::now() + BODY_TIMEOUT, cancel).await?;
+    let hints = http_error_hints(response.headers());
+    let mut emit = |mut chunk| {
+        if let StreamChunk::Finish {
+            reason: reason @ FinishReason::Error { .. },
+            ..
+        } = &mut chunk
+            && let Some(err) = reason.clone().into_error()
+        {
+            *reason = err.with_http_hints(hints).into();
+        }
+        tx.unbounded_send(Ok(chunk)).is_ok()
+    };
+    // 空响应可能在上层才被判为错误，也需要这次响应的重试限制。
+    if hints != HttpErrorHints::default() && !emit(StreamChunk::ResponseHints(hints)) {
+        return Ok(());
+    }
+    decode_sse(response, decoder, idle, cancel, &mut emit)
+        .await
+        .map_err(|err| err.with_http_hints(hints))
+}
+
+async fn decode_sse(
+    mut response: reqwest::Response,
+    mut decoder: impl SseStreamDecoder,
+    idle: Duration,
+    cancel: &CancellationToken,
+    emit: &mut (impl FnMut(StreamChunk) -> bool + Send),
+) -> Result<(), LlmError> {
+    if cancel.is_cancelled() {
+        return Err(LlmError::cancelled());
+    }
+    let mime = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if mime.eq_ignore_ascii_case("text/html") || mime.eq_ignore_ascii_case("application/xhtml+xml")
+    {
+        return Err(markup_response());
+    }
+    let declared_sse = mime.eq_ignore_ascii_case("text/event-stream");
+    let mut body = SseBody::default();
+    let mut terminal = decoder.has_terminal_finish();
+    let watchdog = sleep(if terminal {
+        idle.min(TERMINAL_GRACE)
+    } else {
+        idle
+    });
+    tokio::pin!(watchdog);
+    let done = 'stream: loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(LlmError::cancelled()),
+            _ = &mut watchdog => {
+                if terminal {
+                    break false;
+                }
+                return Err(LlmError::timeout(format!("stream idle timeout after {}s", idle.as_secs())));
+            }
+            next = response.chunk() => next.map_err(|e| request_error("stream error", e))?,
+        };
+        let events = match &next {
+            Some(bytes) => body.push(bytes)?,
+            None => body.finish(declared_sse)?,
+        };
+        for event in events {
+            let mut receiver_closed = false;
+            let done = decoder.on_event(event, &mut |chunk| {
+                if !emit(chunk) {
+                    receiver_closed = true;
+                    return false;
+                }
+                if !terminal && let Some(deadline) = Instant::now().checked_add(idle) {
+                    watchdog.as_mut().reset(deadline);
+                }
+                true
+            })?;
+            if receiver_closed {
+                return Ok(());
+            }
+            if done {
+                break 'stream true;
+            }
+            if !terminal && decoder.has_terminal_finish() {
+                terminal = true;
+                let deadline = watchdog.deadline().min(Instant::now() + TERMINAL_GRACE);
+                watchdog.as_mut().reset(deadline);
+            }
+        }
+        if next.is_none() {
+            break false;
+        }
+    };
+    if !done {
+        decoder.on_eof_without_done()?;
+    }
+    decoder.on_finish(emit)
 }
 
 /// 解析 Pi 风格凭据/请求头字符串：
@@ -479,31 +726,14 @@ pub async fn discover_models_http(
     url: &str,
     headers: &[(String, String)],
 ) -> Result<Vec<ModelInfo>, LlmError> {
-    let header_map = build_header_map(headers)?;
-    let resp = client
-        .get(url)
-        .headers(header_map)
-        .send()
-        .await
-        .map_err(|e| {
-            LlmError::transport(format!(
-                "model discovery failed: {}",
-                format_reqwest_error(&e)
-            ))
-        })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let retry_after = parse_retry_after_ms(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
-        return Err(LlmError::classify_http(status, retry_after, &body));
-    }
-
-    let payload: Value = resp
-        .json()
-        .await
+    let request = client.get(url).headers(build_header_map(headers)?);
+    let deadline = Instant::now() + BODY_TIMEOUT;
+    let cancel = CancellationToken::new();
+    let response = send_request(request, sleep_until(deadline), &cancel).await?;
+    let mut response = check_response(response, deadline, &cancel).await?;
+    let body = read_bounded_body(&mut response, MODELS_BODY_LIMIT, deadline, &cancel).await?;
+    let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| LlmError::malformed(format!("invalid /models json: {e}")))?;
-
     Ok(parse_models_payload(&payload))
 }
 

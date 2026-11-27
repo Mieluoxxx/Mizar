@@ -3,6 +3,7 @@
 //! 子命令：
 //! - `mizar exec [<prompt>]`：非交互单次无头执行（无 explicit prompt 且 stdin 非 TTY 时读取 stdin 至 EOF）
 //! - `mizar update [--version <ver>] [--force] [--check]`：从 GitHub Releases 检查并更新 `mizar` 二进制
+//! - `mizar install-tools [--force] [rg|fd ...]` 可为离线环境预先备齐搜索工具。
 //!
 //! CLI 参数：
 //! - `--workspace <dir>` / `-C <dir>`：工作目录
@@ -15,10 +16,8 @@
 //! - `--reasoning-effort <level>`：推理强度（`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`）
 //! - `--max-steps <n>`：限制单轮最大工具循环步数
 //! - `--timeout <secs>`：限制无头单次任务总超时秒数
-//! - `--output-format <fmt>` / `--json`：无头输出格式（`text` / `json`）
 //! - `--trace-out <path>`：无头模式退出前导出结构化轨迹 JSON（可用环境变量 `MIZAR_TRACE_OUT` 指定，CLI 优先）
-//! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局 SQLite
-//! - `--minimal`：仅启用极简 4 工具（`read` / `bash` / `edit` / `write`）
+//! - `--isolated`：隔离模式，跳过个人 `~/.mizar` / `~/.agents` 配置、MCP、Skills、全局指令与全局会话存储
 //! - `--read-only`：仅启用只读 3 工具（`read` / `grep` / `find`）
 //! - `--tools <a,b,...>` / `-t`：工具白名单
 //! - `--exclude-tools <a,b,...>` / `-xt`：工具黑名单（支持 `*` 通配）
@@ -26,7 +25,7 @@
 //! - `--approve`：开启高危工具交互式审批闸门（TUI 专用；无头模式不兼容并直接报错）
 //! - `--continue` / `-c`：恢复当前工作区最近一次持久化的历史会话（TUI）
 //! - `--resume [id]` / `-r [id]`：按会话 ID 恢复历史会话；省略 ID 时弹出交互式会话选择器（TUI）
-//! - `--no-persist`：禁用 SQLite 会话落盘（仅当前进程内存模式）
+//! - `--no-persist`：禁用 JSONL 会话落盘（仅当前进程内存模式）
 //! - `--no-instructions`：禁用自动发现与注入 `AGENTS.md` / `CLAUDE.md`
 //! - `--theme <preset>`：指定预设主题（`auto` / `mist-dark` / `mist-light` / `sakura-dark` / `system` / `ansi16`）
 //! - `--help` / `-h`：打印命令行帮助信息并退出
@@ -50,17 +49,19 @@ use std::path::PathBuf;
 
 use cordis::{Context, Service};
 use mizar_agent_spine::{
-    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, load_mizar_config,
-    resolve_default_session_db_path,
+    AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
+    load_mizar_config, parse_context_window, resolve_default_sessions_dir,
 };
 use mizar_llm::ReasoningEffort;
 use mizar_llm_mock::MockPlugin;
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_tools_coding::CodingToolsPreset;
 use mizar_tui::exec::{
-    ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
+    ExecConfig, ExecOutputFormat, report_exec_input_error, resolve_exec_prompt,
+    resolve_trace_out_path, run_exec_cli,
 };
+use mizar_tui::runner::interactive_bin_resolver;
+use mizar_tui::tools_manager::run_install_tools_cli;
 use mizar_tui::update::{current_version, is_version_check_disabled, run_update_cli};
 use mizar_tui::{
     ApprovalMode, NoticeLevel, ResumeTarget, ScreenMode, ThemePreset, TuiConfig,
@@ -97,6 +98,7 @@ struct CliArgs {
     reasoning_effort: Option<ReasoningEffort>,
     max_steps: Option<usize>,
     max_tokens: Option<u32>,
+    context_window: Option<u64>,
     timeout_secs: Option<u64>,
     output_format: Option<ExecOutputFormat>,
     trace_out: Option<PathBuf>,
@@ -132,10 +134,12 @@ Usage:
   mizar [OPTIONS]
   mizar exec [OPTIONS] [<prompt>]
   mizar update [OPTIONS]
+  mizar install-tools [--force] [rg|fd ...]
 
 Commands:
   exec                          Run a single non-interactive task and exit
   update                        Check and install the latest release binary
+  install-tools                 Install or locate ripgrep and fd for Mizar
 
 Options:
   -C, --workspace <dir>         Workspace directory (defaults to current directory)
@@ -149,12 +153,13 @@ Options:
       --reasoning-effort <lvl>  Reasoning effort (off, minimal, low, medium, high, xhigh, max)
       --max-steps <n>           Maximum agent loop steps (>= 1)
       --max-tokens <n>          Maximum output tokens per model call (>= 1)
+      --context-window <tokens> Override the model context window in TUI and exec (>= 1, env: MIZAR_CONTEXT_WINDOW)
       --timeout <secs>          Total execution timeout in seconds (>= 1)
-      --output-format <fmt>     Headless output format (text, json)
-      --json                    Shorthand for --output-format json
+      --output-format <fmt>     text (default), json or ndjson (one flushed event per line, result last)
+      --json                    Shorthand for --output-format ndjson
       --trace-out <path>        Export structured trajectory JSON on exit (env: MIZAR_TRACE_OUT)
-      --isolated                Skip personal global config, MCP, skills, instructions, and DB
-      --minimal                 Enable minimal coding preset (read, bash, edit, write)
+      --isolated                Skip personal global config, MCP, skills, instructions, and sessions
+      --minimal                 Use the default coding preset (read, bash, edit, write)
       --read-only               Enable read-only preset (read, grep, find)
   -t, --tools <a,b,...>         Tool allowlist (comma-separated, supports *)
  -xt, --exclude-tools <a,b,...> Tool denylist (comma-separated, supports *)
@@ -162,7 +167,7 @@ Options:
       --approve                 Prompt for approval on high-risk tools (TUI only)
   -c, --continue                Resume the latest persisted session in workspace
   -r, --resume [id]             Open picker in TUI, or resume persisted session by ID in exec
-      --no-persist              Disable SQLite session persistence
+      --no-persist              Disable JSONL session persistence
       --no-instructions         Disable AGENTS.md / CLAUDE.md discovery
       --theme <preset>          Theme preset (auto, mist-dark, mist-light, sakura-dark, system, ansi16)
   -h, --help                    Print help
@@ -211,21 +216,33 @@ fn parse_cli_reasoning_effort(raw: &str) -> Result<ReasoningEffort, String> {
     }
 }
 
-fn parse_cli_args_from<I>(args: I) -> Result<CliArgs, String>
+fn parse_cli_args_into<I>(args: I, out: &mut CliArgs) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut out = CliArgs::default();
     let mut args = args.into_iter().peekable();
     let mut after_double_dash = false;
+    let mut first_error = None;
 
+    // 输出格式可能排在无效参数之后，仍须按调用方选择的格式报告首个错误。
+    while let Err(err) = parse_cli_args(&mut args, out, &mut after_double_dash) {
+        first_error.get_or_insert(err);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn parse_cli_args<I: Iterator<Item = String>>(
+    args: &mut std::iter::Peekable<I>,
+    out: &mut CliArgs,
+    after_double_dash: &mut bool,
+) -> Result<(), String> {
     while let Some(raw_arg) = args.next() {
-        if !after_double_dash && raw_arg == "--" {
-            after_double_dash = true;
+        if !*after_double_dash && raw_arg == "--" {
+            *after_double_dash = true;
             continue;
         }
-        if after_double_dash || !raw_arg.starts_with('-') || raw_arg == "-" {
-            if !after_double_dash
+        if *after_double_dash || !raw_arg.starts_with('-') || raw_arg == "-" {
+            if !*after_double_dash
                 && !out.explicit_exec
                 && out.positional_prompt.is_none()
                 && raw_arg == "exec"
@@ -233,7 +250,7 @@ where
                 out.explicit_exec = true;
                 continue;
             }
-            if out.explicit_exec || after_double_dash {
+            if out.explicit_exec || *after_double_dash {
                 if out.positional_prompt.is_some() {
                     return Err(format!("存在多余的位置参数：{raw_arg}"));
                 }
@@ -253,7 +270,7 @@ where
         let (flag, inline) = split_flag_value(&raw_arg);
         match flag {
             "--workspace" | "-C" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 out.workspace = Some(PathBuf::from(val));
             }
             "--minimal" => {
@@ -269,7 +286,7 @@ where
                 out.preset = Some(CodingToolsPreset::ReadOnly);
             }
             "--tools" | "-t" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 let list: Vec<String> = val
                     .split(',')
                     .map(str::trim)
@@ -279,7 +296,7 @@ where
                 out.include_tools = Some(list);
             }
             "--exclude-tools" | "-xt" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 out.exclude_tools.extend(
                     val.split(',')
                         .map(str::trim)
@@ -338,7 +355,7 @@ where
                 }
             }
             "--theme" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 out.theme = ThemePreset::parse(&val);
             }
             "--isolated" => {
@@ -351,53 +368,53 @@ where
                 if out.prompt.is_some() {
                     return Err("重复指定了 -p / --prompt 参数".to_string());
                 }
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 out.prompt = Some(val);
             }
             "--prompt-file" => {
                 if out.prompt_file.is_some() {
                     return Err("重复指定了 --prompt-file 参数".to_string());
                 }
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 if val.trim().is_empty() {
                     return Err("--prompt-file 路径不能为空".to_string());
                 }
                 out.prompt_file = Some(PathBuf::from(val));
             }
             "--provider" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 if val.trim().is_empty() {
                     return Err("--provider 不能为空".to_string());
                 }
                 out.provider = Some(val);
             }
             "--model" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 if val.trim().is_empty() {
                     return Err("--model 不能为空".to_string());
                 }
                 out.model = Some(val);
             }
             "--protocol" | "--api-format" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 if val.trim().is_empty() {
                     return Err(format!("{flag} 不能为空"));
                 }
                 out.protocol = Some(val);
             }
             "--base-url" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 if val.trim().is_empty() {
                     return Err("--base-url 不能为空".to_string());
                 }
                 out.base_url = Some(val);
             }
             "--reasoning-effort" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 out.reasoning_effort = Some(parse_cli_reasoning_effort(&val)?);
             }
             "--max-steps" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 let parsed = val
                     .trim()
                     .parse::<usize>()
@@ -408,7 +425,7 @@ where
                 out.max_steps = Some(parsed);
             }
             "--max-tokens" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 let parsed = val
                     .trim()
                     .parse::<u32>()
@@ -418,14 +435,21 @@ where
                 }
                 out.max_tokens = Some(parsed);
             }
+            "--context-window" => {
+                if inline.is_none() && args.peek().is_some_and(|next| next.starts_with('-')) {
+                    return Err(format!("{flag} 需要正整数参数"));
+                }
+                let val = take_value(flag, inline, args)?;
+                out.context_window = Some(parse_context_window(flag, &val)?);
+            }
             "--output-format" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 out.output_format = Some(match val.trim().to_ascii_lowercase().as_str() {
                     "text" => ExecOutputFormat::Text,
-                    "json" => ExecOutputFormat::Json,
+                    "json" | "ndjson" => ExecOutputFormat::Json,
                     other => {
                         return Err(format!(
-                            "无效的 --output-format \"{other}\"（可选：text, json）"
+                            "无效的 --output-format \"{other}\"（可选：text, json, ndjson）"
                         ));
                     }
                 });
@@ -437,14 +461,14 @@ where
                 out.output_format = Some(ExecOutputFormat::Json);
             }
             "--trace-out" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 if val.trim().is_empty() {
                     return Err("--trace-out 路径不能为空".to_string());
                 }
                 out.trace_out = Some(PathBuf::from(val));
             }
             "--timeout" => {
-                let val = take_value(flag, inline, &mut args)?;
+                let val = take_value(flag, inline, args)?;
                 let parsed = val
                     .trim()
                     .parse::<u64>()
@@ -473,7 +497,7 @@ where
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn default_tokio_worker_threads(parallelism: usize) -> usize {
@@ -493,23 +517,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some((cmd, rest)) = raw_args.split_first()
-        && cmd == "update"
-    {
-        if let Err(err) = run_update_cli(rest).await {
-            eprintln!("error: {err}");
-            std::process::exit(1);
+    if let Some((cmd, rest)) = raw_args.split_first() {
+        let result = match cmd.as_str() {
+            "update" => Some(run_update_cli(rest).await),
+            "install-tools" => Some(run_install_tools_cli(rest).await),
+            _ => None,
+        };
+        if let Some(result) = result {
+            if let Err(err) = result {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
-    let cli = match parse_cli_args_from(raw_args) {
-        Ok(cli) => cli,
-        Err(err) => {
+    let mut cli = CliArgs::default();
+    if let Err(err) = parse_cli_args_into(raw_args, &mut cli) {
+        if cli.is_exec_mode() {
+            report_exec_input_error(cli.output_format.unwrap_or_default(), &err);
+        } else {
             eprintln!("error: {err}");
-            std::process::exit(1);
         }
-    };
+        std::process::exit(1);
+    }
     if cli.help {
         println!("{}", format_help_text());
         return Ok(());
@@ -527,15 +558,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::env::current_dir().expect("failed to resolve cwd"));
 
     if cli.is_exec_mode() {
+        let format = cli.output_format.unwrap_or_default();
         if cli.approve {
-            eprintln!(
-                "error: --approve is incompatible with non-interactive exec mode (code=invalid_request)"
+            report_exec_input_error(
+                format,
+                "--approve is incompatible with non-interactive exec mode (code=invalid_request)",
             );
             std::process::exit(1);
         }
         if cli.inline {
-            eprintln!(
-                "error: --inline is incompatible with non-interactive exec mode (code=invalid_request)"
+            report_exec_input_error(
+                format,
+                "--inline is incompatible with non-interactive exec mode (code=invalid_request)",
             );
             std::process::exit(1);
         }
@@ -547,7 +581,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("error: {err}");
+                report_exec_input_error(format, &err);
                 std::process::exit(1);
             }
         };
@@ -561,6 +595,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort: cli.reasoning_effort,
             max_steps: cli.max_steps,
             max_tokens: cli.max_tokens,
+            context_window: cli.context_window,
             timeout_secs: cli.timeout_secs,
             isolated: cli.isolated,
             no_persist: cli.no_persist,
@@ -570,7 +605,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             include_tools: cli.include_tools,
             exclude_tools: cli.exclude_tools,
             resume_session: cli.resume_session,
-            output_format: cli.output_format.unwrap_or_default(),
+            output_format: format,
             trace_out: resolve_trace_out_path(cli.trace_out, env_non_empty("MIZAR_TRACE_OUT")),
         })
         .await;
@@ -592,13 +627,26 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     app.logger().set_silent();
 
     let loaded_cfg = load_mizar_config(&workspace);
-    let mut spine_cfg = AgentSpineConfig::coding(workspace.clone());
+    let mut spine_cfg =
+        AgentSpineConfig::coding(workspace.clone()).with_ensure_bin(interactive_bin_resolver(&app));
     if !cli.no_persist {
-        spine_cfg.session_db_path = resolve_default_session_db_path();
+        spine_cfg.sessions_dir = resolve_default_sessions_dir();
     }
     loaded_cfg.apply_to_spine(&mut spine_cfg);
+    let cli_override = CliLlmOverride {
+        context_window: cli.context_window,
+        ..Default::default()
+    };
+    let env = match EnvLlmOverride::from_env(&cli_override) {
+        Ok(env) => env,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    };
+    cli_override.apply_context_window(&env, &mut spine_cfg);
     if cli.no_persist {
-        spine_cfg.session_db_path = None;
+        spine_cfg.sessions_dir = None;
     }
     if cli.no_instructions
         && let AgentToolsMode::Coding {
@@ -621,7 +669,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let resolved_llm = loaded_cfg.resolve_llm_router();
+    let resolved_llm = loaded_cfg.resolve_llm_router_with_env(env);
     if let Some(ref resolved) = resolved_llm {
         spine_cfg.agent.provider = Some(resolved.active_provider.clone());
         spine_cfg.agent.model = resolved.active_model.clone();
@@ -629,7 +677,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tui_cfg = TuiConfig::new(workspace);
     tui_cfg.max_steps = spine_cfg.agent.max_steps;
-    tui_cfg.session_db_path = spine_cfg.session_db_path.clone();
+    tui_cfg.sessions_dir = spine_cfg.sessions_dir.clone();
     tui_cfg.reasoning_effort = spine_cfg.agent.reasoning_effort;
     // 记录强度来源：settings.json 显式指定时才算「配置的默认」，否则留给会话记录覆盖
     tui_cfg.reasoning_effort_from_settings = loaded_cfg.settings.reasoning_effort.is_some();
@@ -678,7 +726,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
 
     if let Some(resolved) = resolved_llm {
         app.plugin(LlmRouter::plugin(), resolved.router);

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CodemodeSettings {
+    pub enabled: Option<bool>,
     pub only_mode: Option<bool>,
     pub inline_budget: Option<usize>,
     pub timeout_ms: Option<u64>,
@@ -46,6 +47,8 @@ pub struct InstructionsSettings {
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
     pub auto_compact: Option<bool>,
+    #[serde(deserialize_with = "deserialize_context_window")]
+    pub default_context_window: Option<u64>,
     pub max_context_tokens: Option<u64>,
     pub trigger_ratio: Option<f64>,
     pub keep_recent_tokens: Option<u64>,
@@ -53,12 +56,11 @@ pub struct CompactionSettings {
     pub drop_useless: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RecallSettings {
-    pub enabled: Option<bool>,
-    pub default_search_limit: Option<usize>,
-    pub read_char_limit: Option<usize>,
+fn deserialize_context_window<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    Option::<std::num::NonZeroU64>::deserialize(deserializer)
+        .map(|v| v.map(std::num::NonZeroU64::get))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -116,13 +118,12 @@ pub struct SettingsConfig {
     #[serde(default, rename = "disabledPlugins")]
     pub disabled_plugins: Vec<String>,
     pub restrict_to_workspace: Option<bool>,
-    pub session_db: Option<PathBuf>,
+    pub sessions_dir: Option<PathBuf>,
     pub codemode: Option<CodemodeSettings>,
     pub tool_search: Option<ToolSearchSettings>,
     pub skills: Option<SkillsSettings>,
     pub instructions: Option<InstructionsSettings>,
     pub compaction: Option<CompactionSettings>,
-    pub recall: Option<RecallSettings>,
     pub session_title: Option<SessionTitleSettings>,
     pub ui: Option<UiSettings>,
 }
@@ -173,11 +174,14 @@ impl SettingsConfig {
         if other.restrict_to_workspace.is_some() {
             self.restrict_to_workspace = other.restrict_to_workspace;
         }
-        if other.session_db.is_some() {
-            self.session_db = other.session_db;
+        if other.sessions_dir.is_some() {
+            self.sessions_dir = other.sessions_dir;
         }
         if let Some(cm) = other.codemode {
             let dst = self.codemode.get_or_insert_with(Default::default);
+            if cm.enabled.is_some() {
+                dst.enabled = cm.enabled;
+            }
             if cm.only_mode.is_some() {
                 dst.only_mode = cm.only_mode;
             }
@@ -243,6 +247,9 @@ impl SettingsConfig {
             if comp.auto_compact.is_some() {
                 dst.auto_compact = comp.auto_compact;
             }
+            if comp.default_context_window.is_some() {
+                dst.default_context_window = comp.default_context_window;
+            }
             if comp.max_context_tokens.is_some() {
                 dst.max_context_tokens = comp.max_context_tokens;
             }
@@ -257,18 +264,6 @@ impl SettingsConfig {
             }
             if comp.drop_useless.is_some() {
                 dst.drop_useless = comp.drop_useless;
-            }
-        }
-        if let Some(rec) = other.recall {
-            let dst = self.recall.get_or_insert_with(Default::default);
-            if rec.enabled.is_some() {
-                dst.enabled = rec.enabled;
-            }
-            if rec.default_search_limit.is_some() {
-                dst.default_search_limit = rec.default_search_limit;
-            }
-            if rec.read_char_limit.is_some() {
-                dst.read_char_limit = rec.read_char_limit;
             }
         }
         if let Some(st) = other.session_title {

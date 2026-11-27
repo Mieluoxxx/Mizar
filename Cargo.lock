@@ -572,18 +572,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fallible-iterator"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
-
-[[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fancy-regex"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -851,15 +839,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
-]
-
-[[package]]
-name = "hashlink"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
-dependencies = [
- "hashbrown",
 ]
 
 [[package]]
@@ -1263,17 +1242,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libsqlite3-sys"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b06e69070b7e12262b0cd90832f0a7396f142a2b330181255562decf9f0c6215"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "line-clipping"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1413,6 +1381,7 @@ dependencies = [
  "cordis",
  "futures",
  "mizar-llm",
+ "mizar-llm-retry",
  "mizar-session",
  "mizar-system-prompt",
  "mizar-tools",
@@ -1435,9 +1404,8 @@ dependencies = [
  "mizar-llm",
  "mizar-llm-router",
  "mizar-mcp",
- "mizar-recall",
  "mizar-session",
- "mizar-session-sqlite",
+ "mizar-session-jsonl",
  "mizar-session-title",
  "mizar-skills",
  "mizar-system-prompt",
@@ -1457,14 +1425,13 @@ dependencies = [
 name = "mizar-client"
 version = "0.2.4"
 dependencies = [
- "base64 0.22.1",
  "chrono",
  "cordis",
  "futures",
- "image",
  "mizar-agent-loop",
  "mizar-agent-spine",
  "mizar-client-core",
+ "mizar-image",
  "mizar-instructions",
  "mizar-llm",
  "mizar-mcp",
@@ -1512,9 +1479,9 @@ name = "mizar-compaction"
 version = "0.2.4"
 dependencies = [
  "cordis",
- "futures",
  "mizar-agent-loop",
  "mizar-llm",
+ "mizar-llm-retry",
  "mizar-session",
  "mizar-system-prompt",
  "mizar-tools",
@@ -1523,6 +1490,16 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "mizar-image"
+version = "0.2.4"
+dependencies = [
+ "base64 0.22.1",
+ "image",
+ "mizar-llm-types",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1567,6 +1544,7 @@ dependencies = [
 name = "mizar-llm-http"
 version = "0.2.4"
 dependencies = [
+ "chrono",
  "futures",
  "mizar-llm",
  "reqwest",
@@ -1616,10 +1594,10 @@ dependencies = [
 name = "mizar-llm-retry"
 version = "0.2.4"
 dependencies = [
- "cordis",
  "futures",
  "mizar-llm",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1651,8 +1629,10 @@ dependencies = [
 name = "mizar-mcp"
 version = "0.2.4"
 dependencies = [
+ "base64 0.22.1",
  "cordis",
  "dirs",
+ "mizar-image",
  "mizar-llm",
  "mizar-llm-http",
  "mizar-system-prompt",
@@ -1663,20 +1643,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "mizar-recall"
-version = "0.2.4"
-dependencies = [
- "cordis",
- "mizar-agent-loop",
- "mizar-llm",
- "mizar-session",
- "mizar-tools",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -1692,13 +1658,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "mizar-session-sqlite"
+name = "mizar-session-jsonl"
 version = "0.2.4"
 dependencies = [
+ "chrono",
  "cordis",
  "mizar-llm-types",
  "mizar-session",
- "rusqlite",
  "serde",
  "serde_json",
  "tokio",
@@ -1710,9 +1676,9 @@ version = "0.2.4"
 dependencies = [
  "chrono",
  "cordis",
- "futures",
  "mizar-agent-loop",
  "mizar-llm",
+ "mizar-llm-retry",
  "mizar-session",
  "serde",
  "thiserror 2.0.21",
@@ -1796,6 +1762,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "mizar-image",
  "mizar-system-prompt",
  "mizar-tools",
  "serde",
@@ -1846,7 +1813,6 @@ dependencies = [
  "mizar-instructions",
  "mizar-llm",
  "mizar-llm-mock",
- "mizar-llm-retry",
  "mizar-llm-router",
  "mizar-mcp",
  "mizar-session",
@@ -2168,12 +2134,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pkg-config"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "png"
@@ -2605,30 +2565,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsqlite-vfs"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "353b74f9810d5b085b6c42c9d86a5f0fdb795553235cdd48753b32e3809d18a7"
-dependencies = [
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "rusqlite"
-version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f172c4812a19b26d1c23cdb0070e69db335503dfa378b910eb857386e5b8beba"
-dependencies = [
- "bitflags 2.13.2",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "hashlink",
- "libsqlite3-sys",
- "smallvec",
- "sqlite-wasm-rs",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2874,16 +2810,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "sqlite-wasm-rs"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
-dependencies = [
- "cc",
- "rsqlite-vfs",
 ]
 
 [[package]]
@@ -3382,12 +3308,6 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

@@ -122,7 +122,6 @@ pub fn is_read_only_compact_tool(name: &str) -> bool {
             | "grep"
             | "find"
             | "tool_search"
-            | "skill"
             | "list_mcp_resources"
             | "list_mcp_resource_templates"
             | "read_mcp_resource"
@@ -260,6 +259,12 @@ pub fn format_expanded_tool_args(
         return (single_line_text(raw), Vec::new());
     };
 
+    let other_args = |shown: &[&str]| -> Vec<String> {
+        map.iter()
+            .filter(|(key, _)| !shown.contains(&key.as_str()))
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    };
     if name == "bash"
         && let Some(cmd) = map.get("command").and_then(Value::as_str)
     {
@@ -273,34 +278,37 @@ pub fn format_expanded_tool_args(
                 }
             }
             let first = single_line_text(cmd.lines().next().unwrap_or(""));
+            extra_lines.extend(other_args(&["command"]));
             return (first, extra_lines);
         }
-        return (cmd.trim().to_string(), Vec::new());
+        return (cmd.trim().to_string(), other_args(&["command"]));
     }
 
     if name == "codemode"
         && let Some(code) = map.get("code").and_then(Value::as_str)
     {
         let n = code.lines().count().max(1);
-        let extra_lines: Vec<String> = code.lines().map(ToString::to_string).collect();
+        let mut extra_lines: Vec<String> = code.lines().map(ToString::to_string).collect();
+        extra_lines.extend(other_args(&["code"]));
         return (format!("{n} lines"), extra_lines);
     }
 
     if name == "write"
         && let Some(path) = map.get("path").and_then(Value::as_str)
     {
-        let extra_lines = map
+        let mut extra_lines: Vec<String> = map
             .get("content")
             .and_then(Value::as_str)
             .map(|c| c.lines().map(ToString::to_string).collect())
             .unwrap_or_default();
+        extra_lines.extend(other_args(&["path", "content"]));
         return (path.to_string(), extra_lines);
     }
 
     if name == "edit"
         && let Some(path) = map.get("path").and_then(Value::as_str)
     {
-        return (path.to_string(), Vec::new());
+        return (path.to_string(), other_args(&["path"]));
     }
 
     let mut pairs = Vec::new();
@@ -504,7 +512,6 @@ pub fn extract_inline_meta(
             .and_then(|d| d.get("loaded"))
             .and_then(Value::as_array)
             .map(|arr| format!("{} loaded", arr.len())),
-        "skill" => Some("loaded".to_string()),
         "edit" => details
             .and_then(|d| d.get("diff"))
             .and_then(Value::as_str)
@@ -576,7 +583,7 @@ pub fn summarize_tool_result(
     }
 
     match name {
-        "skill" | "write" => String::new(),
+        "write" => String::new(),
         "edit" => {
             if let Some(diff) = details.and_then(|d| d.get("diff")).and_then(Value::as_str) {
                 let lines: Vec<String> = diff

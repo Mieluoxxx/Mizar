@@ -1,23 +1,18 @@
 [package]
-name = "mizar-session-sqlite"
+name = "mizar-session-jsonl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "基于嵌入式 SQLite (WAL + 单写者后台线程) 的 SessionPersistence 实现"
+description = "基于宽容单会话 JSONL（按 cwd 分桶、惰性落盘与 Blob 图片外置）的 SessionPersistence 实现"
 
 [lints]
 workspace = true
 
-[features]
-default = ["bundled"]
-bundled = ["rusqlite/bundled"]
-
 [dependencies]
+chrono = { workspace = true }
 cordis = { workspace = true }
 mizar-llm-types = { workspace = true }
 mizar-session = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-

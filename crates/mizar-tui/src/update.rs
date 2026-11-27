@@ -23,7 +23,7 @@ pub fn current_version() -> &'static str {
         .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
-fn is_truthy_env(key: &str) -> bool {
+pub(crate) fn is_truthy_env(key: &str) -> bool {
     env::var(key)
         .ok()
         .map(|v| {
@@ -175,7 +175,7 @@ pub fn is_newer_version(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn extract_tag_from_location_or_url(raw: &str) -> Option<String> {
+pub(crate) fn extract_tag_from_location_or_url(raw: &str) -> Option<String> {
     let path_only = raw.split(['?', '#']).next().unwrap_or(raw);
     let (_, after_tag) = path_only.rsplit_once("/releases/tag/")?;
     let tag = after_tag.trim_end_matches('/');
@@ -389,19 +389,19 @@ fn validate_install_target(exe_path: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-struct StagingDirGuard {
-    path: PathBuf,
+pub(crate) struct StagingDirGuard {
+    pub(crate) path: PathBuf,
 }
 
 impl StagingDirGuard {
-    fn create_in(parent: &Path) -> Result<Self, String> {
+    pub(crate) fn create_in(parent: &Path, prefix: &str) -> Result<Self, String> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         for attempt in 0..8u32 {
             let dir = parent.join(format!(
-                ".mizar-update-{}-{nanos}-{attempt}",
+                ".{prefix}-{}-{nanos}-{attempt}",
                 std::process::id()
             ));
             match fs::create_dir(&dir) {
@@ -409,19 +409,16 @@ impl StagingDirGuard {
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                     return Err(format!(
-                        "没有目录写入权限（{}）：{err}；请检查权限或使用 sudo / install.sh 更新",
+                        "没有目录写入权限（{}）：{err}，请检查该目录的权限",
                         parent.display()
                     ));
                 }
                 Err(err) => {
-                    return Err(format!(
-                        "创建更新暂存目录失败（{}）：{err}",
-                        parent.display()
-                    ));
+                    return Err(format!("创建暂存目录失败（{}）：{err}", parent.display()));
                 }
             }
         }
-        Err(format!("无法在 {} 创建唯一更新暂存目录", parent.display()))
+        Err(format!("无法在 {} 创建唯一暂存目录", parent.display()))
     }
 }
 
@@ -445,7 +442,7 @@ pub fn stage_and_replace_binary(
     let exe_dir = exe_path
         .parent()
         .ok_or_else(|| format!("无法解析可执行文件所在目录：{}", exe_path.display()))?;
-    let staging = StagingDirGuard::create_in(exe_dir)?;
+    let staging = StagingDirGuard::create_in(exe_dir, "mizar-update")?;
 
     let archive_path = staging.path.join(&archive_name);
     fs::write(&archive_path, archive_bytes).map_err(|e| format!("写入临时压缩包失败：{e}"))?;
@@ -595,7 +592,7 @@ pub async fn run_update_with_base_and_exe(
         .parent()
         .ok_or_else(|| format!("无法解析可执行文件目录：{}", canonical_exe.display()))?;
     // 下载大文件前先试探目录写权限，避免白下几十 MB 后才报权限错误
-    drop(StagingDirGuard::create_in(exe_dir)?);
+    drop(StagingDirGuard::create_in(exe_dir, "mizar-update")?);
 
     let target_triple = detect_release_target()?;
     let archive_name = format!("mizar-{target_tag}-{target_triple}.tar.gz");

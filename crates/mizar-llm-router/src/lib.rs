@@ -20,8 +20,9 @@ pub use config::{
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service};
 use futures::channel::mpsc;
 use mizar_llm::{
-    BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo, ProviderInfo,
-    SessionAffinityMode, detect_session_affinity_mode, push_session_affinity_headers,
+    BoxChunkStream, GenerateOptions, LlmAdapter, LlmContextExt, LlmError, ModelInfo,
+    ModelRouteInfo, ProviderInfo, SessionAffinityMode, detect_session_affinity_mode,
+    push_session_affinity_headers,
 };
 use mizar_llm_completions::{CompletionsAdapter, CompletionsCompat, CompletionsConfig};
 pub use mizar_llm_http::resolve_credential;
@@ -112,6 +113,20 @@ fn resolve_header_map(
 }
 
 impl LlmAdapter for RoutedAdapter {
+    fn model_route(&self, model: Option<&str>) -> Option<ModelRouteInfo> {
+        let model = model.or(self.default_model.as_deref());
+        let adapter = model
+            .and_then(|id| self.model_routes.get(id))
+            .map_or(&self.inner, |target| &target.adapter);
+        adapter.model_route(model)
+    }
+
+    fn default_model(&self) -> Option<&str> {
+        self.default_model
+            .as_deref()
+            .or_else(|| self.inner.default_model())
+    }
+
     fn info(&self) -> Option<ProviderInfo> {
         Some(ProviderInfo {
             id: self.provider.clone(),

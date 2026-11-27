@@ -3,13 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use cordis::{BoxFuture, Cleanup, Context, CordisError, Inject, Service, ServicePlugin};
-use futures::StreamExt;
 use mizar_agent_loop::{AgentTurnInputEvent, EVENT_AGENT_TURN_INPUT};
-use mizar_llm::{
-    BlockAssembler, FinishReason, GenerateOptions, LlmContextExt, LlmError, ReasoningEffort,
-};
+use mizar_llm::{GenerateOptions, LlmContextExt, LlmError, ReasoningEffort};
+use mizar_llm_retry::{RetryConfig, collect_with_retry};
 use mizar_session::{Session, SessionContextExt, TitleSource};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -310,6 +309,7 @@ impl SessionTitleRuntime {
             messages: build_title_messages(&params.user_messages),
             tools: Vec::new(),
             model: params.model,
+            supports_images: None,
             provider: params.provider,
             system: None,
             max_tokens: Some(2048),
@@ -321,30 +321,11 @@ impl SessionTitleRuntime {
             cancel: params.cancel.clone(),
         };
 
-        let mut stream = llm.stream(opts)?;
-        let mut assembler = BlockAssembler::new();
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = chunk_res?;
-            assembler.push(chunk);
-        }
-
-        match assembler.finish() {
-            FinishReason::Aborted => return Err(SessionTitleError::Llm(LlmError::cancelled())),
-            FinishReason::Error {
-                code,
-                message,
-                status,
-                retry_after_ms,
-            } => {
-                return Err(SessionTitleError::Llm(LlmError {
-                    code,
-                    message,
-                    status,
-                    retry_after_ms,
-                }));
-            }
-            FinishReason::Stop | FinishReason::ToolCalls | FinishReason::MaxTokens => {}
-        }
+        let mut retry = RetryConfig::from_env();
+        retry.max_retries = retry.max_retries.min(1);
+        retry.max_retry_after = retry.max_retry_after.min(Duration::from_secs(15));
+        let mut retries_used = 0;
+        let assembler = collect_with_retry(&llm, opts, &retry, &mut retries_used, |_| {}).await?;
 
         if params.cancel.is_cancelled() {
             return Err(SessionTitleError::Llm(LlmError::cancelled()));

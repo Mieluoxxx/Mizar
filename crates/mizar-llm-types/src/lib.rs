@@ -9,7 +9,9 @@ pub mod types;
 
 pub use assembler::BlockAssembler;
 pub use error::{
-    LlmError, LlmErrorCode, is_context_window_exceeded, is_empty_response_error, is_quota_exceeded,
+    HttpErrorHints, LlmError, LlmErrorCode, classify_inband_error_value,
+    classify_non_json_sse_frame, is_context_window_exceeded, is_empty_response_error,
+    is_quota_exceeded,
 };
 pub use sse::{SseEvent, SseParser, prefix_digest};
 pub use types::{

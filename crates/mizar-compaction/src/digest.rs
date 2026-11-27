@@ -136,7 +136,11 @@ pub fn plan_compaction_cut_with_pruned(
         .map(|e| estimate_entry_tokens_with_pruned(e, pruned_map))
         .sum();
 
-    let pinned_inputs = detect_split_turn_pinned_inputs(&compacted_entries, &kept_entries);
+    let pinned_inputs = detect_split_turn_pinned_inputs(
+        &compacted_entries,
+        &kept_entries,
+        &previous_digest.pinned_inputs,
+    );
 
     Some(CutPlan {
         previous_summary,
@@ -150,49 +154,33 @@ pub fn plan_compaction_cut_with_pruned(
     })
 }
 
-/// 若 `cut_idx` 落在 `ToolResult`（或属于同一工具批次的中间位置），向前推到其发起 `Assistant(ToolCall)`。
 fn rewind_for_tool_pairing(regular: &[&SessionEntry], mut idx: usize) -> usize {
     if idx >= regular.len() {
         return idx;
     }
-    loop {
-        if idx == 0 {
-            return 0;
-        }
-        match &regular[idx].event {
-            SessionEvent::ToolResult { .. } | SessionEvent::ContextNotice { .. } => {
-                idx -= 1;
+    while idx > 0 && matches!(regular[idx].event, SessionEvent::ContextNotice { .. }) {
+        idx -= 1;
+    }
+    // 并行回执之间可能夹有其他可见事件，仅向前跳过相邻回执会遗失发起调用。
+    let mut results = HashMap::new();
+    for (i, entry) in regular.iter().enumerate().rev() {
+        match &entry.event {
+            SessionEvent::ToolResult { tool_call_id, .. } => {
+                results.entry(tool_call_id.as_str()).or_insert(i);
             }
-            _ => {
-                // 若前一条是带有未配对 ToolCall 的 Assistant 且当前 idx 对应的 ToolResult 被切分了，继续保护
-                if let Some(prev) = regular.get(idx - 1)
-                    && let SessionEvent::Assistant { blocks, .. } = &prev.event
-                {
-                    let call_ids: HashSet<&str> = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::ToolCall { id, .. } => Some(id.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if !call_ids.is_empty() {
-                        let kept_has_matching_result = regular[idx..].iter().any(|e| {
-                            matches!(
-                                &e.event,
-                                SessionEvent::ToolResult { tool_call_id, .. }
-                                if call_ids.contains(tool_call_id.as_str())
-                            )
-                        });
-                        if kept_has_matching_result {
-                            idx -= 1;
-                            continue;
-                        }
+            SessionEvent::Assistant { blocks, .. } => {
+                for block in blocks {
+                    if let ContentBlock::ToolCall { id, .. } = block
+                        && results.remove(id.as_str()).is_some_and(|end| end >= idx)
+                    {
+                        idx = idx.min(i);
                     }
                 }
-                return idx;
             }
+            _ => {}
         }
     }
+    idx
 }
 
 /// 若保留尾部不是以 `User` 开局（说明当前进行中的 turn 被腰斩），
@@ -200,6 +188,7 @@ fn rewind_for_tool_pairing(regular: &[&SessionEntry], mut idx: usize) -> usize {
 fn detect_split_turn_pinned_inputs(
     compacted: &[SessionEntry],
     kept: &[SessionEntry],
+    previous: &[PinnedInput],
 ) -> Vec<PinnedInput> {
     if kept.is_empty() {
         return Vec::new();
@@ -212,7 +201,8 @@ fn detect_split_turn_pinned_inputs(
         .rev()
         .find(|e| matches!(e.event, SessionEvent::User { .. }))
     else {
-        return Vec::new();
+        // 同一轮再次切分时，原始用户输入可能只存在于上个检查点。
+        return previous.to_vec();
     };
     let SessionEvent::User { text, .. } = &last_user.event else {
         return Vec::new();

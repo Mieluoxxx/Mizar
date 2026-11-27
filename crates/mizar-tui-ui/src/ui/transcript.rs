@@ -8,7 +8,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::BRAILLE_SPINNER;
 use super::chrome::render_inline_pills;
 use super::tool_card::{
     ToolGroupCtx, build_tool_lines, compute_tool_group_ctx, compute_tool_group_ctx_cached,
@@ -17,7 +16,7 @@ use super::tool_card::{
 use super::welcome::build_welcome_section;
 use crate::app::{
     AppState, ChatItem, ItemRenderKey, NoticeLevel, StreamingMarkdownPrefixCache, ToolExtraMeta,
-    ToolState, TranscriptRenderCache, truncate_display,
+    TranscriptRenderCache, truncate_display,
 };
 use crate::emphasis::EmphasisConfig;
 use crate::markdown::{
@@ -77,7 +76,6 @@ pub fn build_item_lines_for_scrollback(
                     is_group_end: true,
                     show_expand_hint,
                 },
-                0,
                 w,
                 theme,
             )
@@ -136,7 +134,6 @@ pub fn build_item_lines_for_scrollback_at(
                 extra,
                 verbose_expanded,
                 group_ctx,
-                0,
                 w,
                 theme,
             )
@@ -159,7 +156,6 @@ fn build_transcript_item_lines(
     is_busy: bool,
     show_thinking: bool,
     verbose_expanded: bool,
-    spinner_tick: usize,
     width: usize,
 ) -> Vec<RenderedLine> {
     let is_last_active = is_busy && idx + 1 == items.len();
@@ -203,11 +199,6 @@ fn build_transcript_item_lines(
                 width,
                 theme,
             );
-            let spin_key = if matches!(status, ToolState::Running) {
-                spinner_tick % BRAILLE_SPINNER.len()
-            } else {
-                0
-            };
             build_tool_lines(
                 name,
                 args_summary,
@@ -216,7 +207,6 @@ fn build_transcript_item_lines(
                 extra,
                 verbose_expanded,
                 group_ctx,
-                spin_key,
                 width,
                 theme,
             )
@@ -258,7 +248,6 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
     let is_busy = app.is_busy();
     let show_thinking = app.show_thinking;
     let verbose_expanded = app.verbose_expanded;
-    let spinner_tick = app.spinner_tick;
 
     if app.screen_mode == ScreenMode::Inline && !app.items.is_empty() && start_item >= total_items {
         let hint = Line::from(vec![
@@ -403,11 +392,6 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
                     let status_code = tool_base_status_code(*status)
                         | if group_ctx.is_group_end { 4 } else { 0 }
                         | if group_ctx.show_expand_hint { 8 } else { 0 };
-                    let spin_key = if matches!(status, ToolState::Running) {
-                        spinner_tick % BRAILLE_SPINNER.len()
-                    } else {
-                        0
-                    };
                     ItemRenderKey {
                         width: width_usize,
                         theme_id: theme.id,
@@ -415,7 +399,7 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
                         round_caps: emphasis.round_caps,
                         expanded: verbose_expanded,
                         status_code,
-                        reasoning_len: spin_key,
+                        reasoning_len: 0,
                         text_len: extra_len,
                         preview_len: args_summary.len() + output_preview.len() + name.len(),
                     }
@@ -455,7 +439,6 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
                     is_busy,
                     show_thinking,
                     verbose_expanded,
-                    spinner_tick,
                     width_usize,
                 ));
                 let len = built.len();
@@ -589,7 +572,6 @@ pub(super) fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App
                     is_busy,
                     show_thinking,
                     verbose_expanded,
-                    spinner_tick,
                     width_usize,
                 ));
                 cache.insert_lines(item_idx, key.clone(), Arc::clone(&built));

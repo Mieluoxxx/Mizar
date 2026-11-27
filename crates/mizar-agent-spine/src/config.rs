@@ -63,20 +63,21 @@ pub fn resolve_project_config_dir(workspace: &Path) -> PathBuf {
     workspace.join(CONFIG_DIR_NAME)
 }
 
-/// 解析默认持久化 SQLite 数据库路径：支持 `MIZAR_SESSION_DB` 环境变量覆盖
-/// （设为 `"none"` / `"off"` / `"memory"` 可禁用自动落盘），默认 `~/.mizar/sessions.sqlite`。
-pub fn resolve_default_session_db_path() -> Option<PathBuf> {
-    if let Ok(raw) = std::env::var("MIZAR_SESSION_DB") {
+/// 解析默认持久化 JSONL 会话目录：支持 `MIZAR_SESSIONS_DIR` 环境变量覆盖
+/// （设为 `"none"` / `"off"` / `"memory"` 或空串可禁用自动落盘），默认 `~/.mizar/sessions`。
+pub fn resolve_default_sessions_dir() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("MIZAR_SESSIONS_DIR") {
         let trimmed = raw.trim();
         if trimmed.eq_ignore_ascii_case("none")
             || trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("memory")
             || trimmed.is_empty()
         {
             return None;
         }
         return Some(PathBuf::from(trimmed));
     }
-    resolve_global_config_dir().map(|dir| dir.join("sessions.sqlite"))
+    resolve_global_config_dir().map(|dir| dir.join("sessions"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -206,8 +207,8 @@ impl LoadedMizarConfig {
             merged.extend(self.settings.disabled_plugins.iter().cloned());
             spine.disabled_plugins = normalize_disabled_plugins(merged);
         }
-        if let Some(db_path) = &self.settings.session_db {
-            spine.session_db_path = Some(db_path.clone());
+        if let Some(sessions_dir) = &self.settings.sessions_dir {
+            spine.sessions_dir = Some(sessions_dir.clone());
         }
 
         #[cfg(feature = "compaction")]
@@ -220,6 +221,9 @@ impl LoadedMizarConfig {
                 }
                 if let Some(v) = comp.auto_compact {
                     dst.auto_compact = v;
+                }
+                if let Some(v) = comp.default_context_window {
+                    dst.default_context_window = v;
                 }
                 if let Some(v) = comp.max_context_tokens {
                     dst.max_context_tokens = Some(v);
@@ -235,19 +239,6 @@ impl LoadedMizarConfig {
                 }
                 if let Some(v) = comp.drop_useless {
                     dst.drop_useless = v;
-                }
-            }
-            if let Some(rec) = &self.settings.recall
-                && let Some(dst) = spine.recall.as_mut()
-            {
-                if let Some(v) = rec.enabled {
-                    dst.enabled = v;
-                }
-                if let Some(v) = rec.default_search_limit {
-                    dst.default_search_limit = v;
-                }
-                if let Some(v) = rec.read_char_limit {
-                    dst.read_char_limit = v;
                 }
             }
         }
@@ -326,15 +317,19 @@ impl LoadedMizarConfig {
             }
             if let Some(preset_str) = &self.settings.tools_preset {
                 coding.preset = match preset_str.trim().to_ascii_lowercase().as_str() {
+                    "all" => CodingToolsPreset::All,
                     "minimal" | "minimal-coding" => CodingToolsPreset::MinimalCoding,
                     "read-only" | "readonly" => CodingToolsPreset::ReadOnly,
-                    _ => CodingToolsPreset::All,
+                    _ => coding.preset,
                 };
             }
             if let Some(restrict) = self.settings.restrict_to_workspace {
                 coding.restrict_to_workspace = restrict;
             }
             if let Some(cm) = &self.settings.codemode {
+                if cm.enabled.is_some() {
+                    codemode.enabled = cm.enabled;
+                }
                 if let Some(v) = cm.only_mode {
                     codemode.only_mode = v;
                 }

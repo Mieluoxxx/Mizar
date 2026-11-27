@@ -50,6 +50,15 @@ impl RevealController {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// 新草稿会复用原下标，不能继承旧草稿的揭示进度。
+    pub fn remove_item(&mut self, item_idx: usize) {
+        let text = self.slots.remove(&RevealSlot::AssistantText(item_idx));
+        let reasoning = self.slots.remove(&RevealSlot::AssistantReasoning(item_idx));
+        if text.is_some() || reasoning.is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
     pub fn has_pending(&self) -> bool {
         self.enabled
             && self.slots.values().any(|s| {

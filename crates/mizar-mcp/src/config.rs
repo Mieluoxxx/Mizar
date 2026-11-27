@@ -64,6 +64,11 @@ fn default_true() -> bool {
 }
 
 impl McpServerConfig {
+    pub(crate) fn uses_exposure(&self, exposure: McpExposure) -> bool {
+        self.enabled
+            && (self.exposure == exposure || self.tool_exposure.values().any(|&v| v == exposure))
+    }
+
     pub fn stdio(command: impl Into<String>, args: Vec<String>) -> Self {
         Self {
             command: Some(command.into()),

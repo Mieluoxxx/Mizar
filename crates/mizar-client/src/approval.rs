@@ -120,7 +120,6 @@ pub fn tool_needs_approval(ctx: &Context, tool_name: &str) -> bool {
             | "find"
             | "ls"
             | "tool_search"
-            | "recall"
             | "mcp_list_resources"
             | "mcp_read_resource"
     )

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 pub use mizar_llm_types::{
     CacheRetention, ContentBlock, ContentBlockKind, FinishReason, ImageAttachment,
     MAX_IMAGES_PER_MESSAGE, Message, ModelInfo, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH, ProviderInfo,
@@ -12,6 +14,7 @@ pub struct GenerateOptions {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSchema>,
     pub model: Option<String>,
+    pub supports_images: Option<bool>,
     pub provider: Option<String>,
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
@@ -21,6 +24,28 @@ pub struct GenerateOptions {
     pub session_id: Option<String>,
     pub cache_retention: Option<CacheRetention>,
     pub cancel: CancellationToken,
+}
+
+impl GenerateOptions {
+    pub fn message_for_model<'a>(&self, message: &'a Message) -> Cow<'a, Message> {
+        if self.supports_images != Some(false) || message.images().is_empty() {
+            return Cow::Borrowed(message);
+        }
+        let mut text = message.text_content();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[image omitted: current model does not support image input]");
+        match message {
+            Message::User { .. } => Cow::Owned(Message::user(text)),
+            Message::Tool {
+                tool_call_id,
+                is_error,
+                ..
+            } => Cow::Owned(Message::tool(tool_call_id, text, *is_error)),
+            _ => Cow::Borrowed(message),
+        }
+    }
 }
 
 fn parse_cache_retention_str(raw: &str) -> Option<CacheRetention> {

@@ -4,7 +4,7 @@
 
 pub mod approval;
 pub mod events;
-pub mod images;
+pub use mizar_image as images;
 pub mod local_bash;
 pub mod mentions;
 pub mod session_view;

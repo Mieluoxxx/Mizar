@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use cordis::{Context, CordisError, DisposableHandle, LogLevel, LogRecord};
 use mizar_agent_loop::{
-    AgentReasoningDeltaEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
-    AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallEvent,
-    AgentToolResultEvent, AgentToolUpdateEvent, AgentTurnEndEvent, AgentTurnStartEvent,
-    AgentUsageEvent, EVENT_AGENT_REASONING_DELTA, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_END,
-    EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA,
-    EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TOOL_RESULT, EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END,
-    EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE, StepOutcome, TurnEndReason,
+    AgentReasoningDeltaEvent, AgentRetryEvent, AgentStatus, AgentStatusEvent, AgentStepEndEvent,
+    AgentStepFirstTokenEvent, AgentStepStartEvent, AgentTextDeltaEvent, AgentToolCallDraftEvent,
+    AgentToolCallDraftIdEvent, AgentToolCallEvent, AgentToolResultEvent, AgentToolUpdateEvent,
+    AgentTurnEndEvent, AgentTurnStartEvent, AgentUsageEvent, EVENT_AGENT_REASONING_DELTA,
+    EVENT_AGENT_RETRY, EVENT_AGENT_STATUS, EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN,
+    EVENT_AGENT_STEP_START, EVENT_AGENT_TEXT_DELTA, EVENT_AGENT_TOOL_CALL,
+    EVENT_AGENT_TOOL_CALL_DRAFT, EVENT_AGENT_TOOL_CALL_DRAFT_ID, EVENT_AGENT_TOOL_RESULT,
+    EVENT_AGENT_TOOL_UPDATE, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START, EVENT_AGENT_USAGE,
+    StepOutcome, TurnEndReason,
 };
 use mizar_agent_spine::{
     CompactionEndEvent, CompactionProgressEvent, CompactionStartEvent, CompactionTrigger,
@@ -303,6 +305,23 @@ where
     {
         let send = send.clone();
         let check = is_current.clone();
+        handles.push(ctx.on(EVENT_AGENT_RETRY, move |ev: &AgentRetryEvent| {
+            if check(&ev.session.id) {
+                send(ClientEvent::StepRetrying {
+                    step: ev.step,
+                    attempt: ev.attempt,
+                    max_attempts: ev.max_attempts,
+                    delay_ms: ev.delay_ms,
+                    reason: ev.reason.clone(),
+                    reset_draft: ev.reset_draft,
+                    ts_ms: ev.ts_ms,
+                });
+            }
+        })?);
+    }
+    {
+        let send = send.clone();
+        let check = is_current.clone();
         handles.push(ctx.on(
             EVENT_AGENT_STEP_FIRST_TOKEN,
             move |ev: &AgentStepFirstTokenEvent| {
@@ -350,6 +369,38 @@ where
                     send(ClientEvent::ReasoningDelta {
                         text: ev.text.clone(),
                         ts_ms: ev.ts_ms,
+                    });
+                }
+            },
+        )?);
+    }
+    {
+        let send = send.clone();
+        let check = is_current.clone();
+        handles.push(ctx.on(
+            EVENT_AGENT_TOOL_CALL_DRAFT,
+            move |ev: &AgentToolCallDraftEvent| {
+                if check(&ev.session.id) {
+                    send(ClientEvent::ToolCallDraft {
+                        call_id: ev.call_id.clone(),
+                        name: ev.name.clone(),
+                        arguments_delta: ev.arguments_delta.clone(),
+                        ts_ms: ev.ts_ms,
+                    });
+                }
+            },
+        )?);
+    }
+    {
+        let send = send.clone();
+        let check = is_current.clone();
+        handles.push(ctx.on(
+            EVENT_AGENT_TOOL_CALL_DRAFT_ID,
+            move |ev: &AgentToolCallDraftIdEvent| {
+                if check(&ev.session.id) {
+                    send(ClientEvent::ToolCallDraftId {
+                        previous_id: ev.previous_id.clone(),
+                        call_id: ev.call_id.clone(),
                     });
                 }
             },

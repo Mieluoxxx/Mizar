@@ -1,6 +1,6 @@
 //! 轨迹采集服务 `ctx.trajectory`（`TrajectoryRuntime`）。
 //!
-//! 对已接入 `SessionStore` 的会话直接以 `Session` 作为唯一权威事实源（支持从 SQLite
+//! 对已接入 `SessionStore` 的会话直接以 `Session` 作为唯一权威事实源（支持从 JSONL
 //! 持久化历史重建完整轨迹报告与导出，不再在内存中双份缓存大文本载荷）；
 //! 当未挂载 `SessionStore`（如独立的工具级单元测试）时，仍保留轻量内存缓冲作为兜底。
 
@@ -11,9 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{BoxFuture, Context, CordisError, Service};
 use mizar_agent_loop::{
-    AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent, AgentToolCallEvent,
-    AgentTurnEndEvent, AgentTurnStartEvent, EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN,
-    EVENT_AGENT_STEP_START, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START,
+    AgentRetryEvent, AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent,
+    AgentToolCallEvent, AgentTurnEndEvent, AgentTurnStartEvent, EVENT_AGENT_RETRY,
+    EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
+    EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START,
 };
 use mizar_session::{
     EVENT_SESSION_CREATED, EVENT_SESSION_EVENT, Session, SessionCreatedPayload, SessionEntry,
@@ -120,6 +121,7 @@ fn entry_to_trace_event(
             name,
             content,
             is_error,
+            ..
         } => TraceEventKind::ToolResult {
             tool_call_id: tool_call_id.clone(),
             name: name.clone(),
@@ -172,6 +174,23 @@ fn entry_to_trace_event(
                 step: *step,
                 system_prompt_chars: *system_prompt_chars,
                 tools_count: *tools_count,
+            },
+            SessionTraceEvent::StepRetry {
+                turn,
+                step,
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+                reset_draft,
+            } => TraceEventKind::StepRetry {
+                turn: *turn,
+                step: *step,
+                attempt: *attempt,
+                max_attempts: *max_attempts,
+                delay_ms: *delay_ms,
+                reason: reason.clone(),
+                reset_draft: *reset_draft,
             },
             SessionTraceEvent::FirstToken { turn, step } => TraceEventKind::FirstToken {
                 turn: *turn,
@@ -537,7 +556,7 @@ impl TrajectoryRuntime {
             .unwrap_or_default()
     }
 
-    /// 对指定会话（内存激活或 SQLite 持久化历史）做一次完整轨迹折叠、时间轴投影与异常检测。
+    /// 对指定会话（内存激活或 JSONL 持久化历史）做一次完整轨迹折叠、时间轴投影与异常检测。
     pub fn inspect(&self, session_id: &str, mode: TimelineMode) -> Option<TrajectoryReport> {
         if let Some(session) = self.resolve_session(session_id) {
             self.sync_managed_session(&session);
@@ -884,6 +903,25 @@ impl Service for TrajectoryRuntime {
                     }
                 },
             )?;
+
+            let rt_retry = Arc::clone(&rt);
+            ctx.on(EVENT_AGENT_RETRY, move |ev: &AgentRetryEvent| {
+                if !rt_retry.session_in_memory(&ev.session.id) {
+                    rt_retry.record_standalone_event(
+                        &ev.session.id,
+                        ev.ts_ms,
+                        TraceEventKind::StepRetry {
+                            turn: ev.turn,
+                            step: ev.step,
+                            attempt: ev.attempt,
+                            max_attempts: ev.max_attempts,
+                            delay_ms: ev.delay_ms,
+                            reason: ev.reason.clone(),
+                            reset_draft: ev.reset_draft,
+                        },
+                    );
+                }
+            })?;
 
             let rt_step_end = Arc::clone(&rt);
             ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {

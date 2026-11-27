@@ -1,4 +1,4 @@
-//! `bash` 工具：执行 shell 命令，支持并行批次、默认 `120s` 超时（上限 `600s`）、追加 `~/.mizar/bin` 到 `PATH` 末尾、防 OOM 流式落盘、O(1) 实时预览与 `20KB / 400 lines / 768B` 双向省略输出。
+//! 托管工具排在搜索路径末尾，以保留用户已有工具链的优先级。
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::managed_bins::mizar_bin_dir;
+
 pub const DEFAULT_BASH_TIMEOUT_SECS: f64 = 120.0;
 pub const MAX_BASH_TIMEOUT_SECS: f64 = 600.0;
 
@@ -23,13 +25,10 @@ const BASH_UPDATE_THROTTLE: Duration = Duration::from_millis(120);
 const PREVIEW_MAX_BYTES: usize = 8 * 1024;
 const PREVIEW_MAX_LINES: usize = 40;
 const SPILL_THRESHOLD_BYTES: usize = 64 * 1024;
+const BASH_STRUCTURED_MAX_BYTES: usize = 1024 * 1024;
 const HEAD_CAPTURE_CAP: usize = 32 * 1024;
 const TAIL_CAPTURE_CAP: usize = 32 * 1024;
 const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(200);
-
-fn mizar_bin_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".mizar").join("bin"))
-}
 
 /// 固定优先使用 POSIX 兼容 shell，避免继承用户交互式 `fish`/`nu`/`csh` 导致语法失败。
 pub fn resolve_shell() -> String {
@@ -91,6 +90,7 @@ struct OutputCollector {
     head_buf: Vec<u8>,
     tail_buf: Vec<u8>,
     spill: Option<(PathBuf, tokio::fs::File)>,
+    spill_error: Option<std::io::Error>,
     total_bytes: usize,
     total_newlines: usize,
     last_byte: Option<u8>,
@@ -103,6 +103,7 @@ impl OutputCollector {
             head_buf: Vec::new(),
             tail_buf: Vec::new(),
             spill: None,
+            spill_error: None,
             total_bytes: 0,
             total_newlines: 0,
             last_byte: None,
@@ -136,10 +137,11 @@ impl OutputCollector {
             }
         }
 
+        if self.spill_error.is_some() {
+            return;
+        }
         if let Some((_, file)) = &mut self.spill {
-            if file.write_all(chunk).await.is_err() {
-                self.spill = None;
-            }
+            self.spill_error = file.write_all(chunk).await.err();
             return;
         }
 
@@ -149,12 +151,15 @@ impl OutputCollector {
         }
 
         // 超过阈值时迁移到流式临时文件并释放 in_mem，防止百 MB 输出 OOM。
-        if let Ok((path, mut file)) = create_temp_output_file("mizar-bash-").await
-            && file.write_all(&self.in_mem).await.is_ok()
-            && file.write_all(chunk).await.is_ok()
-        {
+        self.spill_error = async {
+            let (path, mut file) = create_temp_output_file("mizar-bash-").await?;
+            file.write_all(&self.in_mem).await?;
+            file.write_all(chunk).await?;
             self.spill = Some((path, file));
+            Ok::<_, std::io::Error>(())
         }
+        .await
+        .err();
         self.in_mem.clear();
         self.in_mem.shrink_to_fit();
     }
@@ -276,6 +281,7 @@ fn format_spilled_head_tail(
 #[derive(Debug, Clone)]
 pub struct LocalBashResult {
     pub display: String,
+    structured_output: String,
     pub truncated_output: String,
     pub truncation_notice: Option<String>,
     pub exit_code: Option<i32>,
@@ -317,6 +323,7 @@ where
     if cancel.is_cancelled() {
         return Ok(LocalBashResult {
             display: "Command aborted".to_string(),
+            structured_output: String::new(),
             truncated_output: String::new(),
             truncation_notice: None,
             exit_code: Some(-1),
@@ -457,46 +464,74 @@ where
         .or(Some(if aborted || timed_out { -1 } else { 0 }));
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    let (truncated_output, truncated, total_lines, omitted_lines, truncated_by, full_output_path) =
-        if let Some((path, mut file)) = collector.spill.take() {
-            let _ = file.flush().await;
-            drop(file);
-            let total_lines = collector.total_lines_estimate();
-            let (content, omitted, trunc_by) =
-                format_spilled_head_tail(&collector.head_buf, &collector.tail_buf, total_lines);
-            (
-                content,
-                true,
-                total_lines,
-                omitted,
-                trunc_by,
-                Some(path.to_string_lossy().into_owned()),
-            )
+    if let Some(error) = collector.spill_error {
+        return Err(format!("Failed to save full bash output: {error}"));
+    }
+    let (
+        structured_output,
+        truncated_output,
+        truncated,
+        total_lines,
+        omitted_lines,
+        truncated_by,
+        full_output_path,
+    ) = if let Some((path, mut file)) = collector.spill.take() {
+        file.flush().await.map_err(|e| e.to_string())?;
+        drop(file);
+        let mut bytes = Vec::new();
+        tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| e.to_string())?
+            .take(BASH_STRUCTURED_MAX_BYTES as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        // 截断处的半个字符应舍弃，命令本身输出的无效字节仍按原有策略替换。
+        if bytes.len() < collector.total_bytes
+            && let Some(tail) = bytes.utf8_chunks().last()
+            && std::str::from_utf8(tail.invalid()).is_err_and(|e| e.error_len().is_none())
+        {
+            bytes.truncate(bytes.len() - tail.invalid().len());
+        }
+        let raw = String::from_utf8_lossy(&bytes);
+        let total_lines = collector.total_lines_estimate();
+        let (content, omitted, trunc_by) =
+            format_spilled_head_tail(&collector.head_buf, &collector.tail_buf, total_lines);
+        (
+            slice_utf8_head(&raw, BASH_STRUCTURED_MAX_BYTES).to_owned(),
+            content,
+            true,
+            total_lines,
+            omitted,
+            trunc_by,
+            Some(path.to_string_lossy().into_owned()),
+        )
+    } else {
+        let full_text = String::from_utf8_lossy(&collector.in_mem).into_owned();
+        let truncation = truncate_head_tail(
+            &full_text,
+            BASH_MAX_LINES,
+            BASH_MAX_BYTES,
+            BASH_MAX_LINE_BYTES,
+        );
+        let full_path = if truncation.truncated {
+            write_temp_output("mizar-bash-", &full_text)
+                .await
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
         } else {
-            let full_text = String::from_utf8_lossy(&collector.in_mem).into_owned();
-            let truncation = truncate_head_tail(
-                &full_text,
-                BASH_MAX_LINES,
-                BASH_MAX_BYTES,
-                BASH_MAX_LINE_BYTES,
-            );
-            let full_path = if truncation.truncated {
-                write_temp_output("mizar-bash-", &full_text)
-                    .await
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-            (
-                truncation.content,
-                truncation.truncated,
-                truncation.total_lines,
-                truncation.omitted_lines,
-                truncation.truncated_by,
-                full_path,
-            )
+            None
         };
+        (
+            full_text,
+            truncation.content,
+            truncation.truncated,
+            truncation.total_lines,
+            truncation.omitted_lines,
+            truncation.truncated_by,
+            full_path,
+        )
+    };
 
     let mut display = if truncated_output.is_empty() {
         "(no output)".to_string()
@@ -542,6 +577,7 @@ where
 
     Ok(LocalBashResult {
         display,
+        structured_output,
         truncated_output,
         truncation_notice,
         exit_code,
@@ -601,7 +637,7 @@ pub fn create_bash_tool(cwd: PathBuf) -> ToolDefinition {
 
                 let is_error = res.cancelled || res.timed_out || res.exit_code.unwrap_or(0) != 0;
                 let structured = json!({
-                    "output": res.truncated_output,
+                    "output": res.structured_output,
                     "exit_code": res.exit_code,
                     "timed_out": res.timed_out,
                     "cancelled": res.cancelled,
@@ -621,6 +657,7 @@ pub fn create_bash_tool(cwd: PathBuf) -> ToolDefinition {
                     is_error,
                     structured_content: Some(structured),
                     details: Some(details),
+                    ..ToolOutput::default()
                 })
             }
         },
@@ -635,7 +672,7 @@ pub fn create_bash_tool(cwd: PathBuf) -> ToolDefinition {
     .with_output_schema(json!({
         "type": "object",
         "properties": {
-            "output": { "type": "string" },
+            "output": { "type": "string", "description": "Raw stdout and stderr up to 1 MiB. For longer output, read full_output_path." },
             "exit_code": { "type": "integer" },
             "timed_out": { "type": "boolean" },
             "cancelled": { "type": "boolean" },

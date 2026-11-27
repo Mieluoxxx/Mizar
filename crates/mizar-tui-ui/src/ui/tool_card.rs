@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::BRAILLE_SPINNER;
 use crate::app::{
     ChatItem, ToolExtraMeta, ToolState, TranscriptRenderCache, abbreviate_home_path,
-    clean_bash_output_lines, count_diff_stats, format_diff_stat, format_expanded_tool_args,
+    count_diff_stats, extract_inline_meta, format_diff_stat, format_expanded_tool_args,
     is_path_arg_tool, is_read_only_compact_tool, truncate_display,
 };
 use crate::editor::{char_width, display_width};
@@ -34,10 +33,10 @@ pub(super) fn tool_extra_len(extra: Option<&ToolExtraMeta>) -> usize {
 
 pub(super) fn tool_base_status_code(status: ToolState) -> u8 {
     match status {
-        ToolState::Running => 0,
-        ToolState::Done => 1,
-        ToolState::Error => 2,
-        ToolState::Blocked => 3,
+        ToolState::Drafting => 0,
+        ToolState::Running => 1,
+        ToolState::Done => 2,
+        ToolState::Error | ToolState::Blocked => 3,
     }
 }
 
@@ -148,19 +147,12 @@ fn compute_tool_group_ctx_with_cache(
     }
 }
 
-fn tool_status_glyph(
-    status: ToolState,
-    spinner_idx: usize,
-    theme: &Theme,
-) -> (&'static str, Color) {
+fn tool_status_glyph(status: ToolState, theme: &Theme) -> (&'static str, Color) {
     match status {
-        ToolState::Running => (
-            BRAILLE_SPINNER[spinner_idx % BRAILLE_SPINNER.len()],
-            theme.warning,
-        ),
+        ToolState::Drafting => ("○", theme.text_muted),
+        ToolState::Running => ("●", theme.warning),
         ToolState::Done => ("●", theme.success),
-        ToolState::Error => ("✗", theme.error),
-        ToolState::Blocked => ("⊘", theme.error),
+        ToolState::Error | ToolState::Blocked => ("●", theme.error),
     }
 }
 
@@ -263,6 +255,12 @@ fn fit_collapsed_tool_args(name: &str, args: &str, max_cols: usize) -> String {
     }
 }
 
+fn tool_body<'a>(output_preview: &'a str, extra: Option<&'a ToolExtraMeta>) -> &'a str {
+    extra
+        .filter(|e| !e.full_content.is_empty())
+        .map_or(output_preview, |e| e.full_content.as_str())
+}
+
 fn resolve_inline_meta(
     name: &str,
     status: ToolState,
@@ -272,7 +270,7 @@ fn resolve_inline_meta(
     if let Some(meta) = extra.and_then(|e| e.inline_meta.as_ref()) {
         return Some(meta.clone());
     }
-    if matches!(status, ToolState::Running) {
+    if matches!(status, ToolState::Drafting | ToolState::Running) {
         return None;
     }
     if name == "edit"
@@ -283,9 +281,7 @@ fn resolve_inline_meta(
         return format_diff_stat(adds, dels);
     }
 
-    let full_text = extra
-        .filter(|e| !e.full_content.is_empty())
-        .map_or(output_preview, |e| e.full_content.as_str());
+    let full_text = tool_body(output_preview, extra);
 
     if matches!(status, ToolState::Done) && is_read_only_compact_tool(name) {
         let trimmed = full_text.trim();
@@ -318,7 +314,6 @@ fn resolve_inline_meta(
                     })
                 }
             }
-            "skill" => Some("loaded".to_string()),
             _ => {
                 if trimmed == "(empty file)" {
                     Some("empty".to_string())
@@ -335,80 +330,9 @@ fn resolve_inline_meta(
     }
 
     if name == "bash" && matches!(status, ToolState::Done) {
-        let lines = clean_bash_output_lines(full_text, false);
-        if lines.len() > 2 {
-            return Some(format!("{} lines", lines.len()));
-        }
+        return extract_inline_meta(name, full_text, None, false);
     }
     None
-}
-
-fn compact_diff_preview(diff_raw: &str) -> (String, bool) {
-    let mut changed = Vec::new();
-    let mut skipped_non_header = false;
-    for line in diff_raw.lines() {
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            continue;
-        }
-        if line.starts_with('+') || line.starts_with('-') {
-            changed.push(line);
-        } else if !line.trim().is_empty() {
-            skipped_non_header = true;
-        }
-    }
-    if changed.is_empty() {
-        (diff_raw.to_string(), false)
-    } else {
-        (changed.join("\n"), skipped_non_header)
-    }
-}
-
-fn collapsed_preview_lines(name: &str, status: ToolState, output_preview: &str) -> Vec<String> {
-    if matches!(status, ToolState::Error | ToolState::Blocked) {
-        let max_lines = if is_read_only_compact_tool(name) {
-            3
-        } else {
-            4
-        };
-        let lines: Vec<String> = if name == "bash" {
-            let cleaned = clean_bash_output_lines(output_preview, true);
-            let src = if cleaned.is_empty() {
-                output_preview
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .collect()
-            } else {
-                cleaned
-            };
-            let start = src.len().saturating_sub(max_lines);
-            src[start..].iter().map(|s| (*s).to_string()).collect()
-        } else {
-            output_preview
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .take(max_lines)
-                .map(ToString::to_string)
-                .collect()
-        };
-        return lines;
-    }
-
-    if is_read_only_compact_tool(name) || name == "write" {
-        return Vec::new();
-    }
-
-    if name == "bash" {
-        let cleaned = clean_bash_output_lines(output_preview, false);
-        let start = cleaned.len().saturating_sub(2);
-        return cleaned[start..].iter().map(|s| (*s).to_string()).collect();
-    }
-
-    output_preview
-        .lines()
-        .filter(|l| !l.trim().is_empty() && l.trim() != "(no output)")
-        .take(2)
-        .map(ToString::to_string)
-        .collect()
 }
 
 fn collapsed_header_budget(
@@ -478,87 +402,43 @@ pub(super) fn is_tool_expandable(
         return false;
     };
 
-    let body_w = width.saturating_sub(4).max(4);
     let inline_meta = resolve_inline_meta(name, *status, output_preview, extra);
     let abbr_args = abbreviate_home_path(args_summary);
-    let (glyph, _) = tool_status_glyph(*status, 0, theme);
-    let (_, _, args_budget) =
-        collapsed_header_budget(glyph, name, &abbr_args, inline_meta.as_deref(), true, width);
+    let (glyph, _) = tool_status_glyph(*status, theme);
+    let (_, _, args_budget) = collapsed_header_budget(
+        glyph,
+        name,
+        &abbr_args,
+        inline_meta.as_deref(),
+        false,
+        width,
+    );
     if !abbr_args.is_empty() && display_width(&abbr_args) > args_budget {
         return true;
     }
 
-    let (_, extra_arg_lines) = format_expanded_tool_args(name, args_summary, extra);
-    if !extra_arg_lines.is_empty() {
+    if matches!(status, ToolState::Error | ToolState::Blocked)
+        || extra
+            .and_then(|e| e.diff_raw.as_deref())
+            .is_some_and(|diff| !diff.trim().is_empty())
+    {
         return true;
     }
-
-    let full_text = extra
-        .filter(|e| !e.full_content.is_empty())
-        .map_or(output_preview.as_str(), |e| e.full_content.as_str());
-
-    if !matches!(status, ToolState::Error | ToolState::Blocked)
-        && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
-        && !diff_raw.trim().is_empty()
+    if tool_body(output_preview, extra).lines().any(|line| {
+        !matches!(
+            line.trim(),
+            "" | "(no output)" | "(empty file)" | "（空目录）"
+        )
+    }) {
+        return true;
+    }
+    if *status == ToolState::Drafting
+        && let Some(extra) = extra
     {
-        let (compact_src, stripped) = compact_diff_preview(diff_raw);
-        if stripped {
-            return true;
-        }
-        return render_diff_rich(&compact_src, body_w, theme).len() > 4;
+        return args_summary.ends_with('…') || extra.full_args.contains('\n');
     }
-
-    if matches!(status, ToolState::Running) {
-        return output_preview
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count()
-            > 2;
-    }
-
-    if matches!(status, ToolState::Error | ToolState::Blocked) {
-        let preview_src = if output_preview.trim().is_empty() {
-            full_text
-        } else {
-            output_preview.as_str()
-        };
-        let shown = collapsed_preview_lines(name, *status, preview_src);
-        let full_count = if name == "bash" {
-            clean_bash_output_lines(full_text, true).len()
-        } else {
-            full_text.lines().filter(|l| !l.trim().is_empty()).count()
-        };
-        return full_count > shown.len() || shown.iter().any(|l| display_width(l) > body_w);
-    }
-
-    if is_read_only_compact_tool(name) {
-        if name == "get_time" {
-            let t = full_text.trim();
-            return !t.is_empty() && (t.contains('\n') || display_width(t) > 40);
-        }
-        return !full_text.trim().is_empty();
-    }
-
-    if name == "write" {
-        return !full_text.trim().is_empty();
-    }
-
-    let shown = collapsed_preview_lines(name, *status, output_preview);
-    if name == "bash" {
-        let full_lines = clean_bash_output_lines(full_text, false);
-        let has_trunc_note = full_text
-            .lines()
-            .any(|l| l.trim_start().starts_with("[Showing "));
-        return full_lines.len() > shown.len()
-            || has_trunc_note
-            || shown.iter().any(|l| display_width(l) > body_w);
-    }
-
-    let full_count = full_text
-        .lines()
-        .filter(|l| !l.trim().is_empty() && l.trim() != "(no output)")
-        .count();
-    full_count > shown.len() || shown.iter().any(|l| display_width(l) > body_w)
+    let (expanded_args, extra_arg_lines) = format_expanded_tool_args(name, args_summary, extra);
+    !extra_arg_lines.is_empty() || abbreviate_home_path(&expanded_args) != abbr_args
 }
 
 struct ToolHeaderSpec<'a> {
@@ -566,7 +446,6 @@ struct ToolHeaderSpec<'a> {
     args: &'a str,
     status: ToolState,
     inline_meta: Option<&'a str>,
-    spinner_idx: usize,
     width: usize,
     theme: &'a Theme,
 }
@@ -606,11 +485,8 @@ fn build_tool_header_base_spans(
     spans
 }
 
-fn build_collapsed_tool_header(
-    spec: &ToolHeaderSpec<'_>,
-    show_expand_hint: bool,
-) -> Vec<RenderedLine> {
-    let (glyph, glyph_color) = tool_status_glyph(spec.status, spec.spinner_idx, spec.theme);
+fn build_collapsed_tool_header(spec: &ToolHeaderSpec<'_>, show_expand_hint: bool) -> RenderedLine {
+    let (glyph, glyph_color) = tool_status_glyph(spec.status, spec.theme);
     let abbr_args = abbreviate_home_path(spec.args);
     let (use_meta, use_hint, args_budget) = collapsed_header_budget(
         glyph,
@@ -637,16 +513,11 @@ fn build_collapsed_tool_header(
         ));
     }
 
-    let line = Line::from(spans);
-    if line.width() <= spec.width {
-        vec![RenderedLine::hard(line)]
-    } else {
-        wrap_styled_spans_rich(line.spans, None, None, spec.width)
-    }
+    RenderedLine::hard(Line::from(spans))
 }
 
 fn build_expanded_tool_header(spec: &ToolHeaderSpec<'_>) -> Vec<RenderedLine> {
-    let (glyph, glyph_color) = tool_status_glyph(spec.status, spec.spinner_idx, spec.theme);
+    let (glyph, glyph_color) = tool_status_glyph(spec.status, spec.theme);
     let spans = build_tool_header_base_spans(
         glyph,
         glyph_color,
@@ -667,89 +538,53 @@ pub(super) fn build_tool_lines(
     extra: Option<&ToolExtraMeta>,
     expanded: bool,
     group_ctx: ToolGroupCtx,
-    spinner_idx: usize,
     width: usize,
     theme: &Theme,
 ) -> Vec<RenderedLine> {
     let mut out = Vec::new();
     let inline_meta = resolve_inline_meta(name, status, output_preview, extra);
-    let body_w = width.saturating_sub(4).max(4);
-    let prefix = Span::styled("  │ ", Style::default().fg(theme.border));
-
+    let header = ToolHeaderSpec {
+        name,
+        args: args_summary,
+        status,
+        inline_meta: inline_meta.as_deref(),
+        width,
+        theme,
+    };
     if !expanded {
-        out.extend(build_collapsed_tool_header(
-            &ToolHeaderSpec {
-                name,
-                args: args_summary,
-                status,
-                inline_meta: inline_meta.as_deref(),
-                spinner_idx,
-                width,
-                theme,
-            },
+        out.push(build_collapsed_tool_header(
+            &header,
             group_ctx.show_expand_hint,
         ));
-
-        if !matches!(status, ToolState::Error | ToolState::Blocked)
-            && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
-            && !diff_raw.trim().is_empty()
-        {
-            let (compact_src, _) = compact_diff_preview(diff_raw);
-            let diff_lines = render_diff_rich(&compact_src, body_w, theme);
-            for rl in diff_lines.into_iter().take(4) {
-                let mut spans = vec![prefix.clone()];
-                spans.extend(rl.line.spans);
-                out.push(RenderedLine {
-                    line: Line::from(spans),
-                    soft_wrapped: rl.soft_wrapped,
-                });
-            }
-        } else {
-            let preview_src = if matches!(status, ToolState::Error | ToolState::Blocked)
-                && output_preview.trim().is_empty()
-                && let Some(ext) = extra
-                && !ext.full_content.is_empty()
-            {
-                ext.full_content.as_str()
-            } else {
-                output_preview
-            };
-            let body_color = match status {
-                ToolState::Error | ToolState::Blocked => theme.error,
-                ToolState::Running | ToolState::Done => theme.text_muted,
-            };
-            for raw in collapsed_preview_lines(name, status, preview_src) {
-                let clipped = truncate_display(&raw, body_w);
-                out.push(RenderedLine::hard(Line::from(vec![
-                    prefix.clone(),
-                    Span::styled(clipped, Style::default().fg(body_color)),
-                ])));
-            }
-        }
-
         if group_ctx.is_group_end {
             out.push(RenderedLine::hard(Line::raw("")));
         }
         return out;
     }
 
-    // 展开态（Ctrl+O）：完整保留参数/脚本、完整 Diff 与全文输出
+    let body_w = width.saturating_sub(4).max(4);
+    let prefix = Span::styled("  │ ", Style::default().fg(theme.border));
     let (expanded_args, extra_arg_lines) = format_expanded_tool_args(name, args_summary, extra);
     out.extend(build_expanded_tool_header(&ToolHeaderSpec {
-        name,
         args: &expanded_args,
-        status,
-        inline_meta: inline_meta.as_deref(),
-        spinner_idx,
-        width,
-        theme,
+        ..header
     }));
 
-    if !matches!(status, ToolState::Error | ToolState::Blocked)
-        && let Some(diff_raw) = extra.and_then(|e| e.diff_raw.as_deref())
-        && !diff_raw.trim().is_empty()
+    for raw in extra_arg_lines {
+        out.extend(wrap_styled_spans_rich(
+            vec![Span::styled(raw, Style::default().fg(theme.text_dim))],
+            Some(prefix.clone()),
+            Some(prefix.clone()),
+            width,
+        ));
+    }
+
+    let mut body = tool_body(output_preview, extra);
+    if let Some(diff) = extra
+        .and_then(|e| e.diff_raw.as_deref())
+        .filter(|diff| !diff.trim().is_empty())
     {
-        for rl in render_diff_rich(diff_raw, body_w, theme) {
+        for rl in render_diff_rich(diff, body_w, theme) {
             let mut spans = vec![prefix.clone()];
             spans.extend(rl.line.spans);
             out.push(RenderedLine {
@@ -757,63 +592,22 @@ pub(super) fn build_tool_lines(
                 soft_wrapped: rl.soft_wrapped,
             });
         }
-    } else {
-        let mut emitted = 0usize;
-        let max_lines = 160usize;
-        let mut total_omitted = 0usize;
-
-        if !extra_arg_lines.is_empty() {
-            let total_arg_lines = extra_arg_lines.len();
-            let take_n = total_arg_lines.min(max_lines);
-            total_omitted += total_arg_lines.saturating_sub(take_n);
-            for raw in extra_arg_lines.into_iter().take(take_n) {
-                out.extend(wrap_styled_spans_rich(
-                    vec![Span::styled(raw, Style::default().fg(theme.text_dim))],
-                    Some(prefix.clone()),
-                    Some(prefix.clone()),
-                    width,
-                ));
-                emitted += 1;
-            }
-        }
-
-        let body_text = if let Some(ext) = extra
-            && !ext.full_content.is_empty()
-        {
-            ext.full_content.as_str()
-        } else {
-            output_preview
+        // 部分回执把同一份差异附在正文末尾，保留说明即可。
+        body = body
+            .trim_end()
+            .strip_suffix(diff.trim_end())
+            .unwrap_or(body);
+    }
+    if !body.trim().is_empty() {
+        let color = match status {
+            ToolState::Error | ToolState::Blocked => theme.error,
+            _ => theme.text_muted,
         };
-
-        if !body_text.trim().is_empty() {
-            let body_color = match status {
-                ToolState::Error | ToolState::Blocked => theme.error,
-                ToolState::Running | ToolState::Done => theme.text_muted,
-            };
-            let raw_lines: Vec<&str> = body_text.lines().collect();
-            let rem = max_lines.saturating_sub(emitted);
-            total_omitted += raw_lines.len().saturating_sub(rem);
-            for raw in raw_lines.into_iter().take(rem) {
-                out.extend(wrap_styled_spans_rich(
-                    vec![Span::styled(
-                        raw.to_string(),
-                        Style::default().fg(body_color),
-                    )],
-                    Some(prefix.clone()),
-                    Some(prefix.clone()),
-                    width,
-                ));
-            }
-        }
-
-        if total_omitted > 0 {
+        for raw in body.lines() {
             out.extend(wrap_styled_spans_rich(
-                vec![Span::styled(
-                    format!("  │ … 其余 {total_omitted} 行已省略（完整记录请查 Ctrl+T）"),
-                    Style::default().fg(theme.text_dim),
-                )],
-                None,
-                None,
+                vec![Span::styled(raw.to_owned(), Style::default().fg(color))],
+                Some(prefix.clone()),
+                Some(prefix.clone()),
                 width,
             ));
         }

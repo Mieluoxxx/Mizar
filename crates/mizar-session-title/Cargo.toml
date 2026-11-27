@@ -11,9 +11,9 @@ workspace = true
 [dependencies]
 chrono = { workspace = true }
 cordis = { workspace = true }
-futures = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-llm = { workspace = true }
+mizar-llm-retry = { workspace = true }
 mizar-session = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

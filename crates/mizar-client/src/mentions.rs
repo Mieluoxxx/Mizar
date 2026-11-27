@@ -32,7 +32,6 @@ pub const MENTION_MAX_DIR_ENTRIES: usize = 200;
 /// 单文本文件读取上限（16 MiB），避免超大二进制文件引发内存膨胀。
 const MENTION_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// 单张待解码 `@` 图片文件读取上限（32 MiB）。
-const MENTION_MAX_IMAGE_READ_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MentionExpansionResult {
@@ -238,7 +237,7 @@ pub async fn expand_text_mentions(
         let shown_attr = escape_xml_attr(&shown_path);
 
         if meta.is_file() {
-            if meta.len() > MENTION_MAX_IMAGE_READ_BYTES {
+            if meta.len() > mizar_image::MAX_IMAGE_INPUT_BYTES as u64 {
                 // 先读 16 字节区分是超大图片还是超大普通文件
                 let is_img_header = match tokio::fs::File::open(&target).await {
                     Ok(mut f) => {

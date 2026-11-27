@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::error::HttpErrorHints;
 use crate::types::{
     ContentBlock, ContentBlockKind, FinishReason, Message, ReplayEnvelope, StreamChunk, TokenUsage,
     ToolCall,
@@ -56,6 +57,7 @@ impl PartialBlock {
 pub struct BlockAssembler {
     partials: HashMap<usize, PartialBlock>,
     order: Vec<usize>,
+    response_hints: HttpErrorHints,
     usage: Option<TokenUsage>,
     finish: Option<FinishReason>,
     replay: Option<ReplayEnvelope>,
@@ -68,6 +70,7 @@ impl BlockAssembler {
 
     pub fn push(&mut self, chunk: StreamChunk) {
         match chunk {
+            StreamChunk::ResponseHints(hints) => self.response_hints = hints,
             StreamChunk::BlockStart { index, kind } => {
                 self.ensure(index, kind);
             }
@@ -268,6 +271,10 @@ impl BlockAssembler {
             .iter()
             .filter_map(ContentBlock::to_tool_call)
             .collect()
+    }
+
+    pub fn response_hints(&self) -> HttpErrorHints {
+        self.response_hints
     }
 
     pub fn usage(&self) -> Option<TokenUsage> {

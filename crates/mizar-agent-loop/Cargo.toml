@@ -12,6 +12,7 @@ workspace = true
 chrono = { workspace = true }
 cordis = { workspace = true }
 mizar-llm = { workspace = true }
+mizar-llm-retry = { workspace = true }
 mizar-session = { workspace = true }
 mizar-system-prompt = { workspace = true }
 mizar-tools = { workspace = true }
