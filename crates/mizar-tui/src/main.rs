@@ -55,11 +55,11 @@ use mizar_agent_spine::{
 };
 use mizar_llm::ReasoningEffort;
 use mizar_llm_mock::MockPlugin;
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_tools_coding::CodingToolsPreset;
 use mizar_tui::exec::{
-    ExecConfig, ExecOutputFormat, resolve_exec_prompt, resolve_trace_out_path, run_exec_cli,
+    ExecConfig, ExecOutputFormat, report_exec_input_error, resolve_exec_prompt,
+    resolve_trace_out_path, run_exec_cli,
 };
 use mizar_tui::update::{current_version, is_version_check_disabled, run_update_cli};
 use mizar_tui::{
@@ -211,11 +211,10 @@ fn parse_cli_reasoning_effort(raw: &str) -> Result<ReasoningEffort, String> {
     }
 }
 
-fn parse_cli_args_from<I>(args: I) -> Result<CliArgs, String>
+fn parse_cli_args_into<I>(args: I, out: &mut CliArgs) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut out = CliArgs::default();
     let mut args = args.into_iter().peekable();
     let mut after_double_dash = false;
 
@@ -473,7 +472,7 @@ where
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn default_tokio_worker_threads(parallelism: usize) -> usize {
@@ -503,13 +502,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cli = match parse_cli_args_from(raw_args) {
-        Ok(cli) => cli,
-        Err(err) => {
+    let mut cli = CliArgs::default();
+    if let Err(err) = parse_cli_args_into(raw_args, &mut cli) {
+        if cli.is_exec_mode() {
+            report_exec_input_error(cli.output_format.unwrap_or_default(), &err);
+        } else {
             eprintln!("error: {err}");
-            std::process::exit(1);
         }
-    };
+        std::process::exit(1);
+    }
     if cli.help {
         println!("{}", format_help_text());
         return Ok(());
@@ -527,15 +528,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| std::env::current_dir().expect("failed to resolve cwd"));
 
     if cli.is_exec_mode() {
+        let format = cli.output_format.unwrap_or_default();
         if cli.approve {
-            eprintln!(
-                "error: --approve is incompatible with non-interactive exec mode (code=invalid_request)"
+            report_exec_input_error(
+                format,
+                "--approve is incompatible with non-interactive exec mode (code=invalid_request)",
             );
             std::process::exit(1);
         }
         if cli.inline {
-            eprintln!(
-                "error: --inline is incompatible with non-interactive exec mode (code=invalid_request)"
+            report_exec_input_error(
+                format,
+                "--inline is incompatible with non-interactive exec mode (code=invalid_request)",
             );
             std::process::exit(1);
         }
@@ -547,7 +551,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("error: {err}");
+                report_exec_input_error(format, &err);
                 std::process::exit(1);
             }
         };
@@ -570,7 +574,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             include_tools: cli.include_tools,
             exclude_tools: cli.exclude_tools,
             resume_session: cli.resume_session,
-            output_format: cli.output_format.unwrap_or_default(),
+            output_format: format,
             trace_out: resolve_trace_out_path(cli.trace_out, env_non_empty("MIZAR_TRACE_OUT")),
         })
         .await;
@@ -678,7 +682,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
 
     if let Some(resolved) = resolved_llm {
         app.plugin(LlmRouter::plugin(), resolved.router);

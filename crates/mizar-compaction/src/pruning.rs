@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mizar_llm::ContentBlock;
 use mizar_session::{PrunedToolResult, Session, SessionEntry, SessionEvent};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::budget::{estimate_entry_tokens_with_pruned, estimate_text_tokens};
 
@@ -461,6 +462,18 @@ pub fn prune_session_tail(
     workspace: Option<&str>,
     opts: &TailPruneOptions,
 ) -> TailPruneReport {
+    prune_session_tail_cancellable(session, workspace, opts, None)
+}
+
+pub(crate) fn prune_session_tail_cancellable(
+    session: &Arc<Session>,
+    workspace: Option<&str>,
+    opts: &TailPruneOptions,
+    cancel: Option<&CancellationToken>,
+) -> TailPruneReport {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return TailPruneReport::default();
+    }
     let visible = session.visible_log();
     let all_entries = session.all_entries();
     let pruned_map = session.pruned_map();
@@ -485,6 +498,9 @@ pub fn prune_session_tail(
             original_chars: chars_by_seq.get(&item.target_seq).copied().unwrap_or(0),
         })
         .collect();
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return TailPruneReport::default();
+    }
     session.append_prune(pruned_items);
     TailPruneReport {
         pruned_count,

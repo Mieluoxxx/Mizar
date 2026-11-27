@@ -11,9 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cordis::{BoxFuture, Context, CordisError, Service};
 use mizar_agent_loop::{
-    AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent, AgentToolCallEvent,
-    AgentTurnEndEvent, AgentTurnStartEvent, EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN,
-    EVENT_AGENT_STEP_START, EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START,
+    AgentRetryEvent, AgentStepEndEvent, AgentStepFirstTokenEvent, AgentStepStartEvent,
+    AgentToolCallEvent, AgentTurnEndEvent, AgentTurnStartEvent, EVENT_AGENT_RETRY,
+    EVENT_AGENT_STEP_END, EVENT_AGENT_STEP_FIRST_TOKEN, EVENT_AGENT_STEP_START,
+    EVENT_AGENT_TOOL_CALL, EVENT_AGENT_TURN_END, EVENT_AGENT_TURN_START,
 };
 use mizar_session::{
     EVENT_SESSION_CREATED, EVENT_SESSION_EVENT, Session, SessionCreatedPayload, SessionEntry,
@@ -172,6 +173,23 @@ fn entry_to_trace_event(
                 step: *step,
                 system_prompt_chars: *system_prompt_chars,
                 tools_count: *tools_count,
+            },
+            SessionTraceEvent::StepRetry {
+                turn,
+                step,
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+                reset_draft,
+            } => TraceEventKind::StepRetry {
+                turn: *turn,
+                step: *step,
+                attempt: *attempt,
+                max_attempts: *max_attempts,
+                delay_ms: *delay_ms,
+                reason: reason.clone(),
+                reset_draft: *reset_draft,
             },
             SessionTraceEvent::FirstToken { turn, step } => TraceEventKind::FirstToken {
                 turn: *turn,
@@ -884,6 +902,25 @@ impl Service for TrajectoryRuntime {
                     }
                 },
             )?;
+
+            let rt_retry = Arc::clone(&rt);
+            ctx.on(EVENT_AGENT_RETRY, move |ev: &AgentRetryEvent| {
+                if !rt_retry.session_in_memory(&ev.session.id) {
+                    rt_retry.record_standalone_event(
+                        &ev.session.id,
+                        ev.ts_ms,
+                        TraceEventKind::StepRetry {
+                            turn: ev.turn,
+                            step: ev.step,
+                            attempt: ev.attempt,
+                            max_attempts: ev.max_attempts,
+                            delay_ms: ev.delay_ms,
+                            reason: ev.reason.clone(),
+                            reset_draft: ev.reset_draft,
+                        },
+                    );
+                }
+            })?;
 
             let rt_step_end = Arc::clone(&rt);
             ctx.on(EVENT_AGENT_STEP_END, move |ev: &AgentStepEndEvent| {

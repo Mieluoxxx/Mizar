@@ -1,19 +1,16 @@
-//! 非交互一次性任务执行器（`mizar exec` / `mizar -p` / `mizar --prompt-file`）。
-//!
-//! 职责：
-//! - 复用 `AgentSpinePlugin` + `LlmRouter` + `LlmRetryPlugin` 装配 Agent，但不启动 TUI 与版本检查，也不注入 TUI `reply_guidance` 段落；
-//! - 支持 `--isolated` 隔离个人全局配置 / MCP / Skills / 指令与全局会话库；
-//! - 将诊断与警告严格路由至 `stderr` 并完成敏感凭据脱敏，退出码仅在正常收敛（`Stop` 且未截断/未超步/未取消）时为 `0`；
-//! - `stdout` 仅在退出码为 `0` 时输出最终回答全文，失败时 `stdout` 保持完全为空。
+//! 无头调用方依赖标准输出解析结果，诊断信息必须走标准错误。
 
-use std::io::{IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cordis::{Context, LogLevel, Service};
-use mizar_agent_loop::{AgentError, AgentLoop, RunOptions, StepOutcome, TurnEndReason};
+use mizar_agent_loop::{
+    AgentError, AgentLoop, AgentRetryEvent, EVENT_AGENT_RETRY, RunOptions, TurnEndReason,
+    TurnRunReport,
+};
 use mizar_agent_spine::{
     AgentSpineConfig, AgentSpinePlugin, AgentToolsMode, CliLlmOverride, EnvLlmOverride,
     load_mizar_config, load_mizar_config_isolated, resolve_default_session_db_path,
@@ -21,7 +18,6 @@ use mizar_agent_spine::{
 use mizar_client::mentions::{FileMentionsConfig, FileMentionsPlugin};
 use mizar_client_core::{ClientEvent, HostExtensionFlags, NoticeLevel};
 use mizar_llm::{LlmError, LlmErrorCode, ReasoningEffort};
-use mizar_llm_retry::{LlmRetryPlugin, RetryConfig};
 use mizar_llm_router::LlmRouter;
 use mizar_mcp::McpManager;
 use mizar_session::{SessionContextExt, SessionListQuery, SessionPersistenceContextExt};
@@ -463,86 +459,87 @@ fn configure_exec_logger(app: &Context, secrets: Arc<Mutex<Vec<String>>>) {
     });
 }
 
-fn report_error_with_secrets(msg: &str, secrets: &Arc<Mutex<Vec<String>>>) {
-    let guard = secrets.lock().unwrap();
-    let clean = single_line(&sanitize_diagnostic_text(msg, &guard));
-    eprintln!("error: {clean}");
-}
-
 /// 运行无头一次性任务，返回进程应使用的退出码。
 pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     let exec_started = std::time::Instant::now();
     let env_override = EnvLlmOverride::from_env();
     let log_secrets = Arc::new(Mutex::new(env_override.collect_secrets()));
-    let make_meta = |exit_code: i32,
-                     termination_reason: &str,
-                     error: Option<String>,
-                     provider: Option<String>,
-                     model: Option<String>| TraceExportMeta {
-        exit_code,
-        termination_reason: termination_reason.to_string(),
-        error,
-        duration_ms: exec_started.elapsed().as_millis() as u64,
-        provider,
-        model,
-        isolated: cfg.isolated,
-        output_format: Some(cfg.output_format.as_str().to_string()),
+    let finish = |mut outcome: TurnExitOutcome,
+                  app: Option<&Context>,
+                  session: Option<(&str, bool, u64)>,
+                  report: Option<&TurnRunReport>,
+                  provider: Option<String>,
+                  model: Option<String>| {
+        if let Some(err) = &mut outcome.error {
+            *err = single_line(&sanitize_diagnostic_text(err, &log_secrets.lock().unwrap()));
+            eprintln!("error: {err}");
+        }
+        let json_meta = match (cfg.output_format, app, session) {
+            (ExecOutputFormat::Json, Some(ctx), Some((id, resumed, duration))) => {
+                Some(build_exec_json_meta(ctx, id, resumed, duration))
+            }
+            _ => None,
+        };
+        if let Err(err) = outcome.write_output(cfg.output_format, report, json_meta.as_ref()) {
+            let msg = format!("failed to write stdout: {err}");
+            eprintln!("error: {msg}");
+            if outcome.exit_code == 0 {
+                outcome = TurnExitOutcome::failure("error", msg);
+            }
+        }
+        let code = outcome.exit_code;
+        export_exec_trace_best_effort(
+            cfg.trace_out.as_deref(),
+            app,
+            session.map(|(id, _, _)| id),
+            TraceExportMeta {
+                exit_code: code,
+                termination_reason: outcome.termination_reason.to_owned(),
+                error: outcome.error,
+                duration_ms: exec_started.elapsed().as_millis() as u64,
+                provider,
+                model,
+                isolated: cfg.isolated,
+                output_format: Some(cfg.output_format.as_str().to_owned()),
+            },
+            &log_secrets,
+        );
+        code
     };
 
     if cfg.approve {
         let msg = "--approve is incompatible with non-interactive exec mode (code=invalid_request)";
-        eprintln!("error: {msg}");
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+        return finish(
+            TurnExitOutcome::failure("invalid_request", msg),
             None,
             None,
-            make_meta(
-                1,
-                "invalid_request",
-                Some(msg.to_string()),
-                cfg.provider.clone(),
-                cfg.model.clone(),
-            ),
-            &log_secrets,
+            None,
+            cfg.provider.clone(),
+            cfg.model.clone(),
         );
-        return 1;
     }
     if let Some(ref target) = cfg.resume_session {
         if matches!(target, ResumeTarget::Picker) {
             let msg = "--resume requires a session id in non-interactive exec mode (code=invalid_request)";
-            eprintln!("error: {msg}");
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("invalid_request", msg),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "invalid_request",
-                    Some(msg.to_string()),
-                    cfg.provider.clone(),
-                    cfg.model.clone(),
-                ),
-                &log_secrets,
+                None,
+                cfg.provider.clone(),
+                cfg.model.clone(),
             );
-            return 1;
         }
         if cfg.no_persist || cfg.isolated {
             let msg = "--continue/--resume is incompatible with --no-persist/--isolated (code=invalid_request)";
-            eprintln!("error: {msg}");
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("invalid_request", msg),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "invalid_request",
-                    Some(msg.to_string()),
-                    cfg.provider.clone(),
-                    cfg.model.clone(),
-                ),
-                &log_secrets,
+                None,
+                cfg.provider.clone(),
+                cfg.model.clone(),
             );
-            return 1;
         }
     }
 
@@ -557,21 +554,14 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         && mode.trim().eq_ignore_ascii_case("ask")
     {
         let msg = "ui.approvalMode=\"ask\" is incompatible with non-interactive exec mode (code=invalid_request)";
-        eprintln!("error: {msg}");
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+        return finish(
+            TurnExitOutcome::failure("invalid_request", msg),
             None,
             None,
-            make_meta(
-                1,
-                "invalid_request",
-                Some(msg.to_string()),
-                cfg.provider.clone(),
-                cfg.model.clone(),
-            ),
-            &log_secrets,
+            None,
+            cfg.provider.clone(),
+            cfg.model.clone(),
         );
-        return 1;
     }
 
     for parse_err in &loaded_cfg.errors {
@@ -591,21 +581,14 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         Ok(resolved) => resolved,
         Err(err) => {
             let err_msg = err.to_string();
-            report_error_with_secrets(&err_msg, &log_secrets);
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("error", err_msg),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "error",
-                    Some(err_msg),
-                    cfg.provider.clone(),
-                    cfg.model.clone(),
-                ),
-                &log_secrets,
+                None,
+                cfg.provider.clone(),
+                cfg.model.clone(),
             );
-            return 1;
         }
     };
 
@@ -635,21 +618,14 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                 let guard = log_secrets.lock().unwrap();
                 format_llm_error_diagnostic(&err, &guard)
             };
-            eprintln!("error: {diag}");
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
+            return finish(
+                TurnExitOutcome::failure("error", diag),
                 None,
                 None,
-                make_meta(
-                    1,
-                    "error",
-                    Some(diag),
-                    Some(resolved_llm.active_provider.clone()),
-                    resolved_llm.active_model.clone(),
-                ),
-                &log_secrets,
+                None,
+                Some(resolved_llm.active_provider.clone()),
+                resolved_llm.active_model.clone(),
             );
-            return 1;
         }
     }
 
@@ -710,21 +686,14 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
     if cfg.resume_session.is_some() && !has_session_db {
         let msg = "--continue/--resume requires session persistence database configuration (code=invalid_request)";
-        eprintln!("error: {msg}");
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+        return finish(
+            TurnExitOutcome::failure("invalid_request", msg),
             None,
             None,
-            make_meta(
-                1,
-                "invalid_request",
-                Some(msg.to_string()),
-                Some(active_provider.clone()),
-                active_model.clone(),
-            ),
-            &log_secrets,
+            None,
+            Some(active_provider.clone()),
+            active_model.clone(),
         );
-        return 1;
     }
 
     let app = Context::new();
@@ -737,7 +706,19 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
     };
 
     app.plugin(AgentSpinePlugin, spine_cfg);
-    app.plugin(LlmRetryPlugin, RetryConfig::default());
+    let retry_secrets = Arc::clone(&log_secrets);
+    let _retry_subscription = app
+        .on(EVENT_AGENT_RETRY, move |ev: &AgentRetryEvent| {
+            let reason = single_line(&sanitize_diagnostic_text(
+                &ev.reason,
+                &retry_secrets.lock().unwrap(),
+            ));
+            eprintln!(
+                "[W retry] step={} attempt={}/{} wait={}ms reason={reason}",
+                ev.step, ev.attempt, ev.max_attempts, ev.delay_ms
+            );
+        })
+        .expect("active exec context");
     app.plugin(LlmRouter::plugin(), resolved_llm.router);
     if ext_flags.file_mentions {
         let mention_secrets = Arc::clone(&log_secrets);
@@ -779,14 +760,6 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         () = cancel.cancelled() => Err("startup cancelled".to_string()),
         res = async {
             wait_for_services(&app).await.map_err(|e| e.to_string())?;
-            if has_session_db && app.session_persistence().is_none() {
-                for _ in 0..25 {
-                    if app.session_persistence().is_some() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
             if let Some(mcp) = app.get::<McpManager>("mcp") {
                 mcp.wait_ready().await;
             }
@@ -794,51 +767,37 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
         } => res,
     };
 
-    if let Err(err_msg) = init_res {
-        let outcome = resolve_cancel_or_error_exit(
-            &timed_out,
-            cfg.timeout_secs,
-            &signal_code,
-            &err_msg,
-            &log_secrets,
-        );
-        export_exec_trace_best_effort(
-            cfg.trace_out.as_deref(),
+    let complete = |outcome, session: Option<(&str, bool, u64)>, report: Option<&TurnRunReport>| {
+        finish(
+            outcome,
+            Some(&app),
+            session,
+            report,
+            Some(active_provider.clone()),
+            active_model.clone(),
+        )
+    };
+    let interruption = || interrupted_exit(&timed_out, cfg.timeout_secs, &signal_code);
+    let exit_code = if let Err(err_msg) = init_res {
+        complete(
+            interruption().unwrap_or_else(|| TurnExitOutcome::failure("error", err_msg)),
             None,
             None,
-            make_meta(
-                outcome.exit_code,
-                outcome.termination_reason,
-                outcome.error,
-                Some(active_provider.clone()),
-                active_model.clone(),
-            ),
-            &log_secrets,
-        );
-        cleanup_exec(&app, signal_handle, timeout_handle).await;
-        return outcome.exit_code;
-    }
-
-    let exit_code = match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
-        (Ok(sessions), Ok(agent_loop)) => {
-            if cfg.resume_session.is_some() && app.session_persistence().is_none() {
-                let msg = "session persistence backend is unavailable for --continue/--resume (code=storage)";
-                eprintln!("error: {msg}");
-                export_exec_trace_best_effort(
-                    cfg.trace_out.as_deref(),
-                    Some(&app),
-                    None,
-                    make_meta(
-                        1,
-                        "storage",
-                        Some(msg.to_string()),
-                        Some(active_provider.clone()),
-                        active_model.clone(),
-                    ),
-                    &log_secrets,
-                );
-                1
-            } else {
+        )
+    } else if has_session_db && app.session_persistence().is_none() {
+        complete(
+            interruption().unwrap_or_else(|| {
+                TurnExitOutcome::failure(
+                    "storage",
+                    "session persistence backend is unavailable (code=storage)",
+                )
+            }),
+            None,
+            None,
+        )
+    } else {
+        match (app.sessions(), app.service::<AgentLoop>("agentLoop")) {
+            (Ok(sessions), Ok(agent_loop)) => {
                 let resolved_session = match &cfg.resume_session {
                     Some(ResumeTarget::Picker) => Err(
                         "--resume requires a session id in non-interactive exec mode (code=invalid_request)"
@@ -873,21 +832,7 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
 
                 match resolved_session {
                     Err(msg) => {
-                        eprintln!("error: {msg}");
-                        export_exec_trace_best_effort(
-                            cfg.trace_out.as_deref(),
-                            Some(&app),
-                            None,
-                            make_meta(
-                                1,
-                                "invalid_request",
-                                Some(msg),
-                                Some(active_provider.clone()),
-                                active_model.clone(),
-                            ),
-                            &log_secrets,
-                        );
-                        1
+                        complete(TurnExitOutcome::failure("invalid_request", msg), None, None)
                     }
                     Ok((session, resumed)) => {
                         let turn_started = std::time::Instant::now();
@@ -904,87 +849,39 @@ pub async fn run_exec_cli(cfg: ExecConfig) -> i32 {
                             .await;
                         let duration_ms = turn_started.elapsed().as_millis() as u64;
 
-                        if has_session_db {
-                            let _ = sessions.flush_async(Some(session.id.clone())).await;
-                        }
-
-                        let json_meta = if cfg.output_format == ExecOutputFormat::Json {
-                            Some(build_exec_json_meta(
-                                &app,
-                                &session.id,
-                                resumed,
-                                duration_ms,
-                            ))
+                        let flush_error = if has_session_db {
+                            sessions.flush_async(Some(session.id.clone())).await.err()
                         } else {
                             None
                         };
-
-                        let outcome = if timed_out.load(Ordering::SeqCst) {
-                            let secs = cfg.timeout_secs.unwrap_or(0);
-                            let msg = format!("execution timed out after {secs}s (code=timeout)");
-                            eprintln!("error: {msg}");
-                            TurnExitOutcome {
-                                exit_code: 124,
-                                termination_reason: "timeout",
-                                error: Some(msg),
-                            }
-                        } else {
-                            let sig = signal_code.load(Ordering::SeqCst);
-                            if sig != 0 {
-                                let msg =
-                                    "execution interrupted by signal (code=cancelled)".to_string();
-                                eprintln!("error: {msg}");
-                                TurnExitOutcome {
-                                    exit_code: sig,
-                                    termination_reason: "cancelled",
-                                    error: Some(msg),
-                                }
+                        let mut outcome = interruption().unwrap_or_else(|| {
+                            classify_turn_result(&run_res, configured_max_steps, &log_secrets)
+                        });
+                        if let Some(err) = flush_error {
+                            let msg = format!("failed to persist session: {err} (code=storage)");
+                            if outcome.exit_code == 0 {
+                                outcome = TurnExitOutcome::failure("storage", msg);
                             } else {
-                                classify_turn_result(
-                                    run_res,
-                                    configured_max_steps,
-                                    cfg.output_format,
-                                    json_meta.as_ref(),
-                                    &log_secrets,
-                                )
+                                let clean = single_line(&sanitize_diagnostic_text(
+                                    &msg,
+                                    &log_secrets.lock().unwrap(),
+                                ));
+                                eprintln!("[W storage] {clean}");
                             }
-                        };
-
-                        export_exec_trace_best_effort(
-                            cfg.trace_out.as_deref(),
-                            Some(&app),
-                            Some(&session.id),
-                            make_meta(
-                                outcome.exit_code,
-                                outcome.termination_reason,
-                                outcome.error,
-                                Some(active_provider.clone()),
-                                active_model.clone(),
-                            ),
-                            &log_secrets,
-                        );
-                        outcome.exit_code
+                        }
+                        complete(
+                            outcome,
+                            Some((&session.id, resumed, duration_ms)),
+                            run_res.as_ref().ok(),
+                        )
                     }
                 }
             }
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            let err_msg = e.to_string();
-            report_error_with_secrets(&err_msg, &log_secrets);
-            export_exec_trace_best_effort(
-                cfg.trace_out.as_deref(),
-                Some(&app),
+            (Err(err), _) | (_, Err(err)) => complete(
+                TurnExitOutcome::failure("error", err.to_string()),
                 None,
-                make_meta(
-                    1,
-                    "error",
-                    Some(err_msg),
-                    Some(active_provider.clone()),
-                    active_model.clone(),
-                ),
-                &log_secrets,
-            );
-            1
+                None,
+            ),
         }
     };
 
@@ -1105,173 +1002,128 @@ fn export_exec_trace_best_effort(
     }
 }
 
-fn resolve_cancel_or_error_exit(
-    timed_out: &AtomicBool,
-    timeout_secs: Option<u64>,
-    signal_code: &AtomicI32,
-    fallback_msg: &str,
-    secrets: &Arc<Mutex<Vec<String>>>,
-) -> TurnExitOutcome {
-    if timed_out.load(Ordering::SeqCst) {
-        let secs = timeout_secs.unwrap_or(0);
-        let msg = format!("execution timed out after {secs}s (code=timeout)");
-        eprintln!("error: {msg}");
-        return TurnExitOutcome {
-            exit_code: 124,
-            termination_reason: "timeout",
-            error: Some(msg),
-        };
+impl TurnExitOutcome {
+    fn failure(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 1,
+            termination_reason: reason,
+            error: Some(message.into()),
+        }
     }
-    let sig = signal_code.load(Ordering::SeqCst);
-    if sig != 0 {
-        let msg = "execution interrupted by signal (code=cancelled)".to_string();
-        eprintln!("error: {msg}");
-        return TurnExitOutcome {
-            exit_code: sig,
-            termination_reason: "cancelled",
-            error: Some(msg),
-        };
-    }
-    report_error_with_secrets(fallback_msg, secrets);
-    TurnExitOutcome {
-        exit_code: 1,
-        termination_reason: "error",
-        error: Some(fallback_msg.to_string()),
+
+    fn write_output(
+        &self,
+        format: ExecOutputFormat,
+        report: Option<&TurnRunReport>,
+        meta: Option<&ExecJsonMeta>,
+    ) -> io::Result<()> {
+        let text = report
+            .filter(|_| self.exit_code == 0)
+            .map_or("", |r| r.text.as_str());
+        let mut out = io::stdout().lock();
+        match format {
+            ExecOutputFormat::Text if !text.is_empty() => {
+                write!(out, "{text}")?;
+                if !text.ends_with('\n') {
+                    writeln!(out)?;
+                }
+            }
+            ExecOutputFormat::Json => {
+                let mut payload = serde_json::json!({"reason": self.termination_reason, "exit_code": self.exit_code, "text": text});
+                if let Some(report) = report {
+                    payload["steps"] = report.steps.into();
+                }
+                if let Some(error) = &self.error {
+                    payload["error"] = error.as_str().into();
+                }
+                if let Some(meta) = meta {
+                    payload["session_id"] = meta.session_id.as_str().into();
+                    payload["resumed"] = meta.resumed.into();
+                    payload["duration_ms"] = meta.duration_ms.into();
+                    payload["llm_ms"] = meta.turn_llm_ms.into();
+                    payload["ttft_ms"] = meta.turn_ttft_ms.into();
+                    payload["tool_ms"] = meta.session_tool_ms.into();
+                    payload["tool_calls"] = meta.turn_tool_calls.into();
+                    payload["session_turns"] = meta.session_turns.into();
+                    payload["session_steps"] = meta.session_steps.into();
+                }
+                writeln!(out, "{payload}")?;
+            }
+            ExecOutputFormat::Text => {}
+        }
+        out.flush()
     }
 }
 
+pub fn report_exec_input_error(format: ExecOutputFormat, message: &str) {
+    let env_secrets = EnvLlmOverride::from_env().collect_secrets();
+    let msg = single_line(&sanitize_diagnostic_text(message, &env_secrets));
+    eprintln!("error: {msg}");
+    if let Err(err) =
+        TurnExitOutcome::failure("invalid_request", msg).write_output(format, None, None)
+    {
+        eprintln!("error: failed to write stdout: {err}");
+    }
+}
+
+fn interrupted_exit(
+    timed_out: &AtomicBool,
+    timeout_secs: Option<u64>,
+    signal_code: &AtomicI32,
+) -> Option<TurnExitOutcome> {
+    if timed_out.load(Ordering::SeqCst) {
+        let secs = timeout_secs.unwrap_or(0);
+        return Some(TurnExitOutcome {
+            exit_code: 124,
+            termination_reason: "timeout",
+            error: Some(format!("execution timed out after {secs}s (code=timeout)")),
+        });
+    }
+    let sig = signal_code.load(Ordering::SeqCst);
+    (sig != 0).then(|| TurnExitOutcome {
+        exit_code: sig,
+        termination_reason: "cancelled",
+        error: Some("execution interrupted by signal (code=cancelled)".to_owned()),
+    })
+}
+
 fn classify_turn_result(
-    run_res: Result<mizar_agent_loop::TurnRunReport, AgentError>,
+    run_res: &Result<TurnRunReport, AgentError>,
     configured_max_steps: Option<usize>,
-    output_format: ExecOutputFormat,
-    json_meta: Option<&ExecJsonMeta>,
-    secrets: &Arc<Mutex<Vec<String>>>,
+    secrets: &Mutex<Vec<String>>,
 ) -> TurnExitOutcome {
     match run_res {
-        Ok(report) => {
-            if report.reason == TurnEndReason::Truncated
-                || matches!(report.last_step_outcome, Some(StepOutcome::MaxTokens))
-            {
-                let msg = "model output truncated: response exceeded model output token maximum (code=max_tokens)";
-                eprintln!("error: {msg}");
-                return TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "truncated",
-                    error: Some(msg.to_string()),
-                };
+        Ok(report) => match &report.reason {
+            TurnEndReason::Completed => TurnExitOutcome {
+                exit_code: 0,
+                termination_reason: "completed",
+                error: None,
+            },
+            TurnEndReason::MaxSteps => TurnExitOutcome::failure(
+                "max_steps",
+                format!(
+                    "max steps exceeded (steps={}, max_steps={}, code=max_steps)",
+                    report.steps,
+                    configured_max_steps.unwrap_or(report.steps)
+                ),
+            ),
+            TurnEndReason::Cancelled => {
+                TurnExitOutcome::failure("cancelled", "execution cancelled (code=cancelled)")
             }
-            match report.reason {
-                TurnEndReason::Completed => {
-                    match output_format {
-                        ExecOutputFormat::Text => {
-                            if !report.text.is_empty() {
-                                if report.text.ends_with('\n') {
-                                    print!("{}", report.text);
-                                } else {
-                                    println!("{}", report.text);
-                                }
-                            }
-                        }
-                        ExecOutputFormat::Json => {
-                            let payload = if let Some(meta) = json_meta {
-                                serde_json::json!({
-                                    "session_id": meta.session_id,
-                                    "resumed": meta.resumed,
-                                    "reason": "completed",
-                                    "steps": report.steps,
-                                    "duration_ms": meta.duration_ms,
-                                    "llm_ms": meta.turn_llm_ms,
-                                    "ttft_ms": meta.turn_ttft_ms,
-                                    "tool_ms": meta.session_tool_ms,
-                                    "tool_calls": meta.turn_tool_calls,
-                                    "session_turns": meta.session_turns,
-                                    "session_steps": meta.session_steps,
-                                    "text": report.text,
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "reason": "completed",
-                                    "steps": report.steps,
-                                    "text": report.text,
-                                })
-                            };
-                            println!("{payload}");
-                        }
-                    }
-                    TurnExitOutcome {
-                        exit_code: 0,
-                        termination_reason: "completed",
-                        error: None,
-                    }
-                }
-                TurnEndReason::MaxSteps => {
-                    let limit = configured_max_steps.unwrap_or(report.steps);
-                    let msg = format!(
-                        "max steps exceeded (steps={}, max_steps={limit}, code=max_steps)",
-                        report.steps
-                    );
-                    eprintln!("error: {msg}");
-                    TurnExitOutcome {
-                        exit_code: 1,
-                        termination_reason: "max_steps",
-                        error: Some(msg),
-                    }
-                }
-                TurnEndReason::Cancelled => {
-                    let msg = "execution cancelled (code=cancelled)";
-                    eprintln!("error: {msg}");
-                    TurnExitOutcome {
-                        exit_code: 1,
-                        termination_reason: "cancelled",
-                        error: Some(msg.to_string()),
-                    }
-                }
-                TurnEndReason::Error { message } => {
-                    report_error_with_secrets(&message, secrets);
-                    TurnExitOutcome {
-                        exit_code: 1,
-                        termination_reason: "error",
-                        error: Some(message),
-                    }
-                }
-                TurnEndReason::Truncated => TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "truncated",
-                    error: Some("model output truncated (code=max_tokens)".to_string()),
-                },
-            }
+            TurnEndReason::Error { message } => TurnExitOutcome::failure("error", message),
+            TurnEndReason::Truncated => TurnExitOutcome::failure(
+                "truncated",
+                "model output truncated: response exceeded model output token maximum (code=max_tokens)",
+            ),
+        },
+        Err(AgentError::Llm(err)) if err.code == LlmErrorCode::Cancelled => {
+            TurnExitOutcome::failure("cancelled", "execution cancelled (code=cancelled)")
         }
-        Err(AgentError::Llm(llm_err)) => {
-            if llm_err.code == LlmErrorCode::Cancelled {
-                let msg = "execution cancelled (code=cancelled)";
-                eprintln!("error: {msg}");
-                TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "cancelled",
-                    error: Some(msg.to_string()),
-                }
-            } else {
-                let diag = {
-                    let guard = secrets.lock().unwrap();
-                    format_llm_error_diagnostic(&llm_err, &guard)
-                };
-                eprintln!("error: {diag}");
-                TurnExitOutcome {
-                    exit_code: 1,
-                    termination_reason: "error",
-                    error: Some(diag),
-                }
-            }
-        }
-        Err(err) => {
-            let msg = err.to_string();
-            report_error_with_secrets(&msg, secrets);
-            TurnExitOutcome {
-                exit_code: 1,
-                termination_reason: "error",
-                error: Some(msg),
-            }
-        }
+        Err(AgentError::Llm(err)) => TurnExitOutcome::failure(
+            "error",
+            format_llm_error_diagnostic(err, &secrets.lock().unwrap()),
+        ),
+        Err(err) => TurnExitOutcome::failure("error", err.to_string()),
     }
 }
 

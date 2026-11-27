@@ -3,10 +3,10 @@
 use serde_json::Value;
 
 use super::{
-    ActivityState, AppState, ChatItem, NoticeLevel, ToolExtraMeta, ToolState, UiAgentStatus,
-    UiEvent, UiLogLevel, UiStepOutcome, UiTurnEndReason, bash_inline_meta, bash_scope_label,
-    extract_inline_meta, summarize_live_preview, summarize_tool_args, summarize_tool_result,
-    turn_end_program_status,
+    ActivityState, AppState, ChatItem, DraftTtft, NoticeLevel, ToolExtraMeta, ToolState,
+    UiAgentStatus, UiEvent, UiLogLevel, UiStepOutcome, UiTurnEndReason, bash_inline_meta,
+    bash_scope_label, extract_inline_meta, summarize_live_preview, summarize_tool_args,
+    summarize_tool_result, turn_end_program_status,
 };
 use crate::reveal::RevealSlot;
 use crate::terminal::{ProgramStatusState, emit_terminal_progress};
@@ -82,6 +82,7 @@ impl AppState {
             } = &mut self.activity
             {
                 *streaming_assistant_open = true;
+                self.draft.first_item.get_or_insert(self.items.len() - 1);
             }
         }
         let idx = self.items.len() - 1;
@@ -89,16 +90,19 @@ impl AppState {
     }
 
     pub fn apply_ui_event(&mut self, event: UiEvent) {
+        if matches!(
+            event,
+            UiEvent::FirstToken { .. }
+                | UiEvent::ReasoningDelta { .. }
+                | UiEvent::TextDelta { .. }
+                | UiEvent::StepEnd { .. }
+        ) && let ActivityState::Agent { retry_status, .. } = &mut self.activity
+        {
+            *retry_status = None;
+        }
         match event {
             UiEvent::Status(status) => match status {
-                UiAgentStatus::Busy => {
-                    if !matches!(self.activity, ActivityState::Agent { .. }) {
-                        self.activity = ActivityState::Agent {
-                            streaming_assistant_open: false,
-                            compaction_status: None,
-                        };
-                    }
-                }
+                UiAgentStatus::Busy => self.set_busy_state(true),
                 UiAgentStatus::Idle => {
                     if matches!(self.activity, ActivityState::Agent { .. }) {
                         self.activity = ActivityState::Idle;
@@ -116,6 +120,7 @@ impl AppState {
                 self.activity = ActivityState::Agent {
                     streaming_assistant_open: false,
                     compaction_status: preserved_compaction,
+                    retry_status: None,
                 };
                 self.auto_scroll = true;
                 self.last_turn_end_reason = None;
@@ -125,6 +130,8 @@ impl AppState {
                 self.record_program_status(ProgramStatusState::Working, None, Some("Generating"));
             }
             UiEvent::TurnEnd { reason } => {
+                self.draft = Default::default();
+                self.last_step_start_ms = None;
                 self.activity = ActivityState::Idle;
                 self.reveal.snap_all();
                 emit_terminal_progress(false);
@@ -167,8 +174,50 @@ impl AppState {
                 self.refresh_context_breakdown();
             }
             UiEvent::StepStart { ts_ms } => {
+                self.draft = Default::default();
                 self.last_step_start_ms = Some(ts_ms);
                 self.tps.on_step_start();
+            }
+            UiEvent::StepRetrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reset_draft,
+                ts_ms,
+                ..
+            } => {
+                let ActivityState::Agent {
+                    streaming_assistant_open,
+                    retry_status,
+                    ..
+                } = &mut self.activity
+                else {
+                    return;
+                };
+                let seconds = delay_ms.div_ceil(1_000);
+                *retry_status = Some(format!("重试 {attempt}/{max_attempts} ({seconds}s)…"));
+                if reset_draft {
+                    let draft = std::mem::take(&mut self.draft);
+                    if let Some(start) = draft.first_item {
+                        for idx in start..self.items.len() {
+                            self.item_cache.invalidate_item(idx);
+                            self.reveal.remove_item(idx);
+                        }
+                        self.items
+                            .extract_if(start.., |item| matches!(item, ChatItem::Assistant { .. }))
+                            .for_each(drop);
+                    }
+                    if let DraftTtft::Sampled { evicted_ms } = draft.ttft {
+                        self.ttft_history.pop();
+                        if let Some(oldest) = evicted_ms {
+                            self.ttft_history.insert(0, oldest);
+                        }
+                        self.last_ttft_ms = self.ttft_history.last().copied();
+                    }
+                    *streaming_assistant_open = false;
+                    self.tps.reset_open_step(ts_ms);
+                    self.refresh_context_breakdown();
+                }
             }
             UiEvent::StepEnd {
                 step,
@@ -176,17 +225,23 @@ impl AppState {
                 outcome,
                 usage,
             } => {
+                self.draft = Default::default();
+                self.last_step_start_ms = None;
+                self.close_streaming_assistant();
                 self.last_step_outcome = Some((step, outcome));
                 self.tps.on_step_end(ts_ms, usage);
             }
             UiEvent::FirstToken { ts_ms } => {
-                if let Some(start) = self.last_step_start_ms.take() {
+                if let Some(start) = self.last_step_start_ms
+                    && matches!(self.draft.ttft, DraftTtft::Pending)
+                {
                     let ttft = ts_ms.saturating_sub(start) as u64;
+                    let evicted_ms =
+                        (self.ttft_history.len() == 32).then(|| self.ttft_history.remove(0));
                     self.last_ttft_ms = Some(ttft);
                     self.ttft_history.push(ttft);
-                    if self.ttft_history.len() > 32 {
-                        self.ttft_history.remove(0);
-                    }
+                    self.draft.ttft = DraftTtft::Sampled { evicted_ms };
+                    self.refresh_context_breakdown();
                 }
                 self.tps.on_first_token(ts_ms);
             }

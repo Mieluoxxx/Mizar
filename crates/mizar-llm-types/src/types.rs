@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::LlmErrorCode;
+use crate::error::{HttpErrorHints, LlmError, LlmErrorCode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
@@ -452,11 +452,48 @@ pub enum FinishReason {
         status: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        should_retry: Option<bool>,
     },
+}
+
+impl FinishReason {
+    pub fn into_error(self) -> Option<LlmError> {
+        match self {
+            Self::Aborted => Some(LlmError::cancelled()),
+            Self::Error {
+                code,
+                message,
+                status,
+                retry_after_ms,
+                should_retry,
+            } => Some(LlmError {
+                code,
+                message,
+                status,
+                retry_after_ms,
+                should_retry,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl From<LlmError> for FinishReason {
+    fn from(err: LlmError) -> Self {
+        Self::Error {
+            code: err.code,
+            message: err.message,
+            status: err.status,
+            retry_after_ms: err.retry_after_ms,
+            should_retry: err.should_retry,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamChunk {
+    ResponseHints(HttpErrorHints),
     BlockStart {
         index: usize,
         kind: ContentBlockKind,

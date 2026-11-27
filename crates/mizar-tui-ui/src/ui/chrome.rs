@@ -8,7 +8,8 @@ use ratatui::widgets::{Block, Borders};
 
 use super::{BRAILLE_SPINNER, color_to_rgb8, effort_color, format_effort_label};
 use crate::app::{
-    AppState, ApprovalMode, BashInputMode, UiTurnEndReason, format_tokens, truncate_display,
+    ActivityState, AppState, ApprovalMode, BashInputMode, UiTurnEndReason, format_tokens,
+    truncate_display,
 };
 use crate::editor::display_width;
 use crate::selection::SelectionPane;
@@ -346,16 +347,13 @@ pub(super) fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App
     }
 
     let theme = app.theme.clone();
-    let is_busy = app.is_busy();
-    let is_bash = app.is_bash_running();
-    let is_compacting = app.is_compacting();
     let spinner = BRAILLE_SPINNER[app.spinner_tick % BRAILLE_SPINNER.len()];
-    let (status_text, status_color) = if is_compacting {
-        let detail = app.compaction_status().unwrap_or("上下文压缩中…");
+    let (status_text, status_color) = if let Some(detail) = app.compaction_status() {
         (format!("{spinner} {detail}"), theme.info)
-    } else if is_busy {
-        (format!("{spinner} 运行中"), theme.warning)
-    } else if is_bash {
+    } else if let ActivityState::Agent { retry_status, .. } = &app.activity {
+        let detail = retry_status.as_deref().unwrap_or("运行中");
+        (format!("{spinner} {detail}"), theme.warning)
+    } else if app.is_bash_running() {
         (format!("{spinner} Bash"), theme.warning)
     } else {
         match &app.last_turn_end_reason {

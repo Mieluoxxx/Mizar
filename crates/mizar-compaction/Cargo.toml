@@ -10,9 +10,9 @@ workspace = true
 
 [dependencies]
 cordis = { workspace = true }
-futures = { workspace = true }
 mizar-agent-loop = { workspace = true }
 mizar-llm = { workspace = true }
+mizar-llm-retry = { workspace = true }
 mizar-session = { workspace = true }
 mizar-system-prompt = { workspace = true }
 mizar-tools = { workspace = true }

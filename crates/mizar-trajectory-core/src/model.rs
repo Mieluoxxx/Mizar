@@ -30,6 +30,15 @@ pub enum TraceEventKind {
         #[serde(default)]
         tools_count: usize,
     },
+    StepRetry {
+        turn: u64,
+        step: usize,
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        reason: String,
+        reset_draft: bool,
+    },
     FirstToken {
         turn: u64,
         step: usize,
@@ -104,7 +113,7 @@ pub struct SessionStats {
     pub turns: u64,
     /// 已闭合步数（`step/end` 总数）。
     pub steps: u64,
-    /// 组装出助手消息的步的模型墙钟总耗时（毫秒）。
+    /// 失败步骤不会生成助手消息，其模型耗时仍计入总量。
     pub llm_ms: u64,
     /// 成功配对 `tool/call -> tool/result` 的工具墙钟总耗时（毫秒）。
     pub tool_ms: u64,

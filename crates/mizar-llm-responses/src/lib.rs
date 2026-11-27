@@ -10,8 +10,9 @@ use mizar_llm::{
     BoxChunkStream, CacheRetention, ContentBlock, ContentBlockKind, FinishReason, GenerateOptions,
     LlmAdapter, LlmContextExt, LlmError, LlmErrorCode, Message, ModelInfo, ProviderInfo,
     ReasoningEffort, ReplayEnvelope, SessionAffinityMode, SseEvent, StreamChunk, TokenUsage,
-    ToolSchema, clamp_openai_prompt_cache_key, detect_session_affinity_mode,
-    push_session_affinity_headers, resolve_cache_retention,
+    ToolSchema, clamp_openai_prompt_cache_key, classify_inband_error_value,
+    classify_non_json_sse_frame, detect_session_affinity_mode, push_session_affinity_headers,
+    resolve_cache_retention,
 };
 use mizar_llm_http::{
     DEFAULT_IDLE_TIMEOUT, SseRequest, SseStreamDecoder, discover_models_http, resolve_credential,
@@ -114,7 +115,10 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
                         Some("reasoning") if has_encrypted_reasoning(item) => {
                             items.push(item.clone());
                         }
-                        Some("message") => {
+                        Some("message")
+                            if !blocks.is_empty()
+                                || message_text_parts(item).any(|s| !s.is_empty()) =>
+                        {
                             items.push(item.clone());
                         }
                         Some("function_call")
@@ -134,7 +138,7 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
             }
 
             // 跨模型/跨路由或无原生保序回放数据时，仍严格按 blocks 原序输出，且剥离 reasoning 与 fc_* id 避免配对校验错误。
-            let mut items = Vec::with_capacity(blocks.len().max(1));
+            let mut items = Vec::with_capacity(blocks.len());
             for block in blocks {
                 match block {
                     ContentBlock::Reasoning { .. } => {}
@@ -167,7 +171,7 @@ fn to_wire_inner(message: &Message, replay_target: Option<(&str, &str)>) -> Vec<
                 }
             }
 
-            if items.is_empty() {
+            if items.is_empty() && !blocks.is_empty() {
                 items.push(json!({
                     "type": "message",
                     "role": "assistant",
@@ -268,6 +272,18 @@ fn normalize_reasoning_item(item: &Value) -> Option<Value> {
         obj.insert("encrypted_content".to_string(), json!(enc));
     }
     Some(Value::Object(obj))
+}
+
+fn message_text_parts(item: &Value) -> impl Iterator<Item = &str> {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| match part.get("type")?.as_str()? {
+            "output_text" => part.get("text")?.as_str(),
+            "refusal" => part.get("refusal")?.as_str(),
+            _ => None,
+        })
 }
 
 fn normalize_message_item(item: &Value, fallback_text: &str) -> Option<Value> {
@@ -640,12 +656,6 @@ pub fn build_request_body(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ResponsesEventPhase {
-    Streaming,
-    Done,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum ResponsesFinishPhase {
     Pending,
     Emitted,
@@ -729,35 +739,49 @@ fn upsert_recorded_output_item(
 }
 
 fn classify_incomplete_finish(reason: Option<&str>) -> FinishReason {
-    let normalized = reason.map(str::trim).filter(|s| !s.is_empty());
-    match normalized {
+    match reason.map(str::trim).filter(|s| !s.is_empty()) {
         Some("max_output_tokens") => FinishReason::MaxTokens,
-        Some("content_filter") => FinishReason::Error {
-            code: LlmErrorCode::ContentRefused,
-            message: "response incomplete: content_filter".to_string(),
-            status: None,
-            retry_after_ms: None,
-        },
-        Some(other) => {
-            let err = LlmError::classify_provider_error(
-                None,
-                Some("incomplete"),
-                Some(other),
-                &format!("response incomplete: {other}"),
-            );
-            FinishReason::Error {
-                code: err.code,
-                message: err.message,
-                status: err.status,
-                retry_after_ms: err.retry_after_ms,
-            }
-        }
-        None => FinishReason::Error {
-            code: LlmErrorCode::MalformedResponse,
-            message: "response incomplete without a provider reason".to_string(),
-            status: None,
-            retry_after_ms: None,
-        },
+        Some("content_filter") => LlmError::new(
+            LlmErrorCode::ContentRefused,
+            "response incomplete: content_filter",
+        )
+        .into(),
+        other => LlmError::new(
+            LlmErrorCode::Unknown,
+            format!(
+                "response incomplete: {}",
+                other.unwrap_or("unspecified reason")
+            ),
+        )
+        .into(),
+    }
+}
+
+fn validate_function_call(
+    item: &Value,
+    call_id: &str,
+    name: &str,
+    args: &str,
+) -> Result<(), LlmError> {
+    if item
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != "completed")
+        || call_id.is_empty()
+        || name.is_empty()
+    {
+        return Err(LlmError::transport(
+            "responses stream ended with unfinished function_call",
+        ));
+    }
+    match serde_json::from_str(args) {
+        Ok(Value::Object(_)) => Ok(()),
+        Err(e) if e.is_eof() => Err(LlmError::transport(format!(
+            "responses tool arguments truncated: {e}"
+        ))),
+        _ => Err(LlmError::malformed(
+            "responses tool arguments must be a JSON object",
+        )),
     }
 }
 
@@ -772,10 +796,9 @@ pub struct ResponsesSseDecoder {
     completed_items: HashSet<String>,
     completed_output_items: Vec<RecordedOutputItem>,
     has_tool_calls: bool,
+    tool_error: Option<LlmError>,
     saw_terminal_response: bool,
-    usage: Option<TokenUsage>,
     finish_reason: Option<FinishReason>,
-    event_phase: ResponsesEventPhase,
     finish_phase: ResponsesFinishPhase,
 }
 
@@ -791,10 +814,9 @@ impl ResponsesSseDecoder {
             completed_items: HashSet::new(),
             completed_output_items: Vec::new(),
             has_tool_calls: false,
+            tool_error: None,
             saw_terminal_response: false,
-            usage: None,
             finish_reason: None,
-            event_phase: ResponsesEventPhase::Streaming,
             finish_phase: ResponsesFinishPhase::Pending,
         }
     }
@@ -813,7 +835,18 @@ impl ResponsesSseDecoder {
     ) -> Option<SlotKey> {
         if let Some(oi) = output_index {
             let key = SlotKey::OutputIndex(oi);
-            if self.active_slots.contains_key(&key) {
+            if let Some(slot) = self.active_slots.get(&key) {
+                if let Some(id) = item_id.filter(|id| !id.is_empty())
+                    && slot.item_id().is_some_and(|active| active != id)
+                {
+                    // 同一索引上的另一项不能接收原工具的参数或替它闭合。
+                    return Some(
+                        self.item_id_to_slot
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| SlotKey::ItemId(id.to_string())),
+                    );
+                }
                 return Some(key);
             }
         }
@@ -841,8 +874,12 @@ impl ResponsesSseDecoder {
         output_index: Option<usize>,
         item_id: Option<&str>,
         fallback: Option<&SlotKey>,
+        matches_kind: impl FnOnce(&ActiveSlot) -> bool,
     ) -> Option<ActiveSlot> {
         let key = self.resolve_slot_key(output_index, item_id, fallback)?;
+        if !matches_kind(self.active_slots.get(&key)?) {
+            return None;
+        }
         let slot = self.active_slots.remove(&key)?;
         if let Some(id) = item_id.filter(|s| !s.is_empty()) {
             self.item_id_to_slot.remove(id);
@@ -855,26 +892,33 @@ impl ResponsesSseDecoder {
 
     fn parse_usage(resp_obj: &Value) -> Option<TokenUsage> {
         let u = resp_obj.get("usage")?;
-        let raw_input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let raw_input = u.get("input_tokens").and_then(Value::as_u64);
         let cached = u
             .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .and_then(Value::as_u64);
         let cache_write = u
             .pointer("/input_tokens_details/cache_write_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+            .and_then(Value::as_u64);
+        let output = u.get("output_tokens").and_then(Value::as_u64);
         let reasoning = u
             .pointer("/output_tokens_details/reasoning_tokens")
             .and_then(Value::as_u64);
         let total = u.get("total_tokens").and_then(Value::as_u64);
+        raw_input
+            .or(output)
+            .or(cached)
+            .or(cache_write)
+            .or(reasoning)
+            .or(total)?;
         Some(TokenUsage {
-            input_tokens: raw_input.saturating_sub(cached).saturating_sub(cache_write),
-            output_tokens: output,
+            input_tokens: raw_input
+                .unwrap_or(0)
+                .saturating_sub(cached.unwrap_or(0))
+                .saturating_sub(cache_write.unwrap_or(0)),
+            output_tokens: output.unwrap_or(0),
             total_tokens: total,
-            cache_read_tokens: (cached > 0).then_some(cached),
-            cache_write_tokens: (cache_write > 0).then_some(cache_write),
+            cache_read_tokens: cached.filter(|&n| n > 0),
+            cache_write_tokens: cache_write.filter(|&n| n > 0),
             reasoning_tokens: reasoning,
         })
     }
@@ -886,7 +930,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
         event: SseEvent,
         emit: &mut dyn FnMut(StreamChunk) -> bool,
     ) -> Result<bool, LlmError> {
-        if self.event_phase == ResponsesEventPhase::Done {
+        if self.saw_terminal_response {
             return Ok(true);
         }
         let data = event.data.trim();
@@ -894,12 +938,17 @@ impl SseStreamDecoder for ResponsesSseDecoder {
             return Ok(false);
         }
         if data == "[DONE]" {
-            self.event_phase = ResponsesEventPhase::Done;
+            self.on_eof_without_done()?;
             return Ok(true);
         }
 
-        let payload: Value = serde_json::from_str(data)
-            .map_err(|e| LlmError::malformed(format!("invalid responses SSE json: {e}")))?;
+        let payload: Value = serde_json::from_str(data).map_err(|e| {
+            classify_non_json_sse_frame(data)
+                .unwrap_or_else(|| LlmError::malformed(format!("invalid responses SSE json: {e}")))
+        })?;
+        if payload.get("error").is_some_and(|err| !err.is_null()) {
+            return Err(classify_inband_error_value(&payload));
+        }
         let event_type = payload
             .get("type")
             .and_then(Value::as_str)
@@ -923,8 +972,9 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                         .get("id")
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty());
-                    let slot_key = output_index
-                        .map(SlotKey::OutputIndex)
+                    let slot_key = self
+                        .resolve_slot_key(output_index, item_id, None)
+                        .or_else(|| output_index.map(SlotKey::OutputIndex))
                         .or_else(|| item_id.map(|id| SlotKey::ItemId(id.to_string())));
 
                     match item_type {
@@ -1107,6 +1157,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                     }) = self.active_slots.get_mut(&key)
                     && *started
                     && !text.is_empty()
+                    && !text.ends_with("\n\n")
                 {
                     let idx = *stream_idx;
                     text.push_str("\n\n");
@@ -1184,7 +1235,9 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                 if !item_id.is_empty() && self.completed_items.contains(item_id) {
                     return Ok(false);
                 }
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                if let Some(delta) = payload.get("delta").and_then(Value::as_str)
+                    && !delta.is_empty()
+                {
                     let fallback =
                         (!item_id.is_empty()).then(|| SlotKey::ItemId(item_id.to_string()));
                     let key = self
@@ -1265,6 +1318,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                                 output_index,
                                 item_id,
                                 Some(&SlotKey::FallbackReasoning),
+                                |slot| matches!(slot, ActiveSlot::Reasoning { .. }),
                             );
                             let (stream_idx, slot_output_index, started, slot_text) = match slot {
                                 Some(ActiveSlot::Reasoning {
@@ -1334,6 +1388,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                                 output_index,
                                 item_id,
                                 Some(&SlotKey::FallbackText),
+                                |slot| matches!(slot, ActiveSlot::Message { .. }),
                             );
                             let (stream_idx, slot_output_index, started, slot_text, slot_phase) =
                                 match slot {
@@ -1355,33 +1410,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                                         None,
                                     ),
                                 };
-                            let item_text = item
-                                .get("content")
-                                .and_then(Value::as_array)
-                                .map(|arr| {
-                                    let mut buf = String::new();
-                                    for c in arr {
-                                        match c.get("type").and_then(Value::as_str) {
-                                            Some("output_text") => {
-                                                if let Some(t) =
-                                                    c.get("text").and_then(Value::as_str)
-                                                {
-                                                    buf.push_str(t);
-                                                }
-                                            }
-                                            Some("refusal") => {
-                                                if let Some(r) =
-                                                    c.get("refusal").and_then(Value::as_str)
-                                                {
-                                                    buf.push_str(r);
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    buf
-                                })
-                                .unwrap_or_default();
+                            let item_text: String = message_text_parts(item).collect();
                             let final_text = if !item_text.is_empty() {
                                 item_text
                             } else {
@@ -1432,6 +1461,7 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                                 output_index,
                                 (!id_str.is_empty()).then_some(id_str),
                                 None,
+                                |slot| matches!(slot, ActiveSlot::FunctionCall { .. }),
                             );
                             let (
                                 stream_idx,
@@ -1488,6 +1518,13 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                             {
                                 return Ok(true);
                             }
+                            if let Err(err) =
+                                validate_function_call(item, &call_id, &name, &arguments)
+                            {
+                                // 只有响应终态才能区分正常的长度截断与上游损坏。
+                                self.tool_error.get_or_insert(err);
+                                return Ok(false);
+                            }
                             self.has_tool_calls = true;
                             if !emit(StreamChunk::BlockEnd {
                                 index: stream_idx,
@@ -1535,8 +1572,10 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                             }
                         }
                     }
-                    if let Some(u) = Self::parse_usage(resp_obj) {
-                        self.usage = Some(u);
+                    if let Some(usage) = Self::parse_usage(resp_obj)
+                        && !emit(StreamChunk::Usage { usage })
+                    {
+                        return Ok(true);
                     }
                     let status = resp_obj.get("status").and_then(Value::as_str);
                     let incomplete_reason = resp_obj
@@ -1547,41 +1586,23 @@ impl SseStreamDecoder for ResponsesSseDecoder {
                     } else if status == Some("cancelled") {
                         self.finish_reason = Some(FinishReason::Aborted);
                     } else if status == Some("failed") {
-                        let err_obj = resp_obj.get("error").unwrap_or(resp_obj);
-                        let msg = err_obj
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("responses stream failed");
-                        let ecode = err_obj.get("code").and_then(Value::as_str);
-                        let etype = err_obj.get("type").and_then(Value::as_str);
-                        let err = LlmError::classify_provider_error(None, etype, ecode, msg);
-                        self.finish_reason = Some(FinishReason::Error {
-                            code: err.code,
-                            message: err.message,
-                            status: err.status,
-                            retry_after_ms: err.retry_after_ms,
-                        });
+                        self.finish_reason = Some(classify_inband_error_value(resp_obj).into());
                     } else if incomplete_reason == Some("max_output_tokens") {
                         self.finish_reason = Some(FinishReason::MaxTokens);
                     }
                 } else if event_type == "response.incomplete" {
                     self.finish_reason = Some(classify_incomplete_finish(None));
                 }
-                self.event_phase = ResponsesEventPhase::Done;
                 return Ok(true);
             }
             "response.failed" | "error" => {
-                let err_obj = payload
-                    .pointer("/response/error")
-                    .or_else(|| payload.get("error"))
-                    .unwrap_or(&payload);
-                let msg = err_obj
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("responses stream failed");
-                let ecode = err_obj.get("code").and_then(Value::as_str);
-                let etype = err_obj.get("type").and_then(Value::as_str);
-                return Err(LlmError::classify_provider_error(None, etype, ecode, msg));
+                let response = payload.get("response").unwrap_or(&payload);
+                if let Some(usage) = Self::parse_usage(response)
+                    && !emit(StreamChunk::Usage { usage })
+                {
+                    return Ok(true);
+                }
+                return Err(classify_inband_error_value(response));
             }
             _ => {}
         }
@@ -1589,72 +1610,71 @@ impl SseStreamDecoder for ResponsesSseDecoder {
         Ok(false)
     }
 
+    fn on_eof_without_done(&self) -> Result<(), LlmError> {
+        if self.saw_terminal_response {
+            Ok(())
+        } else {
+            Err(LlmError::transport(
+                "responses SSE stream ended before terminal response",
+            ))
+        }
+    }
+
     fn on_finish(&mut self, emit: &mut dyn FnMut(StreamChunk) -> bool) -> Result<(), LlmError> {
+        self.on_eof_without_done()?;
         if self.finish_phase == ResponsesFinishPhase::Emitted {
             return Ok(());
         }
-        self.finish_phase = ResponsesFinishPhase::Emitted;
-
-        let mut has_unfinished_calls = false;
-        let active: Vec<ActiveSlot> = self.active_slots.drain().map(|(_, s)| s).collect();
-        self.item_id_to_slot.clear();
-        for slot in active {
-            match slot {
-                ActiveSlot::FunctionCall { .. } => {
-                    // 未收到 output_item.done 的工具调用绝不发射 BlockEnd，防止参数截断或串号。
-                    has_unfinished_calls = true;
-                }
-                ActiveSlot::Message {
-                    stream_idx,
-                    output_index,
-                    item_id,
-                    phase,
-                    text,
-                    ..
-                } => {
-                    if self.saw_terminal_response && !text.is_empty() {
-                        let raw_msg = json!({
-                            "type": "message",
-                            "role": "assistant",
-                            "status": "completed",
-                            "id": item_id,
-                            "phase": phase,
-                            "content": [{
-                                "type": "output_text",
-                                "text": text,
-                                "annotations": [],
-                            }],
-                        });
-                        if let Some(norm) = normalize_message_item(&raw_msg, &text) {
-                            upsert_recorded_output_item(
-                                &mut self.completed_output_items,
-                                item_id.as_deref(),
-                                output_index,
-                                stream_idx,
-                                norm,
-                            );
-                        }
-                    }
-                }
-                ActiveSlot::Reasoning { .. } => {}
+        if self.finish_reason != Some(FinishReason::MaxTokens) {
+            if let Some(err) = &self.tool_error {
+                return Err(err.clone());
+            }
+            if self
+                .active_slots
+                .values()
+                .any(|slot| matches!(slot, ActiveSlot::FunctionCall { .. }))
+            {
+                return Err(LlmError::transport(
+                    "responses stream ended with unfinished function_call",
+                ));
             }
         }
+        self.finish_phase = ResponsesFinishPhase::Emitted;
 
-        if has_unfinished_calls
-            && !matches!(
-                self.finish_reason,
-                Some(FinishReason::MaxTokens | FinishReason::Error { .. } | FinishReason::Aborted)
-            )
-        {
-            return Err(LlmError::malformed(
-                "responses stream ended with unfinished function_call",
-            ));
-        }
-
-        if let Some(usage) = self.usage
-            && !emit(StreamChunk::Usage { usage })
-        {
-            return Ok(());
+        self.item_id_to_slot.clear();
+        for (_, slot) in self.active_slots.drain() {
+            if let ActiveSlot::Message {
+                stream_idx,
+                output_index,
+                item_id,
+                phase,
+                text,
+                ..
+            } = slot
+                && !text.is_empty()
+            {
+                let raw_msg = json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "id": item_id,
+                    "phase": phase,
+                    "content": [{
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    }],
+                });
+                if let Some(norm) = normalize_message_item(&raw_msg, &text) {
+                    upsert_recorded_output_item(
+                        &mut self.completed_output_items,
+                        item_id.as_deref(),
+                        output_index,
+                        stream_idx,
+                        norm,
+                    );
+                }
+            }
         }
 
         let reason = self

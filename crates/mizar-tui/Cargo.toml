@@ -24,7 +24,6 @@ mizar-client-core = { workspace = true }
 mizar-instructions = { workspace = true }
 mizar-llm = { workspace = true }
 mizar-llm-mock = { workspace = true }
-mizar-llm-retry = { workspace = true }
 mizar-llm-router = { workspace = true }
 mizar-mcp = { workspace = true }
 mizar-session = { workspace = true }

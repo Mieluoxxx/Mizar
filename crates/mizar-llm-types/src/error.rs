@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 /// 提供方无关的统一错误码分类。
@@ -14,6 +15,8 @@ pub enum LlmErrorCode {
     Quota,
     ContextWindowExceeded,
     InvalidRequest,
+    #[serde(rename = "payload_too_large")]
+    PayloadTooLarge,
     ContentRefused,
     EmptyResponse,
     MalformedResponse,
@@ -37,6 +40,7 @@ impl LlmErrorCode {
             Self::Quota => "quota",
             Self::ContextWindowExceeded => "context_window_exceeded",
             Self::InvalidRequest => "invalid_request",
+            Self::PayloadTooLarge => "payload_too_large",
             Self::ContentRefused => "content_refused",
             Self::EmptyResponse => "empty_response",
             Self::MalformedResponse => "malformed_response",
@@ -52,14 +56,16 @@ impl LlmErrorCode {
     pub fn is_retryable(self) -> bool {
         matches!(
             self,
-            Self::RateLimit
-                | Self::Server
-                | Self::Timeout
-                | Self::Transport
-                | Self::EmptyResponse
-                | Self::MalformedResponse
+            Self::RateLimit | Self::Server | Self::Timeout | Self::Transport
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpErrorHints {
+    pub retry_after_ms: Option<u64>,
+    pub should_retry: Option<bool>,
+    pub ratelimit_limit_zero: bool,
 }
 
 /// 统一的 LLM 错误结构，携带稳定分类码、HTTP 状态码与建议重试等待时间。
@@ -70,6 +76,7 @@ pub struct LlmError {
     pub message: String,
     pub status: Option<u16>,
     pub retry_after_ms: Option<u64>,
+    pub should_retry: Option<bool>,
 }
 
 impl LlmError {
@@ -79,6 +86,7 @@ impl LlmError {
             message: message.into(),
             status: None,
             retry_after_ms: None,
+            should_retry: None,
         }
     }
 
@@ -128,100 +136,214 @@ impl LlmError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        self.code.is_retryable()
+        match self.should_retry {
+            Some(false) => false,
+            Some(true) if self.code == LlmErrorCode::Unknown => true,
+            _ => self.code.is_retryable(),
+        }
     }
 
-    /// 结合 HTTP 状态码、服务端错误字段与文本内容进行统一归类。
     pub fn classify_provider_error(
         status: Option<u16>,
         error_type: Option<&str>,
         error_code: Option<&str>,
         message: &str,
     ) -> Self {
-        let combined = format!(
-            "{} {} {}",
-            error_type.unwrap_or(""),
-            error_code.unwrap_or(""),
-            message
-        );
-        let lower = combined.to_ascii_lowercase();
-
-        let code = if is_context_window_exceeded(&lower) {
-            LlmErrorCode::ContextWindowExceeded
-        } else if is_quota_exceeded(&lower) {
-            LlmErrorCode::Quota
-        } else if is_empty_response_error(&lower) {
-            LlmErrorCode::EmptyResponse
-        } else if matches!(status, Some(401 | 403))
-            || lower.contains("authentication_error")
-            || lower.contains("permission_error")
-            || lower.contains("invalid_api_key")
-            || lower.contains("unauthorized")
-        {
+        let lower = format!(
+            "{} {} {message}",
+            error_type.unwrap_or_default(),
+            error_code.unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        let contains = |patterns: &[&str]| patterns.iter().any(|pattern| lower.contains(pattern));
+        let code = if matches!(status, Some(401 | 403))
+            || contains(&[
+                "authentication_error",
+                "permission_error",
+                "permission_denied",
+                "unauthenticated",
+                "invalid_api_key",
+                "unauthorized",
+                "invalid api key",
+            ]) {
             LlmErrorCode::Auth
+        } else if status == Some(402) || is_quota_exceeded(&lower) {
+            LlmErrorCode::Quota
         } else if status == Some(429)
-            || lower.contains("rate_limit")
-            || lower.contains("rate limit")
-            || lower.contains("too many requests")
+            || contains(&[
+                "rate_limit",
+                "rate limit",
+                "too many requests",
+                "tokens per minute",
+            ])
         {
             LlmErrorCode::RateLimit
-        } else if lower.contains("refusal") || lower.contains("content_filter") {
-            LlmErrorCode::ContentRefused
-        } else if matches!(status, Some(400 | 404 | 413 | 422)) || lower.contains("invalid_request")
-        {
-            LlmErrorCode::InvalidRequest
+        } else if matches!(status, Some(408 | 504 | 524)) || contains(&["timeout", "timed out"]) {
+            LlmErrorCode::Timeout
         } else if matches!(status, Some(500..=599))
-            || lower.contains("overloaded")
-            || lower.contains("server_error")
-            || lower.contains("api_error")
+            || contains(&[
+                "server_busy",
+                "overloaded",
+                "internal_error",
+                "service_unavailable",
+                "at capacity",
+                "temporarily unavailable",
+                "bad record mac",
+                "stream error",
+                "server_error",
+                "api_error",
+            ])
         {
             LlmErrorCode::Server
-        } else if lower.contains("timeout") || lower.contains("timed out") {
-            LlmErrorCode::Timeout
+        } else if is_context_window_exceeded(&lower) {
+            LlmErrorCode::ContextWindowExceeded
+        } else if contains(&["refusal", "content_filter", "content_policy_violation"]) {
+            LlmErrorCode::ContentRefused
+        } else if matches!(status, Some(400 | 404 | 405 | 422))
+            || (status != Some(413) && lower.contains("invalid_request"))
+        {
+            LlmErrorCode::InvalidRequest
+        } else if status == Some(413) {
+            LlmErrorCode::PayloadTooLarge
+        } else if is_empty_response_error(&lower) {
+            LlmErrorCode::EmptyResponse
         } else {
             LlmErrorCode::Unknown
         };
-
-        let mut err = Self::new(code, message.to_string());
+        let mut err = Self::new(code, bounded_detail(message));
         err.status = status;
         err
     }
 
+    pub fn with_http_hints(mut self, hints: HttpErrorHints) -> Self {
+        if self.status == Some(429) && hints.ratelimit_limit_zero {
+            self.code = LlmErrorCode::Quota;
+        }
+        self.retry_after_ms = hints.retry_after_ms.or(self.retry_after_ms);
+        if self.should_retry != Some(false) {
+            self.should_retry = hints.should_retry.or(self.should_retry);
+        }
+        self
+    }
+
     pub fn classify_http(status: u16, retry_after_ms: Option<u64>, body: &str) -> Self {
-        let extracted = extract_provider_error_fields(body);
-        let msg = if let Some((_, _, ref detail)) = extracted {
-            format!("HTTP {status}: {detail}")
-        } else if body.trim().is_empty() {
+        Self::classify_http_with_hints(
+            status,
+            HttpErrorHints {
+                retry_after_ms,
+                ..Default::default()
+            },
+            body,
+        )
+    }
+
+    pub fn classify_http_with_hints(status: u16, hints: HttpErrorHints, body: &str) -> Self {
+        let parsed = serde_json::from_str::<Value>(body).ok();
+        let mut err = if let Some(value) = parsed {
+            classify_error_value(&value, Some(status))
+        } else {
+            Self::classify_provider_error(Some(status), None, None, bounded_detail(body.trim()))
+        };
+        err.message = if err.message.is_empty() {
             format!("HTTP {status}")
         } else {
-            format!("HTTP {status}: {}", body.trim())
+            format!("HTTP {status}: {}", err.message)
         };
-        let (etype, ecode) = extracted
-            .as_ref()
-            .map(|(t, c, _)| (t.as_deref(), c.as_deref()))
-            .unwrap_or((None, None));
-        let mut err = Self::classify_provider_error(Some(status), etype, ecode, &msg);
-        err.retry_after_ms = retry_after_ms;
-        err
+        err.message.truncate(bounded_detail(&err.message).len());
+        err.with_http_hints(hints)
     }
 }
 
-fn extract_provider_error_fields(body: &str) -> Option<(Option<String>, Option<String>, String)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let err_obj = v.get("error").unwrap_or(&v);
-    let msg = err_obj
+fn bounded_detail(text: &str) -> &str {
+    text.char_indices()
+        .nth(4096)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
+fn inband_status(value: &Value) -> Option<u16> {
+    let status = if let Some(number) = value.as_u64() {
+        u16::try_from(number).ok()?
+    } else {
+        value.as_str()?.trim().parse().ok()?
+    };
+    matches!(status, 400 | 404 | 408 | 413 | 422 | 429 | 500..=599).then_some(status)
+}
+
+fn retry_delay(value: &Value, unit_ms: u64) -> Option<u64> {
+    if let Some(n) = value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+    {
+        return Some(n.saturating_mul(unit_ms));
+    }
+    let n = value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse().ok())?;
+    (n.is_finite() && n >= 0.0).then(|| (n * unit_ms as f64).ceil() as u64)
+}
+
+fn classify_error_value(value: &Value, http_status: Option<u16>) -> LlmError {
+    let error = value.get("error").unwrap_or(value);
+    let field = |key: &str| error.get(key).or_else(|| value.get(key));
+    let status = http_status.or_else(|| {
+        ["status_code", "status", "code"]
+            .iter()
+            .find_map(|key| inband_status(field(key)?))
+    });
+    let message = error
         .get("message")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)?;
-    let etype = err_obj
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let ecode = err_obj
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    Some((etype, ecode, msg))
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .or_else(|| value.get("message").and_then(Value::as_str));
+    let fallback;
+    let message = match message {
+        Some(message) => message,
+        None => {
+            fallback = error.to_string();
+            &fallback
+        }
+    };
+    let provider_codes = ["code", "status", "status_code"]
+        .iter()
+        .filter_map(|key| field(key)?.as_str())
+        .map(bounded_detail)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut err = LlmError::classify_provider_error(
+        status,
+        field("type").and_then(Value::as_str).map(bounded_detail),
+        Some(&provider_codes),
+        bounded_detail(message),
+    );
+    err.retry_after_ms = field("retry_after_ms")
+        .and_then(|v| retry_delay(v, 1))
+        .or_else(|| field("retry_after").and_then(|v| retry_delay(v, 1000)));
+    err
+}
+
+pub fn classify_inband_error_value(value: &Value) -> LlmError {
+    classify_error_value(value, None)
+}
+
+pub fn classify_non_json_sse_frame(raw: &str) -> Option<LlmError> {
+    let raw = raw.trim();
+    let line = raw.strip_prefix("data:").unwrap_or(raw).trim();
+    if line.starts_with(['<', '{', '[']) {
+        return None;
+    }
+    let words = line
+        .strip_prefix("HTTP/1.1 ")
+        .or_else(|| line.strip_prefix("HTTP/2 "))
+        .or_else(|| line.strip_prefix("HTTP "))
+        .unwrap_or(line);
+    let status = words
+        .split([' ', ':', '\t'])
+        .next()?
+        .parse::<u16>()
+        .ok()
+        .filter(|s| (400..=599).contains(s));
+    let err = LlmError::classify_provider_error(status, None, None, bounded_detail(line));
+    (status.is_some() || err.code.is_retryable()).then_some(err)
 }
 
 pub fn is_empty_response_error(lower: &str) -> bool {
@@ -231,15 +353,31 @@ pub fn is_empty_response_error(lower: &str) -> bool {
 }
 
 pub fn is_context_window_exceeded(lower: &str) -> bool {
+    const NON_OVERFLOW_PATTERNS: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "billing",
+        "unauthorized",
+        "tokens per minute",
+    ];
+    if NON_OVERFLOW_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return false;
+    }
     lower.contains("context_length_exceeded")
         || lower.contains("context_window_exceeded")
         || lower.contains("context length exceeded")
-        || lower.contains("context window")
+        || lower.contains("context window exceeded")
+        || lower.contains("exceeds the context window")
+        || lower.contains("exceeds the model's context window")
         || lower.contains("maximum context length")
         || lower.contains("exceeds the maximum number of tokens")
         || lower.contains("prompt is too long")
         || lower.contains("input is too long")
-        || lower.contains("request too large for")
+        || lower.contains("too many input tokens")
 }
 
 pub fn is_quota_exceeded(lower: &str) -> bool {
@@ -250,4 +388,7 @@ pub fn is_quota_exceeded(lower: &str) -> bool {
         || lower.contains("exceeded your current quota")
         || lower.contains("out of credits")
         || lower.contains("credit balance is too low")
+        || lower.contains("payment required")
+        || lower.contains("billing_hard_limit_reached")
+        || lower.contains("billing limit")
 }

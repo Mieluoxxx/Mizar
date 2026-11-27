@@ -4,6 +4,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use mizar_llm_types::TokenUsage;
+
 use crate::model::{
     RecordKind, SessionStats, Severity, TraceEvent, TraceEventKind, TrajectoryRecord,
     TrajectorySnapshot, TrajectoryStep, TrajectoryTurn,
@@ -16,6 +18,35 @@ struct OpenStep {
     started_at_ms: u128,
     first_token_ms: Option<u128>,
     step_vec_idx: usize,
+}
+
+impl SessionStats {
+    fn add_usage(&mut self, usage: &TokenUsage) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cache_read_tokens += usage.cache_read_tokens.unwrap_or(0);
+    }
+
+    fn record_step_time(
+        &mut self,
+        open: &OpenStep,
+        end_ms: u128,
+        usage: Option<&TokenUsage>,
+    ) -> (u64, Option<u64>) {
+        let duration = end_ms.saturating_sub(open.started_at_ms) as u64;
+        self.llm_ms += duration;
+        let ttft = open.first_token_ms.map(|first| {
+            let ttft = first.saturating_sub(open.started_at_ms) as u64;
+            self.ttft_ms += ttft;
+            self.ttft_steps += 1;
+            if let Some(usage) = usage {
+                self.decode_ms += end_ms.saturating_sub(first) as u64;
+                self.decode_tokens += usage.output_tokens;
+            }
+            ttft
+        });
+        (duration, ttft)
+    }
 }
 
 #[derive(Clone)]
@@ -152,6 +183,20 @@ impl IncrementalFolder {
                     step_vec_idx,
                 });
             }
+            TraceEventKind::StepRetry {
+                turn,
+                step,
+                reset_draft,
+                ..
+            } => {
+                if *reset_draft
+                    && let Some(open) = &mut self.open_step
+                    && open.turn == *turn
+                    && open.step == *step
+                {
+                    open.first_token_ms = None;
+                }
+            }
             TraceEventKind::FirstToken { turn, step } => {
                 if let Some(open) = &mut self.open_step
                     && open.turn == *turn
@@ -176,27 +221,30 @@ impl IncrementalFolder {
                 {
                     self.stats.interrupted_steps += 1;
                 }
+                let open = self
+                    .open_step
+                    .take_if(|o| o.turn == *turn && o.step == *step);
                 if let Some(turn_entry) = self.turns_map.get_mut(turn)
                     && let Some(step_entry) =
                         turn_entry.steps.iter_mut().rev().find(|s| s.step == *step)
                 {
                     step_entry.ended_at_ms = Some(ev.ts_ms);
                     step_entry.outcome = Some(outcome.clone());
-                    if step_entry.usage.is_none() {
-                        step_entry.usage = *usage;
-                    }
+                    // 上游中断不会生成助手消息，步结束仍须计入最终尝试的耗时和用量。
                     if step_entry.duration_ms.is_none()
-                        && let Some(start) = step_entry.started_at_ms
+                        && let Some(open) = open
                     {
-                        step_entry.duration_ms = Some(ev.ts_ms.saturating_sub(start) as u64);
+                        let (duration, ttft) =
+                            self.stats.record_step_time(&open, ev.ts_ms, usage.as_ref());
+                        step_entry.duration_ms = Some(duration);
+                        step_entry.ttft_ms = ttft;
                     }
-                }
-                if self
-                    .open_step
-                    .as_ref()
-                    .is_some_and(|o| o.turn == *turn && o.step == *step)
-                {
-                    self.open_step = None;
+                    if step_entry.usage.is_none()
+                        && let Some(usage) = usage
+                    {
+                        self.stats.add_usage(usage);
+                        step_entry.usage = Some(*usage);
+                    }
                 }
             }
             TraceEventKind::UserMessage { text } => {
@@ -263,21 +311,10 @@ impl IncrementalFolder {
 
                 if let Some(open) = &self.open_step {
                     started_at_ms = Some(open.started_at_ms);
-                    let llm_dur = ev.ts_ms.saturating_sub(open.started_at_ms) as u64;
-                    duration_ms = Some(llm_dur);
-                    self.stats.llm_ms += llm_dur;
-
-                    if let Some(ft) = open.first_token_ms {
-                        let ttft = ft.saturating_sub(open.started_at_ms) as u64;
-                        ttft_ms = Some(ttft);
-                        self.stats.ttft_ms += ttft;
-                        self.stats.ttft_steps += 1;
-                        if let Some(u) = usage {
-                            let decode = ev.ts_ms.saturating_sub(ft) as u64;
-                            self.stats.decode_ms += decode;
-                            self.stats.decode_tokens += u.output_tokens;
-                        }
-                    }
+                    let (duration, ttft) =
+                        self.stats.record_step_time(open, ev.ts_ms, usage.as_ref());
+                    duration_ms = Some(duration);
+                    ttft_ms = ttft;
 
                     if let Some(turn_entry) = self.turns_map.get_mut(&open.turn)
                         && let Some(step_entry) = turn_entry.steps.get_mut(open.step_vec_idx)
@@ -289,9 +326,7 @@ impl IncrementalFolder {
                 }
 
                 if let Some(u) = usage {
-                    self.stats.input_tokens += u.input_tokens;
-                    self.stats.output_tokens += u.output_tokens;
-                    self.stats.cache_read_tokens += u.cache_read_tokens.unwrap_or(0);
+                    self.stats.add_usage(u);
                 }
 
                 let preview = preview_text(text, 80);

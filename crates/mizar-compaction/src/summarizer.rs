@@ -1,11 +1,15 @@
 //! LLM 检查点摘要生成器（同前缀尾置指令、`ReasoningEffort::Off` + 错误放宽回退、
 //! `obelisk` 已证实事实/未证实推断分级）。
 
-use futures::StreamExt;
+use std::borrow::Cow;
+use std::fmt::{self, Write};
+use std::time::Duration;
+
 use mizar_llm::{
     BlockAssembler, ContentBlock, FinishReason, GenerateOptions, LlmError, LlmErrorCode,
-    LlmRuntime, Message, ReasoningEffort, StreamChunk, ToolSchema,
+    LlmRuntime, Message, ReasoningEffort, ToolSchema,
 };
+use mizar_llm_retry::{RetryConfig, collect_with_retry, sleep_cancellable};
 use mizar_session::{SessionEntry, SessionEvent};
 use tokio_util::sync::CancellationToken;
 
@@ -13,6 +17,7 @@ use crate::digest::CutPlan;
 
 const TRANSCRIPT_TOOL_RESULT_MAX_CHARS: usize = 2_000;
 const TRANSCRIPT_TOTAL_MAX_CHARS: usize = 96_000;
+const TRANSCRIPT_MIN_BUDGET: usize = 24_000;
 const BOUNDARY_PREVIEW_MAX_CHARS: usize = 120;
 
 const SUMMARY_SECTIONS_GUIDE: &str = "\
@@ -79,38 +84,111 @@ pub async fn generate_checkpoint_summary<F>(
 where
     F: FnMut(&'static str, usize),
 {
-    if params.reuse_prefix_cache && !params.current_visible_messages.is_empty() {
-        on_progress("prefill", 0);
-        match run_prefix_reuse_summary(&params, &mut on_progress).await {
-            Ok(text) if !text.trim().is_empty() => {
-                return Ok(SummaryOutput {
-                    summary: strip_summary_wrapper(&text),
-                    used_prefix_cache: true,
-                });
+    let mut retry = RetryConfig::from_env();
+    retry.max_retries = retry.max_retries.min(2);
+    let mut retries_used = 0;
+    let mut reuse_prefix = params.reuse_prefix_cache && !params.current_visible_messages.is_empty();
+    let mut budget = TRANSCRIPT_TOTAL_MAX_CHARS;
+    let mut reasoning_effort = Some(ReasoningEffort::Off);
+
+    loop {
+        if params.cancel.is_cancelled() {
+            return Err(LlmError::cancelled());
+        }
+        let opts = if reuse_prefix {
+            on_progress("prefill", 0);
+            prefix_reuse_options(&params, reasoning_effort)
+        } else {
+            on_progress("transcript", 0);
+            clean_transcript_options(&params, budget, reasoning_effort)
+        };
+        let result = collect_with_retry(params.llm, opts, &retry, &mut retries_used, |chars| {
+            on_progress("summary", chars);
+        })
+        .await;
+        let (err, can_transcribe) = match result {
+            Ok(assembler) => match checkpoint_text(&assembler) {
+                Ok(summary) => {
+                    return Ok(SummaryOutput {
+                        summary,
+                        used_prefix_cache: reuse_prefix,
+                    });
+                }
+                Err(err) => (err.with_http_hints(assembler.response_hints()), true),
+            },
+            // 收集器已停止重试的瞬时错误不能借换提示词再次请求。
+            Err(err) if err.is_retryable() => return Err(err),
+            Err(err) => {
+                let can_transcribe = matches!(
+                    err.code,
+                    LlmErrorCode::ContextWindowExceeded
+                        | LlmErrorCode::PayloadTooLarge
+                        | LlmErrorCode::InvalidRequest
+                        | LlmErrorCode::EmptyResponse
+                );
+                (err, can_transcribe)
             }
-            Ok(_) => {
-                // 模型返回空文本或误调工具，降级至纯净转写路径
-            }
-            Err(err) if err.code == LlmErrorCode::Cancelled => return Err(err),
-            Err(_) => {
-                // 前缀复用失败（如接近窗口死线或工具参数限制），自动回退纯净转写
-            }
+        };
+
+        let retry_after = err.retry_after_ms.map(Duration::from_millis);
+        if err.should_retry == Some(false)
+            || retry_after.is_some_and(|delay| delay > retry.max_retry_after)
+        {
+            return Err(err);
+        }
+        if reasoning_effort.is_some() && rejects_reasoning_effort(&err) {
+            reasoning_effort = None;
+        } else if reuse_prefix && can_transcribe {
+            reuse_prefix = false;
+        } else if err.code == LlmErrorCode::ContextWindowExceeded && budget > TRANSCRIPT_MIN_BUDGET
+        {
+            budget /= 2;
+        } else {
+            return Err(err);
+        }
+        if let Some(delay) = retry_after {
+            sleep_cancellable(delay, &params.cancel).await?;
         }
     }
+}
 
-    on_progress("transcript", 0);
-    let text = run_clean_transcript_summary(&params, &mut on_progress).await?;
-    let cleaned = strip_summary_wrapper(&text);
-    if cleaned.is_empty() {
+fn checkpoint_text(assembler: &BlockAssembler) -> Result<String, LlmError> {
+    let finish = assembler.finish();
+    if finish == FinishReason::MaxTokens {
+        return Err(LlmError::malformed(
+            "compaction summary reached the output token limit",
+        ));
+    }
+    let blocks = assembler.blocks();
+    if finish == FinishReason::ToolCalls
+        || blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolCall { .. }))
+    {
+        return Err(LlmError::malformed(
+            "compaction summarizer requested a tool",
+        ));
+    }
+    let text: String = blocks.iter().filter_map(ContentBlock::as_text).collect();
+    let summary = strip_summary_wrapper(&text);
+    if summary.is_empty() {
         return Err(LlmError::new(
             LlmErrorCode::EmptyResponse,
             "compaction summarizer returned empty summary",
         ));
     }
-    Ok(SummaryOutput {
-        summary: cleaned,
-        used_prefix_cache: false,
-    })
+    Ok(summary)
+}
+
+fn rejects_reasoning_effort(err: &LlmError) -> bool {
+    if !matches!(
+        err.code,
+        LlmErrorCode::InvalidRequest | LlmErrorCode::Unknown
+    ) {
+        return false;
+    }
+    let message = err.message.to_ascii_lowercase();
+    message.contains("reason") || message.contains("effort") || message.contains("thinking")
 }
 
 fn compact_preview(raw: &str, max_chars: usize) -> String {
@@ -199,13 +277,10 @@ fn describe_boundary_entry(entry: &SessionEntry) -> String {
     }
 }
 
-async fn run_prefix_reuse_summary<F>(
+fn prefix_reuse_options(
     params: &SummarizeParams<'_>,
-    on_progress: &mut F,
-) -> Result<String, LlmError>
-where
-    F: FnMut(&'static str, usize),
-{
+    reasoning_effort: Option<ReasoningEffort>,
+) -> GenerateOptions {
     let mut messages = Vec::with_capacity(params.current_visible_messages.len() + 2);
     messages.push(Message::System {
         content: params.system_prompt.clone(),
@@ -239,7 +314,7 @@ where
     );
     messages.push(Message::user(instruction));
 
-    let opts = GenerateOptions {
+    GenerateOptions {
         messages,
         tools: params.declared_tools.clone(),
         model: params.model.clone(),
@@ -247,43 +322,45 @@ where
         system: None,
         max_tokens: Some(4_096),
         temperature: None,
-        reasoning_effort: Some(ReasoningEffort::Off),
+        reasoning_effort,
         headers: Vec::new(),
         session_id: params.session_id.clone(),
         cache_retention: None,
         cancel: params.cancel.clone(),
-    };
-
-    run_summary_stream_with_reasoning_fallback(params.llm, opts, true, on_progress).await
+    }
 }
 
-async fn run_clean_transcript_summary<F>(
+fn clean_transcript_options(
     params: &SummarizeParams<'_>,
-    on_progress: &mut F,
-) -> Result<String, LlmError>
-where
-    F: FnMut(&'static str, usize),
-{
-    let transcript = serialize_transcript_for_summary(params.cut);
+    budget: usize,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> GenerateOptions {
+    const SYSTEM: &str = "You are a precise technical context-compaction assistant for a coding agent. Never fabricate verified facts.";
+    const END: &str = "\n</conversation>\n\nOutput ONLY the markdown summary text.";
+    // 手动指定的重点可能很长，不能让它挤掉转录或抵消缩小后的预算。
+    let focus_limit = budget / 4;
     let focus_block = params
         .focus
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|f| format!("\n\nUser requested special focus:\n{f}"))
+        .map(|f| format!("\n\nUser requested special focus:\n{f:.focus_limit$}"))
         .unwrap_or_default();
-
-    let prompt = format!(
+    let mut prompt = format!(
         "Summarize the following coding-agent conversation transcript into a structured checkpoint.\n\
          Note: Authoritative modified files and shell commands are tracked separately by code.\n\n\
-         {SUMMARY_SECTIONS_GUIDE}{focus_block}\n\n\
-         <conversation>\n{transcript}\n</conversation>\n\n\
-         Output ONLY the markdown summary text."
+         {SUMMARY_SECTIONS_GUIDE}{focus_block}\n\n<conversation>\n"
     );
+    let transcript_budget = budget - SYSTEM.len() - prompt.chars().count() - END.len();
+    prompt.push_str(&serialize_transcript_with_budget(
+        params.cut,
+        transcript_budget,
+    ));
+    prompt.push_str(END);
 
-    let opts = GenerateOptions {
+    GenerateOptions {
         messages: vec![
             Message::System {
-                content: "You are a precise technical context-compaction assistant for a coding agent. Never fabricate verified facts.".to_string(),
+                content: SYSTEM.to_string(),
             },
             Message::user(prompt),
         ],
@@ -293,166 +370,97 @@ where
         system: None,
         max_tokens: Some(4_096),
         temperature: None,
-        reasoning_effort: Some(ReasoningEffort::Off),
+        reasoning_effort,
         headers: Vec::new(),
         session_id: None,
         cache_retention: None,
         cancel: params.cancel.clone(),
-    };
-
-    run_summary_stream_with_reasoning_fallback(params.llm, opts, false, on_progress).await
-}
-
-async fn run_summary_stream_with_reasoning_fallback<F>(
-    llm: &LlmRuntime,
-    opts: GenerateOptions,
-    reject_tool_calls: bool,
-    on_progress: &mut F,
-) -> Result<String, LlmError>
-where
-    F: FnMut(&'static str, usize),
-{
-    let retry_without_reasoning = opts.reasoning_effort.is_some();
-    let fallback_opts = if retry_without_reasoning {
-        let mut cloned = opts.clone();
-        cloned.reasoning_effort = None;
-        Some(cloned)
-    } else {
-        None
-    };
-
-    match collect_summary_stream(llm, opts, reject_tool_calls, on_progress).await {
-        Ok(text) => Ok(text),
-        Err(err)
-            if retry_without_reasoning
-                && matches!(
-                    err.code,
-                    LlmErrorCode::InvalidRequest | LlmErrorCode::Unknown
-                )
-                && {
-                    let msg = err.message.to_lowercase();
-                    msg.contains("reason") || msg.contains("effort") || msg.contains("thinking")
-                } =>
-        {
-            if let Some(fb) = fallback_opts {
-                collect_summary_stream(llm, fb, reject_tool_calls, on_progress).await
-            } else {
-                Err(err)
-            }
-        }
-        Err(err) => Err(err),
     }
-}
-
-async fn collect_summary_stream<F>(
-    llm: &LlmRuntime,
-    opts: GenerateOptions,
-    reject_tool_calls: bool,
-    on_progress: &mut F,
-) -> Result<String, LlmError>
-where
-    F: FnMut(&'static str, usize),
-{
-    let mut stream = llm.stream(opts)?;
-    let mut assembler = BlockAssembler::new();
-    let mut chars_seen = 0usize;
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res?;
-        if let StreamChunk::TextDelta { ref text, .. } = chunk
-            && !text.is_empty()
-        {
-            chars_seen += text.chars().count();
-            on_progress("summary", chars_seen);
-        }
-        assembler.push(chunk);
-    }
-
-    match assembler.finish() {
-        FinishReason::Aborted => return Err(LlmError::cancelled()),
-        FinishReason::Error {
-            code,
-            message,
-            status,
-            retry_after_ms,
-        } => {
-            return Err(LlmError {
-                code,
-                message,
-                status,
-                retry_after_ms,
-            });
-        }
-        FinishReason::Stop | FinishReason::ToolCalls | FinishReason::MaxTokens => {}
-    }
-
-    if reject_tool_calls && !assembler.tool_calls().is_empty() && assembler.text().trim().is_empty()
-    {
-        return Ok(String::new());
-    }
-
-    Ok(assembler.text())
 }
 
 pub fn serialize_transcript_for_summary(cut: &CutPlan) -> String {
-    let mut out = String::new();
-    if let Some(prev) = &cut.previous_summary {
-        out.push_str("<earlier-summary>\n");
-        out.push_str(prev.trim());
-        out.push_str("\n</earlier-summary>\n\n");
-    }
-
-    for entry in &cut.compacted_entries {
-        if out.chars().count() >= TRANSCRIPT_TOTAL_MAX_CHARS {
-            out.push_str("\n[... earlier transcript truncated for summarizer budget ...]\n");
-            break;
-        }
-        if let Some(line) = format_entry_for_transcript(entry) {
-            out.push_str(&line);
-            out.push_str("\n\n");
-        }
-    }
-    out
+    serialize_transcript_with_budget(cut, TRANSCRIPT_TOTAL_MAX_CHARS)
 }
 
-fn format_entry_for_transcript(entry: &SessionEntry) -> Option<String> {
+struct Transcript {
+    text: String,
+    remaining: usize,
+}
+
+impl Write for Transcript {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for ch in s.chars() {
+            if self.remaining == 0 {
+                return Err(fmt::Error);
+            }
+            self.text.push(ch);
+            self.remaining -= 1;
+        }
+        Ok(())
+    }
+}
+
+impl Transcript {
+    fn mark_truncated(&mut self) {
+        self.text.pop();
+        self.text.push('…');
+    }
+}
+
+fn serialize_transcript_with_budget(cut: &CutPlan, budget: usize) -> String {
+    let mut out = Transcript {
+        text: String::new(),
+        remaining: budget,
+    };
+    if let Some(prev) = &cut.previous_summary {
+        const END: &str = "\n</earlier-summary>\n\n";
+        // 给新记录留足空间，旧摘要的标签和省略号也占预算。
+        out.remaining = budget / 4 - END.len();
+        if write!(out, "<earlier-summary>\n{}", prev.trim()).is_err() {
+            out.mark_truncated();
+        }
+        out.text.push_str(END);
+        out.remaining = budget - out.text.chars().count();
+    }
+    for entry in &cut.compacted_entries {
+        if write_transcript_entry(&mut out, entry).is_err() {
+            out.mark_truncated();
+            break;
+        }
+    }
+    out.text
+}
+
+fn write_transcript_entry(out: &mut Transcript, entry: &SessionEntry) -> fmt::Result {
     match &entry.event {
         SessionEvent::User { text, images } => {
-            if images.is_empty() {
-                Some(format!("[seq #{} | User]\n{text}", entry.seq))
-            } else {
-                Some(format!(
-                    "[seq #{} | User]\n[图片 {} 张]\n{text}",
-                    entry.seq,
-                    images.len()
-                ))
+            writeln!(out, "[seq #{} | User]", entry.seq)?;
+            if !images.is_empty() {
+                writeln!(out, "[图片 {} 张]", images.len())?;
             }
+            writeln!(out, "{text}\n")
         }
         SessionEvent::Assistant { blocks, .. } => {
-            let mut parts = Vec::new();
-            for b in blocks {
-                match b {
+            let mut parts = blocks
+                .iter()
+                .filter_map(|block| match block {
                     ContentBlock::Text { text } if !text.trim().is_empty() => {
-                        parts.push(text.clone());
+                        Some(Cow::Borrowed(text.as_str()))
                     }
                     ContentBlock::ToolCall {
                         name, arguments, ..
-                    } => {
-                        let args_snip: String = arguments.chars().take(400).collect();
-                        parts.push(format!("[call {name}] {args_snip}"));
-                    }
-                    ContentBlock::Reasoning { .. } | ContentBlock::Text { .. } => {}
-                }
+                    } => Some(Cow::Owned(format!("[call {name}] {arguments:.400}"))),
+                    _ => None,
+                })
+                .peekable();
+            if parts.peek().is_none() {
+                return Ok(());
             }
-            if parts.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "[seq #{} | Assistant]\n{}",
-                    entry.seq,
-                    parts.join("\n")
-                ))
+            writeln!(out, "[seq #{} | Assistant]", entry.seq)?;
+            for part in parts {
+                writeln!(out, "{part}")?;
             }
+            writeln!(out)
         }
         SessionEvent::ToolResult {
             name,
@@ -462,10 +470,11 @@ fn format_entry_for_transcript(entry: &SessionEntry) -> Option<String> {
         } => {
             let status = if *is_error { "error" } else { "ok" };
             let body = truncate_with_ellipsis(content, TRANSCRIPT_TOOL_RESULT_MAX_CHARS);
-            Some(format!(
-                "[seq #{} | ToolResult {name} ({status})]\n{body}",
+            writeln!(
+                out,
+                "[seq #{} | ToolResult {name} ({status})]\n{body}\n",
                 entry.seq
-            ))
+            )
         }
         SessionEvent::BashExecution {
             command,
@@ -478,17 +487,18 @@ fn format_entry_for_transcript(entry: &SessionEntry) -> Option<String> {
             let code = exit_code
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "?".into());
-            Some(format!(
-                "[seq #{} | LocalBash exit={code}]\n$ {command}\n{body}",
+            writeln!(
+                out,
+                "[seq #{} | LocalBash exit={code}]\n$ {command}\n{body}\n",
                 entry.seq
-            ))
+            )
         }
         SessionEvent::ContextNotice { .. }
         | SessionEvent::Compaction { .. }
         | SessionEvent::ToolResultPrune { .. }
         | SessionEvent::BashExecution { .. }
         | SessionEvent::Selection { .. }
-        | SessionEvent::Trace { .. } => None,
+        | SessionEvent::Trace { .. } => Ok(()),
     }
 }
 

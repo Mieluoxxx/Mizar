@@ -42,6 +42,15 @@ pub enum SessionTraceEvent {
         #[serde(default)]
         tools_count: usize,
     },
+    StepRetry {
+        turn: u64,
+        step: usize,
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        reason: String,
+        reset_draft: bool,
+    },
     FirstToken {
         turn: u64,
         step: usize,
@@ -105,6 +114,7 @@ impl SessionTraceEvent {
             Self::TurnStart { .. } => "turn-start",
             Self::TurnEnd { .. } => "turn-end",
             Self::StepStart { .. } => "step-start",
+            Self::StepRetry { .. } => "step-retry",
             Self::FirstToken { .. } => "first-token",
             Self::StepEnd { .. } => "step-end",
             Self::ToolCall { .. } => "tool-call",

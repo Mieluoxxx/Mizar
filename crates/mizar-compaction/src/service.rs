@@ -10,8 +10,8 @@ use mizar_agent_loop::{
     AgentContextOverflowEvent, AgentPreStepEvent, AgentStepEndEvent, EVENT_AGENT_CONTEXT_OVERFLOW,
     EVENT_AGENT_PRE_STEP, EVENT_AGENT_STEP_END, StepOutcome,
 };
-use mizar_llm::LlmContextExt;
-use mizar_session::{Session, SessionContextExt, SessionTraceEvent};
+use mizar_llm::{LlmContextExt, LlmError, LlmErrorCode, Message};
+use mizar_session::{Session, SessionContextExt, SessionEvent, SessionTraceEvent};
 use mizar_system_prompt::SystemPromptContextExt;
 use mizar_tools::{
     EVENT_TOOLS_POST_EXECUTE, EVENT_TOOLS_PRE_EXECUTE, PostExecuteInput, PreExecuteDecision,
@@ -20,11 +20,12 @@ use mizar_tools::{
 use tokio_util::sync::CancellationToken;
 
 use crate::budget::{
-    ContextBudget, compute_budget, estimate_session_context_tokens, estimate_text_tokens,
+    ContextBudget, compute_budget, estimate_message_tokens, estimate_projected_tokens,
+    estimate_session_context_tokens, estimate_text_tokens,
 };
-use crate::digest::{build_compaction_digest, plan_compaction_cut_with_pruned};
+use crate::digest::{build_compaction_digest, plan_compaction_cut};
 use crate::guards::FileGuardTracker;
-use crate::pruning::{TailPruneOptions, prune_session_tail};
+use crate::pruning::{TailPruneOptions, TailPruneReport, prune_session_tail_cancellable};
 use crate::summarizer::{SummarizeParams, generate_checkpoint_summary};
 use crate::{
     CompactionConfig, CompactionEndEvent, CompactionError, CompactionOutcome,
@@ -46,6 +47,25 @@ struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.in_flight.lock().unwrap().remove(&self.session_id);
+    }
+}
+
+struct CompactionTraceGuard<'a> {
+    runtime: &'a CompactionRuntime,
+    session: &'a Arc<Session>,
+    report: CompactionReport,
+}
+
+impl Drop for CompactionTraceGuard<'_> {
+    fn drop(&mut self) {
+        let report = &self.report;
+        self.session.append_trace(SessionTraceEvent::CompactionEnd {
+            status: report.outcome.as_str().to_string(),
+            first_kept_seq: report.first_kept_seq,
+            tokens_before: Some(report.tokens_before),
+            tokens_after: Some(report.tokens_after),
+        });
+        self.runtime.emit_end_event(&self.session.id, report);
     }
 }
 
@@ -231,6 +251,19 @@ impl CompactionRuntime {
         .await
     }
 
+    fn prune_tail(
+        &self,
+        session: &Arc<Session>,
+        opts: &TailPruneOptions,
+        cancel: &CancellationToken,
+    ) -> TailPruneReport {
+        let workspace = session
+            .header()
+            .cwd
+            .or_else(|| self.ctx.sessions().ok().and_then(|s| s.default_cwd()));
+        prune_session_tail_cancellable(session, workspace.as_deref(), opts, Some(cancel))
+    }
+
     async fn handle_pre_step(&self, ev: &AgentPreStepEvent) {
         let cfg = self.config();
         if !cfg.enabled {
@@ -239,11 +272,6 @@ impl CompactionRuntime {
         if (cfg.supersede_reads || cfg.drop_useless)
             && let Ok(_lock) = self.try_lock_session(&ev.session.id)
         {
-            let workspace = ev
-                .session
-                .header()
-                .cwd
-                .or_else(|| self.ctx.sessions().ok().and_then(|s| s.default_cwd()));
             let opts = TailPruneOptions {
                 supersede_reads: cfg.supersede_reads,
                 drop_useless: cfg.drop_useless,
@@ -256,7 +284,7 @@ impl CompactionRuntime {
                 ),
                 now_ms: None,
             };
-            prune_session_tail(&ev.session, workspace.as_deref(), &opts);
+            self.prune_tail(&ev.session, &opts, &ev.cancel);
         }
         if !cfg.auto_compact {
             return;
@@ -298,7 +326,11 @@ impl CompactionRuntime {
             )
             .await
         {
-            Ok(report) => matches!(report.outcome, CompactionOutcome::Compacted),
+            Ok(report) => {
+                report.outcome == CompactionOutcome::Compacted
+                    && report.tokens_after < report.tokens_before
+                    && !ev.cancel.is_cancelled()
+            }
             Err(_) => false,
         }
     }
@@ -347,44 +379,30 @@ impl CompactionRuntime {
             &cfg,
         );
         let (sys_prompt, declared_tools, tools_chars) = self.current_prompt_and_tools(&session.id);
-        let tokens_before = estimate_session_context_tokens(&session, &sys_prompt, tools_chars);
+        let resident_overhead =
+            estimate_text_tokens(&sys_prompt) + (tools_chars as u64).div_ceil(4);
+        // 剪枝会使上一次实测用量失效，溢出前后必须用同一套投影估算。
+        let history_tokens = |first_kept_seq: Option<u64>| {
+            let pruned = session.pruned_map();
+            session.with_visible_entries(|entries| {
+                let kept = entries.iter().copied().filter(|entry| {
+                    first_kept_seq.is_none_or(|seq| {
+                        entry.seq >= seq && !matches!(entry.event, SessionEvent::Compaction { .. })
+                    })
+                });
+                estimate_projected_tokens(kept, &pruned, 0)
+            })
+        };
+        let current_overhead = || {
+            let (prompt, _, chars) = self.current_prompt_and_tools(&session.id);
+            estimate_text_tokens(&prompt) + (chars as u64).div_ceil(4)
+        };
+        let tokens_before = if force_overflow {
+            resident_overhead + history_tokens(None)
+        } else {
+            estimate_session_context_tokens(&session, &sys_prompt, tools_chars)
+        };
 
-        struct CompactionTraceGuard {
-            ctx: Context,
-            session: Arc<Session>,
-            trigger: CompactionTrigger,
-            tokens_before: u64,
-            finished: bool,
-        }
-        impl Drop for CompactionTraceGuard {
-            fn drop(&mut self) {
-                if !self.finished {
-                    self.session.append_trace(SessionTraceEvent::CompactionEnd {
-                        status: "failed".to_string(),
-                        first_kept_seq: None,
-                        tokens_before: Some(self.tokens_before),
-                        tokens_after: Some(self.tokens_before),
-                    });
-                    self.ctx.emit(
-                        EVENT_COMPACTION_END,
-                        CompactionEndEvent {
-                            session_id: self.session.id.clone(),
-                            trigger: self.trigger,
-                            outcome: CompactionOutcome::Failed,
-                            tokens_before: self.tokens_before,
-                            tokens_after: self.tokens_before,
-                            first_kept_seq: None,
-                            summary_preview: None,
-                            skipped_reason: Some(
-                                "compaction aborted before completion".to_string(),
-                            ),
-                        },
-                    );
-                }
-            }
-        }
-
-        // 发送开始审计与 UI 事件
         session.append_trace(SessionTraceEvent::CompactionStart {
             trigger: trigger.as_str().to_string(),
         });
@@ -397,18 +415,76 @@ impl CompactionRuntime {
                 context_window: budget.context_window,
             },
         );
-        let mut trace_guard = CompactionTraceGuard {
-            ctx: self.ctx.clone(),
-            session: Arc::clone(&session),
-            trigger,
-            tokens_before,
-            finished: false,
+        let mut trace = CompactionTraceGuard {
+            runtime: self,
+            session: &session,
+            report: CompactionReport {
+                outcome: CompactionOutcome::Failed,
+                trigger,
+                tokens_before,
+                tokens_after: tokens_before,
+                first_kept_seq: None,
+                summary_preview: None,
+                skipped_reason: Some("compaction aborted before completion".into()),
+            },
         };
+        let pruned = if force_overflow && (cfg.supersede_reads || cfg.drop_useless) {
+            let opts = TailPruneOptions {
+                supersede_reads: cfg.supersede_reads,
+                drop_useless: cfg.drop_useless,
+                warm_suffix_tokens: 0,
+                // 溢出后没有可保留的热前缀，仅将热尾设为零会漏掉较早的候选。
+                idle_flush_ms: 0,
+                ..Default::default()
+            };
+            self.prune_tail(&session, &opts, &cancel).pruned_count > 0
+        } else {
+            false
+        };
+        if pruned {
+            trace.report.tokens_after = resident_overhead + history_tokens(None);
+        }
+        let tokens_after_prune = trace.report.tokens_after;
+        let mut without_checkpoint = |result: Result<&str, CompactionError>| {
+            let report = &mut trace.report;
+            if pruned {
+                // 摘要等待期间历史和已激活的工具都可能增长，须以当前窗口判断能否恢复。
+                report.tokens_after = current_overhead() + history_tokens(None);
+            }
+            let err = match result {
+                // 服务端也能主动中止流，此时本地取消令牌可能仍未触发。
+                Err(CompactionError::Llm(err)) if err.code == LlmErrorCode::Cancelled => err.into(),
+                _ if cancel.is_cancelled() => LlmError::cancelled().into(),
+                _ if tokens_after_prune < tokens_before && report.tokens_after < tokens_before => {
+                    report.outcome = CompactionOutcome::Compacted;
+                    report.skipped_reason = None;
+                    return Ok(report.clone());
+                }
+                Ok(reason) => {
+                    report.outcome = CompactionOutcome::Skipped;
+                    report.skipped_reason = Some(reason.into());
+                    return Ok(report.clone());
+                }
+                Err(err) => err,
+            };
+            report.skipped_reason = Some(err.to_string());
+            Err(err)
+        };
+        if cancel.is_cancelled() {
+            return without_checkpoint(Err(LlmError::cancelled().into()));
+        }
 
-        // 切分规划（单阶段检查点，不再做 L1 批量截断与 Re-plan 二次硬切）
-        let visible = session.visible_log();
         let last_seq = session.last_seq();
-        let pruned_map = session.pruned_map();
+        let mut visible = session.visible_log();
+        let mut pruned_map = session.pruned_map();
+        // 干净转录也应看到剪枝后的内容，避免把刚移除的输出又塞回摘要请求。
+        for entry in &mut visible {
+            if let SessionEvent::ToolResult { content, .. } = &mut entry.event
+                && let Some(notice) = pruned_map.remove(&entry.seq)
+            {
+                *content = notice;
+            }
+        }
 
         let keep_target = match trigger {
             CompactionTrigger::Manual => (budget.keep_recent_tokens / 2).max(512),
@@ -416,67 +492,22 @@ impl CompactionRuntime {
             CompactionTrigger::AutoThreshold => budget.keep_recent_tokens,
         };
 
-        let cut_opt = plan_compaction_cut_with_pruned(
-            &visible,
-            last_seq,
-            keep_target,
-            force_overflow,
-            &pruned_map,
-        )
-        .or_else(|| {
-            // 手动 `/compact` 时，即使总长度尚小于常规保留预算，也收紧为仅保留最新 1 条合法边界
-            if matches!(trigger, CompactionTrigger::Manual) {
-                plan_compaction_cut_with_pruned(&visible, last_seq, 0, true, &pruned_map)
-            } else {
-                None
-            }
-        });
-
-        let Some(cut) = cut_opt else {
-            let report = CompactionReport {
-                outcome: CompactionOutcome::Skipped,
-                trigger,
-                tokens_before,
-                tokens_after: tokens_before,
-                first_kept_seq: None,
-                summary_preview: None,
-                skipped_reason: Some("当前历史较短，暂无可压缩段落".to_string()),
-            };
-            session.append_trace(SessionTraceEvent::CompactionEnd {
-                status: report.outcome.as_str().to_string(),
-                first_kept_seq: None,
-                tokens_before: Some(tokens_before),
-                tokens_after: Some(tokens_before),
+        let cut_opt =
+            plan_compaction_cut(&visible, last_seq, keep_target, force_overflow).or_else(|| {
+                // 手动请求允许只留最新合法边界，否则短会话总是无法压缩。
+                if matches!(trigger, CompactionTrigger::Manual) {
+                    plan_compaction_cut(&visible, last_seq, 0, true)
+                } else {
+                    None
+                }
             });
-            self.emit_end_event(&session.id, &report);
-            trace_guard.finished = true;
-            return Ok(report);
+        let Some(cut) = cut_opt else {
+            return without_checkpoint(Ok("当前历史较短，暂无可压缩段落"));
         };
-
         let llm = match self.ctx.llm() {
             Ok(llm) => llm,
-            Err(err) => {
-                session.append_trace(SessionTraceEvent::CompactionEnd {
-                    status: "failed".to_string(),
-                    first_kept_seq: None,
-                    tokens_before: Some(tokens_before),
-                    tokens_after: Some(tokens_before),
-                });
-                let err_report = CompactionReport {
-                    outcome: CompactionOutcome::Failed,
-                    trigger,
-                    tokens_before,
-                    tokens_after: tokens_before,
-                    first_kept_seq: None,
-                    summary_preview: None,
-                    skipped_reason: Some(err.to_string()),
-                };
-                self.emit_end_event(&session.id, &err_report);
-                trace_guard.finished = true;
-                return Err(err.into());
-            }
+            Err(err) => return without_checkpoint(Err(err.into())),
         };
-        let current_visible_messages = session.derive_messages();
         let ctx_for_progress = self.ctx.clone();
         let sid_for_progress = session.id.clone();
 
@@ -487,11 +518,15 @@ impl CompactionRuntime {
             SummarizeParams {
                 llm: &llm,
                 session_id: Some(session.id.clone()),
-                provider: effective_provider.clone(),
-                model: effective_model.clone(),
-                system_prompt: sys_prompt.clone(),
+                provider: effective_provider,
+                model: effective_model,
+                system_prompt: sys_prompt,
                 declared_tools,
-                current_visible_messages,
+                current_visible_messages: if reuse_prefix {
+                    session.derive_messages()
+                } else {
+                    Vec::new()
+                },
                 cut: &cut,
                 focus: focus.as_deref(),
                 reuse_prefix_cache: reuse_prefix,
@@ -512,29 +547,9 @@ impl CompactionRuntime {
 
         let summary_out = match summary_res {
             Ok(out) => out,
-            Err(err) => {
-                session.append_trace(SessionTraceEvent::CompactionEnd {
-                    status: "failed".to_string(),
-                    first_kept_seq: None,
-                    tokens_before: Some(tokens_before),
-                    tokens_after: Some(tokens_before),
-                });
-                let err_report = CompactionReport {
-                    outcome: CompactionOutcome::Failed,
-                    trigger,
-                    tokens_before,
-                    tokens_after: tokens_before,
-                    first_kept_seq: None,
-                    summary_preview: None,
-                    skipped_reason: Some(err.to_string()),
-                };
-                self.emit_end_event(&session.id, &err_report);
-                trace_guard.finished = true;
-                return Err(CompactionError::Llm(err));
-            }
+            Err(err) => return without_checkpoint(Err(err.into())),
         };
 
-        // 构造确定性硬事实 `<mizar-digest>`
         let digest = build_compaction_digest(
             &cut.previous_digest,
             &cut.compacted_entries,
@@ -542,41 +557,21 @@ impl CompactionRuntime {
         );
         let rendered_checkpoint =
             mizar_session::render_compaction_message(&summary_out.summary, &digest);
-        let checkpoint_tokens = estimate_text_tokens(&rendered_checkpoint);
-        let resident_overhead =
-            estimate_text_tokens(&sys_prompt) + (tools_chars as u64).div_ceil(4);
-
-        // 膨胀保护（`shrinks`）：自动触发时若摘要反而比被折叠内容更长，则放弃写入避免负优化
-        if !matches!(trigger, CompactionTrigger::Manual)
-            && !force_overflow
-            && checkpoint_tokens >= cut.compacted_tokens
+        let checkpoint_tokens = estimate_message_tokens(&Message::user(rendered_checkpoint));
+        let tokens_after_est = if force_overflow {
+            // 等待摘要期间追加的消息也会留在窗口内。
+            current_overhead() + checkpoint_tokens + history_tokens(Some(cut.first_kept_seq))
+        } else {
+            resident_overhead + checkpoint_tokens + cut.kept_tokens
+        };
+        if (force_overflow && tokens_after_est >= tokens_before.min(tokens_after_prune))
+            || (trigger == CompactionTrigger::AutoThreshold
+                && checkpoint_tokens >= cut.compacted_tokens)
         {
-            let report = CompactionReport {
-                outcome: CompactionOutcome::Skipped,
-                trigger,
-                tokens_before,
-                tokens_after: tokens_before,
-                first_kept_seq: None,
-                summary_preview: None,
-                skipped_reason: Some("摘要未能净缩减上下文占用，已跳过本次压缩".to_string()),
-            };
-            session.append_trace(SessionTraceEvent::CompactionEnd {
-                status: report.outcome.as_str().to_string(),
-                first_kept_seq: None,
-                tokens_before: Some(tokens_before),
-                tokens_after: Some(tokens_before),
-            });
-            self.emit_end_event(&session.id, &report);
-            trace_guard.finished = true;
-            return Ok(report);
+            return without_checkpoint(Ok("摘要未能净缩减上下文占用，已跳过本次压缩"));
         }
-
-        // 落盘 Compaction 检查点
-        let tokens_after_est = resident_overhead + checkpoint_tokens + cut.kept_tokens;
-
-        // 压后联动：清空本会话临时激活的延迟工具
-        if let Ok(tools_rt) = self.ctx.tools() {
-            tools_rt.reset_session_activations(&session.id);
+        if cancel.is_cancelled() {
+            return without_checkpoint(Err(LlmError::cancelled().into()));
         }
 
         session.compact_at(
@@ -586,30 +581,17 @@ impl CompactionRuntime {
             Some(tokens_after_est),
             digest,
         );
+        if let Ok(tools) = self.ctx.tools() {
+            tools.reset_session_activations(&session.id);
+        }
+        let tokens_after_actual = current_overhead() + history_tokens(None);
 
-        let tokens_after_actual =
-            estimate_session_context_tokens(&session, &sys_prompt, tools_chars);
-
-        session.append_trace(SessionTraceEvent::CompactionEnd {
-            status: "compacted".to_string(),
-            first_kept_seq: Some(cut.first_kept_seq),
-            tokens_before: Some(tokens_before),
-            tokens_after: Some(tokens_after_actual),
-        });
-
-        let preview = build_summary_preview(&summary_out.summary, 280);
-        let report = CompactionReport {
-            outcome: CompactionOutcome::Compacted,
-            trigger,
-            tokens_before,
-            tokens_after: tokens_after_actual,
-            first_kept_seq: Some(cut.first_kept_seq),
-            summary_preview: Some(preview),
-            skipped_reason: None,
-        };
-        self.emit_end_event(&session.id, &report);
-        trace_guard.finished = true;
-        Ok(report)
+        trace.report.outcome = CompactionOutcome::Compacted;
+        trace.report.tokens_after = tokens_after_actual;
+        trace.report.first_kept_seq = Some(cut.first_kept_seq);
+        trace.report.summary_preview = Some(build_summary_preview(&summary_out.summary, 280));
+        trace.report.skipped_reason = None;
+        Ok(trace.report.clone())
     }
 
     fn emit_end_event(&self, session_id: &str, report: &CompactionReport) {

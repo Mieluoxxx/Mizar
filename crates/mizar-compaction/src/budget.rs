@@ -207,19 +207,26 @@ pub fn estimate_session_context_tokens(
     }
 
     if let Some((anchor_seq, anchor_input)) = calibrated_anchor {
-        let mut total = anchor_input;
-        for entry in &visible {
-            if entry.seq >= anchor_seq {
-                total = total.saturating_add(estimate_entry_tokens_with_pruned(entry, &pruned_map));
-            }
-        }
-        return total;
+        return estimate_projected_tokens(
+            visible.iter().filter(|entry| entry.seq >= anchor_seq),
+            &pruned_map,
+            anchor_input,
+        );
     }
 
-    let mut total =
-        estimate_text_tokens(system_prompt_text) + (tools_schema_chars as u64).div_ceil(4);
-    for entry in &visible {
-        total = total.saturating_add(estimate_entry_tokens_with_pruned(entry, &pruned_map));
-    }
-    total
+    estimate_projected_tokens(
+        visible.iter(),
+        &pruned_map,
+        estimate_text_tokens(system_prompt_text) + (tools_schema_chars as u64).div_ceil(4),
+    )
+}
+
+pub(crate) fn estimate_projected_tokens<'a>(
+    entries: impl Iterator<Item = &'a SessionEntry>,
+    pruned_map: &HashMap<u64, String>,
+    base: u64,
+) -> u64 {
+    entries.fold(base, |total, entry| {
+        total.saturating_add(estimate_entry_tokens_with_pruned(entry, pruned_map))
+    })
 }

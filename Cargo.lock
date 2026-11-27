@@ -1413,6 +1413,7 @@ dependencies = [
  "cordis",
  "futures",
  "mizar-llm",
+ "mizar-llm-retry",
  "mizar-session",
  "mizar-system-prompt",
  "mizar-tools",
@@ -1512,9 +1513,9 @@ name = "mizar-compaction"
 version = "0.2.4"
 dependencies = [
  "cordis",
- "futures",
  "mizar-agent-loop",
  "mizar-llm",
+ "mizar-llm-retry",
  "mizar-session",
  "mizar-system-prompt",
  "mizar-tools",
@@ -1567,6 +1568,7 @@ dependencies = [
 name = "mizar-llm-http"
 version = "0.2.4"
 dependencies = [
+ "chrono",
  "futures",
  "mizar-llm",
  "reqwest",
@@ -1616,10 +1618,10 @@ dependencies = [
 name = "mizar-llm-retry"
 version = "0.2.4"
 dependencies = [
- "cordis",
  "futures",
  "mizar-llm",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1710,9 +1712,9 @@ version = "0.2.4"
 dependencies = [
  "chrono",
  "cordis",
- "futures",
  "mizar-agent-loop",
  "mizar-llm",
+ "mizar-llm-retry",
  "mizar-session",
  "serde",
  "thiserror 2.0.21",
@@ -1846,7 +1848,6 @@ dependencies = [
  "mizar-instructions",
  "mizar-llm",
  "mizar-llm-mock",
- "mizar-llm-retry",
  "mizar-llm-router",
  "mizar-mcp",
  "mizar-session",
